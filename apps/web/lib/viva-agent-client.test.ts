@@ -13,6 +13,7 @@ import {
   agentProtocolVersion,
   createVivaAgentSessionController,
   fetchVivaAgentReadinessProbe,
+  fetchVivaLibrarySnapshot,
   initialVivaAgentSessionState,
   parseVivaAgentMessage,
   vivaAgentHttpBaseUrl,
@@ -559,6 +560,55 @@ describe("Viva agent browser client", () => {
 
     expect(state.finalTranscript).toBe("replacement answer");
     expect(state.staleEvents).toBe(0);
+  });
+
+  test("fetches server-owned library snapshot without rewriting action tokens", async () => {
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input: String(input), init });
+      return jsonResponse(200, {
+        user_id: "user-1",
+        study_sets: [
+          {
+            id: "biology-midterm",
+            user_id: "user-1",
+            title: "Biology Midterm",
+            course: "Biology 201",
+            ingestion_status: "ready",
+            ingestion_error: null,
+            server_owned: true,
+            documents: [],
+            concept_count: 1,
+            question_count: 1,
+            actions: {
+              start: {
+                available: true,
+                session_id: "server-session",
+                session_token: "viva1.server-token",
+              },
+              resume: { available: false, unavailable_reason: "no_open_session" },
+              archive: { available: false, unavailable_reason: "server_mutation_unavailable" },
+              delete: { available: false, unavailable_reason: "server_mutation_unavailable" },
+            },
+          },
+        ],
+        sessions: [],
+      });
+    }) as typeof fetch;
+
+    const snapshot = await fetchVivaLibrarySnapshot({
+      apiBaseUrl: "http://127.0.0.1:4318/",
+      fetchImpl,
+      userId: "user-1",
+    });
+
+    expect(calls[0]?.input).toBe("http://127.0.0.1:4318/study-sets/library?user_id=user-1");
+    expect(calls[0]?.init?.method).toBe("GET");
+    expect(snapshot.study_sets[0]?.actions.start).toEqual({
+      available: true,
+      session_id: "server-session",
+      session_token: "viva1.server-token",
+    });
   });
 });
 

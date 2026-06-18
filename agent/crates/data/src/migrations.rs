@@ -38,6 +38,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0008_ingestion_status_and_generated_questions.sql",
         include_str!("../../../migrations/0008_ingestion_status_and_generated_questions.sql"),
     ),
+    (
+        "0009_review_items_voice_session.sql",
+        include_str!("../../../migrations/0009_review_items_voice_session.sql"),
+    ),
 ];
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
@@ -253,6 +257,7 @@ pub fn assert_schema_has_no_raw_payload_columns() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PostgresStudyStore;
     use agent_domain::{
         fixture_question, fixture_source_reference, ConceptStatus, SessionConfig, SessionId,
         StudyMemoryStore, StudyMode, StudySessionRecap, ToolProposal, VivaToolExecutor,
@@ -278,6 +283,7 @@ mod tests {
         assert!(sql.contains("CREATE TABLE voice_usage_events"));
         assert!(sql.contains("cost_estimate_usd"));
         assert!(sql.contains("CREATE TABLE session_recaps"));
+        assert!(sql.contains("voice_session_id UUID REFERENCES voice_sessions"));
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS study_questions"));
         assert!(sql.contains("source_spans_excerpt_bounded"));
         assert!(!sql.contains("summary TEXT"));
@@ -603,6 +609,85 @@ mod tests {
 
         assert_eq!(negative_store.write_counts(), baseline);
         assert_eq!(db_row_counts(&pool).await, row_baseline);
+    }
+
+    #[tokio::test]
+    async fn optional_postgres_library_snapshot_scopes_review_items_to_voice_session_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool);
+        record_fixture_session(&store).await;
+        let second_session_id = "55555555-5555-4555-8555-555555555555";
+        store
+            .record_voice_session(&SessionConfig {
+                session_id: Some(SessionId::new(second_session_id)),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .expect("records second fixture session");
+        store
+            .schedule_review_item(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "nadh",
+                "2026-06-20T09:00:00Z",
+            )
+            .await
+            .expect("schedules first session review");
+        store
+            .schedule_review_item(
+                "user-1",
+                "biology-midterm",
+                second_session_id,
+                "atp-synthase",
+                "2026-06-18T09:00:00Z",
+            )
+            .await
+            .expect("schedules second session review");
+        store
+            .close_voice_session(second_session_id, "completed")
+            .await
+            .expect("closes second fixture session");
+
+        let snapshot = store
+            .library_snapshot("user-1")
+            .await
+            .expect("library snapshot succeeds");
+        let first = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.voice_session_id == "voice-session-1")
+            .expect("first session row");
+        let second = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.voice_session_id == second_session_id)
+            .expect("second session row");
+
+        assert_eq!(
+            first
+                .next_review
+                .as_ref()
+                .map(|review| review.concept_id.as_str()),
+            Some("nadh")
+        );
+        assert_eq!(
+            second
+                .next_review
+                .as_ref()
+                .map(|review| review.concept_id.as_str()),
+            Some("atp-synthase")
+        );
     }
 
     async fn optional_postgres_pool() -> Option<sqlx::PgPool> {

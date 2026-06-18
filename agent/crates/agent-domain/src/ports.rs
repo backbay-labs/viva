@@ -151,6 +151,67 @@ pub struct StudySetIngestionRecord {
     pub session_token: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LibraryStudyDocumentSummary {
+    pub id: String,
+    pub display_name: String,
+    pub source_kind: String,
+    pub processing_status: StudySetIngestionStatus,
+    pub deleted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LibraryStudySetSummary {
+    pub id: String,
+    pub user_id: String,
+    pub title: String,
+    pub course: Option<String>,
+    pub ingestion_status: StudySetIngestionStatus,
+    pub ingestion_error: Option<String>,
+    pub server_owned: bool,
+    pub documents: Vec<LibraryStudyDocumentSummary>,
+    pub concept_count: usize,
+    pub question_count: usize,
+    pub open_session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LibrarySessionRecapSummary {
+    pub voice_session_id: String,
+    pub strong_concepts: Vec<String>,
+    pub shaky_concepts: Vec<String>,
+    pub missed_concepts: Vec<String>,
+    pub review_later: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LibraryNextReviewSummary {
+    pub concept_id: String,
+    pub label: String,
+    pub status: ConceptStatus,
+    pub persisted_due_at: String,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LibrarySessionSummary {
+    pub voice_session_id: String,
+    pub user_id: String,
+    pub study_set_id: String,
+    pub study_set_title: String,
+    pub status: String,
+    pub terminal_reason: Option<String>,
+    pub recap: Option<LibrarySessionRecapSummary>,
+    pub next_review: Option<LibraryNextReviewSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StudyLibrarySnapshot {
+    pub user_id: String,
+    pub study_sets: Vec<LibraryStudySetSummary>,
+    pub sessions: Vec<LibrarySessionSummary>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PortError {
     #[error("{port} unavailable for {id}: {reason}")]
@@ -229,6 +290,14 @@ pub trait StudyMemoryStore: Send + Sync {
         user_id: &str,
         study_set_id: &str,
     ) -> Result<Option<Value>, PortError>;
+
+    async fn library_snapshot(&self, user_id: &str) -> Result<StudyLibrarySnapshot, PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            user_id,
+            "library snapshot is not implemented by this store",
+        ))
+    }
 
     async fn active_question(
         &self,

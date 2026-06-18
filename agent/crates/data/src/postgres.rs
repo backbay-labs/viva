@@ -4,8 +4,10 @@ use std::{
 };
 
 use agent_domain::{
-    AnswerEvaluation, ConceptStatus, CreatePasteStudySet, PortError, SessionConfig,
-    StudyMemoryStore, StudyQuestion, StudySessionRecap, StudySetIngestionRecord,
+    AnswerEvaluation, ConceptStatus, CreatePasteStudySet, LibraryNextReviewSummary,
+    LibrarySessionRecapSummary, LibrarySessionSummary, LibraryStudyDocumentSummary,
+    LibraryStudySetSummary, PortError, SessionConfig, StudyLibrarySnapshot, StudyMemoryStore,
+    StudyQuestion, StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus,
     StudySourceReference, StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts,
     VoiceUsageRecord,
 };
@@ -701,6 +703,214 @@ impl StudyMemoryStore for PostgresStudyStore {
         Ok(value)
     }
 
+    async fn library_snapshot(&self, user_id: &str) -> Result<StudyLibrarySnapshot, PortError> {
+        let study_set_rows = sqlx::query(
+            "SELECT id, user_id, title, course, ingestion_status, ingestion_error
+             FROM study_sets
+             WHERE user_id = $1
+             ORDER BY title ASC, id ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_error)?;
+
+        let mut study_sets = Vec::with_capacity(study_set_rows.len());
+        for row in study_set_rows {
+            let study_set_uuid: Uuid = row.try_get("id").map_err(pg_error)?;
+            let study_set_id = Self::logical_id_for_uuid(study_set_uuid);
+            let document_rows = sqlx::query(
+                "SELECT id, display_name, source_kind, processing_status, deleted_at IS NOT NULL AS deleted
+                 FROM study_documents
+                 WHERE study_set_id = $1
+                 ORDER BY display_name ASC, id ASC",
+            )
+            .bind(study_set_uuid)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(pg_error)?;
+            let mut documents = Vec::with_capacity(document_rows.len());
+            for document in document_rows {
+                let document_id: Uuid = document.try_get("id").map_err(pg_error)?;
+                let processing_status: String =
+                    document.try_get("processing_status").map_err(pg_error)?;
+                documents.push(LibraryStudyDocumentSummary {
+                    id: Self::logical_id_for_uuid(document_id),
+                    display_name: document.try_get("display_name").map_err(pg_error)?,
+                    source_kind: document.try_get("source_kind").map_err(pg_error)?,
+                    processing_status: ingestion_status(&processing_status)?,
+                    deleted: document.try_get("deleted").map_err(pg_error)?,
+                });
+            }
+
+            let concept_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM concepts WHERE study_set_id = $1",
+            )
+            .bind(study_set_uuid)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(pg_error)?;
+            let question_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*)
+                 FROM study_questions q
+                 JOIN source_spans sp ON sp.id = q.source_span_id
+                 JOIN study_documents d ON d.id = sp.document_id
+                 WHERE q.study_set_id = $1
+                   AND q.active
+                   AND d.study_set_id = q.study_set_id
+                   AND sp.deleted_at IS NULL
+                   AND d.deleted_at IS NULL",
+            )
+            .bind(study_set_uuid)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(pg_error)?;
+            let open_session_id = sqlx::query_scalar::<_, Uuid>(
+                "SELECT id
+                 FROM voice_sessions
+                 WHERE user_id = $1 AND study_set_id = $2 AND status = 'open'
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(study_set_uuid)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(pg_error)?
+            .map(Self::logical_id_for_uuid);
+
+            let ingestion_status_value: String =
+                row.try_get("ingestion_status").map_err(pg_error)?;
+            study_sets.push(LibraryStudySetSummary {
+                id: study_set_id,
+                user_id: row.try_get("user_id").map_err(pg_error)?,
+                title: row.try_get("title").map_err(pg_error)?,
+                course: row.try_get("course").map_err(pg_error)?,
+                ingestion_status: ingestion_status(&ingestion_status_value)?,
+                ingestion_error: row.try_get("ingestion_error").map_err(pg_error)?,
+                server_owned: true,
+                documents,
+                concept_count: usize::try_from(concept_count).map_err(|_| {
+                    PortError::adapter("postgres", "concept count exceeds usize range")
+                })?,
+                question_count: usize::try_from(question_count).map_err(|_| {
+                    PortError::adapter("postgres", "question count exceeds usize range")
+                })?,
+                open_session_id,
+            });
+        }
+
+        let session_rows = sqlx::query(
+            "SELECT
+                vs.id,
+                vs.user_id,
+                vs.study_set_id,
+                COALESCE(s.title, vs.study_set_id::text) AS study_set_title,
+                vs.status,
+                vs.terminal_reason
+             FROM voice_sessions vs
+             LEFT JOIN study_sets s ON s.id = vs.study_set_id
+             WHERE vs.user_id = $1
+               AND vs.study_set_id IS NOT NULL
+               AND vs.status = 'closed'
+               AND vs.terminal_reason = 'completed'
+             ORDER BY vs.started_at DESC, vs.id DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_error)?;
+
+        let mut sessions = Vec::with_capacity(session_rows.len());
+        for row in session_rows {
+            let voice_session_uuid: Uuid = row.try_get("id").map_err(pg_error)?;
+            let study_set_uuid: Uuid = row.try_get("study_set_id").map_err(pg_error)?;
+            let voice_session_id = Self::logical_id_for_uuid(voice_session_uuid);
+            let study_set_id = Self::logical_id_for_uuid(study_set_uuid);
+
+            let recap = sqlx::query(
+                "SELECT voice_session_id, strong_concepts, shaky_concepts, missed_concepts, review_later
+                 FROM session_recaps
+                 WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(study_set_uuid)
+            .bind(voice_session_uuid)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(pg_error)?
+            .map(|recap_row| {
+                let recap_voice_session_uuid: Uuid = recap_row.try_get("voice_session_id")?;
+                Ok::<_, sqlx::Error>(LibrarySessionRecapSummary {
+                    voice_session_id: Self::logical_id_for_uuid(recap_voice_session_uuid),
+                    strong_concepts: recap_row.try_get("strong_concepts")?,
+                    shaky_concepts: recap_row.try_get("shaky_concepts")?,
+                    missed_concepts: recap_row.try_get("missed_concepts")?,
+                    review_later: recap_row.try_get("review_later")?,
+                })
+            })
+            .transpose()
+            .map_err(pg_error)?;
+
+            let next_review = sqlx::query(
+                "SELECT
+                    COALESCE(c.public_id, c.id::text) AS concept_id,
+                    c.label,
+                    c.status,
+                    ri.due_at::text AS persisted_due_at
+                 FROM review_items ri
+                 JOIN concepts c ON c.id = ri.concept_id
+                 WHERE ri.user_id = $1
+                   AND ri.study_set_id = $2
+                   AND ri.status = 'scheduled'
+                   AND ri.voice_session_id = $3
+                 ORDER BY ri.due_at ASC, c.label ASC
+                 LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(study_set_uuid)
+            .bind(voice_session_uuid)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(pg_error)?
+            .map(|review_row| {
+                let status_value: String = review_row.try_get("status")?;
+                Ok::<_, sqlx::Error>((review_row, status_value))
+            })
+            .transpose()
+            .map_err(pg_error)?
+            .map(|(review_row, status_value)| {
+                Ok::<_, PortError>(LibraryNextReviewSummary {
+                    concept_id: review_row.try_get("concept_id").map_err(pg_error)?,
+                    label: review_row.try_get("label").map_err(pg_error)?,
+                    status: concept_status(&status_value)?,
+                    persisted_due_at: review_row.try_get("persisted_due_at").map_err(pg_error)?,
+                    source: "persisted_review_item".to_owned(),
+                })
+            })
+            .transpose()?;
+
+            sessions.push(LibrarySessionSummary {
+                voice_session_id,
+                user_id: row.try_get("user_id").map_err(pg_error)?,
+                study_set_id,
+                study_set_title: row.try_get("study_set_title").map_err(pg_error)?,
+                status: row.try_get("status").map_err(pg_error)?,
+                terminal_reason: row.try_get("terminal_reason").map_err(pg_error)?,
+                recap,
+                next_review,
+            });
+        }
+
+        Ok(StudyLibrarySnapshot {
+            user_id: user_id.to_owned(),
+            study_sets,
+            sessions,
+        })
+    }
+
     async fn active_question(
         &self,
         user_id: &str,
@@ -1216,8 +1426,8 @@ impl StudyMemoryStore for PostgresStudyStore {
         self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
             .await?;
         let result = sqlx::query(
-            "INSERT INTO review_items (id, user_id, study_set_id, concept_id, due_at, reason, status)
-             SELECT $1, $2, $3, $4, $5::timestamptz, 'voice_session', 'scheduled'
+            "INSERT INTO review_items (id, user_id, study_set_id, concept_id, due_at, reason, status, voice_session_id)
+             SELECT $1, $2, $3, $4, $5::timestamptz, 'voice_session', 'scheduled', $6
              WHERE EXISTS (
                  SELECT 1 FROM concepts c
                  JOIN study_sets s ON s.id = c.study_set_id
@@ -1229,6 +1439,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(study_set_uuid)
         .bind(concept_uuid)
         .bind(due_at)
+        .bind(voice_session_uuid)
         .execute(&self.pool)
         .await
         .map_err(pg_error)?;
@@ -1395,6 +1606,32 @@ fn concept_status_str(status: &ConceptStatus) -> &'static str {
         ConceptStatus::Shaky => "shaky",
         ConceptStatus::Missed => "missed",
         ConceptStatus::Review => "review",
+    }
+}
+
+fn concept_status(value: &str) -> Result<ConceptStatus, PortError> {
+    match value {
+        "strong" => Ok(ConceptStatus::Strong),
+        "shaky" => Ok(ConceptStatus::Shaky),
+        "missed" => Ok(ConceptStatus::Missed),
+        "review" => Ok(ConceptStatus::Review),
+        other => Err(PortError::adapter(
+            "postgres",
+            format!("unknown concept status `{other}`"),
+        )),
+    }
+}
+
+fn ingestion_status(value: &str) -> Result<StudySetIngestionStatus, PortError> {
+    match value {
+        "pending" => Ok(StudySetIngestionStatus::Pending),
+        "processing" => Ok(StudySetIngestionStatus::Processing),
+        "ready" => Ok(StudySetIngestionStatus::Ready),
+        "failed" => Ok(StudySetIngestionStatus::Failed),
+        other => Err(PortError::adapter(
+            "postgres",
+            format!("unknown ingestion status `{other}`"),
+        )),
     }
 }
 

@@ -10,8 +10,10 @@ use std::{
 
 use agent_adapters::{cartesia_gemini::FakeCartesiaGeminiRuntime, SyntheticBrain};
 use agent_domain::{
-    AudioFrame, BrainError, BrainEvent, BrainInput, BrainUsage, RealtimeBrain,
-    RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard, StudyMemoryStore,
+    AudioFrame, BrainError, BrainEvent, BrainInput, BrainUsage, ConceptStatus, RealtimeBrain,
+    RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard, RecapSourceMoment,
+    SessionConfig, SessionId, StudyMemoryStore, StudyMode, StudySessionRecap,
+    StudySetIngestionStatus,
 };
 use agent_service::{
     build_router, AppState, ClientFrame, ServerFrame, VoiceEvidenceRecorder, VoiceWsAccess,
@@ -343,6 +345,387 @@ async fn paste_study_set_route_does_not_mint_session_token_for_failed_ingestion(
     assert!(payload["concepts"].as_array().unwrap().is_empty());
     assert!(payload["questions"].as_array().unwrap().is_empty());
     assert!(payload["session_token"].is_null());
+}
+
+#[tokio::test]
+async fn library_route_projects_server_owned_sets_and_completed_session_history() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "pending-set".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Pending Set".to_owned(),
+        course: Some("Biology 201".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Pending,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "failed-set".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Failed Set".to_owned(),
+        course: Some("Biology 201".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Failed,
+        ingestion_error: Some("No usable source span".to_owned()),
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "deleted-document-set".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Deleted Document Set".to_owned(),
+        course: None,
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    store.upsert_document(data::StudyDocumentRecord {
+        study_set_id: "deleted-document-set".to_owned(),
+        document_id: "deleted-doc".to_owned(),
+        title: "Archived lecture".to_owned(),
+        source_kind: "pdf".to_owned(),
+        processing_status: StudySetIngestionStatus::Ready,
+        tombstoned: true,
+    });
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "partial-deleted-source-set".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Partial Deleted Source Set".to_owned(),
+        course: None,
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec!["q-deleted-source".to_owned()],
+    });
+    store.upsert_document(data::StudyDocumentRecord {
+        study_set_id: "partial-deleted-source-set".to_owned(),
+        document_id: "active-doc".to_owned(),
+        title: "Active lecture".to_owned(),
+        source_kind: "pdf".to_owned(),
+        processing_status: StudySetIngestionStatus::Ready,
+        tombstoned: false,
+    });
+    store.upsert_document(data::StudyDocumentRecord {
+        study_set_id: "partial-deleted-source-set".to_owned(),
+        document_id: "deleted-source-doc".to_owned(),
+        title: "Archived source lecture".to_owned(),
+        source_kind: "pdf".to_owned(),
+        processing_status: StudySetIngestionStatus::Ready,
+        tombstoned: true,
+    });
+    let mut deleted_source = agent_domain::fixture_source_reference();
+    deleted_source.source_id = "deleted-source-span".to_owned();
+    deleted_source.document_id = "deleted-source-doc".to_owned();
+    store.upsert_source_span(data::SourceSpanRecord {
+        study_set_id: "partial-deleted-source-set".to_owned(),
+        source: deleted_source.clone(),
+        tombstoned: false,
+    });
+    let mut deleted_source_question = agent_domain::fixture_question();
+    deleted_source_question.question_id = "q-deleted-source".to_owned();
+    deleted_source_question.source = deleted_source;
+    store.upsert_question(data::StudyQuestionRecord {
+        study_set_id: "partial-deleted-source-set".to_owned(),
+        question: deleted_source_question,
+        active: true,
+    });
+
+    store
+        .record_voice_session(&SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        })
+        .await
+        .unwrap();
+    store
+        .record_concept_status(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "response-concept",
+            "nadh",
+            ConceptStatus::Shaky,
+        )
+        .await
+        .unwrap();
+    store
+        .schedule_review_item(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "nadh",
+            "2026-06-19T09:00:00Z",
+        )
+        .await
+        .unwrap();
+    store
+        .record_recap(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "response-recap",
+            StudySessionRecap {
+                voice_session_id: "voice-session-1".to_owned(),
+                headline: "Completed session".to_owned(),
+                summary: "NADH needs one more recall pass.".to_owned(),
+                strong_concepts: vec!["oxidative-phosphorylation".to_owned()],
+                shaky_concepts: vec!["nadh".to_owned()],
+                missed_concepts: vec![],
+                review_later: vec!["nadh".to_owned()],
+                next_action: "Review NADH tomorrow.".to_owned(),
+                source_moments: vec![RecapSourceMoment {
+                    text: "NADH needs one more recall pass.".to_owned(),
+                    source: agent_domain::fixture_source_reference(),
+                    status: ConceptStatus::Shaky,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .close_voice_session("voice-session-1", "completed")
+        .await
+        .unwrap();
+    store
+        .record_voice_session(&SessionConfig {
+            session_id: Some(SessionId::new("open-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        })
+        .await
+        .unwrap();
+
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(store.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    );
+    let app = build_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/library?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "http://localhost:3000"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["user_id"], "user-1");
+
+    let study_sets = payload["study_sets"].as_array().unwrap();
+    let find_set = |id: &str| {
+        study_sets
+            .iter()
+            .find(|set| set["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from library snapshot"))
+    };
+    let ready = find_set("biology-midterm");
+    assert_eq!(ready["ingestion_status"], "ready");
+    assert_eq!(ready["server_owned"], true);
+    assert_eq!(ready["actions"]["start"]["available"], true);
+    assert!(ready["actions"]["start"]["session_token"]
+        .as_str()
+        .expect("start token")
+        .starts_with("viva1."));
+    assert!(
+        ready["actions"]["start"]["session_id"]
+            .as_str()
+            .expect("start session id")
+            .len()
+            > 20
+    );
+    assert_eq!(
+        find_set("pending-set")["actions"]["start"]["available"],
+        false
+    );
+    assert_eq!(
+        find_set("failed-set")["actions"]["start"]["unavailable_reason"],
+        "ingestion_failed"
+    );
+    assert_eq!(
+        find_set("deleted-document-set")["documents"][0]["deleted"],
+        true
+    );
+    assert_eq!(
+        find_set("deleted-document-set")["actions"]["delete"]["available"],
+        false
+    );
+    assert_eq!(
+        find_set("partial-deleted-source-set")["actions"]["start"]["available"],
+        false
+    );
+    assert_eq!(
+        find_set("partial-deleted-source-set")["actions"]["start"]["unavailable_reason"],
+        "no_active_questions"
+    );
+
+    let sessions = payload["sessions"].as_array().unwrap();
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session["voice_session_id"] != "open-session-1"),
+        "open sessions belong to the library Resume action, not completed history"
+    );
+    let completed = sessions
+        .iter()
+        .find(|session| session["voice_session_id"] == "voice-session-1")
+        .expect("completed session row");
+    assert_eq!(completed["status"], "closed");
+    assert_eq!(completed["terminal_reason"], "completed");
+    assert_eq!(
+        completed["recap"]["shaky_concepts"].as_array().unwrap(),
+        &vec![serde_json::Value::String("nadh".to_owned())]
+    );
+    assert_eq!(completed["next_review"]["concept_id"], "nadh");
+    assert_eq!(
+        completed["next_review"]["persisted_due_at"],
+        "2026-06-19T09:00:00Z"
+    );
+    assert_eq!(completed["next_review"]["source"], "persisted_review_item");
+}
+
+#[tokio::test]
+async fn library_route_rejects_cross_user_token_minting_without_rest_auth() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "private-user-2-set".to_owned(),
+        user_id: "user-2".to_owned(),
+        title: "Private User 2 Set".to_owned(),
+        course: None,
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    let brain_store = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(brain_store)),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    );
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/library?user_id=user-2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn library_route_rejects_public_unauthenticated_token_minting() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(store.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec!["https://viva.example".to_owned()],
+        },
+        4,
+        store,
+    )
+    .with_unauthenticated_paste_allowed(false);
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/library")
+                .header("origin", "https://viva.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn library_route_mints_session_tokens_with_public_bearer_auth() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(store.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: Some("rest-secret".to_owned()),
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec!["https://viva.example".to_owned()],
+        },
+        4,
+        store,
+    )
+    .with_unauthenticated_paste_allowed(false);
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/library")
+                .header("origin", "https://viva.example")
+                .header("authorization", "Bearer rest-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let ready = payload["study_sets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|set| set["id"] == "biology-midterm")
+        .expect("ready study set");
+    assert_eq!(ready["actions"]["start"]["available"], true);
+    assert!(ready["actions"]["start"]["session_token"]
+        .as_str()
+        .expect("server-issued session token")
+        .starts_with("viva1."));
 }
 
 #[tokio::test]
