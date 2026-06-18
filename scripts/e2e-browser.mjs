@@ -37,6 +37,7 @@ let boundedSourceVisible = false;
 let postAnswerSourceFolioVisible = false;
 let postAnswerBoundedSourceVisible = false;
 let postAnswerProtocolProof = {
+  conceptId: null,
   conceptStatus: null,
   conceptStatusEventSeen: false,
   responseId: null,
@@ -207,7 +208,10 @@ try {
   const recapPayloadVisible =
     (await isVisible(page.getByText("Recap ready").first())) &&
     (await isVisible(page.getByText(recapSummaryText, { exact: false }).first())) &&
-    (await isVisible(page.getByText("proton gradient", { exact: false }).first())) &&
+    Boolean(postAnswerProtocolProof.conceptId) &&
+    (await isVisible(
+      page.getByText(conceptLabelText(postAnswerProtocolProof.conceptId), { exact: true }).first(),
+    )) &&
     (await isVisible(page.getByText("Conductor next action", { exact: false }).first()));
   const shareVisible = await isVisible(page.getByRole("button", { name: "Share" }));
   const localScheduleVisible = await isVisible(
@@ -240,6 +244,7 @@ try {
     post_answer_bounded_source_visible: postAnswerBoundedSourceVisible,
     post_answer_source_reference_event_seen: postAnswerProtocolProof.sourceReferenceEventSeen,
     post_answer_concept_status_event_seen: postAnswerProtocolProof.conceptStatusEventSeen,
+    post_answer_concept_id: postAnswerProtocolProof.conceptId,
     post_answer_protocol_response_id: postAnswerProtocolProof.responseId,
     local_only_actions_hidden: !shareVisible && !localScheduleVisible,
     console_errors: consoleErrors,
@@ -430,6 +435,23 @@ function conceptStatusText(status) {
   }
 }
 
+function conceptLabelText(conceptId) {
+  const labels = {
+    "atp-yield": "ATP yield",
+    "atp-synthase": "ATP synthase",
+    "cellular-respiration": "Cellular respiration",
+    glycolysis: "Glycolysis",
+    "krebs-cycle": "Krebs cycle",
+    nadh: "NADH",
+    "oxidative-phosphorylation": "Oxidative phosphorylation",
+    photosynthesis: "Photosynthesis",
+  };
+  if (!conceptId || !labels[conceptId]) {
+    throw new Error(`No canonical recap label is known for concept_id: ${conceptId ?? "missing"}`);
+  }
+  return labels[conceptId];
+}
+
 function recordServerFramePayload(payload, events) {
   const text =
     typeof payload === "string"
@@ -446,6 +468,7 @@ function recordServerFramePayload(payload, events) {
   if (frame?.type !== "event" || typeof frame.event?.type !== "string") return;
 
   events.push({
+    conceptId: frame.event.concept_id ?? null,
     conceptStatus: frame.event.status ?? null,
     responseId: frame.event.response_id ?? null,
     sourceId: frame.event.source?.source_id ?? null,
@@ -485,6 +508,7 @@ function postAnswerProtocolProofFromEvents(events) {
         typeof event.conceptStatus === "string",
     );
     return {
+      conceptId: conceptEvent?.conceptId ?? null,
       conceptStatus: conceptEvent?.conceptStatus ?? null,
       conceptStatusEventSeen: Boolean(conceptEvent),
       responseId: answerEvent.responseId,
@@ -492,6 +516,7 @@ function postAnswerProtocolProofFromEvents(events) {
     };
   }
   return {
+    conceptId: null,
     conceptStatus: null,
     conceptStatusEventSeen: false,
     responseId: null,
