@@ -13,13 +13,16 @@ use agent_domain::{
     AudioFrame, BrainError, BrainEvent, BrainInput, BrainUsage, ConceptStatus, RealtimeBrain,
     RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard, RecapSourceMoment,
     SessionConfig, SessionId, StudyMemoryStore, StudyMode, StudySessionRecap,
-    StudySetIngestionStatus,
+    StudySetIngestionStatus, TerminalSessionReason,
 };
 use agent_service::{
-    build_router, AppState, ClientFrame, ServerFrame, VoiceEvidenceRecorder, VoiceWsAccess,
-    WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
+    build_router, AppState, ClientFrame, ServerFrame, VivaServerEvent, VoiceDrainSignal,
+    VoiceEvidenceRecorder, VoiceWsAccess, WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
 };
-use axum::{body::Body, http::Request};
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
@@ -1644,6 +1647,7 @@ async fn websocket_first_frame_timeout_records_terminal_reason() {
     let state = test_state(1).with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_millis(25),
         idle: Duration::from_secs(30),
+        session: Duration::from_secs(30),
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -2233,10 +2237,118 @@ async fn websocket_rejects_browser_tool_result_as_untrusted() {
 }
 
 #[tokio::test]
-async fn websocket_idle_timeout_sends_stop_and_terminal_reason() {
+async fn websocket_drain_emits_terminal_phase_before_close() {
     let state = test_state(1).with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
-        idle: Duration::from_millis(25),
+        idle: Duration::from_secs(5),
+        session: Duration::from_secs(5),
+    });
+    let drain = state.drain_signal.clone();
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_server_frame(&mut socket).await;
+    let _ = read_server_frame(&mut socket).await;
+
+    drain.begin_drain();
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::Drained,
+    );
+    assert_close_code(&mut socket, CloseCode::Normal).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason && event.detail == "drained"
+    }));
+}
+
+#[test]
+fn voice_drain_signal_latches_without_receivers() {
+    let drain = VoiceDrainSignal::default();
+
+    drain.begin_drain();
+    let mut receiver = drain.subscribe();
+
+    assert!(drain.is_draining());
+    assert!(*receiver.borrow_and_update());
+}
+
+#[tokio::test]
+async fn websocket_preflight_rejects_new_sessions_after_drain_begins() {
+    let state = test_state(1);
+    state.drain_signal.begin_drain();
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let error = connect_async(url)
+        .await
+        .expect_err("draining server should reject new websocket preflights");
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        other => panic!("expected HTTP 503 from draining preflight, got {other:?}"),
+    }
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::PreflightRejected).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::PreflightRejected && event.detail == "server draining"
+    }));
+}
+
+#[tokio::test]
+async fn websocket_drain_latches_before_socket_subscribes() {
+    let state = test_state(1).with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(5),
+        session: Duration::from_secs(5),
+    });
+    let drain = state.drain_signal.clone();
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    drain.begin_drain();
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::Drained,
+    );
+    assert_close_code(&mut socket, CloseCode::Normal).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason && event.detail == "drained"
+    }));
+}
+
+#[tokio::test]
+async fn websocket_session_cap_emits_terminal_phase_before_close() {
+    let state = test_state(1).with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(5),
+        session: Duration::from_millis(25),
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -2254,22 +2366,120 @@ async fn websocket_idle_timeout_sends_stop_and_terminal_reason() {
         .unwrap();
     let _ = read_server_frame(&mut socket).await;
     let _ = read_server_frame(&mut socket).await;
-    let error = read_server_frame(&mut socket).await;
 
-    assert!(matches!(
-        error,
-        ServerFrame::Error { message, .. } if message == "idle timeout"
-    ));
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::SessionCap,
+    );
     assert_close_code(&mut socket, CloseCode::Policy).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
     assert!(events.iter().any(|event| {
-        event.kind == VoiceEvidenceEventKind::TerminalReason && event.detail == "idle_timeout"
+        event.kind == VoiceEvidenceEventKind::TerminalReason && event.detail == "session_cap"
+    }));
+}
+
+#[tokio::test]
+async fn websocket_turn_cap_emits_terminal_phase_before_close() {
+    let state = test_state(1).with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(25),
+        session: Duration::from_secs(5),
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_server_frame(&mut socket).await;
+    let _ = read_server_frame(&mut socket).await;
+
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::TurnCap,
+    );
+    assert_close_code(&mut socket, CloseCode::Policy).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason && event.detail == "turn_cap"
     }));
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::StoreCounts
             && event.detail
                 == "sessions=1 answer_attempts=0 concept_statuses=0 review_items=0 recaps=0"
     }));
+}
+
+#[tokio::test]
+async fn websocket_turn_cap_is_not_postponed_by_provider_events() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(ChattyPhaseProbeBrain),
+        "chatty_phase_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(25),
+        session: Duration::from_secs(5),
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "chatty_phase_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut saw_provider_phase = false;
+    for _ in 0..50 {
+        let frame = read_server_frame(&mut socket).await;
+        if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+            assert!(
+                saw_provider_phase,
+                "test should prove provider events were flowing before the cap fired"
+            );
+            assert_close_code(&mut socket, CloseCode::Policy).await;
+            let events =
+                wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+            assert!(events.iter().any(|event| {
+                event.kind == VoiceEvidenceEventKind::TerminalReason && event.detail == "turn_cap"
+            }));
+            return;
+        }
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::SessionPhase {
+                        terminal_reason: None,
+                        ..
+                    }
+                )
+        ) {
+            saw_provider_phase = true;
+        }
+    }
+
+    panic!("provider events postponed the terminal turn_cap phase");
 }
 
 #[tokio::test]
@@ -2947,6 +3157,34 @@ async fn assert_close_code(socket: &mut TestWebSocket, expected: CloseCode) {
     }
 }
 
+fn assert_terminal_session_phase(frame: ServerFrame, expected_reason: TerminalSessionReason) {
+    let ServerFrame::Event { event, .. } = frame else {
+        panic!("expected terminal session phase event, got {frame:?}");
+    };
+    let VivaServerEvent::SessionPhase {
+        phase,
+        terminal_reason,
+    } = *event
+    else {
+        panic!("expected session_phase event, got {event:?}");
+    };
+    assert_eq!(phase, agent_domain::StudySessionPhase::Recap);
+    assert_eq!(terminal_reason, Some(expected_reason));
+}
+
+fn terminal_session_reason(frame: &ServerFrame) -> Option<TerminalSessionReason> {
+    let ServerFrame::Event { event, .. } = frame else {
+        return None;
+    };
+    let VivaServerEvent::SessionPhase {
+        terminal_reason, ..
+    } = event.as_ref()
+    else {
+        return None;
+    };
+    *terminal_reason
+}
+
 async fn wait_for_evidence_kind(
     evidence: &VoiceEvidenceRecorder,
     kind: VoiceEvidenceEventKind,
@@ -3245,6 +3483,52 @@ impl RealtimeBrain for EventProbeBrain {
             input,
             events,
             task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+struct ChattyPhaseProbeBrain;
+
+#[async_trait::async_trait]
+impl RealtimeBrain for ChattyPhaseProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "chatty_phase_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        _config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let event_task = tokio::spawn(async move {
+            loop {
+                if event_tx
+                    .send(BrainEvent::SessionPhase {
+                        phase: agent_domain::StudySessionPhase::Thinking,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let input_task = tokio::spawn(async move { while input_rx.recv().await.is_some() {} });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![
+                event_task.abort_handle(),
+                input_task.abort_handle(),
+            ])),
         })
     }
 }

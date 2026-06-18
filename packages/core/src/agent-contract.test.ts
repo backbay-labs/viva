@@ -67,6 +67,37 @@ describe("Viva voice agent contract", () => {
     expect(frame.event.question.source.confidence).toBe("high");
   });
 
+  test("parses terminal session phases with sanitized enum reasons", () => {
+    const frame = parseVivaServerFrame({
+      type: "event",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      event: {
+        type: "session_phase",
+        phase: "recap",
+        terminal_reason: "turn_cap",
+      },
+    });
+
+    if (frame.type !== "event") throw new Error("Expected event frame");
+    expect(frame.event).toEqual({
+      type: "session_phase",
+      phase: "recap",
+      terminal_reason: "turn_cap",
+    });
+
+    expect(() =>
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "session_phase",
+          phase: "recap",
+          terminal_reason: "raw transcript should never be accepted",
+        },
+      }),
+    ).toThrow("Invalid terminal session reason");
+  });
+
   test("parses shared structured error fixture from Rust service", () => {
     const frame = parseVivaServerFrame(structuredErrorFixture);
 

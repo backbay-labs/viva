@@ -1,6 +1,9 @@
 use std::{collections::HashSet, time::Duration};
 
-use agent_domain::{AudioFrame, BrainInput, SessionConfig, SessionTokenNonceClaim};
+use agent_domain::{
+    AudioFrame, BrainInput, SessionConfig, SessionTokenNonceClaim, StudySessionPhase,
+    TerminalSessionReason,
+};
 use axum::{
     extract::{
         ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade},
@@ -48,6 +51,17 @@ fn validate_ws_preflight(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<OwnedSemaphorePermit, (StatusCode, Json<serde_json::Value>)> {
+    if state.drain_signal.is_draining() {
+        state.evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::PreflightRejected,
+            None,
+            "server draining",
+        ));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "voice session draining" })),
+        ));
+    }
     if let Err(error) = state.ws_access.validate_headers(headers) {
         state.evidence.record(VoiceEvidenceEvent::new(
             VoiceEvidenceEventKind::PreflightRejected,
@@ -173,20 +187,58 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
     ));
     let mut terminal_reason = "event_stream_closed";
     let mut cancelled_response_ids = HashSet::new();
+    let session_cap = tokio::time::sleep(state.ws_timeouts.session);
+    tokio::pin!(session_cap);
+    let turn_cap = tokio::time::sleep(state.ws_timeouts.idle);
+    tokio::pin!(turn_cap);
+    let mut drain_signal = state.drain_signal.subscribe();
+    if *drain_signal.borrow_and_update() {
+        terminal_reason = close_with_terminal_session_phase(
+            &mut sender,
+            &session.input,
+            TerminalSessionReason::Drained,
+            close_code::NORMAL,
+        )
+        .await;
+        record_terminal(&state, voice_session_id, terminal_reason).await;
+        return;
+    }
 
     loop {
         tokio::select! {
-            incoming = timeout(state.ws_timeouts.idle, receiver.next()) => {
-                let incoming = match incoming {
-                    Ok(incoming) => incoming,
-                    Err(_) => {
-                        let _ = send_json(&mut sender, &ServerFrame::error("idle timeout")).await;
-                        let _ = session.input.send(BrainInput::Stop).await;
-                        terminal_reason = "idle_timeout";
-                        let _ = close_with(&mut sender, close_code::POLICY, "idle timeout").await;
-                        break;
-                    }
-                };
+            changed = drain_signal.changed() => {
+                if changed.is_ok() && *drain_signal.borrow_and_update() {
+                    terminal_reason = close_with_terminal_session_phase(
+                        &mut sender,
+                        &session.input,
+                        TerminalSessionReason::Drained,
+                        close_code::NORMAL,
+                    )
+                    .await;
+                    break;
+                }
+            }
+            _ = &mut session_cap => {
+                terminal_reason = close_with_terminal_session_phase(
+                    &mut sender,
+                    &session.input,
+                    TerminalSessionReason::SessionCap,
+                    close_code::POLICY,
+                )
+                .await;
+                break;
+            }
+            _ = &mut turn_cap => {
+                terminal_reason = close_with_terminal_session_phase(
+                    &mut sender,
+                    &session.input,
+                    TerminalSessionReason::TurnCap,
+                    close_code::POLICY,
+                )
+                .await;
+                break;
+            }
+            incoming = receiver.next() => {
                 let Some(Ok(message)) = incoming else {
                     let _ = session.input.send(BrainInput::Stop).await;
                     state.evidence.record(VoiceEvidenceEvent::new(
@@ -197,6 +249,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
                     terminal_reason = "client_disconnect";
                     break;
                 };
+                turn_cap
+                    .as_mut()
+                    .reset(Instant::now() + state.ws_timeouts.idle);
                 match handle_client_message(message, &session.input, &session_binding).await {
                     Ok(action) => {
                         record_client_action(&state, voice_session_id.clone(), action);
@@ -285,6 +340,43 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
         }
     }
     record_terminal(&state, voice_session_id, terminal_reason).await;
+}
+
+async fn close_with_terminal_session_phase<S>(
+    sender: &mut S,
+    input: &mpsc::Sender<BrainInput>,
+    terminal_reason: TerminalSessionReason,
+    close_code: u16,
+) -> &'static str
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    let _ = input.send(BrainInput::Stop).await;
+    if send_terminal_session_phase(sender, terminal_reason)
+        .await
+        .is_err()
+    {
+        return "send_failed";
+    }
+    let _ = close_with(sender, close_code, terminal_reason.close_reason()).await;
+    terminal_reason.as_str()
+}
+
+async fn send_terminal_session_phase<S>(
+    sender: &mut S,
+    terminal_reason: TerminalSessionReason,
+) -> Result<(), axum::Error>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    send_json(
+        sender,
+        &ServerFrame::event(agent_domain::BrainEvent::TerminalSessionPhase {
+            phase: StudySessionPhase::Recap,
+            terminal_reason,
+        }),
+    )
+    .await
 }
 
 async fn drain_terminal_events<S>(

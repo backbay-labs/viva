@@ -8,6 +8,7 @@ import type {
   AgentStudySessionRecap,
   AgentStudySetReadiness,
   AgentStudySourceReference,
+  AgentTerminalSessionReason,
   AnswerEvaluation,
   ConceptStatus,
   CorrectionKind,
@@ -31,6 +32,7 @@ import {
 
 export type VivaAgentDerivedState = {
   phase: VivaAgentSessionState["phase"];
+  terminalReason?: AgentTerminalSessionReason;
   question?: SessionQuestion;
   transcript: string;
   finalTranscript?: string;
@@ -148,6 +150,7 @@ export function deriveVivaAgentUiState(state: VivaAgentSessionState): VivaAgentD
     question,
     recap: state.recap ? agentRecapToSessionRecap(state.recap) : undefined,
     sources: state.sources.map(agentSourceToUiSource),
+    terminalReason: state.terminalReason,
     transcript: state.finalTranscript ?? state.transcript,
   };
 }

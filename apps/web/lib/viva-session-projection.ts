@@ -1,5 +1,6 @@
 import {
   type AgentStudySetReadiness,
+  type AgentTerminalSessionReason,
   type Concept,
   type ConceptStatus,
   type EvaluationLabel,
@@ -63,15 +64,18 @@ export type RuntimeCopyCause =
   | "api_missing"
   | "agent_offline"
   | "auth_failed"
+  | "drained"
   | "fake_provider"
   | "ingestion_failed"
   | "ingestion_pending"
   | "live_provider_gated"
   | "live_runtime"
   | "mic_denied"
+  | "session_cap"
   | "session_disconnected"
   | "store_unavailable"
   | "synthetic"
+  | "turn_cap"
   | "unexpected_close";
 
 export type RuntimeCopy = {
@@ -87,7 +91,11 @@ export type RuntimeCopy = {
   cause: RuntimeCopyCause;
 };
 
-export type RuntimePrimaryActionIntent = "disabled" | "retry_agent" | "submit_turn";
+export type RuntimePrimaryActionIntent =
+  | "disabled"
+  | "retry_agent"
+  | "start_session"
+  | "submit_turn";
 
 export type RuntimeReadinessNote = {
   label: string;
@@ -105,6 +113,7 @@ type RuntimeProjectionContext = {
   status: VivaAgentConnectionStatus;
   mic: RuntimeMicState;
   close?: VivaAgentCloseDiagnostics;
+  terminalReason?: AgentTerminalSessionReason;
 };
 
 function clamp01(value: number): number {
@@ -163,6 +172,7 @@ export function projectRuntimeCopy({
   mic = "unknown",
   close,
   readinessProbe,
+  terminalReason,
 }: {
   readiness: AgentStudySetReadiness;
   ready?: VivaReadyFrame;
@@ -171,6 +181,7 @@ export function projectRuntimeCopy({
   errors?: string[];
   mic?: RuntimeMicState;
   close?: VivaAgentCloseDiagnostics;
+  terminalReason?: AgentTerminalSessionReason;
 }): RuntimeCopy {
   const newestError = errors.at(-1) ?? "";
   const closeReason = close?.reason ?? "";
@@ -185,6 +196,7 @@ export function projectRuntimeCopy({
     readinessProbe,
     ready: readinessFacts,
     status,
+    terminalReason,
     websocketReady: Boolean(ready) && status === "open",
   };
 
@@ -284,6 +296,10 @@ export function projectRuntimeCopy({
       context,
       retryAgentAction(),
     );
+  }
+
+  if (status === "closed" && terminalReason) {
+    return controlledTerminalCopy(terminalReason, context);
   }
 
   if (status === "closed" && close && !context.websocketReady && isUnexpectedClose(close)) {
@@ -448,6 +464,50 @@ export function projectRuntimeCopy({
     context,
     trustedTurnAction(context),
   );
+}
+
+function controlledTerminalCopy(
+  reason: AgentTerminalSessionReason,
+  context: RuntimeProjectionContext,
+): RuntimeCopy {
+  const copyByReason: Record<
+    AgentTerminalSessionReason,
+    Pick<
+      RuntimeCopy,
+      "capsuleLabel" | "marginaliaTitle" | "marginaliaText" | "statusLabel" | "cause"
+    >
+  > = {
+    drained: {
+      capsuleLabel: "Session drained",
+      marginaliaTitle: "The deploy drain closed this manuscript.",
+      marginaliaText:
+        "The Conductor entered deploy drain and closed the manuscript after emitting a terminal phase.",
+      statusLabel: "drained",
+      cause: "drained",
+    },
+    session_cap: {
+      capsuleLabel: "Session cap reached",
+      marginaliaTitle: "The session cap closed this manuscript.",
+      marginaliaText:
+        "The Conductor reached the session cap and closed the manuscript after emitting a terminal phase.",
+      statusLabel: "session cap",
+      cause: "session_cap",
+    },
+    turn_cap: {
+      capsuleLabel: "Turn cap reached",
+      marginaliaTitle: "The turn cap closed this manuscript.",
+      marginaliaText:
+        "The Conductor reached the turn cap and closed the manuscript after emitting a terminal phase.",
+      statusLabel: "turn cap",
+      cause: "turn_cap",
+    },
+  };
+  return runtimeCopy(copyByReason[reason], context, {
+    disabled: false,
+    intent: "start_session",
+    nextActionLabel: "Start a new session",
+    primaryActionLabel: "Start again",
+  });
 }
 
 function runtimeCopy(

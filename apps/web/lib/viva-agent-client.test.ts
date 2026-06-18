@@ -284,6 +284,25 @@ describe("Viva agent browser client", () => {
     expect(afterStalePhase.recap?.voice_session_id).toBe("voice-session-1");
   });
 
+  test("reducer records controlled terminal phase reasons without inventing a recap", () => {
+    const state = vivaAgentReducer(
+      initialVivaAgentSessionState(),
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "session_phase",
+          phase: "recap",
+          terminal_reason: "drained",
+        },
+      }),
+    );
+
+    expect(state.phase).toBe("ready");
+    expect(state.recap).toBeUndefined();
+    expect(state.terminalReason).toBe("drained");
+  });
+
   test("controller records sanitized close diagnostics when the server closes the socket", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({

@@ -14,6 +14,32 @@ pub enum StudySessionPhase {
     Recap,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalSessionReason {
+    Drained,
+    SessionCap,
+    TurnCap,
+}
+
+impl TerminalSessionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Drained => "drained",
+            Self::SessionCap => "session_cap",
+            Self::TurnCap => "turn_cap",
+        }
+    }
+
+    pub fn close_reason(self) -> &'static str {
+        match self {
+            Self::Drained => "drained",
+            Self::SessionCap => "session cap",
+            Self::TurnCap => "turn cap",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StudySourceReference {
     pub source_id: String,

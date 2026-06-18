@@ -33,7 +33,7 @@ pub use ports::{
 };
 pub use study::{
     fixture_question, fixture_source_reference, AnswerEvaluation, RecapSourceMoment, StudyQuestion,
-    StudySessionPhase, StudySessionRecap, StudySourceReference,
+    StudySessionPhase, StudySessionRecap, StudySourceReference, TerminalSessionReason,
 };
 pub use tool_executor::{AuthorizedStudySession, ToolExecutionError, VivaToolExecutor};
 pub use tools::{ToolPlan, ToolProposal, ToolResult};

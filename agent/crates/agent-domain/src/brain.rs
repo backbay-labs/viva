@@ -7,7 +7,7 @@ use crate::{
     ids::SessionId,
     tools::{ToolPlan, ToolProposal, ToolResult},
     AnswerEvaluation, AudioFrame, StudyQuestion, StudySessionPhase, StudySessionRecap,
-    StudySourceReference,
+    StudySourceReference, TerminalSessionReason,
 };
 
 pub type BrainEventStream = BoxStream<'static, BrainEvent>;
@@ -165,6 +165,10 @@ pub enum BrainEvent {
     SessionPhase {
         phase: StudySessionPhase,
     },
+    TerminalSessionPhase {
+        phase: StudySessionPhase,
+        terminal_reason: TerminalSessionReason,
+    },
     QuestionStarted {
         response_id: String,
         question: StudyQuestion,
@@ -257,6 +261,7 @@ impl BrainEvent {
             | Self::TranscriptFinal { response_id, .. } => Some(response_id),
             Self::Transcript(_)
             | Self::SessionPhase { .. }
+            | Self::TerminalSessionPhase { .. }
             | Self::Usage(_)
             | Self::Error(_)
             | Self::SpeechIntent(_)

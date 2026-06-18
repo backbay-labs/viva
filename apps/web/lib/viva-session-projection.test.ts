@@ -440,6 +440,34 @@ describe("projectRuntimeCopy", () => {
     expect(copy.readinessNotes.some((note) => note.text.includes("client stop"))).toBe(true);
   });
 
+  test("maps controlled terminal phase reasons to honest closed manuscript copy", () => {
+    const sessionCap = projectRuntimeCopy({
+      close: { code: 1008, reason: "session cap", wasClean: true },
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "closed",
+      terminalReason: "session_cap",
+    });
+    const drained = projectRuntimeCopy({
+      close: { code: 1000, reason: "drained", wasClean: true },
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "closed",
+      terminalReason: "drained",
+    });
+
+    expect(sessionCap.cause).toBe("session_cap");
+    expect(sessionCap.capsuleLabel).toBe("Session cap reached");
+    expect(sessionCap.marginaliaTitle).toBe("The session cap closed this manuscript.");
+    expect(sessionCap.marginaliaText).toContain("session cap");
+    expect(sessionCap.marginaliaText).not.toContain("interrupted");
+    expect(sessionCap.primaryActionIntent).toBe("start_session");
+    expect(sessionCap.nextActionLabel).toBe("Start a new session");
+    expect(drained.cause).toBe("drained");
+    expect(drained.capsuleLabel).toBe("Session drained");
+    expect(drained.marginaliaText).toContain("deploy");
+  });
+
   test("classifies close-only auth failures before generic interruption recovery", () => {
     const copy = projectRuntimeCopy({
       close: {
