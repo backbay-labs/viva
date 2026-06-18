@@ -102,7 +102,7 @@
         "type": "transcript_final",
         "response_id": "response-1",
         "text": "NADH gives electrons to the electron transport chain.",
-        "confidence": 1.0
+        "confidence": 0.78
       }
     },
     {
@@ -117,13 +117,26 @@
       "type": "event",
       "version": 1,
       "event": {
+        "type": "manuscript_intent",
+        "response_id": "response-1",
+        "intent": {
+          "type": "scene_intent",
+          "register": "examining",
+          "emphasis": "measured"
+        }
+      }
+    },
+    {
+      "type": "event",
+      "version": 1,
+      "event": {
         "type": "answer_evaluated",
         "response_id": "response-1",
         "evaluation": {
           "question_id": "q-oxidative-phosphorylation-nadh",
           "answer_text": "NADH gives electrons to the electron transport chain.",
-          "label": "mostly correct",
-          "concise_feedback": "Good quiz mechanism. Add one sentence that explicitly connects the proton gradient to ATP synthase.",
+          "label": "partially correct",
+          "concise_feedback": "You named ATP, but skipped the proton-gradient mechanism that drives ATP synthase.",
           "retry_prompt": "Now connect that electron flow to ATP synthase in one precise sentence.",
           "source": {
             "source_id": "src-lecture-5-slide-18",
@@ -133,8 +146,8 @@
             "confidence": "high",
             "retrieval_reason": "server fixture source for oxidative phosphorylation"
           },
-          "concept_status": "strong",
-          "confidence_score": 0.84
+          "concept_status": "shaky",
+          "confidence_score": 0.55
         }
       }
     },
@@ -158,10 +171,40 @@
       "type": "event",
       "version": 1,
       "event": {
+        "type": "manuscript_intent",
+        "response_id": "response-1",
+        "intent": {
+          "type": "marginalia_intent",
+          "marginalia_id": "source-folio",
+          "anchor_entity_id": "src-lecture-5-slide-18",
+          "register": "sourcing",
+          "emphasis": "measured"
+        }
+      }
+    },
+    {
+      "type": "event",
+      "version": 1,
+      "event": {
         "type": "concept_status",
         "response_id": "response-1",
-        "concept_id": "oxidative-phosphorylation",
-        "status": "strong"
+        "concept_id": "nadh",
+        "status": "shaky"
+      }
+    },
+    {
+      "type": "event",
+      "version": 1,
+      "event": {
+        "type": "manuscript_intent",
+        "response_id": "response-1",
+        "intent": {
+          "type": "entity_intent",
+          "entity_id": "nadh",
+          "entity_kind": "concept",
+          "register": "correcting",
+          "emphasis": "marked"
+        }
       }
     },
     {
@@ -184,8 +227,16 @@
       "type": "event",
       "version": 1,
       "event": {
+        "type": "cancellation",
+        "response_id": "response-2"
+      }
+    },
+    {
+      "type": "event",
+      "version": 1,
+      "event": {
         "type": "recap_ready",
-        "response_id": "response-1",
+        "response_id": "response-0",
         "recap": {
           "voice_session_id": "voice-session-1",
           "headline": "Oxidative phosphorylation is getting stronger.",
@@ -218,14 +269,6 @@
       "event": {
         "type": "session_phase",
         "phase": "recap"
-      }
-    },
-    {
-      "type": "event",
-      "version": 1,
-      "event": {
-        "type": "cancellation",
-        "response_id": "response-2"
       }
     }
   ]

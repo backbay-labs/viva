@@ -9,7 +9,8 @@ use tokio::{sync::mpsc, task::AbortHandle, time::sleep};
 
 use agent_domain::{
     fixture_question, AnswerEvaluation, BrainError, BrainEvent, BrainInput, BrainProviderError,
-    BrainUsage, ConceptStatus, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession,
+    BrainUsage, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent,
+    ManuscriptRegister, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession,
     RealtimeSessionTaskGuard, RecapSourceMoment, SessionConfig, StudyMemoryStore, StudyQuestion,
     StudySessionPhase, StudySessionRecap,
 };
@@ -393,6 +394,21 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
     {
         return;
     }
+    if !send_unless_cancelled(
+        event_tx,
+        BrainEvent::ManuscriptIntent {
+            response_id: job.response_id.clone(),
+            intent: ManuscriptIntent::Scene {
+                register: ManuscriptRegister::Examining,
+                emphasis: ManuscriptEmphasis::Measured,
+            },
+        },
+        &job.cancelled,
+    )
+    .await
+    {
+        return;
+    }
     // The examiner takes a beat to cross-reference the sources.
     sleep(Duration::from_millis(850)).await;
     let source = job.question.source.clone();
@@ -447,6 +463,23 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
     {
         return;
     }
+    if !send_unless_cancelled(
+        event_tx,
+        BrainEvent::ManuscriptIntent {
+            response_id: job.response_id.clone(),
+            intent: ManuscriptIntent::Marginalia {
+                marginalia_id: "source-folio".to_owned(),
+                anchor_entity_id: source.source_id.clone(),
+                register: ManuscriptRegister::Sourcing,
+                emphasis: ManuscriptEmphasis::Measured,
+            },
+        },
+        &job.cancelled,
+    )
+    .await
+    {
+        return;
+    }
     if job.cancelled.load(Ordering::SeqCst) {
         return;
     }
@@ -469,6 +502,23 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
             response_id: job.response_id.clone(),
             concept_id: answer_spec.concept_id.to_owned(),
             status: answer_spec.status.clone(),
+        },
+        &job.cancelled,
+    )
+    .await
+    {
+        return;
+    }
+    if !send_unless_cancelled(
+        event_tx,
+        BrainEvent::ManuscriptIntent {
+            response_id: job.response_id.clone(),
+            intent: ManuscriptIntent::Entity {
+                entity_id: answer_spec.concept_id.to_owned(),
+                entity_kind: ManuscriptEntityKind::Concept,
+                register: ManuscriptRegister::Correcting,
+                emphasis: ManuscriptEmphasis::Marked,
+            },
         },
         &job.cancelled,
     )

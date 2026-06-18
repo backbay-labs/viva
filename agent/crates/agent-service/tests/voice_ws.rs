@@ -374,12 +374,15 @@ async fn real_websocket_replays_synthetic_fixture_and_evidence_pack() {
         actual.push(read_server_frame(&mut socket).await);
     }
     send_client_frame(&mut socket, &fixture.client[1]).await;
-    for _ in 0..11 {
+    for _ in 0..12 {
         actual.push(read_server_frame(&mut socket).await);
     }
     send_client_frame(&mut socket, &fixture.client[2]).await;
     actual.push(read_server_frame(&mut socket).await);
     send_client_frame(&mut socket, &fixture.client[3]).await;
+    for _ in 0..2 {
+        actual.push(read_server_frame(&mut socket).await);
+    }
     wait_for_socket_close(&mut socket).await;
 
     assert_eq!(actual, fixture.server);
@@ -452,12 +455,15 @@ async fn optional_postgres_replays_synthetic_fixture_when_database_url_is_set() 
         actual.push(read_server_frame(&mut socket).await);
     }
     send_client_frame(&mut socket, &fixture.client[1]).await;
-    for _ in 0..11 {
+    for _ in 0..12 {
         actual.push(read_server_frame(&mut socket).await);
     }
     send_client_frame(&mut socket, &fixture.client[2]).await;
     actual.push(read_server_frame(&mut socket).await);
     send_client_frame(&mut socket, &fixture.client[3]).await;
+    for _ in 0..2 {
+        actual.push(read_server_frame(&mut socket).await);
+    }
     wait_for_socket_close(&mut socket).await;
 
     assert_eq!(actual, fixture.server);

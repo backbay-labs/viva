@@ -73,6 +73,56 @@ pub struct SessionConfig {
     pub active_concepts: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManuscriptRegister {
+    Examining,
+    Reflecting,
+    Correcting,
+    Sourcing,
+    Recapping,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManuscriptEmphasis {
+    Quiet,
+    Measured,
+    Marked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManuscriptEntityKind {
+    Concept,
+    Source,
+    MarginalNote,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ManuscriptIntent {
+    #[serde(rename = "scene_intent")]
+    Scene {
+        register: ManuscriptRegister,
+        emphasis: ManuscriptEmphasis,
+    },
+    #[serde(rename = "entity_intent")]
+    Entity {
+        entity_id: String,
+        entity_kind: ManuscriptEntityKind,
+        register: ManuscriptRegister,
+        emphasis: ManuscriptEmphasis,
+    },
+    #[serde(rename = "marginalia_intent")]
+    Marginalia {
+        marginalia_id: String,
+        anchor_entity_id: String,
+        register: ManuscriptRegister,
+        emphasis: ManuscriptEmphasis,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum BrainInput {
@@ -136,6 +186,10 @@ pub enum BrainEvent {
         concept_id: String,
         status: ConceptStatus,
     },
+    ManuscriptIntent {
+        response_id: String,
+        intent: ManuscriptIntent,
+    },
     RecapReady {
         response_id: String,
         recap: StudySessionRecap,
@@ -190,6 +244,7 @@ impl BrainEvent {
             | Self::AnswerEvaluated { response_id, .. }
             | Self::SourceReference { response_id, .. }
             | Self::ConceptStatus { response_id, .. }
+            | Self::ManuscriptIntent { response_id, .. }
             | Self::RecapReady { response_id, .. }
             | Self::AudioDelta { response_id, .. }
             | Self::ResponseStarted { response_id }
