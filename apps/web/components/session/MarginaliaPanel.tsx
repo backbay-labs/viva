@@ -1,4 +1,5 @@
 import { Icon, Spark } from "@viva/ui-web";
+import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import { CorrectionMarginalia } from "./CorrectionMarginalia";
 import { SessionActionButton } from "./SessionActionButton";
 import { SourceFolio } from "./SourceFolio";
@@ -11,6 +12,7 @@ import type { Question, SessionState } from "./session-data";
  */
 export function MarginaliaPanel({
   state,
+  scene,
   question,
   hintShown,
   onHint,
@@ -21,6 +23,7 @@ export function MarginaliaPanel({
   onNextQuestion,
 }: {
   state: SessionState;
+  scene?: VivaSceneState;
   question: Question;
   hintShown: boolean;
   onHint: () => void;
@@ -33,7 +36,13 @@ export function MarginaliaPanel({
   const isSource = state === "source";
 
   return (
-    <aside className="marginalia" data-state={state}>
+    <aside
+      className="marginalia"
+      data-scene-emphasis={scene?.emphasis ?? "quiet"}
+      data-scene-marginalia-count={scene?.marginalia.length ?? 0}
+      data-scene-register={scene?.register ?? "examining"}
+      data-state={state}
+    >
       <div className="marginalia__head">
         <span className="marginalia__label">{isSource ? "Source" : "Marginalia"}</span>
         <Icon

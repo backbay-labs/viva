@@ -1,5 +1,6 @@
 import { MuseBackdrop } from "../landing/MuseBackdrop";
 import { MuseGlyphCanvas, type MuseGlyphState } from "../landing/MuseGlyphCanvas";
+import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import { MarginaliaPanel } from "./MarginaliaPanel";
 import { QuestionStage } from "./QuestionStage";
 import { SessionBottomControls } from "./SessionBottomControls";
@@ -15,6 +16,7 @@ import { VoiceTraceCanvas, type VoiceTraceLevelRef } from "./VoiceTraceCanvas";
  */
 export function LiveSessionShell({
   state,
+  scene,
   glyphState,
   highlightedTokens,
   conceptNodes,
@@ -30,6 +32,7 @@ export function LiveSessionShell({
   onNextQuestion,
 }: {
   state: SessionState;
+  scene?: VivaSceneState;
   glyphState: MuseGlyphState;
   highlightedTokens: string[];
   conceptNodes: ConceptNode[];
@@ -60,6 +63,7 @@ export function LiveSessionShell({
               conceptNodes={conceptNodes}
               highlightedTokens={highlightedTokens}
               levelRef={levelRef}
+              scene={scene}
               state={state}
             />
             <SessionBottomControls />
@@ -74,6 +78,7 @@ export function LiveSessionShell({
             onSubmitAnswer={onSubmitAnswer}
             onTryAgain={onTryAgain}
             question={question}
+            scene={scene}
             state={state}
           />
         </div>

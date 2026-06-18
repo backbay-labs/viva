@@ -152,7 +152,7 @@ export class VivaAudioPlaybackSink {
   #scheduled = new Map<number, ScheduledPlaybackFrame>();
   #nextStartTime = 0;
   #analyser: AnalyserNode | null = null;
-  #analyserBuffer: Float32Array | null = null;
+  #analyserBuffer: Float32Array<ArrayBuffer> | null = null;
 
   /**
    * Examiner-voice amplitude (0..1) for the listening bloom's "breathe back in

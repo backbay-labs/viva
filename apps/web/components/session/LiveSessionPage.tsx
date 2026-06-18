@@ -13,6 +13,7 @@ import {
   createVivaAudioPlaybackSink,
   type VivaAudioPlaybackSink,
 } from "../../lib/viva-audio-playback";
+import { vivaSceneReducer } from "../../lib/viva-scene-reducer";
 import {
   projectConceptNodes,
   projectHighlightedTokens,
@@ -194,6 +195,28 @@ export function LiveSessionPage() {
     () => projectConceptNodes(STUDY_SET.concepts, agent.agentState.conceptStatuses),
     [agent.agentState.conceptStatuses],
   );
+  const scene = useMemo(() => {
+    const knownEntityIds = new Set<string>([
+      ...STUDY_SET.concepts.map((concept) => concept.id),
+      "hint-1",
+      "source-folio",
+      "correction-note",
+      "recap-fold",
+    ]);
+    for (const source of agent.derived.sources) {
+      if (source.sourceId) knownEntityIds.add(source.sourceId);
+      if (source.documentId) knownEntityIds.add(source.documentId);
+    }
+    if (agent.derived.question?.source.sourceId) {
+      knownEntityIds.add(agent.derived.question.source.sourceId);
+    }
+    if (agent.derived.question?.source.documentId) {
+      knownEntityIds.add(agent.derived.question.source.documentId);
+    }
+    return vivaSceneReducer(agent.derived.manuscriptIntents, {
+      knownEntityIds: [...knownEntityIds],
+    });
+  }, [agent.derived.manuscriptIntents, agent.derived.question, agent.derived.sources]);
   const effectiveState: SessionState = sourceOpen ? "source" : projection.state;
   const highlightedTokens = sourceOpen
     ? projectHighlightedTokens("source", agent.derived)
@@ -214,6 +237,7 @@ export function LiveSessionPage() {
       onSubmitAnswer={submitTurn}
       onTryAgain={submitTurn}
       question={projection.question}
+      scene={scene}
       state={effectiveState}
     />
   );

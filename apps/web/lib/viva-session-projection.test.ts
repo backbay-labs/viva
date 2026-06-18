@@ -52,6 +52,7 @@ function derived(overrides: Partial<VivaAgentDerivedState> = {}): VivaAgentDeriv
     phase: "listening",
     transcript: "",
     sources: [],
+    manuscriptIntents: [],
     errors: [],
     canSubmitAnswer: true,
     ...overrides,
