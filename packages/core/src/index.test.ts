@@ -93,12 +93,16 @@ describe("Viva study set generation", () => {
       canConnect: false,
       reason: "processing_ingestion",
     });
-    expect(
-      agentStudySetReadiness(studySetFromPasteIngestionResponse(serverPasteResponse("failed"))),
-    ).toMatchObject({
+    const failedStudySet = studySetFromPasteIngestionResponse(serverPasteResponse("failed"));
+    expect(agentStudySetReadiness(failedStudySet)).toMatchObject({
       canConnect: false,
       reason: "failed_ingestion",
     });
+    expect(failedStudySet.sessionToken).toBe(null);
+    expect(failedStudySet.concepts).toEqual([]);
+    expect(
+      failedStudySet.generatedCards.some((card) => card.id === "server-ingestion-failed"),
+    ).toBe(true);
   });
 });
 
@@ -124,6 +128,7 @@ describe("Viva answer evaluation", () => {
 function serverPasteResponse(
   status: "pending" | "processing" | "ready" | "failed",
 ): PasteIngestionResponse {
+  const failed = status === "failed";
   return {
     study_set: {
       id: "server-study-set-1",
@@ -140,41 +145,47 @@ function serverPasteResponse(
         processing_status: status,
       },
     ],
-    source_spans: [
-      {
-        id: "span-1",
-        document_id: "doc-1",
-        locator: { span: "chars:0-42" },
-        excerpt: "NADH donates electrons to the transport chain.",
-        confidence: "high",
-        retrieval_reason: "paste ingestion",
-      },
-    ],
-    concepts: [
-      {
-        public_id: "oxidative-phosphorylation",
-        label: "Oxidative phosphorylation",
-        status: "shaky",
-        source_span_id: "span-1",
-      },
-    ],
-    questions: [
-      {
-        question_id: "question-1",
-        prompt: "Explain NADH.",
-        expected_terms: ["electron donor"],
-        follow_up: "Connect it to ATP synthase.",
-        source: {
-          source_id: "span-1",
-          document_id: "doc-1",
-          span: "chars:0-42",
-          excerpt: "NADH donates electrons to the transport chain.",
-          confidence: "high",
-          retrieval_reason: "paste ingestion",
-        },
-      },
-    ],
-    session_token: "signed-session-token",
+    source_spans: failed
+      ? []
+      : [
+          {
+            id: "span-1",
+            document_id: "doc-1",
+            locator: { span: "chars:0-42" },
+            excerpt: "NADH donates electrons to the transport chain.",
+            confidence: "high",
+            retrieval_reason: "paste ingestion",
+          },
+        ],
+    concepts: failed
+      ? []
+      : [
+          {
+            public_id: "oxidative-phosphorylation",
+            label: "Oxidative phosphorylation",
+            status: "shaky",
+            source_span_id: "span-1",
+          },
+        ],
+    questions: failed
+      ? []
+      : [
+          {
+            question_id: "question-1",
+            prompt: "Explain NADH.",
+            expected_terms: ["electron donor"],
+            follow_up: "Connect it to ATP synthase.",
+            source: {
+              source_id: "span-1",
+              document_id: "doc-1",
+              span: "chars:0-42",
+              excerpt: "NADH donates electrons to the transport chain.",
+              confidence: "high",
+              retrieval_reason: "paste ingestion",
+            },
+          },
+        ],
+    session_token: failed ? null : "signed-session-token",
     session_id: "server-session-1",
   };
 }

@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+const MAX_PASTE_SOURCE_EXCERPT_CHARS: usize = 360;
+const MAX_PASTE_SOURCE_SPANS: usize = 4;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StudySetRecord {
     pub study_set_id: String,
@@ -605,9 +608,9 @@ pub(crate) fn generate_paste_study_set(
     let user_id = required_text(&input.user_id, "user_id")?.to_owned();
     let title = required_text(&input.title, "title")?.to_owned();
     let pasted_text = required_text(&input.pasted_text, "pasted_text")?.to_owned();
+    let course = input.course.and_then(non_empty_owned);
     let study_set_id = Uuid::new_v4().to_string();
     let document_id = Uuid::new_v4().to_string();
-    let source_id = Uuid::new_v4().to_string();
     let session_id = input
         .session_id
         .as_deref()
@@ -616,8 +619,46 @@ pub(crate) fn generate_paste_study_set(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let normalized = normalize_whitespace(&pasted_text);
-    let concepts = extract_concepts(&normalized, &title);
-    let excerpt = sanitized_source_excerpt();
+    let source_candidates = derive_paste_source_spans(&normalized);
+    if source_candidates.is_empty() {
+        return Ok(failed_paste_study_set(
+            study_set_id,
+            user_id,
+            title,
+            course,
+            document_id,
+            session_id,
+        ));
+    }
+    let source_text = source_candidates
+        .iter()
+        .map(|candidate| candidate.excerpt.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let concepts = extract_concepts(&source_text);
+    if concepts.is_empty() {
+        return Ok(failed_paste_study_set(
+            study_set_id,
+            user_id,
+            title,
+            course,
+            document_id,
+            session_id,
+        ));
+    }
+
+    let source_quality = classify_paste_source_quality(&normalized);
+    let sources = source_candidates
+        .into_iter()
+        .map(|candidate| StudySourceReference {
+            source_id: Uuid::new_v4().to_string(),
+            document_id: document_id.clone(),
+            span: format!("chars:{}-{}", candidate.start_char, candidate.end_char),
+            excerpt: candidate.excerpt,
+            confidence: source_quality.confidence.clone(),
+            retrieval_reason: source_quality.retrieval_reason.clone(),
+        })
+        .collect::<Vec<_>>();
     let expected_terms = concepts
         .iter()
         .map(|concept| concept.label.clone())
@@ -632,21 +673,18 @@ pub(crate) fn generate_paste_study_set(
         .map(|concept| concept.label.as_str())
         .unwrap_or("the source")
         .to_owned();
-    let source = StudySourceReference {
-        source_id: source_id.clone(),
-        document_id: document_id.clone(),
-        span: format!("generated:concepts:0-{}", concepts.len()),
-        excerpt,
-        confidence: SourceConfidence::High,
-        retrieval_reason: "server-owned paste ingestion bounded source span".to_owned(),
-    };
+    let source = concepts
+        .first()
+        .map(|concept| source_for_concept(concept, &sources))
+        .unwrap_or(&sources[0])
+        .clone();
     let concepts = concepts
         .into_iter()
         .map(|concept| StudyConceptSummary {
+            source_span_id: source_id_for_concept(&concept, &sources),
             public_id: concept.public_id,
             label: concept.label,
             status: ConceptStatus::Review,
-            source_span_id: source_id.clone(),
         })
         .collect::<Vec<_>>();
     let question = StudyQuestion {
@@ -662,7 +700,7 @@ pub(crate) fn generate_paste_study_set(
             id: study_set_id,
             user_id,
             title,
-            course: input.course.and_then(non_empty_owned),
+            course,
             ingestion_status: StudySetIngestionStatus::Ready,
             ingestion_error: None,
         },
@@ -672,7 +710,7 @@ pub(crate) fn generate_paste_study_set(
             source_kind: "pasted_text".to_owned(),
             processing_status: StudySetIngestionStatus::Ready,
         }],
-        source_spans: vec![source_reference_to_summary(&source)],
+        source_spans: sources.iter().map(source_reference_to_summary).collect(),
         concepts,
         questions: vec![question],
         session_id,
@@ -684,6 +722,19 @@ pub(crate) fn generate_paste_study_set(
 struct ExtractedConcept {
     public_id: String,
     label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PasteSourceSpanCandidate {
+    start_char: usize,
+    end_char: usize,
+    excerpt: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PasteSourceQuality {
+    confidence: SourceConfidence,
+    retrieval_reason: String,
 }
 
 fn required_text<'a>(value: &'a str, label: &str) -> Result<&'a str, PortError> {
@@ -708,40 +759,438 @@ fn non_empty_owned(value: String) -> Option<String> {
 }
 
 fn normalize_whitespace(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
+    strip_markup_tags(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-fn sanitized_source_excerpt() -> String {
-    "Server-generated paste summary. Raw notes were transformed into bounded concept references; no raw pasted excerpt is stored.".to_owned()
+fn strip_markup_tags(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut stripped = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '<' {
+            if let Some(close_index) = chars[index + 1..]
+                .iter()
+                .take(128)
+                .position(|ch| *ch == '>')
+                .map(|offset| index + 1 + offset)
+            {
+                let content = chars[index + 1..close_index].iter().collect::<String>();
+                if is_plausible_markup_tag(&content) {
+                    stripped.push(' ');
+                    index = close_index + 1;
+                    continue;
+                }
+            }
+        }
+        stripped.push(chars[index]);
+        index += 1;
+    }
+    stripped
 }
 
-fn extract_concepts(text: &str, title: &str) -> Vec<ExtractedConcept> {
+fn is_plausible_markup_tag(content: &str) -> bool {
+    if content.is_empty() || content.chars().next().is_some_and(char::is_whitespace) {
+        return false;
+    }
+    let trimmed = content.trim_end();
+    let name = trimmed
+        .strip_prefix('/')
+        .or_else(|| trimmed.strip_prefix('!'))
+        .unwrap_or(trimmed);
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    let tag_name_len = std::iter::once(first)
+        .chain(chars)
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .count();
+    tag_name_len > 0 && !trimmed.chars().any(|ch| matches!(ch, '<' | '\n' | '\r'))
+}
+
+fn failed_paste_study_set(
+    study_set_id: String,
+    user_id: String,
+    title: String,
+    course: Option<String>,
+    document_id: String,
+    session_id: String,
+) -> StudySetIngestionRecord {
+    StudySetIngestionRecord {
+        study_set: StudySetSummary {
+            id: study_set_id,
+            user_id,
+            title,
+            course,
+            ingestion_status: StudySetIngestionStatus::Failed,
+            ingestion_error: Some(
+                "no usable source span could be derived from pasted text".to_owned(),
+            ),
+        },
+        documents: vec![StudyDocumentSummary {
+            id: document_id,
+            display_name: "Pasted notes".to_owned(),
+            source_kind: "pasted_text".to_owned(),
+            processing_status: StudySetIngestionStatus::Failed,
+        }],
+        source_spans: vec![],
+        concepts: vec![],
+        questions: vec![],
+        session_id,
+        session_token: None,
+    }
+}
+
+fn derive_paste_source_spans(text: &str) -> Vec<PasteSourceSpanCandidate> {
+    let chars = text.chars().collect::<Vec<_>>();
+    if !has_usable_source_text(&chars) {
+        return vec![];
+    }
+
+    let mut raw_ranges = Vec::new();
+    let mut start = 0;
+    for (index, ch) in chars.iter().enumerate() {
+        if is_source_sentence_boundary(&chars, index, *ch) {
+            raw_ranges.push((start, index + 1));
+            start = index + 1;
+        }
+    }
+    if start < chars.len() {
+        raw_ranges.push((start, chars.len()));
+    }
+    if raw_ranges.is_empty() {
+        raw_ranges.push((0, chars.len()));
+    }
+
+    let bounded_ranges = select_source_ranges(&chars, &raw_ranges, text);
+
+    let mut seen = std::collections::HashSet::new();
+    bounded_ranges
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let (start, end) = trim_char_range(&chars, start, end)?;
+            let excerpt = collect_chars(&chars, start, end);
+            let key = excerpt.to_ascii_lowercase();
+            if !seen.insert(key) {
+                return None;
+            }
+            Some(PasteSourceSpanCandidate {
+                start_char: start,
+                end_char: end,
+                excerpt,
+            })
+        })
+        .take(MAX_PASTE_SOURCE_SPANS)
+        .collect()
+}
+
+fn is_source_sentence_boundary(chars: &[char], index: usize, ch: char) -> bool {
+    if ch == '.' {
+        let previous_is_digit = index
+            .checked_sub(1)
+            .and_then(|previous| chars.get(previous))
+            .is_some_and(|previous| previous.is_ascii_digit());
+        let next_is_digit = chars
+            .get(index + 1)
+            .is_some_and(|next| next.is_ascii_digit());
+        return !(previous_is_digit && next_is_digit);
+    }
+    matches!(ch, '?' | '!' | ';')
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScoredSourceRange {
+    index: usize,
+    start: usize,
+    end: usize,
+    score: usize,
+}
+
+fn select_source_ranges(
+    chars: &[char],
+    raw_ranges: &[(usize, usize)],
+    text: &str,
+) -> Vec<(usize, usize)> {
+    let mut bounded_ranges = Vec::new();
+    if raw_ranges.len() == 1 {
+        let (start, end) = raw_ranges[0];
+        append_non_full_single_source_range(chars, start, end, &mut bounded_ranges);
+        return bounded_ranges;
+    }
+
+    let compact_ambiguous = chars.len() <= MAX_PASTE_SOURCE_EXCERPT_CHARS
+        && has_ambiguous_source_markers(&text.to_ascii_lowercase());
+    if compact_ambiguous {
+        let (start, end) = raw_ranges[0];
+        append_bounded_source_ranges(chars, start, end, &mut bounded_ranges);
+        return bounded_ranges;
+    }
+
+    let limit = MAX_PASTE_SOURCE_SPANS.min(raw_ranges.len());
+    let mut selected = raw_ranges
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (start, end))| {
+            let (start, end) = trim_char_range(chars, *start, *end)?;
+            Some(ScoredSourceRange {
+                index,
+                start,
+                end,
+                score: source_range_score(chars, start, end),
+            })
+        })
+        .collect::<Vec<_>>();
+    selected.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    selected.truncate(limit);
+    selected.sort_by_key(|range| range.index);
+    let truncate_last_selected_range = selected.len() == raw_ranges.len();
+    let last_selected_index = selected.last().map(|range| range.index);
+    for range in selected {
+        if truncate_last_selected_range && Some(range.index) == last_selected_index {
+            append_non_full_single_source_range(chars, range.start, range.end, &mut bounded_ranges);
+        } else {
+            append_bounded_source_ranges(chars, range.start, range.end, &mut bounded_ranges);
+        }
+    }
+    bounded_ranges
+}
+
+fn source_range_score(chars: &[char], start: usize, end: usize) -> usize {
+    let text = collect_chars(chars, start, end);
+    extract_concepts(&text).len()
+}
+
+fn append_non_full_single_source_range(
+    chars: &[char],
+    start: usize,
+    end: usize,
+    bounded_ranges: &mut Vec<(usize, usize)>,
+) {
+    let Some((start, end)) = trim_char_range(chars, start, end) else {
+        return;
+    };
+    let token_ranges = token_char_ranges(chars, start, end);
+    if token_ranges.len() < 2 {
+        return;
+    }
+    let mut candidate_end = token_ranges[token_ranges.len() - 2].1;
+    while candidate_end > start && chars[candidate_end - 1].is_whitespace() {
+        candidate_end -= 1;
+    }
+    if candidate_end <= start {
+        return;
+    }
+    if candidate_end - start > MAX_PASTE_SOURCE_EXCERPT_CHARS {
+        append_bounded_source_ranges(chars, start, candidate_end, bounded_ranges);
+    } else {
+        bounded_ranges.push((start, candidate_end));
+    }
+}
+
+fn append_bounded_source_ranges(
+    chars: &[char],
+    start: usize,
+    end: usize,
+    bounded_ranges: &mut Vec<(usize, usize)>,
+) {
+    let Some((mut cursor, end)) = trim_char_range(chars, start, end) else {
+        return;
+    };
+    while cursor < end {
+        let remaining = end - cursor;
+        if remaining <= MAX_PASTE_SOURCE_EXCERPT_CHARS {
+            bounded_ranges.push((cursor, end));
+            break;
+        }
+
+        let hard_end = cursor + MAX_PASTE_SOURCE_EXCERPT_CHARS;
+        let split_end = preferred_source_break(chars, cursor, hard_end).unwrap_or(hard_end);
+        bounded_ranges.push((cursor, split_end));
+        cursor = split_end;
+        while cursor < end && chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+    }
+}
+
+fn token_char_ranges(chars: &[char], start: usize, end: usize) -> Vec<(usize, usize)> {
+    let mut tokens = Vec::new();
+    let mut token_start = None;
+    for (index, ch) in chars.iter().enumerate().take(end).skip(start) {
+        if ch.is_alphanumeric() {
+            token_start.get_or_insert(index);
+        } else if let Some(start) = token_start.take() {
+            tokens.push((start, index));
+        }
+    }
+    if let Some(start) = token_start {
+        tokens.push((start, end));
+    }
+    tokens
+}
+
+fn preferred_source_break(chars: &[char], start: usize, hard_end: usize) -> Option<usize> {
+    let minimum = start + (MAX_PASTE_SOURCE_EXCERPT_CHARS / 2);
+    for index in (minimum..hard_end).rev() {
+        if chars[index].is_whitespace() || matches!(chars[index], ',' | ':' | ';' | '.') {
+            return Some((index + 1).min(hard_end));
+        }
+    }
+    None
+}
+
+fn trim_char_range(chars: &[char], start: usize, end: usize) -> Option<(usize, usize)> {
+    let mut start = start.min(chars.len());
+    let mut end = end.min(chars.len());
+    while start < end && chars[start].is_whitespace() {
+        start += 1;
+    }
+    while end > start && chars[end - 1].is_whitespace() {
+        end -= 1;
+    }
+    if start >= end || !has_usable_source_text(&chars[start..end]) {
+        None
+    } else {
+        Some((start, end))
+    }
+}
+
+fn collect_chars(chars: &[char], start: usize, end: usize) -> String {
+    chars[start..end].iter().collect()
+}
+
+fn has_usable_source_text(chars: &[char]) -> bool {
+    let mut alpha_count = 0;
+    let mut current_token_alpha = 0;
+    let mut has_word_token = false;
+    for ch in chars {
+        if ch.is_alphabetic() {
+            alpha_count += 1;
+            current_token_alpha += 1;
+        } else if ch.is_alphanumeric() {
+            current_token_alpha += 1;
+        } else {
+            if current_token_alpha >= 3 {
+                has_word_token = true;
+            }
+            current_token_alpha = 0;
+        }
+    }
+    if current_token_alpha >= 3 {
+        has_word_token = true;
+    }
+    alpha_count >= 3 && has_word_token
+}
+
+fn classify_paste_source_quality(text: &str) -> PasteSourceQuality {
+    let lower = text.to_ascii_lowercase();
+    if has_ambiguous_source_markers(&lower) {
+        return PasteSourceQuality {
+            confidence: SourceConfidence::Low,
+            retrieval_reason:
+                "ambiguous paste; bounded server-owned source span selected for review".to_owned(),
+        };
+    }
+    if text.chars().count() <= 80 {
+        return PasteSourceQuality {
+            confidence: SourceConfidence::Medium,
+            retrieval_reason:
+                "short paste; bounded server-owned source span selected for source reference"
+                    .to_owned(),
+        };
+    }
+    PasteSourceQuality {
+        confidence: SourceConfidence::High,
+        retrieval_reason: "server-owned paste ingestion bounded source-specific excerpt".to_owned(),
+    }
+}
+
+fn has_ambiguous_source_markers(lower: &str) -> bool {
+    lower.contains("maybe")
+        || lower.contains("not sure")
+        || lower.contains("unclear")
+        || lower.contains("ask professor")
+}
+
+fn source_id_for_concept(concept: &ExtractedConcept, sources: &[StudySourceReference]) -> String {
+    source_for_concept(concept, sources).source_id.clone()
+}
+
+fn source_for_concept<'a>(
+    concept: &ExtractedConcept,
+    sources: &'a [StudySourceReference],
+) -> &'a StudySourceReference {
+    let label = concept.label.to_ascii_lowercase();
+    sources
+        .iter()
+        .find(|source| source.excerpt.to_ascii_lowercase().contains(&label))
+        .unwrap_or(&sources[0])
+}
+
+fn extract_concepts(text: &str) -> Vec<ExtractedConcept> {
     let mut seen = std::collections::HashSet::new();
     let mut concepts = Vec::new();
     for raw in text.split(|ch: char| !ch.is_alphanumeric()) {
         let trimmed = raw.trim();
-        if trimmed.len() < 5 {
-            continue;
-        }
         let lower = trimmed.to_ascii_lowercase();
-        if is_stop_word(&lower) || !seen.insert(lower.clone()) {
+        if !is_concept_token(trimmed, &lower) || is_stop_word(&lower) || !seen.insert(lower.clone())
+        {
             continue;
         }
         concepts.push(ExtractedConcept {
             public_id: slugify(&lower),
-            label: title_case(&lower),
+            label: concept_label(trimmed, &lower),
         });
         if concepts.len() >= 4 {
             break;
         }
     }
-    if concepts.is_empty() {
-        concepts.push(ExtractedConcept {
-            public_id: slugify(title),
-            label: title.to_owned(),
-        });
-    }
     concepts
+}
+
+fn is_concept_token(raw: &str, lower: &str) -> bool {
+    if raw.is_empty() || !raw.chars().any(char::is_alphabetic) {
+        return false;
+    }
+    if is_stop_word(lower) {
+        return false;
+    }
+    if raw.chars().count() >= 5 {
+        return true;
+    }
+    let alphabetic_count = raw.chars().filter(|ch| ch.is_alphabetic()).count();
+    let acronym_like = alphabetic_count >= 3
+        && raw
+            .chars()
+            .filter(|ch| ch.is_alphabetic())
+            .all(|ch| ch.is_uppercase());
+    let code_like = raw.chars().count() >= 3 && raw.chars().any(|ch| ch.is_ascii_digit());
+    acronym_like || code_like
+}
+
+fn concept_label(raw: &str, lower: &str) -> String {
+    let alphabetic = raw
+        .chars()
+        .filter(|ch| ch.is_alphabetic())
+        .collect::<Vec<_>>();
+    if !alphabetic.is_empty() && alphabetic.iter().all(|ch| ch.is_uppercase()) {
+        return raw.to_owned();
+    }
+    if raw.chars().any(|ch| ch.is_ascii_digit()) {
+        return raw.to_ascii_uppercase();
+    }
+    title_case(lower)
 }
 
 fn is_stop_word(value: &str) -> bool {
@@ -754,11 +1203,15 @@ fn is_stop_word(value: &str) -> bool {
             | "exam"
             | "explain"
             | "first"
+            | "later"
+            | "maybe"
             | "notes"
+            | "professor"
             | "their"
             | "there"
             | "these"
             | "those"
+            | "unclear"
             | "using"
             | "where"
             | "which"
@@ -1280,6 +1733,28 @@ mod tests {
             .unwrap();
     }
 
+    const MAX_TEST_SOURCE_EXCERPT_CHARS: usize = 360;
+
+    fn locator_span(source: &StudySourceSpanSummary) -> &str {
+        source
+            .locator
+            .get("span")
+            .and_then(Value::as_str)
+            .expect("source span locator")
+    }
+
+    fn assert_reference_ready_source_span(source: &StudySourceSpanSummary) {
+        assert!(source.excerpt.chars().count() <= MAX_TEST_SOURCE_EXCERPT_CHARS);
+        assert!(!source.excerpt.trim().is_empty());
+        assert!(locator_span(source).starts_with("chars:"));
+        assert!(source.locator.get("page").is_none());
+        assert!(source.locator.get("bbox").is_none());
+        assert!(source.locator.get("x").is_none());
+        assert!(source.locator.get("y").is_none());
+        assert!(!source.retrieval_reason.trim().is_empty());
+        assert!(!source.retrieval_reason.contains("browser"));
+    }
+
     #[tokio::test]
     async fn retrieves_only_server_owned_live_source_tuple() {
         let store = seeded_store();
@@ -1411,7 +1886,13 @@ mod tests {
     #[tokio::test]
     async fn paste_ingestion_writes_bounded_server_owned_question_bank() {
         let store = InMemoryStudyStore::new();
-        let full_notes = "mitochondria electron transport oxidative phosphorylation proton gradient ATP synthase ".repeat(30);
+        let source_sentences = [
+            "Mitochondria electron transport builds a proton gradient across the inner membrane for ATP synthase.",
+            "NADH transfers electrons through Complex I while oxygen accepts them at the end of the chain.",
+            "Chemiosmosis couples proton flow to ATP production during oxidative phosphorylation.",
+        ]
+        .join(" ");
+        let full_notes = format!("{source_sentences} {}", source_sentences.repeat(8));
         let record = store
             .create_paste_study_set(CreatePasteStudySet {
                 user_id: "user-1".to_owned(),
@@ -1429,30 +1910,232 @@ mod tests {
             StudySetIngestionStatus::Ready
         );
         assert_eq!(record.documents.len(), 1);
-        assert_eq!(record.source_spans.len(), 1);
-        assert!(record.source_spans[0].excerpt.chars().count() <= 600);
-        assert!(!record.source_spans[0].excerpt.is_empty());
-        assert!(!record.source_spans[0]
-            .excerpt
-            .contains("mitochondria electron transport oxidative phosphorylation"));
-        assert!(!record.source_spans[0].excerpt.contains("mitochondria"));
-        assert!(!record.source_spans[0].excerpt.contains("ATP synthase"));
+        assert!(record.source_spans.len() >= 2);
+        assert!(record.source_spans.len() <= 4);
+        for source in &record.source_spans {
+            assert_reference_ready_source_span(source);
+            assert_ne!(source.excerpt, full_notes);
+        }
+        let joined_excerpts = record
+            .source_spans
+            .iter()
+            .map(|source| source.excerpt.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined_excerpts.contains("Mitochondria"));
+        assert!(joined_excerpts.contains("ATP synthase"));
+        assert!(joined_excerpts.contains("NADH") || joined_excerpts.contains("oxygen"));
         assert_eq!(record.questions.len(), 1);
         assert_ne!(
             record.questions[0].question_id,
             "q-oxidative-phosphorylation-nadh"
         );
+        assert!(record
+            .source_spans
+            .iter()
+            .any(|source| source.id == record.questions[0].source.source_id));
+        for concept in &record.concepts {
+            assert!(record
+                .source_spans
+                .iter()
+                .any(|source| source.id == concept.source_span_id));
+        }
+
+        let snapshot_json = serde_json::to_string(&store.snapshot()).unwrap();
+        assert!(!snapshot_json.contains(&full_notes));
+        assert!(!snapshot_json.contains("NADH donates high-energy electrons"));
+    }
+
+    #[tokio::test]
+    async fn paste_ingestion_handles_short_notes_with_bounded_source_span() {
+        let short_notes = "SN1 carbocation rearrangement competes with elimination.";
+        let record = generate_paste_study_set(CreatePasteStudySet {
+            user_id: "user-1".to_owned(),
+            title: "Organic chemistry".to_owned(),
+            course: None,
+            exam_date: None,
+            pasted_text: short_notes.to_owned(),
+            session_id: Some("paste-session-short".to_owned()),
+        })
+        .expect("short paste ingests");
+
+        assert_eq!(
+            record.study_set.ingestion_status,
+            StudySetIngestionStatus::Ready
+        );
+        assert_eq!(record.source_spans.len(), 1);
+        assert_reference_ready_source_span(&record.source_spans[0]);
+        assert!(record.source_spans[0].excerpt.contains("carbocation"));
+        assert_ne!(record.source_spans[0].excerpt, short_notes);
+        assert!(!serde_json::to_string(&record)
+            .unwrap()
+            .contains(short_notes));
+        assert_eq!(record.source_spans[0].confidence, SourceConfidence::Medium);
+        assert!(record.source_spans[0]
+            .retrieval_reason
+            .contains("short paste"));
+        assert!(!record.questions[0]
+            .expected_terms
+            .iter()
+            .any(|term| term == "Elimination"));
         assert_eq!(
             record.questions[0].source.source_id,
             record.source_spans[0].id
         );
+    }
+
+    #[tokio::test]
+    async fn paste_ingestion_keeps_question_source_on_primary_concept_span() {
+        let record = generate_paste_study_set(CreatePasteStudySet {
+            user_id: "user-1".to_owned(),
+            title: "Mixed paste".to_owned(),
+            course: None,
+            exam_date: None,
+            pasted_text: "Cell wall. Mitochondria transport proteins.".to_owned(),
+            session_id: Some("paste-session-source".to_owned()),
+        })
+        .expect("mixed paste ingests");
+
+        assert_eq!(
+            record.study_set.ingestion_status,
+            StudySetIngestionStatus::Ready
+        );
+        assert!(record.questions[0].prompt.contains("Mitochondria"));
+        assert!(record.questions[0].source.excerpt.contains("Mitochondria"));
+        assert!(!record.questions[0].source.excerpt.contains("Cell wall"));
+    }
+
+    #[tokio::test]
+    async fn paste_ingestion_does_not_reconstruct_compact_multi_sentence_paste() {
+        let compact_notes = [
+            "Mitosis spindle checkpoint holds chromatids until kinetochores attach.",
+            "Cytokinesis pinches the membrane after sister chromatids separate.",
+            "Cyclin degradation helps mitotic exit and resets the cell cycle.",
+        ]
+        .join(" ");
+        let record = generate_paste_study_set(CreatePasteStudySet {
+            user_id: "user-1".to_owned(),
+            title: "Cell division".to_owned(),
+            course: None,
+            exam_date: None,
+            pasted_text: compact_notes.clone(),
+            session_id: Some("paste-session-compact".to_owned()),
+        })
+        .expect("compact paste ingests");
+
+        assert_eq!(
+            record.study_set.ingestion_status,
+            StudySetIngestionStatus::Ready
+        );
+        assert!(record.source_spans.len() >= 2);
+        let reconstructed = record
+            .source_spans
+            .iter()
+            .map(|source| source.excerpt.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_ne!(reconstructed, compact_notes);
+        assert!(!serde_json::to_string(&record)
+            .unwrap()
+            .contains(&compact_notes));
+    }
+
+    #[tokio::test]
+    async fn paste_ingestion_preserves_inequality_notes_when_stripping_markup() {
+        let record = generate_paste_study_set(CreatePasteStudySet {
+            user_id: "user-1".to_owned(),
+            title: "Clinical thresholds".to_owned(),
+            course: None,
+            exam_date: None,
+            pasted_text:
+                "LDL < 100 reduces cardiovascular risk. Potassium K+ > 5.0 can indicate hyperkalemia."
+                    .to_owned(),
+            session_id: Some("paste-session-inequality".to_owned()),
+        })
+        .expect("inequality paste ingests");
+
+        assert_eq!(
+            record.study_set.ingestion_status,
+            StudySetIngestionStatus::Ready
+        );
+        let joined_excerpts = record
+            .source_spans
+            .iter()
+            .map(|source| source.excerpt.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined_excerpts.contains("LDL < 100"));
+        assert!(joined_excerpts.contains("K+ > 5.0"));
+    }
+
+    #[tokio::test]
+    async fn paste_ingestion_marks_ambiguous_notes_low_confidence() {
+        let record = generate_paste_study_set(CreatePasteStudySet {
+            user_id: "user-1".to_owned(),
+            title: "Ambiguous metabolism note".to_owned(),
+            course: None,
+            exam_date: None,
+            pasted_text: "Maybe Krebs cycle? not sure. NADH unclear; ask professor later."
+                .to_owned(),
+            session_id: Some("paste-session-ambiguous".to_owned()),
+        })
+        .expect("ambiguous paste ingests with low confidence");
+
+        assert_eq!(
+            record.study_set.ingestion_status,
+            StudySetIngestionStatus::Ready
+        );
+        assert_eq!(record.source_spans.len(), 1);
+        assert_reference_ready_source_span(&record.source_spans[0]);
+        assert_eq!(record.source_spans[0].confidence, SourceConfidence::Low);
+        assert!(record.source_spans[0]
+            .retrieval_reason
+            .contains("ambiguous"));
+        assert!(record.source_spans[0].excerpt.contains("Krebs"));
+        assert!(!record.questions[0].prompt.contains("Maybe"));
+    }
+
+    #[tokio::test]
+    async fn paste_ingestion_fails_without_usable_source_spans() {
+        let store = InMemoryStudyStore::new();
+        let unusable_notes = "!!! ??? ... ---";
+        let record = store
+            .create_paste_study_set(CreatePasteStudySet {
+                user_id: "user-1".to_owned(),
+                title: "Empty paste".to_owned(),
+                course: None,
+                exam_date: None,
+                pasted_text: unusable_notes.to_owned(),
+                session_id: Some("paste-session-empty".to_owned()),
+            })
+            .await
+            .expect("unusable paste returns a failed record");
+
+        assert_eq!(
+            record.study_set.ingestion_status,
+            StudySetIngestionStatus::Failed
+        );
+        assert!(record
+            .study_set
+            .ingestion_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("usable source span"));
+        assert_eq!(
+            record.documents[0].processing_status,
+            StudySetIngestionStatus::Failed
+        );
+        assert!(record.source_spans.is_empty());
+        assert!(record.concepts.is_empty());
+        assert!(record.questions.is_empty());
+        assert!(store
+            .active_question("user-1", &record.study_set.id)
+            .await
+            .unwrap()
+            .is_none());
 
         let snapshot_json = serde_json::to_string(&store.snapshot()).unwrap();
-        assert!(!snapshot_json.contains(&full_notes));
-        assert!(
-            !snapshot_json.contains("mitochondria electron transport oxidative phosphorylation")
-        );
-        assert!(!snapshot_json.contains("NADH donates high-energy electrons"));
+        assert!(!snapshot_json.contains(unusable_notes));
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ use std::{
 
 use agent_domain::{
     BrainUsage, CreatePasteStudySet, RealtimeBrain, StudyMemoryStore, StudySetIngestionRecord,
-    VoiceUsageRecord,
+    StudySetIngestionStatus, VoiceUsageRecord,
 };
 use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -411,18 +411,20 @@ async fn create_paste_study_set(
             );
         }
     };
-    if let Some(secret) = state.ws_access.session_token_secret.as_deref() {
-        match signed_session_token(&record, secret) {
-            Ok(token) => record.session_token = Some(token),
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    response_headers,
-                    Json(json!({
-                        "error": "session_token_failed",
-                        "message": error.to_string(),
-                    })),
-                );
+    if record.study_set.ingestion_status == StudySetIngestionStatus::Ready {
+        if let Some(secret) = state.ws_access.session_token_secret.as_deref() {
+            match signed_session_token(&record, secret) {
+                Ok(token) => record.session_token = Some(token),
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        response_headers,
+                        Json(json!({
+                            "error": "session_token_failed",
+                            "message": error.to_string(),
+                        })),
+                    );
+                }
             }
         }
     }
