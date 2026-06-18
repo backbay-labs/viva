@@ -546,6 +546,96 @@ describe("Viva agent browser client", () => {
     expect(afterCancelledDelta.staleEvents).toBe(state.staleEvents + 1);
   });
 
+  test("reducer treats global cancellation as cancelling the active response", () => {
+    let state = initialVivaAgentSessionState();
+    for (const frame of fullSessionFixture.server.slice(0, 3).map(parseVivaServerFrame)) {
+      state = vivaAgentReducer(state, frame);
+    }
+    expect(state.activeResponseId).toBe("response-1");
+    const source = state.question?.source;
+    if (!source) throw new Error("Expected active question source");
+
+    state = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "cancellation", response_id: null },
+      }),
+    );
+
+    expect(state.activeResponseId).toBeUndefined();
+    expect(state.cancelledResponseIds).toContain("response-1");
+
+    const staleFrames = [
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "answer_evaluated",
+          response_id: "response-1",
+          evaluation: {
+            question_id: "q-oxidative-phosphorylation-nadh",
+            answer_text: "stale answer",
+            label: "mostly correct",
+            concise_feedback: "stale feedback",
+            retry_prompt: "stale retry",
+            source,
+            concept_status: "strong",
+            confidence_score: 0.84,
+          },
+        },
+      }),
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "source_reference",
+          response_id: "response-1",
+          source,
+        },
+      }),
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "recap_ready",
+          response_id: "response-1",
+          recap: {
+            voice_session_id: "voice-session-1",
+            headline: "Stale recap",
+            summary: "Stale summary",
+            strong_concepts: ["NADH"],
+            shaky_concepts: [],
+            missed_concepts: [],
+            review_later: [],
+            next_action: "Do not surface stale recap.",
+            source_moments: [{ text: "Stale source", source, status: "strong" }],
+          },
+        },
+      }),
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "audio_delta",
+          response_id: "response-1",
+          frame: { pcm16_base64: "AQIDBA==" },
+        },
+      }),
+    ];
+
+    const beforeStaleCount = state.staleEvents;
+    for (const frame of staleFrames) state = vivaAgentReducer(state, frame);
+
+    expect(state.evaluation).toBeUndefined();
+    expect(state.currentSource).toBeUndefined();
+    expect(state.sources).toEqual([]);
+    expect(state.recap).toBeUndefined();
+    expect(state.audio).toEqual([]);
+    expect(state.staleEvents).toBe(beforeStaleCount + staleFrames.length);
+  });
+
   test("reducer suppresses manuscript intents for a cancelled active response", () => {
     let state = initialVivaAgentSessionState();
     for (const frame of fullSessionFixture.server.slice(0, 3).map(parseVivaServerFrame)) {

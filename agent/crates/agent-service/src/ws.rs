@@ -290,7 +290,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
         "session opened",
     ));
     let mut terminal_reason = "event_stream_closed";
-    let mut cancelled_response_ids = HashSet::new();
+    let mut cancelled_responses = CancelledResponseTracker::default();
     let mut session_limits = SessionLimitRuntime::new();
     let session_cap = tokio::time::sleep(state.ws_timeouts.session);
     tokio::pin!(session_cap);
@@ -382,7 +382,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
                                 match drain_terminal_events(
                                     &mut forward_context,
                                     &mut session.events,
-                                    &mut cancelled_response_ids,
+                                    &mut cancelled_responses,
                                     session_started_at,
                                     &mut sender,
                                 )
@@ -468,7 +468,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
                 match forward_brain_event(
                     &mut forward_context,
                     event,
-                    &mut cancelled_response_ids,
+                    &mut cancelled_responses,
                     session_started_at.elapsed(),
                     &mut sender,
                 )
@@ -572,7 +572,7 @@ struct BrainForwardContext<'a> {
 async fn drain_terminal_events<S>(
     context: &mut BrainForwardContext<'_>,
     events: &mut mpsc::Receiver<agent_domain::BrainEvent>,
-    cancelled_response_ids: &mut HashSet<String>,
+    cancelled_responses: &mut CancelledResponseTracker,
     session_started_at: Instant,
     sender: &mut S,
 ) -> Result<ForwardBrainEvent, axum::Error>
@@ -590,7 +590,7 @@ where
         let result = forward_brain_event(
             context,
             event,
-            cancelled_response_ids,
+            cancelled_responses,
             session_started_at.elapsed(),
             sender,
         )
@@ -611,14 +611,14 @@ enum ForwardBrainEvent {
 async fn forward_brain_event<S>(
     context: &mut BrainForwardContext<'_>,
     event: agent_domain::BrainEvent,
-    cancelled_response_ids: &mut HashSet<String>,
+    cancelled_responses: &mut CancelledResponseTracker,
     session_elapsed: Duration,
     sender: &mut S,
 ) -> Result<ForwardBrainEvent, axum::Error>
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
-    if should_suppress_cancelled_response(cancelled_response_ids, &event) {
+    if should_suppress_cancelled_response(cancelled_responses, &event) {
         return Ok(ForwardBrainEvent::Continue);
     }
     if !authorize_browser_event(context.state, context.session_binding, &event).await {
@@ -740,17 +740,42 @@ async fn authorize_browser_event(
     result.is_ok()
 }
 
+#[derive(Default)]
+struct CancelledResponseTracker {
+    active_response_id: Option<String>,
+    response_ids: HashSet<String>,
+}
+
 fn should_suppress_cancelled_response(
-    cancelled_response_ids: &mut HashSet<String>,
+    cancelled_responses: &mut CancelledResponseTracker,
     event: &agent_domain::BrainEvent,
 ) -> bool {
-    if let agent_domain::BrainEvent::ResponseCancelledFor { response_id } = event {
-        cancelled_response_ids.insert(response_id.clone());
-        return false;
+    match event {
+        agent_domain::BrainEvent::QuestionStarted { response_id, .. } => {
+            cancelled_responses.active_response_id = Some(response_id.clone());
+            false
+        }
+        agent_domain::BrainEvent::ResponseCancelledFor { response_id } => {
+            cancelled_responses.response_ids.insert(response_id.clone());
+            if cancelled_responses
+                .active_response_id
+                .as_deref()
+                .is_some_and(|active| active == response_id)
+            {
+                cancelled_responses.active_response_id = None;
+            }
+            false
+        }
+        agent_domain::BrainEvent::ResponseCancelled => {
+            if let Some(response_id) = cancelled_responses.active_response_id.take() {
+                cancelled_responses.response_ids.insert(response_id);
+            }
+            false
+        }
+        _ => event
+            .response_id()
+            .is_some_and(|response_id| cancelled_responses.response_ids.contains(response_id)),
     }
-    event
-        .response_id()
-        .is_some_and(|response_id| cancelled_response_ids.contains(response_id))
 }
 
 async fn validate_study_set_access(
@@ -1843,7 +1868,7 @@ mod tests {
             1,
         );
         let (_events_tx, mut events) = mpsc::channel(1);
-        let mut cancelled_response_ids = HashSet::new();
+        let mut cancelled_responses = CancelledResponseTracker::default();
         let mut sender = RecordingSink::new();
         let limits = VoiceLimitConfig::default();
         let mut session_limits = SessionLimitRuntime::new();
@@ -1860,7 +1885,7 @@ mod tests {
         let result = drain_terminal_events(
             &mut context,
             &mut events,
-            &mut cancelled_response_ids,
+            &mut cancelled_responses,
             started_at,
             &mut sender,
         )
