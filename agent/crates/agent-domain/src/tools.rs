@@ -128,7 +128,7 @@ impl ToolProposal {
         study_set_id: impl Into<String>,
         voice_session_id: impl Into<String>,
         concept_id: impl Into<String>,
-        due_at: impl Into<String>,
+        status: impl Into<String>,
     ) -> Self {
         Self::new(
             "schedule_review_item",
@@ -136,7 +136,7 @@ impl ToolProposal {
                 "study_set_id": study_set_id.into(),
                 "voice_session_id": voice_session_id.into(),
                 "concept_id": concept_id.into(),
-                "due_at": due_at.into(),
+                "status": status.into(),
             }),
         )
     }

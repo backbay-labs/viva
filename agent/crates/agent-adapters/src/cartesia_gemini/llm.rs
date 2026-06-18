@@ -464,16 +464,16 @@ pub fn viva_tool_declarations() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "schedule_review_item",
-            "description": "Schedule a concept for later spaced review after the voice session.",
+            "description": "Record a concept verdict for later spaced review; @viva/core computes visible due dates.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "study_set_id": { "type": "string" },
                     "voice_session_id": { "type": "string" },
                     "concept_id": { "type": "string" },
-                    "due_at": { "type": "string" }
+                    "status": { "type": "string", "enum": ["strong", "shaky", "missed", "review"] }
                 },
-                "required": ["study_set_id", "voice_session_id", "concept_id", "due_at"],
+                "required": ["study_set_id", "voice_session_id", "concept_id", "status"],
                 "additionalProperties": false
             }
         }),

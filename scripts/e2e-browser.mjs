@@ -189,10 +189,21 @@ try {
     state: "visible",
     timeout: 10_000,
   });
+  await page.getByText("Next session", { exact: false }).first().waitFor({
+    state: "visible",
+    timeout: 10_000,
+  });
+  await page.getByText("core FSRS", { exact: false }).first().waitFor({
+    state: "visible",
+    timeout: 10_000,
+  });
   await page.getByText("Lecture 5", { exact: false }).first().waitFor({
     state: "visible",
     timeout: 10_000,
   });
+  const nextSessionRecommendationVisible =
+    (await isVisible(page.getByText("Next session", { exact: false }).first())) &&
+    (await isVisible(page.getByText("core FSRS", { exact: false }).first()));
   const recapPayloadVisible =
     (await isVisible(page.getByText("Recap ready").first())) &&
     (await isVisible(page.getByText(recapSummaryText, { exact: false }).first())) &&
@@ -222,6 +233,7 @@ try {
     manuscript_ready: manuscriptReady,
     conductor_terminal_fold: recapPayloadVisible,
     recap_payload_visible: recapPayloadVisible,
+    next_session_recommendation_visible: nextSessionRecommendationVisible,
     source_folio_visible: sourceFolioVisible,
     bounded_source_visible: boundedSourceVisible,
     post_answer_source_folio_visible: postAnswerSourceFolioVisible,
@@ -246,6 +258,9 @@ try {
   if (!manuscriptReady) throw new Error("Landing did not enter the connected manuscript.");
   if (!recapPayloadVisible)
     throw new Error("Connected fake-provider session did not render the recap_ready payload.");
+  if (!nextSessionRecommendationVisible) {
+    throw new Error("Connected session did not render next-session review recommendations.");
+  }
   if (!sourceFolioVisible) {
     throw new Error("Connected session did not render the Source Folio.");
   }

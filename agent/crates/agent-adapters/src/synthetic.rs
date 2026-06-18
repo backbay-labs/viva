@@ -560,7 +560,7 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
                 &job.spec.study_set_id,
                 &job.spec.voice_session_id,
                 concept_id,
-                "2026-06-18T09:00:00Z",
+                storage_due_at_for_status(&answer_spec.status),
             )
             .await;
     }
@@ -657,6 +657,15 @@ async fn emit_store_error(event_tx: &mpsc::Sender<BrainEvent>, message: String) 
             message,
         }))
         .await;
+}
+
+fn storage_due_at_for_status(status: &ConceptStatus) -> &'static str {
+    match status {
+        ConceptStatus::Missed => "2026-06-18T09:00:00Z",
+        ConceptStatus::Shaky => "2026-06-19T09:00:00Z",
+        ConceptStatus::Review => "2026-06-20T09:00:00Z",
+        ConceptStatus::Strong => "2026-06-24T09:00:00Z",
+    }
 }
 
 fn study_session_recap(

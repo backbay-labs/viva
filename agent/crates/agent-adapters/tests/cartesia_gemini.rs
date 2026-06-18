@@ -4,10 +4,10 @@ use agent_adapters::cartesia_gemini::{
     SonicConfig, ThinkingLevel,
 };
 use agent_domain::{
-    AnswerEvaluation, AudioFrame, BrainEvent, BrainInput, ConceptStatus, PortError, RealtimeBrain,
-    RealtimeSession, SessionConfig, SessionId, StudyMemoryStore, StudyMode, StudyQuestion,
-    StudySessionRecap, StudySourceReference, StudyStoreCapabilities, StudyStoreWriteCounts,
-    VoiceUsageRecord,
+    AnswerEvaluation, AudioFrame, AuthorizedStudySession, BrainEvent, BrainInput, ConceptStatus,
+    PortError, RealtimeBrain, RealtimeSession, SessionConfig, SessionId, StudyMemoryStore,
+    StudyMode, StudyQuestion, StudySessionRecap, StudySourceReference, StudyStoreCapabilities,
+    StudyStoreWriteCounts, ToolProposal, VivaToolExecutor, VoiceUsageRecord,
 };
 use serde_json::json;
 use std::sync::{Arc, Mutex};
@@ -579,6 +579,31 @@ async fn fake_runtime_scripted_session_task_guard_aborts_provider_task_on_drop()
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn schedule_review_rejects_model_due_at_authority() {
+    let (store, session_config) = fixture_store_and_session().await;
+    let executor = VivaToolExecutor::new(
+        store,
+        AuthorizedStudySession::from_config(&session_config).unwrap(),
+    );
+    let bad = ToolProposal::new(
+        "schedule_review_item",
+        json!({
+            "study_set_id": "biology-midterm",
+            "voice_session_id": "voice-session-1",
+            "concept_id": "atp-synthase",
+            "status": "shaky",
+            "due_at": "2099-01-01T00:00:00Z"
+        }),
+    );
+
+    let error = executor.execute("response-1", bad).await.unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("due_at is not an authoritative tool argument"));
 }
 
 async fn fixture_store_and_session() -> (Arc<data::InMemoryStudyStore>, SessionConfig) {

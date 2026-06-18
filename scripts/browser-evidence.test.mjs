@@ -13,6 +13,7 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
     manuscript_ready: true,
     conductor_terminal_fold: true,
     recap_payload_visible: true,
+    next_session_recommendation_visible: true,
     source_folio_visible: true,
     bounded_source_visible: true,
     post_answer_source_folio_visible: true,
@@ -30,6 +31,7 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
     manuscript_ready: true,
     conductor_terminal_fold: true,
     recap_payload_visible: true,
+    next_session_recommendation_visible: true,
     source_folio_visible: true,
     bounded_source_visible: true,
     post_answer_source_folio_visible: true,
@@ -75,6 +77,30 @@ test("rejects stale browser evidence before release evidence is written", () => 
         }),
       ),
     /recap_payload_visible/,
+  );
+});
+
+test("rejects browser evidence without next-session review recommendations", () => {
+  assert.throws(
+    () =>
+      assertReleaseBrowserEvidence(
+        normalizeBrowserEvidence({
+          legacy_upload_visible: false,
+          manuscript_ready: true,
+          conductor_terminal_fold: true,
+          recap_payload_visible: true,
+          source_folio_visible: true,
+          bounded_source_visible: true,
+          post_answer_source_folio_visible: true,
+          post_answer_bounded_source_visible: true,
+          post_answer_source_reference_event_seen: true,
+          post_answer_concept_status_event_seen: true,
+          local_only_actions_hidden: true,
+          console_errors: [],
+          page_errors: [],
+        }),
+      ),
+    /next_session_recommendation_visible/,
   );
 });
 
