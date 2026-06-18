@@ -24,6 +24,15 @@ bun run build
 bun run validate
 ```
 
+## Test Environment
+
+Frontend URL tests must pass even when a local root `.env` is present. Tests that
+exercise agent URLs should pass explicit env records; an explicit empty record is
+hermetic and falls back to `ws://127.0.0.1:4318/ws` instead of reading ambient
+`NEXT_PUBLIC_VIVA_AGENT_WS_URL` values. Runtime app code that omits an env record
+still reads the public agent URL and API URL from the normal Next/Bun
+environment.
+
 ## Agent Modes
 
 Default validation uses the Rust synthetic voice agent only. It requires no

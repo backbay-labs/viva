@@ -92,18 +92,27 @@ export type VivaAgentSessionController = {
 
 const bundledVivaAgentWsUrl = process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL;
 const bundledVivaApiUrl = process.env.NEXT_PUBLIC_VIVA_API_URL;
+const defaultVivaAgentWsUrl = "ws://127.0.0.1:4318/ws";
 
-export function vivaAgentWsUrl(env: Record<string, string | undefined> = envRecord()): string {
-  return env.NEXT_PUBLIC_VIVA_AGENT_WS_URL ?? bundledVivaAgentWsUrl ?? "ws://127.0.0.1:4318/ws";
+export function vivaAgentWsUrl(env?: Record<string, string | undefined>): string {
+  const explicitEnv = env !== undefined;
+  const resolvedEnv = env ?? envRecord();
+  return (
+    resolvedEnv.NEXT_PUBLIC_VIVA_AGENT_WS_URL ??
+    (explicitEnv ? undefined : bundledVivaAgentWsUrl) ??
+    defaultVivaAgentWsUrl
+  );
 }
 
-export function vivaApiBaseUrl(
-  env: Record<string, string | undefined> = envRecord(),
-): string | undefined {
-  const explicit = env.NEXT_PUBLIC_VIVA_API_URL ?? bundledVivaApiUrl;
+export function vivaApiBaseUrl(env?: Record<string, string | undefined>): string | undefined {
+  const explicitEnv = env !== undefined;
+  const resolvedEnv = env ?? envRecord();
+  const explicit =
+    resolvedEnv.NEXT_PUBLIC_VIVA_API_URL ?? (explicitEnv ? undefined : bundledVivaApiUrl);
   if (explicit?.trim()) return trimTrailingSlash(explicit.trim());
 
-  const wsUrl = env.NEXT_PUBLIC_VIVA_AGENT_WS_URL ?? bundledVivaAgentWsUrl;
+  const wsUrl =
+    resolvedEnv.NEXT_PUBLIC_VIVA_AGENT_WS_URL ?? (explicitEnv ? undefined : bundledVivaAgentWsUrl);
   if (!wsUrl?.trim()) return undefined;
   try {
     const url = new URL(wsUrl);
