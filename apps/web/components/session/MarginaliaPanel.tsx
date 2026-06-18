@@ -1,7 +1,7 @@
 import type { SessionRecap } from "@viva/core";
 import { Icon, Spark } from "@viva/ui-web";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
-import type { RuntimeCopy } from "../../lib/viva-session-projection";
+import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
 import { CorrectionMarginalia } from "./CorrectionMarginalia";
 import { SessionActionButton } from "./SessionActionButton";
 import { SourceFolio } from "./SourceFolio";
@@ -17,10 +17,12 @@ export function MarginaliaPanel({
   scene,
   runtime,
   question,
+  sourceFolio,
   recap,
   hintShown,
   onHint,
   onShowSource,
+  onChallengeSource,
   onSubmitAnswer,
   onBackToQuestion,
   onTryAgain,
@@ -30,10 +32,12 @@ export function MarginaliaPanel({
   scene?: VivaSceneState;
   runtime: RuntimeCopy;
   question: Question;
+  sourceFolio?: SourceFolioProjection;
   recap?: SessionRecap;
   hintShown: boolean;
   onHint: () => void;
   onShowSource: () => void;
+  onChallengeSource?: () => void;
   onSubmitAnswer: () => void;
   onBackToQuestion: () => void;
   onTryAgain: () => void;
@@ -84,7 +88,12 @@ export function MarginaliaPanel({
           recap ? (
             <RecapFold recap={recap} />
           ) : (
-            <SourceFolio onBack={onBackToQuestion} question={question} />
+            <SourceFolio
+              onBack={onBackToQuestion}
+              onChallenge={onChallengeSource ?? onTryAgain}
+              question={question}
+              sourceFolio={sourceFolio}
+            />
           )
         ) : null}
       </div>

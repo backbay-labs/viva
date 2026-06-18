@@ -17,16 +17,31 @@ const webPort = await freePort();
 const agentUrl = `http://127.0.0.1:${agentPort}`;
 const webUrl = `http://127.0.0.1:${webPort}`;
 const wsUrl = `ws://127.0.0.1:${agentPort}/ws`;
-const agentProvider = process.env.VIVA_E2E_AGENT_PROVIDER ?? "fake_cartesia_gemini";
+const agentProvider = process.env.VIVA_E2E_AGENT_PROVIDER ?? "synthetic";
 const stopToRecap = process.env.VIVA_E2E_STOP_TO_RECAP === "1";
+const requirePostAnswerSourceFolio =
+  process.env.VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO === undefined
+    ? agentProvider === "synthetic"
+    : process.env.VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO === "1";
 const children = [];
 const consoleErrors = [];
 const pageErrors = [];
+const serverEvents = [];
 let browser;
 let context;
 let page;
 let traceStarted = false;
 let traceArtifact = null;
+let sourceFolioVisible = false;
+let boundedSourceVisible = false;
+let postAnswerSourceFolioVisible = false;
+let postAnswerBoundedSourceVisible = false;
+let postAnswerProtocolProof = {
+  conceptStatus: null,
+  conceptStatusEventSeen: false,
+  responseId: null,
+  sourceReferenceEventSeen: false,
+};
 
 await rm(artifactDir, { recursive: true, force: true });
 await mkdir(artifactDir, { recursive: true });
@@ -79,6 +94,9 @@ try {
     }
   });
   page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("websocket", (socket) => {
+    socket.on("framereceived", (frame) => recordServerFramePayload(frame.payload, serverEvents));
+  });
 
   await page.goto(webUrl, { waitUntil: "networkidle" });
   const legacyUploadVisible = await isVisible(page.getByText("What are we studying?"));
@@ -102,10 +120,58 @@ try {
     fullPage: true,
   });
 
+  await page.getByRole("button", { name: "Show source" }).click();
+  await page.getByText("Source Folio").waitFor({
+    state: "visible",
+    timeout: 10_000,
+  });
+  await page.waitForTimeout(600);
+  sourceFolioVisible =
+    (await isVisible(page.getByText("Source Folio").first())) &&
+    (await isVisible(page.getByRole("button", { name: "Challenge citation" }).first()));
+  boundedSourceVisible =
+    (await isVisible(page.getByText("NADH donates", { exact: false }).first())) &&
+    (await isVisible(page.getByText("Document span only", { exact: false }).first()));
+  await page.screenshot({
+    path: path.join(artifactDir, "source-folio.png"),
+    fullPage: true,
+  });
+  await page.getByRole("button", { name: "Back to question" }).click();
+
   if (stopToRecap) {
     await page.getByRole("button", { name: "End session" }).click();
   } else {
     await page.getByRole("button", { name: /check it/i }).click();
+    postAnswerProtocolProof = await waitForPostAnswerProtocolProof(serverEvents, 25_000);
+    if (requirePostAnswerSourceFolio) {
+      await page.getByRole("button", { name: "Show source" }).waitFor({
+        state: "visible",
+        timeout: 25_000,
+      });
+      await page.getByRole("button", { name: "Show source" }).click();
+      await page.getByText("Source Folio").waitFor({
+        state: "visible",
+        timeout: 10_000,
+      });
+      await page.waitForTimeout(600);
+      postAnswerSourceFolioVisible =
+        (await isVisible(page.getByText("Source Folio").first())) &&
+        (await isVisible(page.getByRole("button", { name: "Challenge citation" }).first())) &&
+        (await isVisible(
+          page.getByText(conceptStatusText(postAnswerProtocolProof.conceptStatus), {
+            exact: false,
+          }).first(),
+        ));
+      postAnswerBoundedSourceVisible =
+        (await isVisible(page.getByText("NADH donates", { exact: false }).first())) &&
+        (await isVisible(page.getByText("Document span only", { exact: false }).first()));
+      await page.screenshot({
+        path: path.join(artifactDir, "post-answer-source-folio.png"),
+        fullPage: true,
+      });
+      await page.getByRole("button", { name: "Back to question" }).click();
+    }
+    await page.getByRole("button", { name: "End session" }).click();
   }
   const recapSummaryText =
     agentProvider === "synthetic"
@@ -156,10 +222,22 @@ try {
     manuscript_ready: manuscriptReady,
     conductor_terminal_fold: recapPayloadVisible,
     recap_payload_visible: recapPayloadVisible,
+    source_folio_visible: sourceFolioVisible,
+    bounded_source_visible: boundedSourceVisible,
+    post_answer_source_folio_visible: postAnswerSourceFolioVisible,
+    post_answer_bounded_source_visible: postAnswerBoundedSourceVisible,
+    post_answer_source_reference_event_seen: postAnswerProtocolProof.sourceReferenceEventSeen,
+    post_answer_concept_status_event_seen: postAnswerProtocolProof.conceptStatusEventSeen,
+    post_answer_protocol_response_id: postAnswerProtocolProof.responseId,
     local_only_actions_hidden: !shareVisible && !localScheduleVisible,
     console_errors: consoleErrors,
     page_errors: pageErrors,
-    screenshots: ["session-ready.png", "connected-terminal-fold.png"],
+    screenshots: [
+      "session-ready.png",
+      "source-folio.png",
+      ...(!stopToRecap && requirePostAnswerSourceFolio ? ["post-answer-source-folio.png"] : []),
+      "connected-terminal-fold.png",
+    ],
     trace: traceArtifact,
   };
   await writeFile(path.join(artifactDir, "result.json"), `${JSON.stringify(result, null, 2)}\n`);
@@ -168,6 +246,24 @@ try {
   if (!manuscriptReady) throw new Error("Landing did not enter the connected manuscript.");
   if (!recapPayloadVisible)
     throw new Error("Connected fake-provider session did not render the recap_ready payload.");
+  if (!sourceFolioVisible) {
+    throw new Error("Connected session did not render the Source Folio.");
+  }
+  if (!boundedSourceVisible) {
+    throw new Error("Connected session did not render bounded source folio proof.");
+  }
+  if (!stopToRecap && requirePostAnswerSourceFolio && !postAnswerSourceFolioVisible) {
+    throw new Error("Connected session did not render the post-answer Source Folio.");
+  }
+  if (!stopToRecap && requirePostAnswerSourceFolio && !postAnswerBoundedSourceVisible) {
+    throw new Error("Connected session did not render post-answer bounded source folio proof.");
+  }
+  if (!stopToRecap && requirePostAnswerSourceFolio && !postAnswerProtocolProof.sourceReferenceEventSeen) {
+    throw new Error("Post-answer Source Folio did not observe a source_reference event.");
+  }
+  if (!stopToRecap && requirePostAnswerSourceFolio && !postAnswerProtocolProof.conceptStatusEventSeen) {
+    throw new Error("Post-answer Source Folio did not observe a concept_status event.");
+  }
   if (shareVisible || localScheduleVisible) {
     throw new Error("Connected manuscript exposed local-only Share or schedule actions.");
   }
@@ -302,6 +398,90 @@ async function isVisible(locator) {
   } catch {
     return false;
   }
+}
+
+function conceptStatusText(status) {
+  switch (status) {
+    case "strong":
+      return "Strong";
+    case "shaky":
+      return "Shaky";
+    case "missed":
+      return "Missed";
+    case "review":
+      return "Review";
+    default:
+      return "Awaiting concept status";
+  }
+}
+
+function recordServerFramePayload(payload, events) {
+  const text =
+    typeof payload === "string"
+      ? payload
+      : Buffer.isBuffer(payload)
+        ? payload.toString("utf8")
+        : String(payload);
+  let frame;
+  try {
+    frame = JSON.parse(text);
+  } catch {
+    return;
+  }
+  if (frame?.type !== "event" || typeof frame.event?.type !== "string") return;
+
+  events.push({
+    conceptStatus: frame.event.status ?? null,
+    responseId: frame.event.response_id ?? null,
+    sourceId: frame.event.source?.source_id ?? null,
+    type: frame.event.type,
+  });
+}
+
+async function waitForPostAnswerProtocolProof(events, timeoutMs) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const proof = postAnswerProtocolProofFromEvents(events);
+    if (proof.sourceReferenceEventSeen && proof.conceptStatusEventSeen) return proof;
+    await delay(100);
+  }
+  const eventTypes = events.map((event) => event.type).join(" -> ");
+  throw new Error(
+    `Timed out waiting for post-answer source_reference and concept_status events. Saw: ${eventTypes}`,
+  );
+}
+
+function postAnswerProtocolProofFromEvents(events) {
+  for (let answerIndex = events.length - 1; answerIndex >= 0; answerIndex -= 1) {
+    const answerEvent = events[answerIndex];
+    if (answerEvent.type !== "answer_evaluated" || !answerEvent.responseId) continue;
+
+    const afterAnswer = events.slice(answerIndex + 1);
+    const sourceEvent = afterAnswer.find(
+      (event) =>
+        event.type === "source_reference" &&
+        event.responseId === answerEvent.responseId &&
+        Boolean(event.sourceId),
+    );
+    const conceptEvent = afterAnswer.find(
+      (event) =>
+        event.type === "concept_status" &&
+        event.responseId === answerEvent.responseId &&
+        typeof event.conceptStatus === "string",
+    );
+    return {
+      conceptStatus: conceptEvent?.conceptStatus ?? null,
+      conceptStatusEventSeen: Boolean(conceptEvent),
+      responseId: answerEvent.responseId,
+      sourceReferenceEventSeen: Boolean(sourceEvent),
+    };
+  }
+  return {
+    conceptStatus: null,
+    conceptStatusEventSeen: false,
+    responseId: null,
+    sourceReferenceEventSeen: false,
+  };
 }
 
 function delay(ms) {

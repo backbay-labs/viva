@@ -110,7 +110,9 @@ export type VivaAgentSessionState = {
   transcript: string;
   finalTranscript?: string;
   evaluation?: AgentAnswerEvaluation;
+  currentSource?: AgentStudySourceReference;
   sources: AgentStudySourceReference[];
+  currentConceptStatus?: AgentConceptStatus;
   conceptStatuses: Record<string, AgentConceptStatus>;
   manuscriptIntents: VivaAgentManuscriptIntent[];
   recap?: AgentStudySessionRecap;
@@ -398,6 +400,9 @@ export function vivaAgentReducer(
         transcript: "",
         finalTranscript: undefined,
         evaluation: undefined,
+        currentSource: undefined,
+        sources: [],
+        currentConceptStatus: undefined,
         manuscriptIntents: [],
         recap: undefined,
       };
@@ -408,10 +413,11 @@ export function vivaAgentReducer(
     case "answer_evaluated":
       return { ...state, evaluation: event.evaluation };
     case "source_reference":
-      return { ...state, sources: [...state.sources, event.source] };
+      return { ...state, currentSource: event.source, sources: [...state.sources, event.source] };
     case "concept_status":
       return {
         ...state,
+        currentConceptStatus: event.status,
         conceptStatuses: { ...state.conceptStatuses, [event.concept_id]: event.status },
       };
     case "manuscript_intent":

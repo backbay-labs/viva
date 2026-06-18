@@ -9,6 +9,7 @@ import type {
   AgentStudySetReadiness,
   AgentStudySourceReference,
   AnswerEvaluation,
+  ConceptStatus,
   CorrectionKind,
   EvaluationLabel,
   ManuscriptIntent,
@@ -34,6 +35,9 @@ export type VivaAgentDerivedState = {
   transcript: string;
   finalTranscript?: string;
   evaluation?: AnswerEvaluation;
+  currentSource?: SourceReference;
+  currentConceptStatus?: ConceptStatus;
+  conceptStatuses: Record<string, ConceptStatus>;
   sources: SourceReference[];
   manuscriptIntents: ManuscriptIntent[];
   recap?: SessionRecap;
@@ -135,6 +139,9 @@ export function deriveVivaAgentUiState(state: VivaAgentSessionState): VivaAgentD
     evaluation: state.evaluation
       ? agentAnswerEvaluationToUiEvaluation(state.evaluation)
       : undefined,
+    currentSource: state.currentSource ? agentSourceToUiSource(state.currentSource) : undefined,
+    currentConceptStatus: state.currentConceptStatus,
+    conceptStatuses: state.conceptStatuses,
     finalTranscript: state.finalTranscript,
     manuscriptIntents: state.manuscriptIntents.map((event) => event.intent),
     phase: state.question && state.phase === "ready" ? "listening" : state.phase,

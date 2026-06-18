@@ -24,6 +24,7 @@ import {
   projectConceptNodes,
   projectHighlightedTokens,
   projectRuntimeCopy,
+  projectSourceFolio,
   projectTrace,
   type RuntimeMicState,
 } from "../../lib/viva-session-projection";
@@ -225,6 +226,12 @@ export function LiveSessionPage() {
     // deterministic evaluation sequence. A real provider receives the transcript.
     agentRef.current.sendText("(spoken answer)");
   }, [onUserGesture]);
+  const challengeSource = useCallback(() => {
+    onUserGesture();
+    setSourceOpen(false);
+    setHintShown(false);
+    agentRef.current.sendText("(challenge citation)");
+  }, [onUserGesture]);
   const retryAgent = useCallback(() => {
     setSourceOpen(false);
     setHintShown(false);
@@ -249,6 +256,10 @@ export function LiveSessionPage() {
   const projection = useMemo(
     () => projectTrace(agent.derived, agent.status, sessionStart),
     [agent.derived, agent.status, sessionStart],
+  );
+  const sourceFolio = useMemo(
+    () => projectSourceFolio(agent.derived, sessionStart),
+    [agent.derived, sessionStart],
   );
   const conceptNodes = useMemo(
     () => projectConceptNodes(STUDY_SET.concepts, agent.agentState.conceptStatuses),
@@ -317,6 +328,7 @@ export function LiveSessionPage() {
       hintShown={hintShown}
       levelRef={levelRef}
       onBackToQuestion={() => setSourceOpen(false)}
+      onChallengeSource={challengeSource}
       onEndSession={endSession}
       onHint={() => setHintShown((shown) => !shown)}
       onNextQuestion={submitTurn}
@@ -327,6 +339,7 @@ export function LiveSessionPage() {
       recap={agent.derived.recap}
       runtime={runtime}
       scene={scene}
+      sourceFolio={sourceFolio}
       state={effectiveState}
     />
   );

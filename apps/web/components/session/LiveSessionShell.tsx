@@ -1,6 +1,6 @@
 import type { SessionRecap } from "@viva/core";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
-import type { RuntimeCopy } from "../../lib/viva-session-projection";
+import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
 import { MuseBackdrop } from "../landing/MuseBackdrop";
 import { MuseGlyphCanvas, type MuseGlyphState } from "../landing/MuseGlyphCanvas";
 import { MarginaliaPanel } from "./MarginaliaPanel";
@@ -24,6 +24,7 @@ export function LiveSessionShell({
   highlightedTokens,
   conceptNodes,
   question,
+  sourceFolio,
   recap,
   contextLabel,
   clockLabel,
@@ -33,6 +34,7 @@ export function LiveSessionShell({
   onEndSession,
   onHint,
   onShowSource,
+  onChallengeSource,
   onSubmitAnswer,
   onBackToQuestion,
   onTryAgain,
@@ -45,6 +47,7 @@ export function LiveSessionShell({
   highlightedTokens: string[];
   conceptNodes: ConceptNode[];
   question: Question;
+  sourceFolio?: SourceFolioProjection;
   recap?: SessionRecap;
   contextLabel: string;
   clockLabel?: string;
@@ -54,6 +57,7 @@ export function LiveSessionShell({
   onEndSession: () => void;
   onHint: () => void;
   onShowSource: () => void;
+  onChallengeSource?: () => void;
   onSubmitAnswer: () => void;
   onBackToQuestion: () => void;
   onTryAgain: () => void;
@@ -90,6 +94,7 @@ export function LiveSessionShell({
             hintShown={hintShown}
             onBackToQuestion={onBackToQuestion}
             onHint={onHint}
+            onChallengeSource={onChallengeSource}
             onNextQuestion={onNextQuestion}
             onShowSource={onShowSource}
             onSubmitAnswer={onSubmitAnswer}
@@ -98,6 +103,7 @@ export function LiveSessionShell({
             recap={recap}
             runtime={runtime}
             scene={scene}
+            sourceFolio={sourceFolio}
             state={state}
           />
         </div>

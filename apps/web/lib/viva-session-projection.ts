@@ -4,6 +4,7 @@ import {
   type ConceptStatus,
   type EvaluationLabel,
   reviewIntervalForStatus,
+  type SourceReference,
   type VivaReadyFrame,
 } from "@viva/core";
 import type {
@@ -44,6 +45,18 @@ export type TraceProjection = {
   question: Question;
   highlightedTokens: string[];
   hasAgentQuestion: boolean;
+};
+
+export type SourceFolioState = "present" | "low_confidence" | "conflicting" | "unavailable";
+
+export type SourceFolioProjection = {
+  state: SourceFolioState;
+  source: SourceReference;
+  conceptStatus: string;
+  confidenceLabel: string;
+  caveat: string;
+  challengeLabel: string;
+  regionNavigation: string;
 };
 
 export type RuntimeCopyCause =
@@ -756,6 +769,97 @@ export function projectSessionQuestion(
       ? correctionEmphasis(evaluation.confidenceScore, evaluation.label)
       : undefined,
   };
+}
+
+export function projectSourceFolio(
+  derived: VivaAgentDerivedState,
+  now: Date,
+): SourceFolioProjection {
+  const source = latestBoundedSource(derived);
+  const regionNavigation =
+    "Document span only; exact page and bounding-box navigation is unverified.";
+
+  if (!source?.excerpt.trim()) {
+    return {
+      caveat: "No bounded source_reference has arrived for this correction.",
+      challengeLabel: "Challenge unavailable source",
+      conceptStatus: "Source status unavailable",
+      confidenceLabel: "Source unavailable",
+      regionNavigation,
+      source: {
+        confidence: "low",
+        excerpt: "",
+        label: "Source unavailable",
+      },
+      state: "unavailable",
+    };
+  }
+
+  const boundedSource = { ...source, excerpt: boundedSourceExcerpt(source.excerpt) };
+  const state = sourceFolioState(boundedSource);
+  return {
+    caveat: sourceFolioCaveat(boundedSource, state),
+    challengeLabel: "Challenge citation",
+    conceptStatus: projectedFolioConceptStatus(derived, now),
+    confidenceLabel: sourceConfidenceLabel(boundedSource.confidence),
+    regionNavigation,
+    source: boundedSource,
+    state,
+  };
+}
+
+function latestBoundedSource(derived: VivaAgentDerivedState): SourceReference | undefined {
+  return derived.currentSource ?? derived.evaluation?.source ?? derived.question?.source;
+}
+
+function sourceFolioState(source: SourceReference): SourceFolioState {
+  if (!source.excerpt.trim()) return "unavailable";
+  if (sourceReasonLooksConflicting(source.retrievalReason)) {
+    return source.confidence === "low" ? "low_confidence" : "conflicting";
+  }
+  if (source.confidence === "low") return "low_confidence";
+  return "present";
+}
+
+function sourceReasonLooksConflicting(reason?: string): boolean {
+  return Boolean(reason && /conflict|contradict|disagree|discrepanc/i.test(reason));
+}
+
+function sourceConfidenceLabel(confidence: SourceReference["confidence"]): string {
+  switch (confidence) {
+    case "high":
+      return "High confidence";
+    case "medium":
+      return "Medium confidence";
+    case "low":
+      return "Low confidence";
+  }
+}
+
+function sourceFolioCaveat(source: SourceReference, state: SourceFolioState): string {
+  switch (state) {
+    case "conflicting":
+      return `Conflicting source material: ${source.retrievalReason || "the bounded span needs review."}`;
+    case "low_confidence":
+      return `Low-confidence retrieval: ${source.retrievalReason || "verify this bounded span before treating it as decisive."}`;
+    case "unavailable":
+      return "No bounded source_reference has arrived for this correction.";
+    case "present":
+      return source.retrievalReason
+        ? `Source citation is bounded to this span: ${source.retrievalReason}`
+        : "Source citation is bounded to this server-owned span.";
+  }
+}
+
+function projectedFolioConceptStatus(derived: VivaAgentDerivedState, now: Date): string {
+  const status = derived.currentConceptStatus ?? derived.evaluation?.conceptStatus;
+  return status ? conceptStatusVerdict(status, now) : "Awaiting concept status";
+}
+
+function boundedSourceExcerpt(excerpt: string): string {
+  const normalized = excerpt.replace(/\s+/g, " ").trim();
+  if (normalized.length <= 720) return normalized;
+  return `${normalized.slice(0, 717).trimEnd()}...`;
 }
 
 export function projectTrace(
