@@ -17,7 +17,7 @@ use agent_domain::{
     ToolProposal, VivaToolExecutor,
 };
 
-use super::llm::GeminiConversation;
+use super::llm::{stream_gemini_http, GeminiConversation};
 use super::stt::transcribe_ink_websocket;
 use super::{
     audio_frame_bytes, gemini_request, parse_gemini_sse_line, parse_ink_event, parse_sonic_event,
@@ -958,12 +958,10 @@ impl CartesiaGeminiTransports for GatedNoNetworkCartesiaGeminiTransports {
 
     async fn stream_gemini(
         &self,
-        _config: &CartesiaGeminiConfig,
-        _request: Value,
+        config: &CartesiaGeminiConfig,
+        request: Value,
     ) -> Result<Vec<GeminiStreamEvent>, BrainError> {
-        Err(BrainError::Protocol(
-            "gated no-network Gemini transport cannot stream".to_owned(),
-        ))
+        stream_gemini_http(&config.gemini, request).await
     }
 
     async fn synthesize_sonic(

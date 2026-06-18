@@ -1,8 +1,10 @@
 use std::fmt;
 
+use async_trait::async_trait;
+use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use serde_json::{json, Value};
 
-use agent_domain::ToolResult;
+use agent_domain::{BrainError, ToolResult};
 
 use super::constants::{
     DEFAULT_GEMINI_BASE_URL, DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_THINKING_LEVEL,
@@ -178,6 +180,92 @@ pub enum GeminiStreamEvent {
     },
 }
 
+pub(crate) struct GeminiStreamRequest {
+    pub(crate) url: String,
+    pub(crate) api_key: String,
+    pub(crate) body: Value,
+}
+
+impl GeminiStreamRequest {
+    fn new(config: &GeminiConfig, body: Value) -> Result<Self, BrainError> {
+        let api_key = config.api_key.trim();
+        if api_key.is_empty() {
+            return Err(BrainError::MissingApiKey);
+        }
+
+        Ok(Self {
+            url: config.stream_url(),
+            api_key: api_key.to_owned(),
+            body,
+        })
+    }
+}
+
+#[async_trait]
+pub(crate) trait GeminiSseClient: Send + Sync {
+    async fn stream(&self, request: GeminiStreamRequest) -> Result<String, BrainError>;
+}
+
+pub(crate) async fn stream_gemini_with_client<C>(
+    client: &C,
+    config: &GeminiConfig,
+    request: Value,
+) -> Result<Vec<GeminiStreamEvent>, BrainError>
+where
+    C: GeminiSseClient,
+{
+    let stream_request = GeminiStreamRequest::new(config, request)?;
+    let response = client
+        .stream(stream_request)
+        .await
+        .map_err(|_| BrainError::Connection("Gemini stream request failed".to_owned()))?;
+    if response.trim().is_empty() {
+        return Err(BrainError::Protocol(
+            "Gemini stream returned no events".to_owned(),
+        ));
+    }
+    Ok(parse_gemini_sse_stream(&response))
+}
+
+pub(crate) async fn stream_gemini_http(
+    config: &GeminiConfig,
+    request: Value,
+) -> Result<Vec<GeminiStreamEvent>, BrainError> {
+    stream_gemini_with_client(&ReqwestGeminiSseClient::default(), config, request).await
+}
+
+#[derive(Clone, Default)]
+struct ReqwestGeminiSseClient {
+    client: reqwest::Client,
+}
+
+#[async_trait]
+impl GeminiSseClient for ReqwestGeminiSseClient {
+    async fn stream(&self, request: GeminiStreamRequest) -> Result<String, BrainError> {
+        let api_key = HeaderValue::from_str(&request.api_key)
+            .map_err(|_| BrainError::Protocol("invalid Gemini API key header value".to_owned()))?;
+        let response = self
+            .client
+            .post(&request.url)
+            .header("x-goog-api-key", api_key)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&request.body)
+            .send()
+            .await
+            .map_err(|_| BrainError::Connection("Gemini stream request failed".to_owned()))?;
+        if !response.status().is_success() {
+            return Err(BrainError::Protocol(format!(
+                "Gemini stream request failed with status {}",
+                response.status().as_u16()
+            )));
+        }
+        response
+            .text()
+            .await
+            .map_err(|_| BrainError::Connection("Gemini stream response read failed".to_owned()))
+    }
+}
+
 pub fn gemini_request(config: &GeminiConfig, contents: Vec<Value>, tools: &[Value]) -> Value {
     let mut request = json!({
         "contents": contents,
@@ -237,9 +325,19 @@ pub fn parse_gemini_sse_line(line: &str) -> Vec<GeminiStreamEvent> {
     parse_gemini_value(&value)
 }
 
+pub fn parse_gemini_sse_stream(text: &str) -> Vec<GeminiStreamEvent> {
+    text.lines().flat_map(parse_gemini_sse_line).collect()
+}
+
 fn parse_gemini_value(value: &Value) -> Vec<GeminiStreamEvent> {
-    if let Some(error) = value.pointer("/error/message").and_then(Value::as_str) {
-        return vec![GeminiStreamEvent::Error(error.to_owned())];
+    if value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return vec![GeminiStreamEvent::Error(
+            "Gemini stream provider error".to_owned(),
+        )];
     }
 
     let mut events = Vec::new();
@@ -486,7 +584,12 @@ fn viva_system_instruction() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
     use serde_json::json;
+
+    use agent_domain::BrainError;
 
     use super::*;
 
@@ -564,5 +667,156 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parses_multiline_gemini_sse_stream() {
+        let events = parse_gemini_sse_stream(
+            r#"event: message
+data: {"candidates":[{"content":{"parts":[{"text":"Good."}]}}]}
+
+data: {"candidates":[{"content":{"parts":[{"functionCall":{"id":"call-2","name":"mark_concept_status","args":{"concept_id":"atp","status":"strong"}}}]}}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":6}}
+
+data: [DONE]
+"#,
+        );
+
+        assert_eq!(
+            events,
+            vec![
+                GeminiStreamEvent::ModelPart {
+                    text: Some("Good.".to_owned()),
+                    part: json!({ "text": "Good." }),
+                },
+                GeminiStreamEvent::FunctionCall {
+                    id: "call-2".to_owned(),
+                    name: "mark_concept_status".to_owned(),
+                    args: json!({ "concept_id": "atp", "status": "strong" }),
+                    part: json!({
+                        "functionCall": {
+                            "id": "call-2",
+                            "name": "mark_concept_status",
+                            "args": { "concept_id": "atp", "status": "strong" }
+                        }
+                    }),
+                },
+                GeminiStreamEvent::Usage {
+                    input_tokens: 4,
+                    output_tokens: 6,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_uses_configured_auth_and_parses_sse_without_network() {
+        let capture = Arc::new(Mutex::new(GeminiRequestCapture::default()));
+        let client = RecordingGeminiSseClient {
+            capture: capture.clone(),
+            response: RecordingGeminiResponse::Body(
+                r#"data: {"candidates":[{"content":{"parts":[{"text":"Continue."}]}}]}"#.to_owned(),
+            ),
+        };
+        let config = GeminiConfig {
+            api_key: "gemini-test-key".to_owned(),
+            base_url: "https://generativelanguage.googleapis.com/v1beta/models".to_owned(),
+            model_id: "gemini-3.5-flash".to_owned(),
+            ..GeminiConfig::default()
+        };
+        let body = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "do not log this answer" }] }],
+        });
+
+        let events = stream_gemini_with_client(&client, &config, body.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events,
+            vec![GeminiStreamEvent::ModelPart {
+                text: Some("Continue.".to_owned()),
+                part: json!({ "text": "Continue." }),
+            }]
+        );
+        let capture = capture.lock().expect("capture lock poisoned");
+        assert_eq!(
+            capture.url.as_deref(),
+            Some("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse")
+        );
+        assert_eq!(capture.api_key.as_deref(), Some("gemini-test-key"));
+        assert_eq!(capture.body.as_ref(), Some(&body));
+        assert!(!capture.url.as_ref().unwrap().contains("gemini-test-key"));
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_sanitizes_provider_and_client_failures() {
+        let prompt_text = "do not leak this prompt or source excerpt";
+        let provider_error_events = parse_gemini_sse_stream(&format!(
+            r#"data: {{"error":{{"message":"provider included {prompt_text}"}}}}"#
+        ));
+
+        assert_eq!(
+            provider_error_events,
+            vec![GeminiStreamEvent::Error(
+                "Gemini stream provider error".to_owned()
+            )]
+        );
+
+        let client = RecordingGeminiSseClient {
+            capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
+            response: RecordingGeminiResponse::Error(format!(
+                "network failure after {prompt_text}"
+            )),
+        };
+        let error = stream_gemini_with_client(
+            &client,
+            &GeminiConfig {
+                api_key: "gemini-test-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [{ "parts": [{ "text": prompt_text }] }] }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Gemini stream request failed"));
+        assert!(!error.contains(prompt_text));
+        assert!(!error.contains("gemini-test-key"));
+    }
+
+    #[derive(Default)]
+    struct GeminiRequestCapture {
+        url: Option<String>,
+        api_key: Option<String>,
+        body: Option<Value>,
+    }
+
+    struct RecordingGeminiSseClient {
+        capture: Arc<Mutex<GeminiRequestCapture>>,
+        response: RecordingGeminiResponse,
+    }
+
+    #[derive(Clone)]
+    enum RecordingGeminiResponse {
+        Body(String),
+        Error(String),
+    }
+
+    #[async_trait]
+    impl GeminiSseClient for RecordingGeminiSseClient {
+        async fn stream(&self, request: GeminiStreamRequest) -> Result<String, BrainError> {
+            let mut capture = self.capture.lock().expect("capture lock poisoned");
+            capture.url = Some(request.url);
+            capture.api_key = Some(request.api_key);
+            capture.body = Some(request.body);
+            drop(capture);
+            match &self.response {
+                RecordingGeminiResponse::Body(body) => Ok(body.clone()),
+                RecordingGeminiResponse::Error(message) => {
+                    Err(BrainError::Connection(message.clone()))
+                }
+            }
+        }
     }
 }
