@@ -1,0 +1,13 @@
+{
+  "type": "event",
+  "version": 1,
+  "event": {
+    "type": "manuscript_intent",
+    "response_id": "response-1",
+    "intent": {
+      "type": "scene_intent",
+      "register": "examining",
+      "emphasis": "measured"
+    }
+  }
+}

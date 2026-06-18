@@ -1,6 +1,7 @@
 use agent_domain::{
-    AnswerEvaluation, AudioFrame, BrainEvent, BrainProviderError, ConceptStatus, SessionConfig,
-    StudyQuestion, StudySessionPhase, StudySessionRecap, StudySourceReference, ToolResult,
+    AnswerEvaluation, AudioFrame, BrainEvent, BrainProviderError, ConceptStatus, ManuscriptIntent,
+    SessionConfig, StudyQuestion, StudySessionPhase, StudySessionRecap, StudySourceReference,
+    ToolResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -126,6 +127,10 @@ pub enum VivaServerEvent {
         concept_id: String,
         status: ConceptStatus,
     },
+    ManuscriptIntent {
+        response_id: String,
+        intent: ManuscriptIntent,
+    },
     RecapReady {
         response_id: String,
         recap: StudySessionRecap,
@@ -188,6 +193,13 @@ impl From<BrainEvent> for VivaServerEvent {
                 response_id,
                 concept_id,
                 status,
+            },
+            BrainEvent::ManuscriptIntent {
+                response_id,
+                intent,
+            } => Self::ManuscriptIntent {
+                response_id,
+                intent,
             },
             BrainEvent::RecapReady { response_id, recap } => {
                 Self::RecapReady { response_id, recap }
@@ -273,6 +285,7 @@ impl ServerFrame {
             | BrainEvent::AnswerEvaluated { .. }
             | BrainEvent::SourceReference { .. }
             | BrainEvent::ConceptStatus { .. }
+            | BrainEvent::ManuscriptIntent { .. }
             | BrainEvent::RecapReady { .. }
             | BrainEvent::AudioDelta { .. }
             | BrainEvent::ResponseAudio { .. }
@@ -362,6 +375,25 @@ mod tests {
             serde_json::to_value(frame).expect("serializes"),
             serde_json::from_str::<serde_json::Value>(include_str!(
                 "../../../fixtures/voice-protocol/server-event-structured-error.json"
+            ))
+            .expect("fixture is valid")
+        );
+    }
+
+    #[test]
+    fn serializes_shared_manuscript_intent_fixture() {
+        let frame = ServerFrame::event(BrainEvent::ManuscriptIntent {
+            response_id: "response-1".to_owned(),
+            intent: agent_domain::ManuscriptIntent::Scene {
+                register: agent_domain::ManuscriptRegister::Examining,
+                emphasis: agent_domain::ManuscriptEmphasis::Measured,
+            },
+        });
+
+        assert_eq!(
+            serde_json::to_value(frame).expect("serializes"),
+            serde_json::from_str::<serde_json::Value>(include_str!(
+                "../../../fixtures/voice-protocol/server-event-manuscript-intent.json"
             ))
             .expect("fixture is valid")
         );
@@ -474,7 +506,7 @@ mod tests {
             .send(BrainInput::Text(answer_text))
             .await
             .expect("sends answer");
-        for _ in 0..11 {
+        for _ in 0..12 {
             push_next_browser_frame(&mut actual, &mut session).await;
         }
         session
@@ -483,6 +515,14 @@ mod tests {
             .await
             .expect("sends cancel");
         push_next_browser_frame(&mut actual, &mut session).await;
+        session
+            .input
+            .send(BrainInput::Stop)
+            .await
+            .expect("sends stop");
+        for _ in 0..2 {
+            push_next_browser_frame(&mut actual, &mut session).await;
+        }
 
         assert_eq!(actual, fixture.server);
         let snapshot = store.snapshot();

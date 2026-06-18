@@ -18,9 +18,9 @@ mod tools;
 
 pub use brain::{
     BrainError, BrainEvent, BrainEventStream, BrainInput, BrainProviderError, BrainUsage,
-    ConceptStatus, Planner, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession,
-    RealtimeSessionTaskGuard, SessionConfig, SourceConfidence, SourceContext, SpeechIntent,
-    StudyMode,
+    ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent, ManuscriptRegister,
+    Planner, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard,
+    SessionConfig, SourceConfidence, SourceContext, SpeechIntent, StudyMode,
 };
 pub use ids::{CallId, SessionId, ToolName};
 pub use ports::{

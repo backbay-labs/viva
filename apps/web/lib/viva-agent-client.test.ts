@@ -151,9 +151,14 @@ describe("Viva agent browser client", () => {
     }
 
     expect(state.question?.question_id).toBe("q-oxidative-phosphorylation-nadh");
-    expect(state.evaluation?.concept_status).toBe("strong");
+    expect(state.evaluation?.concept_status).toBe("shaky");
     expect(state.sources[0]?.source_id).toBe("src-lecture-5-slide-18");
-    expect(state.conceptStatuses["oxidative-phosphorylation"]).toBe("strong");
+    expect(state.conceptStatuses.nadh).toBe("shaky");
+    expect(state.manuscriptIntents.map((event) => event.intent.type)).toEqual([
+      "scene_intent",
+      "marginalia_intent",
+      "entity_intent",
+    ]);
     expect(state.recap?.voice_session_id).toBe("voice-session-1");
     expect(state.phase).toBe("recap");
     expect(state.cancelledResponseIds).toContain("response-2");
@@ -169,6 +174,49 @@ describe("Viva agent browser client", () => {
     });
     const afterStale = vivaAgentReducer(state, stale);
     expect(afterStale.transcript).not.toContain("bad stale text");
+    expect(afterStale.staleEvents).toBe(state.staleEvents + 1);
+  });
+
+  test("reducer stores manuscript intents and suppresses stale intent events", () => {
+    let state = initialVivaAgentSessionState();
+    for (const frame of fullSessionFixture.server.slice(0, 3).map(parseVivaServerFrame)) {
+      state = vivaAgentReducer(state, frame);
+    }
+    expect(state.activeResponseId).toBe("response-1");
+
+    state = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: 1,
+        event: {
+          type: "manuscript_intent",
+          response_id: "response-1",
+          intent: { type: "scene_intent", register: "examining", emphasis: "measured" },
+        },
+      }),
+    );
+    expect(state.manuscriptIntents).toEqual([
+      {
+        responseId: "response-1",
+        intent: { type: "scene_intent", register: "examining", emphasis: "measured" },
+      },
+    ]);
+
+    const afterStale = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: 1,
+        event: {
+          type: "manuscript_intent",
+          response_id: "stale-response",
+          intent: { type: "scene_intent", register: "correcting", emphasis: "marked" },
+        },
+      }),
+    );
+
+    expect(afterStale.manuscriptIntents).toEqual(state.manuscriptIntents);
     expect(afterStale.staleEvents).toBe(state.staleEvents + 1);
   });
 
@@ -221,6 +269,37 @@ describe("Viva agent browser client", () => {
 
     expect(afterCancelledDelta.transcript).toBe("");
     expect(afterCancelledDelta.staleEvents).toBe(state.staleEvents + 1);
+  });
+
+  test("reducer suppresses manuscript intents for a cancelled active response", () => {
+    let state = initialVivaAgentSessionState();
+    for (const frame of fullSessionFixture.server.slice(0, 3).map(parseVivaServerFrame)) {
+      state = vivaAgentReducer(state, frame);
+    }
+    state = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: 1,
+        event: { type: "cancellation", response_id: "response-1" },
+      }),
+    );
+
+    const afterCancelledIntent = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: 1,
+        event: {
+          type: "manuscript_intent",
+          response_id: "response-1",
+          intent: { type: "scene_intent", register: "correcting", emphasis: "marked" },
+        },
+      }),
+    );
+
+    expect(afterCancelledIntent.manuscriptIntents).toEqual([]);
+    expect(afterCancelledIntent.staleEvents).toBe(state.staleEvents + 1);
   });
 
   test("reducer accepts a replacement turn after active response cancellation", () => {

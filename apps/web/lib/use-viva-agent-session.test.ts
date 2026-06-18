@@ -113,4 +113,20 @@ describe("useVivaAgentSession adapter", () => {
     expect(derived.recap?.sourceMoments[0]?.source.documentId).toBe("lec-5");
     expect(derived.canSubmitAnswer).toBe(true);
   });
+
+  test("derives validated manuscript intents for the scene reducer", () => {
+    const derived = deriveVivaAgentUiState({
+      ...initialVivaAgentSessionState(),
+      manuscriptIntents: [
+        {
+          responseId: "response-1",
+          intent: { type: "scene_intent", register: "examining", emphasis: "measured" },
+        },
+      ],
+    });
+
+    expect(derived.manuscriptIntents).toEqual([
+      { type: "scene_intent", register: "examining", emphasis: "measured" },
+    ]);
+  });
 });

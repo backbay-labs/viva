@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import { conceptStatusColor } from "../../lib/viva-session-projection";
 import type { ConceptNode, SessionState } from "./session-data";
 
@@ -192,22 +193,26 @@ export type VoiceTraceLevelRef = { current: VoiceTraceLevel | null };
 
 export function VoiceTraceCanvas({
   state,
+  scene,
   highlightedTokens,
   conceptNodes,
   levelRef,
 }: {
   state: SessionState;
+  scene?: VivaSceneState;
   highlightedTokens?: string[];
   conceptNodes?: ConceptNode[];
   levelRef?: VoiceTraceLevelRef;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef<SessionState>(state);
+  const sceneRef = useRef<VivaSceneState | undefined>(scene);
   const highlightRef = useRef<Set<string>>(new Set());
   const conceptNodesRef = useRef<ConceptNode[]>(conceptNodes ?? []);
   const levelRefHolder = useRef<VoiceTraceLevelRef | null>(levelRef ?? null);
   levelRefHolder.current = levelRef ?? null;
   stateRef.current = state;
+  sceneRef.current = scene;
 
   useEffect(() => {
     highlightRef.current = new Set(highlightedTokens ?? []);
@@ -306,6 +311,11 @@ export function VoiceTraceCanvas({
       cur.connector += (target.connector - cur.connector) * k;
 
       const hl = highlightRef.current;
+      const sceneState = sceneRef.current;
+      const sceneEntityWeights = new Map(
+        (sceneState?.entities ?? []).map((entity) => [entity.id, entity.emphasisWeight]),
+      );
+      const sceneWeight = sceneState?.emphasisWeight ?? 0.25;
       const calm = 1 - cur.calm * 0.55;
       const fs = fontScale();
       const levels = levelRefHolder.current?.current;
@@ -391,9 +401,10 @@ export function VoiceTraceCanvas({
         const y = nodePos[i].y * cssH + Math.cos(t * 0.24 + phase) * 2.4;
         const color = conceptStatusColor(node.status);
         const highlighted = hl.has(node.label);
+        const sceneBoost = sceneEntityWeights.get(node.id) ?? 0;
         const emph = Math.min(
           1.2,
-          node.emphasis * (0.55 + cur.gather * 0.45) + (highlighted ? 0.3 : 0),
+          node.emphasis * (0.55 + cur.gather * 0.45) + sceneBoost * 0.22 + (highlighted ? 0.3 : 0),
         );
 
         // status glow
@@ -458,7 +469,7 @@ export function VoiceTraceCanvas({
       const pulse = Math.max(breath, voice);
       const speaking = agentLevel > userLevel + 0.02;
       const bloomColor = mix(speaking ? GOLD : LAV, OCHRE, cur.warm);
-      const presence = Math.max(cur.marker, 0.45);
+      const presence = Math.max(cur.marker, 0.45 + sceneWeight * 0.12);
       const ringR = (10 + pulse * 10) * fs * (0.7 + cur.marker * 0.4);
       ctx.globalAlpha = 1;
       ctx.strokeStyle = rgba(bloomColor, (0.12 + 0.12 * voice) * presence * calm);
@@ -533,7 +544,13 @@ export function VoiceTraceCanvas({
   }, []);
 
   return (
-    <div aria-hidden="true" className="voice-trace">
+    <div
+      aria-hidden="true"
+      className="voice-trace"
+      data-scene-emphasis={scene?.emphasis ?? "quiet"}
+      data-scene-entity-count={scene?.entities.length ?? 0}
+      data-scene-register={scene?.register ?? "examining"}
+    >
       <canvas className="voice-trace__canvas" ref={canvasRef} />
     </div>
   );
