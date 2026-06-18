@@ -41,9 +41,10 @@ jobs:
       - name: Install browser for E2E gate
         run: bunx playwright install --with-deps chromium
 
-      - name: Browser fake-provider E2E gate
+      - name: Browser synthetic manuscript E2E gate
         env:
-          VIVA_AGENT_PROVIDER: fake_cartesia_gemini
+          VIVA_E2E_AGENT_PROVIDER: synthetic
+          VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "1"
         run: bun run e2e:browser
 
       - name: Sanitized release evidence gate
@@ -51,6 +52,22 @@ jobs:
           VIVA_AGENT_PROVIDER: fake_cartesia_gemini
           VIVA_RELEASE_CHECK_SKIP_BROWSER: "1"
         run: bun run release:check
+
+      - name: Upload sanitized release evidence bundle
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: viva-release-evidence-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            artifacts/release-check/evidence.json
+            artifacts/release-check/*.stdout.log
+            artifacts/release-check/*.stderr.log
+            artifacts/e2e-browser/browser-story.json
+            artifacts/e2e-browser/result.json
+            artifacts/e2e-browser/*.png
+            artifacts/e2e-browser/*.log
 
   durable:
     name: Opt-in durable Postgres proof

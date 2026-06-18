@@ -80,6 +80,7 @@ try {
     path.join(root, "artifacts/e2e-browser"),
     path.join(root, "artifacts/e2e-browser-fake-provider"),
   ]);
+  const outputPath = path.join(artifactDir, "evidence.json");
   const evidence = {
     generated_at: new Date().toISOString(),
     schema: "viva.release_evidence.v1",
@@ -88,6 +89,7 @@ try {
     provider_readiness: providerReadiness,
     browser_e2e: browserResult,
     artifact_audit: artifactAudit,
+    release_bundle: buildReleaseBundleManifest(outputPath, commands, browserResult),
     privacy: {
       raw_audio_persisted: false,
       transcripts_persisted: false,
@@ -98,7 +100,6 @@ try {
   };
 
   auditSanitizedEvidence(evidence);
-  const outputPath = path.join(artifactDir, "evidence.json");
   await writeFile(outputPath, `${JSON.stringify(evidence, null, 2)}\n`);
   console.log(`Sanitized release evidence written to ${path.relative(root, outputPath)}`);
 } catch (error) {
@@ -347,6 +348,23 @@ function auditSanitizedEvidence(evidence) {
   }
 }
 
+function buildReleaseBundleManifest(outputPath, commandRecords, browserResult) {
+  const browserArtifactDir =
+    typeof browserResult.artifact_dir === "string" ? browserResult.artifact_dir : null;
+  const browserFiles = Array.isArray(browserResult.browser_story?.artifact_files)
+    ? browserResult.browser_story.artifact_files.filter(isSafeRelativeArtifactName)
+    : [];
+  return {
+    evidence_json: path.relative(root, outputPath),
+    command_logs: commandRecords.flatMap((record) => [record.stdout_log, record.stderr_log]),
+    browser_story_artifacts:
+      browserArtifactDir === null
+        ? []
+        : browserFiles.map((file) => path.posix.join(browserArtifactDir, file)),
+    workflow_artifact_name: "viva-release-evidence-${{ github.sha }}",
+  };
+}
+
 async function auditGeneratedArtifacts(dirs) {
   const forbidden = [
     "pcm16_base64",
@@ -412,6 +430,15 @@ async function listFiles(dir) {
 
 function isTextArtifact(file) {
   return /\.(json|log|txt|stdout|stderr)$/i.test(file);
+}
+
+function isSafeRelativeArtifactName(name) {
+  return (
+    typeof name === "string" &&
+    name.length > 0 &&
+    !path.isAbsolute(name) &&
+    !name.split(/[\\/]/).includes("..")
+  );
 }
 
 function delay(ms) {
