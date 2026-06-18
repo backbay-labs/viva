@@ -261,6 +261,26 @@ describe("Viva agent browser client", () => {
     expect(controller.getState().phase).toBe("recap");
   });
 
+  test("reducer treats recap_ready as terminal without a trailing session_phase", () => {
+    let state = initialVivaAgentSessionState();
+    for (const frame of fullSessionFixture.server.slice(0, 17).map(parseVivaServerFrame)) {
+      state = vivaAgentReducer(state, frame);
+    }
+
+    expect(state.recap?.voice_session_id).toBe("voice-session-1");
+    expect(state.phase).toBe("recap");
+
+    const stalePhase = parseVivaServerFrame({
+      type: "event",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      event: { type: "session_phase", phase: "correction" },
+    });
+    const afterStalePhase = vivaAgentReducer(state, stalePhase);
+
+    expect(afterStalePhase.phase).toBe("recap");
+    expect(afterStalePhase.recap?.voice_session_id).toBe("voice-session-1");
+  });
+
   test("controller records sanitized close diagnostics when the server closes the socket", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({

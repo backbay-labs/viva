@@ -5,7 +5,9 @@ import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
 import { CorrectionMarginalia } from "./CorrectionMarginalia";
 import { SessionActionButton } from "./SessionActionButton";
+import { SourceChip } from "./SourceChip";
 import { SourceFolio } from "./SourceFolio";
+import { StatusChip } from "./StatusChip";
 import type { Question, SessionState } from "./session-data";
 
 export type TextAnswerState = {
@@ -62,7 +64,7 @@ export function MarginaliaPanel({
   onNextQuestion: () => void;
 }) {
   const isSource = state === "source";
-  const isRecap = isSource && Boolean(recap);
+  const isRecap = state === "recap" && recap !== undefined;
   const studentHandAnswer = textAnswer?.lastAnswer;
 
   return (
@@ -75,17 +77,17 @@ export function MarginaliaPanel({
     >
       <div className="marginalia__head">
         <span className="marginalia__label">
-          {isRecap ? "Recap" : isSource ? "Source" : "Marginalia"}
+          {isRecap ? "Closing fold" : isSource ? "Source" : "Marginalia"}
         </span>
         <Icon
           color="var(--viva-muted)"
-          name={isSource ? "book" : "pen"}
+          name={isSource || isRecap ? "book" : "pen"}
           size={16}
           strokeWidth={1.6}
         />
       </div>
       <div className="marginalia__body" aria-live="polite">
-        {state !== "listening" && !isSource && studentHandAnswer ? (
+        {state !== "listening" && !isSource && !isRecap && studentHandAnswer ? (
           <StudentHand answer={studentHandAnswer} />
         ) : null}
         {state === "listening" ? (
@@ -110,17 +112,14 @@ export function MarginaliaPanel({
             question={question}
           />
         ) : null}
+        {isRecap ? <RecapFold recap={recap} reviewPlan={reviewPlan} /> : null}
         {isSource ? (
-          recap ? (
-            <RecapFold recap={recap} reviewPlan={reviewPlan} />
-          ) : (
-            <SourceFolio
-              onBack={onBackToQuestion}
-              onChallenge={onChallengeSource ?? onTryAgain}
-              question={question}
-              sourceFolio={sourceFolio}
-            />
-          )
+          <SourceFolio
+            onBack={onBackToQuestion}
+            onChallenge={onChallengeSource ?? onTryAgain}
+            question={question}
+            sourceFolio={sourceFolio}
+          />
         ) : null}
       </div>
     </aside>
@@ -289,7 +288,7 @@ function RecapFold({
 }) {
   return (
     <div className="folio recap-fold">
-      <p className="folio__subtitle">Recap ready</p>
+      <p className="folio__subtitle">Closing fold / Recap ready</p>
       <p className="folio__ref">{recap.headline}</p>
       <p className="folio__excerpt">{recap.summary}</p>
       <ul className="recap-fold__list" aria-label="Conductor recap">
@@ -318,17 +317,42 @@ function RecapFold({
               <li key={item.conceptId}>
                 <span>{item.label}</span>
                 <span>
-                  {item.intervalLabel} · core FSRS · {item.explanation[0]}
+                  {item.intervalLabel} · core FSRS · {formatRecapDueDate(item.dueAt)} ·{" "}
+                  {item.explanation[0]}
                 </span>
               </li>
             ))}
           </ul>
         </div>
       ) : null}
-      {recap.sourceMoments[0] ? (
-        <p className="folio__footer">
-          {recap.sourceMoments[0].source.label}: {recap.sourceMoments[0].text}
-        </p>
+      {recap.sourceMoments.length > 0 ? (
+        <div className="recap-fold__sources">
+          <p className="recap-fold__section-title">Source moments</p>
+          <ul>
+            {recap.sourceMoments.map((moment) => (
+              <li className="recap-fold__source" key={`${moment.source.label}-${moment.text}`}>
+                <div className="source-folio__chips">
+                  <SourceChip label={moment.source.label} />
+                  <StatusChip label={recapSourceStatusLabel(moment.status)} />
+                </div>
+                <dl className="source-folio__facts">
+                  <div>
+                    <dt>Confidence</dt>
+                    <dd>{recapSourceConfidenceLabel(moment.source.confidence)}</dd>
+                  </div>
+                  <div>
+                    <dt>Span</dt>
+                    <dd>{recapSourceSpanLabel(moment.source)}</dd>
+                  </div>
+                </dl>
+                <div className="source-folio__excerpt">
+                  <p>{moment.source.excerpt || moment.text}</p>
+                </div>
+                <p className="source-folio__caveat">{moment.text}</p>
+              </li>
+            ))}
+          </ul>
+        </div>
       ) : null}
       <p className="folio__footer">Conductor next action: {recap.nextAction}</p>
     </div>
@@ -337,6 +361,56 @@ function RecapFold({
 
 function joinRecapItems(items: string[]) {
   return items.length > 0 ? items.join(", ") : "none yet";
+}
+
+function recapSourceConfidenceLabel(
+  confidence: SessionRecap["sourceMoments"][number]["source"]["confidence"],
+) {
+  switch (confidence) {
+    case "high":
+      return "High confidence";
+    case "medium":
+      return "Medium confidence";
+    case "low":
+      return "Low confidence";
+  }
+}
+
+function recapSourceSpanLabel(source: SessionRecap["sourceMoments"][number]["source"]): string {
+  if (source.documentId && source.span) return `${source.documentId} · ${source.span}`;
+  return source.span ?? source.documentId ?? "bounded span unavailable";
+}
+
+function recapSourceStatusLabel(status: SessionRecap["sourceMoments"][number]["status"]): string {
+  switch (status) {
+    case "strong":
+      return "Strong";
+    case "shaky":
+      return "Shaky";
+    case "missed":
+      return "Missed";
+    case "review":
+      return "Review";
+  }
+}
+
+const DUE_MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+] as const;
+
+function formatRecapDueDate(dueAt: Date) {
+  return `Due ${DUE_MONTHS[dueAt.getUTCMonth()]} ${dueAt.getUTCDate()}, ${dueAt.getUTCFullYear()}`;
 }
 
 function ThinkingNote({ question }: { question: Question }) {

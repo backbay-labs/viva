@@ -1,9 +1,9 @@
 "use client";
 
-import { seedStudySets } from "@viva/core";
+import { type SessionRecap, seedStudySets } from "@viva/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePrefersReducedMotion } from "../../lib/use-prefers-reduced-motion";
-import { useVivaAgentSession } from "../../lib/use-viva-agent-session";
+import { useVivaAgentSession, type VivaAgentDerivedState } from "../../lib/use-viva-agent-session";
 import {
   fetchVivaAgentReadinessProbe,
   type VivaAgentReadinessProbe,
@@ -328,14 +328,6 @@ export function LiveSessionPage() {
   // Stable session-start reference so FSRS review intervals are deterministic
   // across renders (and don't recompute the projection every tick).
   const sessionStart = useRef(new Date()).current;
-  const projection = useMemo(
-    () => projectTrace(agent.derived, agent.status, sessionStart),
-    [agent.derived, agent.status, sessionStart],
-  );
-  const sourceFolio = useMemo(
-    () => projectSourceFolio(agent.derived, sessionStart),
-    [agent.derived, sessionStart],
-  );
   const recapPlan = useMemo(
     () =>
       recapPlanFromSessionEvents({
@@ -346,6 +338,18 @@ export function LiveSessionPage() {
         studySet: activeStudySet,
       }),
     [activeStudySet, agent.derived.conceptStatuses, agent.derived.recap, hintUsed, sessionStart],
+  );
+  const projectedDerived = useMemo(
+    () => derivedStateWithProjectedRecap(agent.derived, recapPlan.recap),
+    [agent.derived, recapPlan.recap],
+  );
+  const projection = useMemo(
+    () => projectTrace(projectedDerived, agent.status, sessionStart),
+    [projectedDerived, agent.status, sessionStart],
+  );
+  const sourceFolio = useMemo(
+    () => projectSourceFolio(agent.derived, sessionStart),
+    [agent.derived, sessionStart],
   );
   const conceptNodes = useMemo(
     () => projectConceptNodes(activeStudySet.concepts, agent.agentState.conceptStatuses),
@@ -378,16 +382,21 @@ export function LiveSessionPage() {
     agent.derived.question,
     agent.derived.sources,
   ]);
-  const effectiveState: SessionState = sourceOpen
-    ? "source"
-    : textRetryOpen
-      ? "listening"
-      : projection.state;
-  const highlightedTokens = sourceOpen
-    ? projectHighlightedTokens("source", agent.derived)
-    : textRetryOpen
-      ? projectHighlightedTokens("listening", agent.derived)
-      : projection.highlightedTokens;
+  const isRecap = projection.state === "recap";
+  const effectiveState: SessionState = isRecap
+    ? "recap"
+    : sourceOpen
+      ? "source"
+      : textRetryOpen
+        ? "listening"
+        : projection.state;
+  const highlightedTokens = isRecap
+    ? projection.highlightedTokens
+    : sourceOpen
+      ? projectHighlightedTokens("source", agent.derived)
+      : textRetryOpen
+        ? projectHighlightedTokens("listening", agent.derived)
+        : projection.highlightedTokens;
   const runtime = useMemo(
     () =>
       projectRuntimeCopy({
@@ -518,6 +527,13 @@ export function enterTextAnswerMode(
 export function textAnswerPayload(answer: string): string | null {
   const trimmed = answer.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+export function derivedStateWithProjectedRecap(
+  derived: VivaAgentDerivedState,
+  recap?: SessionRecap,
+): VivaAgentDerivedState {
+  return recap ? { ...derived, recap } : derived;
 }
 
 function readBrowserSessionRouteIdentity() {
