@@ -24,7 +24,9 @@ pub use brain::{
 };
 pub use ids::{CallId, SessionId, ToolName};
 pub use ports::{
-    CreatePasteStudySet, PortError, SessionStore, StudyConceptSummary, StudyDocumentSummary,
+    CreatePasteStudySet, LibraryNextReviewSummary, LibrarySessionRecapSummary,
+    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
+    SessionStore, StudyConceptSummary, StudyDocumentSummary, StudyLibrarySnapshot,
     StudyMemoryStore, StudySetIngestionRecord, StudySetIngestionStatus, StudySetSummary,
     StudySourceSpanSummary, StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts,
     ToolIssuer, VoiceUsageRecord,

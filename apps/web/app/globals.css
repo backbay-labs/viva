@@ -2625,6 +2625,115 @@ button {
   animation: vivaFadeUp 1.2s ease 0.7s both;
 }
 
+.viva-library {
+  background: #f7f1e8;
+  border-top: 1px solid var(--viva-border);
+  padding: clamp(1.5rem, 4vw, 3rem);
+}
+
+.viva-library__inner {
+  display: grid;
+  gap: 1.2rem;
+  margin: 0 auto;
+  max-width: 72rem;
+}
+
+.viva-library__section {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.viva-library__header {
+  align-items: end;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.viva-library__header h2 {
+  color: var(--viva-ink);
+  font-family: var(--serif);
+  font-size: clamp(1.5rem, 3vw, 2rem);
+  line-height: 1;
+  margin: 0;
+}
+
+.viva-library__header span {
+  color: var(--viva-muted);
+  font-size: 0.86rem;
+  font-weight: 650;
+}
+
+.viva-library__grid {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.viva-library__row {
+  align-items: center;
+  background: rgba(255, 253, 248, 0.84);
+  border: 1px solid var(--viva-border);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.8rem;
+  grid-template-columns: minmax(12rem, 1.2fr) minmax(14rem, 2fr) auto;
+  padding: 0.9rem;
+}
+
+.viva-library__row h3 {
+  color: var(--viva-ink);
+  font-size: 1rem;
+  line-height: 1.15;
+  margin: 0;
+}
+
+.viva-library__row p {
+  color: var(--viva-muted);
+  font-size: 0.84rem;
+  margin: 0.2rem 0 0;
+}
+
+.viva-library__meta {
+  color: var(--viva-ink-soft);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.viva-library__meta span {
+  background: rgba(255, 255, 255, 0.56);
+  border: 1px solid rgba(64, 42, 82, 0.1);
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 650;
+  line-height: 1.2;
+  padding: 0.34rem 0.55rem;
+}
+
+.viva-library__actions {
+  display: flex;
+  gap: 0.45rem;
+  justify-content: flex-end;
+}
+
+.viva-library__actions button {
+  background: var(--viva-ink);
+  border: 1px solid var(--viva-ink);
+  border-radius: 8px;
+  color: var(--viva-paper);
+  cursor: pointer;
+  font-weight: 750;
+  min-height: 2.2rem;
+  padding: 0.48rem 0.72rem;
+}
+
+.viva-library__actions button:disabled {
+  background: transparent;
+  border-color: rgba(64, 42, 82, 0.2);
+  color: var(--viva-muted);
+  cursor: not-allowed;
+}
+
 @keyframes vivaFadeUp {
   from {
     opacity: 0;
@@ -2652,6 +2761,20 @@ button {
    center with the copy, so it becomes a top band (face high, hair flowing) that
    melts into the parchment, and the copy drops onto the clean ground below. */
 @media (max-width: 900px) {
+  .viva-library__header {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  .viva-library__row {
+    align-items: stretch;
+    grid-template-columns: 1fr;
+  }
+
+  .viva-library__actions {
+    justify-content: start;
+  }
+
   .viva-copy__headline {
     font-size: clamp(3.4rem, 9vw, 5rem);
   }

@@ -5,8 +5,10 @@ use std::{
 };
 
 use agent_domain::{
-    AnswerEvaluation, ConceptStatus, CreatePasteStudySet, PortError, SessionConfig, SessionStore,
-    SourceConfidence, StudyConceptSummary, StudyDocumentSummary, StudyMemoryStore, StudyMode,
+    AnswerEvaluation, ConceptStatus, CreatePasteStudySet, LibraryNextReviewSummary,
+    LibrarySessionRecapSummary, LibrarySessionSummary, LibraryStudyDocumentSummary,
+    LibraryStudySetSummary, PortError, SessionConfig, SessionStore, SourceConfidence,
+    StudyConceptSummary, StudyDocumentSummary, StudyLibrarySnapshot, StudyMemoryStore, StudyMode,
     StudyQuestion, StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus,
     StudySetSummary, StudySourceReference, StudySourceSpanSummary, StudyStoreBackend,
     StudyStoreCapabilities, StudyStoreWriteCounts,
@@ -681,6 +683,40 @@ impl InMemoryStudyStore {
             return Ok(Some(record.question.clone()));
         }
         Ok(None)
+    }
+
+    fn retrievable_question_count_locked(
+        state: &InMemoryStudyState,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> usize {
+        let Some(study_set) = state.study_sets.get(study_set_id) else {
+            return 0;
+        };
+        if study_set.user_id != user_id
+            || study_set.ingestion_status != StudySetIngestionStatus::Ready
+        {
+            return 0;
+        }
+        study_set
+            .question_ids
+            .iter()
+            .filter_map(|question_id| {
+                state
+                    .questions
+                    .get(&question_key(study_set_id, question_id))
+            })
+            .filter(|record| record.active)
+            .filter(|record| {
+                Self::source_reference_locked(
+                    state,
+                    user_id,
+                    study_set_id,
+                    &record.question.source.source_id,
+                )
+                .is_some_and(|source| source == record.question.source)
+            })
+            .count()
     }
 }
 
@@ -1697,6 +1733,164 @@ impl StudyMemoryStore for InMemoryStudyStore {
             "concepts": concepts,
             "questions": questions,
         })))
+    }
+
+    async fn library_snapshot(&self, user_id: &str) -> Result<StudyLibrarySnapshot, PortError> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+
+        let mut study_sets = state
+            .study_sets
+            .values()
+            .filter(|study_set| study_set.user_id == user_id)
+            .map(|study_set| {
+                let mut documents = state
+                    .documents
+                    .values()
+                    .filter(|document| document.study_set_id == study_set.study_set_id)
+                    .map(|document| LibraryStudyDocumentSummary {
+                        id: document.document_id.clone(),
+                        display_name: document.title.clone(),
+                        source_kind: document.source_kind.clone(),
+                        processing_status: document.processing_status.clone(),
+                        deleted: document.tombstoned,
+                    })
+                    .collect::<Vec<_>>();
+                documents.sort_by(|a, b| {
+                    a.display_name
+                        .cmp(&b.display_name)
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                let question_count = Self::retrievable_question_count_locked(
+                    &state,
+                    user_id,
+                    &study_set.study_set_id,
+                );
+                let open_session_id = state
+                    .sessions
+                    .iter()
+                    .rev()
+                    .find(|session| {
+                        session.user_id == user_id
+                            && session.study_set_id == study_set.study_set_id
+                            && session.status == "open"
+                    })
+                    .map(|session| session.voice_session_id.clone());
+
+                LibraryStudySetSummary {
+                    id: study_set.study_set_id.clone(),
+                    user_id: study_set.user_id.clone(),
+                    title: study_set.title.clone(),
+                    course: study_set.course.clone(),
+                    ingestion_status: study_set.ingestion_status.clone(),
+                    ingestion_error: study_set.ingestion_error.clone(),
+                    server_owned: true,
+                    documents,
+                    concept_count: study_set.concept_ids.len(),
+                    question_count,
+                    open_session_id,
+                }
+            })
+            .collect::<Vec<_>>();
+        study_sets.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.id.cmp(&b.id)));
+
+        let mut sessions = state
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.user_id == user_id
+                    && session.status == "closed"
+                    && session.terminal_reason.as_deref() == Some("completed")
+            })
+            .map(|session| {
+                let study_set_title = state
+                    .study_sets
+                    .get(&session.study_set_id)
+                    .map(|study_set| study_set.title.clone())
+                    .unwrap_or_else(|| session.study_set_id.clone());
+                let recap = state
+                    .recaps
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        record.user_id == user_id
+                            && record.study_set_id == session.study_set_id
+                            && record.voice_session_id == session.voice_session_id
+                    })
+                    .map(|record| LibrarySessionRecapSummary {
+                        voice_session_id: record.recap.voice_session_id.clone(),
+                        strong_concepts: record.recap.strong_concepts.clone(),
+                        shaky_concepts: record.recap.shaky_concepts.clone(),
+                        missed_concepts: record.recap.missed_concepts.clone(),
+                        review_later: record.recap.review_later.clone(),
+                    });
+                let next_review = state
+                    .review_items
+                    .iter()
+                    .filter(|review| {
+                        review.user_id == user_id
+                            && review.study_set_id == session.study_set_id
+                            && review.voice_session_id == session.voice_session_id
+                    })
+                    .min_by(|a, b| {
+                        a.due_at
+                            .cmp(&b.due_at)
+                            .then_with(|| a.concept_id.cmp(&b.concept_id))
+                    })
+                    .map(|review| {
+                        let concept = state
+                            .concepts
+                            .get(&concept_key(&review.study_set_id, &review.concept_id));
+                        let status = state
+                            .concept_statuses
+                            .iter()
+                            .rev()
+                            .find(|record| {
+                                record.user_id == user_id
+                                    && record.study_set_id == review.study_set_id
+                                    && record.voice_session_id == review.voice_session_id
+                                    && record.concept_id == review.concept_id
+                            })
+                            .map(|record| record.status.clone())
+                            .or_else(|| concept.map(|record| record.status.clone()))
+                            .unwrap_or(ConceptStatus::Review);
+
+                        LibraryNextReviewSummary {
+                            concept_id: review.concept_id.clone(),
+                            label: concept
+                                .map(|record| record.label.clone())
+                                .unwrap_or_else(|| review.concept_id.clone()),
+                            status,
+                            persisted_due_at: review.due_at.clone(),
+                            source: "persisted_review_item".to_owned(),
+                        }
+                    });
+
+                LibrarySessionSummary {
+                    voice_session_id: session.voice_session_id.clone(),
+                    user_id: session.user_id.clone(),
+                    study_set_id: session.study_set_id.clone(),
+                    study_set_title,
+                    status: session.status.clone(),
+                    terminal_reason: session.terminal_reason.clone(),
+                    recap,
+                    next_review,
+                }
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|a, b| {
+            b.voice_session_id
+                .cmp(&a.voice_session_id)
+                .then_with(|| a.study_set_title.cmp(&b.study_set_title))
+        });
+
+        Ok(StudyLibrarySnapshot {
+            user_id: user_id.to_owned(),
+            study_sets,
+            sessions,
+        })
     }
 
     async fn active_question(

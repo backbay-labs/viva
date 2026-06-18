@@ -1,0 +1,191 @@
+import { describe, expect, test } from "bun:test";
+import { projectLibrarySnapshot, type VivaLibrarySnapshot } from "./viva-library";
+
+const snapshot: VivaLibrarySnapshot = {
+  user_id: "user-1",
+  study_sets: [
+    {
+      id: "biology-midterm",
+      user_id: "user-1",
+      title: "Biology Midterm",
+      course: "Biology 201",
+      ingestion_status: "ready",
+      ingestion_error: null,
+      server_owned: true,
+      documents: [
+        {
+          id: "lec-5",
+          display_name: "Lecture 5",
+          source_kind: "pdf",
+          processing_status: "ready",
+          deleted: false,
+        },
+      ],
+      concept_count: 2,
+      question_count: 1,
+      actions: {
+        start: {
+          available: true,
+          session_id: "start-session-1",
+          session_token: "viva1.start-token",
+        },
+        resume: { available: false, unavailable_reason: "no_open_session" },
+        archive: { available: false, unavailable_reason: "server_mutation_unavailable" },
+        delete: { available: false, unavailable_reason: "server_mutation_unavailable" },
+      },
+    },
+    {
+      id: "pending-set",
+      user_id: "user-1",
+      title: "Pending Set",
+      course: null,
+      ingestion_status: "pending",
+      ingestion_error: null,
+      server_owned: true,
+      documents: [],
+      concept_count: 0,
+      question_count: 0,
+      actions: {
+        start: { available: false, unavailable_reason: "ingestion_pending" },
+        resume: { available: false, unavailable_reason: "ingestion_pending" },
+        archive: { available: false, unavailable_reason: "server_mutation_unavailable" },
+        delete: { available: false, unavailable_reason: "server_mutation_unavailable" },
+      },
+    },
+    {
+      id: "failed-set",
+      user_id: "user-1",
+      title: "Failed Set",
+      course: null,
+      ingestion_status: "failed",
+      ingestion_error: "No usable source span",
+      server_owned: true,
+      documents: [],
+      concept_count: 0,
+      question_count: 0,
+      actions: {
+        start: { available: false, unavailable_reason: "ingestion_failed" },
+        resume: { available: false, unavailable_reason: "ingestion_failed" },
+        archive: { available: false, unavailable_reason: "server_mutation_unavailable" },
+        delete: { available: false, unavailable_reason: "server_mutation_unavailable" },
+      },
+    },
+    {
+      id: "deleted-document-set",
+      user_id: "user-1",
+      title: "Deleted Document Set",
+      course: null,
+      ingestion_status: "ready",
+      ingestion_error: null,
+      server_owned: true,
+      documents: [
+        {
+          id: "deleted-doc",
+          display_name: "Archived lecture",
+          source_kind: "pdf",
+          processing_status: "ready",
+          deleted: true,
+        },
+      ],
+      concept_count: 0,
+      question_count: 0,
+      actions: {
+        start: { available: false, unavailable_reason: "source_deleted" },
+        resume: { available: false, unavailable_reason: "source_deleted" },
+        archive: { available: false, unavailable_reason: "server_mutation_unavailable" },
+        delete: { available: false, unavailable_reason: "server_mutation_unavailable" },
+      },
+    },
+  ],
+  sessions: [
+    {
+      voice_session_id: "voice-session-1",
+      study_set_id: "biology-midterm",
+      study_set_title: "Biology Midterm",
+      status: "closed",
+      terminal_reason: "completed",
+      recap: {
+        voice_session_id: "voice-session-1",
+        strong_concepts: ["oxidative-phosphorylation"],
+        shaky_concepts: ["nadh"],
+        missed_concepts: [],
+        review_later: ["nadh"],
+      },
+      next_review: {
+        concept_id: "nadh",
+        label: "NADH",
+        status: "shaky",
+        persisted_due_at: "2099-01-01T00:00:00Z",
+        source: "persisted_review_item",
+      },
+    },
+  ],
+};
+
+describe("Viva library projection", () => {
+  test("renders server-owned study set rows without local-only mutations", () => {
+    const projection = projectLibrarySnapshot(snapshot, {
+      now: new Date("2026-06-17T12:00:00Z"),
+    });
+
+    expect(projection.libraryRows.map((row) => row.id)).toEqual([
+      "biology-midterm",
+      "pending-set",
+      "failed-set",
+      "deleted-document-set",
+    ]);
+    expect(projection.libraryRows[0]?.statusLabel).toBe("Ready");
+    expect(projection.libraryRows[0]?.start.available).toBe(true);
+    expect(projection.libraryRows[0]?.start.sessionToken).toBe("viva1.start-token");
+    expect(projection.libraryRows[1]?.statusLabel).toBe("Ingestion pending");
+    expect(projection.libraryRows[2]?.statusLabel).toBe("Ingestion failed");
+    expect(projection.libraryRows[2]?.detail).toBe("No usable source span");
+    expect(projection.libraryRows[3]?.statusLabel).toBe("Source archived");
+    expect(projection.libraryRows[3]?.start.available).toBe(false);
+    expect(projection.libraryRows[3]?.delete.available).toBe(false);
+    expect(projection.libraryRows[3]?.archive.unavailableReason).toBe(
+      "server_mutation_unavailable",
+    );
+  });
+
+  test("does not expose start or resume actions without server-issued session tokens", () => {
+    const readyStudySet = snapshot.study_sets[0];
+    if (!readyStudySet) throw new Error("test fixture must include a ready study set");
+    const unsignedSnapshot: VivaLibrarySnapshot = {
+      ...snapshot,
+      study_sets: [
+        {
+          ...readyStudySet,
+          actions: {
+            ...readyStudySet.actions,
+            start: {
+              available: true,
+              session_id: "unsigned-start-session",
+              session_token: null,
+            },
+          },
+        },
+      ],
+      sessions: [],
+    };
+
+    const projection = projectLibrarySnapshot(unsignedSnapshot);
+
+    expect(projection.libraryRows[0]?.start.available).toBe(false);
+    expect(projection.libraryRows[0]?.start.unavailableReason).toBe("session_token_unavailable");
+  });
+
+  test("formats completed-session next review from the persisted server schedule only", () => {
+    const projection = projectLibrarySnapshot(snapshot, {
+      now: new Date("2026-06-17T12:00:00Z"),
+    });
+
+    const session = projection.sessionRows[0];
+    expect(session?.statusLabel).toBe("Completed");
+    expect(session?.recapLabel).toBe("1 strong · 1 shaky");
+    expect(session?.nextReview?.conceptId).toBe("nadh");
+    expect(session?.nextReview?.authority).toBe("server_persisted");
+    expect(session?.nextReview?.intervalLabel).toBe("due Jan 1, 2099");
+    expect(session?.nextReview?.persistedDueAt).toBe("2099-01-01T00:00:00Z");
+  });
+});

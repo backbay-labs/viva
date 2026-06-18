@@ -106,10 +106,6 @@ impl ServiceConfig {
     }
 
     pub fn validate(&self) -> Result<(), ServiceConfigError> {
-        if self.ws_access.required_bearer.is_some() && self.ws_access.session_token_secret.is_some()
-        {
-            return Err(ServiceConfigError::AmbiguousVoiceWsAuth);
-        }
         if self.bind_addr.ip().is_loopback() {
             return Ok(());
         }
@@ -199,10 +195,6 @@ pub enum ServiceConfigError {
     PublicBindMissingAuth(SocketAddr),
     #[error("public or non-loopback bind `{0}` requires VIVA_VOICE_WS_ALLOWED_ORIGINS")]
     PublicBindMissingAllowedOrigins(SocketAddr),
-    #[error(
-        "VIVA_VOICE_WS_BEARER_TOKEN and VIVA_VOICE_SESSION_TOKEN_SECRET are mutually exclusive"
-    )]
-    AmbiguousVoiceWsAuth,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -542,8 +534,9 @@ mod tests {
     }
 
     #[test]
-    fn service_config_validation_rejects_ambiguous_bearer_and_session_token_auth() {
+    fn service_config_validation_accepts_rest_bearer_plus_session_token_signing() {
         let config = ServiceConfig {
+            bind_addr: "0.0.0.0:4318".parse().expect("valid public bind"),
             ws_access: VoiceWsAccess {
                 required_bearer: Some("secret".to_owned()),
                 session_token_secret: Some("session-secret".to_owned()),
@@ -552,10 +545,7 @@ mod tests {
             ..ServiceConfig::default()
         };
 
-        assert_eq!(
-            config.validate(),
-            Err(ServiceConfigError::AmbiguousVoiceWsAuth)
-        );
+        assert_eq!(config.validate(), Ok(()));
     }
 
     #[test]

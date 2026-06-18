@@ -20,7 +20,7 @@ import {
 } from "../../lib/viva-audio-playback";
 import { recapPlanFromSessionEvents } from "../../lib/viva-display";
 import { vivaSceneReducer } from "../../lib/viva-scene-reducer";
-import { sessionTokenFromSearch } from "../../lib/viva-session-entry";
+import { sessionRouteIdentityFromSearch } from "../../lib/viva-session-entry";
 import {
   projectConceptNodes,
   projectHighlightedTokens,
@@ -59,7 +59,19 @@ type WindowWithWebkitAudioContext = Window &
 
 export function LiveSessionPage() {
   const reducedMotion = usePrefersReducedMotion();
-  const [sessionToken] = useState(readBrowserSessionToken);
+  const [routeIdentity] = useState(readBrowserSessionRouteIdentity);
+  const activeStudySet = useMemo(
+    () => ({
+      ...STUDY_SET,
+      id: routeIdentity.studySetId ?? STUDY_SET.id,
+      userId: routeIdentity.userId ?? STUDY_SET.userId,
+      sessionId: routeIdentity.sessionId ?? STUDY_SET.sessionId,
+      sessionToken: routeIdentity.sessionToken ?? STUDY_SET.sessionToken,
+      serverOwned: routeIdentity.studySetId ? true : STUDY_SET.serverOwned,
+      ingestionStatus: routeIdentity.studySetId ? ("ready" as const) : STUDY_SET.ingestionStatus,
+    }),
+    [routeIdentity],
+  );
   const [elapsed, setElapsed] = useState(0);
   const [hintShown, setHintShown] = useState(false);
   const [hintUsed, setHintUsed] = useState(false);
@@ -70,11 +82,11 @@ export function LiveSessionPage() {
 
   const agent = useVivaAgentSession({
     mode: "quiz",
-    sessionId: process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID,
-    sessionToken,
-    studySet: STUDY_SET,
+    sessionId: routeIdentity.sessionId ?? process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID,
+    sessionToken: routeIdentity.sessionToken,
+    studySet: activeStudySet,
     trustedStudySetId: process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID,
-    userId: process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID,
+    userId: routeIdentity.userId ?? process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID,
   });
   const agentRef = useRef(agent);
   agentRef.current = agent;
@@ -270,17 +282,17 @@ export function LiveSessionPage() {
         now: sessionStart,
         recap: agent.derived.recap,
         signals: { hinted: hintUsed },
-        studySet: STUDY_SET,
+        studySet: activeStudySet,
       }),
-    [agent.derived.conceptStatuses, agent.derived.recap, hintUsed, sessionStart],
+    [activeStudySet, agent.derived.conceptStatuses, agent.derived.recap, hintUsed, sessionStart],
   );
   const conceptNodes = useMemo(
-    () => projectConceptNodes(STUDY_SET.concepts, agent.agentState.conceptStatuses),
-    [agent.agentState.conceptStatuses],
+    () => projectConceptNodes(activeStudySet.concepts, agent.agentState.conceptStatuses),
+    [activeStudySet.concepts, agent.agentState.conceptStatuses],
   );
   const scene = useMemo(() => {
     const knownEntityIds = new Set<string>([
-      ...STUDY_SET.concepts.map((concept) => concept.id),
+      ...activeStudySet.concepts.map((concept) => concept.id),
       "hint-1",
       "source-folio",
       "correction-note",
@@ -299,7 +311,12 @@ export function LiveSessionPage() {
     return vivaSceneReducer(agent.derived.manuscriptIntents, {
       knownEntityIds: [...knownEntityIds],
     });
-  }, [agent.derived.manuscriptIntents, agent.derived.question, agent.derived.sources]);
+  }, [
+    activeStudySet.concepts,
+    agent.derived.manuscriptIntents,
+    agent.derived.question,
+    agent.derived.sources,
+  ]);
   const effectiveState: SessionState = sourceOpen ? "source" : projection.state;
   const highlightedTokens = sourceOpen
     ? projectHighlightedTokens("source", agent.derived)
@@ -327,8 +344,8 @@ export function LiveSessionPage() {
   );
   const sessionContextLabel =
     agent.readiness.reason === "trusted"
-      ? `Trusted server set: ${STUDY_SET.title}`
-      : `Local demo set: ${STUDY_SET.title}`;
+      ? `Trusted server set: ${activeStudySet.title}`
+      : `Local demo set: ${activeStudySet.title}`;
 
   return (
     <LiveSessionShell
@@ -373,32 +390,28 @@ export function stopCaptureForRecap(
   levelRef.current.user = 0;
 }
 
-function readBrowserSessionToken(): string | null {
+function readBrowserSessionRouteIdentity() {
   const envToken = process.env.NEXT_PUBLIC_VIVA_VOICE_SESSION_TOKEN?.trim() || null;
-  if (typeof window === "undefined") return envToken;
-
-  const queryToken = sessionTokenFromSearch(window.location.search);
-  const storedToken = readStoredSessionToken();
-  const token = queryToken ?? storedToken ?? envToken;
-  if (queryToken) writeStoredSessionToken(queryToken);
-  return token;
-}
-
-function readStoredSessionToken(): string | null {
-  try {
-    const token = window.sessionStorage.getItem("viva.sessionToken")?.trim();
-    return token || null;
-  } catch {
-    return null;
+  if (typeof window === "undefined") {
+    return {
+      ...sessionRouteIdentityFromSearch(""),
+      sessionToken: envToken,
+    };
   }
-}
 
-function writeStoredSessionToken(token: string) {
-  try {
-    window.sessionStorage.setItem("viva.sessionToken", token);
-  } catch {
-    // Private browsing or storage policy failures should not block no-key mode.
+  const routeIdentity = sessionRouteIdentityFromSearch(window.location.search);
+  if (
+    routeIdentity.userId ||
+    routeIdentity.studySetId ||
+    routeIdentity.sessionId ||
+    routeIdentity.sessionToken
+  ) {
+    return routeIdentity;
   }
+  return {
+    ...routeIdentity,
+    sessionToken: envToken,
+  };
 }
 
 function initialReadinessProbe(): VivaAgentReadinessProbe {

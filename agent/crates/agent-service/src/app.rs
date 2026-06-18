@@ -7,10 +7,12 @@ use std::{
 };
 
 use agent_domain::{
-    BrainUsage, CreatePasteStudySet, RealtimeBrain, StudyMemoryStore, StudySetIngestionRecord,
+    BrainUsage, CreatePasteStudySet, LibrarySessionSummary, LibraryStudyDocumentSummary,
+    LibraryStudySetSummary, RealtimeBrain, StudyMemoryStore, StudySetIngestionRecord,
     StudySetIngestionStatus, VoiceUsageRecord,
 };
 use axum::{
+    extract::Query,
     http::{header, HeaderMap, HeaderValue, StatusCode},
     routing::{get, post},
     Json, Router,
@@ -134,6 +136,7 @@ pub fn build_router(state: AppState) -> Router {
             "/study-sets/paste",
             post(create_paste_study_set).options(paste_options),
         )
+        .route("/study-sets/library", get(library_snapshot))
         .route("/ws", get(voice_ws))
         .with_state(state)
 }
@@ -382,6 +385,52 @@ struct PasteStudySetResponse {
     record: StudySetIngestionRecord,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct LibrarySnapshotQuery {
+    user_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LibrarySnapshotResponse {
+    user_id: String,
+    study_sets: Vec<LibraryStudySetResponse>,
+    sessions: Vec<LibrarySessionSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LibraryStudySetResponse {
+    id: String,
+    user_id: String,
+    title: String,
+    course: Option<String>,
+    ingestion_status: StudySetIngestionStatus,
+    ingestion_error: Option<String>,
+    server_owned: bool,
+    documents: Vec<LibraryStudyDocumentSummary>,
+    concept_count: usize,
+    question_count: usize,
+    actions: LibraryStudySetActions,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LibraryStudySetActions {
+    start: LibraryAction,
+    resume: LibraryAction,
+    archive: LibraryAction,
+    delete: LibraryAction,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LibraryAction {
+    available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable_reason: Option<&'static str>,
+}
+
 async fn paste_options(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
@@ -390,6 +439,116 @@ async fn paste_options(
         Ok(headers) => (StatusCode::NO_CONTENT, headers),
         Err(_) => (StatusCode::FORBIDDEN, HeaderMap::new()),
     }
+}
+
+async fn library_snapshot(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Query(query): Query<LibrarySnapshotQuery>,
+    headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let response_headers = match optional_cors_json_headers(&state.ws_access, &headers) {
+        Ok(headers) => headers,
+        Err(error) => return cors_json_error(error),
+    };
+    let user_id = query
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&state.trusted_user_id);
+    if !state.unauthenticated_paste_allowed || user_id != state.trusted_user_id {
+        if state.ws_access.required_bearer.is_none() {
+            return (
+                StatusCode::FORBIDDEN,
+                response_headers,
+                Json(json!({
+                    "error": "library_snapshot_auth_required",
+                    "message": "cross-user library snapshots require authenticated REST access",
+                })),
+            );
+        }
+        if let Err(error) = state.ws_access.validate_headers(&headers) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                response_headers,
+                Json(json!({
+                    "error": "library_snapshot_auth_failed",
+                    "message": error.to_string(),
+                })),
+            );
+        }
+    }
+    let snapshot = match state.study_store.library_snapshot(user_id).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                response_headers,
+                Json(json!({
+                    "error": "library_snapshot_failed",
+                    "message": error.to_string(),
+                })),
+            );
+        }
+    };
+    let study_sets = snapshot
+        .study_sets
+        .into_iter()
+        .map(|study_set| {
+            let unavailable_reason = study_set_start_unavailable_reason(&study_set);
+            let start = match unavailable_reason {
+                Some(reason) => unavailable_action(reason),
+                None => {
+                    let session_id = Uuid::new_v4().to_string();
+                    signed_library_action(&state, &study_set.user_id, &study_set.id, session_id)
+                }
+            };
+            let resume = match (unavailable_reason, study_set.open_session_id.clone()) {
+                (Some(reason), _) => unavailable_action(reason),
+                (None, Some(session_id)) => {
+                    signed_library_action(&state, &study_set.user_id, &study_set.id, session_id)
+                }
+                (None, None) => unavailable_action("no_open_session"),
+            };
+
+            LibraryStudySetResponse {
+                id: study_set.id,
+                user_id: study_set.user_id,
+                title: study_set.title,
+                course: study_set.course,
+                ingestion_status: study_set.ingestion_status,
+                ingestion_error: study_set.ingestion_error,
+                server_owned: study_set.server_owned,
+                documents: study_set.documents,
+                concept_count: study_set.concept_count,
+                question_count: study_set.question_count,
+                actions: LibraryStudySetActions {
+                    start,
+                    resume,
+                    archive: unavailable_action("server_mutation_unavailable"),
+                    delete: unavailable_action("server_mutation_unavailable"),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+
+    (
+        StatusCode::OK,
+        response_headers,
+        Json(
+            serde_json::to_value(LibrarySnapshotResponse {
+                user_id: snapshot.user_id,
+                study_sets,
+                sessions: snapshot.sessions,
+            })
+            .unwrap_or_else(|error| {
+                json!({
+                    "error": "library_response_failed",
+                    "message": error.to_string(),
+                })
+            }),
+        ),
+    )
 }
 
 async fn create_paste_study_set(
@@ -490,15 +649,80 @@ async fn create_paste_study_set(
     )
 }
 
+fn study_set_start_unavailable_reason(study_set: &LibraryStudySetSummary) -> Option<&'static str> {
+    if !study_set.server_owned {
+        return Some("not_server_owned");
+    }
+    match study_set.ingestion_status {
+        StudySetIngestionStatus::Pending => return Some("ingestion_pending"),
+        StudySetIngestionStatus::Processing => return Some("ingestion_processing"),
+        StudySetIngestionStatus::Failed => return Some("ingestion_failed"),
+        StudySetIngestionStatus::Ready => {}
+    }
+    if !study_set.documents.is_empty()
+        && study_set.documents.iter().all(|document| document.deleted)
+    {
+        return Some("source_deleted");
+    }
+    if study_set.question_count == 0 {
+        return Some("no_active_questions");
+    }
+    None
+}
+
+fn unavailable_action(reason: &'static str) -> LibraryAction {
+    LibraryAction {
+        available: false,
+        session_id: None,
+        session_token: None,
+        unavailable_reason: Some(reason),
+    }
+}
+
+fn signed_library_action(
+    state: &AppState,
+    user_id: &str,
+    study_set_id: &str,
+    session_id: String,
+) -> LibraryAction {
+    let Some(secret) = state.ws_access.session_token_secret.as_deref() else {
+        return unavailable_action("session_token_unavailable");
+    };
+    let Ok(session_token) = signed_session_token_for(user_id, study_set_id, &session_id, secret)
+    else {
+        return unavailable_action("session_token_unavailable");
+    };
+    LibraryAction {
+        available: true,
+        session_id: Some(session_id),
+        session_token: Some(session_token),
+        unavailable_reason: None,
+    }
+}
+
 fn signed_session_token(
     record: &StudySetIngestionRecord,
     secret: &str,
 ) -> Result<String, crate::config::SessionTokenError> {
+    signed_session_token_for(
+        &record.study_set.user_id,
+        &record.study_set.id,
+        &record.session_id,
+        secret,
+    )
+}
+
+fn signed_session_token_for(
+    user_id: &str,
+    study_set_id: &str,
+    session_id: &str,
+    secret: &str,
+) -> Result<String, crate::config::SessionTokenError> {
     let expires_at = unix_timestamp_now().unwrap_or(0) + 15 * 60;
     SessionTokenClaims {
-        user_id: record.study_set.user_id.clone(),
-        study_set_id: record.study_set.id.clone(),
-        session_id: record.session_id.clone(),
+        user_id: user_id.to_owned(),
+        study_set_id: study_set_id.to_owned(),
+        session_id: session_id.to_owned(),
         expires_at,
         nonce: Uuid::new_v4().to_string(),
     }

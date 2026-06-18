@@ -22,6 +22,7 @@ import {
   type VivaServerEvent,
   type VivaServerFrame,
 } from "@viva/core";
+import type { VivaLibrarySnapshot } from "./viva-library";
 
 export type VivaAgentClientOptions = {
   url?: string;
@@ -41,6 +42,12 @@ export type VivaPasteStudySetInput = {
 export type VivaPasteStudySetOptions = {
   apiBaseUrl?: string;
   fetchImpl?: typeof fetch;
+};
+
+export type VivaLibrarySnapshotOptions = {
+  apiBaseUrl?: string;
+  fetchImpl?: typeof fetch;
+  userId?: string;
 };
 
 export type VivaAgentStoreReadinessEndpoint = AgentStoreReadiness & {
@@ -337,6 +344,25 @@ export async function pasteStudySetToVivaApi(
   }
   const body = (await response.json()) as PasteIngestionResponse;
   return studySetFromPasteIngestionResponse(body, { examDate: input.examDate });
+}
+
+export async function fetchVivaLibrarySnapshot(
+  options: VivaLibrarySnapshotOptions = {},
+): Promise<VivaLibrarySnapshot> {
+  const apiBaseUrl = options.apiBaseUrl ?? vivaApiBaseUrl() ?? vivaAgentHttpBaseUrl();
+  if (!apiBaseUrl) {
+    throw new Error("Viva API URL is unavailable");
+  }
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const url = new URL(`${trimTrailingSlash(apiBaseUrl)}/study-sets/library`);
+  if (options.userId?.trim()) {
+    url.searchParams.set("user_id", options.userId.trim());
+  }
+  const response = await fetchImpl(url.toString(), { method: "GET" });
+  if (!response.ok) {
+    throw new Error(`Viva library snapshot failed with HTTP ${response.status}`);
+  }
+  return (await response.json()) as VivaLibrarySnapshot;
 }
 
 export function parseVivaAgentMessage(data: string): VivaServerFrame {
