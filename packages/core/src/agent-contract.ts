@@ -39,6 +39,8 @@ export type AgentStudySessionPhase =
   | "correction"
   | "recap";
 
+export type AgentTerminalSessionReason = "drained" | "session_cap" | "turn_cap";
+
 export type AgentStudySourceReference = {
   source_id: string;
   document_id: string;
@@ -173,7 +175,11 @@ export type AgentStoreReadiness = {
 };
 
 export type VivaServerEvent =
-  | { type: "session_phase"; phase: AgentStudySessionPhase }
+  | {
+      type: "session_phase";
+      phase: AgentStudySessionPhase;
+      terminal_reason?: AgentTerminalSessionReason;
+    }
   | { type: "question_started"; response_id: string; question: AgentStudyQuestion }
   | { type: "transcript_delta"; response_id: string; text: string }
   | {
@@ -263,6 +269,9 @@ export function parseVivaServerEvent(value: unknown): VivaServerEvent {
   switch (event.type) {
     case "session_phase":
       requireStudyPhase(event.phase);
+      if ("terminal_reason" in event && event.terminal_reason !== undefined) {
+        requireTerminalSessionReason(event.terminal_reason);
+      }
       return event as VivaServerEvent;
     case "question_started":
       requireString(event.response_id, "response_id");
@@ -585,6 +594,13 @@ function requireStudyPhase(value: unknown): AgentStudySessionPhase {
     value !== "recap"
   ) {
     throw new Error("Invalid session phase");
+  }
+  return value;
+}
+
+function requireTerminalSessionReason(value: unknown): AgentTerminalSessionReason {
+  if (value !== "drained" && value !== "session_cap" && value !== "turn_cap") {
+    throw new Error("Invalid terminal session reason");
   }
   return value;
 }

@@ -65,6 +65,7 @@ export function MarginaliaPanel({
 }) {
   const isSource = state === "source";
   const isRecap = state === "recap" && recap !== undefined;
+  const showsRuntimeNote = state === "listening" || (state === "recap" && !isRecap);
   const studentHandAnswer = textAnswer?.lastAnswer;
 
   return (
@@ -90,7 +91,7 @@ export function MarginaliaPanel({
         {state !== "listening" && !isSource && !isRecap && studentHandAnswer ? (
           <StudentHand answer={studentHandAnswer} />
         ) : null}
-        {state === "listening" ? (
+        {showsRuntimeNote ? (
           <ListeningNote
             hintShown={hintShown}
             onHint={onHint}

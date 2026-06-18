@@ -5,7 +5,9 @@ mod config;
 mod protocol;
 mod ws;
 
-pub use app::{build_router, AppState, VoiceEvidenceRecorder, VoiceUsageRecorder, WsTimeouts};
+pub use app::{
+    build_router, AppState, VoiceDrainSignal, VoiceEvidenceRecorder, VoiceUsageRecorder, WsTimeouts,
+};
 pub use config::{
     build_brain, build_study_store, RealtimeProvider, ServiceConfig, ServiceConfigError,
     VoiceWsAccess,

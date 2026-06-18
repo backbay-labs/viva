@@ -9,6 +9,7 @@ import {
   type AgentStudySessionPhase,
   type AgentStudySessionRecap,
   type AgentStudySourceReference,
+  type AgentTerminalSessionReason,
   audioClientFrame,
   type ManuscriptIntent,
   type PasteIngestionResponse,
@@ -114,6 +115,7 @@ export type VivaAgentSessionState = {
   close?: VivaAgentCloseDiagnostics;
   ready?: VivaReadyFrame;
   phase: AgentStudySessionPhase;
+  terminalReason?: AgentTerminalSessionReason;
   activeResponseId?: string;
   question?: AgentStudyQuestion;
   transcript: string;
@@ -519,13 +521,24 @@ export function vivaAgentReducer(
   switch (event.type) {
     case "session_phase":
       if (state.recap && event.phase !== "recap") return state;
-      return { ...state, phase: event.phase };
+      if (event.terminal_reason && event.phase === "recap" && !state.recap) {
+        return {
+          ...state,
+          terminalReason: event.terminal_reason,
+        };
+      }
+      return {
+        ...state,
+        phase: event.phase,
+        terminalReason: event.terminal_reason ?? state.terminalReason,
+      };
     case "question_started":
       return {
         ...state,
         activeResponseId: event.response_id,
         question: event.question,
         transcript: "",
+        terminalReason: undefined,
         finalTranscript: undefined,
         evaluation: undefined,
         currentSource: undefined,

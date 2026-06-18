@@ -1,7 +1,8 @@
 use agent_domain::{
     AnswerEvaluation, AudioFrame, BrainEvent, BrainProviderError, ConceptStatus, ManuscriptIntent,
     RealtimeBrainCapabilities, SessionConfig, StudyQuestion, StudySessionPhase, StudySessionRecap,
-    StudySourceReference, StudyStoreBackend, StudyStoreCapabilities, ToolResult,
+    StudySourceReference, StudyStoreBackend, StudyStoreCapabilities, TerminalSessionReason,
+    ToolResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -106,6 +107,8 @@ pub enum ServerFrame {
 pub enum VivaServerEvent {
     SessionPhase {
         phase: StudySessionPhase,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        terminal_reason: Option<TerminalSessionReason>,
     },
     QuestionStarted {
         response_id: String,
@@ -157,7 +160,17 @@ pub enum VivaServerEvent {
 impl From<BrainEvent> for VivaServerEvent {
     fn from(event: BrainEvent) -> Self {
         match event {
-            BrainEvent::SessionPhase { phase } => Self::SessionPhase { phase },
+            BrainEvent::SessionPhase { phase } => Self::SessionPhase {
+                phase,
+                terminal_reason: None,
+            },
+            BrainEvent::TerminalSessionPhase {
+                phase,
+                terminal_reason,
+            } => Self::SessionPhase {
+                phase,
+                terminal_reason: Some(terminal_reason),
+            },
             BrainEvent::QuestionStarted {
                 response_id,
                 question,
@@ -227,9 +240,11 @@ impl From<BrainEvent> for VivaServerEvent {
             }
             BrainEvent::InputSpeechStarted => Self::SessionPhase {
                 phase: StudySessionPhase::Listening,
+                terminal_reason: None,
             },
             BrainEvent::InputSpeechStopped => Self::SessionPhase {
                 phase: StudySessionPhase::Thinking,
+                terminal_reason: None,
             },
             BrainEvent::ResponseCancelled => Self::Cancellation { response_id: None },
             BrainEvent::ResponseCancelledFor { response_id } => Self::Cancellation {
@@ -245,9 +260,11 @@ impl From<BrainEvent> for VivaServerEvent {
                 } else {
                     StudySessionPhase::Thinking
                 },
+                terminal_reason: None,
             },
             BrainEvent::ResponseCompleted { .. } => Self::SessionPhase {
                 phase: StudySessionPhase::Feedback,
+                terminal_reason: None,
             },
             BrainEvent::ResponseToolProposal { response_id, .. } => Self::StructuredError {
                 source: "agent-service".to_owned(),
@@ -306,6 +323,7 @@ impl ServerFrame {
     pub fn browser_event(event: BrainEvent) -> Option<Self> {
         match event {
             BrainEvent::SessionPhase { .. }
+            | BrainEvent::TerminalSessionPhase { .. }
             | BrainEvent::QuestionStarted { .. }
             | BrainEvent::TranscriptDelta { .. }
             | BrainEvent::TranscriptFinal { .. }

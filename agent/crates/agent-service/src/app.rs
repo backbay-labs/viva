@@ -20,7 +20,7 @@ use axum::{
 use observe::{usage_event, CostModel, VoiceEvidenceEvent, VoiceUsageEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use uuid::Uuid;
 
 use crate::{
@@ -40,6 +40,7 @@ pub struct AppState {
     pub ws_access: VoiceWsAccess,
     pub session_slots: Arc<Semaphore>,
     pub ws_timeouts: WsTimeouts,
+    pub drain_signal: VoiceDrainSignal,
     pub evidence: VoiceEvidenceRecorder,
     pub usage: VoiceUsageRecorder,
     pub unauthenticated_paste_allowed: bool,
@@ -79,6 +80,7 @@ impl AppState {
             ws_access,
             session_slots: Arc::new(Semaphore::new(max_sessions)),
             ws_timeouts: WsTimeouts::default(),
+            drain_signal: VoiceDrainSignal::default(),
             evidence: VoiceEvidenceRecorder::default(),
             usage: VoiceUsageRecorder::default(),
             unauthenticated_paste_allowed: true,
@@ -157,6 +159,7 @@ pub fn build_router(state: AppState) -> Router {
 pub struct WsTimeouts {
     pub first_frame: Duration,
     pub idle: Duration,
+    pub session: Duration,
 }
 
 impl Default for WsTimeouts {
@@ -164,7 +167,36 @@ impl Default for WsTimeouts {
         Self {
             first_frame: Duration::from_secs(10),
             idle: Duration::from_secs(60),
+            session: Duration::from_secs(6 * 60 * 60),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct VoiceDrainSignal {
+    sender: Arc<watch::Sender<bool>>,
+}
+
+impl Default for VoiceDrainSignal {
+    fn default() -> Self {
+        let (sender, _receiver) = watch::channel(false);
+        Self {
+            sender: Arc::new(sender),
+        }
+    }
+}
+
+impl VoiceDrainSignal {
+    pub fn begin_drain(&self) {
+        self.sender.send_replace(true);
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<bool> {
+        self.sender.subscribe()
+    }
+
+    pub fn is_draining(&self) -> bool {
+        *self.sender.borrow()
     }
 }
 

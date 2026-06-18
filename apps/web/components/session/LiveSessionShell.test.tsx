@@ -586,6 +586,35 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).not.toContain("Back to question");
   });
 
+  test("renders controlled terminal copy when a terminal phase has no recap payload", () => {
+    const runtimeCopy = projectRuntimeCopy({
+      close: { code: 1008, reason: "session cap", wasClean: true },
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "closed",
+      terminalReason: "session_cap",
+    });
+
+    const markup = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        runtime={runtimeCopy}
+        state="recap"
+      />,
+    );
+
+    expect(markup).toContain("The session cap closed this manuscript.");
+    expect(markup).toContain("Start a new session");
+    expect(markup).not.toContain("Conductor recap");
+  });
+
   test("renders recap_ready as a closing fold across the center plate and margin", () => {
     const markup = renderToStaticMarkup(
       <LiveSessionShell

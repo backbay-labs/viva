@@ -301,6 +301,12 @@ export function LiveSessionPage() {
     agentRef.current.reset();
     agentRef.current.connect();
   }, []);
+  const startNewSession = useCallback(() => {
+    setSourceOpen(false);
+    setHintShown(false);
+    setTextRetryOpen(false);
+    if (typeof window !== "undefined") window.location.assign("/");
+  }, []);
   const endSession = useCallback(() => {
     setSourceOpen(false);
     setHintShown(false);
@@ -407,11 +413,13 @@ export function LiveSessionPage() {
         readiness: agent.readiness,
         ready: agent.agentState.ready,
         status: agent.status,
+        terminalReason: agent.derived.terminalReason,
       }),
     [
       agent.agentState.close,
       agent.agentState.ready,
       agent.derived.errors,
+      agent.derived.terminalReason,
       agent.readiness,
       agent.status,
       micState,
@@ -425,6 +433,12 @@ export function LiveSessionPage() {
   const studentHandAnswer = textRetryOpen
     ? undefined
     : (agent.derived.finalTranscript ?? submittedTextAnswer);
+  const submitRuntimePrimaryAction =
+    runtime.primaryActionIntent === "retry_agent"
+      ? retryAgent
+      : runtime.primaryActionIntent === "start_session"
+        ? startNewSession
+        : submitSpokenTurn;
 
   useEffect(() => {
     if (textAnswerActive) {
@@ -467,7 +481,7 @@ export function LiveSessionPage() {
       }}
       onNextQuestion={submitSpokenTurn}
       onShowSource={() => setSourceOpen(true)}
-      onSubmitAnswer={runtime.primaryActionIntent === "retry_agent" ? retryAgent : submitSpokenTurn}
+      onSubmitAnswer={submitRuntimePrimaryAction}
       onSubmitTextAnswer={submitTextTurn}
       onTryAgain={textAnswerActive ? openTextRetry : submitSpokenTurn}
       onUseTextAnswer={() => {
