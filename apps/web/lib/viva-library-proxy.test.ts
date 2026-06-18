@@ -1,0 +1,54 @@
+import { describe, expect, test } from "bun:test";
+import type { NextRequest } from "next/server";
+import { GET } from "../app/api/viva-library/[[...path]]/route";
+
+const originalFetch = globalThis.fetch;
+const originalAgentUrl = process.env.VIVA_AGENT_HTTP_URL;
+const originalBearer = process.env.VIVA_VOICE_WS_BEARER_TOKEN;
+
+describe("Viva library proxy", () => {
+  test("forwards caller control tokens without injecting the private server bearer", async () => {
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_VOICE_WS_BEARER_TOKEN = "server-secret";
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ input: String(input), init });
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        });
+      }) as typeof fetch;
+
+      const request = {
+        headers: new Headers({ "x-viva-library-control-token": "viva1.control-token" }),
+        method: "GET",
+        nextUrl: new URL("http://localhost:3000/api/viva-library/study-sets/export?user_id=user-1"),
+      } as unknown as NextRequest;
+
+      const response = await GET(request, {
+        params: Promise.resolve({ path: ["study-sets", "export"] }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.input).toBe("http://agent.test/study-sets/export?user_id=user-1");
+      const headers = new Headers(calls[0]?.init?.headers);
+      expect(headers.get("x-viva-library-control-token")).toBe("viva1.control-token");
+      expect(headers.get("origin")).toBe("http://localhost:3000");
+      expect(headers.get("authorization")).toBe(null);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_VOICE_WS_BEARER_TOKEN", originalBearer);
+    }
+  });
+});
+
+function restoreEnv(name: string, value: string | undefined) {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+}

@@ -22,7 +22,7 @@ import {
   type VivaServerEvent,
   type VivaServerFrame,
 } from "@viva/core";
-import type { VivaLibrarySnapshot } from "./viva-library";
+import type { VivaLibraryExport, VivaLibrarySnapshot } from "./viva-library";
 
 export type VivaAgentClientOptions = {
   url?: string;
@@ -46,6 +46,8 @@ export type VivaPasteStudySetOptions = {
 
 export type VivaLibrarySnapshotOptions = {
   apiBaseUrl?: string;
+  bearerToken?: string;
+  controlToken?: string;
   fetchImpl?: typeof fetch;
   userId?: string;
 };
@@ -150,6 +152,7 @@ export type VivaAgentSessionController = {
 const bundledVivaAgentWsUrl = process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL;
 const bundledVivaAgentHttpUrl = process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL;
 const bundledVivaApiUrl = process.env.NEXT_PUBLIC_VIVA_API_URL;
+const bundledVivaStaticExport = process.env.VIVA_STATIC_EXPORT;
 const defaultVivaAgentWsUrl = "ws://127.0.0.1:4318/ws";
 
 export function vivaAgentWsUrl(env?: Record<string, string | undefined>): string {
@@ -349,20 +352,118 @@ export async function pasteStudySetToVivaApi(
 export async function fetchVivaLibrarySnapshot(
   options: VivaLibrarySnapshotOptions = {},
 ): Promise<VivaLibrarySnapshot> {
-  const apiBaseUrl = options.apiBaseUrl ?? vivaApiBaseUrl() ?? vivaAgentHttpBaseUrl();
-  if (!apiBaseUrl) {
-    throw new Error("Viva API URL is unavailable");
-  }
+  const apiBaseUrl = vivaLibraryApiBaseUrl(options);
   const fetchImpl = options.fetchImpl ?? fetch;
   const url = new URL(`${trimTrailingSlash(apiBaseUrl)}/study-sets/library`);
   if (options.userId?.trim()) {
     url.searchParams.set("user_id", options.userId.trim());
   }
-  const response = await fetchImpl(url.toString(), { method: "GET" });
+  const response = await fetchImpl(url.toString(), {
+    headers: vivaLibraryAuthHeaders(options),
+    method: "GET",
+  });
   if (!response.ok) {
     throw new Error(`Viva library snapshot failed with HTTP ${response.status}`);
   }
   return (await response.json()) as VivaLibrarySnapshot;
+}
+
+export async function exportVivaLibraryData(
+  options: VivaLibrarySnapshotOptions = {},
+): Promise<VivaLibraryExport> {
+  const apiBaseUrl = vivaLibraryApiBaseUrl(options);
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const url = new URL(`${trimTrailingSlash(apiBaseUrl)}/study-sets/export`);
+  if (options.userId?.trim()) {
+    url.searchParams.set("user_id", options.userId.trim());
+  }
+  const response = await fetchImpl(url.toString(), {
+    headers: vivaLibraryAuthHeaders(options),
+    method: "GET",
+  });
+  if (!response.ok) {
+    throw new Error(`Viva library export failed with HTTP ${response.status}`);
+  }
+  return (await response.json()) as VivaLibraryExport;
+}
+
+export async function deleteVivaStudySet(
+  studySetId: string,
+  options: VivaLibrarySnapshotOptions = {},
+): Promise<unknown> {
+  const apiBaseUrl = vivaLibraryApiBaseUrl(options);
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const url = new URL(
+    `${trimTrailingSlash(apiBaseUrl)}/study-sets/${encodeURIComponent(studySetId)}`,
+  );
+  if (options.userId?.trim()) {
+    url.searchParams.set("user_id", options.userId.trim());
+  }
+  const response = await fetchImpl(url.toString(), {
+    headers: vivaLibraryAuthHeaders(options),
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(`Viva study set delete failed with HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function deleteVivaSessionHistory(
+  studySetId: string,
+  voiceSessionId: string,
+  options: VivaLibrarySnapshotOptions = {},
+): Promise<unknown> {
+  const apiBaseUrl = vivaLibraryApiBaseUrl(options);
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const url = new URL(
+    `${trimTrailingSlash(apiBaseUrl)}/study-sets/${encodeURIComponent(
+      studySetId,
+    )}/sessions/${encodeURIComponent(voiceSessionId)}`,
+  );
+  if (options.userId?.trim()) {
+    url.searchParams.set("user_id", options.userId.trim());
+  }
+  const response = await fetchImpl(url.toString(), {
+    headers: vivaLibraryAuthHeaders(options),
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(`Viva session history delete failed with HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+function vivaLibraryApiBaseUrl(options: VivaLibrarySnapshotOptions): string {
+  const apiBaseUrl =
+    options.apiBaseUrl ??
+    vivaApiBaseUrl() ??
+    configuredVivaAgentHttpBaseUrl() ??
+    browserVivaLibraryProxyBaseUrl() ??
+    vivaAgentHttpBaseUrl();
+  if (!apiBaseUrl) {
+    throw new Error("Viva API URL is unavailable");
+  }
+  return apiBaseUrl;
+}
+
+function configuredVivaAgentHttpBaseUrl(): string | undefined {
+  const explicitAgentHttp = envRecord().NEXT_PUBLIC_VIVA_AGENT_HTTP_URL ?? bundledVivaAgentHttpUrl;
+  return explicitAgentHttp?.trim() ? trimTrailingSlash(explicitAgentHttp.trim()) : undefined;
+}
+
+function browserVivaLibraryProxyBaseUrl(): string | undefined {
+  if (bundledVivaStaticExport === "1" || typeof window === "undefined") return undefined;
+  return `${window.location.origin}/api/viva-library`;
+}
+
+function vivaLibraryAuthHeaders(options: VivaLibrarySnapshotOptions): HeadersInit | undefined {
+  const bearerToken = options.bearerToken?.trim();
+  const controlToken = options.controlToken?.trim();
+  const headers: Record<string, string> = {};
+  if (bearerToken) headers.authorization = `Bearer ${bearerToken}`;
+  if (controlToken) headers["x-viva-library-control-token"] = controlToken;
+  return Object.keys(headers).length > 0 ? headers : undefined;
 }
 
 export function parseVivaAgentMessage(data: string): VivaServerFrame {

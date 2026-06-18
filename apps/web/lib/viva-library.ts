@@ -3,8 +3,9 @@ import type { ConceptStatus, StudySetIngestionStatus } from "@viva/core";
 export type VivaLibraryAction =
   | {
       available: true;
-      session_id: string;
+      session_id?: string | null;
       session_token?: string | null;
+      control_token?: string | null;
     }
   | {
       available: false;
@@ -65,9 +66,27 @@ export type VivaLibrarySession = {
   next_review: VivaLibraryNextReview | null;
 };
 
+export type VivaLibraryPrivacy = {
+  voice_recordings_saved: boolean;
+  transcripts_saved: boolean;
+  raw_audio_persistence: boolean;
+  transcript_persistence: boolean;
+  export_contains_raw_provider_payloads: boolean;
+  export: VivaLibraryAction;
+  copy: string;
+};
+
 export type VivaLibrarySnapshot = {
   user_id: string;
+  privacy: VivaLibraryPrivacy;
   study_sets: VivaLibraryStudySet[];
+  sessions: VivaLibrarySession[];
+};
+
+export type VivaLibraryExport = {
+  user_id: string;
+  privacy: VivaLibraryPrivacy;
+  study_sets: Omit<VivaLibraryStudySet, "actions">[];
   sessions: VivaLibrarySession[];
 };
 
@@ -75,6 +94,7 @@ export type ProjectedLibraryAction = {
   available: boolean;
   sessionId?: string;
   sessionToken?: string | null;
+  controlToken?: string | null;
   unavailableReason?: string;
 };
 
@@ -111,8 +131,19 @@ export type ProjectedNextReview = {
   authority: "server_persisted";
 };
 
+export type ProjectedLibraryPrivacy = {
+  voiceRecordingsSaved: boolean;
+  transcriptsSaved: boolean;
+  rawAudioPersistence: boolean;
+  transcriptPersistence: boolean;
+  exportContainsRawProviderPayloads: boolean;
+  export: ProjectedLibraryAction;
+  copy: string;
+};
+
 export type VivaLibraryProjection = {
   userId: string;
+  privacy: ProjectedLibraryPrivacy;
   libraryRows: ProjectedLibraryRow[];
   sessionRows: ProjectedSessionRow[];
 };
@@ -123,6 +154,7 @@ export function projectLibrarySnapshot(
 ): VivaLibraryProjection {
   return {
     userId: snapshot.user_id,
+    privacy: projectPrivacy(snapshot.privacy),
     libraryRows: snapshot.study_sets.map(projectStudySetRow),
     sessionRows: snapshot.sessions.map(projectSessionRow),
   };
@@ -137,10 +169,10 @@ function projectStudySetRow(studySet: VivaLibraryStudySet): ProjectedLibraryRow 
     statusLabel: studySetStatusLabel(studySet),
     detail: studySetDetail(studySet),
     documentSummary: documentSummary(studySet.documents),
-    start: projectAction(studySet.actions.start),
-    resume: projectAction(studySet.actions.resume),
-    archive: projectAction(studySet.actions.archive),
-    delete: projectAction(studySet.actions.delete),
+    start: projectSessionAction(studySet.actions.start),
+    resume: projectSessionAction(studySet.actions.resume),
+    archive: projectMutationAction(studySet.actions.archive),
+    delete: projectMutationAction(studySet.actions.delete),
   };
 }
 
@@ -155,7 +187,7 @@ function projectSessionRow(session: VivaLibrarySession): ProjectedSessionRow {
   };
 }
 
-function projectAction(action: VivaLibraryAction): ProjectedLibraryAction {
+function projectSessionAction(action: VivaLibraryAction): ProjectedLibraryAction {
   if (!action.available) {
     return {
       available: false,
@@ -170,8 +202,36 @@ function projectAction(action: VivaLibraryAction): ProjectedLibraryAction {
   }
   return {
     available: true,
-    sessionId: action.session_id,
-    sessionToken: action.session_token,
+    sessionId: action.session_id ?? undefined,
+    sessionToken: action.session_token ?? undefined,
+  };
+}
+
+function projectMutationAction(action: VivaLibraryAction): ProjectedLibraryAction {
+  if (!action.available) {
+    return {
+      available: false,
+      unavailableReason: action.unavailable_reason,
+    };
+  }
+  if (!action.control_token) {
+    return {
+      available: false,
+      unavailableReason: "control_token_unavailable",
+    };
+  }
+  return { available: true, controlToken: action.control_token };
+}
+
+function projectPrivacy(privacy: VivaLibraryPrivacy): ProjectedLibraryPrivacy {
+  return {
+    voiceRecordingsSaved: privacy.voice_recordings_saved,
+    transcriptsSaved: privacy.transcripts_saved,
+    rawAudioPersistence: privacy.raw_audio_persistence,
+    transcriptPersistence: privacy.transcript_persistence,
+    exportContainsRawProviderPayloads: privacy.export_contains_raw_provider_payloads,
+    export: projectMutationAction(privacy.export),
+    copy: privacy.copy,
   };
 }
 

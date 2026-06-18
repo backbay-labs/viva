@@ -299,6 +299,31 @@ pub trait StudyMemoryStore: Send + Sync {
         ))
     }
 
+    async fn delete_study_set(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Value, PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            format!("{user_id}/{study_set_id}"),
+            "study set deletion is not implemented by this store",
+        ))
+    }
+
+    async fn delete_session_history(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<Value, PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            format!("{user_id}/{study_set_id}/{voice_session_id}"),
+            "session history deletion is not implemented by this store",
+        ))
+    }
+
     async fn active_question(
         &self,
         _user_id: &str,

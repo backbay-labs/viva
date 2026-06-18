@@ -3,6 +3,15 @@ import { projectLibrarySnapshot, type VivaLibrarySnapshot } from "./viva-library
 
 const snapshot: VivaLibrarySnapshot = {
   user_id: "user-1",
+  privacy: {
+    copy: "Voice recordings and transcripts are not saved; Viva stores sanitized study meaning only.",
+    export: { available: true, control_token: "viva1.control-token" },
+    export_contains_raw_provider_payloads: false,
+    raw_audio_persistence: false,
+    transcript_persistence: false,
+    transcripts_saved: false,
+    voice_recordings_saved: false,
+  },
   study_sets: [
     {
       id: "biology-midterm",
@@ -31,7 +40,7 @@ const snapshot: VivaLibrarySnapshot = {
         },
         resume: { available: false, unavailable_reason: "no_open_session" },
         archive: { available: false, unavailable_reason: "server_mutation_unavailable" },
-        delete: { available: false, unavailable_reason: "server_mutation_unavailable" },
+        delete: { available: true, control_token: "viva1.control-token" },
       },
     },
     {
@@ -123,11 +132,16 @@ const snapshot: VivaLibrarySnapshot = {
 };
 
 describe("Viva library projection", () => {
-  test("renders server-owned study set rows without local-only mutations", () => {
+  test("renders server-owned study set rows with privacy controls", () => {
     const projection = projectLibrarySnapshot(snapshot, {
       now: new Date("2026-06-17T12:00:00Z"),
     });
 
+    expect(projection.privacy.voiceRecordingsSaved).toBe(false);
+    expect(projection.privacy.transcriptsSaved).toBe(false);
+    expect(projection.privacy.exportContainsRawProviderPayloads).toBe(false);
+    expect(projection.privacy.export.available).toBe(true);
+    expect(projection.privacy.copy).toContain("Voice recordings and transcripts are not saved");
     expect(projection.libraryRows.map((row) => row.id)).toEqual([
       "biology-midterm",
       "pending-set",
@@ -137,6 +151,9 @@ describe("Viva library projection", () => {
     expect(projection.libraryRows[0]?.statusLabel).toBe("Ready");
     expect(projection.libraryRows[0]?.start.available).toBe(true);
     expect(projection.libraryRows[0]?.start.sessionToken).toBe("viva1.start-token");
+    expect(projection.libraryRows[0]?.delete.available).toBe(true);
+    expect(projection.libraryRows[0]?.delete.sessionToken).toBeUndefined();
+    expect(projection.libraryRows[0]?.delete.controlToken).toBe("viva1.control-token");
     expect(projection.libraryRows[1]?.statusLabel).toBe("Ingestion pending");
     expect(projection.libraryRows[2]?.statusLabel).toBe("Ingestion failed");
     expect(projection.libraryRows[2]?.detail).toBe("No usable source span");

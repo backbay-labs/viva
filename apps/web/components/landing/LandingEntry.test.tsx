@@ -9,6 +9,15 @@ type LandingHeroProps = Parameters<typeof LandingHero>[0];
 
 const librarySnapshot: VivaLibrarySnapshot = {
   user_id: "user-1",
+  privacy: {
+    copy: "Voice recordings and transcripts are not saved; Viva stores sanitized study meaning only.",
+    export: { available: true, control_token: "viva1.control-token" },
+    export_contains_raw_provider_payloads: false,
+    raw_audio_persistence: false,
+    transcript_persistence: false,
+    transcripts_saved: false,
+    voice_recordings_saved: false,
+  },
   study_sets: [
     {
       id: "biology-midterm",
@@ -37,7 +46,7 @@ const librarySnapshot: VivaLibrarySnapshot = {
         },
         resume: { available: false, unavailable_reason: "no_open_session" },
         archive: { available: false, unavailable_reason: "server_mutation_unavailable" },
-        delete: { available: false, unavailable_reason: "server_mutation_unavailable" },
+        delete: { available: true, control_token: "viva1.control-token" },
       },
     },
   ],
@@ -104,11 +113,16 @@ describe("LandingEntry", () => {
     );
 
     expect(markup).toContain("Library");
+    expect(markup).toContain("Privacy controls");
+    expect(markup).toContain("Voice recordings and transcripts are not saved");
+    expect(markup).toContain("Export data");
     expect(markup).toContain("Biology Midterm");
     expect(markup).toContain("Ready");
     expect(markup).toContain("Start");
+    expect(markup).toContain("Delete source");
     expect(markup).toContain("Sessions");
     expect(markup).toContain("Completed");
+    expect(markup).toContain("Delete recap");
     expect(markup).toContain("NADH");
     expect(markup).toContain("server schedule");
     expect(markup).toContain(

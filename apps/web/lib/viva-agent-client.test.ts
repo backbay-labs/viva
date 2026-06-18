@@ -12,6 +12,9 @@ import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic
 import {
   agentProtocolVersion,
   createVivaAgentSessionController,
+  deleteVivaSessionHistory,
+  deleteVivaStudySet,
+  exportVivaLibraryData,
   fetchVivaAgentReadinessProbe,
   fetchVivaLibrarySnapshot,
   initialVivaAgentSessionState,
@@ -592,6 +595,15 @@ describe("Viva agent browser client", () => {
       calls.push({ input: String(input), init });
       return jsonResponse(200, {
         user_id: "user-1",
+        privacy: {
+          copy: "Voice recordings and transcripts are not saved; Viva stores sanitized study meaning only.",
+          export: { available: true },
+          export_contains_raw_provider_payloads: false,
+          raw_audio_persistence: false,
+          transcript_persistence: false,
+          transcripts_saved: false,
+          voice_recordings_saved: false,
+        },
         study_sets: [
           {
             id: "biology-midterm",
@@ -633,8 +645,94 @@ describe("Viva agent browser client", () => {
       session_id: "server-session",
       session_token: "viva1.server-token",
     });
+    expect(snapshot.privacy.voice_recordings_saved).toBe(false);
+  });
+
+  test("uses an absolute same-origin proxy URL for browser library calls", async () => {
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input: String(input), init });
+      return jsonResponse(200, {
+        privacy: {
+          copy: "Voice recordings and transcripts are not saved.",
+          export: { available: false, unavailable_reason: "mutation_auth_required" },
+          export_contains_raw_provider_payloads: false,
+          raw_audio_persistence: false,
+          transcript_persistence: false,
+          transcripts_saved: false,
+          voice_recordings_saved: false,
+        },
+        sessions: [],
+        study_sets: [],
+        user_id: "user-1",
+      });
+    }) as typeof fetch;
+
+    try {
+      Object.defineProperty(globalThis, "window", {
+        configurable: true,
+        value: { location: { origin: "http://localhost:3000" } },
+      });
+
+      await fetchVivaLibrarySnapshot({ fetchImpl, userId: "user-1" });
+    } finally {
+      restoreGlobalProperty("window", originalWindow);
+    }
+
+    expect(calls[0]?.input).toBe(
+      "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-1",
+    );
+  });
+
+  test("calls privacy export and delete endpoints without client-side source payloads", async () => {
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input: String(input), init });
+      return jsonResponse(200, { ok: true });
+    }) as typeof fetch;
+
+    await exportVivaLibraryData({
+      apiBaseUrl: "http://127.0.0.1:4318/",
+      controlToken: "viva1.control-token",
+      fetchImpl,
+      userId: "user-1",
+    });
+    await deleteVivaStudySet("biology-midterm", {
+      apiBaseUrl: "http://127.0.0.1:4318/",
+      controlToken: "viva1.control-token",
+      fetchImpl,
+      userId: "user-1",
+    });
+    await deleteVivaSessionHistory("biology-midterm", "voice-session-1", {
+      apiBaseUrl: "http://127.0.0.1:4318/",
+      controlToken: "viva1.control-token",
+      fetchImpl,
+      userId: "user-1",
+    });
+
+    expect(calls.map((call) => `${call.init?.method} ${call.input}`)).toEqual([
+      "GET http://127.0.0.1:4318/study-sets/export?user_id=user-1",
+      "DELETE http://127.0.0.1:4318/study-sets/biology-midterm?user_id=user-1",
+      "DELETE http://127.0.0.1:4318/study-sets/biology-midterm/sessions/voice-session-1?user_id=user-1",
+    ]);
+    expect(calls.every((call) => call.init?.body === undefined)).toBe(true);
+    expect(calls.every((call) => call.init?.headers)).toBe(true);
+    expect(calls.map((call) => call.init?.headers)).toEqual([
+      { "x-viva-library-control-token": "viva1.control-token" },
+      { "x-viva-library-control-token": "viva1.control-token" },
+      { "x-viva-library-control-token": "viva1.control-token" },
+    ]);
   });
 });
+
+function restoreGlobalProperty(name: string, descriptor: PropertyDescriptor | undefined) {
+  if (descriptor) {
+    Object.defineProperty(globalThis, name, descriptor);
+  } else {
+    delete (globalThis as Record<string, unknown>)[name];
+  }
+}
 
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];

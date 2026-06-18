@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Write as _,
     sync::{Arc, RwLock},
 };
@@ -726,6 +726,40 @@ fn concept_key(study_set_id: &str, concept_id: &str) -> String {
 
 fn question_key(study_set_id: &str, question_id: &str) -> String {
     format!("{study_set_id}::{question_id}")
+}
+
+fn remove_session_artifacts(
+    state: &mut InMemoryStudyState,
+    user_id: &str,
+    study_set_id: &str,
+    voice_session_ids: &HashSet<String>,
+) {
+    if voice_session_ids.is_empty() {
+        return;
+    }
+    state.recaps.retain(|record| {
+        record.user_id != user_id
+            || record.study_set_id != study_set_id
+            || !voice_session_ids.contains(&record.voice_session_id)
+    });
+    state.review_items.retain(|record| {
+        record.user_id != user_id
+            || record.study_set_id != study_set_id
+            || !voice_session_ids.contains(&record.voice_session_id)
+    });
+    state.concept_statuses.retain(|record| {
+        record.user_id != user_id
+            || record.study_set_id != study_set_id
+            || !voice_session_ids.contains(&record.voice_session_id)
+    });
+    state
+        .answer_attempts
+        .retain(|record| !voice_session_ids.contains(&record.voice_session_id));
+    state.event_authorizations.retain(|record| {
+        record.user_id != user_id
+            || record.study_set_id != study_set_id
+            || !voice_session_ids.contains(&record.voice_session_id)
+    });
 }
 
 pub(crate) fn source_reference_to_summary(source: &StudySourceReference) -> StudySourceSpanSummary {
@@ -1571,10 +1605,13 @@ impl StudyMemoryStore for InMemoryStudyStore {
             .ok_or_else(|| {
                 PortError::unavailable("memory", voice_session_id, "voice session does not exist")
             })?;
-        session.status = "closed".to_owned();
-        session.ended_at = Some("closed".to_owned());
-        session.terminal_reason = Some(terminal_reason.to_owned());
+        if session.status != "deleted" {
+            session.status = "closed".to_owned();
+            session.ended_at = Some("closed".to_owned());
+            session.terminal_reason = Some(terminal_reason.to_owned());
+        }
         let status = session.status.clone();
+        let terminal_reason = session.terminal_reason.clone();
         state
             .event_authorizations
             .retain(|record| record.voice_session_id != voice_session_id);
@@ -1891,6 +1928,116 @@ impl StudyMemoryStore for InMemoryStudyStore {
             study_sets,
             sessions,
         })
+    }
+
+    async fn delete_study_set(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Value, PortError> {
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        Self::study_set_locked(&state, user_id, study_set_id)?;
+
+        let mut deleted_documents = 0usize;
+        for document in state
+            .documents
+            .values_mut()
+            .filter(|document| document.study_set_id == study_set_id && !document.tombstoned)
+        {
+            document.tombstoned = true;
+            deleted_documents += 1;
+        }
+
+        let mut deleted_source_spans = 0usize;
+        for span in state
+            .source_spans
+            .values_mut()
+            .filter(|span| span.study_set_id == study_set_id && !span.tombstoned)
+        {
+            span.tombstoned = true;
+            deleted_source_spans += 1;
+        }
+
+        let mut disabled_questions = 0usize;
+        for question in state
+            .questions
+            .values_mut()
+            .filter(|question| question.study_set_id == study_set_id && question.active)
+        {
+            question.active = false;
+            disabled_questions += 1;
+        }
+
+        let mut hidden_sessions = 0usize;
+        let mut affected_sessions = HashSet::new();
+        for session in state.sessions.iter_mut().filter(|session| {
+            session.user_id == user_id
+                && session.study_set_id == study_set_id
+                && session.status != "deleted"
+        }) {
+            affected_sessions.insert(session.voice_session_id.clone());
+            session.status = "deleted".to_owned();
+            session.ended_at.get_or_insert_with(|| "deleted".to_owned());
+            session.terminal_reason = Some("deleted".to_owned());
+            hidden_sessions += 1;
+        }
+
+        remove_session_artifacts(&mut state, user_id, study_set_id, &affected_sessions);
+
+        Ok(json!({
+            "study_set_id": study_set_id,
+            "status": "deleted",
+            "deleted_documents": deleted_documents,
+            "deleted_source_spans": deleted_source_spans,
+            "disabled_questions": disabled_questions,
+            "hidden_sessions": hidden_sessions,
+        }))
+    }
+
+    async fn delete_session_history(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<Value, PortError> {
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        Self::study_set_locked(&state, user_id, study_set_id)?;
+
+        let session = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.voice_session_id == voice_session_id)
+            .ok_or_else(|| {
+                PortError::unavailable("memory", voice_session_id, "voice session does not exist")
+            })?;
+        if session.user_id != user_id || session.study_set_id != study_set_id {
+            return Err(PortError::unavailable(
+                "memory",
+                voice_session_id,
+                "voice session is not available for this user and study set",
+            ));
+        }
+
+        let already_deleted = session.status == "deleted";
+        session.status = "deleted".to_owned();
+        session.ended_at.get_or_insert_with(|| "deleted".to_owned());
+        session.terminal_reason = Some("deleted".to_owned());
+
+        let affected_sessions = HashSet::from([voice_session_id.to_owned()]);
+        remove_session_artifacts(&mut state, user_id, study_set_id, &affected_sessions);
+
+        Ok(json!({
+            "voice_session_id": voice_session_id,
+            "study_set_id": study_set_id,
+            "status": "deleted",
+            "already_deleted": already_deleted,
+        }))
     }
 
     async fn active_question(
