@@ -503,8 +503,10 @@ describe("Viva agent browser client", () => {
       responseId: "response-1",
       frame: { pcm16_base64: "AQIDBA==" },
     });
-    expect(state.finalTranscript).toBe("received 4 PCM16 bytes");
-    expect(state.evaluation?.answer_text).toBe("received 4 PCM16 bytes");
+    expect(state.finalTranscript).toBe("NADH donates electrons to the electron transport chain.");
+    expect(state.evaluation?.answer_text).toBe(
+      "NADH donates electrons to the electron transport chain.",
+    );
     expect(state.sources[0]?.source_id).toBe("src-lecture-5-slide-18");
     expect(state.recap?.voice_session_id).toBe("voice-session-1");
     expect(state.phase).toBe("recap");

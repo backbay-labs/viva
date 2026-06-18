@@ -1543,7 +1543,7 @@ async fn real_websocket_replays_fake_cartesia_gemini_fixture_and_evidence_pack()
         actual.push(read_server_frame(&mut socket).await);
     }
     send_client_frame(&mut socket, &fixture.client[1]).await;
-    for _ in 0..11 {
+    for _ in 0..12 {
         actual.push(read_server_frame(&mut socket).await);
     }
     send_client_frame(&mut socket, &fixture.client[2]).await;
