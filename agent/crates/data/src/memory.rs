@@ -7,11 +7,11 @@ use std::{
 use agent_domain::{
     AnswerEvaluation, ConceptStatus, CreatePasteStudySet, LibraryNextReviewSummary,
     LibrarySessionRecapSummary, LibrarySessionSummary, LibraryStudyDocumentSummary,
-    LibraryStudySetSummary, PortError, SessionConfig, SessionStore, SourceConfidence,
-    StudyConceptSummary, StudyDocumentSummary, StudyLibrarySnapshot, StudyMemoryStore, StudyMode,
-    StudyQuestion, StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus,
-    StudySetSummary, StudySourceReference, StudySourceSpanSummary, StudyStoreBackend,
-    StudyStoreCapabilities, StudyStoreWriteCounts,
+    LibraryStudySetSummary, PortError, SessionConfig, SessionStore, SessionTokenNonceClaim,
+    SourceConfidence, StudyConceptSummary, StudyDocumentSummary, StudyLibrarySnapshot,
+    StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap, StudySetIngestionRecord,
+    StudySetIngestionStatus, StudySetSummary, StudySourceReference, StudySourceSpanSummary,
+    StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -340,6 +340,7 @@ pub struct InMemoryStudyState {
     pub review_items: Vec<ReviewItemRecord>,
     pub recaps: Vec<RecapRecord>,
     pub event_authorizations: Vec<EventAuthorizationRecord>,
+    pub session_token_nonces: Vec<SessionTokenNonceClaim>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1587,6 +1588,34 @@ impl StudyMemoryStore for InMemoryStudyStore {
             }
         }
         self.save(&VoiceSessionRecord::from_config(config)).await
+    }
+
+    async fn claim_session_token_nonce(
+        &self,
+        claim: SessionTokenNonceClaim,
+    ) -> Result<(), PortError> {
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        Self::study_set_locked(&state, &claim.user_id, &claim.study_set_id)?;
+        if state.session_token_nonces.iter().any(|used| {
+            used.user_id == claim.user_id
+                && used.study_set_id == claim.study_set_id
+                && used.voice_session_id == claim.voice_session_id
+                && used.nonce == claim.nonce
+        }) {
+            return Err(PortError::unavailable(
+                "memory",
+                format!(
+                    "{}/{}/{}",
+                    claim.user_id, claim.study_set_id, claim.voice_session_id
+                ),
+                "session token nonce already used",
+            ));
+        }
+        state.session_token_nonces.push(claim);
+        Ok(())
     }
 
     async fn close_voice_session(

@@ -6,10 +6,10 @@ use std::{
 use agent_domain::{
     AnswerEvaluation, ConceptStatus, CreatePasteStudySet, LibraryNextReviewSummary,
     LibrarySessionRecapSummary, LibrarySessionSummary, LibraryStudyDocumentSummary,
-    LibraryStudySetSummary, PortError, SessionConfig, StudyLibrarySnapshot, StudyMemoryStore,
-    StudyQuestion, StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus,
-    StudySourceReference, StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts,
-    VoiceUsageRecord,
+    LibraryStudySetSummary, PortError, SessionConfig, SessionTokenNonceClaim, StudyLibrarySnapshot,
+    StudyMemoryStore, StudyQuestion, StudySessionRecap, StudySetIngestionRecord,
+    StudySetIngestionStatus, StudySourceReference, StudyStoreBackend, StudyStoreCapabilities,
+    StudyStoreWriteCounts, VoiceUsageRecord,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -504,6 +504,43 @@ impl StudyMemoryStore for PostgresStudyStore {
             ));
         }
         self.increment_count(WriteCountKind::Session)?;
+        Ok(())
+    }
+
+    async fn claim_session_token_nonce(
+        &self,
+        claim: SessionTokenNonceClaim,
+    ) -> Result<(), PortError> {
+        let study_set_uuid = Self::uuid_for(&claim.study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(&claim.voice_session_id)?;
+        self.ensure_study_set(&claim.user_id, study_set_uuid)
+            .await?;
+        let result = sqlx::query(
+            "INSERT INTO voice_session_token_nonces
+                (user_id, study_set_id, voice_session_id, nonce, expires_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&claim.user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .bind(&claim.nonce)
+        .bind(i64::try_from(claim.expires_at).map_err(|_| {
+            PortError::adapter("postgres", "session token expiry exceeds postgres bigint")
+        })?)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_error)?;
+        if result.rows_affected() == 0 {
+            return Err(PortError::unavailable(
+                "postgres",
+                format!(
+                    "{}/{}/{}",
+                    claim.user_id, claim.study_set_id, claim.voice_session_id
+                ),
+                "session token nonce already used",
+            ));
+        }
         Ok(())
     }
 

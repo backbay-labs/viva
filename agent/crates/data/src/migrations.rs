@@ -42,6 +42,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0009_review_items_voice_session.sql",
         include_str!("../../../migrations/0009_review_items_voice_session.sql"),
     ),
+    (
+        "0010_voice_session_token_nonces.sql",
+        include_str!("../../../migrations/0010_voice_session_token_nonces.sql"),
+    ),
 ];
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
@@ -260,8 +264,8 @@ mod tests {
     use crate::PostgresStudyStore;
     use agent_domain::{
         fixture_question, fixture_source_reference, ConceptStatus, SessionConfig, SessionId,
-        StudyMemoryStore, StudyMode, StudySessionRecap, ToolProposal, VivaToolExecutor,
-        VoiceUsageRecord,
+        SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudySessionRecap, ToolProposal,
+        VivaToolExecutor, VoiceUsageRecord,
     };
     use std::sync::Arc;
 
@@ -285,6 +289,8 @@ mod tests {
         assert!(sql.contains("CREATE TABLE session_recaps"));
         assert!(sql.contains("voice_session_id UUID REFERENCES voice_sessions"));
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS study_questions"));
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS voice_session_token_nonces"));
+        assert!(sql.contains("PRIMARY KEY (user_id, study_set_id, voice_session_id, nonce)"));
         assert!(sql.contains("source_spans_excerpt_bounded"));
         assert!(!sql.contains("summary TEXT"));
         assert!(!sql.contains("headline TEXT"));
@@ -612,6 +618,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optional_postgres_session_token_nonce_claims_reject_replay_when_database_url_is_set() {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+
+        let store = PostgresStudyStore::new(pool.clone());
+        let claim = SessionTokenNonceClaim {
+            user_id: "user-1".to_owned(),
+            study_set_id: "biology-midterm".to_owned(),
+            voice_session_id: "voice-session-1".to_owned(),
+            nonce: "nonce-postgres-replay".to_owned(),
+            expires_at: 1_800_000_000,
+        };
+
+        store
+            .claim_session_token_nonce(claim.clone())
+            .await
+            .expect("first nonce claim succeeds");
+        let replay = store
+            .claim_session_token_nonce(claim.clone())
+            .await
+            .expect_err("replayed nonce claim is rejected");
+        match replay {
+            PortError::Unavailable { port, reason, .. } => {
+                assert_eq!(port, "postgres");
+                assert_eq!(reason, "session token nonce already used");
+            }
+            other => panic!("unexpected replay error: {other}"),
+        }
+        assert_eq!(session_token_nonce_rows(&pool, &claim).await, 1);
+    }
+
+    #[tokio::test]
     async fn optional_postgres_library_snapshot_scopes_review_items_to_voice_session_when_database_url_is_set(
     ) {
         let Some(pool) = optional_postgres_pool().await else {
@@ -934,6 +977,24 @@ mod tests {
             session_recaps: count_rows(pool, "session_recaps").await,
             voice_usage_events: count_rows(pool, "voice_usage_events").await,
         }
+    }
+
+    async fn session_token_nonce_rows(pool: &sqlx::PgPool, claim: &SessionTokenNonceClaim) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM voice_session_token_nonces
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND voice_session_id = $3
+               AND nonce = $4",
+        )
+        .bind(&claim.user_id)
+        .bind(fixture_uuid(&claim.study_set_id).expect("study set fixture UUID"))
+        .bind(fixture_uuid(&claim.voice_session_id).expect("voice session fixture UUID"))
+        .bind(&claim.nonce)
+        .fetch_one(pool)
+        .await
+        .expect("session token nonce row count query succeeds")
     }
 
     async fn count_rows(pool: &sqlx::PgPool, table: &str) -> i64 {

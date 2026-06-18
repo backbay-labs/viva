@@ -26,10 +26,10 @@ pub use ids::{CallId, SessionId, ToolName};
 pub use ports::{
     CreatePasteStudySet, LibraryNextReviewSummary, LibrarySessionRecapSummary,
     LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
-    SessionStore, StudyConceptSummary, StudyDocumentSummary, StudyLibrarySnapshot,
-    StudyMemoryStore, StudySetIngestionRecord, StudySetIngestionStatus, StudySetSummary,
-    StudySourceSpanSummary, StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts,
-    ToolIssuer, VoiceUsageRecord,
+    SessionStore, SessionTokenNonceClaim, StudyConceptSummary, StudyDocumentSummary,
+    StudyLibrarySnapshot, StudyMemoryStore, StudySetIngestionRecord, StudySetIngestionStatus,
+    StudySetSummary, StudySourceSpanSummary, StudyStoreBackend, StudyStoreCapabilities,
+    StudyStoreWriteCounts, ToolIssuer, VoiceUsageRecord,
 };
 pub use study::{
     fixture_question, fixture_source_reference, AnswerEvaluation, RecapSourceMoment, StudyQuestion,

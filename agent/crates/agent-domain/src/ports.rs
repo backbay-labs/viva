@@ -74,6 +74,15 @@ pub struct VoiceUsageRecord {
     pub source_grounded_correction_count: u64,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct SessionTokenNonceClaim {
+    pub user_id: String,
+    pub study_set_id: String,
+    pub voice_session_id: String,
+    pub nonce: String,
+    pub expires_at: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreatePasteStudySet {
     pub user_id: String,
@@ -264,6 +273,20 @@ pub trait StudyMemoryStore: Send + Sync {
 
     async fn record_voice_session(&self, _config: &SessionConfig) -> Result<(), PortError> {
         Ok(())
+    }
+
+    async fn claim_session_token_nonce(
+        &self,
+        claim: SessionTokenNonceClaim,
+    ) -> Result<(), PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            format!(
+                "{}/{}/{}",
+                claim.user_id, claim.study_set_id, claim.voice_session_id
+            ),
+            "session token nonce replay protection is not implemented by this store",
+        ))
     }
 
     async fn close_voice_session(
