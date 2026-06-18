@@ -21,6 +21,10 @@ describe("Viva agent browser client", () => {
       "ws://localhost:4318/ws",
     );
     expect(vivaAgentWsUrl({})).toBe("ws://127.0.0.1:4318/ws");
+    expect(vivaApiBaseUrl({})).toBeUndefined();
+    expect(vivaApiBaseUrl({ NEXT_PUBLIC_VIVA_AGENT_WS_URL: "ws://localhost:5199/ws" })).toBe(
+      "http://localhost:5199",
+    );
     expect(vivaApiBaseUrl({ NEXT_PUBLIC_VIVA_API_URL: "http://localhost:4318/" })).toBe(
       "http://localhost:4318",
     );
