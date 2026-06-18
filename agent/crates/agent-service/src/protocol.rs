@@ -1,11 +1,11 @@
 use agent_domain::{
     AnswerEvaluation, AudioFrame, BrainEvent, BrainProviderError, ConceptStatus, ManuscriptIntent,
-    SessionConfig, StudyQuestion, StudySessionPhase, StudySessionRecap, StudySourceReference,
-    ToolResult,
+    RealtimeBrainCapabilities, SessionConfig, StudyQuestion, StudySessionPhase, StudySessionRecap,
+    StudySourceReference, StudyStoreBackend, StudyStoreCapabilities, ToolResult,
 };
 use serde::{Deserialize, Serialize};
 
-pub const VIVA_VOICE_PROTOCOL_VERSION: u32 = 1;
+pub const VIVA_VOICE_PROTOCOL_VERSION: u32 = 2;
 pub const VIVA_VOICE_SAMPLE_RATE_HZ: u32 = 24_000;
 pub const VIVA_VOICE_INPUT_ENCODING: &str = "pcm_s16le";
 pub const VIVA_VOICE_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
@@ -58,6 +58,8 @@ pub struct ReadyFrame {
     pub version: u32,
     pub sample_rate_hz: u32,
     pub input_encoding: String,
+    pub brain: RealtimeBrainCapabilities,
+    pub store: StudyStoreCapabilities,
 }
 
 impl ReadyFrame {
@@ -67,6 +69,8 @@ impl ReadyFrame {
             version: VIVA_VOICE_PROTOCOL_VERSION,
             sample_rate_hz: VIVA_VOICE_SAMPLE_RATE_HZ,
             input_encoding: VIVA_VOICE_INPUT_ENCODING.to_owned(),
+            brain: default_ready_brain(),
+            store: default_ready_store(),
         }
     }
 }
@@ -84,6 +88,8 @@ pub enum ServerFrame {
         version: u32,
         sample_rate_hz: u32,
         input_encoding: String,
+        brain: RealtimeBrainCapabilities,
+        store: StudyStoreCapabilities,
     },
     Event {
         version: u32,
@@ -262,10 +268,31 @@ impl From<BrainEvent> for VivaServerEvent {
 
 impl ServerFrame {
     pub fn ready() -> Self {
+        Self::ready_with_capabilities(default_ready_brain(), default_ready_store())
+    }
+
+    pub fn fake_cartesia_gemini_ready() -> Self {
+        Self::ready_with_capabilities(
+            RealtimeBrainCapabilities {
+                provider: "fake_cartesia_gemini".to_owned(),
+                configured: true,
+                selectable: true,
+                live_runtime: false,
+            },
+            default_ready_store(),
+        )
+    }
+
+    pub fn ready_with_capabilities(
+        brain: RealtimeBrainCapabilities,
+        store: StudyStoreCapabilities,
+    ) -> Self {
         Self::Ready {
             version: VIVA_VOICE_PROTOCOL_VERSION,
             sample_rate_hz: VIVA_VOICE_SAMPLE_RATE_HZ,
             input_encoding: VIVA_VOICE_INPUT_ENCODING.to_owned(),
+            brain,
+            store,
         }
     }
 
@@ -313,6 +340,26 @@ impl ServerFrame {
     }
 }
 
+fn default_ready_brain() -> RealtimeBrainCapabilities {
+    RealtimeBrainCapabilities {
+        provider: "synthetic".to_owned(),
+        configured: true,
+        selectable: true,
+        live_runtime: false,
+    }
+}
+
+fn default_ready_store() -> StudyStoreCapabilities {
+    StudyStoreCapabilities {
+        backend: StudyStoreBackend::InMemory,
+        available: true,
+        durable: false,
+        raw_audio_persistence: false,
+        transcript_persistence: false,
+        uuid_schema_translation: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
@@ -342,7 +389,7 @@ mod tests {
             serde_json::to_value(frame).expect("serializes"),
             json!({
                 "type": "audio",
-                "version": 1,
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
                 "frame": { "pcm16_base64": "AQIDBA==" }
             })
         );
@@ -461,7 +508,11 @@ mod tests {
             fixture.client.get(1),
             Some(ClientFrame::Audio { .. })
         ));
-        assert_eq!(fixture.server.first(), Some(&ServerFrame::ready()));
+        let Some(ServerFrame::Ready { brain, .. }) = fixture.server.first() else {
+            panic!("expected ready frame");
+        };
+        assert_eq!(brain.provider, "fake_cartesia_gemini");
+        assert!(!brain.live_runtime);
         assert!(fixture.server.iter().all(|frame| !matches!(
             frame,
             ServerFrame::Event {
@@ -551,7 +602,7 @@ mod tests {
         let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
         let brain = agent_adapters::cartesia_gemini::FakeCartesiaGeminiRuntime::new(store.clone());
         let mut session = brain.open(session_config).await.expect("opens");
-        let mut actual = vec![ServerFrame::ready()];
+        let mut actual = vec![ServerFrame::fake_cartesia_gemini_ready()];
         for _ in 0..2 {
             push_next_browser_frame(&mut actual, &mut session).await;
         }

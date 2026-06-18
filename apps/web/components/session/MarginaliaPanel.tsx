@@ -1,5 +1,6 @@
 import { Icon, Spark } from "@viva/ui-web";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
+import type { RuntimeCopy } from "../../lib/viva-session-projection";
 import { CorrectionMarginalia } from "./CorrectionMarginalia";
 import { SessionActionButton } from "./SessionActionButton";
 import { SourceFolio } from "./SourceFolio";
@@ -13,6 +14,7 @@ import type { Question, SessionState } from "./session-data";
 export function MarginaliaPanel({
   state,
   scene,
+  runtime,
   question,
   hintShown,
   onHint,
@@ -24,6 +26,7 @@ export function MarginaliaPanel({
 }: {
   state: SessionState;
   scene?: VivaSceneState;
+  runtime: RuntimeCopy;
   question: Question;
   hintShown: boolean;
   onHint: () => void;
@@ -59,6 +62,7 @@ export function MarginaliaPanel({
             onHint={onHint}
             onShowSource={onShowSource}
             onSubmitAnswer={onSubmitAnswer}
+            runtime={runtime}
           />
         ) : null}
         {state === "thinking" ? <ThinkingNote question={question} /> : null}
@@ -78,11 +82,13 @@ export function MarginaliaPanel({
 
 function ListeningNote({
   hintShown,
+  runtime,
   onHint,
   onShowSource,
   onSubmitAnswer,
 }: {
   hintShown: boolean;
+  runtime: RuntimeCopy;
   onHint: () => void;
   onShowSource: () => void;
   onSubmitAnswer: () => void;
@@ -92,10 +98,8 @@ function ListeningNote({
       <span aria-hidden="true" className="margin-note__glyph">
         <EarMark />
       </span>
-      <p className="margin-note__title">Viva is listening.</p>
-      <p className="margin-note__text">
-        Answer aloud from memory. I&rsquo;ll wait for your whole answer, then mark it in the margin.
-      </p>
+      <p className="margin-note__title">{runtime.marginaliaTitle}</p>
+      <p className="margin-note__text">{runtime.marginaliaText}</p>
       {hintShown ? (
         <p className="margin-note__hint">
           Start with NADH&rsquo;s electrons — where do they go first?

@@ -81,7 +81,16 @@ fn validate_ws_preflight(
 
 async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemaphorePermit) {
     let (mut sender, mut receiver) = socket.split();
-    if send_json(&mut sender, &ServerFrame::ready()).await.is_err() {
+    if send_json(
+        &mut sender,
+        &ServerFrame::ready_with_capabilities(
+            state.brain.capabilities(),
+            state.study_store.capabilities(),
+        ),
+    )
+    .await
+    .is_err()
+    {
         return;
     }
 
@@ -956,14 +965,22 @@ mod tests {
             .await
             .unwrap();
         handle_client_message(
-            Message::Text(r#"{"type":"text","version":1,"text":"quiz me"}"#.into()),
+            Message::Text(
+                json!({"type":"text","version":VIVA_VOICE_PROTOCOL_VERSION,"text":"quiz me"})
+                    .to_string()
+                    .into(),
+            ),
             &input,
             &binding,
         )
         .await
         .unwrap();
         handle_client_message(
-            Message::Text(r#"{"type":"cancel","version":1}"#.into()),
+            Message::Text(
+                json!({"type":"cancel","version":VIVA_VOICE_PROTOCOL_VERSION})
+                    .to_string()
+                    .into(),
+            ),
             &input,
             &binding,
         )
@@ -1003,13 +1020,18 @@ mod tests {
     fn requires_session_config_as_bootstrap_frame() {
         let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
         let message = Message::Text(
-            format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+            format!(
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            )
+            .into(),
         );
         let config = session_config_from_message(message).unwrap();
 
         assert_eq!(config.study_set_id.as_deref(), Some("biology-midterm"));
         assert!(session_config_from_message(Message::Text(
-            r#"{"type":"text","version":1,"text":"quiz me"}"#.into()
+            json!({"type":"text","version":VIVA_VOICE_PROTOCOL_VERSION,"text":"quiz me"})
+                .to_string()
+                .into()
         ))
         .is_err());
     }
@@ -1018,7 +1040,10 @@ mod tests {
     fn sanitizes_session_config_identity_and_strips_browser_source_context() {
         let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
         let message = Message::Text(
-            format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+            format!(
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            )
+            .into(),
         );
         let config = session_config_from_message(message).unwrap();
         let binding = fixture_binding();
@@ -1101,7 +1126,7 @@ mod tests {
         let binding = fixture_binding();
 
         let result = handle_client_message(
-            Message::Text(r#"{"type":"text","version":2,"text":"quiz me"}"#.into()),
+            Message::Text(r#"{"type":"text","version":1,"text":"quiz me"}"#.into()),
             &input,
             &binding,
         )
@@ -1117,8 +1142,19 @@ mod tests {
 
         let result = handle_client_message(
             Message::Text(
-                r#"{"type":"tool_result","version":1,"result":{"proposal":{"name":"evaluate_spoken_answer","arguments":{}},"result":{}}}"#
-                    .into(),
+                json!({
+                    "type": "tool_result",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "result": {
+                        "proposal": {
+                            "name": "evaluate_spoken_answer",
+                            "arguments": {},
+                        },
+                        "result": {},
+                    },
+                })
+                .to_string()
+                .into(),
             ),
             &input,
             &binding,

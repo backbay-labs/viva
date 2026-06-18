@@ -21,6 +21,18 @@ import {
 } from "./agent-contract";
 
 describe("Viva voice agent contract", () => {
+  test("uses protocol v2 because ready frames carry required provider/store readiness", () => {
+    expect(VIVA_VOICE_PROTOCOL_VERSION).toBe(2);
+    expect(() =>
+      parseVivaServerFrame({
+        type: "ready",
+        version: 1,
+        sample_rate_hz: VIVA_VOICE_SAMPLE_RATE_HZ,
+        input_encoding: VIVA_VOICE_INPUT_ENCODING,
+      }),
+    ).toThrow("Unsupported Viva voice protocol version");
+  });
+
   test("parses shared ready fixture from Rust service", () => {
     const ready = parseVivaServerFrame(readyFixture);
 
@@ -28,6 +40,20 @@ describe("Viva voice agent contract", () => {
     expect(ready.version).toBe(VIVA_VOICE_PROTOCOL_VERSION);
     expect(ready.sample_rate_hz).toBe(VIVA_VOICE_SAMPLE_RATE_HZ);
     expect(ready.input_encoding).toBe(VIVA_VOICE_INPUT_ENCODING);
+    expect(ready.brain).toEqual({
+      provider: "synthetic",
+      configured: true,
+      selectable: true,
+      live_runtime: false,
+    });
+    expect(ready.store).toEqual({
+      backend: "in_memory",
+      available: true,
+      durable: false,
+      raw_audio_persistence: false,
+      transcript_persistence: false,
+      uuid_schema_translation: true,
+    });
   });
 
   test("parses shared server event fixture from Rust service", () => {
@@ -68,7 +94,7 @@ describe("Viva voice agent contract", () => {
       expect(() =>
         parseVivaServerFrame({
           type: "event",
-          version: 1,
+          version: VIVA_VOICE_PROTOCOL_VERSION,
           event: {
             type: "manuscript_intent",
             response_id: "response-1",
@@ -88,7 +114,7 @@ describe("Viva voice agent contract", () => {
     expect(() =>
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "manuscript_intent",
           response_id: "response-1",
@@ -100,7 +126,7 @@ describe("Viva voice agent contract", () => {
     expect(() =>
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "manuscript_intent",
           response_id: "response-1",
@@ -112,7 +138,7 @@ describe("Viva voice agent contract", () => {
     expect(() =>
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "manuscript_intent",
           response_id: "response-1",
@@ -130,7 +156,7 @@ describe("Viva voice agent contract", () => {
     expect(() =>
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "manuscript_intent",
           response_id: "response-1",
@@ -148,7 +174,7 @@ describe("Viva voice agent contract", () => {
     expect(() =>
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "manuscript_intent",
           response_id: "response-1",
@@ -185,7 +211,7 @@ describe("Viva voice agent contract", () => {
     expect(() =>
       parseVivaClientFrame({
         type: "session_config",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         session: {
           user_id: "user-1",
           study_set_id: "biology-midterm",
@@ -198,7 +224,7 @@ describe("Viva voice agent contract", () => {
     expect(() =>
       parseVivaClientFrame({
         type: "tool_result",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         result: {
           proposal: { name: "evaluate_spoken_answer", arguments: {} },
           result: { accepted: true },
@@ -249,8 +275,9 @@ describe("Viva voice agent contract", () => {
       "session_phase",
       "cancellation",
     ]);
-    expect(JSON.stringify(fakeSessionFixture.server)).not.toContain("usage");
-    expect(JSON.stringify(fakeSessionFixture.server)).not.toContain("fake_cartesia_gemini");
+    const browserEvents = fakeSessionFixture.server.filter((frame) => frame.type === "event");
+    expect(JSON.stringify(browserEvents)).not.toContain("usage");
+    expect(JSON.stringify(browserEvents)).not.toContain("fake_cartesia_gemini");
   });
 
   test("keeps synthetic evidence pack sanitized and tied to release contract", () => {
@@ -321,7 +348,7 @@ describe("Viva voice agent contract", () => {
     expect(() =>
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "answer_evaluated",
           response_id: "response-1",
@@ -349,7 +376,7 @@ describe("Viva voice agent contract", () => {
     expect(() =>
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "answer_evaluated",
           response_id: "response-1",

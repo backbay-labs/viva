@@ -1,6 +1,20 @@
 {
   "type": "ready",
-  "version": 1,
+  "version": 2,
   "sample_rate_hz": 24000,
-  "input_encoding": "pcm_s16le"
+  "input_encoding": "pcm_s16le",
+  "brain": {
+    "provider": "synthetic",
+    "configured": true,
+    "selectable": true,
+    "live_runtime": false
+  },
+  "store": {
+    "backend": "in_memory",
+    "available": true,
+    "durable": false,
+    "raw_audio_persistence": false,
+    "transcript_persistence": false,
+    "uuid_schema_translation": true
+  }
 }

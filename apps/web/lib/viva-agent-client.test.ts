@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { type AgentSessionConfig, parseVivaClientFrame, parseVivaServerFrame } from "@viva/core";
+import {
+  type AgentSessionConfig,
+  parseVivaClientFrame,
+  parseVivaServerFrame,
+  VIVA_VOICE_PROTOCOL_VERSION,
+} from "@viva/core";
 import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/fake-cartesia-gemini-study-session.json";
 import readyFixture from "../../../agent/fixtures/voice-protocol/server-ready.json";
 import sessionFixture from "../../../agent/fixtures/voice-protocol/session-config.json";
@@ -42,7 +47,7 @@ describe("Viva agent browser client", () => {
     const frame = parseVivaAgentMessage(JSON.stringify(readyFixture));
 
     expect(frame.type).toBe("ready");
-    expect(agentProtocolVersion()).toBe(1);
+    expect(agentProtocolVersion()).toBe(VIVA_VOICE_PROTOCOL_VERSION);
   });
 
   test("controller sends initial session config and command frames", () => {
@@ -169,7 +174,7 @@ describe("Viva agent browser client", () => {
 
     const stale = parseVivaServerFrame({
       type: "event",
-      version: 1,
+      version: VIVA_VOICE_PROTOCOL_VERSION,
       event: {
         type: "transcript_delta",
         response_id: "stale-response",
@@ -192,7 +197,7 @@ describe("Viva agent browser client", () => {
       state,
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "manuscript_intent",
           response_id: "response-1",
@@ -211,7 +216,7 @@ describe("Viva agent browser client", () => {
       state,
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "manuscript_intent",
           response_id: "stale-response",
@@ -254,7 +259,7 @@ describe("Viva agent browser client", () => {
       state,
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: { type: "cancellation", response_id: "response-1" },
       }),
     );
@@ -262,7 +267,7 @@ describe("Viva agent browser client", () => {
       state,
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "transcript_delta",
           response_id: "response-1",
@@ -284,7 +289,7 @@ describe("Viva agent browser client", () => {
       state,
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: { type: "cancellation", response_id: "response-1" },
       }),
     );
@@ -293,7 +298,7 @@ describe("Viva agent browser client", () => {
       state,
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "manuscript_intent",
           response_id: "response-1",
@@ -317,7 +322,7 @@ describe("Viva agent browser client", () => {
       state,
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: { type: "cancellation", response_id: "response-1" },
       }),
     );
@@ -325,7 +330,7 @@ describe("Viva agent browser client", () => {
       state,
       parseVivaServerFrame({
         type: "event",
-        version: 1,
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "transcript_final",
           response_id: "response-2",

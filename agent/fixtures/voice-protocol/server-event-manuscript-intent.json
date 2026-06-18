@@ -1,6 +1,6 @@
 {
   "type": "event",
-  "version": 1,
+  "version": 2,
   "event": {
     "type": "manuscript_intent",
     "response_id": "response-1",

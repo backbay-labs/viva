@@ -1,4 +1,4 @@
-export const VIVA_VOICE_PROTOCOL_VERSION = 1;
+export const VIVA_VOICE_PROTOCOL_VERSION = 2;
 export const VIVA_VOICE_SAMPLE_RATE_HZ = 24_000;
 export const VIVA_VOICE_INPUT_ENCODING = "pcm_s16le";
 export const VIVA_VOICE_MAX_TEXT_FRAME_BYTES = 64 * 1024;
@@ -152,6 +152,24 @@ export type VivaReadyFrame = {
   version: typeof VIVA_VOICE_PROTOCOL_VERSION;
   sample_rate_hz: typeof VIVA_VOICE_SAMPLE_RATE_HZ;
   input_encoding: typeof VIVA_VOICE_INPUT_ENCODING;
+  brain: AgentBrainReadiness;
+  store: AgentStoreReadiness;
+};
+
+export type AgentBrainReadiness = {
+  provider: string;
+  configured: boolean;
+  selectable: boolean;
+  live_runtime: boolean;
+};
+
+export type AgentStoreReadiness = {
+  backend: string;
+  available: boolean;
+  durable: boolean;
+  raw_audio_persistence: boolean;
+  transcript_persistence: boolean;
+  uuid_schema_translation: boolean;
 };
 
 export type VivaServerEvent =
@@ -220,6 +238,8 @@ export function parseVivaServerFrame(value: unknown): VivaServerFrame {
     if (frame.input_encoding !== VIVA_VOICE_INPUT_ENCODING) {
       throw new Error("Unexpected Viva voice input encoding");
     }
+    parseBrainReadiness(frame.brain);
+    parseStoreReadiness(frame.store);
     return frame as VivaReadyFrame;
   }
 
@@ -434,6 +454,26 @@ function parseSessionConfig(value: unknown): AgentSessionConfig {
   return session as unknown as AgentSessionConfig;
 }
 
+function parseBrainReadiness(value: unknown): AgentBrainReadiness {
+  const brain = requireRecord(value, "brain readiness");
+  requireNonEmptyString(brain.provider, "provider");
+  requireBoolean(brain.configured, "configured");
+  requireBoolean(brain.selectable, "selectable");
+  requireBoolean(brain.live_runtime, "live_runtime");
+  return brain as unknown as AgentBrainReadiness;
+}
+
+function parseStoreReadiness(value: unknown): AgentStoreReadiness {
+  const store = requireRecord(value, "store readiness");
+  requireNonEmptyString(store.backend, "store backend");
+  requireBoolean(store.available, "store available");
+  requireBoolean(store.durable, "store durable");
+  requireBoolean(store.raw_audio_persistence, "raw audio persistence");
+  requireBoolean(store.transcript_persistence, "transcript persistence");
+  requireBoolean(store.uuid_schema_translation, "uuid schema translation");
+  return store as unknown as AgentStoreReadiness;
+}
+
 function parseManuscriptIntent(value: unknown): ManuscriptIntent {
   const intent = requireRecord(value, "manuscript intent");
   switch (intent.type) {
@@ -587,6 +627,13 @@ function requireEvaluationLabel(value: unknown): AgentEvaluationLabel {
 
 function requireString(value: unknown, label: string): string {
   if (typeof value !== "string") {
+    throw new Error(`Missing ${label}`);
+  }
+  return value;
+}
+
+function requireBoolean(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") {
     throw new Error(`Missing ${label}`);
   }
   return value;
