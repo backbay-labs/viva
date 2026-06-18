@@ -1,7 +1,8 @@
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -24,7 +25,7 @@ use tokio::sync::{watch, Semaphore};
 use uuid::Uuid;
 
 use crate::{
-    config::{SessionTokenClaims, VoiceWsAccess},
+    config::{SessionTokenClaims, VoiceLimitConfig, VoiceWsAccess},
     ws::voice_ws,
 };
 
@@ -40,6 +41,8 @@ pub struct AppState {
     pub ws_access: VoiceWsAccess,
     pub session_slots: Arc<Semaphore>,
     pub ws_timeouts: WsTimeouts,
+    pub voice_limits: VoiceLimitConfig,
+    pub limit_state: VoiceLimitState,
     pub drain_signal: VoiceDrainSignal,
     pub evidence: VoiceEvidenceRecorder,
     pub usage: VoiceUsageRecorder,
@@ -80,6 +83,8 @@ impl AppState {
             ws_access,
             session_slots: Arc::new(Semaphore::new(max_sessions)),
             ws_timeouts: WsTimeouts::default(),
+            voice_limits: VoiceLimitConfig::default(),
+            limit_state: VoiceLimitState::default(),
             drain_signal: VoiceDrainSignal::default(),
             evidence: VoiceEvidenceRecorder::default(),
             usage: VoiceUsageRecorder::default(),
@@ -115,6 +120,11 @@ impl AppState {
         self
     }
 
+    pub fn with_voice_limits(mut self, voice_limits: VoiceLimitConfig) -> Self {
+        self.voice_limits = voice_limits;
+        self
+    }
+
     pub fn with_unauthenticated_paste_allowed(mut self, allowed: bool) -> Self {
         self.unauthenticated_paste_allowed = allowed;
         self
@@ -124,6 +134,78 @@ impl AppState {
         let brain = self.brain.capabilities();
         let store = self.study_store.capabilities();
         brain.configured && brain.selectable && store.available && !self.drain_signal.is_draining()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct VoiceLimitState {
+    active: Arc<Mutex<ActiveVoiceLimits>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ActiveVoiceLimits {
+    users: HashMap<String, usize>,
+    ips: HashMap<String, usize>,
+}
+
+#[derive(Debug)]
+pub struct VoiceLimitLease {
+    state: VoiceLimitState,
+    kind: VoiceLimitKind,
+    key: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum VoiceLimitKind {
+    User,
+    Ip,
+}
+
+impl VoiceLimitState {
+    pub fn try_acquire_user(&self, user_id: &str, max: usize) -> Option<VoiceLimitLease> {
+        self.try_acquire(VoiceLimitKind::User, user_id, max)
+    }
+
+    pub fn try_acquire_ip(&self, ip: &str, max: usize) -> Option<VoiceLimitLease> {
+        self.try_acquire(VoiceLimitKind::Ip, ip, max)
+    }
+
+    fn try_acquire(&self, kind: VoiceLimitKind, key: &str, max: usize) -> Option<VoiceLimitLease> {
+        let mut active = self.active.lock().expect("voice limit state lock poisoned");
+        let counts = match kind {
+            VoiceLimitKind::User => &mut active.users,
+            VoiceLimitKind::Ip => &mut active.ips,
+        };
+        let count = counts.entry(key.to_owned()).or_default();
+        if *count >= max {
+            return None;
+        }
+        *count += 1;
+        Some(VoiceLimitLease {
+            state: self.clone(),
+            kind,
+            key: key.to_owned(),
+        })
+    }
+
+    fn release(&self, kind: VoiceLimitKind, key: &str) {
+        let mut active = self.active.lock().expect("voice limit state lock poisoned");
+        let counts = match kind {
+            VoiceLimitKind::User => &mut active.users,
+            VoiceLimitKind::Ip => &mut active.ips,
+        };
+        if let Some(count) = counts.get_mut(key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(key);
+            }
+        }
+    }
+}
+
+impl Drop for VoiceLimitLease {
+    fn drop(&mut self) {
+        self.state.release(self.kind, &self.key);
     }
 }
 

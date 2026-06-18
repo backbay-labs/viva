@@ -39,7 +39,12 @@ export type AgentStudySessionPhase =
   | "correction"
   | "recap";
 
-export type AgentTerminalSessionReason = "drained" | "session_cap" | "turn_cap";
+export type AgentTerminalSessionReason =
+  | "drained"
+  | "session_cap"
+  | "turn_cap"
+  | "rate_limit"
+  | "cost_budget";
 
 export type AgentStudySourceReference = {
   source_id: string;
@@ -599,7 +604,13 @@ function requireStudyPhase(value: unknown): AgentStudySessionPhase {
 }
 
 function requireTerminalSessionReason(value: unknown): AgentTerminalSessionReason {
-  if (value !== "drained" && value !== "session_cap" && value !== "turn_cap") {
+  if (
+    value !== "drained" &&
+    value !== "session_cap" &&
+    value !== "turn_cap" &&
+    value !== "rate_limit" &&
+    value !== "cost_budget"
+  ) {
     throw new Error("Invalid terminal session reason");
   }
   return value;

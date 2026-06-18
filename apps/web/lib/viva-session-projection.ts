@@ -64,6 +64,7 @@ export type RuntimeCopyCause =
   | "api_missing"
   | "agent_offline"
   | "auth_failed"
+  | "cost_budget"
   | "drained"
   | "fake_provider"
   | "ingestion_failed"
@@ -71,6 +72,7 @@ export type RuntimeCopyCause =
   | "live_provider_gated"
   | "live_runtime"
   | "mic_denied"
+  | "rate_limit"
   | "session_cap"
   | "session_disconnected"
   | "store_unavailable"
@@ -500,6 +502,22 @@ function controlledTerminalCopy(
         "The Conductor reached the turn cap and closed the manuscript after emitting a terminal phase.",
       statusLabel: "turn cap",
       cause: "turn_cap",
+    },
+    rate_limit: {
+      capsuleLabel: "Rate limit reached",
+      marginaliaTitle: "The rate limit closed this manuscript.",
+      marginaliaText:
+        "The Conductor reached the voice rate limit and closed the manuscript after emitting a terminal phase.",
+      statusLabel: "rate limit",
+      cause: "rate_limit",
+    },
+    cost_budget: {
+      capsuleLabel: "Budget cap reached",
+      marginaliaTitle: "The cost budget closed this manuscript.",
+      marginaliaText:
+        "The Conductor reached the live-provider cost budget and closed the manuscript after emitting a terminal phase.",
+      statusLabel: "budget cap",
+      cause: "cost_budget",
     },
   };
   return runtimeCopy(copyByReason[reason], context, {
