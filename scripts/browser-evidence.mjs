@@ -73,6 +73,10 @@ export function assertReleaseBrowserEvidence(evidence) {
     failures.push("browser_story.command_summary must tie screenshots to validation run");
   if (browserStory.fixture_hash_count < 1)
     failures.push("browser_story.fixture_hashes must tie screenshots to fixtures");
+  if (!browserStory.artifact_files.includes("browser-story.json"))
+    failures.push("browser_story.artifact_files must include browser-story.json");
+  if (!browserStory.artifact_files.includes("result.json"))
+    failures.push("browser_story.artifact_files must include result.json");
   if (!browserStory.validation_run_id)
     failures.push("browser_story.command_summary.validation_run_id must be present");
   for (const frameId of REQUIRED_BROWSER_STORY_FRAME_IDS) {
@@ -176,11 +180,15 @@ function normalizeBrowserStory(story) {
         : null,
     )
     .filter(Boolean);
+  const artifactFiles = Array.from(new Set(["browser-story.json", "result.json", ...screenshots]))
+    .filter(isSafeRelativeArtifactName)
+    .sort();
 
   return {
     artifact_forbidden_hits: Number.isInteger(artifactAudit?.forbidden_hits)
       ? artifactAudit.forbidden_hits
       : null,
+    artifact_files: artifactFiles,
     command_summary_present: hasCommandSummary(commandSummary),
     command_provider:
       typeof commandSummary?.provider === "string" ? commandSummary.provider : null,
