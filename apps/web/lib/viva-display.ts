@@ -19,6 +19,19 @@ export type ReviewPlanSignals = {
   lastReviewedAt?: Date;
 };
 
+export type RecapPlanProjection = {
+  recap?: SessionRecap;
+  reviewPlan: ReviewScheduleItem[];
+};
+
+type RecapConceptSignal = {
+  conceptId: string;
+  label: string;
+  status: ConceptStatus;
+  misses: number;
+  centrality: number;
+};
+
 export function uploadPreviewSummary(studySet: StudySet): {
   conceptLabel: string;
   overflowLabel: string;
@@ -62,6 +75,39 @@ export function recapStats(recap: SessionRecap): RecapStat[] {
   ];
 }
 
+export function recapPlanFromSessionEvents({
+  recap,
+  studySet,
+  conceptStatuses,
+  now,
+  signals = {},
+}: {
+  recap?: SessionRecap;
+  studySet: StudySet;
+  conceptStatuses: Record<string, ConceptStatus>;
+  now: Date;
+  signals?: ReviewPlanSignals;
+}): RecapPlanProjection {
+  if (!recap) return { recap: undefined, reviewPlan: [] };
+
+  const conceptSignals = conceptSignalsFromStatuses(studySet, conceptStatuses);
+  const reviewPlan = reviewPlanFromConceptSignals(conceptSignals, studySet, now, signals);
+
+  return {
+    recap: {
+      ...recap,
+      strongConcepts: labelsForStatus(conceptSignals, "strong"),
+      shakyConcepts: labelsForStatus(conceptSignals, "shaky"),
+      missedConcepts: labelsForStatus(conceptSignals, "missed"),
+      reviewLater: conceptSignals
+        .filter((concept) => concept.status !== "strong")
+        .map((concept) => concept.label),
+      nextAction: primaryNextAction(conceptSignals, reviewPlan),
+    },
+    reviewPlan,
+  };
+}
+
 export function reviewPlanFromRecap(
   recap: SessionRecap,
   studySet: StudySet,
@@ -99,6 +145,93 @@ export function reviewPlanFromRecap(
       };
     }),
   );
+}
+
+function reviewPlanFromConceptSignals(
+  conceptSignals: RecapConceptSignal[],
+  studySet: StudySet,
+  now: Date,
+  signals: ReviewPlanSignals,
+): ReviewScheduleItem[] {
+  const examDate = signals.examDate ?? examDateFromLabel(studySet.examDateLabel, now);
+  const lastReviewedAt =
+    signals.lastReviewedAt ?? lastReviewedAtFromLabel(studySet.lastSessionLabel, now);
+
+  return buildReviewSchedule(
+    conceptSignals.map((concept) => ({
+      conceptId: concept.conceptId,
+      label: concept.label,
+      status: concept.status,
+      misses: concept.misses,
+      hinted: signals.hinted === true,
+      centrality: concept.centrality,
+      now,
+      examDate,
+      lastReviewedAt,
+    })),
+  );
+}
+
+function conceptSignalsFromStatuses(
+  studySet: StudySet,
+  conceptStatuses: Record<string, ConceptStatus>,
+): RecapConceptSignal[] {
+  const conceptOrder = new Map(studySet.concepts.map((concept, index) => [concept.id, index]));
+  const concepts = Object.entries(conceptStatuses).map(([conceptId, status]) => {
+    const concept = studySet.concepts.find((item) => item.id === conceptId);
+    return {
+      conceptId,
+      label: concept?.label ?? humanizeConceptId(conceptId),
+      status,
+      misses: concept?.misses ?? (status === "missed" ? 1 : 0),
+      centrality: concept?.centrality ?? 50,
+    };
+  });
+
+  return concepts.sort(
+    (left, right) =>
+      (conceptOrder.get(left.conceptId) ?? Number.MAX_SAFE_INTEGER) -
+        (conceptOrder.get(right.conceptId) ?? Number.MAX_SAFE_INTEGER) ||
+      left.label.localeCompare(right.label),
+  );
+}
+
+function labelsForStatus(concepts: RecapConceptSignal[], status: ConceptStatus): string[] {
+  return concepts.filter((concept) => concept.status === status).map((concept) => concept.label);
+}
+
+function primaryNextAction(
+  conceptSignals: RecapConceptSignal[],
+  reviewPlan: ReviewScheduleItem[],
+): string {
+  if (conceptSignals.length === 0) {
+    return "Finish the session to let the Conductor build a source-grounded review plan.";
+  }
+
+  const firstMissed = reviewPlan.find((item) => item.status === "missed");
+  if (firstMissed) {
+    return `Rebuild ${firstMissed.label} from the source, then answer it once without hints.`;
+  }
+
+  const firstWeak = reviewPlan.find((item) => item.status === "shaky" || item.status === "review");
+  if (firstWeak) {
+    return `Tighten ${firstWeak.label} ${firstWeak.intervalLabel} with one source-backed recall pass.`;
+  }
+
+  const firstStrong = reviewPlan[0];
+  if (firstStrong) {
+    return `Bank this pass; return to ${firstStrong.label} for spaced recall ${firstStrong.intervalLabel}.`;
+  }
+
+  return "Finish the session to let the Conductor build a source-grounded review plan.";
+}
+
+function humanizeConceptId(conceptId: string): string {
+  return conceptId
+    .replace(/[-_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
 export function correctionQuote(answer: string): string {

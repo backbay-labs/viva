@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createStudySetPreview, type SessionRecap, seedStudySets } from "@viva/core";
 import {
   correctionQuote,
+  recapPlanFromSessionEvents,
   recapStats,
   reviewPlanFromRecap,
   uploadPreviewSummary,
@@ -91,5 +92,124 @@ describe("Viva display state", () => {
     expect(plan[0]?.explanation.join(" ")).toContain("hint-assisted");
     expect(plan[0]?.explanation.join(" ")).toContain("exam-near cap");
     expect(plan[0]?.explanation.join(" ")).toContain("session recency cap");
+  });
+
+  test("derives mixed recap buckets and next action from actual concept_status events", () => {
+    const recap: SessionRecap = {
+      durationLabel: "Agent session",
+      headline: "Fixture recap",
+      summary: "Fixture summary",
+      strongConcepts: ["Photosynthesis"],
+      shakyConcepts: [],
+      missedConcepts: [],
+      reviewLater: ["Photosynthesis"],
+      nextAction: "Fixture action that should not ship",
+      plan: [],
+      sourceMoments: [],
+    };
+
+    const projection = recapPlanFromSessionEvents({
+      conceptStatuses: {
+        "atp-yield": "missed",
+        nadh: "strong",
+        "oxidative-phosphorylation": "shaky",
+      },
+      now: new Date("2026-06-17T12:00:00Z"),
+      recap,
+      studySet: seedStudySets[0],
+    });
+
+    expect(projection.recap?.strongConcepts).toEqual(["NADH"]);
+    expect(projection.recap?.shakyConcepts).toEqual(["Oxidative phosphorylation"]);
+    expect(projection.recap?.missedConcepts).toEqual(["ATP yield"]);
+    expect(projection.recap?.reviewLater).toEqual(["Oxidative phosphorylation", "ATP yield"]);
+    expect(projection.recap?.strongConcepts).not.toContain("Photosynthesis");
+    expect(projection.recap?.nextAction).toBe(
+      "Rebuild ATP yield from the source, then answer it once without hints.",
+    );
+    expect(projection.recap?.nextAction).not.toContain("Fixture");
+    expect(projection.reviewPlan[0]?.conceptId).toBe("atp-yield");
+    expect(projection.reviewPlan[0]?.label).toBe("ATP yield");
+    expect(projection.reviewPlan[0]?.authority).toBe("core_fsrs");
+    expect(projection.reviewPlan[0]?.status).toBe("missed");
+  });
+
+  test("derives all-strong recap action without inventing weak concepts", () => {
+    const recap: SessionRecap = {
+      durationLabel: "Agent session",
+      headline: "All strong",
+      summary: "Summary",
+      strongConcepts: [],
+      shakyConcepts: ["Fixture weak item"],
+      missedConcepts: [],
+      reviewLater: ["Fixture weak item"],
+      nextAction: "Review the fixture weak item",
+      plan: [],
+      sourceMoments: [],
+    };
+
+    const projection = recapPlanFromSessionEvents({
+      conceptStatuses: {
+        glycolysis: "strong",
+        nadh: "strong",
+      },
+      now: new Date("2026-06-17T12:00:00Z"),
+      recap,
+      studySet: seedStudySets[0],
+    });
+
+    expect(projection.recap?.strongConcepts).toEqual(["Glycolysis", "NADH"]);
+    expect(projection.recap?.shakyConcepts).toEqual([]);
+    expect(projection.recap?.missedConcepts).toEqual([]);
+    expect(projection.recap?.reviewLater).toEqual([]);
+    expect(projection.recap?.nextAction).toBe(
+      `Bank this pass; return to ${projection.reviewPlan[0]?.label} for spaced recall ${projection.reviewPlan[0]?.intervalLabel}.`,
+    );
+    expect(projection.reviewPlan.every((item) => item.status === "strong")).toBe(true);
+  });
+
+  test("prioritizes missed-heavy sessions by weakest scheduled concept", () => {
+    const recap: SessionRecap = {
+      durationLabel: "Agent session",
+      headline: "Missed-heavy",
+      summary: "Summary",
+      strongConcepts: [],
+      shakyConcepts: [],
+      missedConcepts: [],
+      reviewLater: [],
+      nextAction: "Generic fixture action",
+      plan: [],
+      sourceMoments: [],
+    };
+
+    const projection = recapPlanFromSessionEvents({
+      conceptStatuses: {
+        "atp-yield": "missed",
+        "cellular-respiration": "missed",
+        "oxidative-phosphorylation": "shaky",
+      },
+      now: new Date("2026-06-17T12:00:00Z"),
+      recap,
+      studySet: seedStudySets[0],
+    });
+
+    expect(projection.recap?.missedConcepts).toEqual(["Cellular respiration", "ATP yield"]);
+    expect(projection.reviewPlan[0]?.status).toBe("missed");
+    expect(projection.recap?.nextAction).toBe(
+      `Rebuild ${projection.reviewPlan[0]?.label} from the source, then answer it once without hints.`,
+    );
+  });
+
+  test("returns no recap projection for no-recap early-end sessions", () => {
+    const projection = recapPlanFromSessionEvents({
+      conceptStatuses: {
+        nadh: "shaky",
+      },
+      now: new Date("2026-06-17T12:00:00Z"),
+      recap: undefined,
+      studySet: seedStudySets[0],
+    });
+
+    expect(projection).toEqual({ recap: undefined, reviewPlan: [] });
   });
 });

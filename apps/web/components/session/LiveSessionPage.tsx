@@ -18,7 +18,7 @@ import {
   createVivaAudioPlaybackSink,
   type VivaAudioPlaybackSink,
 } from "../../lib/viva-audio-playback";
-import { reviewPlanFromRecap } from "../../lib/viva-display";
+import { recapPlanFromSessionEvents } from "../../lib/viva-display";
 import { vivaSceneReducer } from "../../lib/viva-scene-reducer";
 import { sessionTokenFromSearch } from "../../lib/viva-session-entry";
 import {
@@ -263,12 +263,16 @@ export function LiveSessionPage() {
     () => projectSourceFolio(agent.derived, sessionStart),
     [agent.derived, sessionStart],
   );
-  const reviewPlan = useMemo(
+  const recapPlan = useMemo(
     () =>
-      agent.derived.recap
-        ? reviewPlanFromRecap(agent.derived.recap, STUDY_SET, sessionStart, { hinted: hintUsed })
-        : [],
-    [agent.derived.recap, hintUsed, sessionStart],
+      recapPlanFromSessionEvents({
+        conceptStatuses: agent.derived.conceptStatuses,
+        now: sessionStart,
+        recap: agent.derived.recap,
+        signals: { hinted: hintUsed },
+        studySet: STUDY_SET,
+      }),
+    [agent.derived.conceptStatuses, agent.derived.recap, hintUsed, sessionStart],
   );
   const conceptNodes = useMemo(
     () => projectConceptNodes(STUDY_SET.concepts, agent.agentState.conceptStatuses),
@@ -348,8 +352,8 @@ export function LiveSessionPage() {
       onSubmitAnswer={runtime.primaryActionIntent === "retry_agent" ? retryAgent : submitTurn}
       onTryAgain={submitTurn}
       question={projection.question}
-      recap={agent.derived.recap}
-      reviewPlan={reviewPlan}
+      recap={recapPlan.recap}
+      reviewPlan={recapPlan.reviewPlan}
       runtime={runtime}
       scene={scene}
       sourceFolio={sourceFolio}
