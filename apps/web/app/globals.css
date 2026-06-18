@@ -3279,6 +3279,105 @@ button {
   color: var(--viva-amethyst-deep);
 }
 
+.student-hand {
+  align-self: stretch;
+  display: grid;
+  gap: 0.36rem;
+  margin: 0;
+  padding: 0.72rem 0.82rem;
+  border-left: 2px solid rgba(129, 84, 189, 0.36);
+  background: linear-gradient(180deg, rgba(255, 253, 248, 0.74), rgba(247, 239, 228, 0.48));
+  text-align: left;
+}
+
+.student-hand figcaption {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--viva-muted);
+}
+
+.student-hand p {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 1.02rem;
+  font-style: italic;
+  line-height: 1.42;
+  color: var(--viva-ink);
+  overflow-wrap: anywhere;
+}
+
+.marginalia__body > .student-hand {
+  flex: 0 0 auto;
+  min-height: auto;
+  margin-bottom: 0.7rem;
+}
+
+.written-answer {
+  align-self: stretch;
+  display: grid;
+  gap: 0.5rem;
+  text-align: left;
+}
+
+.written-answer__label {
+  font-family: var(--serif);
+  font-size: 0.98rem;
+  font-style: italic;
+  color: var(--viva-amethyst-deep);
+}
+
+.written-answer__input {
+  width: 100%;
+  min-height: 6.1rem;
+  resize: vertical;
+  padding: 0.72rem 0.78rem;
+  border: 1px solid rgba(129, 84, 189, 0.24);
+  border-radius: 12px;
+  background:
+    linear-gradient(rgba(255, 253, 248, 0.86), rgba(255, 253, 248, 0.86)),
+    repeating-linear-gradient(
+      to bottom,
+      transparent 0,
+      transparent 1.55rem,
+      rgba(129, 84, 189, 0.12) 1.58rem
+    );
+  color: var(--viva-ink);
+  font-family: var(--serif);
+  font-size: 1rem;
+  line-height: 1.5;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.74);
+}
+
+.written-answer__input:focus-visible {
+  outline: none;
+  border-color: rgba(129, 84, 189, 0.58);
+  box-shadow:
+    0 0 0 2px var(--viva-paper),
+    0 0 0 4px rgba(129, 84, 189, 0.54),
+    inset 0 1px 0 rgba(255, 255, 255, 0.8);
+}
+
+.written-answer__input:disabled {
+  opacity: 0.62;
+  cursor: not-allowed;
+}
+
+.written-answer__note {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 0.74rem;
+  line-height: 1.35;
+  color: var(--viva-muted);
+}
+
+.written-answer__submit {
+  margin-top: 0.1rem;
+}
+
 .readiness-ladder {
   display: flex;
   flex-direction: column;

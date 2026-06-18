@@ -79,6 +79,9 @@ export function LiveSessionPage() {
   const [readinessProbe, setReadinessProbe] =
     useState<VivaAgentReadinessProbe>(initialReadinessProbe);
   const [sourceOpen, setSourceOpen] = useState(false);
+  const [textAnswerEnabled, setTextAnswerEnabled] = useState(false);
+  const [textRetryOpen, setTextRetryOpen] = useState(false);
+  const [submittedTextAnswer, setSubmittedTextAnswer] = useState<string>();
 
   const agent = useVivaAgentSession({
     mode: "quiz",
@@ -94,6 +97,8 @@ export function LiveSessionPage() {
   const levelRef = useRef<VoiceTraceLevel>({ user: 0, agent: 0 });
   const captureRef = useRef<VivaAudioCaptureSource | null>(null);
   const captureStartedRef = useRef(false);
+  const micStartGenerationRef = useRef(0);
+  const textAnswerModeRef = useRef(false);
   const meterRef = useRef(createVoiceLevelMeter({ coefficient: 0.3 }));
   const playbackRef = useRef<VivaAudioPlaybackSink | null>(null);
   const handledAudioRef = useRef(0);
@@ -186,7 +191,7 @@ export function LiveSessionPage() {
   );
 
   const startMic = useCallback(async () => {
-    if (captureStartedRef.current || reducedMotion) return;
+    if (captureStartedRef.current || reducedMotion || textAnswerModeRef.current) return;
     if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       setMicState("unsupported");
       return;
@@ -198,32 +203,52 @@ export function LiveSessionPage() {
       return;
     }
     captureStartedRef.current = true;
+    const startGeneration = ++micStartGenerationRef.current;
     try {
       const source = await createBrowserVivaAudioCaptureSource({
         AudioContextCtor,
         mediaDevices: navigator.mediaDevices,
         sampleRateHz: VIVA_AUDIO_SAMPLE_RATE_HZ,
       });
+      if (textAnswerModeRef.current || startGeneration !== micStartGenerationRef.current) {
+        source.stop();
+        captureStartedRef.current = false;
+        levelRef.current.user = 0;
+        return;
+      }
       captureRef.current = source;
       setMicState("available");
       const meter = meterRef.current;
       // Samples drive the bloom ONLY — never sent to the brain.
       void source.start((samples) => {
+        if (textAnswerModeRef.current) {
+          levelRef.current.user = 0;
+          return;
+        }
         levelRef.current.user = meter.push(samples);
       });
     } catch {
+      if (textAnswerModeRef.current || startGeneration !== micStartGenerationRef.current) {
+        captureStartedRef.current = false;
+        levelRef.current.user = 0;
+        return;
+      }
       captureStartedRef.current = false; // allow another attempt on the next gesture
       levelRef.current.user = 0;
       setMicState("denied");
     }
   }, [reducedMotion]);
 
-  const onUserGesture = useCallback(() => {
+  const unlockPlayback = useCallback(() => {
     void getPlayback()
       .unlock()
       .catch(() => {});
+  }, [getPlayback]);
+
+  const onUserGesture = useCallback(() => {
+    unlockPlayback();
     void startMic();
-  }, [getPlayback, startMic]);
+  }, [startMic, unlockPlayback]);
 
   // Start listening (mic + playback unlock) on the first interaction anywhere.
   useEffect(() => {
@@ -232,29 +257,54 @@ export function LiveSessionPage() {
     return () => window.removeEventListener("pointerdown", handler);
   }, [onUserGesture]);
 
-  const submitTurn = useCallback(() => {
+  const activateTextAnswerMode = useCallback(() => {
+    textAnswerModeRef.current = true;
+    micStartGenerationRef.current += 1;
+    enterTextAnswerMode(captureRef, captureStartedRef, levelRef, meterRef);
+  }, []);
+
+  const submitSpokenTurn = useCallback(() => {
     onUserGesture();
     setSourceOpen(false);
     setHintShown(false);
+    setTextRetryOpen(false);
     // Content is the student's turn signal; the synthetic brain runs its
     // deterministic evaluation sequence. A real provider receives the transcript.
     agentRef.current.sendText("(spoken answer)");
   }, [onUserGesture]);
+  const submitTextTurn = useCallback(
+    (answer: string) => {
+      const payload = textAnswerPayload(answer);
+      if (!payload) return;
+      unlockPlayback();
+      activateTextAnswerMode();
+      setSourceOpen(false);
+      setHintShown(false);
+      setTextRetryOpen(false);
+      setTextAnswerEnabled(true);
+      setSubmittedTextAnswer(payload);
+      agentRef.current.sendText(payload);
+    },
+    [activateTextAnswerMode, unlockPlayback],
+  );
   const challengeSource = useCallback(() => {
     onUserGesture();
     setSourceOpen(false);
     setHintShown(false);
+    setTextRetryOpen(false);
     agentRef.current.sendText("(challenge citation)");
   }, [onUserGesture]);
   const retryAgent = useCallback(() => {
     setSourceOpen(false);
     setHintShown(false);
+    setTextRetryOpen(false);
     agentRef.current.reset();
     agentRef.current.connect();
   }, []);
   const endSession = useCallback(() => {
     setSourceOpen(false);
     setHintShown(false);
+    setTextRetryOpen(false);
     stopCaptureForRecap(captureRef, captureStartedRef, levelRef);
     agentRef.current.stop();
   }, []);
@@ -263,6 +313,17 @@ export function LiveSessionPage() {
     if (!agent.derived.recap) return;
     stopCaptureForRecap(captureRef, captureStartedRef, levelRef);
   }, [agent.derived.recap]);
+
+  const activeQuestionId = agent.derived.question?.id;
+  const previousQuestionIdRef = useRef(activeQuestionId);
+
+  useEffect(() => {
+    if (previousQuestionIdRef.current === activeQuestionId) return;
+    previousQuestionIdRef.current = activeQuestionId;
+    setSubmittedTextAnswer(undefined);
+    setTextAnswerEnabled(false);
+    setTextRetryOpen(false);
+  }, [activeQuestionId]);
 
   // Stable session-start reference so FSRS review intervals are deterministic
   // across renders (and don't recompute the projection every tick).
@@ -317,10 +378,16 @@ export function LiveSessionPage() {
     agent.derived.question,
     agent.derived.sources,
   ]);
-  const effectiveState: SessionState = sourceOpen ? "source" : projection.state;
+  const effectiveState: SessionState = sourceOpen
+    ? "source"
+    : textRetryOpen
+      ? "listening"
+      : projection.state;
   const highlightedTokens = sourceOpen
     ? projectHighlightedTokens("source", agent.derived)
-    : projection.highlightedTokens;
+    : textRetryOpen
+      ? projectHighlightedTokens("listening", agent.derived)
+      : projection.highlightedTokens;
   const runtime = useMemo(
     () =>
       projectRuntimeCopy({
@@ -342,6 +409,31 @@ export function LiveSessionPage() {
       readinessProbe,
     ],
   );
+  const websocketReady = Boolean(agent.agentState.ready) && agent.status === "open";
+  const textAnswerRequired = micState === "denied" || micState === "unsupported";
+  const textAnswerAvailable = websocketReady;
+  const textAnswerActive = textAnswerAvailable && (textAnswerRequired || textAnswerEnabled);
+  const studentHandAnswer = textRetryOpen
+    ? undefined
+    : (agent.derived.finalTranscript ?? submittedTextAnswer);
+
+  useEffect(() => {
+    if (textAnswerActive) {
+      activateTextAnswerMode();
+    } else {
+      textAnswerModeRef.current = false;
+    }
+  }, [activateTextAnswerMode, textAnswerActive]);
+
+  const openTextRetry = useCallback(() => {
+    setSourceOpen(false);
+    setHintShown(false);
+    setSubmittedTextAnswer(undefined);
+    setTextAnswerEnabled(true);
+    setTextRetryOpen(true);
+    activateTextAnswerMode();
+  }, [activateTextAnswerMode]);
+
   const sessionContextLabel =
     agent.readiness.reason === "trusted"
       ? `Trusted server set: ${activeStudySet.title}`
@@ -364,10 +456,20 @@ export function LiveSessionPage() {
         setHintUsed(true);
         setHintShown((shown) => !shown);
       }}
-      onNextQuestion={submitTurn}
+      onNextQuestion={submitSpokenTurn}
       onShowSource={() => setSourceOpen(true)}
-      onSubmitAnswer={runtime.primaryActionIntent === "retry_agent" ? retryAgent : submitTurn}
-      onTryAgain={submitTurn}
+      onSubmitAnswer={runtime.primaryActionIntent === "retry_agent" ? retryAgent : submitSpokenTurn}
+      onSubmitTextAnswer={submitTextTurn}
+      onTryAgain={textAnswerActive ? openTextRetry : submitSpokenTurn}
+      onUseTextAnswer={() => {
+        setTextAnswerEnabled(true);
+        activateTextAnswerMode();
+      }}
+      onUseVoiceAnswer={() => {
+        textAnswerModeRef.current = false;
+        setTextAnswerEnabled(false);
+        onUserGesture();
+      }}
       question={projection.question}
       recap={recapPlan.recap}
       reviewPlan={recapPlan.reviewPlan}
@@ -375,6 +477,16 @@ export function LiveSessionPage() {
       scene={scene}
       sourceFolio={sourceFolio}
       state={effectiveState}
+      textAnswer={
+        textAnswerAvailable
+          ? {
+              active: textAnswerActive,
+              disabled: false,
+              lastAnswer: studentHandAnswer,
+              required: textAnswerRequired,
+            }
+          : undefined
+      }
     />
   );
 }
@@ -388,6 +500,24 @@ export function stopCaptureForRecap(
   captureRef.current = null;
   captureStartedRef.current = false;
   levelRef.current.user = 0;
+}
+
+export function enterTextAnswerMode(
+  captureRef: { current: Pick<VivaAudioCaptureSource, "stop"> | null },
+  captureStartedRef: { current: boolean },
+  levelRef: { current: { user: number } },
+  meterRef?: { current: { reset: () => void } },
+) {
+  captureRef.current?.stop();
+  captureRef.current = null;
+  captureStartedRef.current = false;
+  levelRef.current.user = 0;
+  meterRef?.current.reset();
+}
+
+export function textAnswerPayload(answer: string): string | null {
+  const trimmed = answer.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 function readBrowserSessionRouteIdentity() {

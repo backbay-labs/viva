@@ -191,28 +191,48 @@ export type VoiceTraceLevel = { user: number; agent: number };
 /** A stable ref the parent mutates ~50×/s; read in the rAF loop, never via React state. */
 export type VoiceTraceLevelRef = { current: VoiceTraceLevel | null };
 
+const TEXT_MODE_BLOOM_FLOOR = 0.34;
+
+export function voiceTraceBloomPulse({
+  textMode,
+  time,
+  voice,
+}: {
+  textMode: boolean;
+  time: number;
+  voice: number;
+}): number {
+  return textMode
+    ? TEXT_MODE_BLOOM_FLOOR
+    : Math.max(TEXT_MODE_BLOOM_FLOOR + 0.1 * Math.sin(time * 1.7), voice);
+}
+
 export function VoiceTraceCanvas({
   state,
   scene,
   highlightedTokens,
   conceptNodes,
   levelRef,
+  textMode = false,
 }: {
   state: SessionState;
   scene?: VivaSceneState;
   highlightedTokens?: string[];
   conceptNodes?: ConceptNode[];
   levelRef?: VoiceTraceLevelRef;
+  textMode?: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef<SessionState>(state);
   const sceneRef = useRef<VivaSceneState | undefined>(scene);
+  const textModeRef = useRef(textMode);
   const highlightRef = useRef<Set<string>>(new Set());
   const conceptNodesRef = useRef<ConceptNode[]>(conceptNodes ?? []);
   const levelRefHolder = useRef<VoiceTraceLevelRef | null>(levelRef ?? null);
   levelRefHolder.current = levelRef ?? null;
   stateRef.current = state;
   sceneRef.current = scene;
+  textModeRef.current = textMode;
 
   useEffect(() => {
     highlightRef.current = new Set(highlightedTokens ?? []);
@@ -319,9 +339,10 @@ export function VoiceTraceCanvas({
       const calm = 1 - cur.calm * 0.55;
       const fs = fontScale();
       const levels = levelRefHolder.current?.current;
-      const userLevel = clamp01(levels?.user ?? 0);
-      const agentLevel = clamp01(levels?.agent ?? 0);
-      const voice = Math.max(userLevel, agentLevel);
+      const textModeActive = textModeRef.current;
+      const userLevel = textModeActive ? 0 : clamp01(levels?.user ?? 0);
+      const agentLevel = textModeActive ? 0 : clamp01(levels?.agent ?? 0);
+      const voice = textModeActive ? 0 : Math.max(userLevel, agentLevel);
       ctx.clearRect(0, 0, cssW, cssH);
 
       // concept pathway: the session's real concepts, placed along the main line
@@ -465,9 +486,8 @@ export function VoiceTraceCanvas({
       // old fake `0.5 + 0.5*sin(t)` pulse — the page now literally listens.)
       const bx = 0.5 * cssW;
       const by = 0.7 * cssH;
-      const breath = 0.34 + 0.1 * Math.sin(t * 1.7);
-      const pulse = Math.max(breath, voice);
-      const speaking = agentLevel > userLevel + 0.02;
+      const pulse = voiceTraceBloomPulse({ textMode: textModeActive, time: t, voice });
+      const speaking = !textModeActive && agentLevel > userLevel + 0.02;
       const bloomColor = mix(speaking ? GOLD : LAV, OCHRE, cur.warm);
       const presence = Math.max(cur.marker, 0.45 + sceneWeight * 0.12);
       const ringR = (10 + pulse * 10) * fs * (0.7 + cur.marker * 0.4);
@@ -550,6 +570,7 @@ export function VoiceTraceCanvas({
       data-scene-emphasis={scene?.emphasis ?? "quiet"}
       data-scene-entity-count={scene?.entities.length ?? 0}
       data-scene-register={scene?.register ?? "examining"}
+      data-text-mode={textMode ? "true" : "false"}
     >
       <canvas className="voice-trace__canvas" ref={canvasRef} />
     </div>

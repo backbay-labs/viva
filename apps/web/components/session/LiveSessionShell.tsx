@@ -3,6 +3,7 @@ import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
 import { MuseBackdrop } from "../landing/MuseBackdrop";
 import { MuseGlyphCanvas, type MuseGlyphState } from "../landing/MuseGlyphCanvas";
+import type { TextAnswerState } from "./MarginaliaPanel";
 import { MarginaliaPanel } from "./MarginaliaPanel";
 import { QuestionStage } from "./QuestionStage";
 import { SessionBottomControls } from "./SessionBottomControls";
@@ -31,12 +32,16 @@ export function LiveSessionShell({
   clockLabel,
   elapsed,
   hintShown,
+  textAnswer,
   levelRef,
   onEndSession,
   onHint,
   onShowSource,
   onChallengeSource,
   onSubmitAnswer,
+  onSubmitTextAnswer,
+  onUseTextAnswer,
+  onUseVoiceAnswer,
   onBackToQuestion,
   onTryAgain,
   onNextQuestion,
@@ -55,12 +60,16 @@ export function LiveSessionShell({
   clockLabel?: string;
   elapsed: number;
   hintShown: boolean;
+  textAnswer?: TextAnswerState;
   levelRef?: VoiceTraceLevelRef;
   onEndSession: () => void;
   onHint: () => void;
   onShowSource: () => void;
   onChallengeSource?: () => void;
   onSubmitAnswer: () => void;
+  onSubmitTextAnswer?: (answer: string) => void;
+  onUseTextAnswer?: () => void;
+  onUseVoiceAnswer?: () => void;
   onBackToQuestion: () => void;
   onTryAgain: () => void;
   onNextQuestion: () => void;
@@ -88,6 +97,7 @@ export function LiveSessionShell({
               levelRef={levelRef}
               scene={scene}
               state={state}
+              textMode={Boolean(textAnswer?.active)}
             />
             <SessionBottomControls onEndSession={onEndSession} />
           </div>
@@ -100,7 +110,10 @@ export function LiveSessionShell({
             onNextQuestion={onNextQuestion}
             onShowSource={onShowSource}
             onSubmitAnswer={onSubmitAnswer}
+            onSubmitTextAnswer={onSubmitTextAnswer}
             onTryAgain={onTryAgain}
+            onUseTextAnswer={onUseTextAnswer}
+            onUseVoiceAnswer={onUseVoiceAnswer}
             question={question}
             recap={recap}
             reviewPlan={reviewPlan}
@@ -108,6 +121,7 @@ export function LiveSessionShell({
             scene={scene}
             sourceFolio={sourceFolio}
             state={state}
+            textAnswer={textAnswer}
           />
         </div>
       </div>

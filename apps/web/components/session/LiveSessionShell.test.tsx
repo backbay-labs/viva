@@ -16,7 +16,7 @@ import {
 import { MarginaliaPanel } from "./MarginaliaPanel";
 import { SessionHeader } from "./SessionHeader";
 import type { Question } from "./session-data";
-import { VoiceTraceCanvas } from "./VoiceTraceCanvas";
+import { VoiceTraceCanvas, voiceTraceBloomPulse } from "./VoiceTraceCanvas";
 
 const noop = () => {};
 
@@ -216,7 +216,7 @@ describe("LiveSessionShell scene intent wiring", () => {
 
   test("renders scene state onto the existing Canvas and marginalia surfaces", () => {
     const canvasMarkup = renderToStaticMarkup(
-      <VoiceTraceCanvas conceptNodes={[]} scene={scene} state="correction" />,
+      <VoiceTraceCanvas conceptNodes={[]} scene={scene} state="correction" textMode={true} />,
     );
     const marginaliaMarkup = renderToStaticMarkup(
       <MarginaliaPanel
@@ -238,10 +238,20 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(canvasMarkup).toContain('data-scene-register="correcting"');
     expect(canvasMarkup).toContain('data-scene-emphasis="marked"');
     expect(canvasMarkup).toContain('data-scene-entity-count="1"');
+    expect(canvasMarkup).toContain('data-text-mode="true"');
     expect(marginaliaMarkup).toContain('class="marginalia"');
     expect(marginaliaMarkup).toContain('data-scene-register="correcting"');
     expect(marginaliaMarkup).toContain('data-scene-marginalia-count="1"');
     expect(`${canvasMarkup}${marginaliaMarkup}`).not.toContain("Render instruction");
+  });
+
+  test("keeps the bloom at a constant floor in text mode", () => {
+    expect(voiceTraceBloomPulse({ textMode: true, time: 0, voice: 0 })).toBe(
+      voiceTraceBloomPulse({ textMode: true, time: 10, voice: 1 }),
+    );
+    expect(voiceTraceBloomPulse({ textMode: false, time: 0, voice: 0 })).not.toBe(
+      voiceTraceBloomPulse({ textMode: false, time: 10, voice: 0 }),
+    );
   });
 
   test("renders projected runtime copy in listening marginalia", () => {
@@ -321,6 +331,94 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("Use your own words");
     expect(markup).not.toContain("NADH");
     expect(markup).not.toContain("electrons");
+  });
+
+  test("renders mic-denied written answer as the student's hand in the margin", () => {
+    const markup = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onSubmitTextAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        runtime={runtime}
+        state="listening"
+        textAnswer={{
+          active: true,
+          disabled: false,
+          lastAnswer: "NADH donates electrons to the ETC.",
+          required: true,
+        }}
+      />,
+    );
+
+    expect(markup).toContain('data-text-answer="active"');
+    expect(markup).toContain("Student");
+    expect(markup).toContain("hand");
+    expect(markup).toContain("NADH donates electrons");
+    expect(markup).toContain("<textarea");
+    expect(markup).toContain("Submit written answer");
+    expect(markup).not.toContain("chat");
+    expect(markup).not.toContain("generic textarea");
+  });
+
+  test("offers opt-in written answers without opening a textbox until selected", () => {
+    const markup = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onSubmitTextAnswer={noop}
+        onTryAgain={noop}
+        onUseTextAnswer={noop}
+        question={question}
+        runtime={runtime}
+        state="listening"
+        textAnswer={{
+          active: false,
+          disabled: false,
+          required: false,
+        }}
+      />,
+    );
+
+    expect(markup).toContain("Write answer");
+    expect(markup).not.toContain("<textarea");
+  });
+
+  test("keeps the student's hand visible while the agent evaluates the typed answer", () => {
+    const markup = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onSubmitTextAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        runtime={runtime}
+        state="correction"
+        textAnswer={{
+          active: true,
+          disabled: false,
+          lastAnswer: "NADH donates electrons to the transport chain.",
+          required: true,
+        }}
+      />,
+    );
+
+    expect(markup).toContain("Student&#x27;s hand");
+    expect(markup).toContain("NADH donates electrons to the transport chain.");
+    expect(markup).toContain("Almost.");
   });
 
   test("renders connected recap payloads without local-only actions", () => {

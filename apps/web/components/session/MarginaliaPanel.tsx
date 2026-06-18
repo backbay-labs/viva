@@ -1,11 +1,19 @@
 import type { ReviewScheduleItem, SessionRecap } from "@viva/core";
 import { Icon, Spark } from "@viva/ui-web";
+import { type FormEvent, useEffect, useId, useRef, useState } from "react";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
 import { CorrectionMarginalia } from "./CorrectionMarginalia";
 import { SessionActionButton } from "./SessionActionButton";
 import { SourceFolio } from "./SourceFolio";
 import type { Question, SessionState } from "./session-data";
+
+export type TextAnswerState = {
+  active: boolean;
+  disabled: boolean;
+  lastAnswer?: string;
+  required: boolean;
+};
 
 /**
  * The intelligence surface — "ask in the centre, think in the margins". Its
@@ -21,10 +29,14 @@ export function MarginaliaPanel({
   recap,
   reviewPlan = [],
   hintShown,
+  textAnswer,
   onHint,
   onShowSource,
   onChallengeSource,
   onSubmitAnswer,
+  onSubmitTextAnswer,
+  onUseTextAnswer,
+  onUseVoiceAnswer,
   onBackToQuestion,
   onTryAgain,
   onNextQuestion,
@@ -37,16 +49,21 @@ export function MarginaliaPanel({
   recap?: SessionRecap;
   reviewPlan?: ReviewScheduleItem[];
   hintShown: boolean;
+  textAnswer?: TextAnswerState;
   onHint: () => void;
   onShowSource: () => void;
   onChallengeSource?: () => void;
   onSubmitAnswer: () => void;
+  onSubmitTextAnswer?: (answer: string) => void;
+  onUseTextAnswer?: () => void;
+  onUseVoiceAnswer?: () => void;
   onBackToQuestion: () => void;
   onTryAgain: () => void;
   onNextQuestion: () => void;
 }) {
   const isSource = state === "source";
   const isRecap = isSource && Boolean(recap);
+  const studentHandAnswer = textAnswer?.lastAnswer;
 
   return (
     <aside
@@ -68,13 +85,20 @@ export function MarginaliaPanel({
         />
       </div>
       <div className="marginalia__body" aria-live="polite">
+        {state !== "listening" && !isSource && studentHandAnswer ? (
+          <StudentHand answer={studentHandAnswer} />
+        ) : null}
         {state === "listening" ? (
           <ListeningNote
             hintShown={hintShown}
             onHint={onHint}
             onShowSource={onShowSource}
             onSubmitAnswer={onSubmitAnswer}
+            onSubmitTextAnswer={onSubmitTextAnswer}
+            onUseTextAnswer={onUseTextAnswer}
+            onUseVoiceAnswer={onUseVoiceAnswer}
             runtime={runtime}
+            textAnswer={textAnswer}
           />
         ) : null}
         {state === "thinking" ? <ThinkingNote question={question} /> : null}
@@ -106,23 +130,58 @@ export function MarginaliaPanel({
 function ListeningNote({
   hintShown,
   runtime,
+  textAnswer,
   onHint,
   onShowSource,
   onSubmitAnswer,
+  onSubmitTextAnswer,
+  onUseTextAnswer,
+  onUseVoiceAnswer,
 }: {
   hintShown: boolean;
   runtime: RuntimeCopy;
+  textAnswer?: TextAnswerState;
   onHint: () => void;
   onShowSource: () => void;
   onSubmitAnswer: () => void;
+  onSubmitTextAnswer?: (answer: string) => void;
+  onUseTextAnswer?: () => void;
+  onUseVoiceAnswer?: () => void;
 }) {
+  const [writtenAnswer, setWrittenAnswer] = useState("");
+  const answerId = useId();
+  const helpId = useId();
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const wasActiveRef = useRef(false);
+
+  useEffect(() => {
+    const active = Boolean(textAnswer?.active);
+    if (active && !textAnswer?.disabled && !wasActiveRef.current) {
+      textareaRef.current?.focus();
+      window.requestAnimationFrame(() => textareaRef.current?.focus());
+    }
+    wasActiveRef.current = active;
+  }, [textAnswer?.active, textAnswer?.disabled]);
+
+  const submitWrittenAnswer = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const trimmed = writtenAnswer.trim();
+    if (!trimmed || textAnswer?.disabled) return;
+    onSubmitTextAnswer?.(trimmed);
+    setWrittenAnswer("");
+  };
+
   return (
-    <div className="margin-note margin-note--center">
+    <div
+      className="margin-note margin-note--center"
+      data-text-answer={textAnswer?.active ? "active" : "inactive"}
+    >
       <span aria-hidden="true" className="margin-note__glyph">
         <EarMark />
       </span>
       <p className="margin-note__title">{runtime.marginaliaTitle}</p>
       <p className="margin-note__text">{runtime.marginaliaText}</p>
+      {textAnswer?.lastAnswer ? <StudentHand answer={textAnswer.lastAnswer} /> : null}
       <ul className="readiness-ladder" aria-label="Connected session readiness">
         {runtime.readinessNotes.map((note) => (
           <li className="readiness-ladder__item" data-state={note.state} key={note.label}>
@@ -138,14 +197,64 @@ function ListeningNote({
           Use your own words first; the Conductor will reveal source terms after you answer.
         </p>
       ) : null}
+      {textAnswer?.active ? (
+        <form aria-label="Written answer" className="written-answer" onSubmit={submitWrittenAnswer}>
+          <label className="written-answer__label" htmlFor={answerId}>
+            Write in the margin
+          </label>
+          <textarea
+            aria-describedby={helpId}
+            aria-label="Student written answer"
+            className="written-answer__input"
+            disabled={textAnswer.disabled}
+            id={answerId}
+            onChange={(event) => setWrittenAnswer(event.currentTarget.value)}
+            ref={textareaRef}
+            rows={4}
+            value={writtenAnswer}
+          />
+          <p className="written-answer__note" id={helpId}>
+            {textAnswer.required
+              ? "Mic unavailable; this answer goes to the Conductor."
+              : "This answer goes to the Conductor."}
+          </p>
+          <button
+            className="session-action session-action--primary written-answer__submit"
+            disabled={textAnswer.disabled || writtenAnswer.trim().length === 0}
+            type="submit"
+          >
+            <span className="session-action__icon">
+              <Icon color="var(--viva-paper)" name="pen" size={15} strokeWidth={1.7} />
+            </span>
+            <span className="session-action__label">Submit written answer</span>
+          </button>
+        </form>
+      ) : null}
       <div className="margin-note__actions">
-        <SessionActionButton
-          disabled={runtime.primaryActionDisabled}
-          label={runtime.primaryActionLabel}
-          leading={<Icon color="var(--viva-paper)" name="mic" size={15} strokeWidth={1.7} />}
-          onClick={onSubmitAnswer}
-          variant="primary"
-        />
+        {textAnswer?.active ? (
+          !textAnswer.required && onUseVoiceAnswer ? (
+            <SessionActionButton
+              label="Use mic"
+              leading={<Icon color="var(--viva-amethyst)" name="mic" size={15} strokeWidth={1.6} />}
+              onClick={onUseVoiceAnswer}
+            />
+          ) : null
+        ) : (
+          <SessionActionButton
+            disabled={runtime.primaryActionDisabled}
+            label={runtime.primaryActionLabel}
+            leading={<Icon color="var(--viva-paper)" name="mic" size={15} strokeWidth={1.7} />}
+            onClick={onSubmitAnswer}
+            variant="primary"
+          />
+        )}
+        {!textAnswer?.active && textAnswer && onUseTextAnswer ? (
+          <SessionActionButton
+            label="Write answer"
+            leading={<Icon color="var(--viva-amethyst)" name="pen" size={15} strokeWidth={1.6} />}
+            onClick={onUseTextAnswer}
+          />
+        ) : null}
         <SessionActionButton
           label="Hint"
           leading={<Icon color="var(--viva-amethyst)" name="bulb" size={15} strokeWidth={1.6} />}
@@ -159,6 +268,15 @@ function ListeningNote({
         />
       </div>
     </div>
+  );
+}
+
+function StudentHand({ answer }: { answer: string }) {
+  return (
+    <figure className="student-hand" aria-label="Student hand answer">
+      <figcaption>Student's hand</figcaption>
+      <p>{answer}</p>
+    </figure>
   );
 }
 

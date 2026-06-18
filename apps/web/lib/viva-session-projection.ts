@@ -316,22 +316,27 @@ export function projectRuntimeCopy({
     );
   }
 
-  if (mic === "denied" || mic === "unsupported") {
+  if (
+    context.websocketReady &&
+    readinessFacts.brain.configured &&
+    readinessFacts.brain.selectable &&
+    (mic === "denied" || mic === "unsupported")
+  ) {
     const denied = mic === "denied";
     return runtimeCopy(
       {
         capsuleLabel: denied ? "Mic denied" : "Mic unavailable",
         marginaliaTitle: denied
-          ? "Agent unavailable: mic denied."
-          : "Agent unavailable: mic unavailable.",
+          ? "Mic denied; write in the margin."
+          : "Mic unavailable; write in the margin.",
         marginaliaText: denied
-          ? "Browser microphone capture was denied. Allow mic access before treating this as a spoken session."
-          : "Browser microphone capture is unavailable in this browser context. Check mic access or switch to a browser with audio capture.",
+          ? "Browser microphone capture was denied. Submit a written answer; the Conductor will evaluate the same agent text path and finalize the transcript from the server."
+          : "Browser microphone capture is unavailable in this browser context. Submit a written answer; the Conductor will evaluate the same agent text path and finalize the transcript from the server.",
         statusLabel: denied ? "mic denied" : "mic unavailable",
         cause: "mic_denied",
       },
       context,
-      { disabled: true, nextActionLabel: "Check mic" },
+      trustedTurnAction(context),
     );
   }
 
