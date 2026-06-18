@@ -223,6 +223,7 @@ struct SyntheticStudySessionSpec {
     user_id: String,
     voice_session_id: String,
     study_set_id: String,
+    active_concepts: Vec<String>,
 }
 
 impl SyntheticStudySessionSpec {
@@ -234,11 +235,26 @@ impl SyntheticStudySessionSpec {
             user_id: user_id.to_owned(),
             voice_session_id: voice_session_id.to_owned(),
             study_set_id: study_set_id.to_owned(),
+            active_concepts: config.active_concepts.clone(),
         })
     }
 
     fn response_id(&self, turn: usize) -> String {
         format!("response-{turn}")
+    }
+
+    fn concept_id_for_turn<'a>(&'a self, turn: usize, fixture_concept_id: &'a str) -> &'a str {
+        if self.active_concepts.is_empty() {
+            return fixture_concept_id;
+        }
+        if self
+            .active_concepts
+            .iter()
+            .any(|concept_id| concept_id == fixture_concept_id)
+        {
+            return fixture_concept_id;
+        }
+        self.active_concepts[turn.saturating_sub(1) % self.active_concepts.len()].as_str()
     }
 }
 
@@ -431,6 +447,7 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
                 &job.spec.user_id,
                 &job.spec.study_set_id,
                 &job.spec.voice_session_id,
+                &job.response_id,
                 evaluation.clone(),
             )
             .await
@@ -483,24 +500,30 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
     if job.cancelled.load(Ordering::SeqCst) {
         return;
     }
+    let concept_id = job
+        .spec
+        .concept_id_for_turn(job.turn, answer_spec.concept_id);
     if let Some(store) = &job.study_store {
-        // Best-effort persistence — a store rejection (e.g. an unknown concept)
-        // must never stall the examiner mid-correction.
-        let _ = store
+        if let Err(error) = store
             .record_concept_status(
                 &job.spec.user_id,
                 &job.spec.study_set_id,
                 &job.spec.voice_session_id,
-                answer_spec.concept_id,
+                &job.response_id,
+                concept_id,
                 answer_spec.status.clone(),
             )
-            .await;
+            .await
+        {
+            emit_store_error(event_tx, error.to_string()).await;
+            return;
+        }
     }
     if !send_unless_cancelled(
         event_tx,
         BrainEvent::ConceptStatus {
             response_id: job.response_id.clone(),
-            concept_id: answer_spec.concept_id.to_owned(),
+            concept_id: concept_id.to_owned(),
             status: answer_spec.status.clone(),
         },
         &job.cancelled,
@@ -514,7 +537,7 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
         BrainEvent::ManuscriptIntent {
             response_id: job.response_id.clone(),
             intent: ManuscriptIntent::Entity {
-                entity_id: answer_spec.concept_id.to_owned(),
+                entity_id: concept_id.to_owned(),
                 entity_kind: ManuscriptEntityKind::Concept,
                 register: ManuscriptRegister::Correcting,
                 emphasis: ManuscriptEmphasis::Marked,
@@ -536,7 +559,7 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
                 &job.spec.user_id,
                 &job.spec.study_set_id,
                 &job.spec.voice_session_id,
-                answer_spec.concept_id,
+                concept_id,
                 "2026-06-18T09:00:00Z",
             )
             .await;
@@ -585,6 +608,7 @@ async fn emit_session_recap(
     question: &StudyQuestion,
     study_store: Option<&Arc<dyn StudyMemoryStore>>,
 ) {
+    let response_id = spec.response_id(0);
     let recap = study_session_recap(spec, question.source.clone());
     if let Some(store) = study_store {
         if let Err(error) = store
@@ -592,6 +616,7 @@ async fn emit_session_recap(
                 &spec.user_id,
                 &spec.study_set_id,
                 &spec.voice_session_id,
+                &response_id,
                 recap.clone(),
             )
             .await
@@ -601,10 +626,7 @@ async fn emit_session_recap(
         }
     }
     let _ = event_tx
-        .send(BrainEvent::RecapReady {
-            response_id: spec.response_id(0),
-            recap,
-        })
+        .send(BrainEvent::RecapReady { response_id, recap })
         .await;
     let _ = event_tx
         .send(BrainEvent::SessionPhase {
@@ -829,6 +851,61 @@ mod tests {
             }
             other => panic!("expected question_started, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn uses_server_active_concepts_for_authorized_concept_events() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let brain = SyntheticBrain::with_study_store(store.clone());
+        let mut session = brain
+            .open(SessionConfig {
+                session_id: Some(SessionId::new("voice-session-1")),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                active_concepts: vec!["atp-synthase".to_owned()],
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+
+        let _ = next_event(&mut session).await;
+        let _ = next_event(&mut session).await;
+        session
+            .input
+            .send(BrainInput::Text(
+                "NADH gives electrons to the electron transport chain.".to_owned(),
+            ))
+            .await
+            .unwrap();
+
+        let mut saw_concept_status = false;
+        loop {
+            match next_event(&mut session).await {
+                BrainEvent::ConceptStatus {
+                    response_id,
+                    concept_id,
+                    status,
+                } => {
+                    assert_eq!(response_id, "response-1");
+                    assert_eq!(concept_id, "atp-synthase");
+                    assert_eq!(status, ConceptStatus::Shaky);
+                    saw_concept_status = true;
+                }
+                BrainEvent::Error(error) => panic!("store rejected synthetic concept: {error:?}"),
+                BrainEvent::SessionPhase {
+                    phase: StudySessionPhase::Correction,
+                } => break,
+                _ => {}
+            }
+        }
+        assert!(saw_concept_status);
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.concept_statuses.len(), 1);
+        assert_eq!(snapshot.concept_statuses[0].concept_id, "atp-synthase");
+        assert_eq!(snapshot.review_items.len(), 1);
+        assert_eq!(snapshot.review_items[0].concept_id, "atp-synthase");
     }
 
     #[tokio::test]

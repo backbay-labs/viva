@@ -460,7 +460,7 @@ where
                             ToolProposal::new(name, args).with_call_id(id)
                         };
                         let result = executor
-                            .execute(proposal)
+                            .execute(response_id, proposal)
                             .await
                             .map_err(|error| BrainError::Protocol(error.to_string()))?;
                         if result.proposal.name() == "evaluate_spoken_answer" {
@@ -528,11 +528,14 @@ where
             usage,
         } = job;
         let source = executor
-            .execute(ToolProposal::retrieve_source_reference(
-                &session.study_set_id,
-                &session.voice_session_id,
-                &question.source.source_id,
-            ))
+            .execute(
+                response_id,
+                ToolProposal::retrieve_source_reference(
+                    &session.study_set_id,
+                    &session.voice_session_id,
+                    &question.source.source_id,
+                ),
+            )
             .await
             .map_err(|error| BrainError::Protocol(error.to_string()))
             .and_then(|result| {
@@ -565,12 +568,15 @@ where
         });
 
         let status_result = executor
-            .execute(ToolProposal::mark_concept_status(
-                &session.study_set_id,
-                &session.voice_session_id,
-                &status_concept_id,
-                "strong",
-            ))
+            .execute(
+                response_id,
+                ToolProposal::mark_concept_status(
+                    &session.study_set_id,
+                    &session.voice_session_id,
+                    &status_concept_id,
+                    "strong",
+                ),
+            )
             .await
             .map_err(|error| BrainError::Protocol(error.to_string()))?;
         let concept_id = parse_result_field::<String>(&status_result.result, "concept_id")?;
@@ -590,12 +596,15 @@ where
         }
 
         executor
-            .execute(ToolProposal::schedule_review_item(
-                &session.study_set_id,
-                &session.voice_session_id,
-                &review_concept_id,
-                "2026-06-16T09:00:00Z",
-            ))
+            .execute(
+                response_id,
+                ToolProposal::schedule_review_item(
+                    &session.study_set_id,
+                    &session.voice_session_id,
+                    &review_concept_id,
+                    "2026-06-16T09:00:00Z",
+                ),
+            )
             .await
             .map_err(|error| BrainError::Protocol(error.to_string()))?;
 
@@ -636,10 +645,10 @@ where
         }
 
         let recap = executor
-            .execute(ToolProposal::build_session_recap(
-                &session.study_set_id,
-                &session.voice_session_id,
-            ))
+            .execute(
+                response_id,
+                ToolProposal::build_session_recap(&session.study_set_id, &session.voice_session_id),
+            )
             .await
             .map_err(|error| BrainError::Protocol(error.to_string()))
             .and_then(|result| parse_result_field::<StudySessionRecap>(&result.result, "recap"))?;

@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    AnswerEvaluation, ConceptStatus, SessionConfig, SourceConfidence, StudyQuestion,
-    StudySessionRecap, StudySourceReference, ToolProposal,
+    AnswerEvaluation, ConceptStatus, ManuscriptIntent, SessionConfig, SourceConfidence,
+    StudyQuestion, StudySessionRecap, StudySourceReference, ToolProposal,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -237,11 +237,100 @@ pub trait StudyMemoryStore: Send + Sync {
         Ok(None)
     }
 
+    async fn authorize_question_started(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        question: &StudyQuestion,
+    ) -> Result<(), PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            &question.question_id,
+            "question event authorization is not implemented by this store",
+        ))
+    }
+
+    async fn authorize_answer_evaluation(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        response_id: &str,
+        _evaluation: &AnswerEvaluation,
+    ) -> Result<(), PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            response_id,
+            "answer evaluation authorization is not implemented by this store",
+        ))
+    }
+
+    async fn authorize_source_reference(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        source: &StudySourceReference,
+    ) -> Result<(), PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            &source.source_id,
+            "source reference authorization is not implemented by this store",
+        ))
+    }
+
+    async fn authorize_concept_status(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        response_id: &str,
+        _concept_id: &str,
+        _status: &ConceptStatus,
+    ) -> Result<(), PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            response_id,
+            "concept status authorization is not implemented by this store",
+        ))
+    }
+
+    async fn authorize_manuscript_intent(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        _intent: &ManuscriptIntent,
+    ) -> Result<(), PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            "manuscript_intent",
+            "manuscript intent authorization is not implemented by this store",
+        ))
+    }
+
+    async fn authorize_recap(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        response_id: &str,
+        _recap: &StudySessionRecap,
+    ) -> Result<(), PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            response_id,
+            "recap authorization is not implemented by this store",
+        ))
+    }
+
     async fn record_answer_evaluation(
         &self,
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         evaluation: AnswerEvaluation,
     ) -> Result<Value, PortError>;
 
@@ -257,6 +346,7 @@ pub trait StudyMemoryStore: Send + Sync {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         concept_id: &str,
         status: ConceptStatus,
     ) -> Result<ConceptStatus, PortError>;
@@ -275,6 +365,7 @@ pub trait StudyMemoryStore: Send + Sync {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         recap: StudySessionRecap,
     ) -> Result<Value, PortError>;
 

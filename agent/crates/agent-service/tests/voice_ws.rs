@@ -3,15 +3,15 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     task::{Context, Poll},
 };
 
 use agent_adapters::{cartesia_gemini::FakeCartesiaGeminiRuntime, SyntheticBrain};
 use agent_domain::{
-    AudioFrame, BrainError, BrainEvent, BrainInput, RealtimeBrain, RealtimeBrainCapabilities,
-    RealtimeSession, RealtimeSessionTaskGuard, StudyMemoryStore,
+    AudioFrame, BrainError, BrainEvent, BrainInput, BrainUsage, RealtimeBrain,
+    RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard, StudyMemoryStore,
 };
 use agent_service::{
     build_router, AppState, ClientFrame, ServerFrame, VoiceEvidenceRecorder, VoiceWsAccess,
@@ -23,7 +23,7 @@ use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use observe::{VoiceEvidenceEventKind, VoiceUsageEvent};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::ErrorKind;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,13 +41,9 @@ use tokio_tungstenite::{
 use tower::ServiceExt;
 
 fn test_state(max_sessions: usize) -> AppState {
-    AppState::new(
-        Arc::new(SyntheticBrain::with_study_store(Arc::new(
-            data::InMemoryStudyStore::seeded_fixture(),
-        ))),
-        "synthetic",
-        VoiceWsAccess::default(),
+    test_state_with_store(
         max_sessions,
+        Arc::new(data::InMemoryStudyStore::seeded_fixture()),
     )
 }
 
@@ -62,10 +58,9 @@ fn test_state_with_store(max_sessions: usize, store: Arc<data::InMemoryStudyStor
 }
 
 fn test_state_with_session_token(secret: &str) -> AppState {
-    AppState::new(
-        Arc::new(SyntheticBrain::with_study_store(Arc::new(
-            data::InMemoryStudyStore::seeded_fixture(),
-        ))),
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(store.clone())),
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
@@ -73,6 +68,7 @@ fn test_state_with_session_token(secret: &str) -> AppState {
             allowed_origins: vec![],
         },
         1,
+        store,
     )
 }
 
@@ -466,7 +462,10 @@ async fn real_websocket_replays_synthetic_fixture_and_evidence_pack() {
     }
     wait_for_socket_close(&mut socket).await;
 
-    assert_eq!(actual, fixture.server);
+    assert_eq!(
+        normalized_fixture_value(&actual),
+        normalized_fixture_value(&fixture.server)
+    );
     let expected_pack: serde_json::Value = serde_json::from_str(include_str!(
         "../../../fixtures/voice-protocol/synthetic-evidence-pack.json"
     ))
@@ -489,7 +488,7 @@ async fn real_websocket_replays_synthetic_fixture_and_evidence_pack() {
     );
     assert_usage_summary(&usage.snapshot(), &expected_pack["usage"]);
     assert_eq!(
-        serde_json::to_value(evidence.snapshot()).unwrap(),
+        normalized_fixture_value(&evidence.snapshot()),
         expected_pack["evidence_events"]
     );
     assert_eq!(
@@ -547,7 +546,10 @@ async fn optional_postgres_replays_synthetic_fixture_when_database_url_is_set() 
     }
     wait_for_socket_close(&mut socket).await;
 
-    assert_eq!(actual, fixture.server);
+    assert_eq!(
+        normalized_fixture_value(&actual),
+        normalized_fixture_value(&fixture.server)
+    );
     assert!(store.capabilities().durable);
     let counts = store.write_counts();
     assert_eq!(counts.sessions, 1);
@@ -558,7 +560,8 @@ async fn optional_postgres_replays_synthetic_fixture_when_database_url_is_set() 
     let closed: (String, Option<String>, bool) = sqlx::query_as(
         "SELECT status, terminal_reason, ended_at IS NOT NULL
          FROM voice_sessions
-         WHERE id = '44444444-4444-4444-8444-444444444444'",
+         ORDER BY started_at DESC
+         LIMIT 1",
     )
     .fetch_one(&verify_pool)
     .await
@@ -598,7 +601,10 @@ async fn real_websocket_replays_fake_cartesia_gemini_fixture_and_evidence_pack()
     send_client_frame(&mut socket, &fixture.client[3]).await;
     wait_for_socket_close(&mut socket).await;
 
-    assert_eq!(actual, fixture.server);
+    assert_eq!(
+        normalized_fixture_value(&actual),
+        normalized_fixture_value(&fixture.server)
+    );
     let expected_pack: serde_json::Value = serde_json::from_str(include_str!(
         "../../../fixtures/voice-protocol/fake-cartesia-gemini-evidence-pack.json"
     ))
@@ -622,7 +628,7 @@ async fn real_websocket_replays_fake_cartesia_gemini_fixture_and_evidence_pack()
     let usage_snapshot = usage.snapshot();
     assert_usage_summary(&usage_snapshot, &expected_pack["usage"]);
     assert_eq!(
-        serde_json::to_value(evidence.snapshot()).unwrap(),
+        normalized_fixture_value(&evidence.snapshot()),
         expected_pack["evidence_events"]
     );
     assert_eq!(
@@ -632,6 +638,32 @@ async fn real_websocket_replays_fake_cartesia_gemini_fixture_and_evidence_pack()
             .map(|event| event.detail.as_str()),
         Some(expected_pack["terminal_close_reason"].as_str().unwrap())
     );
+}
+
+fn normalized_fixture_value<T: Serialize>(value: &T) -> serde_json::Value {
+    let mut value = serde_json::to_value(value).expect("fixture value serializes");
+    normalize_voice_session_ids(&mut value);
+    value
+}
+
+fn normalize_voice_session_ids(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, nested) in object.iter_mut() {
+                if key == "voice_session_id" && nested.as_str().is_some() {
+                    *nested = serde_json::Value::String("voice-session-1".to_owned());
+                } else {
+                    normalize_voice_session_ids(nested);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                normalize_voice_session_ids(nested);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn assert_usage_summary(actual: &[VoiceUsageEvent], expected: &serde_json::Value) {
@@ -1011,6 +1043,7 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
         let state = AppState::new(
             Arc::new(OpenProbeBrain {
                 opened: opened.clone(),
+                captured_config: None,
             }),
             "synthetic",
             VoiceWsAccess {
@@ -1066,6 +1099,7 @@ async fn websocket_rejects_token_claim_mismatch_before_brain_open() {
         let state = AppState::new(
             Arc::new(OpenProbeBrain {
                 opened: opened.clone(),
+                captured_config: None,
             }),
             "synthetic",
             VoiceWsAccess {
@@ -1103,6 +1137,7 @@ async fn websocket_checks_study_set_access_before_brain_open() {
     let state = AppState::new(
         Arc::new(OpenProbeBrain {
             opened: opened.clone(),
+            captured_config: None,
         }),
         "synthetic",
         VoiceWsAccess::default(),
@@ -1240,7 +1275,7 @@ async fn websocket_idle_timeout_sends_stop_and_terminal_reason() {
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::StoreCounts
             && event.detail
-                == "sessions=0 answer_attempts=0 concept_statuses=0 review_items=0 recaps=0"
+                == "sessions=1 answer_attempts=0 concept_statuses=0 review_items=0 recaps=0"
     }));
 }
 
@@ -1264,6 +1299,49 @@ async fn websocket_capacity_releases_after_session_close() {
         ServerFrame::ready()
     );
     next_socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_default_trusted_mode_rotates_internal_session_for_reconnect() {
+    let state = test_state(1);
+    let slots = state.session_slots.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    for _ in 0..2 {
+        let (mut socket, _) = connect_async(url.clone()).await.unwrap();
+        assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+        socket
+            .send(WsMessage::Text(
+                format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+            ))
+            .await
+            .unwrap();
+
+        let mut saw_question = false;
+        for _ in 0..3 {
+            match read_server_frame(&mut socket).await {
+                ServerFrame::Event { event, .. }
+                    if matches!(
+                        event.as_ref(),
+                        agent_service::VivaServerEvent::QuestionStarted { .. }
+                    ) =>
+                {
+                    saw_question = true;
+                    break;
+                }
+                ServerFrame::Error { message, .. } => {
+                    panic!("unexpected websocket error: {message}")
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_question);
+        socket.close(None).await.unwrap();
+        wait_until(Duration::from_secs(2), || slots.available_permits() == 1).await;
+    }
 }
 
 #[tokio::test]
@@ -1297,6 +1375,70 @@ async fn websocket_disconnect_aborts_provider_tasks_and_releases_capacity() {
         dropped.load(Ordering::SeqCst) && slots.available_permits() == 1
     })
     .await;
+}
+
+#[tokio::test]
+async fn websocket_hydrates_active_concepts_from_server_context_before_brain_open() {
+    let opened = Arc::new(AtomicBool::new(false));
+    let captured_config = Arc::new(Mutex::new(None));
+    let state = AppState::new(
+        Arc::new(OpenProbeBrain {
+            opened: opened.clone(),
+            captured_config: Some(captured_config.clone()),
+        }),
+        "open_probe",
+        VoiceWsAccess::default(),
+        1,
+    );
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let mut session: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/session-config.json"
+    ))
+    .unwrap();
+    session["active_concepts"] = serde_json::json!([
+        "wrong-concept",
+        "wrong-review-concept",
+        "wrong-third-concept"
+    ]);
+
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "session_config",
+                "version": 1,
+                "session": session,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    for _ in 0..20 {
+        if opened.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(opened.load(Ordering::SeqCst));
+    let opened_config = captured_config
+        .lock()
+        .expect("captured config lock poisoned")
+        .clone()
+        .expect("brain opened with config");
+    assert_eq!(
+        opened_config.active_concepts,
+        vec![
+            "oxidative-phosphorylation".to_owned(),
+            "nadh".to_owned(),
+            "atp-synthase".to_owned(),
+            "cellular-respiration".to_owned(),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1348,6 +1490,315 @@ async fn websocket_suppresses_stale_events_after_cancelled_response() {
             VoiceEvidenceEventKind::EvaluationEmitted | VoiceEvidenceEventKind::SourceEmitted
         ) || event.detail != "stale-response"
     }));
+}
+
+#[tokio::test]
+async fn websocket_rejects_forged_provider_source_tuples_without_leaks_or_writes() {
+    let forged_excerpt = "provider forged source excerpt should not leak";
+    let mut forged_source = agent_domain::fixture_source_reference();
+    forged_source.document_id = "wrong-doc".to_owned();
+    forged_source.span = "slide:99".to_owned();
+    forged_source.excerpt = forged_excerpt.to_owned();
+    let forged_question = agent_domain::StudyQuestion {
+        source: forged_source.clone(),
+        ..agent_domain::fixture_question()
+    };
+    let forged_evaluation = agent_domain::AnswerEvaluation {
+        question_id: "wrong-question".to_owned(),
+        answer_text: "forged answer".to_owned(),
+        label: "mostly correct".to_owned(),
+        concise_feedback: "forged feedback".to_owned(),
+        retry_prompt: "forged retry".to_owned(),
+        source: forged_source.clone(),
+        concept_status: agent_domain::ConceptStatus::Strong,
+        confidence_score: 0.84,
+    };
+    let fixture_question = agent_domain::fixture_question();
+    let unpersisted_evaluation = agent_domain::AnswerEvaluation {
+        question_id: fixture_question.question_id.clone(),
+        answer_text: "unpersisted answer should not leak".to_owned(),
+        label: "mostly correct".to_owned(),
+        concise_feedback: "unpersisted feedback should not leak".to_owned(),
+        retry_prompt: fixture_question.follow_up.clone(),
+        source: fixture_question.source.clone(),
+        concept_status: agent_domain::ConceptStatus::Strong,
+        confidence_score: 0.84,
+    };
+    let unpersisted_recap = agent_domain::StudySessionRecap {
+        voice_session_id: "voice-session-1".to_owned(),
+        headline: "Unpersisted recap should not leak".to_owned(),
+        summary: "Unpersisted recap summary should not leak".to_owned(),
+        strong_concepts: vec!["nadh".to_owned()],
+        shaky_concepts: vec![],
+        missed_concepts: vec![],
+        review_later: vec![],
+        next_action: "Stop".to_owned(),
+        source_moments: vec![agent_domain::RecapSourceMoment {
+            text: "Unpersisted recap source should not leak".to_owned(),
+            source: fixture_question.source.clone(),
+            status: agent_domain::ConceptStatus::Strong,
+        }],
+    };
+    let cases = vec![
+        (
+            BrowserEventKind::QuestionStarted,
+            BrainEvent::QuestionStarted {
+                response_id: "forged-response".to_owned(),
+                question: forged_question,
+            },
+        ),
+        (
+            BrowserEventKind::AnswerEvaluated,
+            BrainEvent::AnswerEvaluated {
+                response_id: "forged-response".to_owned(),
+                evaluation: forged_evaluation,
+            },
+        ),
+        (
+            BrowserEventKind::SourceReference,
+            BrainEvent::SourceReference {
+                response_id: "forged-response".to_owned(),
+                source: forged_source.clone(),
+            },
+        ),
+        (
+            BrowserEventKind::AnswerEvaluated,
+            BrainEvent::AnswerEvaluated {
+                response_id: "forged-response".to_owned(),
+                evaluation: unpersisted_evaluation,
+            },
+        ),
+        (
+            BrowserEventKind::ConceptStatus,
+            BrainEvent::ConceptStatus {
+                response_id: "forged-response".to_owned(),
+                concept_id: "wrong-concept".to_owned(),
+                status: agent_domain::ConceptStatus::Strong,
+            },
+        ),
+        (
+            BrowserEventKind::ConceptStatus,
+            BrainEvent::ConceptStatus {
+                response_id: "forged-response".to_owned(),
+                concept_id: "nadh".to_owned(),
+                status: agent_domain::ConceptStatus::Review,
+            },
+        ),
+        (
+            BrowserEventKind::ManuscriptIntent,
+            BrainEvent::ManuscriptIntent {
+                response_id: "forged-response".to_owned(),
+                intent: agent_domain::ManuscriptIntent::Entity {
+                    entity_id: "wrong-concept".to_owned(),
+                    entity_kind: agent_domain::ManuscriptEntityKind::Concept,
+                    register: agent_domain::ManuscriptRegister::Correcting,
+                    emphasis: agent_domain::ManuscriptEmphasis::Marked,
+                },
+            },
+        ),
+        (
+            BrowserEventKind::ManuscriptIntent,
+            BrainEvent::ManuscriptIntent {
+                response_id: "forged-response".to_owned(),
+                intent: agent_domain::ManuscriptIntent::Entity {
+                    entity_id: "wrong-source".to_owned(),
+                    entity_kind: agent_domain::ManuscriptEntityKind::Source,
+                    register: agent_domain::ManuscriptRegister::Sourcing,
+                    emphasis: agent_domain::ManuscriptEmphasis::Marked,
+                },
+            },
+        ),
+        (
+            BrowserEventKind::ManuscriptIntent,
+            BrainEvent::ManuscriptIntent {
+                response_id: "forged-response".to_owned(),
+                intent: agent_domain::ManuscriptIntent::Marginalia {
+                    marginalia_id: "source-folio".to_owned(),
+                    anchor_entity_id: "wrong-source".to_owned(),
+                    register: agent_domain::ManuscriptRegister::Sourcing,
+                    emphasis: agent_domain::ManuscriptEmphasis::Marked,
+                },
+            },
+        ),
+        (
+            BrowserEventKind::RecapReady,
+            BrainEvent::RecapReady {
+                response_id: "forged-response".to_owned(),
+                recap: agent_domain::StudySessionRecap {
+                    voice_session_id: "voice-session-1".to_owned(),
+                    headline: "Forged recap".to_owned(),
+                    summary: "Forged recap".to_owned(),
+                    strong_concepts: vec!["nadh".to_owned()],
+                    shaky_concepts: vec![],
+                    missed_concepts: vec![],
+                    review_later: vec![],
+                    next_action: "Stop".to_owned(),
+                    source_moments: vec![agent_domain::RecapSourceMoment {
+                        text: "Forged recap source".to_owned(),
+                        source: forged_source,
+                        status: agent_domain::ConceptStatus::Strong,
+                    }],
+                },
+            },
+        ),
+        (
+            BrowserEventKind::RecapReady,
+            BrainEvent::RecapReady {
+                response_id: "forged-response".to_owned(),
+                recap: unpersisted_recap,
+            },
+        ),
+    ];
+
+    for (forbidden_kind, forged_event) in cases {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+        let state = AppState::with_study_store(
+            Arc::new(EventProbeBrain {
+                study_store: Some(brain_store),
+                events: vec![
+                    forged_event,
+                    BrainEvent::Usage(BrainUsage {
+                        text_input_tokens: 9,
+                        text_output_tokens: 3,
+                        ..BrainUsage::default()
+                    }),
+                ],
+            }),
+            "forged_event_probe",
+            VoiceWsAccess::default(),
+            1,
+            store.clone(),
+        );
+        let evidence = state.evidence.clone();
+        let usage = state.usage.clone();
+        let Some(url) = spawn_server(state).await else {
+            return;
+        };
+        let (mut socket, _) = connect_async(url).await.unwrap();
+        let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+        assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+        socket
+            .send(WsMessage::Text(
+                format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+            ))
+            .await
+            .unwrap();
+
+        let frames = read_server_frames_until_close(&mut socket).await;
+        let payload = serde_json::to_string(&frames).unwrap();
+        assert!(frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Error { message, .. } if message == "provider source authority rejected"
+        )));
+        assert!(!payload.contains(forged_excerpt));
+        assert!(!payload.contains("wrong-doc"));
+        assert!(!payload.contains("wrong-question"));
+        assert!(!payload.contains("wrong-concept"));
+        assert!(!payload.contains("wrong-source"));
+        assert!(!payload.contains("unpersisted"));
+        assert!(frames.iter().all(|frame| !matches!(
+            frame,
+            ServerFrame::Event { event, .. } if forbidden_kind.matches(event.as_ref())
+        )));
+        let counts = store.write_counts();
+        assert_eq!(counts.answer_attempts, 0);
+        assert_eq!(counts.concept_statuses, 0);
+        assert_eq!(counts.review_items, 0);
+        assert_eq!(counts.recaps, 0);
+        assert!(usage.snapshot().is_empty());
+        assert!(evidence.snapshot().iter().all(|event| {
+            !matches!(
+                event.kind,
+                VoiceEvidenceEventKind::QuestionEmitted
+                    | VoiceEvidenceEventKind::EvaluationEmitted
+                    | VoiceEvidenceEventKind::SourceEmitted
+            )
+        }));
+    }
+}
+
+#[tokio::test]
+async fn websocket_rejects_authorized_payload_replayed_under_wrong_response_id() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(ResponseReplayProbeBrain {
+            study_store: brain_store,
+        }),
+        "response_replay_probe",
+        VoiceWsAccess::default(),
+        1,
+        store.clone(),
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+
+    let frames = read_server_frames_until_close(&mut socket).await;
+    assert!(frames.iter().any(|frame| matches!(
+        frame,
+        ServerFrame::Error { message, .. } if message == "provider source authority rejected"
+    )));
+    assert!(frames.iter().all(|frame| !matches!(
+        frame,
+        ServerFrame::Event { event, .. }
+            if matches!(event.as_ref(), agent_service::VivaServerEvent::AnswerEvaluated { .. })
+    )));
+    let counts = store.write_counts();
+    assert_eq!(counts.answer_attempts, 1);
+    assert!(evidence.snapshot().iter().all(|event| {
+        event.kind != VoiceEvidenceEventKind::EvaluationEmitted || event.detail != "response-2"
+    }));
+}
+
+#[derive(Clone, Copy)]
+enum BrowserEventKind {
+    QuestionStarted,
+    AnswerEvaluated,
+    SourceReference,
+    ConceptStatus,
+    ManuscriptIntent,
+    RecapReady,
+}
+
+impl BrowserEventKind {
+    fn matches(self, event: &agent_service::VivaServerEvent) -> bool {
+        match self {
+            Self::QuestionStarted => matches!(
+                event,
+                agent_service::VivaServerEvent::QuestionStarted { .. }
+            ),
+            Self::AnswerEvaluated => matches!(
+                event,
+                agent_service::VivaServerEvent::AnswerEvaluated { .. }
+            ),
+            Self::SourceReference => matches!(
+                event,
+                agent_service::VivaServerEvent::SourceReference { .. }
+            ),
+            Self::ConceptStatus => {
+                matches!(event, agent_service::VivaServerEvent::ConceptStatus { .. })
+            }
+            Self::ManuscriptIntent => matches!(
+                event,
+                agent_service::VivaServerEvent::ManuscriptIntent { .. }
+            ),
+            Self::RecapReady => matches!(event, agent_service::VivaServerEvent::RecapReady { .. }),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1559,6 +2010,7 @@ impl Drop for DropFlagFuture {
 
 struct OpenProbeBrain {
     opened: Arc<AtomicBool>,
+    captured_config: Option<Arc<Mutex<Option<agent_domain::SessionConfig>>>>,
 }
 
 #[async_trait::async_trait]
@@ -1574,9 +2026,14 @@ impl RealtimeBrain for OpenProbeBrain {
 
     async fn open(
         &self,
-        _config: agent_domain::SessionConfig,
+        config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
         self.opened.store(true, Ordering::SeqCst);
+        if let Some(captured_config) = &self.captured_config {
+            *captured_config
+                .lock()
+                .expect("captured config lock poisoned") = Some(config);
+        }
         let (input, _input_rx) = mpsc::channel::<BrainInput>(8);
         let (_event_tx, events) = mpsc::channel(8);
         Ok(RealtimeSession {
@@ -1648,6 +2105,125 @@ impl RealtimeBrain for StaleEventProbeBrain {
                     frame: AudioFrame::from_pcm16_bytes(vec![1_u8, 2, 3, 4]),
                 })
                 .await;
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+struct EventProbeBrain {
+    study_store: Option<Arc<dyn StudyMemoryStore>>,
+    events: Vec<BrainEvent>,
+}
+
+struct ResponseReplayProbeBrain {
+    study_store: Arc<dyn StudyMemoryStore>,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for ResponseReplayProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "response_replay_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        self.study_store
+            .record_voice_session(&config)
+            .await
+            .map_err(|error| BrainError::Connection(error.to_string()))?;
+        let user_id = config
+            .user_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?;
+        let study_set_id = config
+            .study_set_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?;
+        let voice_session_id = config
+            .session_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?;
+        let question = agent_domain::fixture_question();
+        let evaluation = agent_domain::AnswerEvaluation {
+            question_id: question.question_id.clone(),
+            answer_text: "NADH gives electrons.".to_owned(),
+            label: "mostly correct".to_owned(),
+            concise_feedback: "Connect this to the proton gradient.".to_owned(),
+            retry_prompt: question.follow_up,
+            source: question.source,
+            concept_status: agent_domain::ConceptStatus::Strong,
+            confidence_score: 0.84,
+        };
+        self.study_store
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                "response-1",
+                evaluation.clone(),
+            )
+            .await
+            .map_err(|error| BrainError::Connection(error.to_string()))?;
+
+        let (input, _input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = event_tx
+                .send(BrainEvent::AnswerEvaluated {
+                    response_id: "response-2".to_owned(),
+                    evaluation,
+                })
+                .await;
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for EventProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "event_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        if let Some(store) = &self.study_store {
+            store
+                .record_voice_session(&config)
+                .await
+                .map_err(|error| BrainError::Connection(error.to_string()))?;
+        }
+        let (input, _input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let events_to_send = self.events.clone();
+        let task = tokio::spawn(async move {
+            for event in events_to_send {
+                let _ = event_tx.send(event).await;
+            }
         });
 
         Ok(RealtimeSession {

@@ -85,7 +85,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
         return;
     }
 
-    let initial_config = match timeout(state.ws_timeouts.first_frame, receiver.next()).await {
+    let mut initial_config = match timeout(state.ws_timeouts.first_frame, receiver.next()).await {
         Err(_) => {
             let _ = send_json(
                 &mut sender,
@@ -117,12 +117,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
     let session_binding = AuthorizedClientSession::from_config(&initial_config)
         .expect("authorized session config has required identity");
     let voice_session_id = initial_config.session_id.as_deref().map(ToOwned::to_owned);
-    if let Err(error) = validate_study_set_access(&state, &initial_config).await {
-        let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
-        let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
-        record_terminal(&state, voice_session_id, error.terminal_reason).await;
-        return;
-    }
+    let study_context = match validate_study_set_access(&state, &initial_config).await {
+        Ok(study_context) => study_context,
+        Err(error) => {
+            let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+            let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
+            record_terminal(&state, voice_session_id, error.terminal_reason).await;
+            return;
+        }
+    };
+    initial_config.active_concepts = server_active_concepts(&study_context);
     state.evidence.record(VoiceEvidenceEvent::new(
         VoiceEvidenceEventKind::ConfigAccepted,
         voice_session_id.clone(),
@@ -175,18 +179,31 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
                         match action {
                             ClientAction::Stop => {
                                 terminal_reason = "client_stop";
-                                if drain_terminal_events(
+                                match drain_terminal_events(
                                     &state,
                                     voice_session_id.clone(),
+                                    &session_binding,
                                     &mut session.events,
                                     &mut cancelled_response_ids,
                                     session_started_at,
                                     &mut sender,
                                 )
                                 .await
-                                .is_err()
                                 {
-                                    terminal_reason = "send_failed";
+                                    Ok(ForwardBrainEvent::Continue) => {}
+                                    Ok(ForwardBrainEvent::Rejected) => {
+                                        terminal_reason = "provider_source_authority_rejected";
+                                        let _ = close_with(
+                                            &mut sender,
+                                            close_code::POLICY,
+                                            "provider source authority rejected",
+                                        )
+                                        .await;
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        terminal_reason = "send_failed";
+                                    }
                                 }
                                 let _ =
                                     close_with(&mut sender, close_code::NORMAL, "client stop").await;
@@ -213,18 +230,32 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
                 let Some(event) = event else {
                     break;
                 };
-                if forward_brain_event(
+                match forward_brain_event(
                     &state,
                     voice_session_id.clone(),
+                    &session_binding,
                     event,
                     &mut cancelled_response_ids,
                     session_started_at.elapsed(),
                     &mut sender,
                 )
                 .await
-                .is_err() {
-                    terminal_reason = "send_failed";
-                    break;
+                {
+                    Ok(ForwardBrainEvent::Continue) => {}
+                    Ok(ForwardBrainEvent::Rejected) => {
+                        terminal_reason = "provider_source_authority_rejected";
+                        let _ = close_with(
+                            &mut sender,
+                            close_code::POLICY,
+                            "provider source authority rejected",
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(_) => {
+                        terminal_reason = "send_failed";
+                        break;
+                    }
                 }
             }
         }
@@ -235,11 +266,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
 async fn drain_terminal_events<S>(
     state: &AppState,
     voice_session_id: Option<String>,
+    session_binding: &AuthorizedClientSession,
     events: &mut mpsc::Receiver<agent_domain::BrainEvent>,
     cancelled_response_ids: &mut HashSet<String>,
     session_started_at: Instant,
     sender: &mut S,
-) -> Result<(), axum::Error>
+) -> Result<ForwardBrainEvent, axum::Error>
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
@@ -249,39 +281,149 @@ where
             .ok()
             .flatten()
         else {
-            return Ok(());
+            return Ok(ForwardBrainEvent::Continue);
         };
-        forward_brain_event(
+        if forward_brain_event(
             state,
             voice_session_id.clone(),
+            session_binding,
             event,
             cancelled_response_ids,
             session_started_at.elapsed(),
             sender,
         )
-        .await?;
+        .await?
+            == ForwardBrainEvent::Rejected
+        {
+            return Ok(ForwardBrainEvent::Rejected);
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForwardBrainEvent {
+    Continue,
+    Rejected,
 }
 
 async fn forward_brain_event<S>(
     state: &AppState,
     voice_session_id: Option<String>,
+    session_binding: &AuthorizedClientSession,
     event: agent_domain::BrainEvent,
     cancelled_response_ids: &mut HashSet<String>,
     session_elapsed: Duration,
     sender: &mut S,
-) -> Result<(), axum::Error>
+) -> Result<ForwardBrainEvent, axum::Error>
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
     if should_suppress_cancelled_response(cancelled_response_ids, &event) {
-        return Ok(());
+        return Ok(ForwardBrainEvent::Continue);
+    }
+    if !authorize_browser_event(state, session_binding, &event).await {
+        send_json(
+            sender,
+            &ServerFrame::error("provider source authority rejected"),
+        )
+        .await?;
+        return Ok(ForwardBrainEvent::Rejected);
     }
     record_brain_event(state, voice_session_id, &event, session_elapsed).await;
     let Some(frame) = ServerFrame::browser_event(event) else {
-        return Ok(());
+        return Ok(ForwardBrainEvent::Continue);
     };
-    send_json(sender, &frame).await
+    send_json(sender, &frame).await?;
+    Ok(ForwardBrainEvent::Continue)
+}
+
+async fn authorize_browser_event(
+    state: &AppState,
+    session_binding: &AuthorizedClientSession,
+    event: &agent_domain::BrainEvent,
+) -> bool {
+    let result = match event {
+        agent_domain::BrainEvent::QuestionStarted { question, .. } => {
+            state
+                .study_store
+                .authorize_question_started(
+                    &session_binding.user_id,
+                    &session_binding.study_set_id,
+                    &session_binding.session_id,
+                    question,
+                )
+                .await
+        }
+        agent_domain::BrainEvent::AnswerEvaluated {
+            response_id,
+            evaluation,
+        } => {
+            state
+                .study_store
+                .authorize_answer_evaluation(
+                    &session_binding.user_id,
+                    &session_binding.study_set_id,
+                    &session_binding.session_id,
+                    response_id,
+                    evaluation,
+                )
+                .await
+        }
+        agent_domain::BrainEvent::SourceReference { source, .. } => {
+            state
+                .study_store
+                .authorize_source_reference(
+                    &session_binding.user_id,
+                    &session_binding.study_set_id,
+                    &session_binding.session_id,
+                    source,
+                )
+                .await
+        }
+        agent_domain::BrainEvent::ConceptStatus {
+            response_id,
+            concept_id,
+            status,
+            ..
+        } => {
+            state
+                .study_store
+                .authorize_concept_status(
+                    &session_binding.user_id,
+                    &session_binding.study_set_id,
+                    &session_binding.session_id,
+                    response_id,
+                    concept_id,
+                    status,
+                )
+                .await
+        }
+        agent_domain::BrainEvent::ManuscriptIntent { intent, .. } => {
+            state
+                .study_store
+                .authorize_manuscript_intent(
+                    &session_binding.user_id,
+                    &session_binding.study_set_id,
+                    &session_binding.session_id,
+                    intent,
+                )
+                .await
+        }
+        agent_domain::BrainEvent::RecapReady { response_id, recap } => {
+            state
+                .study_store
+                .authorize_recap(
+                    &session_binding.user_id,
+                    &session_binding.study_set_id,
+                    &session_binding.session_id,
+                    response_id,
+                    recap,
+                )
+                .await
+        }
+        _ => return true,
+    };
+    result.is_ok()
 }
 
 fn should_suppress_cancelled_response(
@@ -300,16 +442,35 @@ fn should_suppress_cancelled_response(
 async fn validate_study_set_access(
     state: &AppState,
     config: &SessionConfig,
-) -> Result<(), ClientFrameError> {
+) -> Result<serde_json::Value, ClientFrameError> {
     let (Some(user_id), Some(study_set_id)) =
         (config.user_id.as_deref(), config.study_set_id.as_deref())
     else {
         return Err(ClientFrameError::invalid_session_identity());
     };
     match state.study_store.study_context(user_id, study_set_id).await {
-        Ok(Some(_)) => Ok(()),
+        Ok(Some(study_context)) => Ok(study_context),
         Ok(None) | Err(_) => Err(ClientFrameError::study_set_access_denied()),
     }
+}
+
+fn server_active_concepts(study_context: &serde_json::Value) -> Vec<String> {
+    study_context
+        .get("concepts")
+        .and_then(serde_json::Value::as_array)
+        .map(|concepts| {
+            concepts
+                .iter()
+                .filter_map(|concept| {
+                    concept
+                        .get("public_id")
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| concept.get("id").and_then(serde_json::Value::as_str))
+                })
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn handle_client_message(
@@ -446,6 +607,7 @@ fn sanitize_client_session_config(
         return Err(ClientFrameError::invalid_session_identity());
     }
     config.source_context.clear();
+    config.active_concepts.clear();
     Ok(config)
 }
 
@@ -453,6 +615,7 @@ fn authorize_initial_session_config(
     initial: InitialSessionConfig,
     state: &AppState,
 ) -> Result<SessionConfig, ClientFrameError> {
+    let mut rotate_trusted_session = false;
     let binding = if let Some(secret) = state.ws_access.session_token_secret.as_deref() {
         let token = initial
             .session_token
@@ -466,13 +629,20 @@ fn authorize_initial_session_config(
             session_id: claims.session_id,
         }
     } else {
+        rotate_trusted_session = true;
         AuthorizedClientSession {
             user_id: state.trusted_user_id.clone(),
             study_set_id: state.trusted_study_set_id.clone(),
             session_id: state.trusted_session_id.clone(),
         }
     };
-    sanitize_client_session_config(initial.session, &binding)
+    let mut config = sanitize_client_session_config(initial.session, &binding)?;
+    if rotate_trusted_session {
+        config.session_id = Some(agent_domain::SessionId::new(
+            state.next_trusted_voice_session_id(),
+        ));
+    }
+    Ok(config)
 }
 
 fn sanitize_refresh_session_config(
@@ -858,6 +1028,7 @@ mod tests {
         assert_eq!(sanitized.study_set_id.as_deref(), Some("biology-midterm"));
         assert_eq!(sanitized.session_id.as_deref(), Some("voice-session-1"));
         assert!(sanitized.source_context.is_empty());
+        assert!(sanitized.active_concepts.is_empty());
 
         let mut missing_session = sanitized.clone();
         missing_session.session_id = None;
@@ -892,6 +1063,35 @@ mod tests {
         assert_eq!(
             sanitize_client_session_config(missing_study_set, &binding),
             Err(ClientFrameError::invalid_session_identity())
+        );
+    }
+
+    #[test]
+    fn server_active_concepts_use_public_ids_or_uuid_fallback_in_context_order() {
+        let context = serde_json::json!({
+            "concepts": [
+                {
+                    "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "public_id": "first-public",
+                },
+                {
+                    "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    "public_id": null,
+                },
+                {
+                    "id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                    "public_id": "third-public",
+                }
+            ]
+        });
+
+        assert_eq!(
+            server_active_concepts(&context),
+            vec![
+                "first-public".to_owned(),
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_owned(),
+                "third-public".to_owned(),
+            ]
         );
     }
 

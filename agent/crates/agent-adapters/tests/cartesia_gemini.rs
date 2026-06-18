@@ -657,6 +657,7 @@ impl StudyMemoryStore for BlockingAnswerStore {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         evaluation: AnswerEvaluation,
     ) -> Result<serde_json::Value, PortError> {
         if let Some(answer_started) = self
@@ -676,7 +677,13 @@ impl StudyMemoryStore for BlockingAnswerStore {
             let _ = release_answer.await;
         }
         self.inner
-            .record_answer_evaluation(user_id, study_set_id, voice_session_id, evaluation)
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
             .await
     }
 
@@ -696,11 +703,19 @@ impl StudyMemoryStore for BlockingAnswerStore {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         concept_id: &str,
         status: ConceptStatus,
     ) -> Result<ConceptStatus, PortError> {
         self.inner
-            .record_concept_status(user_id, study_set_id, voice_session_id, concept_id, status)
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
             .await
     }
 
@@ -722,10 +737,11 @@ impl StudyMemoryStore for BlockingAnswerStore {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         recap: StudySessionRecap,
     ) -> Result<serde_json::Value, PortError> {
         self.inner
-            .record_recap(user_id, study_set_id, voice_session_id, recap)
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
             .await
     }
 
