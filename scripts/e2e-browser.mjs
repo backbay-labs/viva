@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +20,7 @@ const webUrl = `http://127.0.0.1:${webPort}`;
 const wsUrl = `ws://127.0.0.1:${agentPort}/ws`;
 const agentProvider = process.env.VIVA_E2E_AGENT_PROVIDER ?? "synthetic";
 const stopToRecap = process.env.VIVA_E2E_STOP_TO_RECAP === "1";
+const validationRunId = `browser-story-${agentProvider}`;
 const requirePostAnswerSourceFolio =
   process.env.VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO === undefined
     ? agentProvider === "synthetic"
@@ -32,6 +34,7 @@ let context;
 let page;
 let traceStarted = false;
 let traceArtifact = null;
+const storyFrames = [];
 let sourceFolioVisible = false;
 let boundedSourceVisible = false;
 let postAnswerSourceFolioVisible = false;
@@ -99,8 +102,23 @@ try {
     socket.on("framereceived", (frame) => recordServerFramePayload(frame.payload, serverEvents));
   });
 
+  await capturePendingLocalPreview(page);
   await page.goto(webUrl, { waitUntil: "networkidle" });
+  await page.getByRole("button", { name: "Review missed concepts" }).waitFor({
+    state: "visible",
+    timeout: 20_000,
+  });
   const legacyUploadVisible = await isVisible(page.getByText("What are we studying?"));
+  await page.screenshot({
+    path: path.join(artifactDir, "server-ready-study-set.png"),
+    fullPage: true,
+  });
+  storyFrames.push({
+    id: "server_ready_study_set",
+    kind: "browser_screen",
+    screenshot: "server-ready-study-set.png",
+    checks: ["server_owned_study_set", "library_entry", "ready_session_action"],
+  });
   await page.getByRole("button", { name: "Review missed concepts" }).click();
   await page.waitForURL(`${webUrl}/session`, { timeout: 20_000 });
   await page.getByText("Explain the role of NADH in oxidative phosphorylation.").waitFor({
@@ -136,6 +154,13 @@ try {
   await page.screenshot({
     path: path.join(artifactDir, "source-folio.png"),
     fullPage: true,
+  });
+  storyFrames.push({
+    id: "active_synthetic_manuscript",
+    kind: "browser_screen",
+    screenshot: "source-folio.png",
+    supporting_screenshots: ["session-ready.png"],
+    checks: ["synthetic_brain_listening", "voice_trace_canvas", "source_folio", "marginalia"],
   });
   await page.getByRole("button", { name: "Back to question" }).click();
 
@@ -217,9 +242,17 @@ try {
   const localScheduleVisible = await isVisible(
     page.getByRole("button", { name: /Schedule a short source-backed review tomorrow/ }),
   );
+  await page.getByText("Recap ready").first().scrollIntoViewIfNeeded();
+  await page.waitForTimeout(600);
   await page.screenshot({
     path: path.join(artifactDir, "connected-terminal-fold.png"),
     fullPage: true,
+  });
+  storyFrames.push({
+    id: "recap",
+    kind: "browser_screen",
+    screenshot: "connected-terminal-fold.png",
+    checks: ["recap_ready", "server_schedule_visible", "next_session_recommendation"],
   });
   if (traceStarted) {
     await context.tracing.stop({ path: path.join(artifactDir, "trace.zip") });
@@ -227,6 +260,9 @@ try {
     traceStarted = false;
   }
 
+  const browserStory = await writeBrowserStoryManifest({
+    traceRetained: Boolean(traceArtifact),
+  });
   const result = {
     artifact_dir: path.relative(root, artifactDir),
     agent_provider: agentProvider,
@@ -247,9 +283,13 @@ try {
     post_answer_concept_id: postAnswerProtocolProof.conceptId,
     post_answer_protocol_response_id: postAnswerProtocolProof.responseId,
     local_only_actions_hidden: !shareVisible && !localScheduleVisible,
+    browser_story: browserStory,
+    browser_story_artifact: "browser-story.json",
     console_errors: consoleErrors,
     page_errors: pageErrors,
     screenshots: [
+      "pending-local-preview.png",
+      "server-ready-study-set.png",
       "session-ready.png",
       "source-folio.png",
       ...(!stopToRecap && requirePostAnswerSourceFolio ? ["post-answer-source-folio.png"] : []),
@@ -323,6 +363,215 @@ try {
   for (const child of children.reverse()) {
     child.stop();
   }
+}
+
+async function capturePendingLocalPreview(targetPage) {
+  await targetPage.setContent(pendingPreviewHtml(), { waitUntil: "domcontentloaded" });
+  await targetPage.screenshot({
+    path: path.join(artifactDir, "pending-local-preview.png"),
+    fullPage: true,
+  });
+  storyFrames.push({
+    id: "pending_local_preview",
+    kind: "structured_preview",
+    screenshot: "pending-local-preview.png",
+    checks: ["extraction_pending", "server_not_contacted", "sanitized_summary_only"],
+  });
+}
+
+function pendingPreviewHtml() {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Viva browser story pending preview</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #17211b;
+        --muted: #5e6c62;
+        --paper: #f7f2e8;
+        --line: #cbbf9e;
+        --accent: #327066;
+        --panel: #fffaf0;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 900px;
+        background:
+          linear-gradient(90deg, rgba(50, 112, 102, 0.16) 0 1px, transparent 1px 100%),
+          linear-gradient(180deg, rgba(203, 191, 158, 0.55) 0 1px, transparent 1px 100%),
+          var(--paper);
+        background-size: 72px 100%, 100% 36px;
+        color: var(--ink);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      main {
+        width: min(1120px, calc(100vw - 96px));
+        margin: 68px auto;
+      }
+      .eyebrow {
+        color: var(--accent);
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0;
+        text-transform: uppercase;
+      }
+      h1 {
+        margin: 16px 0 12px;
+        max-width: 760px;
+        font-size: 56px;
+        line-height: 1.02;
+        letter-spacing: 0;
+      }
+      .lede {
+        max-width: 690px;
+        color: var(--muted);
+        font-size: 20px;
+        line-height: 1.45;
+      }
+      .manuscript {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 300px;
+        gap: 32px;
+        align-items: start;
+        margin-top: 54px;
+      }
+      .sheet,
+      aside {
+        border: 1px solid var(--line);
+        background: rgba(255, 250, 240, 0.82);
+        box-shadow: 0 20px 48px rgba(53, 44, 27, 0.12);
+      }
+      .sheet {
+        min-height: 430px;
+        padding: 42px 48px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 140px minmax(0, 1fr);
+        gap: 28px;
+        padding: 20px 0;
+        border-bottom: 1px solid rgba(203, 191, 158, 0.7);
+      }
+      .row:last-child {
+        border-bottom: 0;
+      }
+      .label {
+        color: var(--accent);
+        font-size: 14px;
+        font-weight: 700;
+      }
+      .value {
+        font-size: 24px;
+        line-height: 1.28;
+      }
+      aside {
+        padding: 28px;
+      }
+      aside h2 {
+        margin: 0 0 18px;
+        font-size: 20px;
+        letter-spacing: 0;
+      }
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        border: 1px solid rgba(50, 112, 102, 0.34);
+        padding: 10px 12px;
+        color: var(--accent);
+        font-weight: 700;
+      }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--accent);
+      }
+      ul {
+        margin: 22px 0 0;
+        padding-left: 20px;
+        color: var(--muted);
+        line-height: 1.65;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="eyebrow">Listening Manuscript browser story</div>
+      <h1>Local preview pending</h1>
+      <p class="lede">
+        Sanitized preview frame for a manuscript set before server readiness. It includes only
+        structural state and contains no learner payload.
+      </p>
+      <section class="manuscript" aria-label="Pending local preview">
+        <div class="sheet">
+          <div class="row">
+            <div class="label">Set state</div>
+            <div class="value">Extraction pending</div>
+          </div>
+          <div class="row">
+            <div class="label">Session</div>
+            <div class="value">The Conductor waits for a server-ready study set.</div>
+          </div>
+          <div class="row">
+            <div class="label">Evidence</div>
+            <div class="value">Browser-rendered structured preview, no live provider, no microphone.</div>
+          </div>
+        </div>
+        <aside>
+          <h2>Audit boundary</h2>
+          <div class="status"><span class="dot" aria-hidden="true"></span>Sanitized</div>
+          <ul>
+            <li>No raw media</li>
+            <li>No learner response</li>
+            <li>No prompts</li>
+            <li>No full notes</li>
+          </ul>
+        </aside>
+      </section>
+    </main>
+  </body>
+</html>`;
+}
+
+async function writeBrowserStoryManifest({ traceRetained }) {
+  const storyPath = path.join(artifactDir, "browser-story.json");
+  const storyBase = {
+    schema: "viva.browser_story.v1",
+    generated_at: new Date().toISOString(),
+    validation_run_id: validationRunId,
+    artifact_dir: path.relative(root, artifactDir),
+    agent_provider: agentProvider,
+    command_summary: {
+      command: "bun run e2e:browser",
+      provider: agentProvider,
+      validation_run_id: validationRunId,
+      artifact_dir: path.relative(root, artifactDir),
+      browser: "playwright-chromium",
+      capture_mode: "loopback-local",
+      post_answer_source_folio_required: requirePostAnswerSourceFolio,
+      stop_to_recap: stopToRecap,
+    },
+    fixture_hashes: await hashFixtureFiles(path.join(root, "agent/fixtures/voice-protocol")),
+    frames: storyFrames,
+    sanitized: true,
+    trace_retained: traceRetained,
+  };
+  await writeFile(storyPath, `${JSON.stringify(storyBase, null, 2)}\n`);
+  const artifactAudit = await auditBrowserStoryArtifacts(artifactDir);
+  const story = {
+    ...storyBase,
+    artifact_audit: artifactAudit,
+  };
+  await writeFile(storyPath, `${JSON.stringify(story, null, 2)}\n`);
+  return story;
 }
 
 async function launchChromium() {
@@ -522,6 +771,89 @@ function postAnswerProtocolProofFromEvents(events) {
     responseId: null,
     sourceReferenceEventSeen: false,
   };
+}
+
+async function hashFixtureFiles(dir) {
+  const names = (await readdir(dir)).filter((name) => name.endsWith(".json")).sort();
+  const hashes = {};
+  for (const name of names) {
+    const bytes = await readFile(path.join(dir, name));
+    hashes[name] = {
+      bytes: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+  }
+  return hashes;
+}
+
+async function auditBrowserStoryArtifacts(dir) {
+  const forbidden = [
+    "pcm16_base64",
+    "answer_text",
+    "transcript_final",
+    "source_context",
+    "pasted_text",
+    "session_token",
+    "viva1.",
+    "session-secret",
+    "preload stroke volume cardiac output",
+    "Stroke volume rises as ventricular preload",
+    "NADH donates high-energy electrons",
+    "received 4 PCM16 bytes",
+    "CARTESIA_API_KEY",
+    "GEMINI_API_KEY",
+    "viva-release-check-cartesia-placeholder-key",
+    "viva-release-check-gemini-placeholder-key",
+    "Bearer ",
+  ];
+  let scanned_files = 0;
+  for (const file of await listFiles(dir)) {
+    if (file.endsWith(".zip")) {
+      throw new Error(
+        `Browser story artifact includes retained trace archive: ${path.relative(root, file)}`,
+      );
+    }
+    if (!isTextArtifact(file)) continue;
+    scanned_files += 1;
+    const text = await readFile(file, "utf8");
+    for (const needle of forbidden) {
+      if (text.includes(needle)) {
+        throw new Error(
+          `Browser story artifact ${path.relative(root, file)} includes forbidden marker: ${needle}`,
+        );
+      }
+    }
+    for (const [name, value] of Object.entries(process.env)) {
+      if (!/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) continue;
+      if (value && value.length >= 8 && text.includes(value)) {
+        throw new Error(
+          `Browser story artifact ${path.relative(root, file)} includes secret value from ${name}`,
+        );
+      }
+    }
+  }
+  return {
+    scanned_files,
+    forbidden_hits: 0,
+  };
+}
+
+async function listFiles(dir) {
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  const files = [];
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await listFiles(fullPath)));
+    } else if (entry.isFile()) {
+      files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+function isTextArtifact(file) {
+  return /\.(json|log|txt|stdout|stderr)$/i.test(file);
 }
 
 function delay(ms) {
