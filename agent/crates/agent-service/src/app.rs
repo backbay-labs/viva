@@ -123,7 +123,7 @@ impl AppState {
     pub fn is_ready(&self) -> bool {
         let brain = self.brain.capabilities();
         let store = self.study_store.capabilities();
-        brain.configured && brain.selectable && store.available
+        brain.configured && brain.selectable && store.available && !self.drain_signal.is_draining()
     }
 }
 

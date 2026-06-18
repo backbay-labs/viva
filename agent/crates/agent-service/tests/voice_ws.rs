@@ -271,6 +271,30 @@ async fn readiness_routes_are_browser_readable_from_allowed_origin() {
 }
 
 #[tokio::test]
+async fn ready_route_reports_unavailable_during_voice_drain() {
+    let state = test_state(4);
+    state.drain_signal.begin_drain();
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["ready"], false);
+    assert_eq!(payload["brain"]["selectable"], true);
+    assert_eq!(payload["store"]["available"], true);
+}
+
+#[tokio::test]
 async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token() {
     let store = Arc::new(data::InMemoryStudyStore::new());
     let state = AppState::with_study_store(
@@ -2238,7 +2262,8 @@ async fn websocket_rejects_browser_tool_result_as_untrusted() {
 
 #[tokio::test]
 async fn websocket_drain_emits_terminal_phase_before_close() {
-    let state = test_state(1).with_ws_timeouts(WsTimeouts {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = test_state_with_store(1, store.clone()).with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
@@ -2271,6 +2296,15 @@ async fn websocket_drain_emits_terminal_phase_before_close() {
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::TerminalReason && event.detail == "drained"
     }));
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.sessions.len(), 1);
+    let session = snapshot
+        .sessions
+        .first()
+        .expect("drained session should be recorded");
+    assert_eq!(session.status, "closed");
+    assert_eq!(session.terminal_reason.as_deref(), Some("drained"));
+    assert!(session.ended_at.is_some());
 }
 
 #[test]
@@ -2483,6 +2517,74 @@ async fn websocket_turn_cap_is_not_postponed_by_provider_events() {
 }
 
 #[tokio::test]
+async fn websocket_drain_interrupts_active_provider_response() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(ChattyPhaseProbeBrain),
+        "chatty_phase_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(5),
+        session: Duration::from_secs(5),
+    });
+    let drain = state.drain_signal.clone();
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "chatty_phase_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut saw_provider_phase = false;
+    for _ in 0..50 {
+        let frame = read_server_frame(&mut socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::SessionPhase {
+                        terminal_reason: None,
+                        ..
+                    }
+                )
+        ) {
+            saw_provider_phase = true;
+            break;
+        }
+    }
+    assert!(saw_provider_phase);
+
+    drain.begin_drain();
+    for _ in 0..50 {
+        let frame = read_server_frame(&mut socket).await;
+        if terminal_session_reason(&frame) == Some(TerminalSessionReason::Drained) {
+            assert_close_code(&mut socket, CloseCode::Normal).await;
+            let events =
+                wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+            assert!(events.iter().any(|event| {
+                event.kind == VoiceEvidenceEventKind::TerminalReason && event.detail == "drained"
+            }));
+            return;
+        }
+    }
+
+    panic!("provider events postponed the terminal drained phase");
+}
+
+#[tokio::test]
 async fn websocket_capacity_releases_after_session_close() {
     let state = test_state(1);
     let slots = state.session_slots.clone();
@@ -2578,6 +2680,143 @@ async fn websocket_disconnect_aborts_provider_tasks_and_releases_capacity() {
         dropped.load(Ordering::SeqCst) && slots.available_permits() == 1
     })
     .await;
+}
+
+#[tokio::test]
+async fn websocket_drain_aborts_provider_tasks_and_releases_capacity() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let state = AppState::new(
+        Arc::new(AbortProbeBrain {
+            dropped: dropped.clone(),
+        }),
+        "synthetic",
+        VoiceWsAccess::default(),
+        1,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(5),
+        session: Duration::from_secs(5),
+    });
+    let drain = state.drain_signal.clone();
+    let slots = state.session_slots.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "abort_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+
+    drain.begin_drain();
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::Drained,
+    );
+    assert_close_code(&mut socket, CloseCode::Normal).await;
+    wait_until(Duration::from_secs(2), || {
+        dropped.load(Ordering::SeqCst) && slots.available_permits() == 1
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn websocket_drain_interrupts_backpressured_provider_input() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let state = AppState::new(
+        Arc::new(BackpressuredInputBrain {
+            dropped: dropped.clone(),
+        }),
+        "backpressured_input_probe",
+        VoiceWsAccess::default(),
+        1,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(5),
+        session: Duration::from_secs(5),
+    });
+    let drain = state.drain_signal.clone();
+    let slots = state.session_slots.clone();
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "backpressured_input_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![1_u8, 2, 3, 4].into()))
+        .await
+        .unwrap();
+    wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AnswerReceived).await;
+    socket
+        .send(WsMessage::Binary(vec![5_u8, 6, 7, 8].into()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    drain.begin_drain();
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::Drained,
+    );
+    assert_close_code(&mut socket, CloseCode::Normal).await;
+    wait_until(Duration::from_secs(2), || slots.available_permits() == 1).await;
+}
+
+#[tokio::test]
+async fn websocket_disconnect_releases_backpressured_provider_input() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let state = AppState::new(
+        Arc::new(BackpressuredInputBrain {
+            dropped: dropped.clone(),
+        }),
+        "backpressured_input_probe",
+        VoiceWsAccess::default(),
+        1,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(5),
+        session: Duration::from_secs(5),
+    });
+    let slots = state.session_slots.clone();
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "backpressured_input_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![1_u8, 2, 3, 4].into()))
+        .await
+        .unwrap();
+    wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AnswerReceived).await;
+    drop(socket);
+
+    wait_until(Duration::from_secs(2), || slots.available_permits() == 1).await;
 }
 
 #[tokio::test]
@@ -3238,6 +3477,44 @@ impl RealtimeBrain for AbortProbeBrain {
             task_guard: Some(RealtimeSessionTaskGuard::new(vec![
                 provider_task.abort_handle(),
                 input_task.abort_handle(),
+            ])),
+        })
+    }
+}
+
+struct BackpressuredInputBrain {
+    dropped: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for BackpressuredInputBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "backpressured_input_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        _config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        let (input, input_rx) = mpsc::channel::<BrainInput>(1);
+        let (event_tx, events) = mpsc::channel(1);
+        let dropped = self.dropped.clone();
+        let input_task = tokio::spawn(async move {
+            let _input_rx = input_rx;
+            let _event_tx = event_tx;
+            DropFlagFuture { dropped }.await;
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![
+                input_task.abort_handle()
             ])),
         })
     }
