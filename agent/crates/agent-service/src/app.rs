@@ -8,9 +8,9 @@ use std::{
 };
 
 use agent_domain::{
-    BrainUsage, CreatePasteStudySet, LibrarySessionSummary, LibraryStudyDocumentSummary,
-    LibraryStudySetSummary, PortError, RealtimeBrain, StudyMemoryStore, StudySetIngestionRecord,
-    StudySetIngestionStatus, VoiceUsageRecord,
+    BrainUsage, CreateFileStudySet, CreatePasteStudySet, LibrarySessionSummary,
+    LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError, RealtimeBrain,
+    StudyMemoryStore, StudySetIngestionRecord, StudySetIngestionStatus, VoiceUsageRecord,
 };
 use axum::{
     extract::{Path, Query},
@@ -18,6 +18,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use observe::{usage_event, CostModel, VoiceEvidenceEvent, VoiceUsageEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -219,6 +220,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/study-sets/paste",
             post(create_paste_study_set).options(paste_options),
+        )
+        .route(
+            "/study-sets/files",
+            post(create_file_study_set).options(paste_options),
+        )
+        .route(
+            "/study-sets/{study_set_id}/files/retry",
+            post(retry_file_study_set).options(paste_options),
         )
         .route(
             "/study-sets/export",
@@ -503,6 +512,23 @@ struct PasteStudySetRequest {
     course: Option<String>,
     exam_date: Option<String>,
     pasted_text: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct FileStudySetRequest {
+    title: String,
+    course: Option<String>,
+    exam_date: Option<String>,
+    file_name: String,
+    content_type: Option<String>,
+    file_base64: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RetryFileStudySetRequest {
+    file_name: String,
+    content_type: Option<String>,
+    file_base64: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -918,22 +944,15 @@ async fn create_paste_study_set(
             );
         }
     };
-    if record.study_set.ingestion_status == StudySetIngestionStatus::Ready {
-        if let Some(secret) = state.ws_access.session_token_secret.as_deref() {
-            match signed_session_token(&record, secret) {
-                Ok(token) => record.session_token = Some(token),
-                Err(error) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        response_headers,
-                        Json(json!({
-                            "error": "session_token_failed",
-                            "message": error.to_string(),
-                        })),
-                    );
-                }
-            }
-        }
+    if let Err(error) = attach_ready_session_token(&state, &mut record) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            response_headers,
+            Json(json!({
+                "error": "session_token_failed",
+                "message": error.to_string(),
+            })),
+        );
     }
     (
         StatusCode::CREATED,
@@ -949,6 +968,195 @@ async fn create_paste_study_set(
     )
 }
 
+async fn create_file_study_set(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<FileStudySetRequest>,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let mut response_headers = match cors_headers(&state.ws_access, headers.get(header::ORIGIN)) {
+        Ok(headers) => headers,
+        Err(error) => {
+            return (
+                StatusCode::FORBIDDEN,
+                HeaderMap::new(),
+                Json(json!({
+                    "error": "origin_denied",
+                    "message": error.to_string(),
+                })),
+            );
+        }
+    };
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    if !state.unauthenticated_paste_allowed {
+        if state.ws_access.required_bearer.is_none() {
+            return (
+                StatusCode::FORBIDDEN,
+                response_headers,
+                Json(json!({
+                    "error": "file_ingestion_auth_required",
+                    "message": "file ingestion token minting is disabled without authenticated REST access",
+                })),
+            );
+        }
+        if let Err(error) = state.ws_access.validate_headers(&headers) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                response_headers,
+                Json(json!({
+                    "error": "file_ingestion_auth_failed",
+                    "message": error.to_string(),
+                })),
+            );
+        }
+    }
+
+    let file_bytes = match STANDARD.decode(request.file_base64.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                response_headers,
+                Json(json!({
+                    "error": "file_ingestion_failed",
+                    "message": format!("invalid file_base64: {error}"),
+                })),
+            );
+        }
+    };
+    let session_id = Uuid::new_v4().to_string();
+    let input = CreateFileStudySet {
+        user_id: state.trusted_user_id.clone(),
+        study_set_id: None,
+        title: request.title,
+        course: request.course,
+        exam_date: request.exam_date,
+        file_name: request.file_name,
+        content_type: request.content_type,
+        file_bytes,
+        session_id: Some(session_id),
+    };
+    let mut record = match state.study_store.create_file_study_set(input).await {
+        Ok(record) => record,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                response_headers,
+                Json(json!({
+                    "error": "file_ingestion_failed",
+                    "message": error.to_string(),
+                })),
+            );
+        }
+    };
+    if let Err(error) = attach_ready_session_token(&state, &mut record) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            response_headers,
+            Json(json!({
+                "error": "session_token_failed",
+                "message": error.to_string(),
+            })),
+        );
+    }
+    (
+        StatusCode::CREATED,
+        response_headers,
+        Json(
+            serde_json::to_value(PasteStudySetResponse { record }).unwrap_or_else(|error| {
+                json!({
+                    "error": "file_response_failed",
+                    "message": error.to_string(),
+                })
+            }),
+        ),
+    )
+}
+
+async fn retry_file_study_set(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Path(study_set_id): Path<String>,
+    Query(query): Query<LibrarySnapshotQuery>,
+    headers: HeaderMap,
+    Json(request): Json<RetryFileStudySetRequest>,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let response_headers = match optional_cors_json_headers(&state.ws_access, &headers) {
+        Ok(headers) => headers,
+        Err(error) => return cors_json_error(error),
+    };
+    let user_id = requested_library_user_id(&query, &state);
+    if let Some(error) =
+        require_library_control_access(&state, &headers, &response_headers, &user_id, "file_retry")
+    {
+        return error;
+    }
+    let file_bytes = match STANDARD.decode(request.file_base64.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                response_headers,
+                Json(json!({
+                    "error": "file_retry_failed",
+                    "message": format!("invalid file_base64: {error}"),
+                })),
+            );
+        }
+    };
+    let session_id = Uuid::new_v4().to_string();
+    let input = CreateFileStudySet {
+        user_id,
+        study_set_id: Some(study_set_id),
+        title: String::new(),
+        course: None,
+        exam_date: None,
+        file_name: request.file_name,
+        content_type: request.content_type,
+        file_bytes,
+        session_id: Some(session_id),
+    };
+    let mut record = match state.study_store.retry_file_study_set(input).await {
+        Ok(record) => record,
+        Err(error) => return store_json_error(response_headers, error, "file_retry_failed"),
+    };
+    if let Err(error) = attach_ready_session_token(&state, &mut record) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            response_headers,
+            Json(json!({
+                "error": "session_token_failed",
+                "message": error.to_string(),
+            })),
+        );
+    }
+    (
+        StatusCode::OK,
+        response_headers,
+        Json(
+            serde_json::to_value(PasteStudySetResponse { record }).unwrap_or_else(|error| {
+                json!({
+                    "error": "file_retry_response_failed",
+                    "message": error.to_string(),
+                })
+            }),
+        ),
+    )
+}
+
+fn attach_ready_session_token(
+    state: &AppState,
+    record: &mut StudySetIngestionRecord,
+) -> Result<(), crate::config::SessionTokenError> {
+    if record.study_set.ingestion_status == StudySetIngestionStatus::Ready {
+        if let Some(secret) = state.ws_access.session_token_secret.as_deref() {
+            record.session_token = Some(signed_session_token(record, secret)?);
+        }
+    }
+    Ok(())
+}
+
 fn study_set_start_unavailable_reason(study_set: &LibraryStudySetSummary) -> Option<&'static str> {
     if !study_set.server_owned {
         return Some("not_server_owned");
@@ -956,6 +1164,7 @@ fn study_set_start_unavailable_reason(study_set: &LibraryStudySetSummary) -> Opt
     match study_set.ingestion_status {
         StudySetIngestionStatus::Pending => return Some("ingestion_pending"),
         StudySetIngestionStatus::Processing => return Some("ingestion_processing"),
+        StudySetIngestionStatus::Retry => return Some("ingestion_retry"),
         StudySetIngestionStatus::Failed => return Some("ingestion_failed"),
         StudySetIngestionStatus::Ready => {}
     }

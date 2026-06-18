@@ -4,12 +4,12 @@ use std::{
 };
 
 use agent_domain::{
-    AnswerEvaluation, ConceptStatus, CreatePasteStudySet, LibraryNextReviewSummary,
-    LibrarySessionRecapSummary, LibrarySessionSummary, LibraryStudyDocumentSummary,
-    LibraryStudySetSummary, PortError, SessionConfig, SessionTokenNonceClaim, StudyLibrarySnapshot,
-    StudyMemoryStore, StudyQuestion, StudySessionRecap, StudySetIngestionRecord,
-    StudySetIngestionStatus, StudySourceReference, StudyStoreBackend, StudyStoreCapabilities,
-    StudyStoreWriteCounts, VoiceUsageRecord,
+    AnswerEvaluation, ConceptStatus, CreateFileStudySet, CreatePasteStudySet,
+    LibraryNextReviewSummary, LibrarySessionRecapSummary, LibrarySessionSummary,
+    LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError, SessionConfig,
+    SessionTokenNonceClaim, StudyLibrarySnapshot, StudyMemoryStore, StudyQuestion,
+    StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus, StudySourceReference,
+    StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts, VoiceUsageRecord,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -18,7 +18,10 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use crate::{memory::generate_paste_study_set, InMemoryStudyStore};
+use crate::{
+    memory::{generate_file_study_set, generate_paste_study_set},
+    InMemoryStudyStore,
+};
 
 #[derive(Clone, Debug)]
 pub struct PostgresStudyStore {
@@ -179,6 +182,82 @@ impl PostgresStudyStore {
             "44444444-4444-4444-8444-444444444444" => "voice-session-1".to_owned(),
             _ => uuid.to_string(),
         }
+    }
+
+    async fn insert_ingestion_artifacts(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        generated: &StudySetIngestionRecord,
+        study_set_uuid: Uuid,
+    ) -> Result<(), PortError> {
+        for document in &generated.documents {
+            sqlx::query(
+                "INSERT INTO study_documents (id, study_set_id, display_name, source_kind, processing_status, deleted_at)
+                 VALUES ($1, $2, $3, $4, $5, NULL)",
+            )
+            .bind(Self::uuid_for(&document.id)?)
+            .bind(study_set_uuid)
+            .bind(&document.display_name)
+            .bind(&document.source_kind)
+            .bind(document.processing_status.as_str())
+            .execute(&mut **tx)
+            .await
+            .map_err(pg_error)?;
+        }
+
+        for source in &generated.source_spans {
+            sqlx::query(
+                "INSERT INTO source_spans (
+                    id, document_id, locator, excerpt, confidence, retrieval_reason, deleted_at
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6, NULL)",
+            )
+            .bind(Self::uuid_for(&source.id)?)
+            .bind(Self::uuid_for(&source.document_id)?)
+            .bind(&source.locator)
+            .bind(&source.excerpt)
+            .bind(source_confidence_str(&source.confidence))
+            .bind(&source.retrieval_reason)
+            .execute(&mut **tx)
+            .await
+            .map_err(pg_error)?;
+        }
+
+        for concept in &generated.concepts {
+            sqlx::query(
+                "INSERT INTO concepts (id, study_set_id, label, status, source_span_id, public_id)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(study_set_uuid)
+            .bind(&concept.label)
+            .bind(concept_status_str(&concept.status))
+            .bind(Self::uuid_for(&concept.source_span_id)?)
+            .bind(&concept.public_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(pg_error)?;
+        }
+
+        for question in &generated.questions {
+            sqlx::query(
+                "INSERT INTO study_questions (
+                    id, study_set_id, question_id, source_span_id, prompt, expected_terms, follow_up, active
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(study_set_uuid)
+            .bind(&question.question_id)
+            .bind(Self::uuid_for(&question.source.source_id)?)
+            .bind(&question.prompt)
+            .bind(&question.expected_terms)
+            .bind(&question.follow_up)
+            .execute(&mut **tx)
+            .await
+            .map_err(pg_error)?;
+        }
+
+        Ok(())
     }
 
     fn increment_count(&self, kind: WriteCountKind) -> Result<(), PortError> {
@@ -689,6 +768,123 @@ impl StudyMemoryStore for PostgresStudyStore {
         }
 
         tx.commit().await.map_err(pg_error)?;
+        Ok(generated)
+    }
+
+    async fn create_file_study_set(
+        &self,
+        input: CreateFileStudySet,
+    ) -> Result<StudySetIngestionRecord, PortError> {
+        let generated = generate_file_study_set(input)?;
+        let study_set_uuid = Self::uuid_for(&generated.study_set.id)?;
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
+
+        sqlx::query(
+            "INSERT INTO study_sets (id, user_id, title, course, ingestion_status, ingestion_error)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(study_set_uuid)
+        .bind(&generated.study_set.user_id)
+        .bind(&generated.study_set.title)
+        .bind(&generated.study_set.course)
+        .bind(generated.study_set.ingestion_status.as_str())
+        .bind(&generated.study_set.ingestion_error)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+
+        Self::insert_ingestion_artifacts(&mut tx, &generated, study_set_uuid).await?;
+
+        tx.commit().await.map_err(pg_error)?;
+        Ok(generated)
+    }
+
+    async fn retry_file_study_set(
+        &self,
+        input: CreateFileStudySet,
+    ) -> Result<StudySetIngestionRecord, PortError> {
+        let study_set_id = input
+            .study_set_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                PortError::unavailable("postgres", "file_retry", "study_set_id is required")
+            })?
+            .to_owned();
+        let study_set_uuid = Self::uuid_for(&study_set_id)?;
+        let row =
+            sqlx::query("SELECT title, course FROM study_sets WHERE id = $1 AND user_id = $2")
+                .bind(study_set_uuid)
+                .bind(&input.user_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(pg_error)?
+                .ok_or_else(|| {
+                    PortError::unavailable(
+                        "postgres",
+                        format!("{}/{}", input.user_id, study_set_id),
+                        "study set is not available for this user",
+                    )
+                })?;
+        let generated = generate_file_study_set(CreateFileStudySet {
+            user_id: input.user_id,
+            study_set_id: Some(study_set_id),
+            title: row.try_get("title").map_err(pg_error)?,
+            course: row.try_get("course").map_err(pg_error)?,
+            exam_date: input.exam_date,
+            file_name: input.file_name,
+            content_type: input.content_type,
+            file_bytes: input.file_bytes,
+            session_id: input.session_id,
+        })?;
+
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        sqlx::query("DELETE FROM study_questions WHERE study_set_id = $1")
+            .bind(study_set_uuid)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_error)?;
+        sqlx::query("DELETE FROM concepts WHERE study_set_id = $1")
+            .bind(study_set_uuid)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_error)?;
+        sqlx::query(
+            "DELETE FROM source_spans sp
+             USING study_documents d
+             WHERE sp.document_id = d.id AND d.study_set_id = $1",
+        )
+        .bind(study_set_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        sqlx::query("DELETE FROM study_documents WHERE study_set_id = $1")
+            .bind(study_set_uuid)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_error)?;
+        sqlx::query(
+            "UPDATE study_sets
+             SET title = $2, course = $3, ingestion_status = $4, ingestion_error = $5
+             WHERE id = $1",
+        )
+        .bind(study_set_uuid)
+        .bind(&generated.study_set.title)
+        .bind(&generated.study_set.course)
+        .bind(generated.study_set.ingestion_status.as_str())
+        .bind(&generated.study_set.ingestion_error)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+
+        Self::insert_ingestion_artifacts(&mut tx, &generated, study_set_uuid).await?;
+
+        tx.commit().await.map_err(pg_error)?;
+        self.event_authorizations
+            .write()
+            .map_err(|_| PortError::adapter("postgres", "event authorization lock poisoned"))?
+            .retain(|record| record.study_set_id != generated.study_set.id);
         Ok(generated)
     }
 
@@ -1901,6 +2097,7 @@ fn ingestion_status(value: &str) -> Result<StudySetIngestionStatus, PortError> {
     match value {
         "pending" => Ok(StudySetIngestionStatus::Pending),
         "processing" => Ok(StudySetIngestionStatus::Processing),
+        "retry" => Ok(StudySetIngestionStatus::Retry),
         "ready" => Ok(StudySetIngestionStatus::Ready),
         "failed" => Ok(StudySetIngestionStatus::Failed),
         other => Err(PortError::adapter(

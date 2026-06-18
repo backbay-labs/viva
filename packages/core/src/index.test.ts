@@ -104,6 +104,16 @@ describe("Viva study set generation", () => {
     expect(
       failedStudySet.generatedCards.some((card) => card.id === "server-ingestion-failed"),
     ).toBe(true);
+
+    const retryStudySet = studySetFromPasteIngestionResponse(serverPasteResponse("retry"));
+    expect(agentStudySetReadiness(retryStudySet)).toMatchObject({
+      canConnect: false,
+      reason: "retry_ingestion",
+    });
+    expect(retryStudySet.lastSessionLabel).toBe("Server ingestion awaiting retry");
+    expect(retryStudySet.generatedCards.some((card) => card.id === "server-ingestion-retry")).toBe(
+      true,
+    );
   });
 });
 
@@ -140,9 +150,9 @@ describe("Viva answer evaluation", () => {
 });
 
 function serverPasteResponse(
-  status: "pending" | "processing" | "ready" | "failed",
+  status: "pending" | "processing" | "ready" | "failed" | "retry",
 ): PasteIngestionResponse {
-  const failed = status === "failed";
+  const ready = status === "ready";
   return {
     study_set: {
       id: "server-study-set-1",
@@ -159,9 +169,8 @@ function serverPasteResponse(
         processing_status: status,
       },
     ],
-    source_spans: failed
-      ? []
-      : [
+    source_spans: ready
+      ? [
           {
             id: "span-1",
             document_id: "doc-1",
@@ -170,20 +179,20 @@ function serverPasteResponse(
             confidence: "high",
             retrieval_reason: "paste ingestion",
           },
-        ],
-    concepts: failed
-      ? []
-      : [
+        ]
+      : [],
+    concepts: ready
+      ? [
           {
             public_id: "oxidative-phosphorylation",
             label: "Oxidative phosphorylation",
             status: "shaky",
             source_span_id: "span-1",
           },
-        ],
-    questions: failed
-      ? []
-      : [
+        ]
+      : [],
+    questions: ready
+      ? [
           {
             question_id: "question-1",
             prompt: "Explain NADH.",
@@ -198,8 +207,9 @@ function serverPasteResponse(
               retrieval_reason: "paste ingestion",
             },
           },
-        ],
-    session_token: failed ? null : "signed-session-token",
+        ]
+      : [],
+    session_token: ready ? "signed-session-token" : null,
     session_id: "server-session-1",
   };
 }

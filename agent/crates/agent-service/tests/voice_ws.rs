@@ -24,7 +24,10 @@ use axum::{
     body::Body,
     http::{HeaderValue, Request, StatusCode},
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
@@ -84,6 +87,13 @@ fn test_state_with_rest_auth(
 
 fn test_state_with_session_token(secret: &str) -> AppState {
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    test_state_with_session_token_and_store(secret, store)
+}
+
+fn test_state_with_session_token_and_store(
+    secret: &str,
+    store: Arc<data::InMemoryStudyStore>,
+) -> AppState {
     AppState::with_study_store(
         Arc::new(SyntheticBrain::with_study_store(store.clone())),
         "synthetic",
@@ -407,6 +417,267 @@ async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token
         active_question.question_id,
         "q-oxidative-phosphorylation-nadh"
     );
+}
+
+#[tokio::test]
+async fn file_study_set_route_creates_server_owned_ready_pdf_without_exact_region_claims() {
+    let store = Arc::new(data::InMemoryStudyStore::new());
+    let app = build_router(test_state_with_session_token_and_store(
+        "session-secret",
+        store.clone(),
+    ));
+    let file_text = [
+        "%PDF-1.7",
+        "Mitochondria electron transport builds a proton gradient for ATP synthase.",
+        "NADH carries electrons to Complex I and oxygen accepts electrons at the chain end.",
+        "Chemiosmosis connects proton movement with ATP production.",
+    ]
+    .join("\n");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/study-sets/files")
+                .header("origin", "http://localhost:3000")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "title": "Bio PDF",
+                        "course": "Biology 201",
+                        "exam_date": null,
+                        "file_name": "Lecture 9.pdf",
+                        "content_type": "application/pdf",
+                        "file_base64": STANDARD.encode(file_text.as_bytes()),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["study_set"]["ingestion_status"], "ready");
+    assert_eq!(payload["documents"][0]["display_name"], "Lecture 9.pdf");
+    assert_eq!(payload["documents"][0]["source_kind"], "pdf");
+    assert_eq!(payload["documents"][0]["processing_status"], "ready");
+    assert!(payload["session_token"]
+        .as_str()
+        .expect("ready file ingestion gets token")
+        .starts_with("viva1."));
+    assert!(!payload["source_spans"].as_array().unwrap().is_empty());
+    for source in payload["source_spans"].as_array().unwrap() {
+        assert!(source["locator"]["span"]
+            .as_str()
+            .expect("document-level span")
+            .starts_with("document:chars:"));
+        assert!(source["locator"].get("page").is_none());
+        assert!(source["locator"].get("bbox").is_none());
+        assert_ne!(source["excerpt"], file_text);
+    }
+    assert!(!String::from_utf8(body.to_vec())
+        .unwrap()
+        .contains("file_base64"));
+
+    let library = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/library?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(library.status(), axum::http::StatusCode::OK);
+    let library_body = library.into_body().collect().await.unwrap().to_bytes();
+    let library_payload: serde_json::Value = serde_json::from_slice(&library_body).unwrap();
+    let file_set = library_payload["study_sets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|set| set["title"] == "Bio PDF")
+        .expect("file study set in library");
+    assert_eq!(file_set["ingestion_status"], "ready");
+    assert_eq!(file_set["actions"]["start"]["available"], true);
+    assert_eq!(file_set["documents"][0]["source_kind"], "pdf");
+
+    let snapshot_json = serde_json::to_string(&store.snapshot()).unwrap();
+    assert!(!snapshot_json.contains(&file_text));
+    assert!(!snapshot_json.contains(&STANDARD.encode(file_text.as_bytes())));
+}
+
+#[tokio::test]
+async fn file_study_set_route_blocks_failed_upload_and_retries_to_ready() {
+    let app = build_router(test_state_with_rest_auth(
+        4,
+        Arc::new(data::InMemoryStudyStore::seeded_fixture()),
+    ));
+    let failed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/study-sets/files")
+                .header("origin", "http://localhost:3000")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "title": "Bad PDF",
+                        "course": null,
+                        "exam_date": null,
+                        "file_name": "empty.pdf",
+                        "content_type": "application/pdf",
+                        "file_base64": STANDARD.encode(b"!!! ??? ---"),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(failed.status(), axum::http::StatusCode::CREATED);
+    let failed_body = failed.into_body().collect().await.unwrap().to_bytes();
+    let failed_payload: serde_json::Value = serde_json::from_slice(&failed_body).unwrap();
+    let study_set_id = failed_payload["study_set"]["id"]
+        .as_str()
+        .expect("failed file study set id")
+        .to_owned();
+    assert_eq!(failed_payload["study_set"]["ingestion_status"], "failed");
+    assert_eq!(failed_payload["session_token"], serde_json::Value::Null);
+    assert!(failed_payload["questions"].as_array().unwrap().is_empty());
+
+    let library = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/library?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let library_body = library.into_body().collect().await.unwrap().to_bytes();
+    let library_payload: serde_json::Value = serde_json::from_slice(&library_body).unwrap();
+    let failed_set = library_payload["study_sets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|set| set["id"] == study_set_id)
+        .expect("failed study set in library");
+    assert_eq!(failed_set["actions"]["start"]["available"], false);
+    assert_eq!(
+        failed_set["actions"]["start"]["unavailable_reason"],
+        "ingestion_failed"
+    );
+
+    let still_bad = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/study-sets/{study_set_id}/files/retry?user_id=user-1"
+                ))
+                .header("origin", "http://localhost:3000")
+                .header("authorization", "Bearer rest-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "file_name": "still-empty.pdf",
+                        "content_type": "application/pdf",
+                        "file_base64": STANDARD.encode(b"??? --- !!!"),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(still_bad.status(), axum::http::StatusCode::OK);
+    let still_bad_body = still_bad.into_body().collect().await.unwrap().to_bytes();
+    let still_bad_payload: serde_json::Value = serde_json::from_slice(&still_bad_body).unwrap();
+    assert_eq!(still_bad_payload["study_set"]["ingestion_status"], "retry");
+    assert_eq!(still_bad_payload["session_token"], serde_json::Value::Null);
+
+    let retry_library = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/library?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let retry_library_body = retry_library
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let retry_library_payload: serde_json::Value =
+        serde_json::from_slice(&retry_library_body).unwrap();
+    let retry_set = retry_library_payload["study_sets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|set| set["id"] == study_set_id)
+        .expect("retry study set in library");
+    assert_eq!(retry_set["ingestion_status"], "retry");
+    assert_eq!(
+        retry_set["actions"]["start"]["unavailable_reason"],
+        "ingestion_retry"
+    );
+
+    let retry_text = [
+        "Photosynthesis chloroplast thylakoid membranes split water.",
+        "Carbon fixation stores energy in glucose after the light reactions.",
+    ]
+    .join(" ");
+    let retried = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/study-sets/{study_set_id}/files/retry?user_id=user-1"
+                ))
+                .header("origin", "http://localhost:3000")
+                .header("authorization", "Bearer rest-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "file_name": "replacement.pdf",
+                        "content_type": "application/pdf",
+                        "file_base64": STANDARD.encode(retry_text.as_bytes()),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(retried.status(), axum::http::StatusCode::OK);
+    let retried_body = retried.into_body().collect().await.unwrap().to_bytes();
+    let retried_payload: serde_json::Value = serde_json::from_slice(&retried_body).unwrap();
+    assert_eq!(retried_payload["study_set"]["id"], study_set_id);
+    assert_eq!(retried_payload["study_set"]["ingestion_status"], "ready");
+    assert!(retried_payload["session_token"]
+        .as_str()
+        .expect("retry ready token")
+        .starts_with("viva1."));
+    assert!(!retried_payload["questions"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

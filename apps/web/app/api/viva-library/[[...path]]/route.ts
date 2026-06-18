@@ -10,6 +10,10 @@ export async function GET(request: NextRequest, context: VivaLibraryRouteContext
   return proxyVivaLibraryRequest(request, context);
 }
 
+export async function POST(request: NextRequest, context: VivaLibraryRouteContext) {
+  return proxyVivaLibraryRequest(request, context);
+}
+
 export async function DELETE(request: NextRequest, context: VivaLibraryRouteContext) {
   return proxyVivaLibraryRequest(request, context);
 }
@@ -31,6 +35,7 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
 
   const headers = vivaLibraryProxyHeaders(request);
   const response = await fetch(upstream, {
+    body: request.method === "POST" ? await request.text() : undefined,
     cache: "no-store",
     headers,
     method: request.method,
@@ -58,6 +63,8 @@ function vivaLibraryProxyHeaders(request: NextRequest): Headers {
   if (authorization) headers.set("authorization", authorization);
   const controlToken = request.headers.get("x-viva-library-control-token");
   if (controlToken) headers.set("x-viva-library-control-token", controlToken);
+  const contentType = request.headers.get("content-type");
+  if (contentType) headers.set("content-type", contentType);
   const origin = vivaLibraryProxyOrigin(request);
   if (origin) headers.set("origin", origin);
   return headers;
