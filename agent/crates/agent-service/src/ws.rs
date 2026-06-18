@@ -1,6 +1,6 @@
 use std::{collections::HashSet, time::Duration};
 
-use agent_domain::{AudioFrame, BrainInput, SessionConfig};
+use agent_domain::{AudioFrame, BrainInput, SessionConfig, SessionTokenNonceClaim};
 use axum::{
     extract::{
         ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade},
@@ -94,7 +94,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
         return;
     }
 
-    let mut initial_config = match timeout(state.ws_timeouts.first_frame, receiver.next()).await {
+    let mut initial = match timeout(state.ws_timeouts.first_frame, receiver.next()).await {
         Err(_) => {
             let _ = send_json(
                 &mut sender,
@@ -123,10 +123,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
             }
         },
     };
-    let session_binding = AuthorizedClientSession::from_config(&initial_config)
+    let session_binding = AuthorizedClientSession::from_config(&initial.config)
         .expect("authorized session config has required identity");
-    let voice_session_id = initial_config.session_id.as_deref().map(ToOwned::to_owned);
-    let study_context = match validate_study_set_access(&state, &initial_config).await {
+    let voice_session_id = initial.config.session_id.as_deref().map(ToOwned::to_owned);
+    let study_context = match validate_study_set_access(&state, &initial.config).await {
         Ok(study_context) => study_context,
         Err(error) => {
             let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
@@ -135,6 +135,21 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
             return;
         }
     };
+    if let Some(claim) = initial.token_nonce_claim.take() {
+        if state
+            .study_store
+            .claim_session_token_nonce(claim)
+            .await
+            .is_err()
+        {
+            let error = ClientFrameError::invalid_session_token();
+            let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+            let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
+            record_terminal(&state, voice_session_id, error.terminal_reason).await;
+            return;
+        }
+    }
+    let mut initial_config = initial.config;
     initial_config.active_concepts = server_active_concepts(&study_context);
     state.evidence.record(VoiceEvidenceEvent::new(
         VoiceEvidenceEventKind::ConfigAccepted,
@@ -623,35 +638,51 @@ fn sanitize_client_session_config(
 fn authorize_initial_session_config(
     initial: InitialSessionConfig,
     state: &AppState,
-) -> Result<SessionConfig, ClientFrameError> {
+) -> Result<AuthorizedInitialSessionConfig, ClientFrameError> {
     let mut rotate_trusted_session = false;
-    let binding = if let Some(secret) = state.ws_access.session_token_secret.as_deref() {
-        let token = initial
-            .session_token
-            .as_deref()
-            .ok_or_else(ClientFrameError::invalid_session_token)?;
-        let claims = SessionTokenClaims::verify(token, secret)
-            .map_err(|_| ClientFrameError::invalid_session_token())?;
-        AuthorizedClientSession {
-            user_id: claims.user_id,
-            study_set_id: claims.study_set_id,
-            session_id: claims.session_id,
-        }
-    } else {
-        rotate_trusted_session = true;
-        AuthorizedClientSession {
-            user_id: state.trusted_user_id.clone(),
-            study_set_id: state.trusted_study_set_id.clone(),
-            session_id: state.trusted_session_id.clone(),
-        }
-    };
+    let (binding, token_nonce_claim) =
+        if let Some(secret) = state.ws_access.session_token_secret.as_deref() {
+            let token = initial
+                .session_token
+                .as_deref()
+                .ok_or_else(ClientFrameError::invalid_session_token)?;
+            let claims = SessionTokenClaims::verify(token, secret)
+                .map_err(|_| ClientFrameError::invalid_session_token())?;
+            (
+                AuthorizedClientSession {
+                    user_id: claims.user_id.clone(),
+                    study_set_id: claims.study_set_id.clone(),
+                    session_id: claims.session_id.clone(),
+                },
+                Some(SessionTokenNonceClaim {
+                    user_id: claims.user_id,
+                    study_set_id: claims.study_set_id,
+                    voice_session_id: claims.session_id,
+                    nonce: claims.nonce,
+                    expires_at: claims.expires_at,
+                }),
+            )
+        } else {
+            rotate_trusted_session = true;
+            (
+                AuthorizedClientSession {
+                    user_id: state.trusted_user_id.clone(),
+                    study_set_id: state.trusted_study_set_id.clone(),
+                    session_id: state.trusted_session_id.clone(),
+                },
+                None,
+            )
+        };
     let mut config = sanitize_client_session_config(initial.session, &binding)?;
     if rotate_trusted_session {
         config.session_id = Some(agent_domain::SessionId::new(
             state.next_trusted_voice_session_id(),
         ));
     }
-    Ok(config)
+    Ok(AuthorizedInitialSessionConfig {
+        config,
+        token_nonce_claim,
+    })
 }
 
 fn sanitize_refresh_session_config(
@@ -672,6 +703,12 @@ struct AuthorizedClientSession {
 struct InitialSessionConfig {
     session: SessionConfig,
     session_token: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthorizedInitialSessionConfig {
+    config: SessionConfig,
+    token_nonce_claim: Option<SessionTokenNonceClaim>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1947,6 +1947,63 @@ async fn websocket_accepts_signed_session_token_matching_initial_config() {
 }
 
 #[tokio::test]
+async fn websocket_rejects_replayed_session_token_before_brain_open() {
+    let opened = Arc::new(AtomicBool::new(false));
+    let state = AppState::new(
+        Arc::new(OpenProbeBrain {
+            opened: opened.clone(),
+            captured_config: None,
+        }),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        2,
+    );
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() + 60,
+        "nonce-replay",
+    );
+
+    let (mut first_socket, _) = connect_async(url.clone()).await.unwrap();
+    assert_ready_provider(&mut first_socket, "open_probe").await;
+    first_socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&token).into(),
+        ))
+        .await
+        .unwrap();
+    wait_for_socket_close(&mut first_socket).await;
+    assert!(opened.load(Ordering::SeqCst));
+
+    opened.store(false, Ordering::SeqCst);
+    let (mut replay_socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut replay_socket, "open_probe").await;
+    replay_socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&token).into(),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        read_server_frame(&mut replay_socket).await,
+        ServerFrame::Error { message, .. } if message == "invalid session token"
+    ));
+    assert_close_code(&mut replay_socket, CloseCode::Policy).await;
+    assert!(!opened.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn websocket_rejects_invalid_session_token_before_brain_open() {
     for token in [
         signed_session_token(
@@ -1956,6 +2013,14 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
             "voice-session-1",
             unix_timestamp_now().saturating_sub(1),
             "nonce-expired",
+        ),
+        signed_session_token(
+            "wrong-secret",
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            unix_timestamp_now() + 60,
+            "nonce-forged-signature",
         ),
         "viva1.malformed.signature".to_owned(),
     ] {
@@ -1998,6 +2063,14 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
 #[tokio::test]
 async fn websocket_rejects_token_claim_mismatch_before_brain_open() {
     for token in [
+        signed_session_token(
+            "session-secret",
+            "user-2",
+            "biology-midterm",
+            "voice-session-1",
+            unix_timestamp_now() + 60,
+            "nonce-wrong-user",
+        ),
         signed_session_token(
             "session-secret",
             "user-1",
