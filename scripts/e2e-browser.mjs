@@ -19,8 +19,13 @@ const agentUrl = `http://127.0.0.1:${agentPort}`;
 const webUrl = `http://127.0.0.1:${webPort}`;
 const wsUrl = `ws://127.0.0.1:${agentPort}/ws`;
 const agentProvider = process.env.VIVA_E2E_AGENT_PROVIDER ?? "synthetic";
-if (agentProvider === "cartesia_gemini") {
-  throw new Error("BAC-307 browser-story capture must not use the gated live cartesia_gemini path.");
+const allowedBrowserStoryProviders = new Set(["synthetic", "fake_cartesia_gemini"]);
+if (!allowedBrowserStoryProviders.has(agentProvider)) {
+  throw new Error(
+    `BAC-307 browser-story capture only supports non-live providers: ${[
+      ...allowedBrowserStoryProviders,
+    ].join(", ")}.`,
+  );
 }
 const stopToRecap = process.env.VIVA_E2E_STOP_TO_RECAP === "1";
 const validationRunId = `browser-story-${agentProvider}-${new Date()
