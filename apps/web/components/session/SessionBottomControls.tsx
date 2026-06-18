@@ -1,19 +1,16 @@
 "use client";
 
 import { Icon } from "@viva/ui-web";
-import { useRouter } from "next/navigation";
 
 /**
  * A quiet control rail along the bottom of the question plate. Low visual
- * weight — no alarming red "End". End session returns to the front door; the
- * other two are placeholders for the wired session.
+ * weight — no alarming red "End". End session asks the Conductor to close the
+ * turn so the manuscript can render the terminal recap.
  */
-export function SessionBottomControls() {
-  const router = useRouter();
-
+export function SessionBottomControls({ onEndSession }: { onEndSession: () => void }) {
   return (
     <div className="session-controls">
-      <button className="session-controls__btn" onClick={() => router.push("/")} type="button">
+      <button className="session-controls__btn" onClick={onEndSession} type="button">
         <Icon color="var(--viva-muted)" name="x" size={15} strokeWidth={1.6} />
         End session
       </button>

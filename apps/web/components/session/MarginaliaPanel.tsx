@@ -1,3 +1,4 @@
+import type { SessionRecap } from "@viva/core";
 import { Icon, Spark } from "@viva/ui-web";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import type { RuntimeCopy } from "../../lib/viva-session-projection";
@@ -16,6 +17,7 @@ export function MarginaliaPanel({
   scene,
   runtime,
   question,
+  recap,
   hintShown,
   onHint,
   onShowSource,
@@ -28,6 +30,7 @@ export function MarginaliaPanel({
   scene?: VivaSceneState;
   runtime: RuntimeCopy;
   question: Question;
+  recap?: SessionRecap;
   hintShown: boolean;
   onHint: () => void;
   onShowSource: () => void;
@@ -37,6 +40,7 @@ export function MarginaliaPanel({
   onNextQuestion: () => void;
 }) {
   const isSource = state === "source";
+  const isRecap = isSource && Boolean(recap);
 
   return (
     <aside
@@ -47,7 +51,9 @@ export function MarginaliaPanel({
       data-state={state}
     >
       <div className="marginalia__head">
-        <span className="marginalia__label">{isSource ? "Source" : "Marginalia"}</span>
+        <span className="marginalia__label">
+          {isRecap ? "Recap" : isSource ? "Source" : "Marginalia"}
+        </span>
         <Icon
           color="var(--viva-muted)"
           name={isSource ? "book" : "pen"}
@@ -74,7 +80,13 @@ export function MarginaliaPanel({
             question={question}
           />
         ) : null}
-        {isSource ? <SourceFolio onBack={onBackToQuestion} question={question} /> : null}
+        {isSource ? (
+          recap ? (
+            <RecapFold recap={recap} />
+          ) : (
+            <SourceFolio onBack={onBackToQuestion} question={question} />
+          )
+        ) : null}
       </div>
     </aside>
   );
@@ -112,7 +124,7 @@ function ListeningNote({
       <p className="margin-note__next">Next action: {runtime.nextActionLabel}</p>
       {hintShown ? (
         <p className="margin-note__hint">
-          Start with NADH&rsquo;s electrons — where do they go first?
+          Use your own words first; the Conductor will reveal source terms after you answer.
         </p>
       ) : null}
       <div className="margin-note__actions">
@@ -137,6 +149,44 @@ function ListeningNote({
       </div>
     </div>
   );
+}
+
+function RecapFold({ recap }: { recap: SessionRecap }) {
+  return (
+    <div className="folio recap-fold">
+      <p className="folio__subtitle">Recap ready</p>
+      <p className="folio__ref">{recap.headline}</p>
+      <p className="folio__excerpt">{recap.summary}</p>
+      <ul className="recap-fold__list" aria-label="Conductor recap">
+        <li>
+          <span>Strong</span>
+          <span>{joinRecapItems(recap.strongConcepts)}</span>
+        </li>
+        <li>
+          <span>Shaky</span>
+          <span>{joinRecapItems(recap.shakyConcepts)}</span>
+        </li>
+        <li>
+          <span>Missed</span>
+          <span>{joinRecapItems(recap.missedConcepts)}</span>
+        </li>
+        <li>
+          <span>Review later</span>
+          <span>{joinRecapItems(recap.reviewLater)}</span>
+        </li>
+      </ul>
+      {recap.sourceMoments[0] ? (
+        <p className="folio__footer">
+          {recap.sourceMoments[0].source.label}: {recap.sourceMoments[0].text}
+        </p>
+      ) : null}
+      <p className="folio__footer">Conductor next action: {recap.nextAction}</p>
+    </div>
+  );
+}
+
+function joinRecapItems(items: string[]) {
+  return items.length > 0 ? items.join(", ") : "none yet";
 }
 
 function ThinkingNote({ question }: { question: Question }) {

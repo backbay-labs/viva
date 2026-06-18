@@ -19,6 +19,7 @@ import {
   type VivaAudioPlaybackSink,
 } from "../../lib/viva-audio-playback";
 import { vivaSceneReducer } from "../../lib/viva-scene-reducer";
+import { sessionTokenFromSearch } from "../../lib/viva-session-entry";
 import {
   projectConceptNodes,
   projectHighlightedTokens,
@@ -49,8 +50,14 @@ import type { VoiceTraceLevel } from "./VoiceTraceCanvas";
  */
 const STUDY_SET = seedStudySets[0]; // biology-midterm — the trusted synthetic study set
 
+type WindowWithWebkitAudioContext = Window &
+  typeof globalThis & {
+    webkitAudioContext?: typeof AudioContext;
+  };
+
 export function LiveSessionPage() {
   const reducedMotion = usePrefersReducedMotion();
+  const [sessionToken] = useState(readBrowserSessionToken);
   const [elapsed, setElapsed] = useState(0);
   const [hintShown, setHintShown] = useState(false);
   const [micState, setMicState] = useState<RuntimeMicState>("unknown");
@@ -61,6 +68,7 @@ export function LiveSessionPage() {
   const agent = useVivaAgentSession({
     mode: "quiz",
     sessionId: process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID,
+    sessionToken,
     studySet: STUDY_SET,
     trustedStudySetId: process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID,
     userId: process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID,
@@ -80,7 +88,8 @@ export function LiveSessionPage() {
     if (playbackRef.current) return playbackRef.current;
     const sink = createVivaAudioPlaybackSink({
       contextFactory: () => {
-        const AudioContextCtor = window.AudioContext ?? window.webkitAudioContext;
+        const audioWindow = window as WindowWithWebkitAudioContext;
+        const AudioContextCtor = audioWindow.AudioContext ?? audioWindow.webkitAudioContext;
         if (!AudioContextCtor) throw new Error("Browser audio playback is unavailable");
         return new AudioContextCtor({ sampleRate: VIVA_AUDIO_SAMPLE_RATE_HZ });
       },
@@ -167,7 +176,8 @@ export function LiveSessionPage() {
       setMicState("unsupported");
       return;
     }
-    const AudioContextCtor = window.AudioContext ?? window.webkitAudioContext;
+    const audioWindow = window as WindowWithWebkitAudioContext;
+    const AudioContextCtor = audioWindow.AudioContext ?? audioWindow.webkitAudioContext;
     if (!AudioContextCtor) {
       setMicState("unsupported");
       return;
@@ -221,6 +231,17 @@ export function LiveSessionPage() {
     agentRef.current.reset();
     agentRef.current.connect();
   }, []);
+  const endSession = useCallback(() => {
+    setSourceOpen(false);
+    setHintShown(false);
+    stopCaptureForRecap(captureRef, captureStartedRef, levelRef);
+    agentRef.current.stop();
+  }, []);
+
+  useEffect(() => {
+    if (!agent.derived.recap) return;
+    stopCaptureForRecap(captureRef, captureStartedRef, levelRef);
+  }, [agent.derived.recap]);
 
   // Stable session-start reference so FSRS review intervals are deterministic
   // across renders (and don't recompute the projection every tick).
@@ -280,27 +301,74 @@ export function LiveSessionPage() {
       readinessProbe,
     ],
   );
+  const sessionContextLabel =
+    agent.readiness.reason === "trusted"
+      ? `Trusted server set: ${STUDY_SET.title}`
+      : `Local demo set: ${STUDY_SET.title}`;
 
   return (
     <LiveSessionShell
+      clockLabel="Local session clock"
       conceptNodes={conceptNodes}
+      contextLabel={sessionContextLabel}
       elapsed={elapsed}
       glyphState={glyphStateFor(effectiveState)}
       highlightedTokens={highlightedTokens}
       hintShown={hintShown}
       levelRef={levelRef}
       onBackToQuestion={() => setSourceOpen(false)}
+      onEndSession={endSession}
       onHint={() => setHintShown((shown) => !shown)}
       onNextQuestion={submitTurn}
       onShowSource={() => setSourceOpen(true)}
       onSubmitAnswer={runtime.primaryActionIntent === "retry_agent" ? retryAgent : submitTurn}
       onTryAgain={submitTurn}
       question={projection.question}
+      recap={agent.derived.recap}
       runtime={runtime}
       scene={scene}
       state={effectiveState}
     />
   );
+}
+
+export function stopCaptureForRecap(
+  captureRef: { current: Pick<VivaAudioCaptureSource, "stop"> | null },
+  captureStartedRef: { current: boolean },
+  levelRef: { current: { user: number } },
+) {
+  captureRef.current?.stop();
+  captureRef.current = null;
+  captureStartedRef.current = false;
+  levelRef.current.user = 0;
+}
+
+function readBrowserSessionToken(): string | null {
+  const envToken = process.env.NEXT_PUBLIC_VIVA_VOICE_SESSION_TOKEN?.trim() || null;
+  if (typeof window === "undefined") return envToken;
+
+  const queryToken = sessionTokenFromSearch(window.location.search);
+  const storedToken = readStoredSessionToken();
+  const token = queryToken ?? storedToken ?? envToken;
+  if (queryToken) writeStoredSessionToken(queryToken);
+  return token;
+}
+
+function readStoredSessionToken(): string | null {
+  try {
+    const token = window.sessionStorage.getItem("viva.sessionToken")?.trim();
+    return token || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredSessionToken(token: string) {
+  try {
+    window.sessionStorage.setItem("viva.sessionToken", token);
+  } catch {
+    // Private browsing or storage policy failures should not block no-key mode.
+  }
 }
 
 function initialReadinessProbe(): VivaAgentReadinessProbe {

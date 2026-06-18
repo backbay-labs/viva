@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   type AgentStudySetReadiness,
+  type SessionRecap,
   VIVA_VOICE_PROTOCOL_VERSION,
   type VivaReadyFrame,
 } from "@viva/core";
@@ -70,6 +71,29 @@ const trustedReadiness: AgentStudySetReadiness = {
   message: "Connected agent is mapped to a trusted server study set.",
 };
 
+const trustedRecap: SessionRecap = {
+  durationLabel: "Agent session",
+  headline: "Server recap headline",
+  missedConcepts: [],
+  nextAction: "Review the ATP synthase source span before the next call.",
+  plan: [],
+  reviewLater: ["proton gradient", "ATP synthase"],
+  shakyConcepts: ["proton gradient"],
+  sourceMoments: [
+    {
+      source: {
+        confidence: "high",
+        excerpt: "Electron flow pumps protons across the inner mitochondrial membrane.",
+        label: "Lecture 5 · Slide 18",
+      },
+      status: "strong",
+      text: "Question source: oxidative phosphorylation.",
+    },
+  ],
+  strongConcepts: ["electron donor"],
+  summary: "The Conductor recap stayed grounded to the server-owned source span.",
+};
+
 function ready(provider: string, overrides: Partial<VivaReadyFrame["brain"]> = {}): VivaReadyFrame {
   return {
     type: "ready",
@@ -97,7 +121,12 @@ function ready(provider: string, overrides: Partial<VivaReadyFrame["brain"]> = {
 function renderRuntimeSurfaces(runtimeCopy: RuntimeCopy): string {
   return renderToStaticMarkup(
     <>
-      <SessionHeader elapsed={5} runtime={runtimeCopy} />
+      <SessionHeader
+        clockLabel="Fixture clock"
+        contextLabel="Trusted server set: Biology Midterm"
+        elapsed={5}
+        runtime={runtimeCopy}
+      />
       <MarginaliaPanel
         hintShown={false}
         onBackToQuestion={noop}
@@ -115,6 +144,22 @@ function renderRuntimeSurfaces(runtimeCopy: RuntimeCopy): string {
 }
 
 describe("LiveSessionShell scene intent wiring", () => {
+  test("labels connected header fixture content and its local clock explicitly", () => {
+    const markup = renderToStaticMarkup(
+      <SessionHeader
+        clockLabel="Fixture clock"
+        contextLabel="Trusted server set: Biology Midterm"
+        elapsed={5}
+        runtime={runtime}
+      />,
+    );
+
+    expect(markup).toContain("Trusted server set: Biology Midterm");
+    expect(markup).toContain("Fixture clock 00:05");
+    expect(markup).not.toContain('session-capsule__primary">Biology Midterm</span>');
+    expect(markup).not.toContain('session-capsule__time">00:05</span>');
+  });
+
   test("renders scene state onto the existing Canvas and marginalia surfaces", () => {
     const canvasMarkup = renderToStaticMarkup(
       <VoiceTraceCanvas conceptNodes={[]} scene={scene} state="correction" />,
@@ -197,9 +242,59 @@ describe("LiveSessionShell scene intent wiring", () => {
 
     expect(markup).toContain("Live provider gated");
     expect(markup).toContain("Agent unavailable: live provider gated.");
-    expect(markup).toContain("Run local demo");
+    expect(markup).toContain("Retry when live runtime is ready");
     expect(markup).toContain("disabled");
     expect(markup).not.toContain("Live Cartesia/Gemini tutor is listening.");
+    expect(markup).not.toContain("Run local demo");
+  });
+
+  test("keeps connected hints generic instead of leaking fixture answer terms", () => {
+    const markup = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={true}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        runtime={runtime}
+        state="listening"
+      />,
+    );
+
+    expect(markup).toContain("Use your own words");
+    expect(markup).not.toContain("NADH");
+    expect(markup).not.toContain("electrons");
+  });
+
+  test("renders connected recap payloads without local-only actions", () => {
+    const markup = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        recap={trustedRecap}
+        runtime={runtime}
+        state="source"
+      />,
+    );
+
+    expect(markup).toContain("Recap ready");
+    expect(markup).toContain("Server recap headline");
+    expect(markup).toContain("The Conductor recap stayed grounded");
+    expect(markup).toContain("Review later");
+    expect(markup).toContain("proton gradient");
+    expect(markup).toContain("Review the ATP synthase source span");
+    expect(markup).not.toContain("Share");
+    expect(markup).not.toContain("Add to calendar");
+    expect(markup).not.toContain("Back to question");
   });
 
   test("renders unavailable causes in both capsule and marginalia", () => {

@@ -1,21 +1,24 @@
 "use client";
 
-import { useState } from "react";
-import { VivaApp } from "../viva/VivaApp";
+import { landingSessionTarget } from "../../lib/viva-session-entry";
 import { LandingHero } from "./LandingHero";
 
 /**
- * Entry boundary for "/". The muse hero is the front door; submitting the
- * command surface or tapping a suggestion crosses into the existing Viva app
- * (which opens on its upload screen). Nothing from the app is removed — the
- * hero simply becomes the way in.
+ * Entry boundary for "/". The muse hero is the front door; submitting the command surface or
+ * tapping a suggestion crosses into the single event-driven manuscript route.
  */
-export function LandingEntry() {
-  const [entered, setEntered] = useState(false);
+export function LandingEntry({ onEnter = enterSession }: { onEnter?: (intent: string) => void }) {
+  return <LandingHero onSubmit={onEnter} onSuggestion={onEnter} />;
+}
 
-  if (entered) {
-    return <VivaApp />;
-  }
+export function landingEntryTarget(search = currentSearch()): string {
+  return landingSessionTarget(search);
+}
 
-  return <LandingHero onSubmit={() => setEntered(true)} onSuggestion={() => setEntered(true)} />;
+function enterSession() {
+  window.location.assign(landingEntryTarget());
+}
+
+function currentSearch(): string {
+  return typeof window === "undefined" ? "" : window.location.search;
 }

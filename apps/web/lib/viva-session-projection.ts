@@ -205,7 +205,7 @@ export function projectRuntimeCopy({
       context,
       {
         disabled: true,
-        nextActionLabel: ingestionFailed ? "Return to upload" : "Refresh ingestion",
+        nextActionLabel: ingestionFailed ? "Review ingestion status" : "Refresh ingestion",
       },
     );
   }
@@ -222,7 +222,7 @@ export function projectRuntimeCopy({
           cause: "api_missing",
         },
         context,
-        { disabled: true, nextActionLabel: "Run local demo" },
+        { disabled: true, nextActionLabel: "Configure agent API" },
       );
     }
 
@@ -415,7 +415,7 @@ export function projectRuntimeCopy({
         cause: "live_provider_gated",
       },
       context,
-      { disabled: true, nextActionLabel: "Run local demo" },
+      { disabled: true, nextActionLabel: "Retry when live runtime is ready" },
     );
   }
 

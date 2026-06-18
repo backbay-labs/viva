@@ -17,6 +17,8 @@ const webPort = await freePort();
 const agentUrl = `http://127.0.0.1:${agentPort}`;
 const webUrl = `http://127.0.0.1:${webPort}`;
 const wsUrl = `ws://127.0.0.1:${agentPort}/ws`;
+const agentProvider = process.env.VIVA_E2E_AGENT_PROVIDER ?? "fake_cartesia_gemini";
+const stopToRecap = process.env.VIVA_E2E_STOP_TO_RECAP === "1";
 const children = [];
 const consoleErrors = [];
 const pageErrors = [];
@@ -36,17 +38,17 @@ try {
     ["run", "--manifest-path", "agent/Cargo.toml", "-p", "agent-service"],
     {
       VIVA_AGENT_BIND_ADDR: `127.0.0.1:${agentPort}`,
-      VIVA_AGENT_PROVIDER: "fake_cartesia_gemini",
-      VIVA_VOICE_SESSION_TOKEN_SECRET: "session-secret",
+      VIVA_AGENT_PROVIDER: agentProvider,
+      VIVA_VOICE_SESSION_TOKEN_SECRET: "",
     },
   );
   await waitForHttpJson(
     `${agentUrl}/ready`,
     (json) => {
-      return json?.ready === true && json?.brain?.provider === "fake_cartesia_gemini";
+      return json?.ready === true && json?.brain?.provider === agentProvider;
     },
     120_000,
-    "fake-provider agent readiness",
+    `${agentProvider} agent readiness`,
   );
 
   const web = spawnLogged(
@@ -55,7 +57,7 @@ try {
     ["run", "--cwd", "apps/web", "dev", "--", "--hostname", "127.0.0.1", "--port", String(webPort)],
     {
       NEXT_PUBLIC_VIVA_AGENT_WS_URL: wsUrl,
-      NEXT_PUBLIC_VIVA_API_URL: agentUrl,
+      NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: agentUrl,
       NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID: "user-1",
       NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID: "biology-midterm",
       NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID: "voice-session-1",
@@ -63,10 +65,7 @@ try {
   );
   await waitForHttp(webUrl, 120_000, "Next.js app");
 
-  browser = await chromium.launch({
-    headless: process.env.PLAYWRIGHT_HEADLESS !== "0",
-    args: ["--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream"],
-  });
+  browser = await launchChromium();
   context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   await context.grantPermissions(["microphone"], { origin: webUrl });
   if (process.env.VIVA_E2E_TRACE === "1") {
@@ -82,63 +81,64 @@ try {
   page.on("pageerror", (error) => pageErrors.push(error.message));
 
   await page.goto(webUrl, { waitUntil: "networkidle" });
-  await page.getByLabel("Course / study set name").fill("Local File Preview");
-  await page.locator('input[type="file"]').setInputFiles({
-    name: "local-preview-notes.txt",
-    mimeType: "text/plain",
-    buffer: Buffer.from("Local file preview notes stay pending until server ingestion exists."),
-  });
-  await page.getByRole("button", { name: /Generate local preview/ }).click();
-  await page.getByText("Local study preview").waitFor({ state: "visible", timeout: 20_000 });
-  await page.getByRole("button", { name: /Start first recall drill/ }).click();
-  const agentUnavailable = page.getByRole("button", { name: "Agent unavailable" });
-  await agentUnavailable.waitFor({
-    state: "visible",
-    timeout: 10_000,
-  });
-  const pendingGate = await isVisible(agentUnavailable);
-  await agentUnavailable.screenshot({
-    path: path.join(artifactDir, "pending-local-preview.png"),
-  });
-
-  await page.getByRole("button", { name: "Library" }).click();
-  await page.getByRole("button", { name: /New study set/ }).click();
-  await page.getByLabel("Course / study set name").fill("Cardiac Physiology");
-  await page
-    .getByLabel("Paste notes")
-    .fill(
-      "preload stroke volume cardiac output contractility physiology notes. Stroke volume rises as ventricular preload increases until cardiac muscle reaches its optimal length.",
-    );
-  await page.getByRole("button", { name: /Generate local preview/ }).click();
-  await page.getByText("Server study set").waitFor({ state: "visible", timeout: 20_000 });
-  const serverPasteReadyNotice = page.getByText("Server paste ingestion ready.", { exact: true });
-  await serverPasteReadyNotice.waitFor({ state: "visible", timeout: 20_000 });
-  const serverPasteReady = await isVisible(page.getByText("Server study set"));
-  await serverPasteReadyNotice.screenshot({
-    path: path.join(artifactDir, "server-paste-ready.png"),
-  });
-  await page.getByRole("button", { name: /Start first recall drill/ }).click();
-  await page.getByRole("button", { name: /Start 10-minute recall drill/ }).click();
-  await page.getByText("Explain Preload using the uploaded notes.").waitFor({
+  const legacyUploadVisible = await isVisible(page.getByText("What are we studying?"));
+  await page.getByRole("button", { name: "Review missed concepts" }).click();
+  await page.waitForURL(`${webUrl}/session`, { timeout: 20_000 });
+  await page.getByText("Explain the role of NADH in oxidative phosphorylation.").waitFor({
     state: "visible",
     timeout: 20_000,
   });
+  const listeningText =
+    agentProvider === "synthetic"
+      ? "Synthetic examiner is listening."
+      : "Non-live provider test is listening.";
+  await page.getByText(listeningText).waitFor({
+    state: "visible",
+    timeout: 20_000,
+  });
+  const manuscriptReady = await isVisible(page.getByText(listeningText));
+  await page.screenshot({
+    path: path.join(artifactDir, "session-ready.png"),
+    fullPage: true,
+  });
 
-  await page.getByRole("button", { name: "Use browser audio" }).click();
-  await page.getByText("Session recap").waitFor({ state: "visible", timeout: 25_000 });
-  await page.getByText("The session stayed grounded to the server-owned source span.").waitFor({
+  if (stopToRecap) {
+    await page.getByRole("button", { name: "End session" }).click();
+  } else {
+    await page.getByRole("button", { name: /check it/i }).click();
+  }
+  const recapSummaryText =
+    agentProvider === "synthetic"
+      ? "Next, make the proton-gradient-to-ATP-synthase link explicit."
+      : "The session stayed grounded to the server-owned source span.";
+  await page.getByText("Recap ready").waitFor({
+    state: "visible",
+    timeout: 25_000,
+  });
+  await page.getByText(recapSummaryText, { exact: false }).waitFor({
     state: "visible",
     timeout: 10_000,
   });
-  const connectedRecap = await isVisible(
-    page.getByText("Review the missed terms before the next call.", { exact: false }),
-  );
+  await page.getByText("Review later").waitFor({
+    state: "visible",
+    timeout: 10_000,
+  });
+  await page.getByText("Lecture 5", { exact: false }).first().waitFor({
+    state: "visible",
+    timeout: 10_000,
+  });
+  const recapPayloadVisible =
+    (await isVisible(page.getByText("Recap ready").first())) &&
+    (await isVisible(page.getByText(recapSummaryText, { exact: false }).first())) &&
+    (await isVisible(page.getByText("proton gradient", { exact: false }).first())) &&
+    (await isVisible(page.getByText("Conductor next action", { exact: false }).first()));
   const shareVisible = await isVisible(page.getByRole("button", { name: "Share" }));
   const localScheduleVisible = await isVisible(
     page.getByRole("button", { name: /Schedule a short source-backed review tomorrow/ }),
   );
-  await page.getByText("Session recap", { exact: true }).screenshot({
-    path: path.join(artifactDir, "connected-recap.png"),
+  await page.screenshot({
+    path: path.join(artifactDir, "connected-terminal-fold.png"),
+    fullPage: true,
   });
   if (traceStarted) {
     await context.tracing.stop({ path: path.join(artifactDir, "trace.zip") });
@@ -148,25 +148,28 @@ try {
 
   const result = {
     artifact_dir: path.relative(root, artifactDir),
+    agent_provider: agentProvider,
     agent_url: agentUrl,
+    stop_to_recap: stopToRecap,
     web_url: webUrl,
-    pending_gate: pendingGate,
-    server_paste_ready: serverPasteReady,
-    connected_recap: connectedRecap,
+    legacy_upload_visible: legacyUploadVisible,
+    manuscript_ready: manuscriptReady,
+    conductor_terminal_fold: recapPayloadVisible,
+    recap_payload_visible: recapPayloadVisible,
     local_only_actions_hidden: !shareVisible && !localScheduleVisible,
     console_errors: consoleErrors,
     page_errors: pageErrors,
-    screenshots: ["pending-local-preview.png", "server-paste-ready.png", "connected-recap.png"],
+    screenshots: ["session-ready.png", "connected-terminal-fold.png"],
     trace: traceArtifact,
   };
   await writeFile(path.join(artifactDir, "result.json"), `${JSON.stringify(result, null, 2)}\n`);
 
-  if (!pendingGate) throw new Error("Pending local preview did not show the connected-agent gate.");
-  if (!serverPasteReady)
-    throw new Error("Server paste ingestion did not produce a ready study set.");
-  if (!connectedRecap) throw new Error("Connected fake-provider session did not reach recap.");
+  if (legacyUploadVisible) throw new Error("Landing mounted the retired legacy upload app.");
+  if (!manuscriptReady) throw new Error("Landing did not enter the connected manuscript.");
+  if (!recapPayloadVisible)
+    throw new Error("Connected fake-provider session did not render the recap_ready payload.");
   if (shareVisible || localScheduleVisible) {
-    throw new Error("Connected recap exposed local-only Share or schedule actions.");
+    throw new Error("Connected manuscript exposed local-only Share or schedule actions.");
   }
   if (consoleErrors.length > 0 || pageErrors.length > 0) {
     throw new Error(`Browser errors detected: ${[...consoleErrors, ...pageErrors].join(" | ")}`);
@@ -203,6 +206,26 @@ try {
   await browser?.close().catch(() => {});
   for (const child of children.reverse()) {
     child.stop();
+  }
+}
+
+async function launchChromium() {
+  const options = {
+    headless: process.env.PLAYWRIGHT_HEADLESS !== "0",
+    args: ["--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream"],
+  };
+  try {
+    return await chromium.launch(options);
+  } catch (error) {
+    const systemChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    if (
+      process.platform === "darwin" &&
+      error instanceof Error &&
+      error.message.includes("Executable doesn't exist")
+    ) {
+      return await chromium.launch({ ...options, executablePath: systemChrome });
+    }
+    throw error;
   }
 }
 
