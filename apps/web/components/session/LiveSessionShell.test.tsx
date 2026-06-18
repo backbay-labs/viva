@@ -16,7 +16,11 @@ import {
 import { MarginaliaPanel } from "./MarginaliaPanel";
 import { SessionHeader } from "./SessionHeader";
 import type { Question } from "./session-data";
-import { VoiceTraceCanvas, voiceTraceBloomPulse } from "./VoiceTraceCanvas";
+import {
+  planVoiceTraceConceptLabels,
+  VoiceTraceCanvas,
+  voiceTraceBloomPulse,
+} from "./VoiceTraceCanvas";
 
 const noop = () => {};
 
@@ -130,6 +134,39 @@ const sourceFolio: SourceFolioProjection = {
   state: "present",
 };
 
+const denseConceptNodes = [
+  { id: "nadh", label: "NADH", status: "strong", emphasis: 0.65 },
+  { id: "complex-i", label: "Complex I", status: "review", emphasis: 0.35 },
+  { id: "ubiquinone", label: "Ubiquinone shuttle", status: "shaky", emphasis: 0.8 },
+  { id: "complex-iii", label: "Complex III", status: "review", emphasis: 0.4 },
+  { id: "proton-gradient", label: "Proton gradient", status: "missed", emphasis: 1 },
+  { id: "atp-synthase", label: "ATP synthase", status: "shaky", emphasis: 0.95 },
+  { id: "oxygen", label: "Oxygen acceptor", status: "review", emphasis: 0.55 },
+] as const;
+
+const serverIngestedConceptNodes = [
+  ...denseConceptNodes,
+  { id: "inner-membrane", label: "Inner mitochondrial membrane", status: "review", emphasis: 0.5 },
+  { id: "cytochrome-c", label: "Cytochrome c", status: "shaky", emphasis: 0.7 },
+  { id: "complex-iv", label: "Complex IV", status: "review", emphasis: 0.45 },
+  { id: "water", label: "Water formation", status: "strong", emphasis: 0.25 },
+  { id: "chemiosmosis", label: "Chemiosmosis", status: "missed", emphasis: 1 },
+  { id: "adp-pi", label: "ADP + Pi", status: "review", emphasis: 0.4 },
+  { id: "matrix", label: "Mitochondrial matrix", status: "shaky", emphasis: 0.8 },
+  { id: "intermembrane", label: "Intermembrane space", status: "review", emphasis: 0.55 },
+] as const;
+
+const crowdedNarrowTracePoints = [
+  { x: 16.594434399597592, y: 79.99488019771769 },
+  { x: 57.579370436475365, y: 98.1426989220289 },
+  { x: 99.43751171920508, y: 100.37326006290412 },
+  { x: 140.02523209023306, y: 89.1289555460795 },
+  { x: 187.9456062888585, y: 84.48651282224249 },
+  { x: 224.8389659286666, y: 57.28025170529557 },
+  { x: 263.28653631977994, y: 59.189731234207585 },
+  { x: 305.90642473953795, y: 70.79458203296255 },
+] as const;
+
 function ready(provider: string, overrides: Partial<VivaReadyFrame["brain"]> = {}): VivaReadyFrame {
   return {
     type: "ready",
@@ -216,7 +253,12 @@ describe("LiveSessionShell scene intent wiring", () => {
 
   test("renders scene state onto the existing Canvas and marginalia surfaces", () => {
     const canvasMarkup = renderToStaticMarkup(
-      <VoiceTraceCanvas conceptNodes={[]} scene={scene} state="correction" textMode={true} />,
+      <VoiceTraceCanvas
+        conceptNodes={[...denseConceptNodes]}
+        scene={scene}
+        state="correction"
+        textMode={true}
+      />,
     );
     const marginaliaMarkup = renderToStaticMarkup(
       <MarginaliaPanel
@@ -238,6 +280,8 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(canvasMarkup).toContain('data-scene-register="correcting"');
     expect(canvasMarkup).toContain('data-scene-emphasis="marked"');
     expect(canvasMarkup).toContain('data-scene-entity-count="1"');
+    expect(canvasMarkup).toContain('data-concept-count="7"');
+    expect(canvasMarkup).toContain('data-concept-density="dense"');
     expect(canvasMarkup).toContain('data-text-mode="true"');
     expect(marginaliaMarkup).toContain('class="marginalia"');
     expect(marginaliaMarkup).toContain('data-scene-register="correcting"');
@@ -252,6 +296,91 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(voiceTraceBloomPulse({ textMode: false, time: 0, voice: 0 })).not.toBe(
       voiceTraceBloomPulse({ textMode: false, time: 10, voice: 0 }),
     );
+  });
+
+  test("plans dense concept labels into bounded non-overlapping lanes", () => {
+    const labels = planVoiceTraceConceptLabels({
+      canvasHeight: 180,
+      canvasWidth: 420,
+      fontScale: 0.72,
+      items: denseConceptNodes.map((node, index) => ({
+        emphasis: node.emphasis,
+        label: node.label,
+        point: {
+          x: 44 + index * 55,
+          y: index % 2 === 0 ? 88 : 70,
+        },
+      })),
+    });
+
+    expect(labels).toHaveLength(denseConceptNodes.length);
+    expect(labels.some((label) => label.leaderLine)).toBe(true);
+
+    for (const label of labels) {
+      expect(label.text.length).toBeGreaterThan(0);
+      expect(label.hidden).toBe(false);
+      expect(label.box.left).toBeGreaterThanOrEqual(8);
+      expect(label.box.right).toBeLessThanOrEqual(412);
+      expect(label.box.top).toBeGreaterThanOrEqual(8);
+      expect(label.box.bottom).toBeLessThanOrEqual(172);
+    }
+
+    for (let i = 0; i < labels.length; i++) {
+      for (let j = i + 1; j < labels.length; j++) {
+        expect(boxesOverlap(labels[i].box, labels[j].box)).toBe(false);
+      }
+    }
+  });
+
+  test("keeps uncapped server concept labels bounded on a narrow trace", () => {
+    const crowdedNodes = serverIngestedConceptNodes.slice(0, crowdedNarrowTracePoints.length);
+    const labels = planVoiceTraceConceptLabels({
+      canvasHeight: 172,
+      canvasWidth: 320,
+      fontScale: 0.72,
+      items: crowdedNodes.map((node, index) => ({
+        emphasis: index % 5 === 0 ? 1 : 0.55,
+        label: node.label,
+        point: crowdedNarrowTracePoints[index],
+      })),
+    });
+
+    expect(labels).toHaveLength(crowdedNodes.length);
+    expect(labels.every((label) => !label.hidden)).toBe(true);
+    expect(labels.every((label) => label.text.length > 0)).toBe(true);
+
+    for (const label of labels) {
+      expect(label.box.left).toBeGreaterThanOrEqual(8);
+      expect(label.box.right).toBeLessThanOrEqual(312);
+      expect(label.box.top).toBeGreaterThanOrEqual(8);
+      expect(label.box.bottom).toBeLessThanOrEqual(164);
+    }
+
+    for (let i = 0; i < labels.length; i++) {
+      for (let j = i + 1; j < labels.length; j++) {
+        expect(boxesOverlap(labels[i].box, labels[j].box)).toBe(false);
+      }
+    }
+  });
+
+  test("reserves conservative boxes for short biochemical abbreviations", () => {
+    const labels = planVoiceTraceConceptLabels({
+      canvasHeight: 172,
+      canvasWidth: 320,
+      fontScale: 0.72,
+      items: [
+        { emphasis: 1, label: "FADH2", point: { x: 32, y: 82 } },
+        { emphasis: 0.55, label: "IMS", point: { x: 64, y: 82 } },
+      ],
+    });
+
+    const fadh2Width = labels[0].box.right - labels[0].box.left;
+    const imsWidth = labels[1].box.right - labels[1].box.left;
+
+    expect(fadh2Width).toBeGreaterThanOrEqual(41);
+    expect(imsWidth).toBeGreaterThanOrEqual(19);
+    expect(boxesOverlap(labels[0].box, labels[1].box)).toBe(false);
+    expect(labels[0].box.left).toBeGreaterThanOrEqual(8);
   });
 
   test("renders projected runtime copy in listening marginalia", () => {
@@ -531,3 +660,10 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).not.toContain("modal");
   });
 });
+
+function boxesOverlap(
+  a: { left: number; right: number; top: number; bottom: number },
+  b: { left: number; right: number; top: number; bottom: number },
+) {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
