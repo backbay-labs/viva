@@ -8,6 +8,7 @@ import {
   type AgentStudySessionRecap,
   type AgentStudySourceReference,
   audioClientFrame,
+  type ManuscriptIntent,
   type PasteIngestionResponse,
   parseVivaServerFrame,
   type StudySet,
@@ -47,6 +48,11 @@ export type VivaAgentAudioOutput = {
   frame: AgentAudioFrame;
 };
 
+export type VivaAgentManuscriptIntent = {
+  responseId: string;
+  intent: ManuscriptIntent;
+};
+
 export type VivaAgentSessionState = {
   status: VivaAgentConnectionStatus;
   ready?: VivaReadyFrame;
@@ -58,6 +64,7 @@ export type VivaAgentSessionState = {
   evaluation?: AgentAnswerEvaluation;
   sources: AgentStudySourceReference[];
   conceptStatuses: Record<string, AgentConceptStatus>;
+  manuscriptIntents: VivaAgentManuscriptIntent[];
   recap?: AgentStudySessionRecap;
   audio: VivaAgentAudioOutput[];
   cancelledResponseIds: string[];
@@ -169,6 +176,7 @@ export function initialVivaAgentSessionState(): VivaAgentSessionState {
     transcript: "",
     sources: [],
     conceptStatuses: {},
+    manuscriptIntents: [],
     audio: [],
     cancelledResponseIds: [],
     errors: [],
@@ -213,6 +221,7 @@ export function vivaAgentReducer(
         transcript: "",
         finalTranscript: undefined,
         evaluation: undefined,
+        manuscriptIntents: [],
         recap: undefined,
       };
     case "transcript_delta":
@@ -228,6 +237,14 @@ export function vivaAgentReducer(
         ...state,
         conceptStatuses: { ...state.conceptStatuses, [event.concept_id]: event.status },
       };
+    case "manuscript_intent":
+      return {
+        ...state,
+        manuscriptIntents: [
+          ...state.manuscriptIntents,
+          { responseId: event.response_id, intent: event.intent },
+        ],
+      };
     case "recap_ready":
       return { ...state, recap: event.recap };
     case "audio_delta":
@@ -242,6 +259,9 @@ export function vivaAgentReducer(
           event.response_id && event.response_id === state.activeResponseId
             ? undefined
             : state.activeResponseId,
+        manuscriptIntents: event.response_id
+          ? state.manuscriptIntents.filter((intent) => intent.responseId !== event.response_id)
+          : state.manuscriptIntents,
         cancelledResponseIds: event.response_id
           ? [...state.cancelledResponseIds, event.response_id]
           : state.cancelledResponseIds,
@@ -346,6 +366,7 @@ function responseIdForEvent(event: VivaServerEvent): string | undefined {
     case "answer_evaluated":
     case "source_reference":
     case "concept_status":
+    case "manuscript_intent":
     case "recap_ready":
     case "audio_delta":
       return event.response_id;

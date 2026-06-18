@@ -11,6 +11,7 @@ import type {
   AnswerEvaluation,
   CorrectionKind,
   EvaluationLabel,
+  ManuscriptIntent,
   SessionQuestion,
   SessionRecap,
   SourceReference,
@@ -34,6 +35,7 @@ export type VivaAgentDerivedState = {
   finalTranscript?: string;
   evaluation?: AnswerEvaluation;
   sources: SourceReference[];
+  manuscriptIntents: ManuscriptIntent[];
   recap?: SessionRecap;
   errors: string[];
   canSubmitAnswer: boolean;
@@ -134,6 +136,7 @@ export function deriveVivaAgentUiState(state: VivaAgentSessionState): VivaAgentD
       ? agentAnswerEvaluationToUiEvaluation(state.evaluation)
       : undefined,
     finalTranscript: state.finalTranscript,
+    manuscriptIntents: state.manuscriptIntents.map((event) => event.intent),
     phase: state.question && state.phase === "ready" ? "listening" : state.phase,
     question,
     recap: state.recap ? agentRecapToSessionRecap(state.recap) : undefined,
