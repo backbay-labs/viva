@@ -16,7 +16,7 @@ The command writes `artifacts/release-check/evidence.json`. The artifact directo
 | `fake_cartesia_gemini` | Deterministic fake provider for replay and browser evidence | 200 | 200 | true | true | false |
 | `cartesia_gemini` | Gated Act 3 live provider, configured with placeholder key material during the check | 200 | 503 | true | false | false |
 
-The live provider row must stay unavailable until Act 3 explicitly opens the gate. BAC-305 does not make the live provider selectable.
+The live provider row must stay unavailable until Act 3 explicitly opens the gate. BAC-305 does not make the live provider selectable. The written definition of live provider proof is `docs/superpowers/specs/live-cartesia-gemini-definition.md`.
 
 ## No-Network Gate Proof
 
