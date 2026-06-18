@@ -242,9 +242,11 @@ impl FakeCartesiaGeminiRuntime {
                             "question_id": "q-oxidative-phosphorylation-nadh",
                             "answer_text": "NADH donates electrons to the electron transport chain.",
                         });
+                        let tool_response_id = response_id.clone();
                         let mut tool_task = tokio::spawn(async move {
                             executor
                                 .execute(
+                                    &tool_response_id,
                                     ToolProposal::new("evaluate_spoken_answer", args)
                                         .with_call_id("call-eval-1"),
                                 )
@@ -286,6 +288,7 @@ impl FakeCartesiaGeminiRuntime {
                         });
                         if executor
                             .execute(
+                                &response_id,
                                 ToolProposal::new("evaluate_spoken_answer", args)
                                     .with_call_id("call-eval-1"),
                             )
@@ -359,11 +362,14 @@ async fn select_next_question(
     session: &AuthorizedStudySession,
 ) -> Result<StudyQuestion, BrainError> {
     let result = executor
-        .execute(ToolProposal::select_next_question(
-            &session.study_set_id,
-            &session.voice_session_id,
-            session.mode.as_str(),
-        ))
+        .execute(
+            "response-0",
+            ToolProposal::select_next_question(
+                &session.study_set_id,
+                &session.voice_session_id,
+                session.mode.as_str(),
+            ),
+        )
         .await
         .map_err(|error| BrainError::Protocol(error.to_string()))?;
     parse_result_field(&result.result, "question")

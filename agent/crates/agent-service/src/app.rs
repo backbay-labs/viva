@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -31,6 +34,7 @@ pub struct AppState {
     pub trusted_user_id: String,
     pub trusted_study_set_id: String,
     pub trusted_session_id: String,
+    pub trusted_session_sequence: Arc<AtomicU64>,
     pub ws_access: VoiceWsAccess,
     pub session_slots: Arc<Semaphore>,
     pub ws_timeouts: WsTimeouts,
@@ -69,6 +73,7 @@ impl AppState {
             trusted_user_id: "user-1".to_owned(),
             trusted_study_set_id: "biology-midterm".to_owned(),
             trusted_session_id: "voice-session-1".to_owned(),
+            trusted_session_sequence: Arc::new(AtomicU64::new(0)),
             ws_access,
             session_slots: Arc::new(Semaphore::new(max_sessions)),
             ws_timeouts: WsTimeouts::default(),
@@ -91,6 +96,14 @@ impl AppState {
     pub fn with_trusted_session_id(mut self, trusted_session_id: impl Into<String>) -> Self {
         self.trusted_session_id = trusted_session_id.into();
         self
+    }
+
+    pub fn next_trusted_voice_session_id(&self) -> String {
+        let sequence = self
+            .trusted_session_sequence
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        Uuid::from_u128(u128::from(sequence)).to_string()
     }
 
     pub fn with_ws_timeouts(mut self, ws_timeouts: WsTimeouts) -> Self {

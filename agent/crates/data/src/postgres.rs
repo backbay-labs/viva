@@ -1,4 +1,7 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    fmt::Write as _,
+    sync::{Arc, RwLock},
+};
 
 use agent_domain::{
     AnswerEvaluation, ConceptStatus, CreatePasteStudySet, PortError, SessionConfig,
@@ -7,7 +10,9 @@ use agent_domain::{
     VoiceUsageRecord,
 };
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -17,6 +22,79 @@ use crate::{memory::generate_paste_study_set, InMemoryStudyStore};
 pub struct PostgresStudyStore {
     pool: PgPool,
     counts: Arc<RwLock<StudyStoreWriteCounts>>,
+    event_authorizations: Arc<RwLock<Vec<EventAuthorizationRecord>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventAuthorizationKind {
+    AnswerEvaluation,
+    ConceptStatus,
+    StudySessionRecap,
+}
+
+impl EventAuthorizationKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AnswerEvaluation => "answer_evaluation",
+            Self::ConceptStatus => "concept_status",
+            Self::StudySessionRecap => "study_session_recap",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EventAuthorizationRecord {
+    user_id: String,
+    study_set_id: String,
+    voice_session_id: String,
+    response_id: String,
+    kind: EventAuthorizationKind,
+    payload_sha256: String,
+}
+
+#[derive(Serialize)]
+struct ConceptStatusEventPayload<'a> {
+    concept_id: &'a str,
+    status: &'a ConceptStatus,
+}
+
+fn event_authorization_record<T: Serialize>(
+    user_id: &str,
+    study_set_id: &str,
+    voice_session_id: &str,
+    response_id: &str,
+    kind: EventAuthorizationKind,
+    payload: &T,
+) -> Result<EventAuthorizationRecord, PortError> {
+    Ok(EventAuthorizationRecord {
+        user_id: user_id.to_owned(),
+        study_set_id: study_set_id.to_owned(),
+        voice_session_id: voice_session_id.to_owned(),
+        response_id: response_id.to_owned(),
+        kind,
+        payload_sha256: payload_sha256(kind, response_id, payload)?,
+    })
+}
+
+fn payload_sha256<T: Serialize>(
+    kind: EventAuthorizationKind,
+    response_id: &str,
+    payload: &T,
+) -> Result<String, PortError> {
+    let payload = serde_json::to_vec(payload)
+        .map_err(|error| PortError::adapter("postgres", error.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(response_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    Ok(encoded)
 }
 
 impl PostgresStudyStore {
@@ -24,7 +102,56 @@ impl PostgresStudyStore {
         Self {
             pool,
             counts: Arc::new(RwLock::new(StudyStoreWriteCounts::default())),
+            event_authorizations: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    fn record_event_authorization<T: Serialize>(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        kind: EventAuthorizationKind,
+        payload: &T,
+    ) -> Result<(), PortError> {
+        let record = event_authorization_record(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            kind,
+            payload,
+        )?;
+        self.event_authorizations
+            .write()
+            .map_err(|_| PortError::adapter("postgres", "event authorization lock poisoned"))?
+            .push(record);
+        Ok(())
+    }
+
+    fn has_event_authorization<T: Serialize>(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        kind: EventAuthorizationKind,
+        payload: &T,
+    ) -> Result<bool, PortError> {
+        let record = event_authorization_record(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            kind,
+            payload,
+        )?;
+        Ok(self
+            .event_authorizations
+            .read()
+            .map_err(|_| PortError::adapter("postgres", "event authorization lock poisoned"))?
+            .contains(&record))
     }
 
     fn uuid_for(logical_id: &str) -> Result<Uuid, PortError> {
@@ -148,20 +275,160 @@ impl PostgresStudyStore {
         ))
     }
 
+    async fn active_question_source(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        question_id: &str,
+    ) -> Result<StudySourceReference, PortError> {
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let row = sqlx::query(
+            "SELECT
+                sp.id AS source_id,
+                sp.document_id,
+                sp.locator,
+                sp.excerpt,
+                sp.confidence,
+                sp.retrieval_reason
+             FROM study_questions q
+             JOIN study_sets s ON s.id = q.study_set_id
+             JOIN source_spans sp ON sp.id = q.source_span_id
+             JOIN study_documents d ON d.id = sp.document_id
+             WHERE q.study_set_id = $1
+               AND s.user_id = $2
+               AND q.question_id = $3
+               AND q.active
+               AND d.study_set_id = q.study_set_id
+               AND sp.deleted_at IS NULL
+               AND d.deleted_at IS NULL",
+        )
+        .bind(study_set_uuid)
+        .bind(user_id)
+        .bind(question_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_error)?;
+        let Some(row) = row else {
+            return Err(PortError::unavailable(
+                "postgres",
+                question_id,
+                "question is not active for this study set",
+            ));
+        };
+        let locator: Value = row.try_get("locator").map_err(pg_error)?;
+        Ok(StudySourceReference {
+            source_id: Self::logical_id_for_uuid(
+                row.try_get::<Uuid, _>("source_id").map_err(pg_error)?,
+            ),
+            document_id: Self::logical_id_for_uuid(
+                row.try_get::<Uuid, _>("document_id").map_err(pg_error)?,
+            ),
+            span: locator
+                .get("span")
+                .and_then(Value::as_str)
+                .unwrap_or("source span")
+                .to_owned(),
+            excerpt: row.try_get("excerpt").map_err(pg_error)?,
+            confidence: source_confidence(
+                row.try_get::<String, _>("confidence")
+                    .map_err(pg_error)?
+                    .as_str(),
+            )?,
+            retrieval_reason: row.try_get("retrieval_reason").map_err(pg_error)?,
+        })
+    }
+
+    async fn answer_evaluation_was_recorded(
+        &self,
+        user_id: &str,
+        study_set_uuid: Uuid,
+        voice_session_uuid: Uuid,
+        evaluation: &AnswerEvaluation,
+    ) -> Result<bool, PortError> {
+        let source_span_uuid = Self::uuid_for(&evaluation.source.source_id)?;
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM answer_attempts aa
+                JOIN voice_sessions vs ON vs.id = aa.voice_session_id
+                WHERE aa.voice_session_id = $1
+                  AND vs.user_id = $2
+                  AND vs.study_set_id = $3
+                  AND aa.question_id = $4
+                  AND aa.evaluation_label = $5
+                  AND aa.concept_status = $6
+                  AND ABS(aa.confidence_score - $7) <= 0.000001
+                  AND aa.source_span_id = $8
+             )",
+        )
+        .bind(voice_session_uuid)
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(&evaluation.question_id)
+        .bind(&evaluation.label)
+        .bind(concept_status_str(&evaluation.concept_status))
+        .bind(f64::from(evaluation.confidence_score))
+        .bind(source_span_uuid)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(pg_error)
+    }
+
+    async fn recap_was_recorded(
+        &self,
+        user_id: &str,
+        study_set_uuid: Uuid,
+        voice_session_uuid: Uuid,
+        recap: &StudySessionRecap,
+        source_span_ids: &[Uuid],
+    ) -> Result<bool, PortError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM session_recaps
+                WHERE user_id = $1
+                  AND study_set_id = $2
+                  AND voice_session_id = $3
+                  AND strong_concepts = $4
+                  AND shaky_concepts = $5
+                  AND missed_concepts = $6
+                  AND review_later = $7
+                  AND source_span_ids = $8
+             )",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .bind(&recap.strong_concepts)
+        .bind(&recap.shaky_concepts)
+        .bind(&recap.missed_concepts)
+        .bind(&recap.review_later)
+        .bind(source_span_ids)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(pg_error)
+    }
+
     async fn concept_uuid_for(
         &self,
         study_set_uuid: Uuid,
         concept_id: &str,
     ) -> Result<Uuid, PortError> {
-        if let Ok(uuid) = concept_id.parse() {
-            return Ok(uuid);
+        let concept_uuid = if let Ok(uuid) = concept_id.parse::<Uuid>() {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM concepts
+                 WHERE study_set_id = $1 AND id = $2",
+            )
+            .bind(study_set_uuid)
+            .bind(uuid)
+        } else {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM concepts
+                 WHERE study_set_id = $1 AND public_id = $2",
+            )
+            .bind(study_set_uuid)
+            .bind(concept_id)
         }
-        let concept_uuid = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM concepts
-             WHERE study_set_id = $1 AND public_id = $2",
-        )
-        .bind(study_set_uuid)
-        .bind(concept_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(pg_error)?;
@@ -216,10 +483,10 @@ impl StudyMemoryStore for PostgresStudyStore {
             "INSERT INTO voice_sessions (id, user_id, study_set_id, mode, status)
              VALUES ($1, $2, $3, $4, 'open')
              ON CONFLICT (id) DO UPDATE
-             SET mode = EXCLUDED.mode,
-                 status = EXCLUDED.status
+             SET mode = EXCLUDED.mode
              WHERE voice_sessions.user_id = EXCLUDED.user_id
-               AND voice_sessions.study_set_id = EXCLUDED.study_set_id",
+               AND voice_sessions.study_set_id = EXCLUDED.study_set_id
+               AND voice_sessions.status = 'open'",
         )
         .bind(session_uuid)
         .bind(user_id)
@@ -231,7 +498,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         if result.rows_affected() == 0 {
             return Err(PortError::adapter(
                 "postgres",
-                "voice session ownership cannot be changed",
+                "voice session cannot be reopened or ownership changed",
             ));
         }
         self.increment_count(WriteCountKind::Session)?;
@@ -263,6 +530,10 @@ impl StudyMemoryStore for PostgresStudyStore {
                 "voice session does not exist",
             ));
         }
+        self.event_authorizations
+            .write()
+            .map_err(|_| PortError::adapter("postgres", "event authorization lock poisoned"))?
+            .retain(|record| record.voice_session_id != voice_session_id);
         Ok(json!({
             "voice_session_id": voice_session_id,
             "status": "closed",
@@ -398,14 +669,14 @@ impl StudyMemoryStore for PostgresStudyStore {
                 ), '[]'::jsonb),
                 'concepts', COALESCE((
                     SELECT jsonb_agg(jsonb_build_object(
+                        'id', c.id,
                         'public_id', c.public_id,
                         'label', c.label,
                         'status', c.status,
                         'source_span_id', c.source_span_id
-                    ))
+                    ) ORDER BY COALESCE(c.public_id, c.id::text), c.id)
                     FROM concepts c
                     WHERE c.study_set_id = s.id
-                      AND c.public_id IS NOT NULL
                 ), '[]'::jsonb),
                 'questions', COALESCE((
                     SELECT jsonb_agg(jsonb_build_object(
@@ -456,6 +727,7 @@ impl StudyMemoryStore for PostgresStudyStore {
                AND s.user_id = $2
                AND s.ingestion_status = 'ready'
                AND q.active
+               AND d.study_set_id = q.study_set_id
                AND sp.deleted_at IS NULL
                AND d.deleted_at IS NULL
              ORDER BY q.created_at ASC
@@ -498,30 +770,295 @@ impl StudyMemoryStore for PostgresStudyStore {
         }))
     }
 
+    async fn authorize_question_started(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        question: &StudyQuestion,
+    ) -> Result<(), PortError> {
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
+            .await?;
+        let canonical = self
+            .active_question(user_id, study_set_id)
+            .await?
+            .ok_or_else(|| {
+                PortError::unavailable(
+                    "postgres",
+                    &question.question_id,
+                    "question is not active for this study set",
+                )
+            })?;
+        if canonical != *question {
+            return Err(PortError::adapter(
+                "postgres",
+                "question tuple does not match deterministic retrieval",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn authorize_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: &AnswerEvaluation,
+    ) -> Result<(), PortError> {
+        evaluation
+            .validate_fail_closed()
+            .map_err(|reason| PortError::adapter("postgres", reason))?;
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
+            .await?;
+        let canonical = self
+            .active_question_source(user_id, study_set_id, &evaluation.question_id)
+            .await?;
+        if canonical != evaluation.source {
+            return Err(PortError::adapter(
+                "postgres",
+                "answer evaluation source tuple does not match active question source",
+            ));
+        }
+        if !self
+            .answer_evaluation_was_recorded(user_id, study_set_uuid, voice_session_uuid, evaluation)
+            .await?
+        {
+            return Err(PortError::adapter(
+                "postgres",
+                "answer evaluation event does not match persisted answer attempt",
+            ));
+        }
+        if !self.has_event_authorization(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::AnswerEvaluation,
+            evaluation,
+        )? {
+            return Err(PortError::adapter(
+                "postgres",
+                "answer evaluation event does not match authorized browser payload",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn authorize_source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        source: &StudySourceReference,
+    ) -> Result<(), PortError> {
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
+            .await?;
+        let canonical = self
+            .source_reference(user_id, study_set_id, &source.source_id)
+            .await?
+            .ok_or_else(|| {
+                PortError::unavailable(
+                    "postgres",
+                    source.source_id.clone(),
+                    "source reference unavailable",
+                )
+            })?;
+        if canonical != *source {
+            return Err(PortError::adapter(
+                "postgres",
+                "source tuple does not match deterministic retrieval",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn authorize_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: &ConceptStatus,
+    ) -> Result<(), PortError> {
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
+            .await?;
+        self.concept_uuid_for(study_set_uuid, concept_id).await?;
+        let payload = ConceptStatusEventPayload { concept_id, status };
+        if !self.has_event_authorization(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::ConceptStatus,
+            &payload,
+        )? {
+            return Err(PortError::adapter(
+                "postgres",
+                "concept status event does not match authorized browser payload",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn authorize_manuscript_intent(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        intent: &agent_domain::ManuscriptIntent,
+    ) -> Result<(), PortError> {
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
+            .await?;
+        match intent {
+            agent_domain::ManuscriptIntent::Scene { .. } => Ok(()),
+            agent_domain::ManuscriptIntent::Entity {
+                entity_id,
+                entity_kind,
+                ..
+            } => match entity_kind {
+                agent_domain::ManuscriptEntityKind::Concept => {
+                    self.concept_uuid_for(study_set_uuid, entity_id).await?;
+                    Ok(())
+                }
+                agent_domain::ManuscriptEntityKind::Source => self
+                    .source_reference(user_id, study_set_id, entity_id)
+                    .await?
+                    .map(|_| ())
+                    .ok_or_else(|| {
+                        PortError::unavailable(
+                            "postgres",
+                            entity_id,
+                            "source entity is not available for this study set",
+                        )
+                    }),
+                agent_domain::ManuscriptEntityKind::MarginalNote => Err(PortError::unavailable(
+                    "postgres",
+                    entity_id,
+                    "marginal note entity is not server-owned",
+                )),
+            },
+            agent_domain::ManuscriptIntent::Marginalia {
+                anchor_entity_id, ..
+            } => {
+                if self
+                    .concept_uuid_for(study_set_uuid, anchor_entity_id)
+                    .await
+                    .is_ok()
+                    || self
+                        .source_reference(user_id, study_set_id, anchor_entity_id)
+                        .await?
+                        .is_some()
+                {
+                    return Ok(());
+                }
+                Err(PortError::unavailable(
+                    "postgres",
+                    anchor_entity_id,
+                    "marginalia anchor is not available for this study set",
+                ))
+            }
+        }
+    }
+
+    async fn authorize_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: &StudySessionRecap,
+    ) -> Result<(), PortError> {
+        if recap.voice_session_id != voice_session_id {
+            return Err(PortError::adapter(
+                "postgres",
+                "recap session does not match authorized session",
+            ));
+        }
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
+            .await?;
+        let mut source_span_ids = Vec::new();
+        for moment in &recap.source_moments {
+            let canonical = self
+                .source_reference(user_id, study_set_id, &moment.source.source_id)
+                .await?
+                .ok_or_else(|| {
+                    PortError::unavailable(
+                        "postgres",
+                        moment.source.source_id.clone(),
+                        "recap source reference unavailable",
+                    )
+                })?;
+            if canonical != moment.source {
+                return Err(PortError::adapter(
+                    "postgres",
+                    "recap source tuple does not match deterministic retrieval",
+                ));
+            }
+            source_span_ids.push(Self::uuid_for(&moment.source.source_id)?);
+        }
+        if !self
+            .recap_was_recorded(
+                user_id,
+                study_set_uuid,
+                voice_session_uuid,
+                recap,
+                &source_span_ids,
+            )
+            .await?
+        {
+            return Err(PortError::adapter(
+                "postgres",
+                "recap event does not match persisted session recap",
+            ));
+        }
+        if !self.has_event_authorization(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::StudySessionRecap,
+            recap,
+        )? {
+            return Err(PortError::adapter(
+                "postgres",
+                "recap event does not match authorized browser payload",
+            ));
+        }
+        Ok(())
+    }
+
     async fn record_answer_evaluation(
         &self,
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         evaluation: AnswerEvaluation,
     ) -> Result<Value, PortError> {
         evaluation
             .validate_fail_closed()
             .map_err(|reason| PortError::adapter("postgres", reason))?;
         let canonical = self
-            .source_reference(user_id, study_set_id, &evaluation.source.source_id)
-            .await?
-            .ok_or_else(|| {
-                PortError::unavailable(
-                    "postgres",
-                    evaluation.source.source_id.clone(),
-                    "source reference unavailable",
-                )
-            })?;
+            .active_question_source(user_id, study_set_id, &evaluation.question_id)
+            .await?;
         if canonical != evaluation.source {
             return Err(PortError::adapter(
                 "postgres",
-                "answer evaluation source tuple does not match deterministic retrieval",
+                "answer evaluation source tuple does not match active question source",
             ));
         }
         let voice_session_uuid = Self::uuid_for(voice_session_id)?;
@@ -546,6 +1083,14 @@ impl StudyMemoryStore for PostgresStudyStore {
         .await
         .map_err(pg_error)?;
         self.increment_count(WriteCountKind::AnswerAttempt)?;
+        self.record_event_authorization(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::AnswerEvaluation,
+            &evaluation,
+        )?;
         Ok(json!({
             "voice_session_id": voice_session_id,
             "question_id": evaluation.question_id,
@@ -609,6 +1154,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         concept_id: &str,
         status: ConceptStatus,
     ) -> Result<ConceptStatus, PortError> {
@@ -641,6 +1187,18 @@ impl StudyMemoryStore for PostgresStudyStore {
             ));
         }
         self.increment_count(WriteCountKind::ConceptStatus)?;
+        let payload = ConceptStatusEventPayload {
+            concept_id,
+            status: &status,
+        };
+        self.record_event_authorization(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::ConceptStatus,
+            &payload,
+        )?;
         Ok(status)
     }
 
@@ -690,8 +1248,15 @@ impl StudyMemoryStore for PostgresStudyStore {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         recap: StudySessionRecap,
     ) -> Result<Value, PortError> {
+        if recap.voice_session_id != voice_session_id {
+            return Err(PortError::adapter(
+                "postgres",
+                "recap session does not match authorized session",
+            ));
+        }
         let study_set_uuid = Self::uuid_for(study_set_id)?;
         let voice_session_uuid = Self::uuid_for(voice_session_id)?;
         self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
@@ -733,6 +1298,14 @@ impl StudyMemoryStore for PostgresStudyStore {
         .await
         .map_err(pg_error)?;
         self.increment_count(WriteCountKind::Recap)?;
+        self.record_event_authorization(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::StudySessionRecap,
+            &recap,
+        )?;
         Ok(json!({
             "voice_session_id": voice_session_id,
             "strong_concepts": recap.strong_concepts,

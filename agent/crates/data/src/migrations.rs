@@ -351,11 +351,10 @@ mod tests {
         );
 
         let question = executor
-            .execute(ToolProposal::select_next_question(
-                "biology-midterm",
-                "voice-session-1",
-                "quiz",
-            ))
+            .execute(
+                "response-0",
+                ToolProposal::select_next_question("biology-midterm", "voice-session-1", "quiz"),
+            )
             .await
             .expect("selects seeded question");
         assert_eq!(
@@ -363,45 +362,57 @@ mod tests {
             "src-lecture-5-slide-18"
         );
         executor
-            .execute(ToolProposal::evaluate_spoken_answer(
-                "biology-midterm",
-                "voice-session-1",
-                "q-oxidative-phosphorylation-nadh",
-                "NADH donates electrons.",
-            ))
+            .execute(
+                "response-1",
+                ToolProposal::evaluate_spoken_answer(
+                    "biology-midterm",
+                    "voice-session-1",
+                    "q-oxidative-phosphorylation-nadh",
+                    "NADH donates electrons.",
+                ),
+            )
             .await
             .expect("records answer");
         executor
-            .execute(ToolProposal::retrieve_source_reference(
-                "biology-midterm",
-                "voice-session-1",
-                "src-lecture-5-slide-18",
-            ))
+            .execute(
+                "response-1",
+                ToolProposal::retrieve_source_reference(
+                    "biology-midterm",
+                    "voice-session-1",
+                    "src-lecture-5-slide-18",
+                ),
+            )
             .await
             .expect("retrieves source");
         executor
-            .execute(ToolProposal::mark_concept_status(
-                "biology-midterm",
-                "voice-session-1",
-                "oxidative-phosphorylation",
-                "strong",
-            ))
+            .execute(
+                "response-1",
+                ToolProposal::mark_concept_status(
+                    "biology-midterm",
+                    "voice-session-1",
+                    "oxidative-phosphorylation",
+                    "strong",
+                ),
+            )
             .await
             .expect("records concept status");
         executor
-            .execute(ToolProposal::schedule_review_item(
-                "biology-midterm",
-                "voice-session-1",
-                "atp-synthase",
-                "2026-06-16T09:00:00Z",
-            ))
+            .execute(
+                "response-1",
+                ToolProposal::schedule_review_item(
+                    "biology-midterm",
+                    "voice-session-1",
+                    "atp-synthase",
+                    "2026-06-16T09:00:00Z",
+                ),
+            )
             .await
             .expect("schedules review");
         executor
-            .execute(ToolProposal::build_session_recap(
-                "biology-midterm",
-                "voice-session-1",
-            ))
+            .execute(
+                "response-0",
+                ToolProposal::build_session_recap("biology-midterm", "voice-session-1"),
+            )
             .await
             .expect("records recap");
         store
@@ -475,6 +486,7 @@ mod tests {
                 "user-1",
                 "biology-midterm",
                 "missing-session",
+                "response-1",
                 "nadh",
                 ConceptStatus::Strong,
             )
@@ -485,6 +497,7 @@ mod tests {
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
+                "response-1",
                 "unknown-concept",
                 ConceptStatus::Strong,
             )
@@ -509,6 +522,7 @@ mod tests {
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
+                "response-1",
                 agent_domain::AnswerEvaluation {
                     question_id: question.question_id.clone(),
                     answer_text: "NADH donates electrons.".to_owned(),
@@ -529,6 +543,7 @@ mod tests {
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
+                "response-1",
                 agent_domain::AnswerEvaluation {
                     question_id: question.question_id,
                     answer_text: "NADH donates electrons.".to_owned(),
@@ -566,6 +581,7 @@ mod tests {
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
+                "response-0",
                 StudySessionRecap {
                     voice_session_id: "voice-session-1".to_owned(),
                     headline: "Done".to_owned(),

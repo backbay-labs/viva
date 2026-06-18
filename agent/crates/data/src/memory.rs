@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     sync::{Arc, RwLock},
 };
 
@@ -13,6 +14,7 @@ use agent_domain::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const MAX_PASTE_SOURCE_EXCERPT_CHARS: usize = 360;
@@ -139,6 +141,45 @@ fn required_study_set_id(config: &SessionConfig) -> Result<&str, PortError> {
     Ok(study_set_id)
 }
 
+fn event_authorization_record<T: Serialize>(
+    user_id: &str,
+    study_set_id: &str,
+    voice_session_id: &str,
+    response_id: &str,
+    kind: EventAuthorizationKind,
+    payload: &T,
+) -> Result<EventAuthorizationRecord, PortError> {
+    Ok(EventAuthorizationRecord {
+        user_id: user_id.to_owned(),
+        study_set_id: study_set_id.to_owned(),
+        voice_session_id: voice_session_id.to_owned(),
+        response_id: response_id.to_owned(),
+        kind,
+        payload_sha256: payload_sha256(kind, response_id, payload)?,
+    })
+}
+
+fn payload_sha256<T: Serialize>(
+    kind: EventAuthorizationKind,
+    response_id: &str,
+    payload: &T,
+) -> Result<String, PortError> {
+    let payload = serde_json::to_vec(payload)
+        .map_err(|error| PortError::adapter("memory", error.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(response_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    Ok(encoded)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PersistedSourceReference {
     pub source_id: String,
@@ -250,6 +291,40 @@ pub struct RecapRecord {
     pub recap: PersistedSessionRecap,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventAuthorizationKind {
+    AnswerEvaluation,
+    ConceptStatus,
+    StudySessionRecap,
+}
+
+impl EventAuthorizationKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AnswerEvaluation => "answer_evaluation",
+            Self::ConceptStatus => "concept_status",
+            Self::StudySessionRecap => "study_session_recap",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EventAuthorizationRecord {
+    pub user_id: String,
+    pub study_set_id: String,
+    pub voice_session_id: String,
+    pub response_id: String,
+    pub kind: EventAuthorizationKind,
+    pub payload_sha256: String,
+}
+
+#[derive(Serialize)]
+struct ConceptStatusEventPayload<'a> {
+    concept_id: &'a str,
+    status: &'a ConceptStatus,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct InMemoryStudyState {
     pub study_sets: HashMap<String, StudySetRecord>,
@@ -262,6 +337,7 @@ pub struct InMemoryStudyState {
     pub concept_statuses: Vec<ConceptStatusRecord>,
     pub review_items: Vec<ReviewItemRecord>,
     pub recaps: Vec<RecapRecord>,
+    pub event_authorizations: Vec<EventAuthorizationRecord>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -475,6 +551,7 @@ impl InMemoryStudyStore {
             session.user_id == user_id
                 && session.study_set_id == study_set_id
                 && session.voice_session_id == voice_session_id
+                && session.status == "open"
         }) {
             return Ok(());
         }
@@ -483,6 +560,46 @@ impl InMemoryStudyStore {
             voice_session_id,
             "voice session is not available for this user and study set",
         ))
+    }
+
+    fn active_question_source_locked(
+        study_set: &StudySetRecord,
+        state: &InMemoryStudyState,
+        user_id: &str,
+        question_id: &str,
+    ) -> Result<StudySourceReference, PortError> {
+        Self::ensure_question_locked(study_set, state, question_id)?;
+        let record = state
+            .questions
+            .get(&question_key(&study_set.study_set_id, question_id))
+            .filter(|record| record.active)
+            .ok_or_else(|| {
+                PortError::unavailable(
+                    "memory",
+                    question_id,
+                    "question is not active for this study set",
+                )
+            })?;
+        let source = Self::source_reference_locked(
+            state,
+            user_id,
+            &study_set.study_set_id,
+            &record.question.source.source_id,
+        )
+        .ok_or_else(|| {
+            PortError::unavailable(
+                "memory",
+                &record.question.source.source_id,
+                "question source reference is not available for this user and study set",
+            )
+        })?;
+        if source != record.question.source {
+            return Err(PortError::adapter(
+                "memory",
+                "active question source tuple does not match deterministic retrieval",
+            ));
+        }
+        Ok(source)
     }
 
     fn ensure_concept_locked(
@@ -1316,13 +1433,32 @@ impl StudyMemoryStore for InMemoryStudyStore {
     async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
         let user_id = required_user_id(config)?;
         let study_set_id = required_study_set_id(config)?;
-        let _voice_session_id = required_session_id(config)?;
+        let voice_session_id = required_session_id(config)?;
         {
             let state = self
                 .inner
                 .read()
                 .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
             Self::study_set_locked(&state, user_id, study_set_id)?;
+            if let Some(existing) = state
+                .sessions
+                .iter()
+                .find(|session| session.voice_session_id == voice_session_id)
+            {
+                if existing.user_id != user_id || existing.study_set_id != study_set_id {
+                    return Err(PortError::adapter(
+                        "memory",
+                        "voice session ownership cannot be changed",
+                    ));
+                }
+                if existing.status != "open" {
+                    return Err(PortError::unavailable(
+                        "memory",
+                        voice_session_id,
+                        "closed voice session cannot be reopened",
+                    ));
+                }
+            }
         }
         self.save(&VoiceSessionRecord::from_config(config)).await
     }
@@ -1346,9 +1482,13 @@ impl StudyMemoryStore for InMemoryStudyStore {
         session.status = "closed".to_owned();
         session.ended_at = Some("closed".to_owned());
         session.terminal_reason = Some(terminal_reason.to_owned());
+        let status = session.status.clone();
+        state
+            .event_authorizations
+            .retain(|record| record.voice_session_id != voice_session_id);
         Ok(json!({
             "voice_session_id": voice_session_id,
-            "status": session.status,
+            "status": status,
             "terminal_reason": terminal_reason,
         }))
     }
@@ -1515,11 +1655,307 @@ impl StudyMemoryStore for InMemoryStudyStore {
         Self::active_question_locked(&state, user_id, study_set_id)
     }
 
+    async fn authorize_question_started(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        question: &StudyQuestion,
+    ) -> Result<(), PortError> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+        let canonical =
+            Self::active_question_locked(&state, user_id, study_set_id)?.ok_or_else(|| {
+                PortError::unavailable(
+                    "memory",
+                    &question.question_id,
+                    "question is not active for this study set",
+                )
+            })?;
+        if canonical != *question {
+            return Err(PortError::adapter(
+                "memory",
+                "question tuple does not match deterministic retrieval",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn authorize_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: &AnswerEvaluation,
+    ) -> Result<(), PortError> {
+        evaluation
+            .validate_fail_closed()
+            .map_err(|reason| PortError::adapter("memory", reason))?;
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+        let canonical_source = Self::active_question_source_locked(
+            study_set,
+            &state,
+            user_id,
+            &evaluation.question_id,
+        )?;
+        if canonical_source != evaluation.source {
+            return Err(PortError::adapter(
+                "memory",
+                "answer evaluation source tuple does not match active question source",
+            ));
+        }
+        let persisted = PersistedAnswerEvaluation::from(evaluation);
+        if !state.answer_attempts.iter().any(|record| {
+            record.user_id == user_id
+                && record.voice_session_id == voice_session_id
+                && record.evaluation == persisted
+        }) {
+            return Err(PortError::adapter(
+                "memory",
+                "answer evaluation event does not match persisted answer attempt",
+            ));
+        }
+        let authorization = event_authorization_record(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::AnswerEvaluation,
+            evaluation,
+        )?;
+        if !state.event_authorizations.contains(&authorization) {
+            return Err(PortError::adapter(
+                "memory",
+                "answer evaluation event does not match authorized browser payload",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn authorize_source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        source: &StudySourceReference,
+    ) -> Result<(), PortError> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+        let canonical =
+            Self::source_reference_locked(&state, user_id, study_set_id, &source.source_id)
+                .ok_or_else(|| {
+                    PortError::unavailable(
+                        "memory",
+                        &source.source_id,
+                        "source reference is not available for this user and study set",
+                    )
+                })?;
+        if canonical != *source {
+            return Err(PortError::adapter(
+                "memory",
+                "source tuple does not match deterministic retrieval",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn authorize_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: &ConceptStatus,
+    ) -> Result<(), PortError> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+        Self::ensure_concept_locked(study_set, &state, concept_id)?;
+        if !state.concept_statuses.iter().any(|record| {
+            record.user_id == user_id
+                && record.study_set_id == study_set_id
+                && record.voice_session_id == voice_session_id
+                && record.concept_id == concept_id
+                && record.status == *status
+        }) {
+            return Err(PortError::adapter(
+                "memory",
+                "concept status event does not match persisted concept status write",
+            ));
+        }
+        let payload = ConceptStatusEventPayload { concept_id, status };
+        let authorization = event_authorization_record(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::ConceptStatus,
+            &payload,
+        )?;
+        if !state.event_authorizations.contains(&authorization) {
+            return Err(PortError::adapter(
+                "memory",
+                "concept status event does not match authorized browser payload",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn authorize_manuscript_intent(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        intent: &agent_domain::ManuscriptIntent,
+    ) -> Result<(), PortError> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+        match intent {
+            agent_domain::ManuscriptIntent::Scene { .. } => Ok(()),
+            agent_domain::ManuscriptIntent::Entity {
+                entity_id,
+                entity_kind,
+                ..
+            } => match entity_kind {
+                agent_domain::ManuscriptEntityKind::Concept => {
+                    Self::ensure_concept_locked(study_set, &state, entity_id)
+                }
+                agent_domain::ManuscriptEntityKind::Source => {
+                    Self::source_reference_locked(&state, user_id, study_set_id, entity_id)
+                        .map(|_| ())
+                        .ok_or_else(|| {
+                            PortError::unavailable(
+                                "memory",
+                                entity_id,
+                                "source entity is not available for this study set",
+                            )
+                        })
+                }
+                agent_domain::ManuscriptEntityKind::MarginalNote => Err(PortError::unavailable(
+                    "memory",
+                    entity_id,
+                    "marginal note entity is not server-owned",
+                )),
+            },
+            agent_domain::ManuscriptIntent::Marginalia {
+                anchor_entity_id, ..
+            } => {
+                if Self::ensure_concept_locked(study_set, &state, anchor_entity_id).is_ok()
+                    || Self::source_reference_locked(
+                        &state,
+                        user_id,
+                        study_set_id,
+                        anchor_entity_id,
+                    )
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                Err(PortError::unavailable(
+                    "memory",
+                    anchor_entity_id,
+                    "marginalia anchor is not available for this study set",
+                ))
+            }
+        }
+    }
+
+    async fn authorize_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: &StudySessionRecap,
+    ) -> Result<(), PortError> {
+        if recap.voice_session_id != voice_session_id {
+            return Err(PortError::adapter(
+                "memory",
+                "recap session does not match authorized session",
+            ));
+        }
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let _study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+        for moment in &recap.source_moments {
+            let canonical = Self::source_reference_locked(
+                &state,
+                user_id,
+                study_set_id,
+                &moment.source.source_id,
+            )
+            .ok_or_else(|| {
+                PortError::unavailable(
+                    "memory",
+                    moment.source.source_id.clone(),
+                    "recap source reference unavailable",
+                )
+            })?;
+            if canonical != moment.source {
+                return Err(PortError::adapter(
+                    "memory",
+                    "recap source tuple does not match deterministic retrieval",
+                ));
+            }
+        }
+        let persisted = PersistedSessionRecap::from(recap);
+        if !state.recaps.iter().any(|record| {
+            record.user_id == user_id
+                && record.study_set_id == study_set_id
+                && record.voice_session_id == voice_session_id
+                && record.recap == persisted
+        }) {
+            return Err(PortError::adapter(
+                "memory",
+                "recap event does not match persisted session recap",
+            ));
+        }
+        let authorization = event_authorization_record(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::StudySessionRecap,
+            recap,
+        )?;
+        if !state.event_authorizations.contains(&authorization) {
+            return Err(PortError::adapter(
+                "memory",
+                "recap event does not match authorized browser payload",
+            ));
+        }
+        Ok(())
+    }
+
     async fn record_answer_evaluation(
         &self,
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         evaluation: AnswerEvaluation,
     ) -> Result<Value, PortError> {
         evaluation
@@ -1532,25 +1968,12 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
             let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
             Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-            Self::ensure_question_locked(study_set, &state, &evaluation.question_id)?;
-            Self::source_reference_locked(
-                &state,
-                user_id,
-                study_set_id,
-                &evaluation.source.source_id,
-            )
-        }
-        .ok_or_else(|| {
-            PortError::unavailable(
-                "memory",
-                evaluation.source.source_id.clone(),
-                "source reference is not available for this user and study set",
-            )
-        })?;
+            Self::active_question_source_locked(study_set, &state, user_id, &evaluation.question_id)
+        }?;
         if canonical_source != evaluation.source {
             return Err(PortError::adapter(
                 "memory",
-                "answer evaluation source tuple does not match deterministic retrieval",
+                "answer evaluation source tuple does not match active question source",
             ));
         }
         let record = AnswerAttemptRecord {
@@ -1558,13 +1981,22 @@ impl StudyMemoryStore for InMemoryStudyStore {
             voice_session_id: voice_session_id.to_owned(),
             evaluation: PersistedAnswerEvaluation::from(&evaluation),
         };
+        let authorization = event_authorization_record(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::AnswerEvaluation,
+            &evaluation,
+        )?;
         let result = serde_json::to_value(&record)
             .map_err(|error| PortError::adapter("memory", error.to_string()))?;
-        self.inner
+        let mut state = self
+            .inner
             .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?
-            .answer_attempts
-            .push(record);
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        state.answer_attempts.push(record);
+        state.event_authorizations.push(authorization);
         Ok(result)
     }
 
@@ -1591,6 +2023,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         concept_id: &str,
         status: ConceptStatus,
     ) -> Result<ConceptStatus, PortError> {
@@ -1610,11 +2043,30 @@ impl StudyMemoryStore for InMemoryStudyStore {
             concept_id: concept_id.to_owned(),
             status: status.clone(),
         };
-        self.inner
+        let payload = ConceptStatusEventPayload {
+            concept_id,
+            status: &status,
+        };
+        let authorization = event_authorization_record(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::ConceptStatus,
+            &payload,
+        )?;
+        let mut state = self
+            .inner
             .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?
-            .concept_statuses
-            .push(record);
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        if let Some(concept) = state
+            .concepts
+            .get_mut(&concept_key(study_set_id, concept_id))
+        {
+            concept.status = status.clone();
+        }
+        state.concept_statuses.push(record);
+        state.event_authorizations.push(authorization);
         Ok(status)
     }
 
@@ -1657,8 +2109,15 @@ impl StudyMemoryStore for InMemoryStudyStore {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         recap: StudySessionRecap,
     ) -> Result<Value, PortError> {
+        if recap.voice_session_id != voice_session_id {
+            return Err(PortError::adapter(
+                "memory",
+                "recap session does not match authorized session",
+            ));
+        }
         {
             let state = self
                 .inner
@@ -1700,9 +2159,29 @@ impl StudyMemoryStore for InMemoryStudyStore {
             voice_session_id: voice_session_id.to_owned(),
             recap: PersistedSessionRecap::from(&recap),
         };
+        let authorization = event_authorization_record(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::StudySessionRecap,
+            &recap,
+        )?;
         let result = serde_json::to_value(&record)
             .map_err(|error| PortError::adapter("memory", error.to_string()))?;
-        self.save_recap(record);
+        {
+            let mut state = self
+                .inner
+                .write()
+                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            state.recaps.retain(|existing| {
+                existing.user_id != record.user_id
+                    || existing.study_set_id != record.study_set_id
+                    || existing.voice_session_id != record.voice_session_id
+            });
+            state.recaps.push(record);
+            state.event_authorizations.push(authorization);
+        }
         Ok(result)
     }
 }
@@ -1731,6 +2210,51 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    fn fixture_session_config() -> SessionConfig {
+        SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        }
+    }
+
+    fn add_second_active_question_with_source(store: &InMemoryStudyStore) -> StudyQuestion {
+        let mut source = fixture_source_reference();
+        source.source_id = "src-lecture-5-slide-19".to_owned();
+        source.span = "slide:19".to_owned();
+        source.excerpt = "FADH2 enters later in the electron transport chain and contributes fewer protons than NADH.".to_owned();
+        source.retrieval_reason = "server fixture source for FADH2 contrast".to_owned();
+        store.upsert_source_span(SourceSpanRecord {
+            study_set_id: "biology-midterm".to_owned(),
+            source: source.clone(),
+            tombstoned: false,
+        });
+        let question = StudyQuestion {
+            question_id: "q-fadh2-entry-point".to_owned(),
+            prompt: "Where does FADH2 enter the electron transport chain?".to_owned(),
+            expected_terms: vec!["complex ii".to_owned(), "fewer protons".to_owned()],
+            follow_up: "Connect the entry point to ATP yield.".to_owned(),
+            source,
+        };
+        store.upsert_question(StudyQuestionRecord {
+            study_set_id: "biology-midterm".to_owned(),
+            question: question.clone(),
+            active: true,
+        });
+        store
+            .inner
+            .write()
+            .expect("memory store lock poisoned")
+            .study_sets
+            .get_mut("biology-midterm")
+            .expect("fixture study set")
+            .question_ids
+            .push(question.question_id.clone());
+        question
     }
 
     const MAX_TEST_SOURCE_EXCERPT_CHARS: usize = 360;
@@ -1871,7 +2395,13 @@ mod tests {
             confidence_score: 0.84,
         };
         store
-            .record_answer_evaluation("user-1", "biology-midterm", "voice-session-1", evaluation)
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                evaluation,
+            )
             .await
             .unwrap();
 
@@ -2206,19 +2736,21 @@ mod tests {
         );
 
         let first_question = first_executor
-            .execute(ToolProposal::select_next_question(
-                &first.study_set.id,
-                &first.session_id,
-                "quiz",
-            ))
+            .execute(
+                "response-0",
+                ToolProposal::select_next_question(&first.study_set.id, &first.session_id, "quiz"),
+            )
             .await
             .expect("selects first generated question");
         let second_question = second_executor
-            .execute(ToolProposal::select_next_question(
-                &second.study_set.id,
-                &second.session_id,
-                "quiz",
-            ))
+            .execute(
+                "response-0",
+                ToolProposal::select_next_question(
+                    &second.study_set.id,
+                    &second.session_id,
+                    "quiz",
+                ),
+            )
             .await
             .expect("selects second generated question");
         let first_question_id = first_question.result["question"]["question_id"]
@@ -2237,22 +2769,28 @@ mod tests {
         );
 
         first_executor
-            .execute(ToolProposal::evaluate_spoken_answer(
-                &first.study_set.id,
-                &first.session_id,
-                first_question_id,
-                "mitosis chromosome spindle",
-            ))
+            .execute(
+                "response-1",
+                ToolProposal::evaluate_spoken_answer(
+                    &first.study_set.id,
+                    &first.session_id,
+                    first_question_id,
+                    "mitosis chromosome spindle",
+                ),
+            )
             .await
             .expect("first generated answer records");
         let baseline_writes = store.write_counts();
         let wrong_set = first_executor
-            .execute(ToolProposal::evaluate_spoken_answer(
-                &first.study_set.id,
-                &first.session_id,
-                second_question_id,
-                "photosynthesis chloroplast",
-            ))
+            .execute(
+                "response-1",
+                ToolProposal::evaluate_spoken_answer(
+                    &first.study_set.id,
+                    &first.session_id,
+                    second_question_id,
+                    "photosynthesis chloroplast",
+                ),
+            )
             .await;
 
         assert!(wrong_set.is_err());
@@ -2278,7 +2816,13 @@ mod tests {
         };
 
         let result = store
-            .record_answer_evaluation("user-1", "biology-midterm", "voice-session-1", evaluation)
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                evaluation,
+            )
             .await;
 
         assert!(result.is_err());
@@ -2329,12 +2873,315 @@ mod tests {
                     "user-1",
                     "biology-midterm",
                     "voice-session-1",
+                    "response-1",
                     evaluation
                 )
                 .await
                 .is_err());
         }
         assert!(store.snapshot().answer_attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_answer_evaluation_source_from_wrong_active_question() {
+        let store = seeded_store();
+        record_fixture_session(&store).await;
+        let other_question = add_second_active_question_with_source(&store);
+        let question = fixture_question();
+        let evaluation = AnswerEvaluation {
+            question_id: question.question_id,
+            answer_text: "NADH gives electrons.".to_owned(),
+            label: "mostly correct".to_owned(),
+            concise_feedback: "Wrong source for this question.".to_owned(),
+            retry_prompt: question.follow_up,
+            source: other_question.source,
+            concept_status: ConceptStatus::Strong,
+            confidence_score: 0.84,
+        };
+
+        let result = store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                evaluation,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(store.snapshot().answer_attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_writes_after_voice_session_is_closed() {
+        let store = seeded_store();
+        record_fixture_session(&store).await;
+        store
+            .close_voice_session("voice-session-1", "client_stop")
+            .await
+            .unwrap();
+        let question = fixture_question();
+
+        assert!(store
+            .record_voice_session(&fixture_session_config())
+            .await
+            .is_err());
+        assert!(store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                AnswerEvaluation {
+                    question_id: question.question_id.clone(),
+                    answer_text: "NADH gives electrons.".to_owned(),
+                    label: "mostly correct".to_owned(),
+                    concise_feedback: "Closed session.".to_owned(),
+                    retry_prompt: question.follow_up.clone(),
+                    source: question.source.clone(),
+                    concept_status: ConceptStatus::Strong,
+                    confidence_score: 0.84,
+                },
+            )
+            .await
+            .is_err());
+        assert!(store
+            .record_concept_status(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                "nadh",
+                ConceptStatus::Strong,
+            )
+            .await
+            .is_err());
+        assert!(store
+            .schedule_review_item(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "atp-synthase",
+                "2026-06-16T09:00:00Z",
+            )
+            .await
+            .is_err());
+        assert!(store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-0",
+                StudySessionRecap {
+                    voice_session_id: "voice-session-1".to_owned(),
+                    headline: "Closed".to_owned(),
+                    summary: "Closed session recap.".to_owned(),
+                    strong_concepts: vec!["NADH".to_owned()],
+                    shaky_concepts: vec![],
+                    missed_concepts: vec![],
+                    review_later: vec![],
+                    next_action: "Stop".to_owned(),
+                    source_moments: vec![RecapSourceMoment {
+                        text: "Closed recap source".to_owned(),
+                        source: fixture_source_reference(),
+                        status: ConceptStatus::Strong,
+                    }],
+                },
+            )
+            .await
+            .is_err());
+
+        let snapshot = store.snapshot();
+        assert!(snapshot.answer_attempts.is_empty());
+        assert!(snapshot.concept_statuses.is_empty());
+        assert!(snapshot.review_items.is_empty());
+        assert!(snapshot.recaps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_browser_event_payloads_that_do_not_match_recorded_payload_hash() {
+        let store = seeded_store();
+        record_fixture_session(&store).await;
+        let question = fixture_question();
+        let evaluation = AnswerEvaluation {
+            question_id: question.question_id.clone(),
+            answer_text: "NADH gives electrons.".to_owned(),
+            label: "mostly correct".to_owned(),
+            concise_feedback: "Connect this to the proton gradient.".to_owned(),
+            retry_prompt: question.follow_up.clone(),
+            source: question.source.clone(),
+            concept_status: ConceptStatus::Strong,
+            confidence_score: 0.84,
+        };
+        store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                evaluation.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .authorize_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-2",
+                &evaluation,
+            )
+            .await
+            .is_err());
+
+        let mut forged_evaluation = evaluation.clone();
+        forged_evaluation.concise_feedback = "Forged browser-only feedback.".to_owned();
+
+        assert!(store
+            .authorize_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                &forged_evaluation,
+            )
+            .await
+            .is_err());
+
+        let recap = StudySessionRecap {
+            voice_session_id: "voice-session-1".to_owned(),
+            headline: "Done".to_owned(),
+            summary: "Recap".to_owned(),
+            strong_concepts: vec!["NADH".to_owned()],
+            shaky_concepts: vec![],
+            missed_concepts: vec![],
+            review_later: vec!["ATP synthase".to_owned()],
+            next_action: "Review tomorrow".to_owned(),
+            source_moments: vec![RecapSourceMoment {
+                text: "NADH source".to_owned(),
+                source: fixture_source_reference(),
+                status: ConceptStatus::Strong,
+            }],
+        };
+        store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-0",
+                recap.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .authorize_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                &recap
+            )
+            .await
+            .is_err());
+
+        let mut forged_recap = recap.clone();
+        forged_recap.summary = "Forged browser-only recap.".to_owned();
+
+        assert!(store
+            .authorize_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-0",
+                &forged_recap
+            )
+            .await
+            .is_err());
+
+        let persisted = serde_json::to_string(&store.snapshot()).unwrap();
+        assert!(!persisted.contains("NADH gives electrons"));
+        assert!(!persisted.contains("Connect this to the proton gradient"));
+        assert!(!persisted.contains("NADH source"));
+        assert!(!persisted.contains("Forged browser-only"));
+    }
+
+    #[tokio::test]
+    async fn authorizes_concept_event_from_recorded_write_after_later_status_change() {
+        let store = seeded_store();
+        record_fixture_session(&store).await;
+
+        store
+            .record_concept_status(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                "nadh",
+                ConceptStatus::Review,
+            )
+            .await
+            .unwrap();
+        store
+            .record_concept_status(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-2",
+                "nadh",
+                ConceptStatus::Strong,
+            )
+            .await
+            .unwrap();
+
+        store
+            .authorize_concept_status(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                "nadh",
+                &ConceptStatus::Review,
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .authorize_concept_status(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-2",
+                "nadh",
+                &ConceptStatus::Review,
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn close_voice_session_evicts_event_authorizations() {
+        let store = seeded_store();
+        record_fixture_session(&store).await;
+
+        store
+            .record_concept_status(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                "nadh",
+                ConceptStatus::Strong,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.snapshot().event_authorizations.len(), 1);
+
+        store
+            .close_voice_session("voice-session-1", "client_stop")
+            .await
+            .unwrap();
+
+        assert!(store.snapshot().event_authorizations.is_empty());
     }
 
     #[tokio::test]
@@ -2354,7 +3201,39 @@ mod tests {
         };
 
         assert!(store
-            .record_answer_evaluation("user-1", "wrong-set", "voice-session-1", evaluation)
+            .record_answer_evaluation(
+                "user-1",
+                "wrong-set",
+                "voice-session-1",
+                "response-1",
+                evaluation
+            )
+            .await
+            .is_err());
+
+        let mismatched_session_recap = StudySessionRecap {
+            voice_session_id: "voice-session-2".to_owned(),
+            headline: "Done".to_owned(),
+            summary: "Recap".to_owned(),
+            strong_concepts: vec!["NADH".to_owned()],
+            shaky_concepts: vec![],
+            missed_concepts: vec![],
+            review_later: vec!["ATP synthase".to_owned()],
+            next_action: "Review tomorrow".to_owned(),
+            source_moments: vec![RecapSourceMoment {
+                text: "Mismatched recap source".to_owned(),
+                source: fixture_source_reference(),
+                status: ConceptStatus::Strong,
+            }],
+        };
+        assert!(store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-0",
+                mismatched_session_recap,
+            )
             .await
             .is_err());
 
@@ -2377,7 +3256,13 @@ mod tests {
         };
 
         assert!(store
-            .record_recap("user-1", "biology-midterm", "voice-session-1", recap)
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-0",
+                recap
+            )
             .await
             .is_err());
         assert!(store.snapshot().recaps.is_empty());
@@ -2392,6 +3277,7 @@ mod tests {
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
+                "response-1",
                 "nadh",
                 ConceptStatus::Strong,
             )
@@ -2412,6 +3298,7 @@ mod tests {
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
+                "response-0",
                 StudySessionRecap {
                     voice_session_id: "voice-session-1".to_owned(),
                     headline: "Done".to_owned(),
@@ -2459,11 +3346,10 @@ mod tests {
             },
         );
         let question = executor
-            .execute(ToolProposal::select_next_question(
-                "biology-midterm",
-                "voice-session-1",
-                "quiz",
-            ))
+            .execute(
+                "response-0",
+                ToolProposal::select_next_question("biology-midterm", "voice-session-1", "quiz"),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2472,55 +3358,70 @@ mod tests {
         );
 
         executor
-            .execute(ToolProposal::evaluate_spoken_answer(
-                "biology-midterm",
-                "voice-session-1",
-                "q-oxidative-phosphorylation-nadh",
-                "NADH donates electrons.",
-            ))
+            .execute(
+                "response-1",
+                ToolProposal::evaluate_spoken_answer(
+                    "biology-midterm",
+                    "voice-session-1",
+                    "q-oxidative-phosphorylation-nadh",
+                    "NADH donates electrons.",
+                ),
+            )
             .await
             .unwrap();
         executor
-            .execute(ToolProposal::retrieve_source_reference(
-                "biology-midterm",
-                "voice-session-1",
-                "src-lecture-5-slide-18",
-            ))
+            .execute(
+                "response-1",
+                ToolProposal::retrieve_source_reference(
+                    "biology-midterm",
+                    "voice-session-1",
+                    "src-lecture-5-slide-18",
+                ),
+            )
             .await
             .unwrap();
         executor
-            .execute(ToolProposal::mark_concept_status(
-                "biology-midterm",
-                "voice-session-1",
-                "oxidative-phosphorylation",
-                "strong",
-            ))
+            .execute(
+                "response-1",
+                ToolProposal::mark_concept_status(
+                    "biology-midterm",
+                    "voice-session-1",
+                    "oxidative-phosphorylation",
+                    "strong",
+                ),
+            )
             .await
             .unwrap();
         executor
-            .execute(ToolProposal::schedule_review_item(
-                "biology-midterm",
-                "voice-session-1",
-                "atp-synthase",
-                "2026-06-16T09:00:00Z",
-            ))
+            .execute(
+                "response-1",
+                ToolProposal::schedule_review_item(
+                    "biology-midterm",
+                    "voice-session-1",
+                    "atp-synthase",
+                    "2026-06-16T09:00:00Z",
+                ),
+            )
             .await
             .unwrap();
         executor
-            .execute(ToolProposal::build_session_recap(
-                "biology-midterm",
-                "voice-session-1",
-            ))
+            .execute(
+                "response-0",
+                ToolProposal::build_session_recap("biology-midterm", "voice-session-1"),
+            )
             .await
             .unwrap();
         executor
-            .execute(ToolProposal::challenge_correction(
-                "biology-midterm",
-                "voice-session-1",
-                &fixture_source_reference(),
-                "correction-1",
-                "Re-check this source.",
-            ))
+            .execute(
+                "response-1",
+                ToolProposal::challenge_correction(
+                    "biology-midterm",
+                    "voice-session-1",
+                    &fixture_source_reference(),
+                    "correction-1",
+                    "Re-check this source.",
+                ),
+            )
             .await
             .unwrap();
 
@@ -2549,24 +3450,26 @@ mod tests {
             },
         );
         assert!(executor
-            .execute(ToolProposal::select_next_question(
-                "wrong-set",
-                "voice-session-1",
-                "quiz",
-            ))
+            .execute(
+                "response-0",
+                ToolProposal::select_next_question("wrong-set", "voice-session-1", "quiz",),
+            )
             .await
             .is_err());
 
         let mut forged_source = fixture_source_reference();
         forged_source.excerpt = "forged excerpt".to_owned();
         assert!(executor
-            .execute(ToolProposal::challenge_correction(
-                "biology-midterm",
-                "voice-session-1",
-                &forged_source,
-                "correction-1",
-                "Re-check this source.",
-            ))
+            .execute(
+                "response-1",
+                ToolProposal::challenge_correction(
+                    "biology-midterm",
+                    "voice-session-1",
+                    &forged_source,
+                    "correction-1",
+                    "Re-check this source.",
+                ),
+            )
             .await
             .is_err());
     }

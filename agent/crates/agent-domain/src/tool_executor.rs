@@ -39,14 +39,18 @@ impl VivaToolExecutor {
         Self { store, session }
     }
 
-    pub async fn execute(&self, proposal: ToolProposal) -> Result<ToolResult, ToolExecutionError> {
+    pub async fn execute(
+        &self,
+        response_id: &str,
+        proposal: ToolProposal,
+    ) -> Result<ToolResult, ToolExecutionError> {
         bind_study_set_and_session(&proposal, &self.session)?;
         let result = match proposal.name() {
             "select_next_question" => self.select_next_question().await?,
-            "evaluate_spoken_answer" => self.evaluate_spoken_answer(&proposal).await?,
+            "evaluate_spoken_answer" => self.evaluate_spoken_answer(response_id, &proposal).await?,
             "retrieve_source_reference" => self.retrieve_source_reference(&proposal).await?,
-            "mark_concept_status" => self.mark_concept_status(&proposal).await?,
-            "build_session_recap" => self.build_session_recap().await?,
+            "mark_concept_status" => self.mark_concept_status(response_id, &proposal).await?,
+            "build_session_recap" => self.build_session_recap(response_id).await?,
             "challenge_correction" => self.challenge_correction(&proposal).await?,
             "schedule_review_item" => self.schedule_review_item(&proposal).await?,
             other => {
@@ -65,6 +69,7 @@ impl VivaToolExecutor {
 
     async fn evaluate_spoken_answer(
         &self,
+        response_id: &str,
         proposal: &ToolProposal,
     ) -> Result<Value, ToolExecutionError> {
         let question_id = string_arg(proposal.arguments(), "question_id")?;
@@ -104,6 +109,7 @@ impl VivaToolExecutor {
                 &self.session.user_id,
                 &self.session.study_set_id,
                 &self.session.voice_session_id,
+                response_id,
                 evaluation.clone(),
             )
             .await?;
@@ -121,6 +127,7 @@ impl VivaToolExecutor {
 
     async fn mark_concept_status(
         &self,
+        response_id: &str,
         proposal: &ToolProposal,
     ) -> Result<Value, ToolExecutionError> {
         let concept_id = string_arg(proposal.arguments(), "concept_id")?;
@@ -131,6 +138,7 @@ impl VivaToolExecutor {
                 &self.session.user_id,
                 &self.session.study_set_id,
                 &self.session.voice_session_id,
+                response_id,
                 &concept_id,
                 status,
             )
@@ -138,7 +146,7 @@ impl VivaToolExecutor {
         Ok(json!({ "concept_id": concept_id, "status": status }))
     }
 
-    async fn build_session_recap(&self) -> Result<Value, ToolExecutionError> {
+    async fn build_session_recap(&self, response_id: &str) -> Result<Value, ToolExecutionError> {
         let question = self.active_question().await?;
         let source = question.source.clone();
         let strong_concepts = question
@@ -175,6 +183,7 @@ impl VivaToolExecutor {
                 &self.session.user_id,
                 &self.session.study_set_id,
                 &self.session.voice_session_id,
+                response_id,
                 recap.clone(),
             )
             .await?;
