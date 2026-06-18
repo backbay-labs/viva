@@ -353,7 +353,9 @@ describe("Viva agent browser client", () => {
 
     expect(state.question?.question_id).toBe("q-oxidative-phosphorylation-nadh");
     expect(state.evaluation?.concept_status).toBe("shaky");
+    expect(state.currentSource?.source_id).toBe("src-lecture-5-slide-18");
     expect(state.sources[0]?.source_id).toBe("src-lecture-5-slide-18");
+    expect(state.currentConceptStatus).toBe("shaky");
     expect(state.conceptStatuses.nadh).toBe("shaky");
     expect(state.manuscriptIntents.map((event) => event.intent.type)).toEqual([
       "scene_intent",
@@ -376,6 +378,29 @@ describe("Viva agent browser client", () => {
     const afterStale = vivaAgentReducer(state, stale);
     expect(afterStale.transcript).not.toContain("bad stale text");
     expect(afterStale.staleEvents).toBe(state.staleEvents + 1);
+
+    const currentQuestion = state.question;
+    if (!currentQuestion) throw new Error("Expected current question");
+    const nextQuestion = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "question_started",
+          response_id: "response-next",
+          question: {
+            ...currentQuestion,
+            question_id: "q-next",
+            prompt: "Next question",
+          },
+        },
+      }),
+    );
+    expect(nextQuestion.currentSource).toBeUndefined();
+    expect(nextQuestion.currentConceptStatus).toBeUndefined();
+    expect(nextQuestion.sources).toEqual([]);
+    expect(nextQuestion.conceptStatuses.nadh).toBe("shaky");
   });
 
   test("reducer stores manuscript intents and suppresses stale intent events", () => {

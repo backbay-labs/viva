@@ -21,6 +21,7 @@ import {
   projectRuntimeCopy,
   projectSessionQuestion,
   projectSessionState,
+  projectSourceFolio,
   projectTrace,
 } from "./viva-session-projection";
 
@@ -60,6 +61,7 @@ function derived(overrides: Partial<VivaAgentDerivedState> = {}): VivaAgentDeriv
   return {
     phase: "listening",
     transcript: "",
+    conceptStatuses: {},
     sources: [],
     manuscriptIntents: [],
     errors: [],
@@ -594,6 +596,173 @@ describe("projectTrace", () => {
     const projection = projectTrace(derived({ phase: "listening", question }), "open", NOW);
     expect(projection.state).toBe("listening");
     expect(projection.highlightedTokens).toEqual([]);
+  });
+});
+
+describe("projectSourceFolio", () => {
+  test("uses the latest source_reference event as the bounded museum label", () => {
+    const folio = projectSourceFolio(
+      derived({
+        currentConceptStatus: "shaky",
+        currentSource: {
+          ...source,
+          excerpt: "Bounded source_reference event excerpt.",
+          sourceId: "src-lecture-5-slide-18",
+        },
+        evaluation: evaluation({ conceptStatus: "strong" }),
+        phase: "correction",
+        question,
+        sources: [
+          {
+            confidence: "high",
+            documentId: "lec-5",
+            excerpt: "Older source event.",
+            label: "Lecture 5 · Slide 12",
+            retrievalReason: "older source span",
+            sourceId: "src-old",
+            span: "slide:12",
+          },
+        ],
+      }),
+      NOW,
+    );
+
+    expect(folio.state).toBe("present");
+    expect(folio.source.sourceId).toBe("src-lecture-5-slide-18");
+    expect(folio.source.excerpt).toBe("Bounded source_reference event excerpt.");
+    expect(folio.conceptStatus).toContain("Shaky");
+    expect(folio.confidenceLabel).toBe("High confidence");
+    expect(folio.regionNavigation).toBe(
+      "Document span only; exact page and bounding-box navigation is unverified.",
+    );
+  });
+
+  test("does not let a stale prior source_reference override the active question source", () => {
+    const activeQuestion: SessionQuestion = {
+      ...question,
+      source: {
+        ...source,
+        excerpt: "Active question bounded source.",
+        label: "Lecture 6 · Slide 3",
+        sourceId: "src-active-question",
+        span: "slide:3",
+      },
+    };
+    const folio = projectSourceFolio(
+      derived({
+        phase: "listening",
+        question: activeQuestion,
+        sources: [
+          {
+            ...source,
+            excerpt: "Stale prior correction source.",
+            label: "Lecture 5 · Slide 18",
+            sourceId: "src-prior-correction",
+          },
+        ],
+      }),
+      NOW,
+    );
+
+    expect(folio.source.sourceId).toBe("src-active-question");
+    expect(folio.source.excerpt).toBe("Active question bounded source.");
+    expect(folio.source.excerpt).not.toContain("Stale prior");
+  });
+
+  test("labels low-confidence source material honestly", () => {
+    const folio = projectSourceFolio(
+      derived({
+        evaluation: evaluation({
+          label: "insufficient evidence",
+          source: {
+            ...source,
+            confidence: "low",
+            retrievalReason: "retrieval confidence below threshold",
+          },
+        }),
+        phase: "correction",
+        question,
+      }),
+      NOW,
+    );
+
+    expect(folio.state).toBe("low_confidence");
+    expect(folio.confidenceLabel).toBe("Low confidence");
+    expect(folio.caveat).toContain("retrieval confidence below threshold");
+  });
+
+  test("labels conflicting source material as a caveat", () => {
+    const folio = projectSourceFolio(
+      derived({
+        evaluation: evaluation({
+          label: "insufficient evidence",
+          source: {
+            ...source,
+            confidence: "medium",
+            retrievalReason: "conflicting source spans disagree",
+          },
+        }),
+        phase: "correction",
+        question,
+      }),
+      NOW,
+    );
+
+    expect(folio.state).toBe("conflicting");
+    expect(folio.confidenceLabel).toBe("Medium confidence");
+    expect(folio.caveat).toContain("Conflicting source material");
+  });
+
+  test("does not turn answer-level insufficient evidence into source conflict", () => {
+    const folio = projectSourceFolio(
+      derived({
+        evaluation: evaluation({
+          label: "insufficient evidence",
+          source: {
+            ...source,
+            confidence: "high",
+            retrievalReason: "server fixture source for oxidative phosphorylation",
+          },
+        }),
+        phase: "correction",
+        question,
+      }),
+      NOW,
+    );
+
+    expect(folio.state).toBe("present");
+    expect(folio.caveat).not.toContain("Conflicting source material");
+  });
+
+  test("does not display stale concept_status values before the current response reports one", () => {
+    const folio = projectSourceFolio(
+      derived({
+        conceptStatuses: { "prior-concept": "missed" },
+        phase: "listening",
+        question,
+      }),
+      NOW,
+    );
+
+    expect(folio.conceptStatus).toBe("Awaiting concept status");
+    expect(folio.conceptStatus).not.toContain("Missed");
+  });
+
+  test("records source unavailable without exposing fallback document text", () => {
+    const folio = projectSourceFolio(
+      derived({
+        question: {
+          ...question,
+          source: { confidence: "low", excerpt: "", label: "" },
+        },
+      }),
+      NOW,
+    );
+
+    expect(folio.state).toBe("unavailable");
+    expect(folio.source.excerpt).toBe("");
+    expect(folio.confidenceLabel).toBe("Source unavailable");
+    expect(folio.caveat).toContain("No bounded source_reference");
   });
 });
 

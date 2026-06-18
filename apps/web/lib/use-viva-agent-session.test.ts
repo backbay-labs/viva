@@ -110,6 +110,8 @@ describe("useVivaAgentSession adapter", () => {
     expect(derived.phase).toBe("recap");
     expect(derived.question?.prompt).toBe("Explain the role of NADH in oxidative phosphorylation.");
     expect(derived.evaluation?.source.sourceId).toBe("src-lecture-5-slide-18");
+    expect(derived.currentSource?.sourceId).toBe("src-lecture-5-slide-18");
+    expect(derived.currentConceptStatus).toBe("shaky");
     expect(derived.recap?.sourceMoments[0]?.source.documentId).toBe("lec-5");
     expect(derived.canSubmitAnswer).toBe(true);
   });

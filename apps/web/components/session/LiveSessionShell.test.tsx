@@ -7,7 +7,11 @@ import {
 } from "@viva/core";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
-import { projectRuntimeCopy, type RuntimeCopy } from "../../lib/viva-session-projection";
+import {
+  projectRuntimeCopy,
+  type RuntimeCopy,
+  type SourceFolioProjection,
+} from "../../lib/viva-session-projection";
 import { MarginaliaPanel } from "./MarginaliaPanel";
 import { SessionHeader } from "./SessionHeader";
 import type { Question } from "./session-data";
@@ -94,6 +98,24 @@ const trustedRecap: SessionRecap = {
   summary: "The Conductor recap stayed grounded to the server-owned source span.",
 };
 
+const sourceFolio: SourceFolioProjection = {
+  caveat: "Source citation is bounded to this server-owned span.",
+  challengeLabel: "Challenge citation",
+  conceptStatus: "Shaky · review tomorrow",
+  confidenceLabel: "High confidence",
+  regionNavigation: "Document span only; exact page and bounding-box navigation is unverified.",
+  source: {
+    confidence: "high",
+    documentId: "lec-5",
+    excerpt: "Bounded source_reference excerpt, not the full uploaded lecture.",
+    label: "Lecture 5 · Slide 18",
+    retrievalReason: "server fixture source for oxidative phosphorylation",
+    sourceId: "src-lecture-5-slide-18",
+    span: "slide:18",
+  },
+  state: "present",
+};
+
 function ready(provider: string, overrides: Partial<VivaReadyFrame["brain"]> = {}): VivaReadyFrame {
   return {
     type: "ready",
@@ -140,6 +162,24 @@ function renderRuntimeSurfaces(runtimeCopy: RuntimeCopy): string {
         state="listening"
       />
     </>,
+  );
+}
+
+function renderSourceFolioSurface(overrides: Partial<SourceFolioProjection> = {}): string {
+  return renderToStaticMarkup(
+    <MarginaliaPanel
+      hintShown={false}
+      onBackToQuestion={noop}
+      onHint={noop}
+      onNextQuestion={noop}
+      onShowSource={noop}
+      onSubmitAnswer={noop}
+      onTryAgain={noop}
+      question={question}
+      runtime={runtime}
+      sourceFolio={{ ...sourceFolio, ...overrides }}
+      state="source"
+    />,
   );
 }
 
@@ -295,6 +335,48 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).not.toContain("Share");
     expect(markup).not.toContain("Add to calendar");
     expect(markup).not.toContain("Back to question");
+  });
+
+  test("renders source_reference folio as a bounded museum label", () => {
+    const markup = renderSourceFolioSurface();
+
+    expect(markup).toContain("Source Folio");
+    expect(markup).toContain("Lecture 5 · Slide 18");
+    expect(markup).toContain("Shaky · review tomorrow");
+    expect(markup).toContain("High confidence");
+    expect(markup).toContain("Bounded source_reference excerpt");
+    expect(markup).toContain("Document span only");
+    expect(markup).toContain("Challenge citation");
+    expect(markup).not.toContain("Full document");
+    expect(markup).not.toContain("page/bbox");
+  });
+
+  test("renders low-confidence, conflicting, and unavailable source states honestly", () => {
+    const low = renderSourceFolioSurface({
+      caveat: "Low-confidence retrieval; use this as a prompt to re-check the course source.",
+      confidenceLabel: "Low confidence",
+      source: { ...sourceFolio.source, confidence: "low" },
+      state: "low_confidence",
+    });
+    const conflicting = renderSourceFolioSurface({
+      caveat: "Conflicting source material: source spans disagree.",
+      confidenceLabel: "Medium confidence",
+      source: { ...sourceFolio.source, confidence: "medium" },
+      state: "conflicting",
+    });
+    const unavailable = renderSourceFolioSurface({
+      caveat: "No bounded source_reference has arrived for this correction.",
+      confidenceLabel: "Source unavailable",
+      conceptStatus: "Source status unavailable",
+      source: { confidence: "low", excerpt: "", label: "Source unavailable" },
+      state: "unavailable",
+    });
+
+    expect(low).toContain("Low confidence");
+    expect(low).toContain("Low-confidence retrieval");
+    expect(conflicting).toContain("Conflicting source material");
+    expect(unavailable).toContain("Source unavailable");
+    expect(unavailable).toContain("No bounded source_reference");
   });
 
   test("renders unavailable causes in both capsule and marginalia", () => {

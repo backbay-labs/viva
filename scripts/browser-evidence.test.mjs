@@ -13,6 +13,12 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
     manuscript_ready: true,
     conductor_terminal_fold: true,
     recap_payload_visible: true,
+    source_folio_visible: true,
+    bounded_source_visible: true,
+    post_answer_source_folio_visible: true,
+    post_answer_bounded_source_visible: true,
+    post_answer_source_reference_event_seen: true,
+    post_answer_concept_status_event_seen: true,
     local_only_actions_hidden: true,
     console_errors: ["console failure"],
     page_errors: [],
@@ -24,6 +30,12 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
     manuscript_ready: true,
     conductor_terminal_fold: true,
     recap_payload_visible: true,
+    source_folio_visible: true,
+    bounded_source_visible: true,
+    post_answer_source_folio_visible: true,
+    post_answer_bounded_source_visible: true,
+    post_answer_source_reference_event_seen: true,
+    post_answer_concept_status_event_seen: true,
     local_only_actions_hidden: true,
     console_error_count: 1,
     page_error_count: 0,
@@ -54,11 +66,75 @@ test("rejects stale browser evidence before release evidence is written", () => 
           manuscript_ready: true,
           conductor_terminal_fold: true,
           local_only_actions_hidden: true,
+          source_folio_visible: true,
+          bounded_source_visible: true,
+          post_answer_source_folio_visible: true,
+          post_answer_bounded_source_visible: true,
           console_errors: [],
           page_errors: [],
         }),
       ),
     /recap_payload_visible/,
+  );
+});
+
+test("rejects browser evidence that omits the bounded Source Folio proof", () => {
+  assert.throws(
+    () =>
+      assertReleaseBrowserEvidence(
+        normalizeBrowserEvidence({
+          legacy_upload_visible: false,
+          manuscript_ready: true,
+          conductor_terminal_fold: true,
+          recap_payload_visible: true,
+          local_only_actions_hidden: true,
+          console_errors: [],
+          page_errors: [],
+        }),
+      ),
+    /source_folio_visible|bounded_source_visible/,
+  );
+});
+
+test("rejects browser evidence that only proves the pre-answer source fallback", () => {
+  assert.throws(
+    () =>
+      assertReleaseBrowserEvidence(
+        normalizeBrowserEvidence({
+          legacy_upload_visible: false,
+          manuscript_ready: true,
+          conductor_terminal_fold: true,
+          recap_payload_visible: true,
+          source_folio_visible: true,
+          bounded_source_visible: true,
+          local_only_actions_hidden: true,
+          console_errors: [],
+          page_errors: [],
+        }),
+      ),
+    /post_answer_source_folio_visible|post_answer_bounded_source_visible/,
+  );
+});
+
+test("rejects post-answer Source Folio evidence without protocol event proof", () => {
+  assert.throws(
+    () =>
+      assertReleaseBrowserEvidence(
+        normalizeBrowserEvidence({
+          legacy_upload_visible: false,
+          manuscript_ready: true,
+          conductor_terminal_fold: true,
+          recap_payload_visible: true,
+          source_folio_visible: true,
+          bounded_source_visible: true,
+          post_answer_source_folio_visible: true,
+          post_answer_bounded_source_visible: true,
+          local_only_actions_hidden: true,
+          console_errors: [],
+          page_errors: [],
+        }),
+      ),
+    /post_answer_source_reference_event_seen|post_answer_concept_status_event_seen/,
   );
 });
 

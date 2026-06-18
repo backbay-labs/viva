@@ -77,6 +77,7 @@ try {
   const artifactAudit = await auditGeneratedArtifacts([
     artifactDir,
     path.join(root, "artifacts/e2e-browser"),
+    path.join(root, "artifacts/e2e-browser-fake-provider"),
   ]);
   const evidence = {
     generated_at: new Date().toISOString(),
@@ -120,8 +121,15 @@ try {
 }
 
 async function runBrowserE2E() {
-  await run("browser_e2e_fake_provider", "bun", ["run", "e2e:browser"], {
+  await run("browser_e2e_fake_provider_smoke", "bun", ["run", "e2e:browser"], {
+    VIVA_E2E_ARTIFACT_DIR: path.join(root, "artifacts/e2e-browser-fake-provider"),
+    VIVA_E2E_AGENT_PROVIDER: "fake_cartesia_gemini",
+    VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
+  });
+  await run("browser_e2e_synthetic_provider", "bun", ["run", "e2e:browser"], {
     VIVA_E2E_ARTIFACT_DIR: path.join(root, "artifacts/e2e-browser"),
+    VIVA_E2E_AGENT_PROVIDER: "synthetic",
+    VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "1",
   });
   return readExistingBrowserResult();
 }
