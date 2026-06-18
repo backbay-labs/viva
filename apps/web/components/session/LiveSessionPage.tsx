@@ -262,6 +262,7 @@ export function LiveSessionPage() {
   const runtime = useMemo(
     () =>
       projectRuntimeCopy({
+        close: agent.agentState.close,
         errors: agent.derived.errors,
         mic: micState,
         readinessProbe,
@@ -270,6 +271,7 @@ export function LiveSessionPage() {
         status: agent.status,
       }),
     [
+      agent.agentState.close,
       agent.agentState.ready,
       agent.derived.errors,
       agent.readiness,

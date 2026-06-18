@@ -15,6 +15,7 @@ import type {
 } from "../components/session/session-data";
 import type { VivaAgentDerivedState } from "./use-viva-agent-session";
 import type {
+  VivaAgentCloseDiagnostics,
   VivaAgentConnectionStatus,
   VivaAgentReadinessProbe,
   VivaAgentReadyEndpoint,
@@ -57,7 +58,8 @@ export type RuntimeCopyCause =
   | "mic_denied"
   | "session_disconnected"
   | "store_unavailable"
-  | "synthetic";
+  | "synthetic"
+  | "unexpected_close";
 
 export type RuntimeCopy = {
   capsuleLabel: string;
@@ -89,6 +91,7 @@ type RuntimeProjectionContext = {
   websocketReady: boolean;
   status: VivaAgentConnectionStatus;
   mic: RuntimeMicState;
+  close?: VivaAgentCloseDiagnostics;
 };
 
 function clamp01(value: number): number {
@@ -145,6 +148,7 @@ export function projectRuntimeCopy({
   status,
   errors = [],
   mic = "unknown",
+  close,
   readinessProbe,
 }: {
   readiness: AgentStudySetReadiness;
@@ -153,13 +157,17 @@ export function projectRuntimeCopy({
   status: VivaAgentConnectionStatus;
   errors?: string[];
   mic?: RuntimeMicState;
+  close?: VivaAgentCloseDiagnostics;
 }): RuntimeCopy {
   const newestError = errors.at(-1) ?? "";
-  const authFailed = /auth|token|claim|unauthori[sz]ed/i.test(newestError);
+  const closeReason = close?.reason ?? "";
+  const diagnosticText = `${newestError} ${closeReason}`;
+  const authFailed = /auth|token|claim|unauthori[sz]ed/i.test(diagnosticText);
   const endpointReady = readinessProbe?.status === "observed" ? readinessProbe.ready : undefined;
   const readinessFacts = ready ?? endpointReady;
   const context: RuntimeProjectionContext = {
     mic,
+    close,
     readiness,
     readinessProbe,
     ready: readinessFacts,
@@ -259,6 +267,21 @@ export function projectRuntimeCopy({
         marginaliaText: newestError,
         statusLabel: "session rejected",
         cause: "agent_offline",
+      },
+      context,
+      retryAgentAction(),
+    );
+  }
+
+  if (status === "closed" && close && !context.websocketReady && isUnexpectedClose(close)) {
+    const reason = close.reason ? ` Reason: ${close.reason}.` : "";
+    return runtimeCopy(
+      {
+        capsuleLabel: "Session interrupted",
+        marginaliaTitle: "Session interrupted before the manuscript closed.",
+        marginaliaText: `The WebSocket closed with code ${close.code} before the Conductor sent a terminal phase.${reason} Retry the agent or share the close details with a developer.`,
+        statusLabel: "unexpected close",
+        cause: "unexpected_close",
       },
       context,
       retryAgentAction(),
@@ -436,6 +459,10 @@ function runtimeCopy(
   };
 }
 
+function isUnexpectedClose(close: VivaAgentCloseDiagnostics): boolean {
+  return !(close.wasClean && (close.code === 1000 || close.code === 1001));
+}
+
 function trustedTurnAction(context: RuntimeProjectionContext): {
   disabled: boolean;
   intent: RuntimePrimaryActionIntent;
@@ -520,6 +547,14 @@ function runtimeReadinessNotes(
         context.mic === "denied"
           ? "Browser microphone permission is denied."
           : "Browser microphone capture is unsupported here.",
+    });
+  }
+
+  if (context.close) {
+    notes.push({
+      label: "Close",
+      state: context.close.wasClean ? "blocked" : "unavailable",
+      text: `code ${context.close.code}; ${context.close.wasClean ? "clean" : "unclean"}${context.close.reason ? `; ${context.close.reason}` : ""}.`,
     });
   }
 

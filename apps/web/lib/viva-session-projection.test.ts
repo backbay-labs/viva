@@ -344,6 +344,66 @@ describe("projectRuntimeCopy", () => {
     expect(copy.readinessNotes.map((note) => note.label)).toContain("/ready");
   });
 
+  test("surfaces unexpected WebSocket close diagnostics as quiet recovery marginalia", () => {
+    const copy = projectRuntimeCopy({
+      close: {
+        code: 1006,
+        reason: "proxy closed before terminal phase",
+        wasClean: false,
+      },
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "closed",
+    });
+
+    expect(copy.cause).toBe("unexpected_close");
+    expect(copy.capsuleLabel).toBe("Session interrupted");
+    expect(copy.marginaliaTitle).toBe("Session interrupted before the manuscript closed.");
+    expect(copy.marginaliaText).toContain("code 1006");
+    expect(copy.marginaliaText).toContain("proxy closed before terminal phase");
+    expect(copy.marginaliaText).not.toContain("Synthetic examiner is listening");
+    expect(copy.primaryActionIntent).toBe("retry_agent");
+    expect(copy.nextActionLabel).toBe("Retry agent");
+    expect(copy.readinessNotes.some((note) => note.label === "Close")).toBe(true);
+  });
+
+  test("does not classify a clean terminal socket close as an unexpected interruption", () => {
+    const copy = projectRuntimeCopy({
+      close: {
+        code: 1000,
+        reason: "client stop",
+        wasClean: true,
+      },
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "closed",
+    });
+
+    expect(copy.cause).toBe("session_disconnected");
+    expect(copy.capsuleLabel).toBe("Session not connected");
+    expect(copy.marginaliaTitle).not.toContain("interrupted");
+    expect(copy.marginaliaText).not.toContain("terminal phase");
+    expect(copy.readinessNotes.some((note) => note.text.includes("client stop"))).toBe(true);
+  });
+
+  test("classifies close-only auth failures before generic interruption recovery", () => {
+    const copy = projectRuntimeCopy({
+      close: {
+        code: 1008,
+        reason: "invalid session token",
+        wasClean: false,
+      },
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "closed",
+    });
+
+    expect(copy.cause).toBe("auth_failed");
+    expect(copy.capsuleLabel).toBe("Auth failed");
+    expect(copy.nextActionLabel).toBe("Refresh session");
+    expect(copy.marginaliaText).not.toContain("terminal phase");
+  });
+
   test("distinguishes API missing and agent offline before flattening unavailable states", () => {
     const apiMissing = projectRuntimeCopy({
       readiness: trustedReadiness,
