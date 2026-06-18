@@ -306,6 +306,24 @@ describe("projectRuntimeCopy", () => {
     expect(copy.nextActionLabel).toBe("Retry agent");
   });
 
+  test("keeps provider gating ahead of the mic text fallback", () => {
+    const copy = projectRuntimeCopy({
+      mic: "denied",
+      readiness: trustedReadiness,
+      ready: ready("cartesia_gemini", {
+        configured: true,
+        selectable: false,
+        live_runtime: false,
+      }),
+      status: "open",
+    });
+
+    expect(copy.cause).toBe("live_provider_gated");
+    expect(copy.primaryActionDisabled).toBe(true);
+    expect(copy.primaryActionIntent).toBe("disabled");
+    expect(copy.marginaliaTitle).toBe("Agent unavailable: live provider gated.");
+  });
+
   test("surfaces REST readiness as quiet marginalia for gated providers", () => {
     const copy = projectRuntimeCopy({
       readiness: trustedReadiness,

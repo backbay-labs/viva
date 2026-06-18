@@ -316,7 +316,12 @@ export function projectRuntimeCopy({
     );
   }
 
-  if (context.websocketReady && (mic === "denied" || mic === "unsupported")) {
+  if (
+    context.websocketReady &&
+    readinessFacts.brain.configured &&
+    readinessFacts.brain.selectable &&
+    (mic === "denied" || mic === "unsupported")
+  ) {
     const denied = mic === "denied";
     return runtimeCopy(
       {

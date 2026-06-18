@@ -80,6 +80,7 @@ export function LiveSessionPage() {
     useState<VivaAgentReadinessProbe>(initialReadinessProbe);
   const [sourceOpen, setSourceOpen] = useState(false);
   const [textAnswerEnabled, setTextAnswerEnabled] = useState(false);
+  const [textRetryOpen, setTextRetryOpen] = useState(false);
   const [submittedTextAnswer, setSubmittedTextAnswer] = useState<string>();
 
   const agent = useVivaAgentSession({
@@ -266,6 +267,7 @@ export function LiveSessionPage() {
     onUserGesture();
     setSourceOpen(false);
     setHintShown(false);
+    setTextRetryOpen(false);
     // Content is the student's turn signal; the synthetic brain runs its
     // deterministic evaluation sequence. A real provider receives the transcript.
     agentRef.current.sendText("(spoken answer)");
@@ -278,6 +280,7 @@ export function LiveSessionPage() {
       activateTextAnswerMode();
       setSourceOpen(false);
       setHintShown(false);
+      setTextRetryOpen(false);
       setTextAnswerEnabled(true);
       setSubmittedTextAnswer(payload);
       agentRef.current.sendText(payload);
@@ -288,17 +291,20 @@ export function LiveSessionPage() {
     onUserGesture();
     setSourceOpen(false);
     setHintShown(false);
+    setTextRetryOpen(false);
     agentRef.current.sendText("(challenge citation)");
   }, [onUserGesture]);
   const retryAgent = useCallback(() => {
     setSourceOpen(false);
     setHintShown(false);
+    setTextRetryOpen(false);
     agentRef.current.reset();
     agentRef.current.connect();
   }, []);
   const endSession = useCallback(() => {
     setSourceOpen(false);
     setHintShown(false);
+    setTextRetryOpen(false);
     stopCaptureForRecap(captureRef, captureStartedRef, levelRef);
     agentRef.current.stop();
   }, []);
@@ -316,6 +322,7 @@ export function LiveSessionPage() {
     previousQuestionIdRef.current = activeQuestionId;
     setSubmittedTextAnswer(undefined);
     setTextAnswerEnabled(false);
+    setTextRetryOpen(false);
   }, [activeQuestionId]);
 
   // Stable session-start reference so FSRS review intervals are deterministic
@@ -371,10 +378,16 @@ export function LiveSessionPage() {
     agent.derived.question,
     agent.derived.sources,
   ]);
-  const effectiveState: SessionState = sourceOpen ? "source" : projection.state;
+  const effectiveState: SessionState = sourceOpen
+    ? "source"
+    : textRetryOpen
+      ? "listening"
+      : projection.state;
   const highlightedTokens = sourceOpen
     ? projectHighlightedTokens("source", agent.derived)
-    : projection.highlightedTokens;
+    : textRetryOpen
+      ? projectHighlightedTokens("listening", agent.derived)
+      : projection.highlightedTokens;
   const runtime = useMemo(
     () =>
       projectRuntimeCopy({
@@ -400,7 +413,9 @@ export function LiveSessionPage() {
   const textAnswerRequired = micState === "denied" || micState === "unsupported";
   const textAnswerAvailable = websocketReady;
   const textAnswerActive = textAnswerAvailable && (textAnswerRequired || textAnswerEnabled);
-  const studentHandAnswer = agent.derived.finalTranscript ?? submittedTextAnswer;
+  const studentHandAnswer = textRetryOpen
+    ? undefined
+    : (agent.derived.finalTranscript ?? submittedTextAnswer);
 
   useEffect(() => {
     if (textAnswerActive) {
@@ -409,6 +424,15 @@ export function LiveSessionPage() {
       textAnswerModeRef.current = false;
     }
   }, [activateTextAnswerMode, textAnswerActive]);
+
+  const openTextRetry = useCallback(() => {
+    setSourceOpen(false);
+    setHintShown(false);
+    setSubmittedTextAnswer(undefined);
+    setTextAnswerEnabled(true);
+    setTextRetryOpen(true);
+    activateTextAnswerMode();
+  }, [activateTextAnswerMode]);
 
   const sessionContextLabel =
     agent.readiness.reason === "trusted"
@@ -436,7 +460,7 @@ export function LiveSessionPage() {
       onShowSource={() => setSourceOpen(true)}
       onSubmitAnswer={runtime.primaryActionIntent === "retry_agent" ? retryAgent : submitSpokenTurn}
       onSubmitTextAnswer={submitTextTurn}
-      onTryAgain={submitSpokenTurn}
+      onTryAgain={textAnswerActive ? openTextRetry : submitSpokenTurn}
       onUseTextAnswer={() => {
         setTextAnswerEnabled(true);
         activateTextAnswerMode();
