@@ -9,9 +9,7 @@ formatting, linting, tests, and builds; root `package.json` exposes wrappers so
 ## Local Run
 
 ```sh
-cd agent
-cp .env.example .env
-cargo run -p agent-service
+bun run dev:agent
 ```
 
 Default local mode is `VIVA_AGENT_PROVIDER=synthetic`, which requires no provider
@@ -20,6 +18,32 @@ keys and is the only provider used unless explicitly overridden. Use
 Cartesia/Gemini-shaped runtime through the real WebSocket service boundary. Live
 `cartesia_gemini` remains rejected until the live STT -> Gemini -> TTS pipeline
 is proven.
+
+`bun run dev:agent` is the no-secret loopback path. It defaults
+`VIVA_AGENT_BIND_ADDR` to `127.0.0.1:4318`, defaults the provider to
+`synthetic`, and clears inherited `VIVA_VOICE_SESSION_TOKEN_SECRET` and
+`VIVA_VOICE_WS_BEARER_TOKEN` values before `dotenvy` reads `.env`. That is
+intentional: a root `.env` copied from production must not make the local
+synthetic `/session` page require a signed token.
+
+For the signed-session path, set `VIVA_VOICE_SESSION_TOKEN_SECRET` and run:
+
+```sh
+bun run dev:agent:signed
+```
+
+Use the signed path for production-like testing only. Session-token signing is
+required for public/non-loopback deployments and is paired with BAC-338 nonce
+replay hardening. Public binds still fail closed without auth and
+`VIVA_VOICE_WS_ALLOWED_ORIGINS` configured, per BAC-337.
+
+Running from `agent/` directly is still supported for service-only work:
+
+```sh
+cd agent
+cp .env.example .env
+cargo run -p agent-service
+```
 
 Leave `DATABASE_URL` and `VIVA_AGENT_DATABASE_URL` unset for the default
 in-memory fixture store. Setting either value opts the service into Postgres,
