@@ -45,4 +45,6 @@ Postgres durability is opt-in by setting `DATABASE_URL` or
 `VIVA_AGENT_DATABASE_URL` before starting `bun run dev:agent`. Leave those unset
 for the default in-memory fixture store. Cartesia/Gemini request builders,
 parsers, and fake-runtime tests exist in the Rust adapters, but
-`cartesia_gemini` is intentionally not a selectable runtime provider yet.
+`cartesia_gemini` is intentionally not a selectable runtime provider yet. The
+authoritative definition of live Cartesia/Gemini proof is in
+`docs/superpowers/specs/live-cartesia-gemini-definition.md`.
