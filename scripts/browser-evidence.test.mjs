@@ -59,6 +59,13 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
         "correction_marginalia",
         "recap",
       ],
+      frame_screenshot_ids: [
+        "pending_local_preview",
+        "server_ready_study_set",
+        "active_synthetic_manuscript",
+        "correction_marginalia",
+        "recap",
+      ],
       sanitized: true,
       schema: "viva.browser_story.v1",
       screenshot_count: 5,
@@ -148,6 +155,29 @@ test("rejects browser evidence without every browser-story manuscript frame", ()
         ),
       ),
     /server_ready_study_set/,
+  );
+});
+
+test("rejects required browser-story frames without their own screenshot", () => {
+  assert.throws(
+    () =>
+      assertReleaseBrowserEvidence(
+        normalizeBrowserEvidence(
+          completeBrowserResult({
+            browser_story: completeBrowserStory({
+              frames: [
+                ...completeBrowserStory().frames.map((frame) =>
+                  frame.id === "correction_marginalia"
+                    ? { id: frame.id, kind: frame.kind }
+                    : frame,
+                ),
+                { id: "extra_visual", kind: "browser_screen", screenshot: "extra.png" },
+              ],
+            }),
+          }),
+        ),
+      ),
+    /correction_marginalia.*screenshot/,
   );
 });
 

@@ -158,6 +158,7 @@ try {
   boundedSourceVisible =
     (await isVisible(page.getByText("NADH donates", { exact: false }).first())) &&
     (await isVisible(page.getByText("Document span only", { exact: false }).first()));
+  await redactSourceFolioForSanitizedScreenshot(page);
   await page.screenshot({
     path: path.join(artifactDir, "source-folio.png"),
     fullPage: true,
@@ -199,6 +200,7 @@ try {
         (await isVisible(page.getByRole("button", { name: "Try again" }).first())) &&
         (await isVisible(page.getByRole("button", { name: "Show source" }).first())) &&
         (await isVisible(page.getByRole("button", { name: "Next question" }).first()));
+      await redactCorrectionMarginaliaForSanitizedScreenshot(page);
       await page.screenshot({
         path: path.join(artifactDir, "correction-marginalia.png"),
         fullPage: true,
@@ -233,6 +235,7 @@ try {
       postAnswerBoundedSourceVisible =
         (await isVisible(page.getByText("NADH donates", { exact: false }).first())) &&
         (await isVisible(page.getByText("Document span only", { exact: false }).first()));
+      await redactSourceFolioForSanitizedScreenshot(page);
       await page.screenshot({
         path: path.join(artifactDir, "post-answer-source-folio.png"),
         fullPage: true,
@@ -285,6 +288,7 @@ try {
     page.getByRole("button", { name: /Schedule a short source-backed review tomorrow/ }),
   );
   await page.getByText("Recap ready").first().scrollIntoViewIfNeeded();
+  await redactRecapForSanitizedScreenshot(page);
   await page.waitForTimeout(600);
   await page.screenshot({
     path: path.join(artifactDir, "connected-terminal-fold.png"),
@@ -423,7 +427,47 @@ async function capturePendingLocalPreview(targetPage) {
     kind: "structured_preview",
     screenshot: "pending-local-preview.png",
     checks: ["extraction_pending", "server_not_contacted", "sanitized_summary_only"],
+    note: "Rendered from the sanitized pending-preview contract because the retired local upload UI is not mounted in the Listening Manuscript app.",
   });
+}
+
+async function redactSourceFolioForSanitizedScreenshot(targetPage) {
+  await redactLocatorText(
+    targetPage.locator(".source-folio__excerpt p").first(),
+    "Bounded source excerpt redacted in sanitized browser-story artifact.",
+  );
+}
+
+async function redactCorrectionMarginaliaForSanitizedScreenshot(targetPage) {
+  await redactLocatorText(
+    targetPage.locator(".correction__body").first(),
+    "Learner-answer reference redacted in sanitized browser-story artifact.",
+  );
+  await redactLocatorText(
+    targetPage.locator(".correction__explain").first(),
+    "Source-grounded model explanation redacted in sanitized browser-story artifact.",
+  );
+}
+
+async function redactRecapForSanitizedScreenshot(targetPage) {
+  await redactLocatorText(
+    targetPage.locator(".recap-fold .folio__excerpt").first(),
+    "Session recap summary redacted in sanitized browser-story artifact.",
+  );
+  const sourceFooters = await targetPage.locator(".recap-fold .folio__footer").all();
+  if (sourceFooters.length > 0) {
+    await redactLocatorText(
+      sourceFooters[0],
+      "Bounded source moment redacted in sanitized browser-story artifact.",
+    );
+  }
+}
+
+async function redactLocatorText(locator, replacement) {
+  if ((await locator.count()) === 0) return;
+  await locator.evaluate((element, text) => {
+    element.textContent = text;
+  }, replacement);
 }
 
 function pendingPreviewHtml() {
@@ -615,6 +659,11 @@ async function buildBrowserStoryManifest({ traceRetained }) {
 async function writeAuditedBrowserStoryResult(baseResult) {
   const storyPath = path.join(artifactDir, "browser-story.json");
   const resultPath = path.join(artifactDir, "result.json");
+  if (baseResult.trace) {
+    await writeFile(storyPath, `${JSON.stringify(baseResult.browser_story, null, 2)}\n`);
+    await writeFile(resultPath, `${JSON.stringify(baseResult, null, 2)}\n`);
+    return baseResult;
+  }
   let result = baseResult;
   for (let pass = 0; pass < 2; pass += 1) {
     await writeFile(storyPath, `${JSON.stringify(result.browser_story, null, 2)}\n`);

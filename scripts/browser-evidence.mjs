@@ -79,6 +79,9 @@ export function assertReleaseBrowserEvidence(evidence) {
     if (!browserStory.frame_ids.includes(frameId)) {
       failures.push(`browser_story.frames must include ${frameId}`);
     }
+    if (!browserStory.frame_screenshot_ids.includes(frameId)) {
+      failures.push(`browser_story.frames ${frameId} must include a screenshot`);
+    }
   }
   if (browserStory.screenshot_count < REQUIRED_BROWSER_STORY_FRAME_IDS.length) {
     failures.push(
@@ -164,6 +167,15 @@ function normalizeBrowserStory(story) {
   const screenshots = frames
     .map((frame) => (typeof frame?.screenshot === "string" ? frame.screenshot : null))
     .filter(Boolean);
+  const frameScreenshotIds = frames
+    .map((frame) =>
+      typeof frame?.id === "string" &&
+      typeof frame?.screenshot === "string" &&
+      frame.screenshot.length > 0
+        ? frame.id
+        : null,
+    )
+    .filter(Boolean);
 
   return {
     artifact_forbidden_hits: Number.isInteger(artifactAudit?.forbidden_hits)
@@ -174,6 +186,7 @@ function normalizeBrowserStory(story) {
       typeof commandSummary?.provider === "string" ? commandSummary.provider : null,
     fixture_hash_count: countFixtureHashes(story?.fixture_hashes),
     frame_ids: frameIds,
+    frame_screenshot_ids: frameScreenshotIds,
     agent_provider: typeof story?.agent_provider === "string" ? story.agent_provider : null,
     sanitized: story?.sanitized === true,
     schema: typeof story?.schema === "string" ? story.schema : null,
