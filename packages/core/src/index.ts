@@ -258,7 +258,7 @@ export const seedStudySets: StudySet[] = [
       ),
       concept("photosynthesis", "Photosynthesis", "strong", 0, sampleQuestion.source, 58),
       concept("nadh", "NADH", "review", 1, sampleQuestion.source, 91),
-      concept("atp-yield", "ATP yield", "missed", 3, sourceConflictExample, 88),
+      concept("atp-synthase", "ATP synthase", "missed", 3, sampleQuestion.source, 88),
     ],
     mastery: {
       strong: 72,
@@ -523,7 +523,7 @@ export function buildSessionRecap(evaluation: AnswerEvaluation): SessionRecap {
     strongConcepts: ["Photosynthesis basics", "Glycolysis"],
     shakyConcepts: [shakyConcept, "Krebs cycle"],
     missedConcepts: evaluation.conceptStatus === "missed" ? ["Electron transport chain"] : [],
-    reviewLater: ["ATP yield", "Shuttle systems"],
+    reviewLater: ["ATP synthase", "Shuttle systems"],
     nextAction: "Schedule tomorrow's recall drill",
     sourceMoments: [
       {
@@ -546,7 +546,7 @@ export function buildSessionRecap(evaluation: AnswerEvaluation): SessionRecap {
       },
       {
         day: "Tomorrow · 15 min",
-        topics: "NADH · Krebs cycle · ATP yield",
+        topics: "NADH · Krebs cycle · ATP synthase",
         meta: "Scheduled",
         status: "today",
       },

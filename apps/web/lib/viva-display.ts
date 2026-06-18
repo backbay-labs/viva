@@ -127,22 +127,25 @@ export function reviewPlanFromRecap(
   }
 
   return buildReviewSchedule(
-    [...statusByLabel].map(([key, status]) => {
-      const concept =
-        studySet.concepts.find((item) => item.label.toLowerCase() === key || item.id === key) ??
-        studySet.concepts.find((item) => item.label.toLowerCase().includes(key));
+    [...statusByLabel].flatMap(([key, status]) => {
+      const concept = studySet.concepts.find(
+        (item) => item.label.toLowerCase() === key || item.id === key,
+      );
+      if (!concept) return [];
 
-      return {
-        conceptId: concept?.id ?? key.replace(/\s+/g, "-"),
-        label: concept?.label ?? key,
-        status,
-        misses: concept?.misses ?? (status === "missed" ? 1 : 0),
-        hinted: signals.hinted === true,
-        centrality: concept?.centrality ?? 50,
-        now,
-        examDate,
-        lastReviewedAt,
-      };
+      return [
+        {
+          conceptId: concept.id,
+          label: concept.label,
+          status,
+          misses: concept.misses,
+          hinted: signals.hinted === true,
+          centrality: concept.centrality,
+          now,
+          examDate,
+          lastReviewedAt,
+        },
+      ];
     }),
   );
 }
@@ -177,14 +180,16 @@ function conceptSignalsFromStatuses(
   conceptStatuses: Record<string, ConceptStatus>,
 ): RecapConceptSignal[] {
   const conceptOrder = new Map(studySet.concepts.map((concept, index) => [concept.id, index]));
-  const concepts = Object.entries(conceptStatuses).map(([conceptId, status]) => {
+  const concepts = Object.entries(conceptStatuses).flatMap(([conceptId, status]) => {
     const concept = studySet.concepts.find((item) => item.id === conceptId);
+    if (!concept) return [];
+
     return {
       conceptId,
-      label: concept?.label ?? humanizeConceptId(conceptId),
+      label: concept.label,
       status,
-      misses: concept?.misses ?? (status === "missed" ? 1 : 0),
-      centrality: concept?.centrality ?? 50,
+      misses: concept.misses,
+      centrality: concept.centrality,
     };
   });
 
@@ -224,14 +229,6 @@ function primaryNextAction(
   }
 
   return "Finish the session to let the Conductor build a source-grounded review plan.";
-}
-
-function humanizeConceptId(conceptId: string): string {
-  return conceptId
-    .replace(/[-_]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
 export function correctionQuote(answer: string): string {

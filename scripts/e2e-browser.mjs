@@ -799,7 +799,6 @@ function conceptStatusText(status) {
 
 function conceptLabelText(conceptId) {
   const labels = {
-    "atp-yield": "ATP yield",
     "atp-synthase": "ATP synthase",
     "cellular-respiration": "Cellular respiration",
     glycolysis: "Glycolysis",

@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { createStudySetPreview, type SessionRecap, seedStudySets } from "@viva/core";
+import {
+  type ConceptStatus,
+  createStudySetPreview,
+  parseVivaClientFrame,
+  parseVivaServerFrame,
+  type SessionRecap,
+  seedStudySets,
+} from "@viva/core";
+import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/fake-cartesia-gemini-study-session.json";
+import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
 import {
   correctionQuote,
   recapPlanFromSessionEvents,
@@ -7,6 +16,7 @@ import {
   reviewPlanFromRecap,
   uploadPreviewSummary,
 } from "./viva-display";
+import { projectConceptNodes } from "./viva-session-projection";
 
 describe("Viva display state", () => {
   test("keeps local upload preview honest while ingestion is pending", () => {
@@ -55,16 +65,16 @@ describe("Viva display state", () => {
       summary: "Summary",
       strongConcepts: ["NADH"],
       shakyConcepts: ["Oxidative phosphorylation"],
-      missedConcepts: ["ATP yield"],
-      reviewLater: ["ATP yield"],
-      nextAction: "Review ATP yield tomorrow",
+      missedConcepts: ["ATP synthase"],
+      reviewLater: ["ATP synthase"],
+      nextAction: "Review ATP synthase tomorrow",
       plan: [],
       sourceMoments: [],
     };
 
     const plan = reviewPlanFromRecap(recap, seedStudySets[0], new Date("2026-06-17T12:00:00Z"));
 
-    expect(plan[0]?.label).toBe("ATP yield");
+    expect(plan[0]?.label).toBe("ATP synthase");
     expect(plan[0]?.authority).toBe("core_fsrs");
     expect(plan[0]?.intervalLabel).toBe("tomorrow");
   });
@@ -94,6 +104,25 @@ describe("Viva display state", () => {
     expect(plan[0]?.explanation.join(" ")).toContain("session recency cap");
   });
 
+  test("does not fuzzy-match recap labels into FSRS cards", () => {
+    const recap: SessionRecap = {
+      durationLabel: "Agent session",
+      headline: "Recap",
+      summary: "Summary",
+      strongConcepts: [],
+      shakyConcepts: [],
+      missedConcepts: ["ATP"],
+      reviewLater: ["ATP"],
+      nextAction: "Review ATP tomorrow",
+      plan: [],
+      sourceMoments: [],
+    };
+
+    const plan = reviewPlanFromRecap(recap, seedStudySets[0], new Date("2026-06-17T12:00:00Z"));
+
+    expect(plan).toEqual([]);
+  });
+
   test("derives mixed recap buckets and next action from actual concept_status events", () => {
     const recap: SessionRecap = {
       durationLabel: "Agent session",
@@ -110,7 +139,7 @@ describe("Viva display state", () => {
 
     const projection = recapPlanFromSessionEvents({
       conceptStatuses: {
-        "atp-yield": "missed",
+        "atp-synthase": "missed",
         nadh: "strong",
         "oxidative-phosphorylation": "shaky",
       },
@@ -121,17 +150,84 @@ describe("Viva display state", () => {
 
     expect(projection.recap?.strongConcepts).toEqual(["NADH"]);
     expect(projection.recap?.shakyConcepts).toEqual(["Oxidative phosphorylation"]);
-    expect(projection.recap?.missedConcepts).toEqual(["ATP yield"]);
-    expect(projection.recap?.reviewLater).toEqual(["Oxidative phosphorylation", "ATP yield"]);
+    expect(projection.recap?.missedConcepts).toEqual(["ATP synthase"]);
+    expect(projection.recap?.reviewLater).toEqual(["Oxidative phosphorylation", "ATP synthase"]);
     expect(projection.recap?.strongConcepts).not.toContain("Photosynthesis");
     expect(projection.recap?.nextAction).toBe(
-      "Rebuild ATP yield from the source, then answer it once without hints.",
+      "Rebuild ATP synthase from the source, then answer it once without hints.",
     );
     expect(projection.recap?.nextAction).not.toContain("Fixture");
-    expect(projection.reviewPlan[0]?.conceptId).toBe("atp-yield");
-    expect(projection.reviewPlan[0]?.label).toBe("ATP yield");
+    expect(projection.reviewPlan[0]?.conceptId).toBe("atp-synthase");
+    expect(projection.reviewPlan[0]?.label).toBe("ATP synthase");
     expect(projection.reviewPlan[0]?.authority).toBe("core_fsrs");
     expect(projection.reviewPlan[0]?.status).toBe("missed");
+  });
+
+  test("ignores orphan concept_status ids instead of inventing nodes or FSRS cards", () => {
+    const recap: SessionRecap = {
+      durationLabel: "Agent session",
+      headline: "Fixture recap",
+      summary: "Fixture summary",
+      strongConcepts: [],
+      shakyConcepts: [],
+      missedConcepts: ["Fixture stale id"],
+      reviewLater: ["Fixture stale id"],
+      nextAction: "Fixture action that should not ship",
+      plan: [],
+      sourceMoments: [],
+    };
+
+    const projection = recapPlanFromSessionEvents({
+      conceptStatuses: {
+        "atp-yield": "missed",
+        nadh: "strong",
+      },
+      now: new Date("2026-06-17T12:00:00Z"),
+      recap,
+      studySet: seedStudySets[0],
+    });
+
+    expect(projection.recap?.strongConcepts).toEqual(["NADH"]);
+    expect(projection.recap?.missedConcepts).toEqual([]);
+    expect(projection.recap?.reviewLater).toEqual([]);
+    expect(projection.reviewPlan.map((item) => item.conceptId)).toEqual(["nadh"]);
+  });
+
+  test("maps shared fixture concept_status ids to one Mastery node and one FSRS card", () => {
+    const biology = seedStudySets[0];
+    const conceptIds = biology.concepts.map((concept) => concept.id);
+    expect(new Set(conceptIds).size).toBe(conceptIds.length);
+
+    for (const fixture of [fullSessionFixture, fakeSessionFixture]) {
+      const activeConcepts = new Set(activeConceptIdsFromFixture(fixture));
+      const statusEntries = conceptStatusEntriesFromFixture(fixture);
+      const conceptStatuses = Object.fromEntries(statusEntries);
+      const nodes = projectConceptNodes(biology.concepts, conceptStatuses);
+      const projection = recapPlanFromSessionEvents({
+        conceptStatuses,
+        now: new Date("2026-06-17T12:00:00Z"),
+        recap: emptyRecap(),
+        studySet: biology,
+      });
+
+      expect(new Set(statusEntries.map(([conceptId]) => conceptId)).size).toBe(
+        statusEntries.length,
+      );
+      expect(projection.reviewPlan).toHaveLength(statusEntries.length);
+
+      for (const [conceptId, status] of statusEntries) {
+        expect(activeConcepts.has(conceptId)).toBe(true);
+        expect(conceptIds).toContain(conceptId);
+
+        const matchingNodes = nodes.filter((node) => node.id === conceptId);
+        expect(matchingNodes).toHaveLength(1);
+        expect(matchingNodes[0]?.status).toBe(status);
+
+        const matchingCards = projection.reviewPlan.filter((item) => item.conceptId === conceptId);
+        expect(matchingCards).toHaveLength(1);
+        expect(matchingCards[0]?.status).toBe(status);
+      }
+    }
   });
 
   test("derives all-strong recap action without inventing weak concepts", () => {
@@ -184,7 +280,7 @@ describe("Viva display state", () => {
 
     const projection = recapPlanFromSessionEvents({
       conceptStatuses: {
-        "atp-yield": "missed",
+        "atp-synthase": "missed",
         "cellular-respiration": "missed",
         "oxidative-phosphorylation": "shaky",
       },
@@ -193,7 +289,7 @@ describe("Viva display state", () => {
       studySet: seedStudySets[0],
     });
 
-    expect(projection.recap?.missedConcepts).toEqual(["Cellular respiration", "ATP yield"]);
+    expect(projection.recap?.missedConcepts).toEqual(["Cellular respiration", "ATP synthase"]);
     expect(projection.reviewPlan[0]?.status).toBe("missed");
     expect(projection.recap?.nextAction).toBe(
       `Rebuild ${projection.reviewPlan[0]?.label} from the source, then answer it once without hints.`,
@@ -213,3 +309,37 @@ describe("Viva display state", () => {
     expect(projection).toEqual({ recap: undefined, reviewPlan: [] });
   });
 });
+
+function emptyRecap(): SessionRecap {
+  return {
+    durationLabel: "Agent session",
+    headline: "Fixture recap",
+    summary: "Fixture summary",
+    strongConcepts: [],
+    shakyConcepts: [],
+    missedConcepts: [],
+    reviewLater: [],
+    nextAction: "Fixture action",
+    plan: [],
+    sourceMoments: [],
+  };
+}
+
+function activeConceptIdsFromFixture(fixture: { client: unknown[] }): string[] {
+  return fixture.client.flatMap((frame) => {
+    const parsed = parseVivaClientFrame(frame);
+    return parsed.type === "session_config" ? parsed.session.active_concepts : [];
+  });
+}
+
+function conceptStatusEntriesFromFixture(fixture: {
+  server: unknown[];
+}): [string, ConceptStatus][] {
+  return fixture.server.flatMap((frame) => {
+    const parsed = parseVivaServerFrame(frame);
+    if (parsed.type !== "event" || parsed.event.type !== "concept_status") {
+      return [];
+    }
+    return [[parsed.event.concept_id, parsed.event.status]];
+  });
+}
