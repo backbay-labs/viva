@@ -36,6 +36,9 @@ use runner::{
     CartesiaGeminiRunner, FakeCartesiaGeminiTransports, GatedNoNetworkCartesiaGeminiTransports,
 };
 
+pub(crate) const FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT: &str =
+    "NADH donates electrons to the electron transport chain.";
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct CartesiaGeminiConfig {
     pub cartesia_api_key: String,
@@ -217,9 +220,9 @@ impl FakeCartesiaGeminiRuntime {
         let (event_tx, events) = mpsc::channel::<BrainEvent>(32);
         let task = tokio::spawn(async move {
             while let Some(input) = input_rx.recv().await {
-                let audio_len = match input {
-                    BrainInput::Audio(frame) => frame.pcm16_bytes().len(),
-                    BrainInput::Text(text) => text.len(),
+                let final_transcript = match input {
+                    BrainInput::Audio(_) => FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT.to_owned(),
+                    BrainInput::Text(text) => text,
                     BrainInput::Stop => break,
                     _ => continue,
                 };
@@ -228,7 +231,7 @@ impl FakeCartesiaGeminiRuntime {
                 let _ = event_tx
                     .send(BrainEvent::TranscriptFinal {
                         response_id: response_id.clone(),
-                        text: format!("received {audio_len} bytes"),
+                        text: final_transcript.clone(),
                         confidence: Some(0.9),
                     })
                     .await;
@@ -240,7 +243,7 @@ impl FakeCartesiaGeminiRuntime {
                             "study_set_id": session.study_set_id.clone(),
                             "voice_session_id": session.voice_session_id.clone(),
                             "question_id": "q-oxidative-phosphorylation-nadh",
-                            "answer_text": "NADH donates electrons to the electron transport chain.",
+                            "answer_text": final_transcript.clone(),
                         });
                         let tool_response_id = response_id.clone();
                         let mut tool_task = tokio::spawn(async move {
@@ -284,7 +287,7 @@ impl FakeCartesiaGeminiRuntime {
                             "study_set_id": session.study_set_id.clone(),
                             "voice_session_id": session.voice_session_id.clone(),
                             "question_id": "q-oxidative-phosphorylation-nadh",
-                            "answer_text": "NADH donates electrons to the electron transport chain.",
+                            "answer_text": final_transcript.clone(),
                         });
                         if executor
                             .execute(

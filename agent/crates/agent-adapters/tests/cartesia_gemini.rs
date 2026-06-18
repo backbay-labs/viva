@@ -446,18 +446,27 @@ async fn fake_runtime_replays_provider_shaped_pipeline_without_live_selection() 
         .await
         .unwrap();
 
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, BrainEvent::TranscriptFinal { .. })));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        BrainEvent::TranscriptDelta { text, .. } if text == FAKE_INK_INTERIM_TRANSCRIPT
+    )));
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        BrainEvent::ResponseTranscriptDelta { text, .. } if text == FAKE_INK_INTERIM_TRANSCRIPT
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        BrainEvent::TranscriptFinal { text, .. } if text == FAKE_INK_FINAL_TRANSCRIPT
+    )));
     assert!(events.iter().any(|event| matches!(
         event,
         BrainEvent::AnswerEvaluated { evaluation, .. }
-            if evaluation.answer_text == "NADH donates electrons to the electron transport chain."
+            if evaluation.answer_text == FAKE_INK_FINAL_TRANSCRIPT
     )));
     assert!(events.iter().all(|event| !matches!(
         event,
         BrainEvent::AnswerEvaluated { evaluation, .. }
-            if evaluation.answer_text == "received 4 PCM16 bytes"
+            if evaluation.answer_text == FAKE_INK_INTERIM_TRANSCRIPT
     )));
     assert!(events.iter().any(|event| matches!(
         event,
@@ -569,8 +578,10 @@ async fn fake_runtime_session_cancel_during_gemini_tool_call_suppresses_tool_wri
     );
     assert!(matches!(
         next_event(&mut session).await,
-        BrainEvent::TranscriptFinal { response_id, .. }
-            if response_id == "fake-cartesia-gemini-session-response-1"
+        BrainEvent::TranscriptFinal {
+            response_id, text, ..
+        } if response_id == "fake-cartesia-gemini-session-response-1"
+            && text == FAKE_INK_FINAL_TRANSCRIPT
     ));
     timeout(Duration::from_secs(2), answer_started)
         .await
@@ -623,8 +634,10 @@ async fn fake_runtime_session_barge_in_during_sonic_audio_suppresses_old_audio()
     );
     assert!(matches!(
         next_event(&mut session).await,
-        BrainEvent::TranscriptFinal { response_id, .. }
-            if response_id == "fake-cartesia-gemini-session-response-1"
+        BrainEvent::TranscriptFinal {
+            response_id, text, ..
+        } if response_id == "fake-cartesia-gemini-session-response-1"
+            && text == FAKE_INK_FINAL_TRANSCRIPT
     ));
     assert!(matches!(
         next_event(&mut session).await,

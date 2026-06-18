@@ -22,7 +22,7 @@ use super::{
     audio_frame_bytes, gemini_request, parse_gemini_sse_line, parse_ink_event, parse_sonic_event,
     select_next_question, send_fake_unless_cancelled, sonic_generation_request,
     CartesiaGeminiConfig, FakeRuntimeInterrupt, FakeRuntimeReport, GeminiStreamEvent, InkEvent,
-    SonicEvent,
+    SonicEvent, FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT,
 };
 use super::{emit_fake_provider_error, parse_result_field};
 
@@ -78,12 +78,12 @@ where
         &self,
         session_config: SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        self.transports.authorize_open().await?;
         let store = self.store.clone().ok_or_else(|| {
             BrainError::Protocol(
                 "Cartesia/Gemini runner opened without a study-memory store".to_owned(),
             )
         })?;
+        self.transports.authorize_open().await?;
         let session = AuthorizedStudySession::from_config(&session_config)
             .map_err(|error| BrainError::Protocol(error.to_string()))?;
         store
@@ -222,18 +222,20 @@ where
             .transports
             .transcribe_audio(&self.config, &response_id, &frame)
             .await?;
-        let mut events = vec![
-            BrainEvent::InputSpeechStarted,
-            BrainEvent::ResponseTranscriptDelta {
+        let mut events = vec![BrainEvent::InputSpeechStarted];
+        if !transcript.interim_text.trim().is_empty()
+            && transcript.interim_text != transcript.final_text
+        {
+            events.push(BrainEvent::TranscriptDelta {
                 response_id: response_id.clone(),
-                text: transcript.interim_text,
-            },
-            BrainEvent::TranscriptFinal {
-                response_id: response_id.clone(),
-                text: transcript.final_text.clone(),
-                confidence: transcript.confidence,
-            },
-        ];
+                text: transcript.interim_text.clone(),
+            });
+        }
+        events.push(BrainEvent::TranscriptFinal {
+            response_id: response_id.clone(),
+            text: transcript.final_text.clone(),
+            confidence: transcript.confidence,
+        });
 
         let mut usage = BrainUsage::default();
         let prompt = self
@@ -848,9 +850,8 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
                 r#"data: {"candidates":[{"content":{"parts":[{"text":"Good. Now connect the proton gradient to ATP synthase."}]}}],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":2}}"#,
             ))
         } else {
-            let answer_text = first_user_text(&request).unwrap_or_else(|| {
-                "NADH donates electrons to the electron transport chain.".to_owned()
-            });
+            let answer_text = first_user_text(&request)
+                .unwrap_or_else(|| FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT.to_owned());
             let args = json!({
                 "study_set_id": "biology-midterm",
                 "voice_session_id": "voice-session-1",
