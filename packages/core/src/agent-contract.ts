@@ -105,7 +105,12 @@ export type AgentToolResult = {
   result: unknown;
 };
 
-export type ManuscriptRegister = "examining" | "reflecting" | "correcting" | "sourcing" | "recapping";
+export type ManuscriptRegister =
+  | "examining"
+  | "reflecting"
+  | "correcting"
+  | "sourcing"
+  | "recapping";
 export type ManuscriptEmphasis = "quiet" | "measured" | "marked";
 export type ManuscriptEntityKind = "concept" | "source" | "marginal_note";
 

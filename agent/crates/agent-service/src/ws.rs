@@ -28,6 +28,8 @@ use crate::{
     },
 };
 
+const TERMINAL_EVENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub async fn voice_ws(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -170,10 +172,33 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
                 match handle_client_message(message, &session.input, &session_binding).await {
                     Ok(action) => {
                         record_client_action(&state, voice_session_id.clone(), action);
-                        if matches!(action, ClientAction::Stop) {
-                            terminal_reason = "client_stop";
-                            let _ = close_with(&mut sender, close_code::NORMAL, "client stop").await;
-                            break;
+                        match action {
+                            ClientAction::Stop => {
+                                terminal_reason = "client_stop";
+                                if drain_terminal_events(
+                                    &state,
+                                    voice_session_id.clone(),
+                                    &mut session.events,
+                                    &mut cancelled_response_ids,
+                                    session_started_at,
+                                    &mut sender,
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    terminal_reason = "send_failed";
+                                }
+                                let _ =
+                                    close_with(&mut sender, close_code::NORMAL, "client stop").await;
+                                break;
+                            }
+                            ClientAction::Close => {
+                                terminal_reason = "client_stop";
+                                let _ =
+                                    close_with(&mut sender, close_code::NORMAL, "client stop").await;
+                                break;
+                            }
+                            _ => {}
                         }
                     }
                     Err(error) => {
@@ -188,20 +213,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
                 let Some(event) = event else {
                     break;
                 };
-                if should_suppress_cancelled_response(&mut cancelled_response_ids, &event) {
-                    continue;
-                }
-                record_brain_event(
+                if forward_brain_event(
                     &state,
                     voice_session_id.clone(),
-                    &event,
+                    event,
+                    &mut cancelled_response_ids,
                     session_started_at.elapsed(),
+                    &mut sender,
                 )
-                .await;
-                let Some(frame) = ServerFrame::browser_event(event) else {
-                    continue;
-                };
-                if send_json(&mut sender, &frame).await.is_err() {
+                .await
+                .is_err() {
                     terminal_reason = "send_failed";
                     break;
                 }
@@ -209,6 +230,58 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
         }
     }
     record_terminal(&state, voice_session_id, terminal_reason).await;
+}
+
+async fn drain_terminal_events<S>(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    events: &mut mpsc::Receiver<agent_domain::BrainEvent>,
+    cancelled_response_ids: &mut HashSet<String>,
+    session_started_at: Instant,
+    sender: &mut S,
+) -> Result<(), axum::Error>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    loop {
+        let Some(event) = timeout(TERMINAL_EVENT_DRAIN_TIMEOUT, events.recv())
+            .await
+            .ok()
+            .flatten()
+        else {
+            return Ok(());
+        };
+        forward_brain_event(
+            state,
+            voice_session_id.clone(),
+            event,
+            cancelled_response_ids,
+            session_started_at.elapsed(),
+            sender,
+        )
+        .await?;
+    }
+}
+
+async fn forward_brain_event<S>(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    event: agent_domain::BrainEvent,
+    cancelled_response_ids: &mut HashSet<String>,
+    session_elapsed: Duration,
+    sender: &mut S,
+) -> Result<(), axum::Error>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    if should_suppress_cancelled_response(cancelled_response_ids, &event) {
+        return Ok(());
+    }
+    record_brain_event(state, voice_session_id, &event, session_elapsed).await;
+    let Some(frame) = ServerFrame::browser_event(event) else {
+        return Ok(());
+    };
+    send_json(sender, &frame).await
 }
 
 fn should_suppress_cancelled_response(
@@ -302,7 +375,7 @@ async fn handle_client_message(
         Message::Close(_) => input
             .send(BrainInput::Stop)
             .await
-            .map(|_| ClientAction::Stop)
+            .map(|_| ClientAction::Close)
             .map_err(|_| ClientFrameError::disconnected()),
         Message::Ping(_) | Message::Pong(_) => Ok(ClientAction::Keepalive),
     }
@@ -447,6 +520,7 @@ enum ClientAction {
     Audio,
     AnswerText,
     Cancel,
+    Close,
     ConfigRefresh,
     Keepalive,
     Stop,
@@ -554,6 +628,7 @@ fn record_client_action(state: &AppState, voice_session_id: Option<String>, acti
             "text answer received",
         ),
         ClientAction::Cancel => (VoiceEvidenceEventKind::CancelReceived, "cancel received"),
+        ClientAction::Close => (VoiceEvidenceEventKind::StopReceived, "close received"),
         ClientAction::ConfigRefresh => (
             VoiceEvidenceEventKind::ConfigAccepted,
             "config refresh received",

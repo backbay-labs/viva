@@ -1,6 +1,6 @@
+import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import { MuseBackdrop } from "../landing/MuseBackdrop";
 import { MuseGlyphCanvas, type MuseGlyphState } from "../landing/MuseGlyphCanvas";
-import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import { MarginaliaPanel } from "./MarginaliaPanel";
 import { QuestionStage } from "./QuestionStage";
 import { SessionBottomControls } from "./SessionBottomControls";

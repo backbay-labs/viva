@@ -151,13 +151,7 @@ function validateSceneIntent(value: unknown): ManuscriptIntent | null {
       };
     case "marginalia_intent":
       if (
-        !hasOnlyKeys(record, [
-          "type",
-          "marginalia_id",
-          "anchor_entity_id",
-          "register",
-          "emphasis",
-        ])
+        !hasOnlyKeys(record, ["type", "marginalia_id", "anchor_entity_id", "register", "emphasis"])
       ) {
         return null;
       }

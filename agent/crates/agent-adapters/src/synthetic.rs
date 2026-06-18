@@ -729,8 +729,9 @@ mod tests {
 
         let mut saw_evaluation = false;
         let mut saw_source = false;
+        let mut saw_manuscript_intent = false;
         let mut saw_usage = false;
-        for _ in 0..12 {
+        loop {
             match next_event(&mut session).await {
                 BrainEvent::AnswerEvaluated {
                     response_id,
@@ -748,6 +749,10 @@ mod tests {
                     assert_eq!(source.span, "slide:18");
                     saw_source = true;
                 }
+                BrainEvent::ManuscriptIntent { response_id, .. } => {
+                    assert_eq!(response_id, "response-1");
+                    saw_manuscript_intent = true;
+                }
                 BrainEvent::Usage(usage) => {
                     assert_eq!(usage.text_input_tokens, 20);
                     assert_eq!(usage.text_output_tokens, 10);
@@ -762,6 +767,7 @@ mod tests {
         }
         assert!(saw_evaluation);
         assert!(saw_source);
+        assert!(saw_manuscript_intent);
         assert!(saw_usage);
 
         session

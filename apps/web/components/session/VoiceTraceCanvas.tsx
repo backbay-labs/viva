@@ -404,9 +404,7 @@ export function VoiceTraceCanvas({
         const sceneBoost = sceneEntityWeights.get(node.id) ?? 0;
         const emph = Math.min(
           1.2,
-          node.emphasis * (0.55 + cur.gather * 0.45) +
-            sceneBoost * 0.22 +
-            (highlighted ? 0.3 : 0),
+          node.emphasis * (0.55 + cur.gather * 0.45) + sceneBoost * 0.22 + (highlighted ? 0.3 : 0),
         );
 
         // status glow
