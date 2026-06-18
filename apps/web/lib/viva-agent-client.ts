@@ -84,6 +84,12 @@ export type VivaAgentReadinessProbe =
 
 export type VivaAgentConnectionStatus = "idle" | "connecting" | "open" | "closed" | "error";
 
+export type VivaAgentCloseDiagnostics = {
+  code: number;
+  reason: string;
+  wasClean: boolean;
+};
+
 export type VivaAgentAudioOutput = {
   responseId: string;
   frame: AgentAudioFrame;
@@ -96,6 +102,7 @@ export type VivaAgentManuscriptIntent = {
 
 export type VivaAgentSessionState = {
   status: VivaAgentConnectionStatus;
+  close?: VivaAgentCloseDiagnostics;
   ready?: VivaReadyFrame;
   phase: AgentStudySessionPhase;
   activeResponseId?: string;
@@ -486,9 +493,9 @@ export function createVivaAgentSessionController(
           });
         }
       });
-      setSocketHandler(nextSocket, "close", () => {
+      setSocketHandler(nextSocket, "close", (event) => {
         if (socket !== nextSocket) return;
-        setState({ ...state, status: "closed" });
+        setState({ ...state, status: "closed", close: closeDiagnosticsForEvent(event) });
       });
       setSocketHandler(nextSocket, "error", () => {
         if (socket !== nextSocket) return;
@@ -547,7 +554,43 @@ function responseIdForEvent(event: VivaServerEvent): string | undefined {
   }
 }
 
-type VivaSocketEvent = Event & { data?: unknown };
+function closeDiagnosticsForEvent(event: VivaSocketEvent): VivaAgentCloseDiagnostics {
+  return {
+    code: typeof event.code === "number" ? event.code : 1005,
+    reason: safeCloseReasonForDisplay(typeof event.reason === "string" ? event.reason : ""),
+    wasClean: typeof event.wasClean === "boolean" ? event.wasClean : false,
+  };
+}
+
+const safeAgentCloseReasons = new Set([
+  "agent input closed",
+  "binary frame too large",
+  "client stop",
+  "first frame timeout",
+  "idle timeout",
+  "invalid client frame",
+  "invalid session identity",
+  "invalid session token",
+  "provider source authority rejected",
+  "session config required",
+  "study set access denied",
+  "text frame too large",
+  "untrusted tool_result",
+]);
+
+function safeCloseReasonForDisplay(reason: string): string {
+  const normalized = reason.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  const lower = normalized.toLowerCase();
+  return safeAgentCloseReasons.has(lower) ? lower : "[redacted close reason]";
+}
+
+type VivaSocketEvent = Event & {
+  code?: number;
+  data?: unknown;
+  reason?: string;
+  wasClean?: boolean;
+};
 
 function setSocketHandler(
   socket: WebSocket,

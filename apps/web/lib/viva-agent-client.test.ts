@@ -256,6 +256,95 @@ describe("Viva agent browser client", () => {
     expect(controller.getState().phase).toBe("recap");
   });
 
+  test("controller records sanitized close diagnostics when the server closes the socket", () => {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      session: sessionFixture as AgentSessionConfig,
+      url: "ws://localhost:4318/ws",
+    });
+
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.open();
+    socket.close({
+      code: 1008,
+      reason:
+        "provider payload rejected bearer viva1.secret-token with raw answer transcript that should be redacted",
+      wasClean: false,
+    });
+
+    expect(controller.getState().status).toBe("closed");
+    expect(controller.getState().close).toEqual({
+      code: 1008,
+      reason: "[redacted close reason]",
+      wasClean: false,
+    });
+  });
+
+  test("controller only displays allowlisted close reasons", () => {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      session: sessionFixture as AgentSessionConfig,
+      url: "ws://localhost:4318/ws",
+    });
+
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.open();
+    socket.close({
+      code: 1008,
+      reason: "NADH donates electrons before the exam answer key is shown",
+      wasClean: false,
+    });
+
+    expect(controller.getState().close).toEqual({
+      code: 1008,
+      reason: "[redacted close reason]",
+      wasClean: false,
+    });
+  });
+
+  test("controller preserves standardized auth close reasons for recovery classification", () => {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      session: sessionFixture as AgentSessionConfig,
+      url: "ws://localhost:4318/ws",
+    });
+
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.open();
+    socket.close({
+      code: 1008,
+      reason: "invalid session token",
+      wasClean: false,
+    });
+
+    expect(controller.getState().close).toEqual({
+      code: 1008,
+      reason: "invalid session token",
+      wasClean: false,
+    });
+  });
+
+  test("controller reconnect closes the previous socket before opening a replacement", () => {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      session: sessionFixture as AgentSessionConfig,
+      url: "ws://localhost:4318/ws",
+    });
+
+    const first = controller.connect() as unknown as FakeWebSocket;
+    const second = controller.connect() as unknown as FakeWebSocket;
+
+    expect(FakeWebSocket.instances).toEqual([first, second]);
+    expect(first.closeCount).toBe(1);
+    expect(first.readyState).toBe(3);
+    expect(second.closeCount).toBe(0);
+    expect(controller.getState().status).toBe("connecting");
+  });
+
   test("reducer maps product session fixture and suppresses stale response events", () => {
     let state = initialVivaAgentSessionState();
     for (const frame of fullSessionFixture.server.map(parseVivaServerFrame)) {
@@ -450,6 +539,7 @@ describe("Viva agent browser client", () => {
 
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
+  closeCount = 0;
   readyState = 0;
   sent: string[] = [];
   listeners = new Map<string, Array<(event: Event & { data?: unknown }) => void>>();
@@ -471,9 +561,17 @@ class FakeWebSocket {
     this.sent.push(data);
   }
 
-  close() {
+  close(event: Partial<CloseEvent> = {}) {
+    this.closeCount += 1;
     this.readyState = 3;
-    this.emit("close", new Event("close"));
+    this.emit(
+      "close",
+      Object.assign(new Event("close"), {
+        code: event.code ?? 1000,
+        reason: event.reason ?? "",
+        wasClean: event.wasClean ?? true,
+      }),
+    );
   }
 
   open() {
