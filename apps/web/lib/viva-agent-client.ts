@@ -1,8 +1,10 @@
 import {
   type AgentAnswerEvaluation,
   type AgentAudioFrame,
+  type AgentBrainReadiness,
   type AgentConceptStatus,
   type AgentSessionConfig,
+  type AgentStoreReadiness,
   type AgentStudyQuestion,
   type AgentStudySessionPhase,
   type AgentStudySessionRecap,
@@ -40,6 +42,45 @@ export type VivaPasteStudySetOptions = {
   apiBaseUrl?: string;
   fetchImpl?: typeof fetch;
 };
+
+export type VivaAgentStoreReadinessEndpoint = AgentStoreReadiness & {
+  writes?: {
+    sessions: number;
+    answer_attempts: number;
+    concept_statuses: number;
+    review_items: number;
+    recaps: number;
+  };
+};
+
+export type VivaAgentReadyEndpoint = {
+  ready: boolean;
+  brain: AgentBrainReadiness;
+  store: VivaAgentStoreReadinessEndpoint;
+};
+
+export type VivaAgentBrainHealthEndpoint = {
+  provider: string;
+  brain: AgentBrainReadiness;
+  store: VivaAgentStoreReadinessEndpoint;
+  status: string;
+  usage?: {
+    events?: number;
+  };
+};
+
+export type VivaAgentReadinessProbe =
+  | { status: "api_missing" }
+  | { status: "checking"; apiBaseUrl: string }
+  | { status: "offline"; apiBaseUrl: string; error: string }
+  | {
+      status: "observed";
+      apiBaseUrl: string;
+      healthHttpStatus: number;
+      health: VivaAgentBrainHealthEndpoint;
+      readyHttpStatus: number;
+      ready: VivaAgentReadyEndpoint;
+    };
 
 export type VivaAgentConnectionStatus = "idle" | "connecting" | "open" | "closed" | "error";
 
@@ -91,6 +132,7 @@ export type VivaAgentSessionController = {
 };
 
 const bundledVivaAgentWsUrl = process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL;
+const bundledVivaAgentHttpUrl = process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL;
 const bundledVivaApiUrl = process.env.NEXT_PUBLIC_VIVA_API_URL;
 const defaultVivaAgentWsUrl = "ws://127.0.0.1:4318/ws";
 
@@ -130,6 +172,124 @@ export function vivaApiBaseUrl(env?: Record<string, string | undefined>): string
   } catch {
     return undefined;
   }
+}
+
+export function vivaAgentHttpBaseUrl(env?: Record<string, string | undefined>): string | undefined {
+  const explicitEnv = env !== undefined;
+  const resolvedEnv = env ?? envRecord();
+  const explicitAgentHttp =
+    resolvedEnv.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL ??
+    (explicitEnv ? undefined : bundledVivaAgentHttpUrl);
+  if (explicitAgentHttp?.trim()) return trimTrailingSlash(explicitAgentHttp.trim());
+
+  try {
+    const url = new URL(vivaAgentWsUrl(env));
+    if (url.protocol === "ws:") {
+      url.protocol = "http:";
+    } else if (url.protocol === "wss:") {
+      url.protocol = "https:";
+    } else {
+      return undefined;
+    }
+    url.pathname = url.pathname.replace(/\/ws\/?$/, "") || "/";
+    url.search = "";
+    url.hash = "";
+    return trimTrailingSlash(url.toString());
+  } catch {
+    return undefined;
+  }
+}
+
+export async function fetchVivaAgentReadinessProbe({
+  apiBaseUrl = vivaAgentHttpBaseUrl(),
+  fetchImpl = fetch,
+}: {
+  apiBaseUrl?: string;
+  fetchImpl?: typeof fetch;
+} = {}): Promise<VivaAgentReadinessProbe> {
+  if (!apiBaseUrl) return { status: "api_missing" };
+  const base = trimTrailingSlash(apiBaseUrl);
+  try {
+    const [healthResponse, readyResponse] = await Promise.all([
+      fetchImpl(`${base}/health/brain`),
+      fetchImpl(`${base}/ready`),
+    ]);
+    const [health, ready] = await Promise.all([
+      healthResponse.json() as Promise<VivaAgentBrainHealthEndpoint>,
+      readyResponse.json() as Promise<VivaAgentReadyEndpoint>,
+    ]);
+    if (!isVivaAgentBrainHealthEndpoint(health)) {
+      throw new Error("invalid /health/brain readiness payload");
+    }
+    if (!isVivaAgentReadyEndpoint(ready)) {
+      throw new Error("invalid /ready readiness payload");
+    }
+    return {
+      apiBaseUrl: base,
+      health,
+      healthHttpStatus: healthResponse.status,
+      ready,
+      readyHttpStatus: readyResponse.status,
+      status: "observed",
+    };
+  } catch (error) {
+    return {
+      apiBaseUrl: base,
+      error: error instanceof Error ? error.message : String(error),
+      status: "offline",
+    };
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isBoolean(value: unknown): value is boolean {
+  return typeof value === "boolean";
+}
+
+function isAgentBrainReadiness(value: unknown): value is AgentBrainReadiness {
+  return (
+    isRecord(value) &&
+    typeof value.provider === "string" &&
+    isBoolean(value.configured) &&
+    isBoolean(value.selectable) &&
+    isBoolean(value.live_runtime)
+  );
+}
+
+function isVivaAgentStoreReadinessEndpoint(
+  value: unknown,
+): value is VivaAgentStoreReadinessEndpoint {
+  return (
+    isRecord(value) &&
+    typeof value.backend === "string" &&
+    isBoolean(value.available) &&
+    isBoolean(value.durable) &&
+    isBoolean(value.raw_audio_persistence) &&
+    isBoolean(value.transcript_persistence) &&
+    isBoolean(value.uuid_schema_translation)
+  );
+}
+
+function isVivaAgentReadyEndpoint(value: unknown): value is VivaAgentReadyEndpoint {
+  return (
+    isRecord(value) &&
+    isBoolean(value.ready) &&
+    isAgentBrainReadiness(value.brain) &&
+    isVivaAgentStoreReadinessEndpoint(value.store)
+  );
+}
+
+function isVivaAgentBrainHealthEndpoint(value: unknown): value is VivaAgentBrainHealthEndpoint {
+  return (
+    isRecord(value) &&
+    typeof value.provider === "string" &&
+    typeof value.status === "string" &&
+    isAgentBrainReadiness(value.brain) &&
+    isVivaAgentStoreReadinessEndpoint(value.store)
+  );
 }
 
 export function vivaAgentProtocols(token?: string): string[] {

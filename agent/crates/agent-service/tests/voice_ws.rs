@@ -131,6 +131,62 @@ async fn ready_and_brain_health_routes_report_configured_synthetic_provider() {
 }
 
 #[tokio::test]
+async fn readiness_routes_are_browser_readable_from_allowed_origin() {
+    let origin = "http://127.0.0.1:3007";
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(store.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: None,
+            allowed_origins: vec![origin.to_owned()],
+        },
+        4,
+        store,
+    );
+    let app = build_router(state);
+
+    for path in ["/health", "/live", "/ready", "/health/brain"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("origin", origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            response.status().is_success(),
+            "{path} returned {}",
+            response.status()
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            origin,
+            "{path} did not expose browser-readable CORS"
+        );
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-methods")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("GET"),
+            "{path} did not advertise GET as an allowed method"
+        );
+    }
+}
+
+#[tokio::test]
 async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token() {
     let store = Arc::new(data::InMemoryStudyStore::new());
     let state = AppState::with_study_store(

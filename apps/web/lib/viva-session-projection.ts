@@ -14,7 +14,11 @@ import type {
   SessionState,
 } from "../components/session/session-data";
 import type { VivaAgentDerivedState } from "./use-viva-agent-session";
-import type { VivaAgentConnectionStatus } from "./viva-agent-client";
+import type {
+  VivaAgentConnectionStatus,
+  VivaAgentReadinessProbe,
+  VivaAgentReadyEndpoint,
+} from "./viva-agent-client";
 
 /**
  * The Conductor — a pure projection from the real agent event stream
@@ -42,6 +46,7 @@ export type TraceProjection = {
 };
 
 export type RuntimeCopyCause =
+  | "api_missing"
   | "agent_offline"
   | "auth_failed"
   | "fake_provider"
@@ -50,6 +55,7 @@ export type RuntimeCopyCause =
   | "live_provider_gated"
   | "live_runtime"
   | "mic_denied"
+  | "session_disconnected"
   | "store_unavailable"
   | "synthetic";
 
@@ -57,11 +63,33 @@ export type RuntimeCopy = {
   capsuleLabel: string;
   marginaliaTitle: string;
   marginaliaText: string;
+  nextActionLabel: string;
+  primaryActionIntent: RuntimePrimaryActionIntent;
+  primaryActionDisabled: boolean;
+  primaryActionLabel: string;
+  readinessNotes: RuntimeReadinessNote[];
   statusLabel: string;
   cause: RuntimeCopyCause;
 };
 
+export type RuntimePrimaryActionIntent = "disabled" | "retry_agent" | "submit_turn";
+
+export type RuntimeReadinessNote = {
+  label: string;
+  state: "blocked" | "checking" | "ready" | "unavailable";
+  text: string;
+};
+
 export type RuntimeMicState = "available" | "denied" | "unsupported" | "unknown";
+
+type RuntimeProjectionContext = {
+  readiness: AgentStudySetReadiness;
+  readinessProbe?: VivaAgentReadinessProbe;
+  ready?: VivaReadyFrame | VivaAgentReadyEndpoint;
+  websocketReady: boolean;
+  status: VivaAgentConnectionStatus;
+  mic: RuntimeMicState;
+};
 
 function clamp01(value: number): number {
   if (!Number.isFinite(value)) return 0;
@@ -117,156 +145,439 @@ export function projectRuntimeCopy({
   status,
   errors = [],
   mic = "unknown",
+  readinessProbe,
 }: {
   readiness: AgentStudySetReadiness;
   ready?: VivaReadyFrame;
+  readinessProbe?: VivaAgentReadinessProbe;
   status: VivaAgentConnectionStatus;
   errors?: string[];
   mic?: RuntimeMicState;
 }): RuntimeCopy {
   const newestError = errors.at(-1) ?? "";
   const authFailed = /auth|token|claim|unauthori[sz]ed/i.test(newestError);
+  const endpointReady = readinessProbe?.status === "observed" ? readinessProbe.ready : undefined;
+  const readinessFacts = ready ?? endpointReady;
+  const context: RuntimeProjectionContext = {
+    mic,
+    readiness,
+    readinessProbe,
+    ready: readinessFacts,
+    status,
+    websocketReady: Boolean(ready) && status === "open",
+  };
+
   if (authFailed) {
-    return {
-      capsuleLabel: "Auth failed",
-      marginaliaTitle: "Agent unavailable: auth failed.",
-      marginaliaText:
-        "The Conductor auth failed for this session identity; refresh the signed session before the manuscript opens another question.",
-      statusLabel: "Auth failed",
-      cause: "auth_failed",
-    };
+    return runtimeCopy(
+      {
+        capsuleLabel: "Auth failed",
+        marginaliaTitle: "Agent unavailable: auth failed.",
+        marginaliaText:
+          "The Conductor auth failed for this session identity; refresh the signed session before the manuscript opens another question.",
+        statusLabel: "Auth failed",
+        cause: "auth_failed",
+      },
+      context,
+      { disabled: true, nextActionLabel: "Refresh session" },
+    );
   }
 
   if (!readiness.canConnect) {
     const ingestionFailed = readiness.reason === "failed_ingestion";
-    return {
-      capsuleLabel: ingestionFailed ? "Ingestion failed" : "Ingestion pending",
-      marginaliaTitle: ingestionFailed
-        ? "Agent unavailable: ingestion failed."
-        : "Agent unavailable: ingestion pending.",
-      marginaliaText: readiness.message,
-      statusLabel: readiness.reason.replace(/_/g, " "),
-      cause: ingestionFailed ? "ingestion_failed" : "ingestion_pending",
-    };
+    return runtimeCopy(
+      {
+        capsuleLabel: ingestionFailed ? "Ingestion failed" : "Ingestion pending",
+        marginaliaTitle: ingestionFailed
+          ? "Agent unavailable: ingestion failed."
+          : "Agent unavailable: ingestion pending.",
+        marginaliaText: readiness.message,
+        statusLabel: readiness.reason.replace(/_/g, " "),
+        cause: ingestionFailed ? "ingestion_failed" : "ingestion_pending",
+      },
+      context,
+      {
+        disabled: true,
+        nextActionLabel: ingestionFailed ? "Return to upload" : "Refresh ingestion",
+      },
+    );
   }
 
-  if (!ready) {
+  if (!readinessFacts) {
+    if (readinessProbe?.status === "api_missing") {
+      return runtimeCopy(
+        {
+          capsuleLabel: "API missing",
+          marginaliaTitle: "Agent unavailable: API missing.",
+          marginaliaText:
+            "The manuscript cannot derive an HTTP readiness URL for `/ready` or `/health/brain`.",
+          statusLabel: "api missing",
+          cause: "api_missing",
+        },
+        context,
+        { disabled: true, nextActionLabel: "Run local demo" },
+      );
+    }
+
+    if (readinessProbe?.status === "offline") {
+      return runtimeCopy(
+        {
+          capsuleLabel: "Agent offline",
+          marginaliaTitle: "Agent unavailable: service offline.",
+          marginaliaText: `The manuscript could not reach \`/ready\` or \`/health/brain\` at ${readinessProbe.apiBaseUrl}: ${readinessProbe.error}`,
+          statusLabel: "agent offline",
+          cause: "agent_offline",
+        },
+        context,
+        retryAgentAction(),
+      );
+    }
+
     const connecting = status === "connecting" || status === "idle";
-    return {
-      capsuleLabel: connecting ? "Agent connecting" : "Agent offline",
-      marginaliaTitle: connecting
-        ? "Waiting for the Conductor."
-        : "Agent unavailable: service offline.",
-      marginaliaText: connecting
-        ? "The manuscript has not received provider readiness from the Conductor yet."
-        : newestError ||
-          "The `/ws` stream closed before provider readiness reached the manuscript.",
-      statusLabel: connecting ? "connecting" : "agent offline",
-      cause: "agent_offline",
-    };
+    return runtimeCopy(
+      {
+        capsuleLabel: connecting ? "Agent connecting" : "Agent offline",
+        marginaliaTitle: connecting
+          ? "Waiting for the Conductor."
+          : "Agent unavailable: service offline.",
+        marginaliaText: connecting
+          ? "The manuscript has not received provider readiness from the Conductor yet."
+          : newestError ||
+            "The `/ws` stream closed before provider readiness reached the manuscript.",
+        statusLabel: connecting ? "connecting" : "agent offline",
+        cause: "agent_offline",
+      },
+      context,
+      retryAgentAction(),
+    );
   }
 
   if (newestError && (status === "error" || status === "closed")) {
-    return {
-      capsuleLabel: "Agent unavailable",
-      marginaliaTitle: "Agent unavailable: session rejected.",
-      marginaliaText: newestError,
-      statusLabel: "session rejected",
-      cause: "agent_offline",
-    };
+    return runtimeCopy(
+      {
+        capsuleLabel: "Agent unavailable",
+        marginaliaTitle: "Agent unavailable: session rejected.",
+        marginaliaText: newestError,
+        statusLabel: "session rejected",
+        cause: "agent_offline",
+      },
+      context,
+      retryAgentAction(),
+    );
   }
 
-  if (!ready.store.available) {
-    const backend = ready.store.backend.replace(/_/g, " ");
-    return {
-      capsuleLabel: "Store unavailable",
-      marginaliaTitle: "Agent unavailable: store unavailable.",
-      marginaliaText: `The ${backend} store is unavailable, so Viva will not ask or mark questions for this session.`,
-      statusLabel: `${backend} store unavailable`,
-      cause: "store_unavailable",
-    };
+  if (!readinessFacts.store.available) {
+    const backend = readinessFacts.store.backend.replace(/_/g, " ");
+    return runtimeCopy(
+      {
+        capsuleLabel: "Store unavailable",
+        marginaliaTitle: "Agent unavailable: store unavailable.",
+        marginaliaText: `The ${backend} store is unavailable, so Viva will not ask or mark questions for this session.`,
+        statusLabel: `${backend} store unavailable`,
+        cause: "store_unavailable",
+      },
+      context,
+      retryAgentAction(),
+    );
   }
 
   if (mic === "denied" || mic === "unsupported") {
     const denied = mic === "denied";
-    return {
-      capsuleLabel: denied ? "Mic denied" : "Mic unavailable",
-      marginaliaTitle: denied
-        ? "Agent unavailable: mic denied."
-        : "Agent unavailable: mic unavailable.",
-      marginaliaText: denied
-        ? "Browser microphone capture was denied. Use the keyboard turn control or allow mic access before treating this as a spoken session."
-        : "Browser microphone capture is unavailable in this browser context. Use the keyboard turn control or switch to a browser with audio capture.",
-      statusLabel: denied ? "mic denied" : "mic unavailable",
-      cause: "mic_denied",
-    };
-  }
-
-  if (ready.brain.selectable && ready.brain.live_runtime) {
-    if (ready.brain.provider === "cartesia_gemini") {
-      return {
-        capsuleLabel: "Live Cartesia/Gemini tutor",
-        marginaliaTitle: "Live Cartesia/Gemini tutor is listening.",
-        marginaliaText:
-          "The live Cartesia/Gemini runtime is selected; spoken turns are handled by the Act 3 provider path.",
-        statusLabel: "live runtime",
-        cause: "live_runtime",
-      };
-    }
-    return {
-      capsuleLabel: "Live tutor",
-      marginaliaTitle: "Live tutor is listening.",
-      marginaliaText:
-        "The live provider runtime is selected; spoken turns are handled by the Act 3 provider path.",
-      statusLabel: "live runtime",
-      cause: "live_runtime",
-    };
-  }
-
-  if (ready.brain.provider === "synthetic") {
-    return {
-      capsuleLabel: "Synthetic examiner",
-      marginaliaTitle: "Synthetic examiner is listening.",
-      marginaliaText:
-        "Default no-key synthetic brain: a verified Act 1 event stream with source-grounded questions and no provider keys.",
-      statusLabel: "synthetic",
-      cause: "synthetic",
-    };
-  }
-
-  if (ready.brain.provider === "fake_cartesia_gemini") {
-    return {
-      capsuleLabel: "Non-live provider test",
-      marginaliaTitle: "Non-live provider test is listening.",
-      marginaliaText:
-        "The Cartesia/Gemini-shaped path is running through no-key test transports; it is not a live tutor.",
-      statusLabel: "fake provider",
-      cause: "fake_provider",
-    };
+    return runtimeCopy(
+      {
+        capsuleLabel: denied ? "Mic denied" : "Mic unavailable",
+        marginaliaTitle: denied
+          ? "Agent unavailable: mic denied."
+          : "Agent unavailable: mic unavailable.",
+        marginaliaText: denied
+          ? "Browser microphone capture was denied. Allow mic access before treating this as a spoken session."
+          : "Browser microphone capture is unavailable in this browser context. Check mic access or switch to a browser with audio capture.",
+        statusLabel: denied ? "mic denied" : "mic unavailable",
+        cause: "mic_denied",
+      },
+      context,
+      { disabled: true, nextActionLabel: "Check mic" },
+    );
   }
 
   if (
-    ready.brain.provider === "cartesia_gemini" ||
-    !ready.brain.configured ||
-    !ready.brain.selectable
+    !context.websocketReady &&
+    readinessFacts.brain.configured &&
+    readinessFacts.brain.selectable &&
+    readinessFacts.store.available
   ) {
-    return {
-      capsuleLabel: "Live provider gated",
-      marginaliaTitle: "Agent unavailable: live provider gated.",
-      marginaliaText:
-        "Cartesia/Gemini is reserved for Act 3 until provider keys and the live runtime are selectable.",
-      statusLabel: "live provider gated",
-      cause: "live_provider_gated",
-    };
+    return runtimeCopy(
+      {
+        capsuleLabel: "Session not connected",
+        marginaliaTitle: "Agent ready; session not connected.",
+        marginaliaText: `HTTP readiness is green for ${readinessFacts.brain.provider}, but the manuscript has not received an open WebSocket ready frame for a trusted turn.`,
+        statusLabel: "session not connected",
+        cause: "session_disconnected",
+      },
+      context,
+      retryAgentAction(),
+    );
   }
 
+  if (readinessFacts.brain.selectable && readinessFacts.brain.live_runtime) {
+    if (readinessFacts.brain.provider === "cartesia_gemini") {
+      return runtimeCopy(
+        {
+          capsuleLabel: "Live Cartesia/Gemini tutor",
+          marginaliaTitle: "Live Cartesia/Gemini tutor is listening.",
+          marginaliaText:
+            "The live Cartesia/Gemini runtime is selected; spoken turns are handled by the Act 3 provider path.",
+          statusLabel: "live runtime",
+          cause: "live_runtime",
+        },
+        context,
+        trustedTurnAction(context),
+      );
+    }
+    return runtimeCopy(
+      {
+        capsuleLabel: "Live tutor",
+        marginaliaTitle: "Live tutor is listening.",
+        marginaliaText:
+          "The live provider runtime is selected; spoken turns are handled by the Act 3 provider path.",
+        statusLabel: "live runtime",
+        cause: "live_runtime",
+      },
+      context,
+      trustedTurnAction(context),
+    );
+  }
+
+  if (readinessFacts.brain.provider === "synthetic") {
+    return runtimeCopy(
+      {
+        capsuleLabel: "Synthetic examiner",
+        marginaliaTitle: "Synthetic examiner is listening.",
+        marginaliaText:
+          "Default no-key synthetic brain: a verified Act 1 event stream with source-grounded questions and no provider keys.",
+        statusLabel: "synthetic",
+        cause: "synthetic",
+      },
+      context,
+      trustedTurnAction(context),
+    );
+  }
+
+  if (readinessFacts.brain.provider === "fake_cartesia_gemini") {
+    return runtimeCopy(
+      {
+        capsuleLabel: "Non-live provider test",
+        marginaliaTitle: "Non-live provider test is listening.",
+        marginaliaText:
+          "The Cartesia/Gemini-shaped path is running through no-key test transports; it is not a live tutor.",
+        statusLabel: "fake provider",
+        cause: "fake_provider",
+      },
+      context,
+      trustedTurnAction(context),
+    );
+  }
+
+  if (
+    readinessFacts.brain.provider === "cartesia_gemini" ||
+    !readinessFacts.brain.configured ||
+    !readinessFacts.brain.selectable
+  ) {
+    return runtimeCopy(
+      {
+        capsuleLabel: "Live provider gated",
+        marginaliaTitle: "Agent unavailable: live provider gated.",
+        marginaliaText:
+          "Cartesia/Gemini is reserved for Act 3 until provider keys and the live runtime are selectable.",
+        statusLabel: "live provider gated",
+        cause: "live_provider_gated",
+      },
+      context,
+      { disabled: true, nextActionLabel: "Run local demo" },
+    );
+  }
+
+  return runtimeCopy(
+    {
+      capsuleLabel: "Non-live provider test",
+      marginaliaTitle: "Non-live provider test is listening.",
+      marginaliaText: `${readinessFacts.brain.provider} is running through a no-key provider path; it is not a live tutor.`,
+      statusLabel: "non-live provider",
+      cause: "fake_provider",
+    },
+    context,
+    trustedTurnAction(context),
+  );
+}
+
+function runtimeCopy(
+  copy: Omit<
+    RuntimeCopy,
+    | "nextActionLabel"
+    | "primaryActionDisabled"
+    | "primaryActionIntent"
+    | "primaryActionLabel"
+    | "readinessNotes"
+  >,
+  context: RuntimeProjectionContext,
+  action: {
+    disabled: boolean;
+    intent?: RuntimePrimaryActionIntent;
+    nextActionLabel: string;
+    primaryActionLabel?: string;
+  },
+): RuntimeCopy {
   return {
-    capsuleLabel: "Non-live provider test",
-    marginaliaTitle: "Non-live provider test is listening.",
-    marginaliaText: `${ready.brain.provider} is running through a no-key provider path; it is not a live tutor.`,
-    statusLabel: "non-live provider",
-    cause: "fake_provider",
+    ...copy,
+    nextActionLabel: action.nextActionLabel,
+    primaryActionDisabled: action.disabled,
+    primaryActionIntent: action.intent ?? (action.disabled ? "disabled" : "submit_turn"),
+    primaryActionLabel: action.primaryActionLabel ?? action.nextActionLabel,
+    readinessNotes: runtimeReadinessNotes(context, copy.cause),
   };
+}
+
+function trustedTurnAction(context: RuntimeProjectionContext): {
+  disabled: boolean;
+  intent: RuntimePrimaryActionIntent;
+  nextActionLabel: string;
+  primaryActionLabel: string;
+} {
+  if (context.websocketReady) {
+    return {
+      disabled: false,
+      intent: "submit_turn",
+      nextActionLabel: "Answer when ready",
+      primaryActionLabel: "I'm ready — check it",
+    };
+  }
+  return retryAgentAction();
+}
+
+function retryAgentAction(): {
+  disabled: boolean;
+  intent: RuntimePrimaryActionIntent;
+  nextActionLabel: string;
+  primaryActionLabel: string;
+} {
+  return {
+    disabled: false,
+    intent: "retry_agent",
+    nextActionLabel: "Retry agent",
+    primaryActionLabel: "Retry agent",
+  };
+}
+
+function runtimeReadinessNotes(
+  context: RuntimeProjectionContext,
+  cause: RuntimeCopyCause,
+): RuntimeReadinessNote[] {
+  const notes: RuntimeReadinessNote[] = [];
+
+  if (!context.readiness.canConnect) {
+    notes.push({
+      label: "Study set",
+      state: context.readiness.reason === "failed_ingestion" ? "unavailable" : "blocked",
+      text: context.readiness.message,
+    });
+  }
+
+  if (context.readinessProbe) {
+    notes.push(...probeNotes(context.readinessProbe));
+  } else if (!context.ready) {
+    const waiting = context.status === "connecting" || context.status === "idle";
+    notes.push({
+      label: "Socket",
+      state: waiting ? "checking" : "unavailable",
+      text: waiting
+        ? "Waiting for the WebSocket ready frame."
+        : "The WebSocket closed before a ready frame arrived.",
+    });
+  }
+
+  if (context.ready) {
+    notes.push({
+      label: "Provider",
+      state:
+        context.ready.brain.configured && context.ready.brain.selectable
+          ? "ready"
+          : context.ready.brain.configured
+            ? "blocked"
+            : "unavailable",
+      text: `${context.ready.brain.provider}: configured=${context.ready.brain.configured}, selectable=${context.ready.brain.selectable}, live=${context.ready.brain.live_runtime}.`,
+    });
+    notes.push({
+      label: "Store",
+      state: context.ready.store.available ? "ready" : "unavailable",
+      text: `${context.ready.store.backend.replace(/_/g, " ")} store available=${context.ready.store.available}.`,
+    });
+  }
+
+  if (context.mic === "denied" || context.mic === "unsupported") {
+    notes.push({
+      label: "Mic",
+      state: "blocked",
+      text:
+        context.mic === "denied"
+          ? "Browser microphone permission is denied."
+          : "Browser microphone capture is unsupported here.",
+    });
+  }
+
+  if (notes.length === 0) {
+    notes.push({
+      label: "Connected",
+      state: cause === "live_provider_gated" ? "blocked" : "ready",
+      text: "The Conductor has enough readiness facts to keep the manuscript calm.",
+    });
+  }
+
+  return notes;
+}
+
+function probeNotes(probe: VivaAgentReadinessProbe): RuntimeReadinessNote[] {
+  switch (probe.status) {
+    case "api_missing":
+      return [
+        {
+          label: "API",
+          state: "blocked",
+          text: "No HTTP readiness URL is available for `/ready` or `/health/brain`.",
+        },
+      ];
+    case "checking":
+      return [
+        {
+          label: "Readiness",
+          state: "checking",
+          text: `Checking ${probe.apiBaseUrl}/ready and ${probe.apiBaseUrl}/health/brain.`,
+        },
+      ];
+    case "offline":
+      return [
+        {
+          label: "Agent",
+          state: "unavailable",
+          text: `Could not reach /ready or /health/brain at ${probe.apiBaseUrl}.`,
+        },
+      ];
+    case "observed":
+      return [
+        {
+          label: "/health/brain",
+          state: probe.health.status === "configured" ? "ready" : "blocked",
+          text: `HTTP ${probe.healthHttpStatus}; ${probe.health.brain.provider}: configured=${probe.health.brain.configured}, selectable=${probe.health.brain.selectable}, live=${probe.health.brain.live_runtime}.`,
+        },
+        {
+          label: "/ready",
+          state: probe.ready.ready
+            ? "ready"
+            : probe.readyHttpStatus === 503
+              ? "blocked"
+              : "unavailable",
+          text: `HTTP ${probe.readyHttpStatus}; ready=${probe.ready.ready}; ${probe.ready.brain.provider}.`,
+        },
+      ];
+  }
 }
 
 /**

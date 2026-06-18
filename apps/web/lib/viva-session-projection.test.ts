@@ -125,6 +125,8 @@ describe("projectRuntimeCopy", () => {
     expect(copy.marginaliaTitle).toBe("Synthetic examiner is listening.");
     expect(copy.marginaliaText).toContain("no provider keys");
     expect(copy.marginaliaText).not.toContain("live tutor");
+    expect(copy.primaryActionDisabled).toBe(false);
+    expect(copy.nextActionLabel).toBe("Answer when ready");
   });
 
   test("labels fake Cartesia/Gemini as a non-live provider test path", () => {
@@ -137,6 +139,8 @@ describe("projectRuntimeCopy", () => {
     expect(copy.capsuleLabel).toBe("Non-live provider test");
     expect(copy.marginaliaText).toContain("Cartesia/Gemini-shaped");
     expect(copy.marginaliaText).toContain("not a live tutor");
+    expect(copy.readinessNotes.some((note) => note.label === "Provider")).toBe(true);
+    expect(copy.primaryActionDisabled).toBe(false);
   });
 
   test("reserves live tutor copy for selectable live runtime readiness", () => {
@@ -157,8 +161,11 @@ describe("projectRuntimeCopy", () => {
 
     expect(gated.capsuleLabel).toBe("Live provider gated");
     expect(gated.marginaliaText).toContain("Act 3");
+    expect(gated.primaryActionDisabled).toBe(true);
+    expect(gated.nextActionLabel).toBe("Run local demo");
     expect(live.capsuleLabel).toBe("Live Cartesia/Gemini tutor");
     expect(live.marginaliaText).toContain("live Cartesia/Gemini runtime");
+    expect(live.primaryActionDisabled).toBe(false);
   });
 
   test("surfaces actionable unavailable causes", () => {
@@ -189,10 +196,14 @@ describe("projectRuntimeCopy", () => {
 
     expect(ingestion.cause).toBe("ingestion_pending");
     expect(ingestion.marginaliaText).toContain("server is still processing");
+    expect(ingestion.nextActionLabel).toBe("Refresh ingestion");
+    expect(ingestion.primaryActionDisabled).toBe(true);
     expect(store.cause).toBe("store_unavailable");
     expect(store.marginaliaText).toContain("postgres store");
+    expect(store.nextActionLabel).toBe("Retry agent");
     expect(auth.cause).toBe("auth_failed");
     expect(auth.marginaliaText).toContain("auth failed");
+    expect(auth.nextActionLabel).toBe("Refresh session");
   });
 
   test("treats post-ready server rejections as unavailable instead of provider copy", () => {
@@ -255,6 +266,109 @@ describe("projectRuntimeCopy", () => {
     expect(copy.cause).toBe("mic_denied");
     expect(copy.capsuleLabel).toBe("Mic denied");
     expect(copy.marginaliaText).toContain("Browser microphone capture was denied");
+    expect(copy.primaryActionDisabled).toBe(true);
+    expect(copy.nextActionLabel).toBe("Check mic");
+  });
+
+  test("surfaces REST readiness as quiet marginalia for gated providers", () => {
+    const copy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      readinessProbe: {
+        apiBaseUrl: "http://localhost:4318",
+        health: {
+          provider: "cartesia_gemini",
+          brain: {
+            provider: "cartesia_gemini",
+            configured: true,
+            selectable: false,
+            live_runtime: false,
+          },
+          store: ready("synthetic").store,
+          status: "unavailable",
+        },
+        healthHttpStatus: 200,
+        ready: {
+          ready: false,
+          brain: {
+            provider: "cartesia_gemini",
+            configured: true,
+            selectable: false,
+            live_runtime: false,
+          },
+          store: ready("synthetic").store,
+        },
+        readyHttpStatus: 503,
+        status: "observed",
+      },
+      status: "connecting",
+    });
+
+    expect(copy.cause).toBe("live_provider_gated");
+    expect(copy.readinessNotes.map((note) => note.label)).toContain("/health/brain");
+    expect(copy.readinessNotes.map((note) => note.label)).toContain("/ready");
+    expect(copy.readinessNotes.some((note) => note.text.includes("HTTP 503"))).toBe(true);
+    expect(copy.primaryActionDisabled).toBe(true);
+  });
+
+  test("does not call a REST-ready agent connected until the WebSocket is ready", () => {
+    const copy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      readinessProbe: {
+        apiBaseUrl: "http://localhost:4318",
+        health: {
+          provider: "synthetic",
+          brain: ready("synthetic").brain,
+          store: ready("synthetic").store,
+          status: "configured",
+        },
+        healthHttpStatus: 200,
+        ready: {
+          ready: true,
+          brain: ready("synthetic").brain,
+          store: ready("synthetic").store,
+        },
+        readyHttpStatus: 200,
+        status: "observed",
+      },
+      status: "closed",
+    });
+
+    expect(copy.cause).toBe("session_disconnected");
+    expect(copy.capsuleLabel).toBe("Session not connected");
+    expect(copy.marginaliaTitle).toBe("Agent ready; session not connected.");
+    expect(copy.marginaliaText).toContain("WebSocket ready frame");
+    expect(copy.marginaliaTitle).not.toContain("listening");
+    expect(copy.primaryActionDisabled).toBe(false);
+    expect(copy.primaryActionIntent).toBe("retry_agent");
+    expect(copy.nextActionLabel).toBe("Retry agent");
+    expect(copy.readinessNotes.map((note) => note.label)).toContain("/ready");
+  });
+
+  test("distinguishes API missing and agent offline before flattening unavailable states", () => {
+    const apiMissing = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      readinessProbe: { status: "api_missing" },
+      status: "idle",
+    });
+    const offline = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      readinessProbe: {
+        apiBaseUrl: "http://localhost:4318",
+        error: "connection refused",
+        status: "offline",
+      },
+      status: "connecting",
+    });
+
+    expect(apiMissing.cause).toBe("api_missing");
+    expect(apiMissing.nextActionLabel).toBe("Run local demo");
+    expect(apiMissing.primaryActionDisabled).toBe(true);
+    expect(offline.cause).toBe("agent_offline");
+    expect(offline.marginaliaText).toContain("/ready");
+    expect(offline.marginaliaText).toContain("/health/brain");
+    expect(offline.nextActionLabel).toBe("Retry agent");
+    expect(offline.primaryActionDisabled).toBe(false);
+    expect(offline.primaryActionIntent).toBe("retry_agent");
   });
 });
 

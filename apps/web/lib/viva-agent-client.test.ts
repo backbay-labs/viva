@@ -12,8 +12,10 @@ import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic
 import {
   agentProtocolVersion,
   createVivaAgentSessionController,
+  fetchVivaAgentReadinessProbe,
   initialVivaAgentSessionState,
   parseVivaAgentMessage,
+  vivaAgentHttpBaseUrl,
   vivaAgentProtocols,
   vivaAgentReducer,
   vivaAgentWsUrl,
@@ -36,6 +38,107 @@ describe("Viva agent browser client", () => {
     expect(vivaApiBaseUrl({ NEXT_PUBLIC_VIVA_AGENT_WS_URL: "wss://viva.example/ws" })).toBe(
       "https://viva.example",
     );
+    expect(vivaAgentHttpBaseUrl({})).toBe("http://127.0.0.1:4318");
+    expect(vivaAgentHttpBaseUrl({ NEXT_PUBLIC_VIVA_AGENT_WS_URL: "wss://viva.example/ws" })).toBe(
+      "https://viva.example",
+    );
+    expect(
+      vivaAgentHttpBaseUrl({
+        NEXT_PUBLIC_VIVA_AGENT_WS_URL: "ws://localhost:5199/ws",
+        NEXT_PUBLIC_VIVA_API_URL: "http://localhost:3000/",
+      }),
+    ).toBe("http://localhost:5199");
+    expect(
+      vivaAgentHttpBaseUrl({
+        NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: "http://agent.local:4318/",
+        NEXT_PUBLIC_VIVA_API_URL: "http://localhost:3000/",
+      }),
+    ).toBe("http://agent.local:4318");
+    expect(
+      vivaAgentHttpBaseUrl({
+        NEXT_PUBLIC_VIVA_AGENT_WS_URL: "not-a-url",
+        NEXT_PUBLIC_VIVA_API_URL: "http://localhost:3000/",
+      }),
+    ).toBeUndefined();
+    expect(vivaAgentHttpBaseUrl({ NEXT_PUBLIC_VIVA_API_URL: "http://localhost:3000/" })).toBe(
+      "http://127.0.0.1:4318",
+    );
+  });
+
+  test("fetches /health/brain and /ready without treating gated 503 as offline", async () => {
+    const calls: string[] = [];
+    const fetchImpl = async (input: string | URL | Request) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.endsWith("/health/brain")) {
+        return jsonResponse(200, {
+          provider: "cartesia_gemini",
+          brain: {
+            provider: "cartesia_gemini",
+            configured: true,
+            selectable: false,
+            live_runtime: false,
+          },
+          store: readyFixture.store,
+          status: "unavailable",
+        });
+      }
+      if (url.endsWith("/ready")) {
+        return jsonResponse(503, {
+          ready: false,
+          brain: {
+            provider: "cartesia_gemini",
+            configured: true,
+            selectable: false,
+            live_runtime: false,
+          },
+          store: readyFixture.store,
+        });
+      }
+      throw new Error(`unexpected URL ${url}`);
+    };
+
+    const probe = await fetchVivaAgentReadinessProbe({
+      apiBaseUrl: "http://localhost:4318",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+
+    expect(calls).toEqual(["http://localhost:4318/health/brain", "http://localhost:4318/ready"]);
+    expect(probe.status).toBe("observed");
+    if (probe.status !== "observed") throw new Error("Expected observed probe");
+    expect(probe.readyHttpStatus).toBe(503);
+    expect(probe.ready.ready).toBe(false);
+    expect(probe.health.brain.provider).toBe("cartesia_gemini");
+    expect(probe.health.brain.selectable).toBe(false);
+  });
+
+  test("reports readiness endpoints as offline when fetch fails", async () => {
+    const probe = await fetchVivaAgentReadinessProbe({
+      apiBaseUrl: "http://localhost:4318",
+      fetchImpl: async () => {
+        throw new Error("connection refused");
+      },
+    });
+
+    expect(probe.status).toBe("offline");
+    if (probe.status !== "offline") throw new Error("Expected offline probe");
+    expect(probe.error).toContain("connection refused");
+  });
+
+  test("reports readiness endpoints as offline when JSON contracts are invalid", async () => {
+    const probe = await fetchVivaAgentReadinessProbe({
+      apiBaseUrl: "http://localhost:4318",
+      fetchImpl: async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/health/brain")) return jsonResponse(200, { error: "not found" });
+        if (url.endsWith("/ready")) return jsonResponse(200, { ready: true });
+        throw new Error(`unexpected URL ${url}`);
+      },
+    });
+
+    expect(probe.status).toBe("offline");
+    if (probe.status !== "offline") throw new Error("Expected offline probe");
+    expect(probe.error).toContain("invalid /health/brain readiness payload");
   });
 
   test("encodes optional bearer token as websocket subprotocol", () => {
@@ -385,4 +488,12 @@ class FakeWebSocket {
   private emit(type: string, event: Event & { data?: unknown }) {
     for (const listener of this.listeners.get(type) ?? []) listener(event);
   }
+}
+
+function jsonResponse(status: number, body: unknown) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  } as Response;
 }
