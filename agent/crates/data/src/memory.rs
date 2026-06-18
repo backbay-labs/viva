@@ -776,25 +776,7 @@ pub(crate) fn generate_paste_study_set(
             retrieval_reason: source_quality.retrieval_reason.clone(),
         })
         .collect::<Vec<_>>();
-    let expected_terms = concepts
-        .iter()
-        .map(|concept| concept.label.clone())
-        .collect::<Vec<_>>();
-    let primary = concepts
-        .first()
-        .map(|concept| concept.label.as_str())
-        .unwrap_or(title.as_str())
-        .to_owned();
-    let secondary = concepts
-        .get(1)
-        .map(|concept| concept.label.as_str())
-        .unwrap_or("the source")
-        .to_owned();
-    let source = concepts
-        .first()
-        .map(|concept| source_for_concept(concept, &sources))
-        .unwrap_or(&sources[0])
-        .clone();
+    let questions = questions_for_concepts(&concepts, &sources, &title);
     let concepts = concepts
         .into_iter()
         .map(|concept| StudyConceptSummary {
@@ -804,13 +786,6 @@ pub(crate) fn generate_paste_study_set(
             status: ConceptStatus::Review,
         })
         .collect::<Vec<_>>();
-    let question = StudyQuestion {
-        question_id: format!("q-{}", slugify(&primary)),
-        prompt: format!("Explain {primary} using the uploaded notes."),
-        expected_terms,
-        follow_up: format!("Now connect that answer to {secondary} in one precise sentence."),
-        source: source.clone(),
-    };
 
     Ok(StudySetIngestionRecord {
         study_set: StudySetSummary {
@@ -829,7 +804,7 @@ pub(crate) fn generate_paste_study_set(
         }],
         source_spans: sources.iter().map(source_reference_to_summary).collect(),
         concepts,
-        questions: vec![question],
+        questions,
         session_id,
         session_token: None,
     })
@@ -1242,6 +1217,87 @@ fn has_ambiguous_source_markers(lower: &str) -> bool {
 
 fn source_id_for_concept(concept: &ExtractedConcept, sources: &[StudySourceReference]) -> String {
     source_for_concept(concept, sources).source_id.clone()
+}
+
+fn questions_for_concepts(
+    concepts: &[ExtractedConcept],
+    sources: &[StudySourceReference],
+    title: &str,
+) -> Vec<StudyQuestion> {
+    concepts
+        .iter()
+        .map(|concept| {
+            let source = source_for_concept(concept, sources).clone();
+            let secondary = follow_up_concept_label(concepts, concept, &source)
+                .unwrap_or(title)
+                .to_owned();
+            StudyQuestion {
+                question_id: format!("q-{}", concept.public_id),
+                prompt: format!(
+                    "Explain {} in your own words using the pasted notes.",
+                    concept.label
+                ),
+                expected_terms: expected_terms_for_concept(concepts, concept, &source),
+                follow_up: format!(
+                    "Now connect {} to {secondary} in one precise sentence.",
+                    concept.label
+                ),
+                source,
+            }
+        })
+        .collect()
+}
+
+fn expected_terms_for_concept(
+    concepts: &[ExtractedConcept],
+    primary: &ExtractedConcept,
+    source: &StudySourceReference,
+) -> Vec<String> {
+    let mut terms = Vec::new();
+    push_expected_term(&mut terms, &primary.label);
+    let source_lower = source.excerpt.to_ascii_lowercase();
+    for concept in concepts {
+        if concept.public_id != primary.public_id
+            && source_lower.contains(&concept.label.to_ascii_lowercase())
+        {
+            push_expected_term(&mut terms, &concept.label);
+        }
+    }
+    for concept in concepts {
+        if concept.public_id != primary.public_id {
+            push_expected_term(&mut terms, &concept.label);
+        }
+        if terms.len() >= 4 {
+            break;
+        }
+    }
+    terms
+}
+
+fn push_expected_term(terms: &mut Vec<String>, term: &str) {
+    if !terms.iter().any(|known| known == term) {
+        terms.push(term.to_owned());
+    }
+}
+
+fn follow_up_concept_label<'a>(
+    concepts: &'a [ExtractedConcept],
+    primary: &ExtractedConcept,
+    source: &StudySourceReference,
+) -> Option<&'a str> {
+    let source_lower = source.excerpt.to_ascii_lowercase();
+    concepts
+        .iter()
+        .find(|concept| {
+            concept.public_id != primary.public_id
+                && source_lower.contains(&concept.label.to_ascii_lowercase())
+        })
+        .or_else(|| {
+            concepts
+                .iter()
+                .find(|concept| concept.public_id != primary.public_id)
+        })
+        .map(|concept| concept.label.as_str())
 }
 
 fn source_for_concept<'a>(
@@ -2455,25 +2511,89 @@ mod tests {
         assert!(joined_excerpts.contains("Mitochondria"));
         assert!(joined_excerpts.contains("ATP synthase"));
         assert!(joined_excerpts.contains("NADH") || joined_excerpts.contains("oxygen"));
-        assert_eq!(record.questions.len(), 1);
-        assert_ne!(
-            record.questions[0].question_id,
-            "q-oxidative-phosphorylation-nadh"
-        );
-        assert!(record
-            .source_spans
-            .iter()
-            .any(|source| source.id == record.questions[0].source.source_id));
+        assert!(record.concepts.len() >= 3);
+        assert_eq!(record.questions.len(), record.concepts.len());
+        let mut question_ids = std::collections::HashSet::new();
         for concept in &record.concepts {
             assert!(record
                 .source_spans
                 .iter()
                 .any(|source| source.id == concept.source_span_id));
+            let question = record
+                .questions
+                .iter()
+                .find(|question| question.question_id == format!("q-{}", concept.public_id))
+                .expect("concept has a generated question");
+            assert!(question_ids.insert(question.question_id.clone()));
+            assert_ne!(question.question_id, "q-oxidative-phosphorylation-nadh");
+            assert_eq!(question.source.source_id, concept.source_span_id);
+            assert!(question
+                .expected_terms
+                .iter()
+                .any(|term| term == &concept.label));
+            assert!(question.prompt.contains(&concept.label));
+            assert!(!question
+                .prompt
+                .to_ascii_lowercase()
+                .contains("multiple choice"));
+            assert!(!question.prompt.contains("A)"));
         }
 
         let snapshot_json = serde_json::to_string(&store.snapshot()).unwrap();
         assert!(!snapshot_json.contains(&full_notes));
         assert!(!snapshot_json.contains("NADH donates high-energy electrons"));
+    }
+
+    #[tokio::test]
+    async fn paste_ingestion_generates_distinct_concept_question_sets_for_different_inputs() {
+        let first = generate_paste_study_set(CreatePasteStudySet {
+            user_id: "user-1".to_owned(),
+            title: "Cell division".to_owned(),
+            course: None,
+            exam_date: None,
+            pasted_text: "Mitosis spindle checkpoint holds chromatids until kinetochores attach. Cytokinesis pinches the membrane after sister chromatids separate.".to_owned(),
+            session_id: Some("paste-session-cell".to_owned()),
+        })
+        .expect("first paste ingests");
+        let second = generate_paste_study_set(CreatePasteStudySet {
+            user_id: "user-1".to_owned(),
+            title: "Plant energy".to_owned(),
+            course: None,
+            exam_date: None,
+            pasted_text: "Photosynthesis chloroplast thylakoid membranes split water. Carbon fixation stores energy in glucose after light reactions.".to_owned(),
+            session_id: Some("paste-session-plant".to_owned()),
+        })
+        .expect("second paste ingests");
+
+        let first_concepts = first
+            .concepts
+            .iter()
+            .map(|concept| concept.public_id.as_str())
+            .collect::<Vec<_>>();
+        let second_concepts = second
+            .concepts
+            .iter()
+            .map(|concept| concept.public_id.as_str())
+            .collect::<Vec<_>>();
+        let first_questions = first
+            .questions
+            .iter()
+            .map(|question| question.question_id.as_str())
+            .collect::<Vec<_>>();
+        let second_questions = second
+            .questions
+            .iter()
+            .map(|question| question.question_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(first_questions.len() >= 2);
+        assert!(second_questions.len() >= 2);
+        assert_ne!(first_concepts, second_concepts);
+        assert_ne!(first_questions, second_questions);
+        assert!(!first_questions
+            .iter()
+            .chain(second_questions.iter())
+            .any(|question_id| *question_id == "q-oxidative-phosphorylation-nadh"));
     }
 
     #[tokio::test]
