@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import audioFixture from "../../../agent/fixtures/voice-protocol/client-audio.json";
 import fakeEvidencePackFixture from "../../../agent/fixtures/voice-protocol/fake-cartesia-gemini-evidence-pack.json";
 import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/fake-cartesia-gemini-study-session.json";
+import manuscriptIntentFixture from "../../../agent/fixtures/voice-protocol/server-event-manuscript-intent.json";
 import eventFixture from "../../../agent/fixtures/voice-protocol/server-event-question-started.json";
 import structuredErrorFixture from "../../../agent/fixtures/voice-protocol/server-event-structured-error.json";
 import readyFixture from "../../../agent/fixtures/voice-protocol/server-ready.json";
@@ -46,6 +47,121 @@ describe("Viva voice agent contract", () => {
     expect(frame.event.type).toBe("structured_error");
     if (frame.event.type !== "structured_error") throw new Error("Expected structured error");
     expect(frame.event.source).toBe("agent-service");
+  });
+
+  test("parses shared manuscript intent fixture from Rust service", () => {
+    const frame = parseVivaServerFrame(manuscriptIntentFixture);
+
+    if (frame.type !== "event") throw new Error("Expected event frame");
+    expect(frame.event.type).toBe("manuscript_intent");
+    if (frame.event.type !== "manuscript_intent") throw new Error("Expected manuscript intent");
+    expect(frame.event.response_id).toBe("response-1");
+    expect(frame.event.intent).toEqual({
+      type: "scene_intent",
+      register: "examining",
+      emphasis: "measured",
+    });
+  });
+
+  test("rejects manuscript intents that try to carry render instructions", () => {
+    for (const key of ["color", "coordinates", "x", "y", "css", "markup", "html", "draw"]) {
+      expect(() =>
+        parseVivaServerFrame({
+          type: "event",
+          version: 1,
+          event: {
+            type: "manuscript_intent",
+            response_id: "response-1",
+            intent: {
+              type: "scene_intent",
+              register: "examining",
+              emphasis: "quiet",
+              [key]: "bad",
+            },
+          },
+        }),
+      ).toThrow("Invalid manuscript intent");
+    }
+  });
+
+  test("rejects invalid or oversized manuscript intent fields", () => {
+    expect(() =>
+      parseVivaServerFrame({
+        type: "event",
+        version: 1,
+        event: {
+          type: "manuscript_intent",
+          response_id: "response-1",
+          intent: { type: "scene_intent", register: "glitter", emphasis: "quiet" },
+        },
+      }),
+    ).toThrow("Invalid manuscript register");
+
+    expect(() =>
+      parseVivaServerFrame({
+        type: "event",
+        version: 1,
+        event: {
+          type: "manuscript_intent",
+          response_id: "response-1",
+          intent: { type: "scene_intent", register: "examining", emphasis: "neon" },
+        },
+      }),
+    ).toThrow("Invalid manuscript emphasis");
+
+    expect(() =>
+      parseVivaServerFrame({
+        type: "event",
+        version: 1,
+        event: {
+          type: "manuscript_intent",
+          response_id: "response-1",
+          intent: {
+            type: "entity_intent",
+            entity_id: "",
+            entity_kind: "concept",
+            register: "examining",
+            emphasis: "quiet",
+          },
+        },
+      }),
+    ).toThrow("Missing entity_id");
+
+    expect(() =>
+      parseVivaServerFrame({
+        type: "event",
+        version: 1,
+        event: {
+          type: "manuscript_intent",
+          response_id: "response-1",
+          intent: {
+            type: "entity_intent",
+            entity_id: "<b>nadh</b>",
+            entity_kind: "concept",
+            register: "examining",
+            emphasis: "quiet",
+          },
+        },
+      }),
+    ).toThrow("Invalid manuscript entity_id");
+
+    expect(() =>
+      parseVivaServerFrame({
+        type: "event",
+        version: 1,
+        event: {
+          type: "manuscript_intent",
+          response_id: "response-1",
+          intent: {
+            type: "marginalia_intent",
+            marginalia_id: "a".repeat(97),
+            anchor_entity_id: "nadh",
+            register: "reflecting",
+            emphasis: "marked",
+          },
+        },
+      }),
+    ).toThrow("Invalid manuscript marginalia_id");
   });
 
   test("builds and parses shared audio frame fixture", () => {

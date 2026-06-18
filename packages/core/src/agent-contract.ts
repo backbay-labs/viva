@@ -105,6 +105,31 @@ export type AgentToolResult = {
   result: unknown;
 };
 
+export type ManuscriptRegister = "examining" | "reflecting" | "correcting" | "sourcing" | "recapping";
+export type ManuscriptEmphasis = "quiet" | "measured" | "marked";
+export type ManuscriptEntityKind = "concept" | "source" | "marginal_note";
+
+export type ManuscriptIntent =
+  | {
+      type: "scene_intent";
+      register: ManuscriptRegister;
+      emphasis: ManuscriptEmphasis;
+    }
+  | {
+      type: "entity_intent";
+      entity_id: string;
+      entity_kind: ManuscriptEntityKind;
+      register: ManuscriptRegister;
+      emphasis: ManuscriptEmphasis;
+    }
+  | {
+      type: "marginalia_intent";
+      marginalia_id: string;
+      anchor_entity_id: string;
+      register: ManuscriptRegister;
+      emphasis: ManuscriptEmphasis;
+    };
+
 export type VivaClientFrame =
   | {
       type: "session_config";
@@ -142,6 +167,7 @@ export type VivaServerEvent =
       concept_id: string;
       status: AgentConceptStatus;
     }
+  | { type: "manuscript_intent"; response_id: string; intent: ManuscriptIntent }
   | { type: "recap_ready"; response_id: string; recap: AgentStudySessionRecap }
   | { type: "audio_delta"; response_id: string; frame: AgentAudioFrame }
   | { type: "cancellation"; response_id?: string | null }
@@ -245,6 +271,12 @@ export function parseVivaServerEvent(value: unknown): VivaServerEvent {
       requireString(event.concept_id, "concept_id");
       requireConceptStatus(event.status);
       return event as VivaServerEvent;
+    case "manuscript_intent":
+      return {
+        type: "manuscript_intent",
+        response_id: requireString(event.response_id, "response_id"),
+        intent: parseManuscriptIntent(event.intent),
+      };
     case "recap_ready":
       requireString(event.response_id, "response_id");
       parseStudySessionRecap(event.recap);
@@ -395,6 +427,92 @@ function parseSessionConfig(value: unknown): AgentSessionConfig {
   for (const source of sourceContext) parseStudySourceReference(source);
   requireStringArray(session.active_concepts, "active_concepts");
   return session as unknown as AgentSessionConfig;
+}
+
+function parseManuscriptIntent(value: unknown): ManuscriptIntent {
+  const intent = requireRecord(value, "manuscript intent");
+  switch (intent.type) {
+    case "scene_intent": {
+      requireOnlyKeys(intent, ["type", "register", "emphasis"]);
+      return {
+        type: "scene_intent",
+        register: requireManuscriptRegister(intent.register),
+        emphasis: requireManuscriptEmphasis(intent.emphasis),
+      };
+    }
+    case "entity_intent": {
+      requireOnlyKeys(intent, ["type", "entity_id", "entity_kind", "register", "emphasis"]);
+      return {
+        type: "entity_intent",
+        entity_id: requireManuscriptId(intent.entity_id, "entity_id"),
+        entity_kind: requireManuscriptEntityKind(intent.entity_kind),
+        register: requireManuscriptRegister(intent.register),
+        emphasis: requireManuscriptEmphasis(intent.emphasis),
+      };
+    }
+    case "marginalia_intent": {
+      requireOnlyKeys(intent, [
+        "type",
+        "marginalia_id",
+        "anchor_entity_id",
+        "register",
+        "emphasis",
+      ]);
+      return {
+        type: "marginalia_intent",
+        marginalia_id: requireManuscriptId(intent.marginalia_id, "marginalia_id"),
+        anchor_entity_id: requireManuscriptId(intent.anchor_entity_id, "anchor_entity_id"),
+        register: requireManuscriptRegister(intent.register),
+        emphasis: requireManuscriptEmphasis(intent.emphasis),
+      };
+    }
+    default:
+      throw new Error("Invalid manuscript intent");
+  }
+}
+
+function requireOnlyKeys(record: Record<string, unknown>, allowed: string[]): void {
+  const allowedKeys = new Set(allowed);
+  for (const key of Object.keys(record)) {
+    if (!allowedKeys.has(key)) {
+      throw new Error("Invalid manuscript intent");
+    }
+  }
+}
+
+function requireManuscriptId(value: unknown, label: string): string {
+  const text = requireNonEmptyString(value, label);
+  if (text.length > 96 || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/.test(text)) {
+    throw new Error(`Invalid manuscript ${label}`);
+  }
+  return text;
+}
+
+function requireManuscriptRegister(value: unknown): ManuscriptRegister {
+  if (
+    value !== "examining" &&
+    value !== "reflecting" &&
+    value !== "correcting" &&
+    value !== "sourcing" &&
+    value !== "recapping"
+  ) {
+    throw new Error("Invalid manuscript register");
+  }
+  return value;
+}
+
+function requireManuscriptEmphasis(value: unknown): ManuscriptEmphasis {
+  if (value !== "quiet" && value !== "measured" && value !== "marked") {
+    throw new Error("Invalid manuscript emphasis");
+  }
+  return value;
+}
+
+function requireManuscriptEntityKind(value: unknown): ManuscriptEntityKind {
+  if (value !== "concept" && value !== "source" && value !== "marginal_note") {
+    throw new Error("Invalid manuscript entity kind");
+  }
+  return value;
 }
 
 function requireStringArray(value: unknown, label: string): string[] {
