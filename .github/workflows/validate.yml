@@ -1,0 +1,89 @@
+name: Validate
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  validate:
+    name: No-secret validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.3
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Validate TypeScript, Rust, and purity gates
+        env:
+          VIVA_AGENT_PROVIDER: synthetic
+        run: bun run validate
+
+      - name: Direct WebSocket replay gate
+        env:
+          VIVA_AGENT_PROVIDER: fake_cartesia_gemini
+        run: bun run agent:replay:ws
+
+      - name: Install browser for E2E gate
+        run: bunx playwright install --with-deps chromium
+
+      - name: Browser fake-provider E2E gate
+        env:
+          VIVA_AGENT_PROVIDER: fake_cartesia_gemini
+        run: bun run e2e:browser
+
+      - name: Sanitized release evidence gate
+        env:
+          VIVA_AGENT_PROVIDER: fake_cartesia_gemini
+          VIVA_RELEASE_CHECK_SKIP_BROWSER: "1"
+        run: bun run release:check
+
+  durable:
+    name: Opt-in durable Postgres proof
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: viva_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d viva_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Run durable replay and parity tests
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/viva_test
+          VIVA_ALLOW_LOOPBACK_TEST_SKIP: "1"
+          VIVA_AGENT_PROVIDER: synthetic
+        run: |
+          cargo test --manifest-path agent/Cargo.toml -p data optional_postgres -- --nocapture
+          cargo test --manifest-path agent/Cargo.toml -p agent-service --test voice_ws optional_postgres -- --nocapture

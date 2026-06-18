@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Viva — Design Direction</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Cormorant:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500;1,600&family=Hanken+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+/* ───────────────────────── Viva · design tokens ───────────────────────── */
+:root{
+  /* surfaces */
+  --bg:#f4efe6;            /* warm parchment */
+  --bg-deep:#efe8dc;       /* session backdrop */
+  --paper:#faf7f1;         /* soft paper card */
+  --paper-2:#fdfbf6;       /* raised card */
+  --paper-edge:#fffdf9;
+  /* ink */
+  --ink:#2c2536;           /* deep plum-ink, near black */
+  --ink-2:#5d5670;         /* secondary */
+  --ink-3:#938aa4;         /* tertiary / captions */
+  --ink-4:#b6adc1;         /* faint */
+  /* accent — amethyst */
+  --plum:#7a5ba6;
+  --plum-deep:#553b78;
+  --plum-soft:#a98fce;
+  --plum-wash:#efe7f6;
+  --plum-line:#e1d5ee;
+  /* micro accents */
+  --sage:#7f9277;
+  --sage-wash:#e9eee4;
+  --gold:#bd9a55;
+  --gold-wash:#f3ebd8;
+  --amber:#c1864a;
+  --amber-wash:#f4e7d6;
+  --lavender:#c3b2dd;
+  /* lines + shadow */
+  --line:rgba(44,37,54,.10);
+  --line-soft:rgba(44,37,54,.06);
+  --shadow-sm:0 1px 2px rgba(60,45,90,.05),0 2px 8px rgba(60,45,90,.05);
+  --shadow-md:0 2px 6px rgba(60,45,90,.05),0 14px 38px rgba(60,45,90,.09);
+  --shadow-lg:0 4px 12px rgba(60,45,90,.07),0 30px 70px rgba(60,45,90,.13);
+  --radius:18px;
+  --radius-sm:12px;
+  --radius-lg:26px;
+  --serif:'Cormorant',Georgia,serif;
+  --sans:'Hanken Grotesk',-apple-system,BlinkMacSystemFont,sans-serif;
+}
+*{box-sizing:border-box}
+.v-root,.v-root *{font-family:var(--sans);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+.serif{font-family:var(--serif)}
+.v-root{color:var(--ink)}
+
+/* type helpers */
+.display{font-family:var(--serif);font-weight:500;line-height:1.02;letter-spacing:-.01em;color:var(--ink)}
+.kicker{font-size:11px;font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-3)}
+.cap{font-size:12.5px;color:var(--ink-3);letter-spacing:.01em}
+
+/* ───────────────────────── Voice Orb ───────────────────────── */
+.orb{position:relative;display:grid;place-items:center;width:var(--orb,200px);height:var(--orb,200px);
+  --c1:#d3b6ef;--c2:#a279cf;--c3:#6f48a6;--c4:#3d2962;--glow:rgba(150,102,205,.50);--ring:rgba(140,95,180,.22)}
+.orb__glow{position:absolute;width:158%;height:158%;border-radius:50%;
+  background:radial-gradient(circle,var(--glow),transparent 62%);filter:blur(16px);
+  animation:orbGlow 5.5s ease-in-out infinite}
+.orb__halo{position:absolute;inset:2%;border-radius:50%;border:1px solid var(--ring)}
+.orb__halo.two{inset:-9%;opacity:.6}
+.orb__pulse{position:absolute;inset:6%;border-radius:50%;border:1px solid var(--glow);opacity:0;
+  animation:ringPulse 3.8s ease-out infinite}
+.orb__pulse.b{animation-delay:1.9s}
+.orb__core{position:relative;width:64%;height:64%;border-radius:50%;display:grid;place-items:center;
+  background:radial-gradient(circle at 36% 30%,var(--c1),var(--c2) 26%,var(--c3) 56%,var(--c4) 88%);
+  box-shadow:inset 0 -10px 26px rgba(40,20,70,.55),inset 0 7px 18px rgba(255,255,255,.22),0 16px 44px rgba(95,55,150,.36);
+  animation:breathe 5.5s ease-in-out infinite}
+.orb__core::after{content:'';position:absolute;top:13%;left:19%;width:36%;height:27%;border-radius:50%;
+  background:radial-gradient(circle,rgba(255,255,255,.62),transparent 70%);filter:blur(2px)}
+.orb__shimmer{position:absolute;width:64%;height:64%;border-radius:50%;mix-blend-mode:screen;opacity:0;
+  background:conic-gradient(from 0deg,transparent,rgba(208,182,239,.55),transparent 42%);
+  animation:spinSlow 7s linear infinite}
+.orb__star{position:relative;color:#fff;filter:drop-shadow(0 1px 4px rgba(60,30,100,.45));animation:twinkle 4.5s ease-in-out infinite}
+.orb__orbiter{position:absolute;width:7px;height:7px;border-radius:50%;background:#fff;
+  box-shadow:0 0 10px 2px rgba(220,200,250,.9);opacity:0}
+
+/* orb states */
+.orb[data-state="ready"]{}
+.orb[data-state="listening"]{--glow:rgba(168,116,222,.60);--ring:rgba(150,100,200,.3)}
+.orb[data-state="listening"] .orb__core{animation-duration:2.6s}
+.orb[data-state="listening"] .orb__glow{animation-duration:2.6s}
+.orb[data-state="listening"] .orb__pulse{animation-duration:2.4s}
+.orb[data-state="thinking"]{--glow:rgba(130,108,180,.42);--c1:#c3aee0;--c2:#9277c2}
+.orb[data-state="thinking"] .orb__shimmer{opacity:1}
+.orb[data-state="thinking"] .orb__core{animation-duration:7s}
+.orb[data-state="thinking"] .orb__orbiter{opacity:1;animation:orbit 3.4s linear infinite}
+.orb[data-state="correcting"]{--glow:rgba(199,156,92,.46);--ring:rgba(190,150,90,.3);--c1:#d8c0ee;--c2:#a982ca;--c3:#6f48a6;--c4:#3d2962}
+.orb[data-state="correcting"] .orb__halo{border-color:rgba(189,154,85,.5)}
+.orb[data-state="correcting"] .orb__core{animation-duration:6s}
+.orb[data-state="encouraging"]{--glow:rgba(135,168,124,.46);--ring:rgba(127,146,119,.32)}
+.orb[data-state="encouraging"] .orb__pulse{animation-duration:3s}
+.orb[data-state="recall"]{--glow:rgba(120,78,170,.58);--c1:#bb98e0;--c2:#8a5cbd;--c3:#5c3792;--c4:#2c1c4a;--ring:rgba(110,72,160,.4)}
+.orb[data-state="recall"] .orb__halo.two{inset:-9%;border-color:rgba(110,72,160,.45)}
+.orb[data-state="recall"] .orb__core{animation-duration:4s}
+.orb[data-state="recall"] .orb__pulse{animation-duration:2.6s}
+
+/* equalizer / waveform */
+.eq{display:flex;align-items:center;gap:3px;height:22px}
+.eq i{width:3px;border-radius:2px;background:var(--plum);opacity:.55;animation:eq 1s ease-in-out infinite}
+.eq i:nth-child(1){animation-delay:-.9s}.eq i:nth-child(2){animation-delay:-.2s}
+.eq i:nth-child(3){animation-delay:-.6s}.eq i:nth-child(4){animation-delay:-.35s}
+.eq i:nth-child(5){animation-delay:-.75s}.eq i:nth-child(6){animation-delay:-.1s}
+.eq i:nth-child(7){animation-delay:-.5s}.eq i:nth-child(8){animation-delay:-.8s}
+.eq i:nth-child(9){animation-delay:-.3s}.eq i:nth-child(10){animation-delay:-.65s}
+.eq.wide{height:30px;gap:3.5px}
+.eq.faint i{background:var(--plum-soft);opacity:.5}
+
+/* keyframes */
+@keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.045)}}
+@keyframes orbGlow{0%,100%{opacity:.75;transform:scale(1)}50%{opacity:1;transform:scale(1.06)}}
+@keyframes ringPulse{0%{transform:scale(.85);opacity:.7}70%{opacity:0}100%{transform:scale(1.55);opacity:0}}
+@keyframes spinSlow{to{transform:rotate(360deg)}}
+@keyframes twinkle{0%,100%{opacity:.92;transform:scale(1)}50%{opacity:1;transform:scale(1.08)}}
+@keyframes orbit{from{transform:rotate(0) translateX(calc(var(--orb,200px)*.40)) rotate(0)}to{transform:rotate(360deg) translateX(calc(var(--orb,200px)*.40)) rotate(-360deg)}}
+@keyframes eq{0%,100%{height:5px}50%{height:20px}}
+@keyframes floaty{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+@keyframes drawDash{to{stroke-dashoffset:0}}
+
+/* small shared pieces */
+.chip{display:inline-flex;align-items:center;gap:7px;border-radius:999px;font-family:var(--sans);
+  font-weight:500;white-space:nowrap}
+.thin-divider{height:1px;background:var(--line);border:0;margin:0}
+.sprig{opacity:.5}
+
+/* scrollbars hidden inside cards already by canvas */
+.v-soft-card{background:var(--paper);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow-sm)}
+
+/* entrance for orbiting chips */
+.orbit-chip{position:absolute;animation:floaty 5s ease-in-out infinite}
+</style>
+</head>
+<body style="margin:0;background:#f0eee9">
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script type="text/babel" src="viva-system.jsx"></script>
+<script type="text/babel" src="viva-identity.jsx"></script>
+<script type="text/babel" src="viva-onboarding.jsx"></script>
+<script type="text/babel" src="viva-home.jsx"></script>
+<script type="text/babel" src="viva-session.jsx"></script>
+<script type="text/babel" src="viva-recap.jsx"></script>
+<script type="text/babel" src="viva-library.jsx"></script>
+<script type="text/babel" src="viva-main.jsx"></script>
+</body>
+</html>

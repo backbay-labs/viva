@@ -1,0 +1,17 @@
+node_modules
+.next
+dist
+coverage
+out
+artifacts
+.turbo
+apps/web/out
+*.tsbuildinfo
+.env
+.env.local
+.env.*.local
+.DS_Store
+agent/.env
+agent/certs
+agent/target
+.playwright-cli

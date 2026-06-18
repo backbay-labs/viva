@@ -1,0 +1,27 @@
+{
+  "type": "event",
+  "version": 1,
+  "event": {
+    "type": "question_started",
+    "response_id": "response-1",
+    "question": {
+      "question_id": "q-oxidative-phosphorylation-nadh",
+      "prompt": "Explain the role of NADH in oxidative phosphorylation.",
+      "expected_terms": [
+        "electron donor",
+        "electron transport chain",
+        "proton gradient",
+        "ATP synthase"
+      ],
+      "follow_up": "Now connect that electron flow to ATP synthase in one precise sentence.",
+      "source": {
+        "source_id": "src-lecture-5-slide-18",
+        "document_id": "lec-5",
+        "span": "slide:18",
+        "excerpt": "NADH donates high-energy electrons to the electron transport chain. Electron flow pumps protons across the inner mitochondrial membrane, creating the gradient that drives ATP synthase.",
+        "confidence": "high",
+        "retrieval_reason": "server fixture source for oxidative phosphorylation"
+      }
+    }
+  }
+}

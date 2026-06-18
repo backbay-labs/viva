@@ -1,0 +1,38 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": [".env", ".env.local", ".env.*.local"],
+  "globalEnv": [
+    "NODE_ENV",
+    "NEXT_PUBLIC_VIVA_API_URL",
+    "NEXT_PUBLIC_VIVA_AGENT_WS_URL",
+    "VIVA_AGENT_BASE_URL",
+    "PLAYWRIGHT_HEADLESS",
+    "VIVA_E2E_ARTIFACT_DIR",
+    "VIVA_E2E_FAILURE_SCREENSHOT",
+    "VIVA_E2E_TRACE",
+    "VIVA_ENV",
+    "VIVA_RELEASE_ARTIFACT_DIR",
+    "VIVA_RELEASE_CHECK_SKIP_BROWSER"
+  ],
+  "tasks": {
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "build": {
+      "dependsOn": ["^build"]
+    },
+    "lint": {
+      "inputs": ["$TURBO_DEFAULT$", "biome.json", "package.json"],
+      "outputs": []
+    },
+    "typecheck": {
+      "inputs": ["$TURBO_DEFAULT$", "tsconfig.json", "../../tsconfig.base.json", "package.json"],
+      "outputs": []
+    },
+    "test": {
+      "inputs": ["$TURBO_DEFAULT$", "package.json"],
+      "outputs": []
+    }
+  }
+}

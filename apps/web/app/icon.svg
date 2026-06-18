@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Viva</title>
+  <rect width="64" height="64" rx="12" fill="#40213d"/>
+  <path
+    d="M18 18h8l6 27 6-27h8l-9 34H27L18 18Z"
+    fill="#f4d35e"
+  />
+  <circle cx="48" cy="17" r="5" fill="#93b88f"/>
+</svg>

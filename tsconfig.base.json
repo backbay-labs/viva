@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "baseUrl": ".",
+    "paths": {
+      "@viva/core": ["packages/core/src/index.ts"],
+      "@viva/core/*": ["packages/core/src/*.ts"],
+      "@viva/tokens": ["packages/tokens/src/index.ts"],
+      "@viva/ui-web": ["packages/ui-web/src/index.tsx"]
+    }
+  }
+}

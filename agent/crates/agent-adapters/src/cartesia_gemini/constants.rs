@@ -1,0 +1,10 @@
+pub const DEFAULT_CARTESIA_VERSION: &str = "2026-03-01";
+pub const DEFAULT_INK_TURNS_WEBSOCKET_URL: &str = "wss://api.cartesia.ai/stt/turns/websocket";
+pub const DEFAULT_INK_MODEL: &str = "ink-2";
+pub const DEFAULT_SONIC_WEBSOCKET_URL: &str = "wss://api.cartesia.ai/tts/websocket";
+pub const DEFAULT_SONIC_MODEL: &str = "sonic-3.5";
+pub const DEFAULT_SONIC_VOICE_ID: &str = "a0e99841-438c-4a64-b679-ae501e7d6091";
+pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.5-flash";
+pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+pub const DEFAULT_GEMINI_THINKING_LEVEL: &str = "LOW";
+pub const CARTESIA_SAMPLE_RATE: u32 = 24_000;

@@ -1,0 +1,95 @@
+{
+  "client_fixture": "synthetic-study-session.json#client",
+  "server_fixture": "synthetic-study-session.json#server",
+  "client_frame_count": 4,
+  "server_frame_count": 15,
+  "store_snapshot": {
+    "sessions": 1,
+    "answer_attempts": 1,
+    "concept_statuses": 1,
+    "review_items": 1,
+    "recaps": 1,
+    "durable": false
+  },
+  "usage": {
+    "events": 1,
+    "provider": "synthetic",
+    "model": "synthetic-viva",
+    "duration_seconds_min": 1,
+    "text_input_tokens": 20,
+    "text_output_tokens": 10,
+    "audio_input_tokens": 0,
+    "audio_output_tokens": 0,
+    "cost_estimate_usd": 0.00002,
+    "answer_eval_latency_ms_present": true,
+    "source_grounded_correction_count": 1
+  },
+  "evidence_events": [
+    {
+      "kind": "preflight_accepted",
+      "voice_session_id": null,
+      "detail": "websocket preflight accepted"
+    },
+    {
+      "kind": "config_accepted",
+      "voice_session_id": "voice-session-1",
+      "detail": "session config accepted"
+    },
+    {
+      "kind": "session_opened",
+      "voice_session_id": "voice-session-1",
+      "detail": "session opened"
+    },
+    {
+      "kind": "question_emitted",
+      "voice_session_id": "voice-session-1",
+      "detail": "response-1"
+    },
+    {
+      "kind": "answer_received",
+      "voice_session_id": "voice-session-1",
+      "detail": "text answer received"
+    },
+    {
+      "kind": "evaluation_emitted",
+      "voice_session_id": "voice-session-1",
+      "detail": "response-1"
+    },
+    {
+      "kind": "source_emitted",
+      "voice_session_id": "voice-session-1",
+      "detail": "response-1"
+    },
+    {
+      "kind": "cancel_received",
+      "voice_session_id": "voice-session-1",
+      "detail": "cancel received"
+    },
+    {
+      "kind": "cancel_received",
+      "voice_session_id": "voice-session-1",
+      "detail": "response-2"
+    },
+    {
+      "kind": "stop_received",
+      "voice_session_id": "voice-session-1",
+      "detail": "stop received"
+    },
+    {
+      "kind": "store_counts",
+      "voice_session_id": "voice-session-1",
+      "detail": "sessions=1 answer_attempts=1 concept_statuses=1 review_items=1 recaps=1"
+    },
+    {
+      "kind": "terminal_reason",
+      "voice_session_id": "voice-session-1",
+      "detail": "client_stop"
+    },
+    {
+      "kind": "close",
+      "voice_session_id": "voice-session-1",
+      "detail": "client_stop"
+    }
+  ],
+  "terminal_close_reason": "client_stop"
+}
