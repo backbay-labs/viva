@@ -207,6 +207,154 @@ export function voiceTraceBloomPulse({
     : Math.max(TEXT_MODE_BLOOM_FLOOR + 0.1 * Math.sin(time * 1.7), voice);
 }
 
+type LabelBox = { left: number; right: number; top: number; bottom: number };
+
+export type VoiceTraceConceptLabelPlan = {
+  box: LabelBox;
+  fontSize: number;
+  hidden: false;
+  label: string;
+  leaderLine: { from: Vec; to: Vec } | null;
+  maxWidth: number;
+  text: string;
+  textAlign: CanvasTextAlign;
+  x: number;
+  y: number;
+};
+
+export function voiceTraceConceptDensity(conceptCount: number): "sparse" | "roomy" | "dense" {
+  if (conceptCount >= 7) return "dense";
+  if (conceptCount >= 5) return "roomy";
+  return "sparse";
+}
+
+export function planVoiceTraceConceptLabels({
+  canvasHeight,
+  canvasWidth,
+  fontScale = 1,
+  items,
+}: {
+  canvasHeight: number;
+  canvasWidth: number;
+  fontScale?: number;
+  items: Array<{ emphasis: number; label: string; point: Vec }>;
+}): VoiceTraceConceptLabelPlan[] {
+  if (canvasWidth <= 0 || canvasHeight <= 0) return [];
+
+  const padding = canvasWidth < 520 ? 8 : 12;
+  const maxWidth = Math.max(
+    54,
+    Math.min(canvasWidth < 520 ? 94 : canvasWidth < 760 ? 112 : 142, canvasWidth - padding * 2),
+  );
+  const laneOffsets = conceptLabelLaneOffsets(canvasWidth);
+  const placed: LabelBox[] = [];
+
+  return items.map((item, index) => {
+    const fontSize = Math.round((14 + (item.emphasis >= 1 ? 2.5 : 0)) * fontScale);
+    const labelHeight = Math.max(15, fontSize * 1.35);
+    const text = compactConceptLabel(item.label, maxWidth, fontSize);
+    const textWidth = Math.min(maxWidth, estimateConceptLabelWidth(text, fontSize));
+    const laneOrder = laneOffsets.map(
+      (_offset, laneIndex) => laneOffsets[(laneIndex + index) % laneOffsets.length],
+    );
+
+    let best: { box: LabelBox; overlap: number; offset: number; x: number; y: number } | null =
+      null;
+    for (const offset of laneOrder) {
+      const x = clamp(item.point.x, padding + textWidth / 2, canvasWidth - padding - textWidth / 2);
+      const y = clamp(
+        item.point.y + offset,
+        padding + labelHeight / 2,
+        canvasHeight - padding - labelHeight / 2,
+      );
+      const box = labelBox(x, y, textWidth, labelHeight);
+      const overlap = placed.reduce(
+        (total, other) => total + overlapArea(inflate(box, 2), other),
+        0,
+      );
+      const score = overlap * 1000 + Math.abs(offset);
+      if (!best || score < best.overlap * 1000 + Math.abs(best.offset)) {
+        best = { box, overlap, offset, x, y };
+      }
+      if (overlap === 0) break;
+    }
+
+    const label = best ?? {
+      box: labelBox(item.point.x, item.point.y, textWidth, labelHeight),
+      overlap: 0,
+      offset: 0,
+      x: item.point.x,
+      y: item.point.y,
+    };
+    placed.push(label.box);
+    const lineTargetY = label.y < item.point.y ? label.box.bottom + 1.5 : label.box.top - 1.5;
+
+    return {
+      box: label.box,
+      fontSize,
+      hidden: false,
+      label: item.label,
+      leaderLine:
+        Math.abs(label.y - item.point.y) > labelHeight * 0.72
+          ? {
+              from: item.point,
+              to: { x: label.x, y: lineTargetY },
+            }
+          : null,
+      maxWidth,
+      text,
+      textAlign: "center",
+      x: label.x,
+      y: label.y,
+    };
+  });
+}
+
+function conceptLabelLaneOffsets(canvasWidth: number): number[] {
+  if (canvasWidth < 520) return [-62, 42, -38, 66, 18, -82];
+  if (canvasWidth < 760) return [-54, 40, -32, 62, 20, -78];
+  return [-42, 42, -68, 68, 18, -88];
+}
+
+function estimateConceptLabelWidth(label: string, fontSize: number): number {
+  return Math.max(12, label.length * fontSize * 0.5);
+}
+
+function compactConceptLabel(label: string, maxWidth: number, fontSize: number): string {
+  const maxChars = Math.max(4, Math.floor(maxWidth / Math.max(1, fontSize * 0.5)));
+  if (label.length <= maxChars) return label;
+  return `${label.slice(0, Math.max(1, maxChars - 3)).trimEnd()}...`;
+}
+
+function labelBox(x: number, y: number, width: number, height: number): LabelBox {
+  return {
+    bottom: y + height / 2,
+    left: x - width / 2,
+    right: x + width / 2,
+    top: y - height / 2,
+  };
+}
+
+function inflate(box: LabelBox, amount: number): LabelBox {
+  return {
+    bottom: box.bottom + amount,
+    left: box.left - amount,
+    right: box.right + amount,
+    top: box.top - amount,
+  };
+}
+
+function overlapArea(a: LabelBox, b: LabelBox): number {
+  const width = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+  const height = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+  return width > 0 && height > 0 ? width * height : 0;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (max < min) return (min + max) / 2;
+  return Math.max(min, Math.min(max, value));
+}
+
 export function VoiceTraceCanvas({
   state,
   scene,
@@ -412,14 +560,31 @@ export function VoiceTraceCanvas({
 
       // 3 — the Concept Mastery Field: the session's real concepts, each a dot on
       // the pathway coloured by its live mastery (sage strong / lavender review /
-      // amber shaky / deep-ochre missed); labels stagger above/below the line.
+      // amber shaky / deep-ochre missed); dense labels use bounded lanes and
+      // leader lines, never hidden concepts.
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      for (let i = 0; i < nodeCount; i++) {
-        const node = nodes[i];
+      const nodeDrawState = nodes.map((node, i) => {
         const phase = i * 1.3;
-        const x = nodePos[i].x * cssW + Math.sin(t * 0.3 + phase) * 3;
-        const y = nodePos[i].y * cssH + Math.cos(t * 0.24 + phase) * 2.4;
+        const point = {
+          x: nodePos[i].x * cssW + Math.sin(t * 0.3 + phase) * 3,
+          y: nodePos[i].y * cssH + Math.cos(t * 0.24 + phase) * 2.4,
+        };
+        return { node, phase, point };
+      });
+      const labelPlans = planVoiceTraceConceptLabels({
+        canvasHeight: cssH,
+        canvasWidth: cssW,
+        fontScale: fs,
+        items: nodeDrawState.map(({ node, point }) => ({
+          emphasis: node.emphasis,
+          label: node.label,
+          point,
+        })),
+      });
+      for (let i = 0; i < nodeCount; i++) {
+        const { node, phase, point } = nodeDrawState[i];
+        const { x, y } = point;
         const color = conceptStatusColor(node.status);
         const highlighted = hl.has(node.label);
         const sceneBoost = sceneEntityWeights.get(node.id) ?? 0;
@@ -452,14 +617,30 @@ export function VoiceTraceCanvas({
         ctx.stroke();
         ctx.globalAlpha = 1;
 
-        // label — status-tinted ink, staggered above (even) / below (odd)
-        const labelY = y + (i % 2 === 0 ? -20 : 22) * fs;
+        // label — status-tinted ink, lane-planned to keep 7+ active concepts legible
+        const labelPlan = labelPlans[i];
         const labelColor = mix(INK, color, 0.45 + node.emphasis * 0.3);
         const alpha = Math.min(0.88, (0.5 + emph * 0.34) * calm);
-        const size = 14 + (node.emphasis >= 1 ? 2.5 : 0);
-        ctx.font = `${Math.round(size * fs)}px "Cormorant", Georgia, serif`;
+        if (labelPlan?.leaderLine) {
+          ctx.strokeStyle = rgba(labelColor, 0.18 * alpha);
+          ctx.lineWidth = 1;
+          ctx.setLineDash([1.5, 4]);
+          ctx.beginPath();
+          ctx.moveTo(labelPlan.leaderLine.from.x, labelPlan.leaderLine.from.y);
+          ctx.lineTo(labelPlan.leaderLine.to.x, labelPlan.leaderLine.to.y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        ctx.textAlign = labelPlan?.textAlign ?? "center";
+        ctx.textBaseline = "middle";
+        ctx.font = `${labelPlan?.fontSize ?? Math.round(14 * fs)}px "Cormorant", Georgia, serif`;
         ctx.fillStyle = rgba(labelColor, alpha);
-        ctx.fillText(node.label, x, labelY);
+        ctx.fillText(
+          labelPlan?.text ?? node.label,
+          labelPlan?.x ?? x,
+          labelPlan?.y ?? y,
+          labelPlan?.maxWidth,
+        );
       }
 
       // 4 — gold check-glints lifting off the concepts while Viva is thinking
@@ -563,10 +744,14 @@ export function VoiceTraceCanvas({
     };
   }, []);
 
+  const conceptCount = conceptNodes?.length ?? 0;
+
   return (
     <div
       aria-hidden="true"
       className="voice-trace"
+      data-concept-count={conceptCount}
+      data-concept-density={voiceTraceConceptDensity(conceptCount)}
       data-scene-emphasis={scene?.emphasis ?? "quiet"}
       data-scene-entity-count={scene?.entities.length ?? 0}
       data-scene-register={scene?.register ?? "examining"}

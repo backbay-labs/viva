@@ -16,7 +16,11 @@ import {
 import { MarginaliaPanel } from "./MarginaliaPanel";
 import { SessionHeader } from "./SessionHeader";
 import type { Question } from "./session-data";
-import { VoiceTraceCanvas, voiceTraceBloomPulse } from "./VoiceTraceCanvas";
+import {
+  planVoiceTraceConceptLabels,
+  VoiceTraceCanvas,
+  voiceTraceBloomPulse,
+} from "./VoiceTraceCanvas";
 
 const noop = () => {};
 
@@ -130,6 +134,16 @@ const sourceFolio: SourceFolioProjection = {
   state: "present",
 };
 
+const denseConceptNodes = [
+  { id: "nadh", label: "NADH", status: "strong", emphasis: 0.65 },
+  { id: "complex-i", label: "Complex I", status: "review", emphasis: 0.35 },
+  { id: "ubiquinone", label: "Ubiquinone shuttle", status: "shaky", emphasis: 0.8 },
+  { id: "complex-iii", label: "Complex III", status: "review", emphasis: 0.4 },
+  { id: "proton-gradient", label: "Proton gradient", status: "missed", emphasis: 1 },
+  { id: "atp-synthase", label: "ATP synthase", status: "shaky", emphasis: 0.95 },
+  { id: "oxygen", label: "Oxygen acceptor", status: "review", emphasis: 0.55 },
+] as const;
+
 function ready(provider: string, overrides: Partial<VivaReadyFrame["brain"]> = {}): VivaReadyFrame {
   return {
     type: "ready",
@@ -216,7 +230,12 @@ describe("LiveSessionShell scene intent wiring", () => {
 
   test("renders scene state onto the existing Canvas and marginalia surfaces", () => {
     const canvasMarkup = renderToStaticMarkup(
-      <VoiceTraceCanvas conceptNodes={[]} scene={scene} state="correction" textMode={true} />,
+      <VoiceTraceCanvas
+        conceptNodes={[...denseConceptNodes]}
+        scene={scene}
+        state="correction"
+        textMode={true}
+      />,
     );
     const marginaliaMarkup = renderToStaticMarkup(
       <MarginaliaPanel
@@ -238,6 +257,8 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(canvasMarkup).toContain('data-scene-register="correcting"');
     expect(canvasMarkup).toContain('data-scene-emphasis="marked"');
     expect(canvasMarkup).toContain('data-scene-entity-count="1"');
+    expect(canvasMarkup).toContain('data-concept-count="7"');
+    expect(canvasMarkup).toContain('data-concept-density="dense"');
     expect(canvasMarkup).toContain('data-text-mode="true"');
     expect(marginaliaMarkup).toContain('class="marginalia"');
     expect(marginaliaMarkup).toContain('data-scene-register="correcting"');
@@ -252,6 +273,40 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(voiceTraceBloomPulse({ textMode: false, time: 0, voice: 0 })).not.toBe(
       voiceTraceBloomPulse({ textMode: false, time: 10, voice: 0 }),
     );
+  });
+
+  test("plans dense concept labels into bounded non-overlapping lanes", () => {
+    const labels = planVoiceTraceConceptLabels({
+      canvasHeight: 180,
+      canvasWidth: 420,
+      fontScale: 0.72,
+      items: denseConceptNodes.map((node, index) => ({
+        emphasis: node.emphasis,
+        label: node.label,
+        point: {
+          x: 44 + index * 55,
+          y: index % 2 === 0 ? 88 : 70,
+        },
+      })),
+    });
+
+    expect(labels).toHaveLength(denseConceptNodes.length);
+    expect(labels.some((label) => label.leaderLine)).toBe(true);
+
+    for (const label of labels) {
+      expect(label.text.length).toBeGreaterThan(0);
+      expect(label.hidden).toBe(false);
+      expect(label.box.left).toBeGreaterThanOrEqual(8);
+      expect(label.box.right).toBeLessThanOrEqual(412);
+      expect(label.box.top).toBeGreaterThanOrEqual(8);
+      expect(label.box.bottom).toBeLessThanOrEqual(172);
+    }
+
+    for (let i = 0; i < labels.length; i++) {
+      for (let j = i + 1; j < labels.length; j++) {
+        expect(boxesOverlap(labels[i].box, labels[j].box)).toBe(false);
+      }
+    }
   });
 
   test("renders projected runtime copy in listening marginalia", () => {
@@ -531,3 +586,10 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).not.toContain("modal");
   });
 });
+
+function boxesOverlap(
+  a: { left: number; right: number; top: number; bottom: number },
+  b: { left: number; right: number; top: number; bottom: number },
+) {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
