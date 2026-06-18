@@ -93,11 +93,25 @@ pub struct CreatePasteStudySet {
     pub session_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateFileStudySet {
+    pub user_id: String,
+    pub study_set_id: Option<String>,
+    pub title: String,
+    pub course: Option<String>,
+    pub exam_date: Option<String>,
+    pub file_name: String,
+    pub content_type: Option<String>,
+    pub file_bytes: Vec<u8>,
+    pub session_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StudySetIngestionStatus {
     Pending,
     Processing,
+    Retry,
     Ready,
     Failed,
 }
@@ -107,6 +121,7 @@ impl StudySetIngestionStatus {
         match self {
             Self::Pending => "pending",
             Self::Processing => "processing",
+            Self::Retry => "retry",
             Self::Ready => "ready",
             Self::Failed => "failed",
         }
@@ -305,6 +320,28 @@ pub trait StudyMemoryStore: Send + Sync {
             "study_store",
             "paste",
             "paste ingestion is not implemented by this store",
+        ))
+    }
+
+    async fn create_file_study_set(
+        &self,
+        _input: CreateFileStudySet,
+    ) -> Result<StudySetIngestionRecord, PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            "file",
+            "file ingestion is not implemented by this store",
+        ))
+    }
+
+    async fn retry_file_study_set(
+        &self,
+        _input: CreateFileStudySet,
+    ) -> Result<StudySetIngestionRecord, PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            "file_retry",
+            "file ingestion retry is not implemented by this store",
         ))
     }
 

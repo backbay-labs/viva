@@ -28,7 +28,7 @@ export type UploadedDocument = {
   processed: boolean;
 };
 
-export type StudySetIngestionStatus = "pending" | "processing" | "ready" | "failed";
+export type StudySetIngestionStatus = "pending" | "processing" | "ready" | "failed" | "retry";
 
 export type SourceReference = {
   label: string;
@@ -91,6 +91,7 @@ export type AgentStudySetReadiness =
         | "pending_ingestion"
         | "processing_ingestion"
         | "failed_ingestion"
+        | "retry_ingestion"
         | "unmapped_fixture";
       message: string;
     };
@@ -576,6 +577,13 @@ export function agentStudySetReadiness(
         message: "Connected agent is unavailable because server ingestion failed.",
       };
     }
+    if (studySet.ingestionStatus === "retry") {
+      return {
+        canConnect: false,
+        reason: "retry_ingestion",
+        message: "Connected agent is unavailable until file ingestion is retried.",
+      };
+    }
     if (studySet.ingestionStatus === "processing") {
       return {
         canConnect: false,
@@ -614,11 +622,15 @@ export function agentStudySetReadiness(
           ? "processing_ingestion"
           : studySet.ingestionStatus === "failed"
             ? "failed_ingestion"
-            : "pending_ingestion",
+            : studySet.ingestionStatus === "retry"
+              ? "retry_ingestion"
+              : "pending_ingestion",
       message:
         studySet.ingestionStatus === "failed"
           ? "Connected agent is unavailable because server ingestion failed."
-          : "Connected agent is unavailable until source-grounded ingestion returns concepts and processed documents.",
+          : studySet.ingestionStatus === "retry"
+            ? "Connected agent is unavailable until file ingestion is retried."
+            : "Connected agent is unavailable until source-grounded ingestion returns concepts and processed documents.",
     };
   }
 
@@ -704,6 +716,7 @@ function masteryFromConcepts(concepts: Concept[]): StudySet["mastery"] {
 function serverIngestionSessionLabel(status: StudySetIngestionStatus): string {
   if (status === "ready") return "Server ingestion ready";
   if (status === "failed") return "Server ingestion failed";
+  if (status === "retry") return "Server ingestion awaiting retry";
   if (status === "processing") return "Server ingestion processing";
   return "Server ingestion pending";
 }
@@ -721,13 +734,17 @@ function generateServerCards(
         title:
           status === "failed"
             ? "Server ingestion failed"
-            : status === "processing"
-              ? "Server ingestion processing"
-              : "Server ingestion pending",
+            : status === "retry"
+              ? "Server ingestion awaiting retry"
+              : status === "processing"
+                ? "Server ingestion processing"
+                : "Server ingestion pending",
         body:
           status === "failed"
             ? "The connected agent is blocked until ingestion succeeds."
-            : "The connected agent will unlock after processed documents and concepts return.",
+            : status === "retry"
+              ? "Upload a fresh file or retry processing before starting the connected agent."
+              : "The connected agent will unlock after processed documents and concepts return.",
         accent: status === "failed" ? "amber" : "plum",
       },
       {

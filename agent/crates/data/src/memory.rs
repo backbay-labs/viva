@@ -5,13 +5,13 @@ use std::{
 };
 
 use agent_domain::{
-    AnswerEvaluation, ConceptStatus, CreatePasteStudySet, LibraryNextReviewSummary,
-    LibrarySessionRecapSummary, LibrarySessionSummary, LibraryStudyDocumentSummary,
-    LibraryStudySetSummary, PortError, SessionConfig, SessionStore, SessionTokenNonceClaim,
-    SourceConfidence, StudyConceptSummary, StudyDocumentSummary, StudyLibrarySnapshot,
-    StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap, StudySetIngestionRecord,
-    StudySetIngestionStatus, StudySetSummary, StudySourceReference, StudySourceSpanSummary,
-    StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts,
+    AnswerEvaluation, ConceptStatus, CreateFileStudySet, CreatePasteStudySet,
+    LibraryNextReviewSummary, LibrarySessionRecapSummary, LibrarySessionSummary,
+    LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError, SessionConfig, SessionStore,
+    SessionTokenNonceClaim, SourceConfidence, StudyConceptSummary, StudyDocumentSummary,
+    StudyLibrarySnapshot, StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap,
+    StudySetIngestionRecord, StudySetIngestionStatus, StudySetSummary, StudySourceReference,
+    StudySourceSpanSummary, StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -495,6 +495,97 @@ impl InMemoryStudyStore {
             );
     }
 
+    fn persist_ingestion_record_locked(
+        state: &mut InMemoryStudyState,
+        generated: &StudySetIngestionRecord,
+        replace_existing: bool,
+    ) {
+        let study_set_id = generated.study_set.id.clone();
+        if replace_existing {
+            state
+                .documents
+                .retain(|_, document| document.study_set_id != study_set_id);
+            state
+                .source_spans
+                .retain(|_, source| source.study_set_id != study_set_id);
+            state
+                .concepts
+                .retain(|_, concept| concept.study_set_id != study_set_id);
+            state
+                .questions
+                .retain(|_, question| question.study_set_id != study_set_id);
+            state
+                .event_authorizations
+                .retain(|authorization| authorization.study_set_id != study_set_id);
+        }
+        state.study_sets.insert(
+            study_set_id.clone(),
+            StudySetRecord {
+                study_set_id: study_set_id.clone(),
+                user_id: generated.study_set.user_id.clone(),
+                title: generated.study_set.title.clone(),
+                course: generated.study_set.course.clone(),
+                ingestion_status: generated.study_set.ingestion_status.clone(),
+                ingestion_error: generated.study_set.ingestion_error.clone(),
+                concept_ids: generated
+                    .concepts
+                    .iter()
+                    .map(|concept| concept.public_id.clone())
+                    .collect(),
+                question_ids: generated
+                    .questions
+                    .iter()
+                    .map(|question| question.question_id.clone())
+                    .collect(),
+            },
+        );
+        for document in &generated.documents {
+            state.documents.insert(
+                document.id.clone(),
+                StudyDocumentRecord {
+                    study_set_id: study_set_id.clone(),
+                    document_id: document.id.clone(),
+                    title: document.display_name.clone(),
+                    source_kind: document.source_kind.clone(),
+                    processing_status: document.processing_status.clone(),
+                    tombstoned: false,
+                },
+            );
+        }
+        for source in &generated.source_spans {
+            state.source_spans.insert(
+                source.id.clone(),
+                SourceSpanRecord {
+                    study_set_id: study_set_id.clone(),
+                    source: source_summary_to_reference(source),
+                    tombstoned: false,
+                },
+            );
+        }
+        for concept in &generated.concepts {
+            state.concepts.insert(
+                concept_key(&study_set_id, &concept.public_id),
+                ConceptRecord {
+                    study_set_id: study_set_id.clone(),
+                    concept_id: concept.public_id.clone(),
+                    label: concept.label.clone(),
+                    status: concept.status.clone(),
+                    source_span_id: concept.source_span_id.clone(),
+                },
+            );
+        }
+        for question in &generated.questions {
+            state.questions.insert(
+                question_key(&study_set_id, &question.question_id),
+                StudyQuestionRecord {
+                    study_set_id: study_set_id.clone(),
+                    question: question.clone(),
+                    active: true,
+                },
+            );
+        }
+    }
+
     pub fn save_recap(&self, record: RecapRecord) {
         let mut state = self.inner.write().expect("memory store lock poisoned");
         state.recaps.retain(|existing| {
@@ -881,6 +972,130 @@ pub(crate) fn generate_paste_study_set(
     })
 }
 
+pub(crate) fn generate_file_study_set(
+    input: CreateFileStudySet,
+) -> Result<StudySetIngestionRecord, PortError> {
+    let user_id = required_text(&input.user_id, "user_id")?.to_owned();
+    let title = required_text(&input.title, "title")?.to_owned();
+    let file_name = required_text(&input.file_name, "file_name")?.to_owned();
+    let course = input.course.and_then(non_empty_owned);
+    let failure_status = if input
+        .study_set_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        StudySetIngestionStatus::Retry
+    } else {
+        StudySetIngestionStatus::Failed
+    };
+    let study_set_id = input
+        .study_set_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let document_id = Uuid::new_v4().to_string();
+    let session_id = input
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let source_kind = file_source_kind(&file_name, input.content_type.as_deref());
+    let normalized = normalize_file_bytes(&input.file_bytes);
+    let source_candidates = derive_paste_source_spans(&normalized);
+    if source_candidates.is_empty() {
+        return Ok(failed_file_study_set(
+            FailedFileStudySetInput {
+                study_set_id,
+                user_id,
+                title,
+                course,
+                document_id,
+                file_name,
+                source_kind,
+                session_id,
+                status: failure_status.clone(),
+            },
+            "no usable source span could be derived from uploaded file",
+        ));
+    }
+    let source_text = source_candidates
+        .iter()
+        .map(|candidate| candidate.excerpt.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let concepts = extract_concepts(&source_text);
+    if concepts.is_empty() {
+        return Ok(failed_file_study_set(
+            FailedFileStudySetInput {
+                study_set_id,
+                user_id,
+                title,
+                course,
+                document_id,
+                file_name,
+                source_kind,
+                session_id,
+                status: failure_status,
+            },
+            "no source-grounded concepts could be derived from uploaded file",
+        ));
+    }
+
+    let source_quality = classify_file_source_quality(&normalized);
+    let sources = source_candidates
+        .into_iter()
+        .map(|candidate| StudySourceReference {
+            source_id: Uuid::new_v4().to_string(),
+            document_id: document_id.clone(),
+            span: format!(
+                "document:chars:{}-{}",
+                candidate.start_char, candidate.end_char
+            ),
+            excerpt: candidate.excerpt,
+            confidence: source_quality.confidence.clone(),
+            retrieval_reason: source_quality.retrieval_reason.clone(),
+        })
+        .collect::<Vec<_>>();
+    let questions = questions_for_concepts(&concepts, &sources, &title);
+    let concepts = concepts
+        .into_iter()
+        .map(|concept| StudyConceptSummary {
+            source_span_id: source_id_for_concept(&concept, &sources),
+            public_id: concept.public_id,
+            label: concept.label,
+            status: ConceptStatus::Review,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(StudySetIngestionRecord {
+        study_set: StudySetSummary {
+            id: study_set_id,
+            user_id,
+            title,
+            course,
+            ingestion_status: StudySetIngestionStatus::Ready,
+            ingestion_error: None,
+        },
+        documents: vec![StudyDocumentSummary {
+            id: document_id,
+            display_name: file_name,
+            source_kind,
+            processing_status: StudySetIngestionStatus::Ready,
+        }],
+        source_spans: sources.iter().map(source_reference_to_summary).collect(),
+        concepts,
+        questions,
+        session_id,
+        session_token: None,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExtractedConcept {
     public_id: String,
@@ -926,6 +1141,31 @@ fn normalize_whitespace(value: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn normalize_file_bytes(bytes: &[u8]) -> String {
+    let lossy = String::from_utf8_lossy(bytes);
+    let printable = lossy
+        .chars()
+        .map(|ch| {
+            if ch.is_control() && !ch.is_whitespace() {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    normalize_whitespace(&printable)
+}
+
+fn file_source_kind(file_name: &str, content_type: Option<&str>) -> String {
+    let lower_name = file_name.to_ascii_lowercase();
+    let lower_content_type = content_type.unwrap_or_default().to_ascii_lowercase();
+    if lower_name.ends_with(".pdf") || lower_content_type.contains("pdf") {
+        "pdf".to_owned()
+    } else {
+        "file".to_owned()
+    }
 }
 
 fn strip_markup_tags(value: &str) -> String {
@@ -1006,6 +1246,45 @@ fn failed_paste_study_set(
         concepts: vec![],
         questions: vec![],
         session_id,
+        session_token: None,
+    }
+}
+
+struct FailedFileStudySetInput {
+    study_set_id: String,
+    user_id: String,
+    title: String,
+    course: Option<String>,
+    document_id: String,
+    file_name: String,
+    source_kind: String,
+    session_id: String,
+    status: StudySetIngestionStatus,
+}
+
+fn failed_file_study_set(
+    input: FailedFileStudySetInput,
+    reason: &'static str,
+) -> StudySetIngestionRecord {
+    StudySetIngestionRecord {
+        study_set: StudySetSummary {
+            id: input.study_set_id,
+            user_id: input.user_id,
+            title: input.title,
+            course: input.course,
+            ingestion_status: input.status.clone(),
+            ingestion_error: Some(reason.to_owned()),
+        },
+        documents: vec![StudyDocumentSummary {
+            id: input.document_id,
+            display_name: input.file_name,
+            source_kind: input.source_kind,
+            processing_status: input.status,
+        }],
+        source_spans: vec![],
+        concepts: vec![],
+        questions: vec![],
+        session_id: input.session_id,
         session_token: None,
     }
 }
@@ -1276,6 +1555,29 @@ fn classify_paste_source_quality(text: &str) -> PasteSourceQuality {
     PasteSourceQuality {
         confidence: SourceConfidence::High,
         retrieval_reason: "server-owned paste ingestion bounded source-specific excerpt".to_owned(),
+    }
+}
+
+fn classify_file_source_quality(text: &str) -> PasteSourceQuality {
+    let ambiguous = text.split_whitespace().any(|token| {
+        matches!(
+            token.to_ascii_lowercase().as_str(),
+            "maybe" | "unclear" | "todo"
+        )
+    });
+    if ambiguous {
+        return PasteSourceQuality {
+            confidence: SourceConfidence::Low,
+            retrieval_reason:
+                "server-owned file ingestion bounded document-level excerpt; ambiguous source text"
+                    .to_owned(),
+        };
+    }
+    PasteSourceQuality {
+        confidence: SourceConfidence::Medium,
+        retrieval_reason:
+            "server-owned file ingestion bounded document-level excerpt; exact page/bbox provenance unverified"
+                .to_owned(),
     }
 }
 
@@ -1656,78 +1958,69 @@ impl StudyMemoryStore for InMemoryStudyStore {
         input: CreatePasteStudySet,
     ) -> Result<StudySetIngestionRecord, PortError> {
         let generated = generate_paste_study_set(input)?;
-        let study_set_id = generated.study_set.id.clone();
         {
             let mut state = self
                 .inner
                 .write()
                 .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-            state.study_sets.insert(
-                study_set_id.clone(),
-                StudySetRecord {
-                    study_set_id: study_set_id.clone(),
-                    user_id: generated.study_set.user_id.clone(),
-                    title: generated.study_set.title.clone(),
-                    course: generated.study_set.course.clone(),
-                    ingestion_status: generated.study_set.ingestion_status.clone(),
-                    ingestion_error: generated.study_set.ingestion_error.clone(),
-                    concept_ids: generated
-                        .concepts
-                        .iter()
-                        .map(|concept| concept.public_id.clone())
-                        .collect(),
-                    question_ids: generated
-                        .questions
-                        .iter()
-                        .map(|question| question.question_id.clone())
-                        .collect(),
-                },
-            );
-            for document in &generated.documents {
-                state.documents.insert(
-                    document.id.clone(),
-                    StudyDocumentRecord {
-                        study_set_id: study_set_id.clone(),
-                        document_id: document.id.clone(),
-                        title: document.display_name.clone(),
-                        source_kind: document.source_kind.clone(),
-                        processing_status: document.processing_status.clone(),
-                        tombstoned: false,
-                    },
-                );
-            }
-            for source in &generated.source_spans {
-                state.source_spans.insert(
-                    source.id.clone(),
-                    SourceSpanRecord {
-                        study_set_id: study_set_id.clone(),
-                        source: source_summary_to_reference(source),
-                        tombstoned: false,
-                    },
-                );
-            }
-            for concept in &generated.concepts {
-                state.concepts.insert(
-                    concept_key(&study_set_id, &concept.public_id),
-                    ConceptRecord {
-                        study_set_id: study_set_id.clone(),
-                        concept_id: concept.public_id.clone(),
-                        label: concept.label.clone(),
-                        status: concept.status.clone(),
-                        source_span_id: concept.source_span_id.clone(),
-                    },
-                );
-            }
-            for question in &generated.questions {
-                state.questions.insert(
-                    question_key(&study_set_id, &question.question_id),
-                    StudyQuestionRecord {
-                        study_set_id: study_set_id.clone(),
-                        question: question.clone(),
-                        active: true,
-                    },
-                );
-            }
+            Self::persist_ingestion_record_locked(&mut state, &generated, false);
+        }
+        Ok(generated)
+    }
+
+    async fn create_file_study_set(
+        &self,
+        input: CreateFileStudySet,
+    ) -> Result<StudySetIngestionRecord, PortError> {
+        let generated = generate_file_study_set(input)?;
+        {
+            let mut state = self
+                .inner
+                .write()
+                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            Self::persist_ingestion_record_locked(&mut state, &generated, false);
+        }
+        Ok(generated)
+    }
+
+    async fn retry_file_study_set(
+        &self,
+        input: CreateFileStudySet,
+    ) -> Result<StudySetIngestionRecord, PortError> {
+        let study_set_id = input
+            .study_set_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                PortError::unavailable("memory", "file_retry", "study_set_id is required")
+            })?
+            .to_owned();
+        let (title, course) = {
+            let state = self
+                .inner
+                .read()
+                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            let existing = Self::study_set_locked(&state, &input.user_id, &study_set_id)?;
+            (existing.title.clone(), existing.course.clone())
+        };
+        let generated = generate_file_study_set(CreateFileStudySet {
+            user_id: input.user_id,
+            study_set_id: Some(study_set_id),
+            title,
+            course,
+            exam_date: input.exam_date,
+            file_name: input.file_name,
+            content_type: input.content_type,
+            file_bytes: input.file_bytes,
+            session_id: input.session_id,
+        })?;
+        {
+            let mut state = self
+                .inner
+                .write()
+                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            Self::persist_ingestion_record_locked(&mut state, &generated, true);
         }
         Ok(generated)
     }
@@ -3156,6 +3449,262 @@ mod tests {
 
         let snapshot_json = serde_json::to_string(&store.snapshot()).unwrap();
         assert!(!snapshot_json.contains(unusable_notes));
+    }
+
+    #[tokio::test]
+    async fn file_ingestion_writes_pdf_artifacts_without_exact_region_provenance() {
+        let store = InMemoryStudyStore::new();
+        let file_text = [
+            "%PDF-1.7",
+            "Mitochondria electron transport builds a proton gradient across the inner membrane.",
+            "NADH transfers electrons while oxygen accepts them at the end of the chain.",
+            "ATP synthase uses chemiosmosis to make ATP from ADP.",
+        ]
+        .join("\n");
+
+        let record = store
+            .create_file_study_set(CreateFileStudySet {
+                user_id: "user-1".to_owned(),
+                study_set_id: None,
+                title: "Bio PDF".to_owned(),
+                course: Some("Biology 201".to_owned()),
+                exam_date: None,
+                file_name: "Lecture 9.pdf".to_owned(),
+                content_type: Some("application/pdf".to_owned()),
+                file_bytes: file_text.as_bytes().to_vec(),
+                session_id: Some("file-session-1".to_owned()),
+            })
+            .await
+            .expect("file ingestion succeeds");
+
+        assert_eq!(
+            record.study_set.ingestion_status,
+            StudySetIngestionStatus::Ready
+        );
+        assert_eq!(record.documents[0].display_name, "Lecture 9.pdf");
+        assert_eq!(record.documents[0].source_kind, "pdf");
+        assert!(!record.source_spans.is_empty());
+        for source in &record.source_spans {
+            assert!(locator_span(source).starts_with("document:chars:"));
+            assert!(source.locator.get("page").is_none());
+            assert!(source.locator.get("bbox").is_none());
+            assert!(!source.excerpt.is_empty());
+            assert!(source.excerpt.chars().count() <= MAX_PASTE_SOURCE_EXCERPT_CHARS);
+            assert_ne!(source.excerpt, file_text);
+            assert!(source
+                .retrieval_reason
+                .contains("server-owned file ingestion"));
+        }
+        assert!(!record.concepts.is_empty());
+        assert_eq!(record.questions.len(), record.concepts.len());
+        assert!(store
+            .active_question("user-1", &record.study_set.id)
+            .await
+            .unwrap()
+            .is_some());
+
+        let snapshot_json = serde_json::to_string(&store.snapshot()).unwrap();
+        assert!(!snapshot_json.contains(&file_text));
+    }
+
+    #[tokio::test]
+    async fn file_ingested_study_set_flows_through_authorized_tools() {
+        let store = Arc::new(InMemoryStudyStore::new());
+        let file_text = [
+            "%PDF-1.7",
+            "Electron transport in mitochondria transfers electrons from NADH to oxygen.",
+            "The proton gradient powers ATP synthase during oxidative phosphorylation.",
+        ]
+        .join("\n");
+
+        let record = store
+            .create_file_study_set(CreateFileStudySet {
+                user_id: "user-1".to_owned(),
+                study_set_id: None,
+                title: "Tool Flow PDF".to_owned(),
+                course: Some("Biology 201".to_owned()),
+                exam_date: None,
+                file_name: "tool-flow.pdf".to_owned(),
+                content_type: Some("application/pdf".to_owned()),
+                file_bytes: file_text.as_bytes().to_vec(),
+                session_id: Some("file-session-tool-flow".to_owned()),
+            })
+            .await
+            .expect("file ingestion succeeds");
+        let voice_session_id = "voice-session-file-flow";
+        store
+            .record_voice_session(&SessionConfig {
+                session_id: Some(SessionId::new(voice_session_id)),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some(record.study_set.id.clone()),
+                mode: Some(StudyMode::Quiz),
+                active_concepts: record
+                    .concepts
+                    .iter()
+                    .map(|concept| concept.public_id.clone())
+                    .collect(),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+        let active_question = store
+            .active_question("user-1", &record.study_set.id)
+            .await
+            .unwrap()
+            .expect("file-generated active question");
+        let concept_id = record
+            .concepts
+            .first()
+            .expect("file-generated concept")
+            .public_id
+            .clone();
+        let executor = VivaToolExecutor::new(
+            store.clone(),
+            AuthorizedStudySession {
+                user_id: "user-1".to_owned(),
+                study_set_id: record.study_set.id.clone(),
+                voice_session_id: voice_session_id.to_owned(),
+                mode: StudyMode::Quiz,
+                active_concepts: vec![concept_id.clone()],
+            },
+        );
+
+        let selected = executor
+            .execute(
+                "response-file-0",
+                ToolProposal::select_next_question(&record.study_set.id, voice_session_id, "quiz"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            selected.result["question"]["source"]["source_id"],
+            active_question.source.source_id
+        );
+        assert!(selected.result["question"]["source"]["span"]
+            .as_str()
+            .unwrap()
+            .starts_with("document:chars:"));
+
+        let source_result = executor
+            .execute(
+                "response-file-1",
+                ToolProposal::retrieve_source_reference(
+                    &record.study_set.id,
+                    voice_session_id,
+                    &active_question.source.source_id,
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            source_result.result["source"]["document_id"],
+            record.documents[0].id
+        );
+        assert!(source_result.result["source"]["span"]
+            .as_str()
+            .unwrap()
+            .starts_with("document:chars:"));
+
+        let concept_status = executor
+            .execute(
+                "response-file-2",
+                ToolProposal::mark_concept_status(
+                    &record.study_set.id,
+                    voice_session_id,
+                    &concept_id,
+                    "shaky",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(concept_status.result["concept_id"], concept_id);
+        assert_eq!(concept_status.result["status"], "shaky");
+
+        let snapshot = store.snapshot();
+        assert!(snapshot.concept_statuses.iter().any(|status| {
+            status.study_set_id == record.study_set.id
+                && status.voice_session_id == voice_session_id
+                && status.concept_id == concept_id
+                && status.status == ConceptStatus::Shaky
+        }));
+    }
+
+    #[tokio::test]
+    async fn failed_file_ingestion_blocks_questions_until_retry_succeeds() {
+        let store = InMemoryStudyStore::new();
+        let failed = store
+            .create_file_study_set(CreateFileStudySet {
+                user_id: "user-1".to_owned(),
+                study_set_id: None,
+                title: "Bad PDF".to_owned(),
+                course: None,
+                exam_date: None,
+                file_name: "empty.pdf".to_owned(),
+                content_type: Some("application/pdf".to_owned()),
+                file_bytes: b"!!! ??? ---".to_vec(),
+                session_id: Some("file-session-failed".to_owned()),
+            })
+            .await
+            .expect("unusable file returns failed record");
+        assert_eq!(
+            failed.study_set.ingestion_status,
+            StudySetIngestionStatus::Failed
+        );
+        assert!(failed.questions.is_empty());
+        assert!(store
+            .active_question("user-1", &failed.study_set.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let retry_failed = store
+            .retry_file_study_set(CreateFileStudySet {
+                user_id: "user-1".to_owned(),
+                study_set_id: Some(failed.study_set.id.clone()),
+                title: "Bad PDF".to_owned(),
+                course: None,
+                exam_date: None,
+                file_name: "still-empty.pdf".to_owned(),
+                content_type: Some("application/pdf".to_owned()),
+                file_bytes: b"??? --- !!!".to_vec(),
+                session_id: Some("file-session-retry-failed".to_owned()),
+            })
+            .await
+            .expect("unusable retry returns retry state");
+        assert_eq!(
+            retry_failed.study_set.ingestion_status,
+            StudySetIngestionStatus::Retry
+        );
+        assert!(retry_failed.questions.is_empty());
+
+        let retry_text =
+            "Photosynthesis chloroplast thylakoid membranes split water. Carbon fixation stores energy in glucose after light reactions.";
+        let ready = store
+            .retry_file_study_set(CreateFileStudySet {
+                user_id: "user-1".to_owned(),
+                study_set_id: Some(failed.study_set.id.clone()),
+                title: "Bad PDF".to_owned(),
+                course: None,
+                exam_date: None,
+                file_name: "replacement.pdf".to_owned(),
+                content_type: Some("application/pdf".to_owned()),
+                file_bytes: retry_text.as_bytes().to_vec(),
+                session_id: Some("file-session-retry".to_owned()),
+            })
+            .await
+            .expect("retry succeeds");
+
+        assert_eq!(ready.study_set.id, failed.study_set.id);
+        assert_eq!(
+            ready.study_set.ingestion_status,
+            StudySetIngestionStatus::Ready
+        );
+        assert!(!ready.questions.is_empty());
+        assert!(store
+            .active_question("user-1", &ready.study_set.id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

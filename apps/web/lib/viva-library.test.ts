@@ -80,6 +80,32 @@ const snapshot: VivaLibrarySnapshot = {
       },
     },
     {
+      id: "retry-set",
+      user_id: "user-1",
+      title: "Retry Set",
+      course: null,
+      ingestion_status: "retry",
+      ingestion_error: "Upload failed; provide a fresh PDF to retry.",
+      server_owned: true,
+      documents: [
+        {
+          id: "retry-doc",
+          display_name: "Retry lecture.pdf",
+          source_kind: "pdf",
+          processing_status: "retry",
+          deleted: false,
+        },
+      ],
+      concept_count: 0,
+      question_count: 0,
+      actions: {
+        start: { available: false, unavailable_reason: "ingestion_retry" },
+        resume: { available: false, unavailable_reason: "ingestion_retry" },
+        archive: { available: false, unavailable_reason: "server_mutation_unavailable" },
+        delete: { available: true, control_token: "viva1.control-token" },
+      },
+    },
+    {
       id: "deleted-document-set",
       user_id: "user-1",
       title: "Deleted Document Set",
@@ -146,6 +172,7 @@ describe("Viva library projection", () => {
       "biology-midterm",
       "pending-set",
       "failed-set",
+      "retry-set",
       "deleted-document-set",
     ]);
     expect(projection.libraryRows[0]?.statusLabel).toBe("Ready");
@@ -157,10 +184,14 @@ describe("Viva library projection", () => {
     expect(projection.libraryRows[1]?.statusLabel).toBe("Ingestion pending");
     expect(projection.libraryRows[2]?.statusLabel).toBe("Ingestion failed");
     expect(projection.libraryRows[2]?.detail).toBe("No usable source span");
-    expect(projection.libraryRows[3]?.statusLabel).toBe("Source archived");
+    expect(projection.libraryRows[3]?.statusLabel).toBe("Ingestion retry needed");
+    expect(projection.libraryRows[3]?.detail).toBe("Upload failed; provide a fresh PDF to retry.");
     expect(projection.libraryRows[3]?.start.available).toBe(false);
-    expect(projection.libraryRows[3]?.delete.available).toBe(false);
-    expect(projection.libraryRows[3]?.archive.unavailableReason).toBe(
+    expect(projection.libraryRows[3]?.delete.available).toBe(true);
+    expect(projection.libraryRows[4]?.statusLabel).toBe("Source archived");
+    expect(projection.libraryRows[4]?.start.available).toBe(false);
+    expect(projection.libraryRows[4]?.delete.available).toBe(false);
+    expect(projection.libraryRows[4]?.archive.unavailableReason).toBe(
       "server_mutation_unavailable",
     );
   });

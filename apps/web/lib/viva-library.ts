@@ -243,6 +243,8 @@ function studySetStatusLabel(studySet: VivaLibraryStudySet): string {
       return "Ingestion processing";
     case "failed":
       return "Ingestion failed";
+    case "retry":
+      return "Ingestion retry needed";
     case "ready":
       return studySet.documents.length > 0 &&
         studySet.documents.every((document) => document.deleted)
