@@ -75,6 +75,15 @@ impl Default for CartesiaGeminiConfig {
 
 impl CartesiaGeminiConfig {
     pub fn from_env() -> Self {
+        Self::from_env_with(env_value)
+    }
+
+    fn from_env_with(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let env_value = |name: &str| {
+            lookup(name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
         let mut config = Self {
             cartesia_api_key: env_value("CARTESIA_API_KEY").unwrap_or_default(),
             gemini: GeminiConfig {
@@ -94,8 +103,35 @@ impl CartesiaGeminiConfig {
         if let Some(thinking_level) = env_value("GEMINI_THINKING_LEVEL") {
             config.gemini.thinking_level = ThinkingLevel::parse(thinking_level);
         }
+        if let Some(websocket_url) = env_value("CARTESIA_INK_WEBSOCKET_URL") {
+            config.ink.websocket_url = websocket_url;
+        }
         if let Some(model) = env_value("CARTESIA_INK_MODEL") {
             config.ink.model = model;
+        }
+        if let Some(language) = env_value("CARTESIA_INK_LANGUAGE") {
+            config.ink.language = language;
+        }
+        if let Some(encoding) = env_value("CARTESIA_INK_ENCODING") {
+            config.ink.encoding = encoding;
+        }
+        if let Some(sample_rate) = env_value("CARTESIA_INK_SAMPLE_RATE")
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|sample_rate| *sample_rate > 0)
+        {
+            config.ink.sample_rate = sample_rate;
+        }
+        if let Some(min_volume) = env_value("CARTESIA_INK_MIN_VOLUME") {
+            config.ink.min_volume = min_volume;
+        }
+        if let Some(max_silence_duration_secs) = env_value("CARTESIA_INK_MAX_SILENCE_DURATION_SECS")
+        {
+            config.ink.max_silence_duration_secs = max_silence_duration_secs;
+        }
+        if let Some(cartesia_version) =
+            env_value("CARTESIA_VERSION").or_else(|| env_value("CARTESIA_INK_VERSION"))
+        {
+            config.ink.cartesia_version = cartesia_version;
         }
         if let Some(model) = env_value("CARTESIA_SONIC_MODEL") {
             config.sonic.model_id = model;
@@ -420,4 +456,42 @@ fn env_value(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_env_applies_ink_transport_overrides() {
+        let config = CartesiaGeminiConfig::from_env_with(|name| match name {
+            "CARTESIA_API_KEY" => Some(" cartesia-key ".to_owned()),
+            "GEMINI_API_KEY" => Some(" gemini-key ".to_owned()),
+            "CARTESIA_INK_WEBSOCKET_URL" => {
+                Some(" wss://example.test/stt/turns/websocket ".to_owned())
+            }
+            "CARTESIA_INK_MODEL" => Some(" ink-custom ".to_owned()),
+            "CARTESIA_INK_LANGUAGE" => Some(" en ".to_owned()),
+            "CARTESIA_INK_ENCODING" => Some(" pcm_f32le ".to_owned()),
+            "CARTESIA_INK_SAMPLE_RATE" => Some(" 16000 ".to_owned()),
+            "CARTESIA_INK_MIN_VOLUME" => Some(" 0.2 ".to_owned()),
+            "CARTESIA_INK_MAX_SILENCE_DURATION_SECS" => Some(" 1.1 ".to_owned()),
+            "CARTESIA_VERSION" => Some(" 2026-03-01 ".to_owned()),
+            _ => None,
+        });
+
+        assert_eq!(config.cartesia_api_key, "cartesia-key");
+        assert_eq!(config.gemini.api_key, "gemini-key");
+        assert_eq!(
+            config.ink.websocket_url,
+            "wss://example.test/stt/turns/websocket"
+        );
+        assert_eq!(config.ink.model, "ink-custom");
+        assert_eq!(config.ink.language, "en");
+        assert_eq!(config.ink.encoding, "pcm_f32le");
+        assert_eq!(config.ink.sample_rate, 16_000);
+        assert_eq!(config.ink.min_volume, "0.2");
+        assert_eq!(config.ink.max_silence_duration_secs, "1.1");
+        assert_eq!(config.ink.cartesia_version, "2026-03-01");
+    }
 }
