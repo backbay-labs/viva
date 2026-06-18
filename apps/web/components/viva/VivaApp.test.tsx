@@ -114,7 +114,7 @@ describe("VivaApp component states", () => {
       />,
     );
 
-    expect(markup).toContain("Agent unavailable");
+    expect(markup).toContain("Connect after ingestion");
     expect(markup).toContain("Run local demo drill");
     expect(markup).toContain("source-grounded ingestion");
     expect(markup).toContain('disabled=""');

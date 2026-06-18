@@ -1023,7 +1023,9 @@ export function HomeScreen({
           type="button"
         >
           <Icon color="var(--plum-soft)" name="mic" size={18} />
-          {canStartConnectedAgent ? "Start 10-minute recall drill" : "Agent unavailable"}
+          {canStartConnectedAgent
+            ? "Start 10-minute recall drill"
+            : connectedAgentBlockedLabel(agentReadiness)}
         </button>
         {!canStartConnectedAgent ? (
           <p className="session-nudge">
@@ -1077,6 +1079,19 @@ export function HomeScreen({
       </section>
     </div>
   );
+}
+
+function connectedAgentBlockedLabel(readiness: AgentStudySetReadiness): string {
+  if (readiness.canConnect) return "Start 10-minute recall drill";
+  switch (readiness.reason) {
+    case "failed_ingestion":
+      return "Fix ingestion before recall";
+    case "unmapped_fixture":
+      return "Use a trusted server study set";
+    case "processing_ingestion":
+    case "pending_ingestion":
+      return "Connect after ingestion";
+  }
 }
 
 export function SessionScreen({

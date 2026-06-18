@@ -1,4 +1,5 @@
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
+import type { RuntimeCopy } from "../../lib/viva-session-projection";
 import { MuseBackdrop } from "../landing/MuseBackdrop";
 import { MuseGlyphCanvas, type MuseGlyphState } from "../landing/MuseGlyphCanvas";
 import { MarginaliaPanel } from "./MarginaliaPanel";
@@ -17,6 +18,7 @@ import { VoiceTraceCanvas, type VoiceTraceLevelRef } from "./VoiceTraceCanvas";
 export function LiveSessionShell({
   state,
   scene,
+  runtime,
   glyphState,
   highlightedTokens,
   conceptNodes,
@@ -33,6 +35,7 @@ export function LiveSessionShell({
 }: {
   state: SessionState;
   scene?: VivaSceneState;
+  runtime: RuntimeCopy;
   glyphState: MuseGlyphState;
   highlightedTokens: string[];
   conceptNodes: ConceptNode[];
@@ -53,7 +56,7 @@ export function LiveSessionShell({
       <MuseGlyphCanvas highlightedTokens={highlightedTokens} state={glyphState} />
       <div className="live-session__veil" />
 
-      <SessionHeader elapsed={elapsed} />
+      <SessionHeader elapsed={elapsed} runtime={runtime} />
 
       <div className="live-session__stage-wrap">
         <div className="live-session__stage">
@@ -78,6 +81,7 @@ export function LiveSessionShell({
             onSubmitAnswer={onSubmitAnswer}
             onTryAgain={onTryAgain}
             question={question}
+            runtime={runtime}
             scene={scene}
             state={state}
           />

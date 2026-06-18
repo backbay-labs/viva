@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import type { AnswerEvaluation, Concept, SessionQuestion, SourceReference } from "@viva/core";
+import type {
+  AgentStudySetReadiness,
+  AnswerEvaluation,
+  Concept,
+  SessionQuestion,
+  SourceReference,
+  VivaReadyFrame,
+} from "@viva/core";
+import { VIVA_VOICE_PROTOCOL_VERSION } from "@viva/core";
 import type { VivaAgentDerivedState } from "./use-viva-agent-session";
 import {
   checklistFromExpectedTerms,
@@ -10,6 +18,7 @@ import {
   expectedTermsRevealed,
   projectConceptNodes,
   projectHighlightedTokens,
+  projectRuntimeCopy,
   projectSessionQuestion,
   projectSessionState,
   projectTrace,
@@ -59,6 +68,36 @@ function derived(overrides: Partial<VivaAgentDerivedState> = {}): VivaAgentDeriv
   };
 }
 
+function ready(provider: string, overrides: Partial<VivaReadyFrame["brain"]> = {}): VivaReadyFrame {
+  return {
+    type: "ready",
+    version: VIVA_VOICE_PROTOCOL_VERSION,
+    sample_rate_hz: 24000,
+    input_encoding: "pcm_s16le",
+    brain: {
+      provider,
+      configured: true,
+      selectable: true,
+      live_runtime: false,
+      ...overrides,
+    },
+    store: {
+      backend: "in_memory",
+      available: true,
+      durable: false,
+      raw_audio_persistence: false,
+      transcript_persistence: false,
+      uuid_schema_translation: true,
+    },
+  };
+}
+
+const trustedReadiness: AgentStudySetReadiness = {
+  canConnect: true,
+  reason: "trusted",
+  message: "Connected agent is mapped to a trusted server study set.",
+};
+
 describe("projectSessionState", () => {
   test("maps agent phases onto the four trace states", () => {
     expect(projectSessionState("listening", true)).toBe("listening");
@@ -71,6 +110,151 @@ describe("projectSessionState", () => {
   test("stays calm (listening) before a question arrives", () => {
     expect(projectSessionState("ready", false)).toBe("listening");
     expect(projectSessionState("ready", true)).toBe("listening");
+  });
+});
+
+describe("projectRuntimeCopy", () => {
+  test("labels the default no-key synthetic brain without implying live tutoring", () => {
+    const copy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "open",
+    });
+
+    expect(copy.capsuleLabel).toBe("Synthetic examiner");
+    expect(copy.marginaliaTitle).toBe("Synthetic examiner is listening.");
+    expect(copy.marginaliaText).toContain("no provider keys");
+    expect(copy.marginaliaText).not.toContain("live tutor");
+  });
+
+  test("labels fake Cartesia/Gemini as a non-live provider test path", () => {
+    const copy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("fake_cartesia_gemini"),
+      status: "open",
+    });
+
+    expect(copy.capsuleLabel).toBe("Non-live provider test");
+    expect(copy.marginaliaText).toContain("Cartesia/Gemini-shaped");
+    expect(copy.marginaliaText).toContain("not a live tutor");
+  });
+
+  test("reserves live tutor copy for selectable live runtime readiness", () => {
+    const gated = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("cartesia_gemini", { configured: false, selectable: false }),
+      status: "open",
+    });
+    const live = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("cartesia_gemini", {
+        configured: true,
+        selectable: true,
+        live_runtime: true,
+      }),
+      status: "open",
+    });
+
+    expect(gated.capsuleLabel).toBe("Live provider gated");
+    expect(gated.marginaliaText).toContain("Act 3");
+    expect(live.capsuleLabel).toBe("Live Cartesia/Gemini tutor");
+    expect(live.marginaliaText).toContain("live Cartesia/Gemini runtime");
+  });
+
+  test("surfaces actionable unavailable causes", () => {
+    const ingestion = projectRuntimeCopy({
+      readiness: {
+        canConnect: false,
+        reason: "processing_ingestion",
+        message:
+          "Connected agent is unavailable while the server is still processing this study set.",
+      },
+      ready: ready("synthetic"),
+      status: "open",
+    });
+    const store = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: {
+        ...ready("synthetic"),
+        store: { ...ready("synthetic").store, available: false, backend: "postgres" },
+      },
+      status: "open",
+    });
+    const auth = projectRuntimeCopy({
+      errors: ["session token claim mismatch"],
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "error",
+    });
+
+    expect(ingestion.cause).toBe("ingestion_pending");
+    expect(ingestion.marginaliaText).toContain("server is still processing");
+    expect(store.cause).toBe("store_unavailable");
+    expect(store.marginaliaText).toContain("postgres store");
+    expect(auth.cause).toBe("auth_failed");
+    expect(auth.marginaliaText).toContain("auth failed");
+  });
+
+  test("treats post-ready server rejections as unavailable instead of provider copy", () => {
+    const copy = projectRuntimeCopy({
+      errors: ["study set access denied"],
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "error",
+    });
+
+    expect(copy.cause).toBe("agent_offline");
+    expect(copy.capsuleLabel).toBe("Agent unavailable");
+    expect(copy.marginaliaTitle).toBe("Agent unavailable: session rejected.");
+    expect(copy.marginaliaText).toContain("study set access denied");
+    expect(copy.marginaliaText).not.toContain("Synthetic examiner");
+  });
+
+  test("uses readiness facts before provider names for generic live runtimes", () => {
+    const copy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("future_live_provider", {
+        configured: true,
+        selectable: true,
+        live_runtime: true,
+      }),
+      status: "open",
+    });
+
+    expect(copy.cause).toBe("live_runtime");
+    expect(copy.capsuleLabel).toBe("Live tutor");
+    expect(copy.marginaliaText).toContain("live provider runtime");
+    expect(copy.marginaliaText).not.toContain("Synthetic");
+  });
+
+  test("labels unknown non-live providers as test paths instead of synthetic", () => {
+    const copy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("noop_provider", {
+        configured: true,
+        selectable: true,
+        live_runtime: false,
+      }),
+      status: "open",
+    });
+
+    expect(copy.cause).toBe("fake_provider");
+    expect(copy.capsuleLabel).toBe("Non-live provider test");
+    expect(copy.marginaliaText).toContain("noop_provider");
+    expect(copy.marginaliaText).not.toContain("Default no-key synthetic brain");
+  });
+
+  test("surfaces browser mic denial on the manuscript path", () => {
+    const copy = projectRuntimeCopy({
+      mic: "denied",
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "open",
+    });
+
+    expect(copy.cause).toBe("mic_denied");
+    expect(copy.capsuleLabel).toBe("Mic denied");
+    expect(copy.marginaliaText).toContain("Browser microphone capture was denied");
   });
 });
 

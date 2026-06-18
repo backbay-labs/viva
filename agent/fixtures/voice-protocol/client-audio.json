@@ -1,6 +1,6 @@
 {
   "type": "audio",
-  "version": 1,
+  "version": 2,
   "frame": {
     "pcm16_base64": "AQIDBA=="
   }

@@ -15,7 +15,7 @@ use agent_domain::{
 };
 use agent_service::{
     build_router, AppState, ClientFrame, ServerFrame, VoiceEvidenceRecorder, VoiceWsAccess,
-    WsTimeouts,
+    WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
 };
 use axum::{body::Body, http::Request};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -401,12 +401,12 @@ async fn shared_audio_fixture_matches_client_frame_contract() {
     ))
     .unwrap();
 
-    assert_eq!(audio.version(), 1);
+    assert_eq!(audio.version(), VIVA_VOICE_PROTOCOL_VERSION);
     assert_eq!(
         serde_json::to_value(audio).unwrap(),
         serde_json::json!({
             "type": "audio",
-            "version": 1,
+            "version": VIVA_VOICE_PROTOCOL_VERSION,
             "frame": { "pcm16_base64": "AQIDBA==" }
         })
     );
@@ -759,7 +759,7 @@ async fn websocket_malformed_frame_reports_protocol_close_code() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -796,7 +796,7 @@ async fn websocket_oversized_text_frame_closes_with_size_and_terminal_reason() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -835,7 +835,7 @@ async fn websocket_oversized_binary_frame_closes_with_size_and_terminal_reason()
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -910,7 +910,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
     for session in [
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":1,"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -922,7 +922,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         },
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":1,"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -934,7 +934,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         },
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":1,"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -946,7 +946,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         },
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":1,"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -958,7 +958,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         },
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":1,"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -1058,7 +1058,7 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
         };
         let (mut socket, _) = connect_async(url).await.unwrap();
 
-        assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+        assert_ready_provider(&mut socket, "open_probe").await;
         socket
             .send(WsMessage::Text(
                 session_config_json_with_token(&token).into(),
@@ -1114,7 +1114,7 @@ async fn websocket_rejects_token_claim_mismatch_before_brain_open() {
         };
         let (mut socket, _) = connect_async(url).await.unwrap();
 
-        assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+        assert_ready_provider(&mut socket, "open_probe").await;
         socket
             .send(WsMessage::Text(
                 session_config_json_with_token(&token).into(),
@@ -1159,12 +1159,12 @@ async fn websocket_checks_study_set_access_before_brain_open() {
         "active_concepts": []
     });
 
-    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    assert_ready_provider(&mut socket, "open_probe").await;
     socket
         .send(WsMessage::Text(
             serde_json::json!({
                 "type": "session_config",
-                "version": 1,
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
                 "session": session,
             })
             .to_string()
@@ -1207,7 +1207,7 @@ async fn websocket_rejects_browser_tool_result_as_untrusted() {
         .send(WsMessage::Text(
             serde_json::json!({
                 "type": "tool_result",
-                "version": 1,
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
                 "result": {
                     "proposal": {
                         "name": "evaluate_spoken_answer",
@@ -1255,7 +1255,7 @@ async fn websocket_idle_timeout_sends_stop_and_terminal_reason() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -1315,7 +1315,7 @@ async fn websocket_default_trusted_mode_rotates_internal_session_for_reconnect()
         assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
         socket
             .send(WsMessage::Text(
-                format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+                format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
             ))
             .await
             .unwrap();
@@ -1362,10 +1362,10 @@ async fn websocket_disconnect_aborts_provider_tasks_and_releases_capacity() {
     let (mut socket, _) = connect_async(url).await.unwrap();
     let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
 
-    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    assert_ready_provider(&mut socket, "abort_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -1404,12 +1404,12 @@ async fn websocket_hydrates_active_concepts_from_server_context_before_brain_ope
         "wrong-third-concept"
     ]);
 
-    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    assert_ready_provider(&mut socket, "open_probe").await;
     socket
         .send(WsMessage::Text(
             serde_json::json!({
                 "type": "session_config",
-                "version": 1,
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
                 "session": session,
             })
             .to_string()
@@ -1456,10 +1456,10 @@ async fn websocket_suppresses_stale_events_after_cancelled_response() {
     let (mut socket, _) = connect_async(url).await.unwrap();
     let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
 
-    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    assert_ready_provider(&mut socket, "stale_event_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -1678,10 +1678,10 @@ async fn websocket_rejects_forged_provider_source_tuples_without_leaks_or_writes
         let (mut socket, _) = connect_async(url).await.unwrap();
         let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
 
-        assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+        assert_ready_provider(&mut socket, "event_probe").await;
         socket
             .send(WsMessage::Text(
-                format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+                format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
             ))
             .await
             .unwrap();
@@ -1739,10 +1739,10 @@ async fn websocket_rejects_authorized_payload_replayed_under_wrong_response_id()
     let (mut socket, _) = connect_async(url).await.unwrap();
     let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
 
-    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    assert_ready_provider(&mut socket, "response_replay_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":1,"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -1845,7 +1845,7 @@ fn session_config_json_with_token(token: &str) -> String {
     .unwrap();
     serde_json::json!({
         "type": "session_config",
-        "version": 1,
+        "version": VIVA_VOICE_PROTOCOL_VERSION,
         "session": session,
         "session_token": token,
     })
@@ -1894,6 +1894,28 @@ async fn read_server_frame(socket: &mut TestWebSocket) -> ServerFrame {
         WsMessage::Text(text) => serde_json::from_str(&text).unwrap(),
         other => panic!("expected text server frame, got {other:?}"),
     }
+}
+
+async fn assert_ready_provider(socket: &mut TestWebSocket, expected_provider: &str) {
+    let frame = read_server_frame(socket).await;
+    let ServerFrame::Ready {
+        sample_rate_hz,
+        input_encoding,
+        brain,
+        store,
+        ..
+    } = frame
+    else {
+        panic!("expected ready frame, got {frame:?}");
+    };
+    assert_eq!(sample_rate_hz, 24_000);
+    assert_eq!(input_encoding, "pcm_s16le");
+    assert_eq!(brain.provider, expected_provider);
+    assert!(brain.configured);
+    assert!(brain.selectable);
+    assert!(!brain.live_runtime);
+    assert_eq!(store.backend.as_str(), "in_memory");
+    assert!(store.available);
 }
 
 async fn wait_for_socket_close(socket: &mut TestWebSocket) {

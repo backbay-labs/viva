@@ -17,7 +17,9 @@ import { vivaSceneReducer } from "../../lib/viva-scene-reducer";
 import {
   projectConceptNodes,
   projectHighlightedTokens,
+  projectRuntimeCopy,
   projectTrace,
+  type RuntimeMicState,
 } from "../../lib/viva-session-projection";
 import { createVoiceLevelMeter } from "../../lib/viva-voice-level";
 import { LiveSessionShell } from "./LiveSessionShell";
@@ -46,6 +48,7 @@ export function LiveSessionPage() {
   const reducedMotion = usePrefersReducedMotion();
   const [elapsed, setElapsed] = useState(0);
   const [hintShown, setHintShown] = useState(false);
+  const [micState, setMicState] = useState<RuntimeMicState>("unknown");
   const [sourceOpen, setSourceOpen] = useState(false);
 
   const agent = useVivaAgentSession({
@@ -139,9 +142,15 @@ export function LiveSessionPage() {
 
   const startMic = useCallback(async () => {
     if (captureStartedRef.current || reducedMotion) return;
-    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) return;
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setMicState("unsupported");
+      return;
+    }
     const AudioContextCtor = window.AudioContext ?? window.webkitAudioContext;
-    if (!AudioContextCtor) return;
+    if (!AudioContextCtor) {
+      setMicState("unsupported");
+      return;
+    }
     captureStartedRef.current = true;
     try {
       const source = await createBrowserVivaAudioCaptureSource({
@@ -150,6 +159,7 @@ export function LiveSessionPage() {
         sampleRateHz: VIVA_AUDIO_SAMPLE_RATE_HZ,
       });
       captureRef.current = source;
+      setMicState("available");
       const meter = meterRef.current;
       // Samples drive the bloom ONLY — never sent to the brain.
       void source.start((samples) => {
@@ -158,6 +168,7 @@ export function LiveSessionPage() {
     } catch {
       captureStartedRef.current = false; // allow another attempt on the next gesture
       levelRef.current.user = 0;
+      setMicState("denied");
     }
   }, [reducedMotion]);
 
@@ -221,6 +232,17 @@ export function LiveSessionPage() {
   const highlightedTokens = sourceOpen
     ? projectHighlightedTokens("source", agent.derived)
     : projection.highlightedTokens;
+  const runtime = useMemo(
+    () =>
+      projectRuntimeCopy({
+        errors: agent.derived.errors,
+        mic: micState,
+        readiness: agent.readiness,
+        ready: agent.agentState.ready,
+        status: agent.status,
+      }),
+    [agent.agentState.ready, agent.derived.errors, agent.readiness, agent.status, micState],
+  );
 
   return (
     <LiveSessionShell
@@ -237,6 +259,7 @@ export function LiveSessionPage() {
       onSubmitAnswer={submitTurn}
       onTryAgain={submitTurn}
       question={projection.question}
+      runtime={runtime}
       scene={scene}
       state={effectiveState}
     />
