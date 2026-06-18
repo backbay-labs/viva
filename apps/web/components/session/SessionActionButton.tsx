@@ -6,12 +6,14 @@ import type { ReactNode } from "react";
  * stays decoupled from the icon set.
  */
 export function SessionActionButton({
+  disabled = false,
   label,
   onClick,
   variant = "default",
   leading,
   trailing,
 }: {
+  disabled?: boolean;
   label: string;
   onClick?: () => void;
   variant?: "default" | "primary";
@@ -19,7 +21,12 @@ export function SessionActionButton({
   trailing?: ReactNode;
 }) {
   return (
-    <button className={`session-action session-action--${variant}`} onClick={onClick} type="button">
+    <button
+      className={`session-action session-action--${variant}`}
+      disabled={disabled}
+      onClick={onClick}
+      type="button"
+    >
       {leading ? <span className="session-action__icon">{leading}</span> : null}
       <span className="session-action__label">{label}</span>
       {trailing ? (

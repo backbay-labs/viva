@@ -100,6 +100,16 @@ function ListeningNote({
       </span>
       <p className="margin-note__title">{runtime.marginaliaTitle}</p>
       <p className="margin-note__text">{runtime.marginaliaText}</p>
+      <ul className="readiness-ladder" aria-label="Connected session readiness">
+        {runtime.readinessNotes.map((note) => (
+          <li className="readiness-ladder__item" data-state={note.state} key={note.label}>
+            <span className="readiness-ladder__dot" />
+            <span className="readiness-ladder__label">{note.label}</span>
+            <span className="readiness-ladder__text">{note.text}</span>
+          </li>
+        ))}
+      </ul>
+      <p className="margin-note__next">Next action: {runtime.nextActionLabel}</p>
       {hintShown ? (
         <p className="margin-note__hint">
           Start with NADH&rsquo;s electrons — where do they go first?
@@ -107,7 +117,8 @@ function ListeningNote({
       ) : null}
       <div className="margin-note__actions">
         <SessionActionButton
-          label="I&rsquo;m ready — check it"
+          disabled={runtime.primaryActionDisabled}
+          label={runtime.primaryActionLabel}
           leading={<Icon color="var(--viva-paper)" name="mic" size={15} strokeWidth={1.7} />}
           onClick={onSubmitAnswer}
           variant="primary"

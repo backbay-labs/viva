@@ -239,21 +239,46 @@ async fn root() -> Json<serde_json::Value> {
 
 async fn health(
     axum::extract::State(state): axum::extract::State<AppState>,
-) -> Json<serde_json::Value> {
-    Json(json!({
-        "ok": state.is_ready(),
-        "live": true,
-        "ready": state.is_ready(),
-    }))
+    headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let response_headers = match optional_cors_json_headers(&state.ws_access, &headers) {
+        Ok(headers) => headers,
+        Err(error) => return cors_json_error(error),
+    };
+    (
+        StatusCode::OK,
+        response_headers,
+        Json(json!({
+            "ok": state.is_ready(),
+            "live": true,
+            "ready": state.is_ready(),
+        })),
+    )
 }
 
-async fn live() -> Json<serde_json::Value> {
-    Json(json!({ "live": true }))
+async fn live(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let response_headers = match optional_cors_json_headers(&state.ws_access, &headers) {
+        Ok(headers) => headers,
+        Err(error) => return cors_json_error(error),
+    };
+    (
+        StatusCode::OK,
+        response_headers,
+        Json(json!({ "live": true })),
+    )
 }
 
 async fn ready(
     axum::extract::State(state): axum::extract::State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+    headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let response_headers = match optional_cors_json_headers(&state.ws_access, &headers) {
+        Ok(headers) => headers,
+        Err(error) => return cors_json_error(error),
+    };
     let brain = state.brain.capabilities();
     let store = state.study_store.capabilities();
     let writes = state.study_store.write_counts();
@@ -265,6 +290,7 @@ async fn ready(
     };
     (
         status,
+        response_headers,
         Json(json!({
             "ready": ready,
             "brain": {
@@ -294,43 +320,52 @@ async fn ready(
 
 async fn brain_health(
     axum::extract::State(state): axum::extract::State<AppState>,
-) -> Json<serde_json::Value> {
+    headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let response_headers = match optional_cors_json_headers(&state.ws_access, &headers) {
+        Ok(headers) => headers,
+        Err(error) => return cors_json_error(error),
+    };
     let brain = state.brain.capabilities();
     let store = state.study_store.capabilities();
     let writes = state.study_store.write_counts();
 
-    Json(json!({
-        "provider": state.provider,
-        "brain": {
-            "provider": brain.provider,
-            "configured": brain.configured,
-            "selectable": brain.selectable,
-            "live_runtime": brain.live_runtime,
-        },
-        "store": {
-            "backend": store.backend.as_str(),
-            "available": store.available,
-            "durable": store.durable,
-            "raw_audio_persistence": store.raw_audio_persistence,
-            "transcript_persistence": store.transcript_persistence,
-            "uuid_schema_translation": store.uuid_schema_translation,
-            "writes": {
-                "sessions": writes.sessions,
-                "answer_attempts": writes.answer_attempts,
-                "concept_statuses": writes.concept_statuses,
-                "review_items": writes.review_items,
-                "recaps": writes.recaps,
+    (
+        StatusCode::OK,
+        response_headers,
+        Json(json!({
+            "provider": state.provider,
+            "brain": {
+                "provider": brain.provider,
+                "configured": brain.configured,
+                "selectable": brain.selectable,
+                "live_runtime": brain.live_runtime,
             },
-        },
-        "usage": {
-            "events": state.usage.snapshot().len(),
-        },
-        "status": if brain.configured && brain.selectable && store.available {
-            "configured"
-        } else {
-            "unavailable"
-        },
-    }))
+            "store": {
+                "backend": store.backend.as_str(),
+                "available": store.available,
+                "durable": store.durable,
+                "raw_audio_persistence": store.raw_audio_persistence,
+                "transcript_persistence": store.transcript_persistence,
+                "uuid_schema_translation": store.uuid_schema_translation,
+                "writes": {
+                    "sessions": writes.sessions,
+                    "answer_attempts": writes.answer_attempts,
+                    "concept_statuses": writes.concept_statuses,
+                    "review_items": writes.review_items,
+                    "recaps": writes.recaps,
+                },
+            },
+            "usage": {
+                "events": state.usage.snapshot().len(),
+            },
+            "status": if brain.configured && brain.selectable && store.available {
+                "configured"
+            } else {
+                "unavailable"
+            },
+        })),
+    )
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -477,6 +512,34 @@ fn unix_timestamp_now() -> Result<u64, crate::config::SessionTokenError> {
         .map_err(|_| crate::config::SessionTokenError::Invalid)
 }
 
+fn optional_cors_json_headers(
+    access: &VoiceWsAccess,
+    request_headers: &HeaderMap,
+) -> Result<HeaderMap, crate::config::VoiceWsAccessError> {
+    let mut headers = request_headers.get(header::ORIGIN).map_or_else(
+        || Ok(HeaderMap::new()),
+        |origin| cors_headers(access, Some(origin)),
+    )?;
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(headers)
+}
+
+fn cors_json_error(
+    error: crate::config::VoiceWsAccessError,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        HeaderMap::new(),
+        Json(json!({
+            "error": "origin_denied",
+            "message": error.to_string(),
+        })),
+    )
+}
+
 fn cors_headers(
     access: &VoiceWsAccess,
     origin: Option<&HeaderValue>,
@@ -503,7 +566,7 @@ fn cors_headers(
     headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin);
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("POST, OPTIONS"),
+        HeaderValue::from_static("GET, POST, OPTIONS"),
     );
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,

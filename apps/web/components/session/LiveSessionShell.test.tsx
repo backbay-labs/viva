@@ -55,6 +55,11 @@ const runtime: RuntimeCopy = {
   capsuleLabel: "Synthetic examiner",
   marginaliaTitle: "Synthetic examiner is listening.",
   marginaliaText: "Default no-key synthetic brain.",
+  nextActionLabel: "Answer when ready",
+  primaryActionDisabled: false,
+  primaryActionIntent: "submit_turn",
+  primaryActionLabel: "I'm ready — check it",
+  readinessNotes: [{ label: "Provider", state: "ready", text: "Synthetic brain ready." }],
   statusLabel: "synthetic",
   cause: "synthetic",
 };
@@ -158,6 +163,8 @@ describe("LiveSessionShell scene intent wiring", () => {
 
     expect(markup).toContain("Synthetic examiner is listening.");
     expect(markup).toContain("Default no-key synthetic brain.");
+    expect(markup).toContain("Synthetic brain ready.");
+    expect(markup).toContain("Answer when ready");
     expect(markup).not.toContain("live tutor");
   });
 
@@ -190,6 +197,8 @@ describe("LiveSessionShell scene intent wiring", () => {
 
     expect(markup).toContain("Live provider gated");
     expect(markup).toContain("Agent unavailable: live provider gated.");
+    expect(markup).toContain("Run local demo");
+    expect(markup).toContain("disabled");
     expect(markup).not.toContain("Live Cartesia/Gemini tutor is listening.");
   });
 
@@ -205,5 +214,27 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("Agent offline");
     expect(markup).toContain("Agent unavailable: service offline.");
     expect(markup).toContain("WebSocket error");
+    expect(markup).toContain("Retry agent");
+  });
+
+  test("renders quiet readiness ladder without blocking the centered plate", () => {
+    const runtimeCopy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      readinessProbe: {
+        apiBaseUrl: "http://localhost:4318",
+        error: "connection refused",
+        status: "offline",
+      },
+      status: "connecting",
+    });
+
+    const markup = renderRuntimeSurfaces(runtimeCopy);
+
+    expect(markup).toContain('class="readiness-ladder"');
+    expect(markup).toContain("/ready");
+    expect(markup).toContain("/health/brain");
+    expect(markup).toContain("Retry agent");
+    expect(markup).not.toContain("disabled");
+    expect(markup).not.toContain("modal");
   });
 });

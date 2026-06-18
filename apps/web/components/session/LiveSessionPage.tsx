@@ -5,6 +5,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePrefersReducedMotion } from "../../lib/use-prefers-reduced-motion";
 import { useVivaAgentSession } from "../../lib/use-viva-agent-session";
 import {
+  fetchVivaAgentReadinessProbe,
+  type VivaAgentReadinessProbe,
+  vivaAgentHttpBaseUrl,
+} from "../../lib/viva-agent-client";
+import {
   createBrowserVivaAudioCaptureSource,
   VIVA_AUDIO_SAMPLE_RATE_HZ,
   type VivaAudioCaptureSource,
@@ -49,6 +54,8 @@ export function LiveSessionPage() {
   const [elapsed, setElapsed] = useState(0);
   const [hintShown, setHintShown] = useState(false);
   const [micState, setMicState] = useState<RuntimeMicState>("unknown");
+  const [readinessProbe, setReadinessProbe] =
+    useState<VivaAgentReadinessProbe>(initialReadinessProbe);
   const [sourceOpen, setSourceOpen] = useState(false);
 
   const agent = useVivaAgentSession({
@@ -97,6 +104,20 @@ export function LiveSessionPage() {
   useEffect(() => {
     const id = window.setInterval(() => setElapsed((value) => value + 1), 1000);
     return () => window.clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshReadiness = async () => {
+      const next = await fetchVivaAgentReadinessProbe();
+      if (!cancelled) setReadinessProbe(next);
+    };
+    void refreshReadiness();
+    const id = window.setInterval(refreshReadiness, 5_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
   }, []);
 
   // Play the examiner's streamed audio (synthetic emits none yet; wired for the
@@ -194,6 +215,12 @@ export function LiveSessionPage() {
     // deterministic evaluation sequence. A real provider receives the transcript.
     agentRef.current.sendText("(spoken answer)");
   }, [onUserGesture]);
+  const retryAgent = useCallback(() => {
+    setSourceOpen(false);
+    setHintShown(false);
+    agentRef.current.reset();
+    agentRef.current.connect();
+  }, []);
 
   // Stable session-start reference so FSRS review intervals are deterministic
   // across renders (and don't recompute the projection every tick).
@@ -237,11 +264,19 @@ export function LiveSessionPage() {
       projectRuntimeCopy({
         errors: agent.derived.errors,
         mic: micState,
+        readinessProbe,
         readiness: agent.readiness,
         ready: agent.agentState.ready,
         status: agent.status,
       }),
-    [agent.agentState.ready, agent.derived.errors, agent.readiness, agent.status, micState],
+    [
+      agent.agentState.ready,
+      agent.derived.errors,
+      agent.readiness,
+      agent.status,
+      micState,
+      readinessProbe,
+    ],
   );
 
   return (
@@ -256,7 +291,7 @@ export function LiveSessionPage() {
       onHint={() => setHintShown((shown) => !shown)}
       onNextQuestion={submitTurn}
       onShowSource={() => setSourceOpen(true)}
-      onSubmitAnswer={submitTurn}
+      onSubmitAnswer={runtime.primaryActionIntent === "retry_agent" ? retryAgent : submitTurn}
       onTryAgain={submitTurn}
       question={projection.question}
       runtime={runtime}
@@ -264,4 +299,9 @@ export function LiveSessionPage() {
       state={effectiveState}
     />
   );
+}
+
+function initialReadinessProbe(): VivaAgentReadinessProbe {
+  const apiBaseUrl = vivaAgentHttpBaseUrl();
+  return apiBaseUrl ? { apiBaseUrl, status: "checking" } : { status: "api_missing" };
 }
