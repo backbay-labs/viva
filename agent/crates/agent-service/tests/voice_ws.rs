@@ -3168,6 +3168,76 @@ async fn websocket_suppresses_stale_events_after_cancelled_response() {
 }
 
 #[tokio::test]
+async fn websocket_global_cancellation_suppresses_active_response_events() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(GlobalCancellationProbeBrain {
+            store: store.clone(),
+        }),
+        "synthetic",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "global_cancel_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+
+    let frames = read_server_frames_until_close(&mut socket).await;
+    assert!(frames.iter().any(|frame| matches!(
+        frame,
+        ServerFrame::Event { event, .. }
+            if matches!(event.as_ref(), agent_service::VivaServerEvent::Cancellation { response_id }
+                if response_id.is_none())
+    )));
+    assert!(frames
+        .iter()
+        .all(|frame| !matches!(frame, ServerFrame::Error { .. })));
+    assert!(frames.iter().all(|frame| !matches!(
+        frame,
+        ServerFrame::Event { event, .. }
+            if matches!(event.as_ref(), agent_service::VivaServerEvent::AnswerEvaluated { response_id, .. }
+                if response_id == "response-1")
+    )));
+    assert!(frames.iter().all(|frame| !matches!(
+        frame,
+        ServerFrame::Event { event, .. }
+            if matches!(event.as_ref(), agent_service::VivaServerEvent::SourceReference { response_id, .. }
+                if response_id == "response-1")
+    )));
+    assert!(frames.iter().all(|frame| !matches!(
+        frame,
+        ServerFrame::Event { event, .. }
+            if matches!(event.as_ref(), agent_service::VivaServerEvent::RecapReady { response_id, .. }
+                if response_id == "response-1")
+    )));
+    assert!(frames.iter().all(|frame| !matches!(
+        frame,
+        ServerFrame::Event { event, .. }
+            if matches!(event.as_ref(), agent_service::VivaServerEvent::AudioDelta { response_id, .. }
+                if response_id == "response-1")
+    )));
+    let events = evidence.snapshot();
+    assert!(events.iter().all(|event| {
+        !matches!(
+            event.kind,
+            VoiceEvidenceEventKind::EvaluationEmitted | VoiceEvidenceEventKind::SourceEmitted
+        ) || event.detail != "response-1"
+    }));
+}
+
+#[tokio::test]
 async fn websocket_rejects_forged_provider_source_tuples_without_leaks_or_writes() {
     let forged_excerpt = "provider forged source excerpt should not leak";
     let mut forged_source = agent_domain::fixture_source_reference();
@@ -3865,6 +3935,100 @@ impl RealtimeBrain for StaleEventProbeBrain {
             let _ = event_tx
                 .send(BrainEvent::AudioDelta {
                     response_id: "stale-response".to_owned(),
+                    frame: AudioFrame::from_pcm16_bytes(vec![1_u8, 2, 3, 4]),
+                })
+                .await;
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+struct GlobalCancellationProbeBrain {
+    store: Arc<data::InMemoryStudyStore>,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for GlobalCancellationProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "global_cancel_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        self.store
+            .record_voice_session(&config)
+            .await
+            .map_err(|error| BrainError::Connection(error.to_string()))?;
+        let (input, _input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let question = agent_domain::fixture_question();
+            let source = question.source.clone();
+            let evaluation = agent_domain::AnswerEvaluation {
+                question_id: question.question_id.clone(),
+                answer_text: "stale answer".to_owned(),
+                label: "mostly correct".to_owned(),
+                concise_feedback: "stale feedback".to_owned(),
+                retry_prompt: question.follow_up.clone(),
+                source: source.clone(),
+                concept_status: agent_domain::ConceptStatus::Strong,
+                confidence_score: 0.84,
+            };
+            let recap = StudySessionRecap {
+                voice_session_id: "voice-session-1".to_owned(),
+                headline: "Stale recap".to_owned(),
+                summary: "Stale recap summary".to_owned(),
+                strong_concepts: vec!["NADH".to_owned()],
+                shaky_concepts: vec![],
+                missed_concepts: vec![],
+                review_later: vec![],
+                next_action: "Do not surface stale recap.".to_owned(),
+                source_moments: vec![RecapSourceMoment {
+                    text: "Stale recap source".to_owned(),
+                    source: source.clone(),
+                    status: agent_domain::ConceptStatus::Strong,
+                }],
+            };
+            let _ = event_tx
+                .send(BrainEvent::QuestionStarted {
+                    response_id: "response-1".to_owned(),
+                    question,
+                })
+                .await;
+            let _ = event_tx.send(BrainEvent::ResponseCancelled).await;
+            let _ = event_tx
+                .send(BrainEvent::AnswerEvaluated {
+                    response_id: "response-1".to_owned(),
+                    evaluation,
+                })
+                .await;
+            let _ = event_tx
+                .send(BrainEvent::SourceReference {
+                    response_id: "response-1".to_owned(),
+                    source,
+                })
+                .await;
+            let _ = event_tx
+                .send(BrainEvent::RecapReady {
+                    response_id: "response-1".to_owned(),
+                    recap,
+                })
+                .await;
+            let _ = event_tx
+                .send(BrainEvent::AudioDelta {
+                    response_id: "response-1".to_owned(),
                     frame: AudioFrame::from_pcm16_bytes(vec![1_u8, 2, 3, 4]),
                 })
                 .await;

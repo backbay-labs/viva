@@ -576,20 +576,27 @@ export function vivaAgentReducer(
         ...state,
         audio: [...state.audio, { responseId: event.response_id, frame: event.frame }],
       };
-    case "cancellation":
+    case "cancellation": {
+      const cancelledResponseId = event.response_id ?? state.activeResponseId;
+      const cancelledResponseIds =
+        cancelledResponseId && !state.cancelledResponseIds.includes(cancelledResponseId)
+          ? [...state.cancelledResponseIds, cancelledResponseId]
+          : state.cancelledResponseIds;
       return {
         ...state,
         activeResponseId:
-          event.response_id && event.response_id === state.activeResponseId
+          cancelledResponseId && cancelledResponseId === state.activeResponseId
             ? undefined
             : state.activeResponseId,
-        manuscriptIntents: event.response_id
-          ? state.manuscriptIntents.filter((intent) => intent.responseId !== event.response_id)
+        manuscriptIntents: cancelledResponseId
+          ? state.manuscriptIntents.filter((intent) => intent.responseId !== cancelledResponseId)
           : state.manuscriptIntents,
-        cancelledResponseIds: event.response_id
-          ? [...state.cancelledResponseIds, event.response_id]
-          : state.cancelledResponseIds,
+        audio: cancelledResponseId
+          ? state.audio.filter((output) => output.responseId !== cancelledResponseId)
+          : state.audio,
+        cancelledResponseIds,
       };
+    }
     case "structured_error":
       return { ...state, status: "error", errors: [...state.errors, event.message] };
     default:
