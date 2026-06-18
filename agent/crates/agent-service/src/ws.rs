@@ -18,7 +18,7 @@ use observe::{VoiceEvidenceEvent, VoiceEvidenceEventKind};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::{
-    sync::{mpsc, OwnedSemaphorePermit},
+    sync::{mpsc, watch, OwnedSemaphorePermit},
     time::{timeout, Instant},
 };
 
@@ -240,7 +240,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
             }
             incoming = receiver.next() => {
                 let Some(Ok(message)) = incoming else {
-                    let _ = session.input.send(BrainInput::Stop).await;
+                    let _ = session.input.try_send(BrainInput::Stop);
                     state.evidence.record(VoiceEvidenceEvent::new(
                         VoiceEvidenceEventKind::StopReceived,
                         voice_session_id.clone(),
@@ -252,7 +252,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
                 turn_cap
                     .as_mut()
                     .reset(Instant::now() + state.ws_timeouts.idle);
-                match handle_client_message(message, &session.input, &session_binding).await {
+                match handle_client_message_with_drain(
+                    message,
+                    &session.input,
+                    &session_binding,
+                    &mut drain_signal,
+                )
+                .await
+                {
                     Ok(action) => {
                         record_client_action(&state, voice_session_id.clone(), action);
                         match action {
@@ -297,7 +304,17 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
                             _ => {}
                         }
                     }
-                    Err(error) => {
+                    Err(ClientMessageError::Drained) => {
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            TerminalSessionReason::Drained,
+                            close_code::NORMAL,
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(ClientMessageError::Frame(error)) => {
                         let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
                         let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
                         terminal_reason = error.terminal_reason;
@@ -351,7 +368,7 @@ async fn close_with_terminal_session_phase<S>(
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
-    let _ = input.send(BrainInput::Stop).await;
+    let _ = input.try_send(BrainInput::Stop);
     if send_terminal_session_phase(sender, terminal_reason)
         .await
         .is_err()
@@ -589,11 +606,60 @@ fn server_active_concepts(study_context: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 async fn handle_client_message(
     message: Message,
     input: &mpsc::Sender<BrainInput>,
     session_binding: &AuthorizedClientSession,
 ) -> Result<ClientAction, ClientFrameError> {
+    match client_input_action(message, session_binding)? {
+        ClientInputAction::Send {
+            brain_input,
+            action,
+        } => input
+            .send(brain_input)
+            .await
+            .map(|_| action)
+            .map_err(|_| ClientFrameError::disconnected()),
+        ClientInputAction::TrySend {
+            brain_input,
+            action,
+        } => {
+            let _ = input.try_send(brain_input);
+            Ok(action)
+        }
+        ClientInputAction::Keepalive => Ok(ClientAction::Keepalive),
+    }
+}
+
+async fn handle_client_message_with_drain(
+    message: Message,
+    input: &mpsc::Sender<BrainInput>,
+    session_binding: &AuthorizedClientSession,
+    drain_signal: &mut watch::Receiver<bool>,
+) -> Result<ClientAction, ClientMessageError> {
+    match client_input_action(message, session_binding).map_err(ClientMessageError::Frame)? {
+        ClientInputAction::Send {
+            brain_input,
+            action,
+        } => send_brain_input_with_drain(input, brain_input, drain_signal)
+            .await
+            .map(|_| action),
+        ClientInputAction::TrySend {
+            brain_input,
+            action,
+        } => {
+            let _ = input.try_send(brain_input);
+            Ok(action)
+        }
+        ClientInputAction::Keepalive => Ok(ClientAction::Keepalive),
+    }
+}
+
+fn client_input_action(
+    message: Message,
+    session_binding: &AuthorizedClientSession,
+) -> Result<ClientInputAction, ClientFrameError> {
     match message {
         Message::Text(text) => {
             if text.len() > VIVA_VOICE_MAX_TEXT_FRAME_BYTES {
@@ -607,54 +673,73 @@ async fn handle_client_message(
             match frame {
                 ClientFrame::SessionConfig { session, .. } => {
                     let sanitized = sanitize_refresh_session_config(session, session_binding)?;
-                    input
-                        .send(BrainInput::SessionContextRefresh(
+                    Ok(ClientInputAction::Send {
+                        brain_input: BrainInput::SessionContextRefresh(
                             serde_json::to_value(sanitized)
                                 .map_err(|_| ClientFrameError::invalid())?,
-                        ))
-                        .await
-                        .map(|_| ClientAction::ConfigRefresh)
-                        .map_err(|_| ClientFrameError::disconnected())
+                        ),
+                        action: ClientAction::ConfigRefresh,
+                    })
                 }
-                ClientFrame::Audio { frame, .. } => input
-                    .send(BrainInput::Audio(frame))
-                    .await
-                    .map(|_| ClientAction::Audio)
-                    .map_err(|_| ClientFrameError::disconnected()),
-                ClientFrame::Text { text, .. } => input
-                    .send(BrainInput::Text(text))
-                    .await
-                    .map(|_| ClientAction::AnswerText)
-                    .map_err(|_| ClientFrameError::disconnected()),
+                ClientFrame::Audio { frame, .. } => Ok(ClientInputAction::Send {
+                    brain_input: BrainInput::Audio(frame),
+                    action: ClientAction::Audio,
+                }),
+                ClientFrame::Text { text, .. } => Ok(ClientInputAction::Send {
+                    brain_input: BrainInput::Text(text),
+                    action: ClientAction::AnswerText,
+                }),
                 ClientFrame::ToolResult { .. } => Err(ClientFrameError::untrusted_tool_result()),
-                ClientFrame::Cancel { .. } => input
-                    .send(BrainInput::CancelResponse)
-                    .await
-                    .map(|_| ClientAction::Cancel)
-                    .map_err(|_| ClientFrameError::disconnected()),
-                ClientFrame::Stop { .. } => input
-                    .send(BrainInput::Stop)
-                    .await
-                    .map(|_| ClientAction::Stop)
-                    .map_err(|_| ClientFrameError::disconnected()),
+                ClientFrame::Cancel { .. } => Ok(ClientInputAction::Send {
+                    brain_input: BrainInput::CancelResponse,
+                    action: ClientAction::Cancel,
+                }),
+                ClientFrame::Stop { .. } => Ok(ClientInputAction::TrySend {
+                    brain_input: BrainInput::Stop,
+                    action: ClientAction::Stop,
+                }),
             }
         }
         Message::Binary(bytes) => {
             if bytes.len() > VIVA_VOICE_MAX_BINARY_FRAME_BYTES {
                 return Err(ClientFrameError::oversized_binary());
             }
-            input
-                .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(bytes)))
-                .await
-                .map(|_| ClientAction::Audio)
-                .map_err(|_| ClientFrameError::disconnected())
+            Ok(ClientInputAction::Send {
+                brain_input: BrainInput::Audio(AudioFrame::from_pcm16_bytes(bytes)),
+                action: ClientAction::Audio,
+            })
         }
-        Message::Close(_) => input
-            .send(BrainInput::Stop)
-            .await
-            .map(|_| ClientAction::Close)
-            .map_err(|_| ClientFrameError::disconnected()),
-        Message::Ping(_) | Message::Pong(_) => Ok(ClientAction::Keepalive),
+        Message::Close(_) => Ok(ClientInputAction::TrySend {
+            brain_input: BrainInput::Stop,
+            action: ClientAction::Close,
+        }),
+        Message::Ping(_) | Message::Pong(_) => Ok(ClientInputAction::Keepalive),
+    }
+}
+
+async fn send_brain_input_with_drain(
+    input: &mpsc::Sender<BrainInput>,
+    brain_input: BrainInput,
+    drain_signal: &mut watch::Receiver<bool>,
+) -> Result<(), ClientMessageError> {
+    if *drain_signal.borrow_and_update() {
+        return Err(ClientMessageError::Drained);
+    }
+    let send = input.send(brain_input);
+    tokio::pin!(send);
+    loop {
+        tokio::select! {
+            result = &mut send => {
+                return result.map_err(|_| {
+                    ClientMessageError::Frame(ClientFrameError::disconnected())
+                });
+            }
+            changed = drain_signal.changed() => {
+                if changed.is_ok() && *drain_signal.borrow_and_update() {
+                    return Err(ClientMessageError::Drained);
+                }
+            }
+        }
     }
 }
 
@@ -832,6 +917,25 @@ enum ClientAction {
     ConfigRefresh,
     Keepalive,
     Stop,
+}
+
+#[derive(Debug)]
+enum ClientInputAction {
+    Send {
+        brain_input: BrainInput,
+        action: ClientAction,
+    },
+    TrySend {
+        brain_input: BrainInput,
+        action: ClientAction,
+    },
+    Keepalive,
+}
+
+#[derive(Debug)]
+enum ClientMessageError {
+    Frame(ClientFrameError),
+    Drained,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1075,12 +1179,90 @@ fn ws_access_error(error: VoiceWsAccessError) -> (StatusCode, Json<serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
 
     fn fixture_binding() -> AuthorizedClientSession {
         AuthorizedClientSession {
             user_id: "user-1".to_owned(),
             study_set_id: "biology-midterm".to_owned(),
             session_id: "voice-session-1".to_owned(),
+        }
+    }
+
+    struct FailingSink;
+
+    impl futures_util::Sink<Message> for FailingSink {
+        type Error = axum::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            Err(axum::Error::new(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "writer closed",
+            )))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct RecordingSink {
+        sent: Vec<Message>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self { sent: vec![] }
+        }
+    }
+
+    impl futures_util::Sink<Message> for RecordingSink {
+        type Error = axum::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.sent.push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -1381,6 +1563,104 @@ mod tests {
             Err((status, _)) => assert_eq!(status, StatusCode::TOO_MANY_REQUESTS),
             Ok(_) => panic!("expected capacity rejection"),
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_session_phase_close_reports_send_failed_when_writer_fails() {
+        let (input, mut received) = mpsc::channel(1);
+        let mut sender = FailingSink;
+
+        let reason = close_with_terminal_session_phase(
+            &mut sender,
+            &input,
+            TerminalSessionReason::Drained,
+            close_code::NORMAL,
+        )
+        .await;
+
+        assert_eq!(reason, "send_failed");
+        assert!(matches!(received.recv().await.unwrap(), BrainInput::Stop));
+    }
+
+    #[tokio::test]
+    async fn terminal_session_phase_close_does_not_wait_for_full_input_channel() {
+        let (input, mut received) = mpsc::channel(1);
+        input
+            .try_send(BrainInput::Text("queued".to_owned()))
+            .unwrap();
+        let mut sender = RecordingSink::new();
+
+        let reason = timeout(
+            Duration::from_millis(100),
+            close_with_terminal_session_phase(
+                &mut sender,
+                &input,
+                TerminalSessionReason::Drained,
+                close_code::NORMAL,
+            ),
+        )
+        .await
+        .expect("terminal close must not block behind provider input backpressure");
+
+        assert_eq!(reason, "drained");
+        assert_eq!(sender.sent.len(), 2);
+        let Message::Text(text) = &sender.sent[0] else {
+            panic!("expected terminal session phase text frame");
+        };
+        let frame: ServerFrame = serde_json::from_str(text).unwrap();
+        let ServerFrame::Event { event, .. } = frame else {
+            panic!("expected terminal session phase event");
+        };
+        assert!(matches!(
+            event.as_ref(),
+            crate::VivaServerEvent::SessionPhase {
+                terminal_reason: Some(TerminalSessionReason::Drained),
+                ..
+            }
+        ));
+        let Message::Close(Some(close)) = &sender.sent[1] else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(close.code, close_code::NORMAL);
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            BrainInput::Text(text) if text == "queued"
+        ));
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn client_stop_terminal_event_drain_times_out_when_provider_stops_sending() {
+        use std::sync::Arc;
+
+        use agent_adapters::SyntheticBrain;
+
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "synthetic",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let (_events_tx, mut events) = mpsc::channel(1);
+        let mut cancelled_response_ids = HashSet::new();
+        let mut sender = RecordingSink::new();
+        let started_at = Instant::now();
+
+        let result = drain_terminal_events(
+            &state,
+            Some("voice-session-1".to_owned()),
+            &fixture_binding(),
+            &mut events,
+            &mut cancelled_response_ids,
+            started_at,
+            &mut sender,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, ForwardBrainEvent::Continue);
+        assert!(sender.sent.is_empty());
+        assert!(started_at.elapsed() >= TERMINAL_EVENT_DRAIN_TIMEOUT);
     }
 
     #[tokio::test]
