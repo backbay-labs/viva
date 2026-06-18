@@ -182,7 +182,11 @@ describe("Viva agent browser client", () => {
     controller.sendAudio("AQIDBA==");
     controller.cancel();
     controller.stop();
-    expect(parseVivaClientFrame(JSON.parse(socket.sent[1] ?? "{}")).type).toBe("text");
+    expect(parseVivaClientFrame(JSON.parse(socket.sent[1] ?? "{}"))).toEqual({
+      text: "quiz me",
+      type: "text",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+    });
     expect(parseVivaClientFrame(JSON.parse(socket.sent[2] ?? "{}")).type).toBe("audio");
     expect(parseVivaClientFrame(JSON.parse(socket.sent[3] ?? "{}")).type).toBe("cancel");
     expect(parseVivaClientFrame(JSON.parse(socket.sent[4] ?? "{}")).type).toBe("stop");

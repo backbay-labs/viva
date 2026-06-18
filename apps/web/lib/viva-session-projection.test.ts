@@ -267,9 +267,43 @@ describe("projectRuntimeCopy", () => {
 
     expect(copy.cause).toBe("mic_denied");
     expect(copy.capsuleLabel).toBe("Mic denied");
+    expect(copy.marginaliaTitle).toBe("Mic denied; write in the margin.");
     expect(copy.marginaliaText).toContain("Browser microphone capture was denied");
-    expect(copy.primaryActionDisabled).toBe(true);
-    expect(copy.nextActionLabel).toBe("Check mic");
+    expect(copy.marginaliaText).toContain("written answer");
+    expect(copy.marginaliaText).toContain("finalize the transcript from the server");
+    expect(copy.primaryActionDisabled).toBe(false);
+    expect(copy.primaryActionIntent).toBe("submit_turn");
+    expect(copy.nextActionLabel).toBe("Answer when ready");
+  });
+
+  test("surfaces unsupported microphone as the same text fallback when connected", () => {
+    const copy = projectRuntimeCopy({
+      mic: "unsupported",
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "open",
+    });
+
+    expect(copy.cause).toBe("mic_denied");
+    expect(copy.capsuleLabel).toBe("Mic unavailable");
+    expect(copy.marginaliaTitle).toBe("Mic unavailable; write in the margin.");
+    expect(copy.marginaliaText).toContain("Browser microphone capture is unavailable");
+    expect(copy.marginaliaText).toContain("written answer");
+    expect(copy.primaryActionDisabled).toBe(false);
+  });
+
+  test("does not enable the text fallback when the WebSocket is disconnected", () => {
+    const copy = projectRuntimeCopy({
+      mic: "denied",
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "closed",
+    });
+
+    expect(copy.cause).toBe("session_disconnected");
+    expect(copy.primaryActionDisabled).toBe(false);
+    expect(copy.primaryActionIntent).toBe("retry_agent");
+    expect(copy.nextActionLabel).toBe("Retry agent");
   });
 
   test("surfaces REST readiness as quiet marginalia for gated providers", () => {
