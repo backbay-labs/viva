@@ -359,7 +359,14 @@ function orderedUniqueNumbers(values: number[]): number[] {
 }
 
 function estimateConceptLabelWidth(label: string, fontSize: number): number {
-  return Math.max(12, label.length * fontSize * 0.5);
+  let units = 0;
+  for (const char of label) {
+    if (char === " ") units += 0.28;
+    else if (/[A-Z0-9]/.test(char)) units += 0.7;
+    else if (/[+\-/·]/.test(char)) units += 0.46;
+    else units += 0.5;
+  }
+  return Math.max(12, units * fontSize);
 }
 
 function compactConceptLabel(label: string, maxWidth: number, fontSize: number): string {

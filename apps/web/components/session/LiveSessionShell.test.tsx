@@ -363,6 +363,26 @@ describe("LiveSessionShell scene intent wiring", () => {
     }
   });
 
+  test("reserves conservative boxes for short biochemical abbreviations", () => {
+    const labels = planVoiceTraceConceptLabels({
+      canvasHeight: 172,
+      canvasWidth: 320,
+      fontScale: 0.72,
+      items: [
+        { emphasis: 1, label: "FADH2", point: { x: 32, y: 82 } },
+        { emphasis: 0.55, label: "IMS", point: { x: 64, y: 82 } },
+      ],
+    });
+
+    const fadh2Width = labels[0].box.right - labels[0].box.left;
+    const imsWidth = labels[1].box.right - labels[1].box.left;
+
+    expect(fadh2Width).toBeGreaterThanOrEqual(41);
+    expect(imsWidth).toBeGreaterThanOrEqual(19);
+    expect(boxesOverlap(labels[0].box, labels[1].box)).toBe(false);
+    expect(labels[0].box.left).toBeGreaterThanOrEqual(8);
+  });
+
   test("renders projected runtime copy in listening marginalia", () => {
     const markup = renderToStaticMarkup(
       <MarginaliaPanel
