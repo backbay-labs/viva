@@ -18,6 +18,7 @@ use agent_domain::{
 };
 
 use super::llm::GeminiConversation;
+use super::stt::transcribe_ink_websocket;
 use super::{
     audio_frame_bytes, gemini_request, parse_gemini_sse_line, parse_ink_event, parse_sonic_event,
     select_next_question, send_fake_unless_cancelled, sonic_generation_request,
@@ -942,13 +943,17 @@ impl CartesiaGeminiTransports for GatedNoNetworkCartesiaGeminiTransports {
 
     async fn transcribe_audio(
         &self,
-        _config: &CartesiaGeminiConfig,
+        config: &CartesiaGeminiConfig,
         _response_id: &str,
-        _frame: &AudioFrame,
+        frame: &AudioFrame,
     ) -> Result<RunnerTranscript, BrainError> {
-        Err(BrainError::Protocol(
-            "gated no-network STT transport cannot transcribe".to_owned(),
-        ))
+        let transcript =
+            transcribe_ink_websocket(&config.ink, &config.cartesia_api_key, frame).await?;
+        Ok(RunnerTranscript {
+            interim_text: transcript.interim_text,
+            final_text: transcript.final_text,
+            confidence: transcript.confidence,
+        })
     }
 
     async fn stream_gemini(
