@@ -19,6 +19,7 @@ use agent_domain::{
 
 use super::llm::{stream_gemini_http, GeminiConversation};
 use super::stt::transcribe_ink_websocket;
+use super::tts::synthesize_sonic_websocket;
 use super::{
     audio_frame_bytes, gemini_request, parse_gemini_sse_line, parse_ink_event, parse_sonic_event,
     select_next_question, send_fake_unless_cancelled, sonic_generation_request,
@@ -275,11 +276,16 @@ where
                 stopped_stage: Some("sonic_audio"),
             });
         }
-        let frame = self
+        let frames = self
             .transports
             .synthesize_sonic(&self.config, &response_id, &prompt, interrupt)
             .await?;
-        events.push(BrainEvent::AudioDelta { response_id, frame });
+        for frame in frames {
+            events.push(BrainEvent::AudioDelta {
+                response_id: response_id.clone(),
+                frame,
+            });
+        }
 
         Ok(FakeRuntimeReport {
             events,
@@ -631,7 +637,7 @@ where
             return Ok(());
         }
 
-        let frame = self
+        let frames = self
             .transports
             .synthesize_sonic(
                 &self.config,
@@ -640,17 +646,19 @@ where
                 FakeRuntimeInterrupt::None,
             )
             .await?;
-        if !send_fake_unless_cancelled(
-            event_tx,
-            BrainEvent::AudioDelta {
-                response_id: response_id.to_owned(),
-                frame,
-            },
-            cancelled,
-        )
-        .await
-        {
-            return Ok(());
+        for frame in frames {
+            if !send_fake_unless_cancelled(
+                event_tx,
+                BrainEvent::AudioDelta {
+                    response_id: response_id.to_owned(),
+                    frame,
+                },
+                cancelled,
+            )
+            .await
+            {
+                return Ok(());
+            }
         }
 
         for phase in [StudySessionPhase::Feedback, StudySessionPhase::Correction] {
@@ -795,7 +803,7 @@ pub(crate) trait CartesiaGeminiTransports: Clone + Send + Sync + 'static {
         response_id: &str,
         transcript: &str,
         interrupt: FakeRuntimeInterrupt,
-    ) -> Result<AudioFrame, BrainError>;
+    ) -> Result<Vec<AudioFrame>, BrainError>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -886,7 +894,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         response_id: &str,
         transcript: &str,
         interrupt: FakeRuntimeInterrupt,
-    ) -> Result<AudioFrame, BrainError> {
+    ) -> Result<Vec<AudioFrame>, BrainError> {
         let _request = sonic_generation_request(&config.sonic, response_id, transcript, false);
         if interrupt == FakeRuntimeInterrupt::WriterFailureBeforeSonicAudio {
             return Err(BrainError::Connection(
@@ -904,7 +912,9 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
                 "fake Sonic audio did not parse".to_owned(),
             ));
         };
-        AudioFrame::from_base64(pcm16_base64).map_err(BrainError::Protocol)
+        AudioFrame::from_base64(pcm16_base64)
+            .map(|frame| vec![frame])
+            .map_err(BrainError::Protocol)
     }
 }
 
@@ -966,13 +976,17 @@ impl CartesiaGeminiTransports for GatedNoNetworkCartesiaGeminiTransports {
 
     async fn synthesize_sonic(
         &self,
-        _config: &CartesiaGeminiConfig,
-        _response_id: &str,
-        _transcript: &str,
+        config: &CartesiaGeminiConfig,
+        response_id: &str,
+        transcript: &str,
         _interrupt: FakeRuntimeInterrupt,
-    ) -> Result<AudioFrame, BrainError> {
-        Err(BrainError::Protocol(
-            "gated no-network Sonic transport cannot synthesize".to_owned(),
-        ))
+    ) -> Result<Vec<AudioFrame>, BrainError> {
+        synthesize_sonic_websocket(
+            &config.sonic,
+            &config.cartesia_api_key,
+            response_id,
+            transcript,
+        )
+        .await
     }
 }

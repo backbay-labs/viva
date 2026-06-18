@@ -133,6 +133,9 @@ impl CartesiaGeminiConfig {
         {
             config.ink.cartesia_version = cartesia_version;
         }
+        if let Some(websocket_url) = env_value("CARTESIA_SONIC_WEBSOCKET_URL") {
+            config.sonic.websocket_url = websocket_url;
+        }
         if let Some(model) = env_value("CARTESIA_SONIC_MODEL") {
             config.sonic.model_id = model;
         }
@@ -140,6 +143,25 @@ impl CartesiaGeminiConfig {
             env_value("CARTESIA_VOICE_ID").or_else(|| env_value("CARTESIA_SONIC_VOICE_ID"))
         {
             config.sonic.voice_id = voice_id;
+        }
+        if let Some(language) = env_value("CARTESIA_SONIC_LANGUAGE") {
+            config.sonic.language = language;
+        }
+        if let Some(sample_rate) = env_value("CARTESIA_SONIC_SAMPLE_RATE")
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|sample_rate| *sample_rate > 0)
+        {
+            config.sonic.sample_rate = sample_rate;
+        }
+        if let Some(max_buffer_delay_ms) = env_value("CARTESIA_SONIC_MAX_BUFFER_DELAY_MS")
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            config.sonic.max_buffer_delay_ms = max_buffer_delay_ms;
+        }
+        if let Some(cartesia_version) =
+            env_value("CARTESIA_VERSION").or_else(|| env_value("CARTESIA_SONIC_VERSION"))
+        {
+            config.sonic.cartesia_version = cartesia_version;
         }
         config
     }
@@ -493,5 +515,30 @@ mod tests {
         assert_eq!(config.ink.min_volume, "0.2");
         assert_eq!(config.ink.max_silence_duration_secs, "1.1");
         assert_eq!(config.ink.cartesia_version, "2026-03-01");
+    }
+
+    #[test]
+    fn from_env_applies_sonic_transport_overrides() {
+        let config = CartesiaGeminiConfig::from_env_with(|name| match name {
+            "CARTESIA_SONIC_WEBSOCKET_URL" => Some(" wss://example.test/tts/websocket ".to_owned()),
+            "CARTESIA_SONIC_MODEL" => Some(" sonic-custom ".to_owned()),
+            "CARTESIA_SONIC_VOICE_ID" => Some(" voice-custom ".to_owned()),
+            "CARTESIA_SONIC_LANGUAGE" => Some(" es ".to_owned()),
+            "CARTESIA_SONIC_SAMPLE_RATE" => Some(" 16000 ".to_owned()),
+            "CARTESIA_SONIC_MAX_BUFFER_DELAY_MS" => Some(" 40 ".to_owned()),
+            "CARTESIA_SONIC_VERSION" => Some(" 2026-03-01 ".to_owned()),
+            _ => None,
+        });
+
+        assert_eq!(
+            config.sonic.websocket_url,
+            "wss://example.test/tts/websocket"
+        );
+        assert_eq!(config.sonic.model_id, "sonic-custom");
+        assert_eq!(config.sonic.voice_id, "voice-custom");
+        assert_eq!(config.sonic.language, "es");
+        assert_eq!(config.sonic.sample_rate, 16_000);
+        assert_eq!(config.sonic.max_buffer_delay_ms, 40);
+        assert_eq!(config.sonic.cartesia_version, "2026-03-01");
     }
 }
