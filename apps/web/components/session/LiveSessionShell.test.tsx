@@ -110,7 +110,7 @@ const trustedReviewPlan: ReviewScheduleItem[] = [
     dueAt: new Date("2026-06-18T12:00:00.000Z"),
     explanation: ["FSRS rating: Hard", "hint-assisted answer lowered the rating"],
     intervalLabel: "tomorrow",
-    label: "ATP yield",
+    label: "ATP synthase",
     priority: "urgent",
     status: "missed",
   },
@@ -574,7 +574,7 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("Review later");
     expect(markup).toContain("proton gradient");
     expect(markup).toContain("Next session");
-    expect(markup).toContain("ATP yield");
+    expect(markup).toContain("ATP synthase");
     expect(markup).toContain("core FSRS");
     expect(markup).toContain("Review the ATP synthase source span");
     expect(markup).not.toContain("Share");

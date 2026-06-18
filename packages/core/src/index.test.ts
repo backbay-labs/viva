@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   agentStudySetReadiness,
+  buildSessionRecap,
   createStudySetPreview,
   evaluateAnswer,
   generatedHomeCards,
@@ -122,6 +123,19 @@ describe("Viva answer evaluation", () => {
 
     expect(evaluation.label).toBe("mostly correct");
     expect(evaluation.conceptStatus).toBe("strong");
+  });
+
+  test("builds recap review labels from the canonical Biology concept vocabulary", () => {
+    const evaluation = evaluateAnswer(
+      "NADH is an electron donor to the electron transport chain, which builds a proton gradient for ATP synthase.",
+    );
+    const recap = buildSessionRecap(evaluation);
+
+    expect(seedStudySets[0].concepts.map((concept) => concept.label)).toContain("ATP synthase");
+    expect(recap.reviewLater).toContain("ATP synthase");
+    expect(recap.reviewLater).not.toContain("ATP yield");
+    expect(recap.plan[1]?.topics).toContain("ATP synthase");
+    expect(recap.plan[1]?.topics).not.toContain("ATP yield");
   });
 });
 

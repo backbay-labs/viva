@@ -19,6 +19,7 @@ import {
   VIVA_VOICE_PROTOCOL_VERSION,
   VIVA_VOICE_SAMPLE_RATE_HZ,
 } from "./agent-contract";
+import { seedStudySets } from "./index";
 
 describe("Viva voice agent contract", () => {
   test("uses protocol v2 because ready frames carry required provider/store readiness", () => {
@@ -205,6 +206,22 @@ describe("Viva voice agent contract", () => {
     expect(parseVivaClientFrame(frame)).toEqual(frame);
     expect(frame.session.mode).toBe("quiz");
     expect(frame.session.source_context[0]?.confidence).toBe("high");
+  });
+
+  test("keeps shared agent concept ids inside the Biology study-set vocabulary", () => {
+    const biology = seedStudySets.find((studySet) => studySet.id === "biology-midterm");
+    const vocabulary = new Set(biology?.concepts.map((concept) => concept.id) ?? []);
+    const fixtureIds = new Set([
+      ...(sessionFixture as AgentSessionConfig).active_concepts,
+      ...activeConceptIdsFromFixture(fullSessionFixture),
+      ...activeConceptIdsFromFixture(fakeSessionFixture),
+      ...conceptStatusIdsFromFixture(fullSessionFixture),
+      ...conceptStatusIdsFromFixture(fakeSessionFixture),
+    ]);
+
+    const missing = [...fixtureIds].filter((conceptId) => !vocabulary.has(conceptId));
+
+    expect(missing).toEqual([]);
   });
 
   test("rejects browser-authority client frames", () => {
@@ -402,3 +419,20 @@ describe("Viva voice agent contract", () => {
     ).toThrow("Missing document_id");
   });
 });
+
+function activeConceptIdsFromFixture(fixture: { client: unknown[] }): string[] {
+  return fixture.client.flatMap((frame) => {
+    const parsed = parseVivaClientFrame(frame);
+    return parsed.type === "session_config" ? parsed.session.active_concepts : [];
+  });
+}
+
+function conceptStatusIdsFromFixture(fixture: { server: unknown[] }): string[] {
+  return fixture.server.flatMap((frame) => {
+    const parsed = parseVivaServerFrame(frame);
+    if (parsed.type !== "event" || parsed.event.type !== "concept_status") {
+      return [];
+    }
+    return [parsed.event.concept_id];
+  });
+}
