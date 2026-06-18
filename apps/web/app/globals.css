@@ -3566,6 +3566,49 @@ button {
   text-transform: uppercase;
 }
 
+.recap-fold__next {
+  display: grid;
+  gap: 0.42rem;
+  padding-top: 0.55rem;
+  border-top: 1px solid rgba(93, 52, 127, 0.12);
+  font-family: var(--sans);
+}
+
+.recap-fold__next p {
+  margin: 0;
+  color: var(--viva-muted);
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.recap-fold__next ul {
+  display: grid;
+  gap: 0.34rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.recap-fold__next li {
+  display: grid;
+  gap: 0.14rem;
+  color: var(--viva-ink-soft);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.recap-fold__next span:first-child {
+  color: var(--viva-ink);
+  font-weight: 650;
+}
+
+.recap-fold__next span:last-child {
+  color: var(--viva-muted);
+  font-size: 0.72rem;
+}
+
 .folio .session-action {
   margin-top: auto;
 }

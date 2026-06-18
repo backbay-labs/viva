@@ -215,7 +215,14 @@ impl VivaToolExecutor {
         proposal: &ToolProposal,
     ) -> Result<Value, ToolExecutionError> {
         let concept_id = string_arg(proposal.arguments(), "concept_id")?;
-        let due_at = string_arg(proposal.arguments(), "due_at")?;
+        if proposal.arguments().get("due_at").is_some() {
+            return Err(ToolExecutionError::InvalidArguments(
+                "due_at is not an authoritative tool argument; @viva/core computes review dates"
+                    .to_owned(),
+            ));
+        }
+        let status = concept_status_arg(proposal.arguments(), "status")?;
+        let due_at = storage_due_at_for_status(&status);
         Ok(self
             .store
             .schedule_review_item(
@@ -223,7 +230,7 @@ impl VivaToolExecutor {
                 &self.session.study_set_id,
                 &self.session.voice_session_id,
                 &concept_id,
-                &due_at,
+                due_at,
             )
             .await?)
     }
@@ -310,6 +317,15 @@ fn label_for_status(status: &ConceptStatus) -> &'static str {
         ConceptStatus::Shaky => "partially correct",
         ConceptStatus::Review => "vague",
         ConceptStatus::Missed => "insufficient evidence",
+    }
+}
+
+fn storage_due_at_for_status(status: &ConceptStatus) -> &'static str {
+    match status {
+        ConceptStatus::Missed => "2026-06-18T09:00:00Z",
+        ConceptStatus::Shaky => "2026-06-19T09:00:00Z",
+        ConceptStatus::Review => "2026-06-20T09:00:00Z",
+        ConceptStatus::Strong => "2026-06-24T09:00:00Z",
     }
 }
 

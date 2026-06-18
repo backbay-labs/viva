@@ -1,4 +1,4 @@
-import type { SessionRecap } from "@viva/core";
+import type { ReviewScheduleItem, SessionRecap } from "@viva/core";
 import { Icon, Spark } from "@viva/ui-web";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
@@ -19,6 +19,7 @@ export function MarginaliaPanel({
   question,
   sourceFolio,
   recap,
+  reviewPlan = [],
   hintShown,
   onHint,
   onShowSource,
@@ -34,6 +35,7 @@ export function MarginaliaPanel({
   question: Question;
   sourceFolio?: SourceFolioProjection;
   recap?: SessionRecap;
+  reviewPlan?: ReviewScheduleItem[];
   hintShown: boolean;
   onHint: () => void;
   onShowSource: () => void;
@@ -86,7 +88,7 @@ export function MarginaliaPanel({
         ) : null}
         {isSource ? (
           recap ? (
-            <RecapFold recap={recap} />
+            <RecapFold recap={recap} reviewPlan={reviewPlan} />
           ) : (
             <SourceFolio
               onBack={onBackToQuestion}
@@ -160,7 +162,13 @@ function ListeningNote({
   );
 }
 
-function RecapFold({ recap }: { recap: SessionRecap }) {
+function RecapFold({
+  recap,
+  reviewPlan,
+}: {
+  recap: SessionRecap;
+  reviewPlan: ReviewScheduleItem[];
+}) {
   return (
     <div className="folio recap-fold">
       <p className="folio__subtitle">Recap ready</p>
@@ -184,6 +192,21 @@ function RecapFold({ recap }: { recap: SessionRecap }) {
           <span>{joinRecapItems(recap.reviewLater)}</span>
         </li>
       </ul>
+      {reviewPlan.length > 0 ? (
+        <div className="recap-fold__next">
+          <p>Next session</p>
+          <ul>
+            {reviewPlan.slice(0, 3).map((item) => (
+              <li key={item.conceptId}>
+                <span>{item.label}</span>
+                <span>
+                  {item.intervalLabel} · core FSRS · {item.explanation[0]}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
       {recap.sourceMoments[0] ? (
         <p className="folio__footer">
           {recap.sourceMoments[0].source.label}: {recap.sourceMoments[0].text}

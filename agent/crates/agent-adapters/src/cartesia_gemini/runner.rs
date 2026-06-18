@@ -586,7 +586,7 @@ where
             BrainEvent::ConceptStatus {
                 response_id: response_id.to_owned(),
                 concept_id,
-                status,
+                status: status.clone(),
             },
             cancelled,
         )
@@ -602,7 +602,7 @@ where
                     &session.study_set_id,
                     &session.voice_session_id,
                     &review_concept_id,
-                    "2026-06-16T09:00:00Z",
+                    concept_status_tool_arg(&status),
                 ),
             )
             .await
@@ -902,6 +902,15 @@ fn first_user_text(request: &Value) -> Option<String> {
         .iter()
         .find_map(|part| part.get("text").and_then(Value::as_str))
         .map(ToOwned::to_owned)
+}
+
+fn concept_status_tool_arg(status: &ConceptStatus) -> &'static str {
+    match status {
+        ConceptStatus::Strong => "strong",
+        ConceptStatus::Shaky => "shaky",
+        ConceptStatus::Missed => "missed",
+        ConceptStatus::Review => "review",
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

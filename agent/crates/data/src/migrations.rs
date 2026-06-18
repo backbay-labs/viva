@@ -403,7 +403,7 @@ mod tests {
                     "biology-midterm",
                     "voice-session-1",
                     "atp-synthase",
-                    "2026-06-16T09:00:00Z",
+                    "shaky",
                 ),
             )
             .await

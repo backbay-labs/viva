@@ -1,4 +1,4 @@
-import type { SessionRecap } from "@viva/core";
+import type { ReviewScheduleItem, SessionRecap } from "@viva/core";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
 import { MuseBackdrop } from "../landing/MuseBackdrop";
@@ -26,6 +26,7 @@ export function LiveSessionShell({
   question,
   sourceFolio,
   recap,
+  reviewPlan,
   contextLabel,
   clockLabel,
   elapsed,
@@ -49,6 +50,7 @@ export function LiveSessionShell({
   question: Question;
   sourceFolio?: SourceFolioProjection;
   recap?: SessionRecap;
+  reviewPlan?: ReviewScheduleItem[];
   contextLabel: string;
   clockLabel?: string;
   elapsed: number;
@@ -101,6 +103,7 @@ export function LiveSessionShell({
             onTryAgain={onTryAgain}
             question={question}
             recap={recap}
+            reviewPlan={reviewPlan}
             runtime={runtime}
             scene={scene}
             sourceFolio={sourceFolio}

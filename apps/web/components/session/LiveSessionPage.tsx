@@ -18,6 +18,7 @@ import {
   createVivaAudioPlaybackSink,
   type VivaAudioPlaybackSink,
 } from "../../lib/viva-audio-playback";
+import { reviewPlanFromRecap } from "../../lib/viva-display";
 import { vivaSceneReducer } from "../../lib/viva-scene-reducer";
 import { sessionTokenFromSearch } from "../../lib/viva-session-entry";
 import {
@@ -61,6 +62,7 @@ export function LiveSessionPage() {
   const [sessionToken] = useState(readBrowserSessionToken);
   const [elapsed, setElapsed] = useState(0);
   const [hintShown, setHintShown] = useState(false);
+  const [hintUsed, setHintUsed] = useState(false);
   const [micState, setMicState] = useState<RuntimeMicState>("unknown");
   const [readinessProbe, setReadinessProbe] =
     useState<VivaAgentReadinessProbe>(initialReadinessProbe);
@@ -261,6 +263,13 @@ export function LiveSessionPage() {
     () => projectSourceFolio(agent.derived, sessionStart),
     [agent.derived, sessionStart],
   );
+  const reviewPlan = useMemo(
+    () =>
+      agent.derived.recap
+        ? reviewPlanFromRecap(agent.derived.recap, STUDY_SET, sessionStart, { hinted: hintUsed })
+        : [],
+    [agent.derived.recap, hintUsed, sessionStart],
+  );
   const conceptNodes = useMemo(
     () => projectConceptNodes(STUDY_SET.concepts, agent.agentState.conceptStatuses),
     [agent.agentState.conceptStatuses],
@@ -330,13 +339,17 @@ export function LiveSessionPage() {
       onBackToQuestion={() => setSourceOpen(false)}
       onChallengeSource={challengeSource}
       onEndSession={endSession}
-      onHint={() => setHintShown((shown) => !shown)}
+      onHint={() => {
+        setHintUsed(true);
+        setHintShown((shown) => !shown);
+      }}
       onNextQuestion={submitTurn}
       onShowSource={() => setSourceOpen(true)}
       onSubmitAnswer={runtime.primaryActionIntent === "retry_agent" ? retryAgent : submitTurn}
       onTryAgain={submitTurn}
       question={projection.question}
       recap={agent.derived.recap}
+      reviewPlan={reviewPlan}
       runtime={runtime}
       scene={scene}
       sourceFolio={sourceFolio}

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   type AgentStudySetReadiness,
+  type ReviewScheduleItem,
   type SessionRecap,
   VIVA_VOICE_PROTOCOL_VERSION,
   type VivaReadyFrame,
@@ -97,6 +98,19 @@ const trustedRecap: SessionRecap = {
   strongConcepts: ["electron donor"],
   summary: "The Conductor recap stayed grounded to the server-owned source span.",
 };
+
+const trustedReviewPlan: ReviewScheduleItem[] = [
+  {
+    authority: "core_fsrs",
+    conceptId: "atp-synthase",
+    dueAt: new Date("2026-06-18T12:00:00.000Z"),
+    explanation: ["FSRS rating: Hard", "hint-assisted answer lowered the rating"],
+    intervalLabel: "tomorrow",
+    label: "ATP yield",
+    priority: "urgent",
+    status: "missed",
+  },
+];
 
 const sourceFolio: SourceFolioProjection = {
   caveat: "Source citation is bounded to this server-owned span.",
@@ -321,6 +335,7 @@ describe("LiveSessionShell scene intent wiring", () => {
         onTryAgain={noop}
         question={question}
         recap={trustedRecap}
+        reviewPlan={trustedReviewPlan}
         runtime={runtime}
         state="source"
       />,
@@ -331,6 +346,9 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("The Conductor recap stayed grounded");
     expect(markup).toContain("Review later");
     expect(markup).toContain("proton gradient");
+    expect(markup).toContain("Next session");
+    expect(markup).toContain("ATP yield");
+    expect(markup).toContain("core FSRS");
     expect(markup).toContain("Review the ATP synthase source span");
     expect(markup).not.toContain("Share");
     expect(markup).not.toContain("Add to calendar");

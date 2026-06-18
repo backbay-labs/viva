@@ -5,6 +5,7 @@ export function normalizeBrowserEvidence(result) {
     manuscript_ready: result.manuscript_ready === true,
     conductor_terminal_fold: result.conductor_terminal_fold === true,
     recap_payload_visible: result.recap_payload_visible === true,
+    next_session_recommendation_visible: result.next_session_recommendation_visible === true,
     source_folio_visible: result.source_folio_visible === true,
     bounded_source_visible: result.bounded_source_visible === true,
     post_answer_source_folio_visible: result.post_answer_source_folio_visible === true,
@@ -25,6 +26,8 @@ export function assertReleaseBrowserEvidence(evidence) {
   if (evidence.conductor_terminal_fold !== true)
     failures.push("conductor_terminal_fold must be true");
   if (evidence.recap_payload_visible !== true) failures.push("recap_payload_visible must be true");
+  if (evidence.next_session_recommendation_visible !== true)
+    failures.push("next_session_recommendation_visible must be true");
   if (evidence.source_folio_visible !== true) failures.push("source_folio_visible must be true");
   if (evidence.bounded_source_visible !== true) failures.push("bounded_source_visible must be true");
   if (evidence.post_answer_source_folio_visible !== true)
