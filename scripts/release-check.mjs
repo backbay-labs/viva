@@ -6,11 +6,22 @@ import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  buildProviderReadinessMatrix,
+  LIVE_PROVIDER_GATE_COMMAND_NAME,
+  PROVIDER_READINESS_TARGETS,
+} from "./provider-readiness-matrix.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactDir = path.resolve(
   root,
   process.env.VIVA_RELEASE_ARTIFACT_DIR ?? "artifacts/release-check",
+);
+const failureArtifactDir = path.resolve(root, "artifacts/release-check-failures");
+const agentServiceBinary = path.join(
+  root,
+  "agent/target/debug",
+  process.platform === "win32" ? "agent-service.exe" : "agent-service",
 );
 const commands = [];
 
@@ -19,6 +30,10 @@ await mkdir(artifactDir, { recursive: true });
 
 try {
   await run("generated_artifact_hygiene", "bun", ["run", "release:hygiene"]);
+  await run("provider_readiness_matrix_unit_tests", "node", [
+    "--test",
+    "scripts/provider-readiness-matrix.test.mjs",
+  ]);
   await run("provider_gate_tests", "cargo", [
     "test",
     "--manifest-path",
@@ -28,6 +43,23 @@ try {
     "fake_provider",
     "--",
     "--nocapture",
+  ]);
+  await run(LIVE_PROVIDER_GATE_COMMAND_NAME, "cargo", [
+    "test",
+    "--manifest-path",
+    "agent/Cargo.toml",
+    "-p",
+    "agent-adapters",
+    "cartesia_gemini_brain",
+    "--",
+    "--nocapture",
+  ]);
+  await run("agent_service_binary_build", "cargo", [
+    "build",
+    "--manifest-path",
+    "agent/Cargo.toml",
+    "-p",
+    "agent-service",
   ]);
   await run("direct_websocket_replay", "bun", ["run", "agent:replay:ws"]);
   const browserResult =
@@ -62,17 +94,22 @@ try {
   await writeFile(outputPath, `${JSON.stringify(evidence, null, 2)}\n`);
   console.log(`Sanitized release evidence written to ${path.relative(root, outputPath)}`);
 } catch (error) {
+  await rm(failureArtifactDir, { recursive: true, force: true }).catch(() => {});
+  await mkdir(failureArtifactDir, { recursive: true }).catch(() => {});
   await writeFile(
-    path.join(artifactDir, "failure.json"),
+    path.join(failureArtifactDir, "failure.json"),
     `${JSON.stringify(
       {
         error: error instanceof Error ? error.message : String(error),
         commands,
+        releasable_artifact_dir_deleted: path.relative(root, artifactDir),
+        unsafe_to_attach: true,
       },
       null,
       2,
     )}\n`,
   ).catch(() => {});
+  await rm(artifactDir, { recursive: true, force: true }).catch(() => {});
   throw error;
 }
 
@@ -139,65 +176,124 @@ async function run(name, command, args, extraEnv = {}) {
 }
 
 async function collectProviderReadiness() {
+  const endpointEvidence = [];
+  for (const target of PROVIDER_READINESS_TARGETS) {
+    endpointEvidence.push(await collectProviderReadinessTarget(target));
+  }
+  return buildProviderReadinessMatrix(endpointEvidence);
+}
+
+async function collectProviderReadinessTarget(target) {
   const port = await freePort();
-  const stdoutPath = path.join(artifactDir, "readiness-agent.stdout.log");
-  const stderrPath = path.join(artifactDir, "readiness-agent.stderr.log");
+  const stdoutPath = path.join(artifactDir, `readiness-agent-${target.provider}.stdout.log`);
+  const stderrPath = path.join(artifactDir, `readiness-agent-${target.provider}.stderr.log`);
   const stdout = createWriteStream(stdoutPath);
   const stderr = createWriteStream(stderrPath);
-  const child = spawn(
-    "cargo",
-    ["run", "--manifest-path", "agent/Cargo.toml", "-p", "agent-service"],
-    {
-      cwd: root,
-      env: {
-        ...process.env,
-        VIVA_AGENT_BIND_ADDR: `127.0.0.1:${port}`,
-        VIVA_AGENT_PROVIDER: "fake_cartesia_gemini",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
+  const child = spawn(agentServiceBinary, [], {
+    cwd: root,
+    env: {
+      ...process.env,
+      ...target.env,
+      VIVA_AGENT_BIND_ADDR: `127.0.0.1:${port}`,
+      VIVA_AGENT_PROVIDER: target.provider,
     },
-  );
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const childExit = { value: null };
+  child.once("exit", (code, signal) => {
+    childExit.value = { code, signal };
+  });
+  child.once("error", (error) => {
+    childExit.value = { error: error.message };
+  });
   child.stdout.pipe(stdout);
   child.stderr.pipe(stderr);
   try {
-    const ready = await waitForReady(`http://127.0.0.1:${port}/ready`);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const health = await waitForEndpoint(
+      `${baseUrl}/health/brain`,
+      `${target.provider} /health/brain`,
+      childExit,
+      (record) =>
+        record.http_status === target.expected.health_http_status &&
+        record.body?.brain?.provider === target.provider,
+    );
+    const ready = await waitForEndpoint(
+      `${baseUrl}/ready`,
+      `${target.provider} /ready`,
+      childExit,
+      (record) =>
+        record.http_status === target.expected.ready_http_status &&
+        record.body?.ready === target.expected.ready &&
+        record.body?.brain?.provider === target.provider,
+    );
     return {
-      ready: ready.ready === true,
-      provider: ready.brain?.provider,
-      configured: ready.brain?.configured === true,
-      selectable: ready.brain?.selectable === true,
-      live_runtime: ready.brain?.live_runtime === true,
-      store: {
-        backend: ready.store?.backend,
-        available: ready.store?.available === true,
-        durable: ready.store?.durable === true,
-        raw_audio_persistence: ready.store?.raw_audio_persistence === true,
-        transcript_persistence: ready.store?.transcript_persistence === true,
-      },
+      provider: target.provider,
+      health_brain: health,
+      ready,
     };
   } finally {
-    child.kill("SIGTERM");
+    await stopChild(child);
     stdout.end();
     stderr.end();
   }
 }
 
-async function waitForReady(url) {
+async function waitForEndpoint(url, description, childExit, predicate) {
   const started = Date.now();
   let lastError;
+  let lastRecord;
   while (Date.now() - started < 120_000) {
+    if (childExit.value) {
+      throw new Error(
+        `Agent exited before ${description} became observable: ${JSON.stringify(childExit.value)}`,
+      );
+    }
     try {
       const response = await fetch(url);
-      const json = await response.json();
-      if (response.ok && json.ready === true) return json;
+      const text = await response.text();
+      const body = text.length > 0 ? JSON.parse(text) : {};
+      const record = {
+        http_status: response.status,
+        body,
+      };
+      lastRecord = record;
+      if (predicate(record)) return record;
     } catch (error) {
       lastError = error;
     }
     await delay(500);
   }
   throw new Error(
-    `Timed out waiting for provider readiness${lastError ? `: ${lastError.message}` : ""}`,
+    `Timed out waiting for ${description}${
+      lastRecord ? `; last response ${JSON.stringify(summarizeEndpointRecord(lastRecord))}` : ""
+    }${lastError ? `; last error ${lastError.message}` : ""}`,
   );
+}
+
+function summarizeEndpointRecord(record) {
+  return {
+    http_status: record.http_status,
+    provider: record.body?.provider,
+    ready: record.body?.ready,
+    status: record.body?.status,
+    brain_provider: record.body?.brain?.provider,
+    configured: record.body?.brain?.configured,
+    selectable: record.body?.brain?.selectable,
+    live_runtime: record.body?.brain?.live_runtime,
+  };
+}
+
+async function stopChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  child.kill("SIGTERM");
+  const terminated = await Promise.race([exited.then(() => true), delay(5_000).then(() => false)]);
+  if (terminated) return;
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+  }
+  await exited;
 }
 
 async function hashFixtureFiles(dir) {
@@ -224,6 +320,8 @@ function auditSanitizedEvidence(evidence) {
     "received 4 PCM16 bytes",
     "CARTESIA_API_KEY",
     "GEMINI_API_KEY",
+    "viva-release-check-cartesia-placeholder-key",
+    "viva-release-check-gemini-placeholder-key",
     "Bearer ",
   ];
   for (const needle of forbidden) {
@@ -255,6 +353,8 @@ async function auditGeneratedArtifacts(dirs) {
     "received 4 PCM16 bytes",
     "CARTESIA_API_KEY",
     "GEMINI_API_KEY",
+    "viva-release-check-cartesia-placeholder-key",
+    "viva-release-check-gemini-placeholder-key",
     "Bearer ",
   ];
   let scanned_files = 0;
