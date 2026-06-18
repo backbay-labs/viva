@@ -3222,6 +3222,8 @@ button {
   flex-direction: column;
   flex: 1;
   min-height: 0;
+  margin: -0.25rem;
+  padding: 0.25rem;
   overflow-y: auto;
   scrollbar-gutter: stable;
 }
@@ -3907,6 +3909,8 @@ button {
   }
 
   .marginalia__body {
+    margin: 0;
+    padding: 0;
     overflow: visible;
     scrollbar-gutter: auto;
   }

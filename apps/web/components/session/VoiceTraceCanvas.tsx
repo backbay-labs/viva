@@ -254,29 +254,36 @@ export function planVoiceTraceConceptLabels({
     const labelHeight = Math.max(15, fontSize * 1.35);
     const text = compactConceptLabel(item.label, maxWidth, fontSize);
     const textWidth = Math.min(maxWidth, estimateConceptLabelWidth(text, fontSize));
-    const laneOrder = laneOffsets.map(
-      (_offset, laneIndex) => laneOffsets[(laneIndex + index) % laneOffsets.length],
+    const rowCandidates = orderedUniqueNumbers(
+      [
+        ...laneOffsets.map((_, laneIndex) => {
+          const offset = laneOffsets[(laneIndex + index) % laneOffsets.length];
+          return item.point.y + offset;
+        }),
+        ...conceptLabelRowCandidates(canvasHeight, labelHeight, padding),
+      ].map((y) => clamp(y, padding + labelHeight / 2, canvasHeight - padding - labelHeight / 2)),
+    );
+    const xCandidates = orderedUniqueNumbers(
+      conceptLabelXCandidates(item.point.x, textWidth, canvasWidth, padding),
     );
 
     let best: { box: LabelBox; overlap: number; offset: number; x: number; y: number } | null =
       null;
-    for (const offset of laneOrder) {
-      const x = clamp(item.point.x, padding + textWidth / 2, canvasWidth - padding - textWidth / 2);
-      const y = clamp(
-        item.point.y + offset,
-        padding + labelHeight / 2,
-        canvasHeight - padding - labelHeight / 2,
-      );
-      const box = labelBox(x, y, textWidth, labelHeight);
-      const overlap = placed.reduce(
-        (total, other) => total + overlapArea(inflate(box, 2), other),
-        0,
-      );
-      const score = overlap * 1000 + Math.abs(offset);
-      if (!best || score < best.overlap * 1000 + Math.abs(best.offset)) {
-        best = { box, overlap, offset, x, y };
+    for (const y of rowCandidates) {
+      for (const x of xCandidates) {
+        const box = labelBox(x, y, textWidth, labelHeight);
+        const overlap = placed.reduce(
+          (total, other) => total + overlapArea(inflate(box, 2), other),
+          0,
+        );
+        const offset = Math.abs(y - item.point.y) + Math.abs(x - item.point.x) * 0.55;
+        const score = overlap * 1000 + offset;
+        if (!best || score < best.overlap * 1000 + best.offset) {
+          best = { box, overlap, offset, x, y };
+        }
+        if (overlap === 0) break;
       }
-      if (overlap === 0) break;
+      if (best?.overlap === 0) break;
     }
 
     const label = best ?? {
@@ -314,6 +321,41 @@ function conceptLabelLaneOffsets(canvasWidth: number): number[] {
   if (canvasWidth < 520) return [-62, 42, -38, 66, 18, -82];
   if (canvasWidth < 760) return [-54, 40, -32, 62, 20, -78];
   return [-42, 42, -68, 68, 18, -88];
+}
+
+function conceptLabelRowCandidates(
+  canvasHeight: number,
+  labelHeight: number,
+  padding: number,
+): number[] {
+  const min = padding + labelHeight / 2;
+  const max = canvasHeight - padding - labelHeight / 2;
+  if (max <= min) return [min];
+  const step = Math.max(labelHeight + 3, 16);
+  const rows: number[] = [];
+  for (let y = min; y <= max; y += step) rows.push(y);
+  if (rows[rows.length - 1] !== max) rows.push(max);
+  return rows;
+}
+
+function conceptLabelXCandidates(
+  anchorX: number,
+  textWidth: number,
+  canvasWidth: number,
+  padding: number,
+): number[] {
+  const min = padding + textWidth / 2;
+  const max = canvasWidth - padding - textWidth / 2;
+  const shifts = [0, -textWidth * 0.5, textWidth * 0.5, -textWidth, textWidth];
+  return shifts.map((shift) => clamp(anchorX + shift, min, max));
+}
+
+function orderedUniqueNumbers(values: number[]): number[] {
+  const out: number[] = [];
+  for (const value of values) {
+    if (!out.some((existing) => Math.abs(existing - value) < 0.5)) out.push(value);
+  }
+  return out;
 }
 
 function estimateConceptLabelWidth(label: string, fontSize: number): number {

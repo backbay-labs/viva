@@ -144,6 +144,29 @@ const denseConceptNodes = [
   { id: "oxygen", label: "Oxygen acceptor", status: "review", emphasis: 0.55 },
 ] as const;
 
+const serverIngestedConceptNodes = [
+  ...denseConceptNodes,
+  { id: "inner-membrane", label: "Inner mitochondrial membrane", status: "review", emphasis: 0.5 },
+  { id: "cytochrome-c", label: "Cytochrome c", status: "shaky", emphasis: 0.7 },
+  { id: "complex-iv", label: "Complex IV", status: "review", emphasis: 0.45 },
+  { id: "water", label: "Water formation", status: "strong", emphasis: 0.25 },
+  { id: "chemiosmosis", label: "Chemiosmosis", status: "missed", emphasis: 1 },
+  { id: "adp-pi", label: "ADP + Pi", status: "review", emphasis: 0.4 },
+  { id: "matrix", label: "Mitochondrial matrix", status: "shaky", emphasis: 0.8 },
+  { id: "intermembrane", label: "Intermembrane space", status: "review", emphasis: 0.55 },
+] as const;
+
+const crowdedNarrowTracePoints = [
+  { x: 16.594434399597592, y: 79.99488019771769 },
+  { x: 57.579370436475365, y: 98.1426989220289 },
+  { x: 99.43751171920508, y: 100.37326006290412 },
+  { x: 140.02523209023306, y: 89.1289555460795 },
+  { x: 187.9456062888585, y: 84.48651282224249 },
+  { x: 224.8389659286666, y: 57.28025170529557 },
+  { x: 263.28653631977994, y: 59.189731234207585 },
+  { x: 305.90642473953795, y: 70.79458203296255 },
+] as const;
+
 function ready(provider: string, overrides: Partial<VivaReadyFrame["brain"]> = {}): VivaReadyFrame {
   return {
     type: "ready",
@@ -300,6 +323,37 @@ describe("LiveSessionShell scene intent wiring", () => {
       expect(label.box.right).toBeLessThanOrEqual(412);
       expect(label.box.top).toBeGreaterThanOrEqual(8);
       expect(label.box.bottom).toBeLessThanOrEqual(172);
+    }
+
+    for (let i = 0; i < labels.length; i++) {
+      for (let j = i + 1; j < labels.length; j++) {
+        expect(boxesOverlap(labels[i].box, labels[j].box)).toBe(false);
+      }
+    }
+  });
+
+  test("keeps uncapped server concept labels bounded on a narrow trace", () => {
+    const crowdedNodes = serverIngestedConceptNodes.slice(0, crowdedNarrowTracePoints.length);
+    const labels = planVoiceTraceConceptLabels({
+      canvasHeight: 172,
+      canvasWidth: 320,
+      fontScale: 0.72,
+      items: crowdedNodes.map((node, index) => ({
+        emphasis: index % 5 === 0 ? 1 : 0.55,
+        label: node.label,
+        point: crowdedNarrowTracePoints[index],
+      })),
+    });
+
+    expect(labels).toHaveLength(crowdedNodes.length);
+    expect(labels.every((label) => !label.hidden)).toBe(true);
+    expect(labels.every((label) => label.text.length > 0)).toBe(true);
+
+    for (const label of labels) {
+      expect(label.box.left).toBeGreaterThanOrEqual(8);
+      expect(label.box.right).toBeLessThanOrEqual(312);
+      expect(label.box.top).toBeGreaterThanOrEqual(8);
+      expect(label.box.bottom).toBeLessThanOrEqual(164);
     }
 
     for (let i = 0; i < labels.length; i++) {
