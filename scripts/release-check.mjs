@@ -11,6 +11,11 @@ import {
   LIVE_PROVIDER_GATE_COMMAND_NAME,
   PROVIDER_READINESS_TARGETS,
 } from "./provider-readiness-matrix.mjs";
+import {
+  assertReleaseBrowserEvidence,
+  normalizeBrowserEvidence,
+  shouldSkipMissingBrowserResult,
+} from "./browser-evidence.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactDir = path.resolve(
@@ -34,6 +39,7 @@ try {
     "--test",
     "scripts/provider-readiness-matrix.test.mjs",
   ]);
+  await run("browser_evidence_unit_tests", "node", ["--test", "scripts/browser-evidence.test.mjs"]);
   await run("provider_gate_tests", "cargo", [
     "test",
     "--manifest-path",
@@ -124,17 +130,11 @@ async function readExistingBrowserResult() {
   const resultPath = path.join(root, "artifacts/e2e-browser/result.json");
   try {
     const result = JSON.parse(await readFile(resultPath, "utf8"));
-    return {
-      artifact_dir: result.artifact_dir,
-      pending_gate: result.pending_gate === true,
-      server_paste_ready: result.server_paste_ready === true,
-      connected_recap: result.connected_recap === true,
-      local_only_actions_hidden: result.local_only_actions_hidden === true,
-      console_error_count: Array.isArray(result.console_errors) ? result.console_errors.length : 0,
-      page_error_count: Array.isArray(result.page_errors) ? result.page_errors.length : 0,
-    };
+    const evidence = normalizeBrowserEvidence(result);
+    assertReleaseBrowserEvidence(evidence);
+    return evidence;
   } catch (error) {
-    if (process.env.VIVA_RELEASE_CHECK_SKIP_BROWSER === "1") {
+    if (shouldSkipMissingBrowserResult(error, process.env.VIVA_RELEASE_CHECK_SKIP_BROWSER)) {
       return {
         skipped: true,
         reason: "VIVA_RELEASE_CHECK_SKIP_BROWSER=1 and no existing browser result was found",

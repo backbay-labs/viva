@@ -162,7 +162,7 @@ describe("projectRuntimeCopy", () => {
     expect(gated.capsuleLabel).toBe("Live provider gated");
     expect(gated.marginaliaText).toContain("Act 3");
     expect(gated.primaryActionDisabled).toBe(true);
-    expect(gated.nextActionLabel).toBe("Run local demo");
+    expect(gated.nextActionLabel).toBe("Retry when live runtime is ready");
     expect(live.capsuleLabel).toBe("Live Cartesia/Gemini tutor");
     expect(live.marginaliaText).toContain("live Cartesia/Gemini runtime");
     expect(live.primaryActionDisabled).toBe(false);
@@ -421,7 +421,7 @@ describe("projectRuntimeCopy", () => {
     });
 
     expect(apiMissing.cause).toBe("api_missing");
-    expect(apiMissing.nextActionLabel).toBe("Run local demo");
+    expect(apiMissing.nextActionLabel).toBe("Configure agent API");
     expect(apiMissing.primaryActionDisabled).toBe(true);
     expect(offline.cause).toBe("agent_offline");
     expect(offline.marginaliaText).toContain("/ready");
@@ -429,6 +429,33 @@ describe("projectRuntimeCopy", () => {
     expect(offline.nextActionLabel).toBe("Retry agent");
     expect(offline.primaryActionDisabled).toBe(false);
     expect(offline.primaryActionIntent).toBe("retry_agent");
+  });
+
+  test("does not preserve upload or local-demo actions on connected session unavailable states", () => {
+    const ingestionFailed = projectRuntimeCopy({
+      readiness: {
+        canConnect: false,
+        reason: "failed_ingestion",
+        message: "Connected agent is unavailable because server ingestion failed.",
+      },
+      status: "open",
+    });
+    const liveGated = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("cartesia_gemini", { configured: false, selectable: false }),
+      status: "open",
+    });
+    const apiMissing = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      readinessProbe: { status: "api_missing" },
+      status: "idle",
+    });
+
+    for (const copy of [ingestionFailed, liveGated, apiMissing]) {
+      expect(copy.nextActionLabel).not.toContain("upload");
+      expect(copy.nextActionLabel).not.toContain("local demo");
+      expect(copy.nextActionLabel).not.toContain("Local demo");
+    }
   });
 });
 

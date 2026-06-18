@@ -1,3 +1,4 @@
+import type { SessionRecap } from "@viva/core";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import type { RuntimeCopy } from "../../lib/viva-session-projection";
 import { MuseBackdrop } from "../landing/MuseBackdrop";
@@ -23,9 +24,13 @@ export function LiveSessionShell({
   highlightedTokens,
   conceptNodes,
   question,
+  recap,
+  contextLabel,
+  clockLabel,
   elapsed,
   hintShown,
   levelRef,
+  onEndSession,
   onHint,
   onShowSource,
   onSubmitAnswer,
@@ -40,9 +45,13 @@ export function LiveSessionShell({
   highlightedTokens: string[];
   conceptNodes: ConceptNode[];
   question: Question;
+  recap?: SessionRecap;
+  contextLabel: string;
+  clockLabel?: string;
   elapsed: number;
   hintShown: boolean;
   levelRef?: VoiceTraceLevelRef;
+  onEndSession: () => void;
   onHint: () => void;
   onShowSource: () => void;
   onSubmitAnswer: () => void;
@@ -56,7 +65,12 @@ export function LiveSessionShell({
       <MuseGlyphCanvas highlightedTokens={highlightedTokens} state={glyphState} />
       <div className="live-session__veil" />
 
-      <SessionHeader elapsed={elapsed} runtime={runtime} />
+      <SessionHeader
+        clockLabel={clockLabel}
+        contextLabel={contextLabel}
+        elapsed={elapsed}
+        runtime={runtime}
+      />
 
       <div className="live-session__stage-wrap">
         <div className="live-session__stage">
@@ -69,7 +83,7 @@ export function LiveSessionShell({
               scene={scene}
               state={state}
             />
-            <SessionBottomControls />
+            <SessionBottomControls onEndSession={onEndSession} />
           </div>
 
           <MarginaliaPanel
@@ -81,6 +95,7 @@ export function LiveSessionShell({
             onSubmitAnswer={onSubmitAnswer}
             onTryAgain={onTryAgain}
             question={question}
+            recap={recap}
             runtime={runtime}
             scene={scene}
             state={state}

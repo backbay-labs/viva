@@ -3454,6 +3454,37 @@ button {
   color: var(--viva-muted);
 }
 
+.recap-fold__list {
+  display: grid;
+  gap: 0.42rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  color: var(--viva-ink-soft);
+}
+
+.recap-fold__list li {
+  display: grid;
+  grid-template-columns: 5.8rem minmax(0, 1fr);
+  gap: 0.7rem;
+  padding: 0.45rem 0;
+  border-top: 1px solid rgba(93, 52, 127, 0.12);
+}
+
+.recap-fold__list li:first-child {
+  border-top: 0;
+}
+
+.recap-fold__list span:first-child {
+  color: var(--viva-muted);
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
 .folio .session-action {
   margin-top: auto;
 }
