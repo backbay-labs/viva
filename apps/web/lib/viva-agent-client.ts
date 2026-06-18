@@ -417,6 +417,7 @@ export function vivaAgentReducer(
 
   switch (event.type) {
     case "session_phase":
+      if (state.recap && event.phase !== "recap") return state;
       return { ...state, phase: event.phase };
     case "question_started":
       return {
@@ -455,7 +456,7 @@ export function vivaAgentReducer(
         ],
       };
     case "recap_ready":
-      return { ...state, recap: event.recap };
+      return { ...state, phase: "recap", recap: event.recap };
     case "audio_delta":
       return {
         ...state,

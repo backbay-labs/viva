@@ -120,6 +120,16 @@ const TARGETS: Record<SessionState, Params> = {
     highlight: 0.4,
     connector: 0.2,
   },
+  recap: {
+    flow: 0.14,
+    gather: 0.72,
+    warm: 0.34,
+    source: 0.86,
+    calm: 0.72,
+    marker: 0.22,
+    highlight: 0.64,
+    connector: 0.12,
+  },
 };
 
 type Particle = {
@@ -804,6 +814,7 @@ export function VoiceTraceCanvas({
       data-scene-emphasis={scene?.emphasis ?? "quiet"}
       data-scene-entity-count={scene?.entities.length ?? 0}
       data-scene-register={scene?.register ?? "examining"}
+      data-state={state}
       data-text-mode={textMode ? "true" : "false"}
     >
       <canvas className="voice-trace__canvas" ref={canvasRef} />

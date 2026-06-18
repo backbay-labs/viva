@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { enterTextAnswerMode, stopCaptureForRecap, textAnswerPayload } from "./LiveSessionPage";
+import type { SessionRecap } from "@viva/core";
+import type { VivaAgentDerivedState } from "../../lib/use-viva-agent-session";
+import { projectTrace } from "../../lib/viva-session-projection";
+import {
+  derivedStateWithProjectedRecap,
+  enterTextAnswerMode,
+  stopCaptureForRecap,
+  textAnswerPayload,
+} from "./LiveSessionPage";
 
 describe("LiveSessionPage recap cleanup", () => {
   test("stops microphone capture when a terminal recap appears", () => {
@@ -56,5 +64,46 @@ describe("LiveSessionPage recap cleanup", () => {
       "NADH donates electrons to the ETC.",
     );
     expect(textAnswerPayload("   \n\t   ")).toBe(null);
+  });
+
+  test("uses projected recap buckets for center trace highlights", () => {
+    const staleRawRecap: SessionRecap = {
+      durationLabel: "Agent session",
+      headline: "Good session, Ananya.",
+      missedConcepts: ["Fixture stale id"],
+      nextAction: "Fixture action",
+      plan: [],
+      reviewLater: ["Fixture stale id"],
+      shakyConcepts: [],
+      sourceMoments: [],
+      strongConcepts: [],
+      summary: "Server recap summary.",
+    };
+    const projectedRecap: SessionRecap = {
+      ...staleRawRecap,
+      missedConcepts: ["ATP synthase"],
+      nextAction: "Rebuild ATP synthase from the source.",
+      reviewLater: ["ATP synthase"],
+      strongConcepts: ["NADH"],
+    };
+    const derived: VivaAgentDerivedState = {
+      canSubmitAnswer: true,
+      conceptStatuses: {},
+      errors: [],
+      manuscriptIntents: [],
+      phase: "recap",
+      recap: staleRawRecap,
+      sources: [],
+      transcript: "",
+    };
+
+    const projection = projectTrace(
+      derivedStateWithProjectedRecap(derived, projectedRecap),
+      "open",
+      new Date("2026-06-17T12:00:00.000Z"),
+    );
+
+    expect(projection.question.highlights).toEqual(["NADH", "ATP synthase"]);
+    expect(projection.question.highlights).not.toContain("Fixture stale id");
   });
 });

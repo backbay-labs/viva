@@ -101,12 +101,12 @@ const trustedReadiness: AgentStudySetReadiness = {
 };
 
 describe("projectSessionState", () => {
-  test("maps agent phases onto the four trace states", () => {
+  test("maps agent phases onto the manuscript states", () => {
     expect(projectSessionState("listening", true)).toBe("listening");
     expect(projectSessionState("thinking", true)).toBe("thinking");
     expect(projectSessionState("feedback", true)).toBe("correction");
     expect(projectSessionState("correction", true)).toBe("correction");
-    expect(projectSessionState("recap", true)).toBe("source");
+    expect(projectSessionState("recap", true)).toBe("recap");
   });
 
   test("stays calm (listening) before a question arrives", () => {
@@ -648,6 +648,45 @@ describe("projectTrace", () => {
     const projection = projectTrace(derived({ phase: "listening", question }), "open", NOW);
     expect(projection.state).toBe("listening");
     expect(projection.highlightedTokens).toEqual([]);
+  });
+
+  test("projects recap_ready as the manuscript closing fold, not a source-retry state", () => {
+    const projection = projectTrace(
+      derived({
+        phase: "correction",
+        question,
+        recap: {
+          durationLabel: "Agent session",
+          headline: "Good session, Ananya.",
+          summary: "The Conductor folded the source-grounded answer into a kept study artifact.",
+          strongConcepts: ["NADH"],
+          shakyConcepts: ["Oxidative phosphorylation"],
+          missedConcepts: ["ATP synthase"],
+          reviewLater: ["Oxidative phosphorylation", "ATP synthase"],
+          nextAction: "Rebuild ATP synthase from the source.",
+          plan: [],
+          sourceMoments: [
+            {
+              source,
+              status: "shaky",
+              text: "Question source: oxidative phosphorylation.",
+            },
+          ],
+        },
+      }),
+      "open",
+      NOW,
+    );
+
+    expect(projection.state).toBe("recap");
+    expect(projection.question.prompt).toBe("Good session,\nAnanya.");
+    expect(projection.question.explanation).toContain("kept study artifact");
+    expect(projection.question.sourceRef).toBe("Lecture 5 · Slide 18");
+    expect(projection.question.highlights).toEqual([
+      "NADH",
+      "Oxidative phosphorylation",
+      "ATP synthase",
+    ]);
   });
 });
 

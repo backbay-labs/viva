@@ -13,6 +13,7 @@ import {
   type RuntimeCopy,
   type SourceFolioProjection,
 } from "../../lib/viva-session-projection";
+import { LiveSessionShell } from "./LiveSessionShell";
 import { MarginaliaPanel } from "./MarginaliaPanel";
 import { SessionHeader } from "./SessionHeader";
 import type { Question } from "./session-data";
@@ -92,8 +93,11 @@ const trustedRecap: SessionRecap = {
     {
       source: {
         confidence: "high",
+        documentId: "lec-5",
         excerpt: "Electron flow pumps protons across the inner mitochondrial membrane.",
         label: "Lecture 5 · Slide 18",
+        retrievalReason: "server bounded source moment",
+        span: "slide:18",
       },
       status: "strong",
       text: "Question source: oxidative phosphorylation.",
@@ -564,7 +568,7 @@ describe("LiveSessionShell scene intent wiring", () => {
         recap={trustedRecap}
         reviewPlan={trustedReviewPlan}
         runtime={runtime}
-        state="source"
+        state="recap"
       />,
     );
 
@@ -580,6 +584,55 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).not.toContain("Share");
     expect(markup).not.toContain("Add to calendar");
     expect(markup).not.toContain("Back to question");
+  });
+
+  test("renders recap_ready as a closing fold across the center plate and margin", () => {
+    const markup = renderToStaticMarkup(
+      <LiveSessionShell
+        clockLabel="Fixture clock"
+        conceptNodes={[...denseConceptNodes]}
+        contextLabel="Trusted server set: Biology Midterm"
+        elapsed={620}
+        glyphState="idle"
+        highlightedTokens={["NADH", "ATP synthase"]}
+        hintShown={false}
+        onBackToQuestion={noop}
+        onEndSession={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={{
+          ...question,
+          explanation: trustedRecap.summary,
+          prompt: "Good session,\nAnanya.",
+          sourceRef: "Lecture 5 · Slide 18",
+        }}
+        recap={trustedRecap}
+        reviewPlan={trustedReviewPlan}
+        runtime={runtime}
+        state="recap"
+      />,
+    );
+
+    expect(markup).toContain("Good session");
+    expect(markup).toContain("The manuscript is folded for review.");
+    expect(markup).toContain("Closing fold");
+    expect(markup).toContain("Server recap headline");
+    expect(markup).toContain("Source moments");
+    expect(markup).toContain("Lecture 5 · Slide 18");
+    expect(markup).toContain("Confidence");
+    expect(markup).toContain("High confidence");
+    expect(markup).toContain("Span");
+    expect(markup).toContain("lec-5");
+    expect(markup).toContain("slide:18");
+    expect(markup).toContain("Electron flow pumps protons");
+    expect(markup).toContain("Due Jun 18, 2026");
+    expect(markup).toContain("core FSRS");
+    expect(markup).toContain('class="voice-trace"');
+    expect(markup).not.toContain("Use this to answer again.");
+    expect(markup).not.toContain("dashboard");
   });
 
   test("renders source_reference folio as a bounded museum label", () => {

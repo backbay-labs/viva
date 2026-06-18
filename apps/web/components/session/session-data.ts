@@ -7,7 +7,7 @@ import type { MuseGlyphState } from "../landing/MuseGlyphCanvas";
  * here is shaped so it can later be fed by real session events (each Question is
  * the kind of payload an adaptive examiner would emit per prompt).
  */
-export type SessionState = "listening" | "thinking" | "correction" | "source";
+export type SessionState = "listening" | "thinking" | "correction" | "source" | "recap";
 
 export type ChecklistStatus = "done" | "partial" | "missing";
 
@@ -124,6 +124,7 @@ export const STATUS_LINE: Record<SessionState, string> = {
   thinking: "Checking against your sources…",
   correction: "Reviewing your answer…",
   source: "Use this to answer again.",
+  recap: "The manuscript is folded for review.",
 };
 
 /** Map a session state onto the landing glyph layer's energy states. */
@@ -134,6 +135,7 @@ export function glyphStateFor(state: SessionState): MuseGlyphState {
     case "correction":
       return "correcting";
     case "source":
+    case "recap":
       return "idle";
     default:
       return "listening";

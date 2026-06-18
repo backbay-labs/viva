@@ -25,7 +25,7 @@ import type {
 /**
  * The Conductor — a pure projection from the real agent event stream
  * (VivaAgentDerivedState, folded by the existing reducer) onto the inputs the
- * gorgeous "Listening Manuscript" already consumes: a four-state SessionState,
+ * gorgeous "Listening Manuscript" already consumes: a session state,
  * the per-prompt Question the marginalia renders, and the tokens that glow on
  * the trace.
  *
@@ -123,7 +123,7 @@ export function projectSessionState(
     case "correction":
       return "correction";
     case "recap":
-      return "source";
+      return "recap";
     default:
       return "listening";
   }
@@ -749,6 +749,8 @@ export function projectSessionQuestion(
   status: VivaAgentConnectionStatus,
   now: Date,
 ): Question {
+  if (derived.recap) return recapClosingQuestion(derived.recap);
+
   const agentQuestion = derived.question;
   if (!agentQuestion) {
     return { ...EMPTY_QUESTION, prompt: connectionPlaceholderPrompt(status), status: "" };
@@ -774,6 +776,39 @@ export function projectSessionQuestion(
       ? correctionEmphasis(evaluation.confidenceScore, evaluation.label)
       : undefined,
   };
+}
+
+function recapClosingQuestion(recap: NonNullable<VivaAgentDerivedState["recap"]>): Question {
+  const sourceMoment = recap.sourceMoments[0];
+  const highlights = [
+    ...new Set([
+      ...recap.strongConcepts,
+      ...recap.shakyConcepts,
+      ...recap.missedConcepts,
+      ...recap.reviewLater,
+    ]),
+  ];
+
+  return {
+    ...EMPTY_QUESTION,
+    prompt: recapHeadlinePrompt(recap.headline),
+    explanation: recap.summary,
+    sourceRef: sourceMoment?.source.label ?? "",
+    sourceSubtitle: sourceMoment ? "Source moment" : "",
+    excerpt: sourceMoment?.text ?? "",
+    sourceFooter: sourceMoment?.source.label ?? "",
+    status: "Closing fold ready",
+    highlights,
+  };
+}
+
+function recapHeadlinePrompt(headline: string): string {
+  const normalized = headline.replace(/\s+/g, " ").trim();
+  const comma = normalized.indexOf(",");
+  if (comma > 0 && comma < normalized.length - 1) {
+    return `${normalized.slice(0, comma + 1)}\n${normalized.slice(comma + 1).trimStart()}`;
+  }
+  return normalized || "Session recap ready.";
 }
 
 export function projectSourceFolio(
@@ -873,7 +908,7 @@ export function projectTrace(
   now: Date,
 ): TraceProjection {
   const hasAgentQuestion = Boolean(derived.question);
-  const state = projectSessionState(derived.phase, hasAgentQuestion);
+  const state = derived.recap ? "recap" : projectSessionState(derived.phase, hasAgentQuestion);
   return {
     state,
     question: projectSessionQuestion(derived, status, now),
