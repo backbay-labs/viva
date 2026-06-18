@@ -311,6 +311,7 @@ describe("Viva voice agent contract", () => {
       "session_phase",
       "question_started",
       "session_phase",
+      "transcript_delta",
       "transcript_final",
       "session_phase",
       "answer_evaluated",
