@@ -149,6 +149,8 @@ async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token
         store.clone(),
     );
     let app = build_router(state);
+    let pasted_text = "mitosis chromosome spindle metaphase cytokinesis";
+    let forged_excerpt = "browser forged source excerpt should never survive";
 
     let response = app
         .oneshot(
@@ -163,7 +165,25 @@ async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token
                         "session_id": "attacker-session",
                         "title": "Cell Division",
                         "course": "Biology 201",
-                        "pasted_text": "mitosis chromosome spindle metaphase cytokinesis"
+                        "pasted_text": pasted_text,
+                        "source_spans": [{
+                            "id": "browser-span",
+                            "document_id": "browser-doc",
+                            "locator": { "page": 7, "bbox": [1, 2, 3, 4], "span": "page:7:bbox" },
+                            "excerpt": forged_excerpt,
+                            "confidence": "high",
+                            "retrieval_reason": "browser supplied"
+                        }],
+                        "questions": [{
+                            "source": {
+                                "source_id": "browser-span",
+                                "document_id": "browser-doc",
+                                "span": "page:7:bbox",
+                                "excerpt": forged_excerpt,
+                                "confidence": "high",
+                                "retrieval_reason": "browser supplied"
+                            }
+                        }]
                     })
                     .to_string(),
                 ))
@@ -186,6 +206,20 @@ async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token
     assert_eq!(payload["study_set"]["user_id"], "user-1");
     assert_ne!(payload["session_id"], "attacker-session");
     assert_eq!(payload["documents"][0]["processing_status"], "ready");
+    let locator = &payload["source_spans"][0]["locator"];
+    assert!(locator["span"].as_str().unwrap().starts_with("chars:"));
+    assert!(locator.get("page").is_none());
+    assert!(locator.get("bbox").is_none());
+    let excerpt = payload["source_spans"][0]["excerpt"].as_str().unwrap();
+    assert!(excerpt.contains("mitosis"));
+    assert_ne!(excerpt, pasted_text);
+    let payload_json = payload.to_string();
+    assert!(!payload_json.contains(pasted_text));
+    assert!(!payload_json.contains("browser-span"));
+    assert!(!payload_json.contains("browser-doc"));
+    assert!(!payload_json.contains(forged_excerpt));
+    assert!(!payload_json.contains("page:7:bbox"));
+    assert!(excerpt.chars().count() <= 360);
     assert_eq!(
         payload["source_spans"][0]["id"],
         payload["questions"][0]["source"]["source_id"]
@@ -210,6 +244,53 @@ async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token
         active_question.question_id,
         "q-oxidative-phosphorylation-nadh"
     );
+}
+
+#[tokio::test]
+async fn paste_study_set_route_does_not_mint_session_token_for_failed_ingestion() {
+    let store = Arc::new(data::InMemoryStudyStore::new());
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(store.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        4,
+        store.clone(),
+    );
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/study-sets/paste")
+                .header("origin", "http://localhost:3000")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "title": "Empty paste",
+                        "course": "Biology 201",
+                        "pasted_text": "!!! ??? ... ---"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["study_set"]["ingestion_status"], "failed");
+    assert_eq!(payload["documents"][0]["processing_status"], "failed");
+    assert!(payload["source_spans"].as_array().unwrap().is_empty());
+    assert!(payload["concepts"].as_array().unwrap().is_empty());
+    assert!(payload["questions"].as_array().unwrap().is_empty());
+    assert!(payload["session_token"].is_null());
 }
 
 #[tokio::test]
