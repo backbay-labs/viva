@@ -1,7 +1,18 @@
 "use client";
 
+import { useEffect, useState } from "react";
+import {
+  deleteVivaSessionHistory,
+  deleteVivaStudySet,
+  exportVivaLibraryData,
+  fetchVivaLibrarySnapshot,
+} from "../../lib/viva-agent-client";
 import { projectLibrarySnapshot, type VivaLibrarySnapshot } from "../../lib/viva-library";
 import { librarySessionTarget } from "../../lib/viva-session-entry";
+
+type LibraryProjection = ReturnType<typeof projectLibrarySnapshot>;
+type LibraryRow = LibraryProjection["libraryRows"][number];
+type SessionRow = LibraryProjection["sessionRows"][number];
 
 export function LibraryStatusPanel({
   snapshot,
@@ -10,11 +21,81 @@ export function LibraryStatusPanel({
   snapshot?: VivaLibrarySnapshot | null;
   now?: Date;
 }) {
-  if (!snapshot) return null;
-  const projection = projectLibrarySnapshot(snapshot, { now });
+  const [currentSnapshot, setCurrentSnapshot] = useState(snapshot ?? null);
+  const [status, setStatus] = useState("");
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+
+  useEffect(() => setCurrentSnapshot(snapshot ?? null), [snapshot]);
+
+  if (!currentSnapshot) return null;
+  const projection = projectLibrarySnapshot(currentSnapshot, { now });
+  const controlToken = projection.privacy.export.controlToken ?? undefined;
+  const refreshLibrary = async () => {
+    setCurrentSnapshot(
+      await fetchVivaLibrarySnapshot({
+        controlToken,
+        userId: projection.userId,
+      }),
+    );
+  };
+  const runControl = async (label: string, action: () => Promise<void>) => {
+    setBusyAction(label);
+    setStatus("");
+    try {
+      await action();
+      setStatus(`${label} complete.`);
+    } catch {
+      setStatus(`${label} failed.`);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+  const exportLibrary = () =>
+    runControl("Export data", async () => {
+      const exported = await exportVivaLibraryData({
+        controlToken,
+        userId: projection.userId,
+      });
+      downloadJson(`viva-export-${projection.userId}.json`, exported);
+    });
+  const deleteStudySet = (row: LibraryRow) =>
+    runControl("Delete source", async () => {
+      await deleteVivaStudySet(row.id, {
+        controlToken,
+        userId: projection.userId,
+      });
+      await refreshLibrary();
+    });
+  const deleteSession = (row: SessionRow) =>
+    runControl("Delete recap", async () => {
+      await deleteVivaSessionHistory(row.studySetId, row.id, {
+        controlToken,
+        userId: projection.userId,
+      });
+      await refreshLibrary();
+    });
+
   return (
     <section aria-label="Library" className="viva-library">
       <div className="viva-library__inner">
+        <div className="viva-library__privacy">
+          <div>
+            <p>Privacy controls</p>
+            <span>{projection.privacy.copy}</span>
+          </div>
+          <button
+            disabled={!projection.privacy.export.available || busyAction === "Export data"}
+            onClick={exportLibrary}
+            type="button"
+          >
+            Export data
+          </button>
+        </div>
+        {status ? (
+          <p aria-live="polite" className="viva-library__status">
+            {status}
+          </p>
+        ) : null}
         <div className="viva-library__section">
           <header className="viva-library__header">
             <h2>Library</h2>
@@ -22,7 +103,12 @@ export function LibraryStatusPanel({
           </header>
           <div className="viva-library__grid">
             {projection.libraryRows.map((row) => (
-              <LibraryStudySetRow key={row.id} row={row} />
+              <LibraryStudySetRow
+                busy={busyAction === "Delete source"}
+                key={row.id}
+                onDelete={deleteStudySet}
+                row={row}
+              />
             ))}
           </div>
         </div>
@@ -49,6 +135,16 @@ export function LibraryStatusPanel({
                     <span>No scheduled review</span>
                   )}
                 </div>
+                <div className="viva-library__actions">
+                  <button
+                    aria-label={`Delete recap for ${row.studySetTitle}`}
+                    disabled={!projection.privacy.export.available || busyAction === "Delete recap"}
+                    onClick={() => deleteSession(row)}
+                    type="button"
+                  >
+                    Delete recap
+                  </button>
+                </div>
               </article>
             ))}
           </div>
@@ -59,9 +155,13 @@ export function LibraryStatusPanel({
 }
 
 function LibraryStudySetRow({
+  busy,
+  onDelete,
   row,
 }: {
-  row: ReturnType<typeof projectLibrarySnapshot>["libraryRows"][number];
+  busy: boolean;
+  onDelete: (row: LibraryRow) => void;
+  row: LibraryRow;
 }) {
   const startTarget = libraryActionTarget(row, row.start);
   const resumeTarget = libraryActionTarget(row, row.resume);
@@ -95,15 +195,20 @@ function LibraryStudySetRow({
         >
           Resume
         </button>
+        <button
+          aria-label={`Delete source for ${row.title}`}
+          disabled={!row.delete.available || busy}
+          onClick={() => onDelete(row)}
+          type="button"
+        >
+          Delete source
+        </button>
       </div>
     </article>
   );
 }
 
-function libraryActionTarget(
-  row: ReturnType<typeof projectLibrarySnapshot>["libraryRows"][number],
-  action: ReturnType<typeof projectLibrarySnapshot>["libraryRows"][number]["start"],
-) {
+function libraryActionTarget(row: LibraryRow, action: LibraryRow["start"]) {
   if (!action.available) return "/session";
   return librarySessionTarget({
     sessionId: action.sessionId,
@@ -115,4 +220,15 @@ function libraryActionTarget(
 
 function navigateToSession(target: string) {
   if (typeof window !== "undefined") window.location.assign(target);
+}
+
+function downloadJson(filename: string, value: unknown) {
+  if (typeof window === "undefined" || typeof document === "undefined") return;
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }

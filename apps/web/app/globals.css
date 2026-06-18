@@ -2643,6 +2643,50 @@ button {
   gap: 0.75rem;
 }
 
+.viva-library__privacy {
+  align-items: center;
+  background: rgba(255, 253, 248, 0.72);
+  border: 1px solid rgba(64, 42, 82, 0.12);
+  border-radius: 8px;
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+  padding: 0.9rem;
+}
+
+.viva-library__privacy p,
+.viva-library__status {
+  color: var(--viva-ink);
+  font-size: 0.82rem;
+  font-weight: 750;
+  margin: 0;
+}
+
+.viva-library__privacy span {
+  color: var(--viva-muted);
+  display: block;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  margin-top: 0.18rem;
+}
+
+.viva-library__privacy button {
+  background: transparent;
+  border: 1px solid rgba(64, 42, 82, 0.22);
+  border-radius: 8px;
+  color: var(--viva-ink);
+  cursor: pointer;
+  font-weight: 750;
+  min-height: 2.2rem;
+  padding: 0.48rem 0.72rem;
+  white-space: nowrap;
+}
+
+.viva-library__privacy button:disabled {
+  color: var(--viva-muted);
+  cursor: not-allowed;
+}
+
 .viva-library__header {
   align-items: end;
   display: flex;
@@ -2712,6 +2756,7 @@ button {
 
 .viva-library__actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.45rem;
   justify-content: flex-end;
 }
@@ -2761,6 +2806,11 @@ button {
    center with the copy, so it becomes a top band (face high, hair flowing) that
    melts into the parchment, and the copy drops onto the clean ground below. */
 @media (max-width: 900px) {
+  .viva-library__privacy {
+    align-items: start;
+    flex-direction: column;
+  }
+
   .viva-library__header {
     align-items: start;
     flex-direction: column;

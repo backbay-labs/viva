@@ -59,6 +59,23 @@ fn test_state_with_store(max_sessions: usize, store: Arc<data::InMemoryStudyStor
     )
 }
 
+fn test_state_with_rest_auth(
+    max_sessions: usize,
+    store: Arc<data::InMemoryStudyStore>,
+) -> AppState {
+    AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(store.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: Some("rest-secret".to_owned()),
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        max_sessions,
+        store,
+    )
+}
+
 fn test_state_with_session_token(secret: &str) -> AppState {
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     AppState::with_study_store(
@@ -72,6 +89,68 @@ fn test_state_with_session_token(secret: &str) -> AppState {
         1,
         store,
     )
+}
+
+async fn seed_completed_library_session(store: &Arc<data::InMemoryStudyStore>) {
+    store
+        .record_voice_session(&SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        })
+        .await
+        .unwrap();
+    store
+        .record_concept_status(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "response-concept",
+            "nadh",
+            ConceptStatus::Shaky,
+        )
+        .await
+        .unwrap();
+    store
+        .schedule_review_item(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "nadh",
+            "2026-06-19T09:00:00Z",
+        )
+        .await
+        .unwrap();
+    store
+        .record_recap(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "response-recap",
+            StudySessionRecap {
+                voice_session_id: "voice-session-1".to_owned(),
+                headline: "Completed session".to_owned(),
+                summary: "NADH needs one more recall pass.".to_owned(),
+                strong_concepts: vec!["oxidative-phosphorylation".to_owned()],
+                shaky_concepts: vec!["nadh".to_owned()],
+                missed_concepts: vec![],
+                review_later: vec!["nadh".to_owned()],
+                next_action: "Review NADH tomorrow.".to_owned(),
+                source_moments: vec![RecapSourceMoment {
+                    text: "NADH needs one more recall pass.".to_owned(),
+                    source: agent_domain::fixture_source_reference(),
+                    status: ConceptStatus::Shaky,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .close_voice_session("voice-session-1", "completed")
+        .await
+        .unwrap();
 }
 
 fn fake_cartesia_gemini_state_with_store(
@@ -536,6 +615,11 @@ async fn library_route_projects_server_owned_sets_and_completed_session_history(
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["user_id"], "user-1");
+    assert_eq!(payload["privacy"]["export"]["available"], false);
+    assert_eq!(
+        payload["privacy"]["export"]["unavailable_reason"],
+        "mutation_auth_required"
+    );
 
     let study_sets = payload["study_sets"].as_array().unwrap();
     let find_set = |id: &str| {
@@ -547,6 +631,11 @@ async fn library_route_projects_server_owned_sets_and_completed_session_history(
     let ready = find_set("biology-midterm");
     assert_eq!(ready["ingestion_status"], "ready");
     assert_eq!(ready["server_owned"], true);
+    assert_eq!(ready["actions"]["delete"]["available"], false);
+    assert_eq!(
+        ready["actions"]["delete"]["unavailable_reason"],
+        "mutation_auth_required"
+    );
     assert_eq!(ready["actions"]["start"]["available"], true);
     assert!(ready["actions"]["start"]["session_token"]
         .as_str()
@@ -607,6 +696,398 @@ async fn library_route_projects_server_owned_sets_and_completed_session_history(
         "2026-06-19T09:00:00Z"
     );
     assert_eq!(completed["next_review"]["source"], "persisted_review_item");
+}
+
+#[tokio::test]
+async fn library_export_returns_sanitized_user_visible_state_and_privacy_facts() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let app = build_router(test_state_with_rest_auth(4, store));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/export?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .header("authorization", "Bearer rest-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["user_id"], "user-1");
+    assert_eq!(payload["privacy"]["voice_recordings_saved"], false);
+    assert_eq!(payload["privacy"]["transcripts_saved"], false);
+    assert_eq!(payload["privacy"]["raw_audio_persistence"], false);
+    assert_eq!(payload["privacy"]["transcript_persistence"], false);
+    assert_eq!(
+        payload["privacy"]["export_contains_raw_provider_payloads"],
+        false
+    );
+    assert_eq!(payload["privacy"]["export"]["available"], true);
+    assert!(payload["privacy"]["copy"]
+        .as_str()
+        .unwrap()
+        .contains("Voice recordings and transcripts are not saved"));
+    assert!(!payload["study_sets"].as_array().unwrap().is_empty());
+
+    let exported = String::from_utf8(body.to_vec()).unwrap();
+    assert!(!exported.contains("session_token"));
+    assert!(!exported.contains("viva1."));
+    assert!(!exported.contains("pasted_text"));
+    assert!(!exported.contains("transcript_final"));
+    assert!(!exported.contains("\"raw_provider_payload\""));
+}
+
+#[tokio::test]
+async fn library_export_and_delete_reject_public_trusted_user_without_rest_auth() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    seed_completed_library_session(&store).await;
+    let app = build_router(test_state_with_store(4, store));
+
+    let export = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/export?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(export.status(), axum::http::StatusCode::FORBIDDEN);
+
+    let study_set_delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/study-sets/biology-midterm?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(study_set_delete.status(), axum::http::StatusCode::FORBIDDEN);
+
+    let session_delete = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/study-sets/biology-midterm/sessions/voice-session-1?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session_delete.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn library_control_token_authorizes_browser_controls_without_proxy_bearer() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    seed_completed_library_session(&store).await;
+    let app = build_router(test_state_with_rest_auth(4, store));
+
+    let snapshot = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/library?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .header("authorization", "Bearer rest-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot.status(), axum::http::StatusCode::OK);
+    let snapshot_body = snapshot.into_body().collect().await.unwrap().to_bytes();
+    let snapshot_payload: serde_json::Value = serde_json::from_slice(&snapshot_body).unwrap();
+    let control_token = snapshot_payload["privacy"]["export"]["control_token"]
+        .as_str()
+        .expect("authenticated snapshot should mint a control token")
+        .to_owned();
+    assert!(control_token.starts_with("viva1."));
+
+    let export = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/export?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .header("x-viva-library-control-token", &control_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(export.status(), axum::http::StatusCode::OK);
+
+    let cross_user = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/export?user_id=user-2")
+                .header("origin", "http://localhost:3000")
+                .header("x-viva-library-control-token", &control_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_user.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/study-sets/biology-midterm/sessions/voice-session-1?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .header("x-viva-library-control-token", &control_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), axum::http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn library_control_preflights_advertise_required_methods_and_headers() {
+    let app = build_router(test_state_with_store(
+        4,
+        Arc::new(data::InMemoryStudyStore::seeded_fixture()),
+    ));
+
+    for (path, expected_method) in [
+        ("/study-sets/export", "GET"),
+        ("/study-sets/biology-midterm", "DELETE"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri(path)
+                    .header("origin", "http://localhost:3000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let methods = response
+            .headers()
+            .get("access-control-allow-methods")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            methods
+                .split(',')
+                .map(str::trim)
+                .any(|method| method == expected_method),
+            "{path} did not advertise {expected_method}"
+        );
+        assert!(response
+            .headers()
+            .get("access-control-allow-headers")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(',')
+            .map(str::trim)
+            .any(|header| header.eq_ignore_ascii_case("authorization")));
+        assert!(response
+            .headers()
+            .get("access-control-allow-headers")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(',')
+            .map(str::trim)
+            .any(|header| header.eq_ignore_ascii_case("x-viva-library-control-token")));
+    }
+}
+
+#[tokio::test]
+async fn delete_study_set_tombstones_sources_hides_history_and_is_idempotent() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    seed_completed_library_session(&store).await;
+    let app = build_router(test_state_with_rest_auth(4, store.clone()));
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/study-sets/biology-midterm?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .header("authorization", "Bearer rest-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), axum::http::StatusCode::OK);
+    let first_body = first.into_body().collect().await.unwrap().to_bytes();
+    let first_payload: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    assert_eq!(first_payload["study_set_id"], "biology-midterm");
+    assert_eq!(first_payload["status"], "deleted");
+    assert_eq!(first_payload["deleted_documents"], 1);
+    assert_eq!(first_payload["hidden_sessions"], 1);
+
+    let second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/study-sets/biology-midterm?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .header("authorization", "Bearer rest-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), axum::http::StatusCode::OK);
+    let second_body = second.into_body().collect().await.unwrap().to_bytes();
+    let second_payload: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+    assert_eq!(second_payload["deleted_documents"], 0);
+    assert_eq!(second_payload["hidden_sessions"], 0);
+
+    let library = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/library?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .header("authorization", "Bearer rest-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(library.status(), axum::http::StatusCode::OK);
+    let library_body = library.into_body().collect().await.unwrap().to_bytes();
+    let library_payload: serde_json::Value = serde_json::from_slice(&library_body).unwrap();
+    let biology = library_payload["study_sets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|set| set["id"] == "biology-midterm")
+        .expect("biology study set");
+    assert_eq!(biology["documents"][0]["deleted"], true);
+    assert_eq!(biology["question_count"], 0);
+    assert_eq!(biology["actions"]["start"]["available"], false);
+    assert_eq!(
+        biology["actions"]["start"]["unavailable_reason"],
+        "source_deleted"
+    );
+    assert_eq!(biology["actions"]["delete"]["available"], false);
+    assert!(library_payload["sessions"].as_array().unwrap().is_empty());
+
+    let cross_user = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/study-sets/biology-midterm?user_id=user-2")
+                .header("origin", "http://localhost:3000")
+                .header("authorization", "Bearer rest-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_user.status(), axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_session_history_hides_completed_recap_without_deleting_study_set() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    seed_completed_library_session(&store).await;
+    let app = build_router(test_state_with_rest_auth(4, store.clone()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/study-sets/biology-midterm/sessions/voice-session-1?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .header("authorization", "Bearer rest-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["voice_session_id"], "voice-session-1");
+    assert_eq!(payload["status"], "deleted");
+
+    let repeat = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/study-sets/biology-midterm/sessions/voice-session-1?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .header("authorization", "Bearer rest-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeat.status(), axum::http::StatusCode::OK);
+
+    let close_after_delete = store
+        .close_voice_session("voice-session-1", "completed")
+        .await
+        .expect("deleted session close is idempotent");
+    assert_eq!(close_after_delete["status"], "deleted");
+    assert_eq!(close_after_delete["terminal_reason"], "deleted");
+
+    let library = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/library?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .header("authorization", "Bearer rest-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(library.status(), axum::http::StatusCode::OK);
+    let library_body = library.into_body().collect().await.unwrap().to_bytes();
+    let library_payload: serde_json::Value = serde_json::from_slice(&library_body).unwrap();
+    assert!(library_payload["sessions"].as_array().unwrap().is_empty());
+    let biology = library_payload["study_sets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|set| set["id"] == "biology-midterm")
+        .expect("biology study set");
+    assert_eq!(biology["documents"][0]["deleted"], false);
+    assert_eq!(biology["question_count"], 1);
+    assert_eq!(biology["actions"]["delete"]["available"], true);
 }
 
 #[tokio::test]

@@ -513,33 +513,51 @@ impl StudyMemoryStore for PostgresStudyStore {
         terminal_reason: &str,
     ) -> Result<Value, PortError> {
         let voice_session_uuid = Self::uuid_for(voice_session_id)?;
-        let result = sqlx::query(
+        let updated = sqlx::query(
             "UPDATE voice_sessions
              SET status = 'closed',
                  ended_at = COALESCE(ended_at, NOW()),
                  terminal_reason = $2
-             WHERE id = $1",
+             WHERE id = $1 AND status <> 'deleted'
+             RETURNING status, terminal_reason",
         )
         .bind(voice_session_uuid)
         .bind(terminal_reason)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(pg_error)?;
-        if result.rows_affected() == 0 {
-            return Err(PortError::unavailable(
-                "postgres",
-                voice_session_id,
-                "voice session does not exist",
-            ));
-        }
+        let (status, stored_terminal_reason): (String, Option<String>) = if let Some(row) = updated
+        {
+            (
+                row.try_get("status").map_err(pg_error)?,
+                row.try_get("terminal_reason").map_err(pg_error)?,
+            )
+        } else {
+            let row = sqlx::query(
+                "SELECT status, terminal_reason
+                     FROM voice_sessions
+                     WHERE id = $1",
+            )
+            .bind(voice_session_uuid)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(pg_error)?
+            .ok_or_else(|| {
+                PortError::unavailable("postgres", voice_session_id, "voice session does not exist")
+            })?;
+            (
+                row.try_get("status").map_err(pg_error)?,
+                row.try_get("terminal_reason").map_err(pg_error)?,
+            )
+        };
         self.event_authorizations
             .write()
             .map_err(|_| PortError::adapter("postgres", "event authorization lock poisoned"))?
             .retain(|record| record.voice_session_id != voice_session_id);
         Ok(json!({
             "voice_session_id": voice_session_id,
-            "status": "closed",
-            "terminal_reason": terminal_reason,
+            "status": status,
+            "terminal_reason": stored_terminal_reason,
         }))
     }
 
@@ -909,6 +927,213 @@ impl StudyMemoryStore for PostgresStudyStore {
             study_sets,
             sessions,
         })
+    }
+
+    async fn delete_study_set(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Value, PortError> {
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        self.ensure_study_set(user_id, study_set_uuid).await?;
+
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        let deleted_source_spans = sqlx::query(
+            "UPDATE source_spans sp
+             SET deleted_at = COALESCE(sp.deleted_at, NOW())
+             FROM study_documents d
+             WHERE sp.document_id = d.id
+               AND d.study_set_id = $1
+               AND sp.deleted_at IS NULL",
+        )
+        .bind(study_set_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?
+        .rows_affected();
+        let deleted_documents = sqlx::query(
+            "UPDATE study_documents
+             SET deleted_at = COALESCE(deleted_at, NOW())
+             WHERE study_set_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(study_set_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?
+        .rows_affected();
+        let disabled_questions = sqlx::query(
+            "UPDATE study_questions
+             SET active = FALSE
+             WHERE study_set_id = $1 AND active",
+        )
+        .bind(study_set_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?
+        .rows_affected();
+        let hidden_sessions = sqlx::query(
+            "UPDATE voice_sessions
+             SET status = 'deleted',
+                 terminal_reason = 'deleted',
+                 ended_at = COALESCE(ended_at, NOW())
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND status <> 'deleted'",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?
+        .rows_affected();
+
+        sqlx::query(
+            "DELETE FROM session_recaps
+             WHERE user_id = $1 AND study_set_id = $2",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        sqlx::query(
+            "DELETE FROM review_items
+             WHERE user_id = $1 AND study_set_id = $2",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        sqlx::query(
+            "DELETE FROM answer_attempts aa
+             USING voice_sessions vs
+             WHERE aa.voice_session_id = vs.id
+               AND vs.user_id = $1
+               AND vs.study_set_id = $2",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        sqlx::query(
+            "DELETE FROM voice_usage_events vue
+             USING voice_sessions vs
+             WHERE vue.voice_session_id = vs.id
+               AND vs.user_id = $1
+               AND vs.study_set_id = $2",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+
+        tx.commit().await.map_err(pg_error)?;
+        self.event_authorizations
+            .write()
+            .map_err(|_| PortError::adapter("postgres", "authorization lock poisoned"))?
+            .retain(|record| record.user_id != user_id || record.study_set_id != study_set_id);
+
+        Ok(json!({
+            "study_set_id": study_set_id,
+            "status": "deleted",
+            "deleted_documents": deleted_documents,
+            "deleted_source_spans": deleted_source_spans,
+            "disabled_questions": disabled_questions,
+            "hidden_sessions": hidden_sessions,
+        }))
+    }
+
+    async fn delete_session_history(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<Value, PortError> {
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        let owner = sqlx::query(
+            "SELECT user_id, study_set_id
+             FROM voice_sessions
+             WHERE id = $1",
+        )
+        .bind(voice_session_uuid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_error)?
+        .ok_or_else(|| {
+            PortError::unavailable("postgres", voice_session_id, "voice session does not exist")
+        })?;
+        let owner_user_id: String = owner.try_get("user_id").map_err(pg_error)?;
+        let owner_study_set_id: Uuid = owner.try_get("study_set_id").map_err(pg_error)?;
+        if owner_user_id != user_id || owner_study_set_id != study_set_uuid {
+            return Err(PortError::unavailable(
+                "postgres",
+                voice_session_id,
+                "voice session is not available for this user and study set",
+            ));
+        }
+
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        sqlx::query(
+            "UPDATE voice_sessions
+             SET status = 'deleted',
+                 terminal_reason = 'deleted',
+                 ended_at = COALESCE(ended_at, NOW())
+             WHERE id = $1",
+        )
+        .bind(voice_session_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        sqlx::query(
+            "DELETE FROM session_recaps
+             WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        sqlx::query(
+            "DELETE FROM review_items
+             WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        sqlx::query("DELETE FROM answer_attempts WHERE voice_session_id = $1")
+            .bind(voice_session_uuid)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_error)?;
+        sqlx::query("DELETE FROM voice_usage_events WHERE voice_session_id = $1")
+            .bind(voice_session_uuid)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_error)?;
+        tx.commit().await.map_err(pg_error)?;
+
+        self.event_authorizations
+            .write()
+            .map_err(|_| PortError::adapter("postgres", "authorization lock poisoned"))?
+            .retain(|record| {
+                record.user_id != user_id
+                    || record.study_set_id != study_set_id
+                    || record.voice_session_id != voice_session_id
+            });
+
+        Ok(json!({
+            "voice_session_id": voice_session_id,
+            "study_set_id": study_set_id,
+            "status": "deleted",
+        }))
     }
 
     async fn active_question(
@@ -1533,6 +1758,19 @@ impl StudyMemoryStore for PostgresStudyStore {
             .as_deref()
             .map(Self::uuid_for)
             .transpose()?;
+        if let Some(voice_session_uuid) = voice_session_uuid {
+            let deleted = sqlx::query_scalar::<_, bool>(
+                "SELECT status = 'deleted' FROM voice_sessions WHERE id = $1",
+            )
+            .bind(voice_session_uuid)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(pg_error)?
+            .unwrap_or(false);
+            if deleted {
+                return Ok(());
+            }
+        }
         sqlx::query(
             "INSERT INTO voice_usage_events (
                 id,

@@ -690,6 +690,151 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn optional_postgres_privacy_deletes_purge_usage_and_preserve_deleted_sessions_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        let session_id = "55555555-5555-4555-8555-555555555555";
+        store
+            .record_voice_session(&SessionConfig {
+                session_id: Some(SessionId::new(session_id)),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .expect("records privacy session");
+        store
+            .record_voice_usage(VoiceUsageRecord {
+                voice_session_id: Some(session_id.to_owned()),
+                provider: "synthetic".to_owned(),
+                model: "synthetic-viva".to_owned(),
+                duration_seconds: 2,
+                text_input_tokens: 20,
+                text_output_tokens: 10,
+                audio_input_tokens: 0,
+                audio_output_tokens: 0,
+                cost_estimate_usd: 0.00002,
+                first_audio_latency_ms: None,
+                answer_eval_latency_ms: Some(1),
+                source_retrieval_latency_ms: None,
+                source_grounded_correction_count: 1,
+            })
+            .await
+            .expect("records privacy usage");
+        assert_eq!(usage_rows_for_session(&pool, session_id).await, 1);
+
+        store
+            .delete_session_history("user-1", "biology-midterm", session_id)
+            .await
+            .expect("deletes session history");
+        assert_eq!(usage_rows_for_session(&pool, session_id).await, 0);
+        store
+            .record_voice_usage(VoiceUsageRecord {
+                voice_session_id: Some(session_id.to_owned()),
+                provider: "synthetic".to_owned(),
+                model: "synthetic-viva".to_owned(),
+                duration_seconds: 2,
+                text_input_tokens: 20,
+                text_output_tokens: 10,
+                audio_input_tokens: 0,
+                audio_output_tokens: 0,
+                cost_estimate_usd: 0.00002,
+                first_audio_latency_ms: None,
+                answer_eval_latency_ms: Some(1),
+                source_retrieval_latency_ms: None,
+                source_grounded_correction_count: 1,
+            })
+            .await
+            .expect("ignores usage for deleted session");
+        assert_eq!(usage_rows_for_session(&pool, session_id).await, 0);
+
+        let close_after_delete = store
+            .close_voice_session(session_id, "completed")
+            .await
+            .expect("close preserves deleted session");
+        assert_eq!(close_after_delete["status"], "deleted");
+        assert_eq!(close_after_delete["terminal_reason"], "deleted");
+        assert_eq!(session_status(&pool, session_id).await, "deleted");
+
+        let study_delete_session_id = "66666666-6666-4666-8666-666666666666";
+        store
+            .record_voice_session(&SessionConfig {
+                session_id: Some(SessionId::new(study_delete_session_id)),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .expect("records study delete session");
+        store
+            .record_voice_usage(VoiceUsageRecord {
+                voice_session_id: Some(study_delete_session_id.to_owned()),
+                provider: "synthetic".to_owned(),
+                model: "synthetic-viva".to_owned(),
+                duration_seconds: 2,
+                text_input_tokens: 20,
+                text_output_tokens: 10,
+                audio_input_tokens: 0,
+                audio_output_tokens: 0,
+                cost_estimate_usd: 0.00002,
+                first_audio_latency_ms: None,
+                answer_eval_latency_ms: Some(1),
+                source_retrieval_latency_ms: None,
+                source_grounded_correction_count: 1,
+            })
+            .await
+            .expect("records study delete usage");
+        assert_eq!(
+            usage_rows_for_session(&pool, study_delete_session_id).await,
+            1
+        );
+
+        store
+            .delete_study_set("user-1", "biology-midterm")
+            .await
+            .expect("deletes study set privacy artifacts");
+        assert_eq!(
+            usage_rows_for_session(&pool, study_delete_session_id).await,
+            0
+        );
+        store
+            .record_voice_usage(VoiceUsageRecord {
+                voice_session_id: Some(study_delete_session_id.to_owned()),
+                provider: "synthetic".to_owned(),
+                model: "synthetic-viva".to_owned(),
+                duration_seconds: 2,
+                text_input_tokens: 20,
+                text_output_tokens: 10,
+                audio_input_tokens: 0,
+                audio_output_tokens: 0,
+                cost_estimate_usd: 0.00002,
+                first_audio_latency_ms: None,
+                answer_eval_latency_ms: Some(1),
+                source_retrieval_latency_ms: None,
+                source_grounded_correction_count: 1,
+            })
+            .await
+            .expect("ignores usage after study set deletion");
+        assert_eq!(
+            usage_rows_for_session(&pool, study_delete_session_id).await,
+            0
+        );
+        assert_eq!(
+            session_status(&pool, study_delete_session_id).await,
+            "deleted"
+        );
+    }
+
     async fn optional_postgres_pool() -> Option<sqlx::PgPool> {
         let database_url = std::env::var("DATABASE_URL")
             .ok()
@@ -804,5 +949,29 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("row count query succeeds")
+    }
+
+    async fn usage_rows_for_session(pool: &sqlx::PgPool, voice_session_id: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM voice_usage_events
+             WHERE voice_session_id = $1",
+        )
+        .bind(parse_uuid(voice_session_id).expect("session id is a UUID"))
+        .fetch_one(pool)
+        .await
+        .expect("usage row count query succeeds")
+    }
+
+    async fn session_status(pool: &sqlx::PgPool, voice_session_id: &str) -> String {
+        sqlx::query_scalar::<_, String>(
+            "SELECT status
+             FROM voice_sessions
+             WHERE id = $1",
+        )
+        .bind(parse_uuid(voice_session_id).expect("session id is a UUID"))
+        .fetch_one(pool)
+        .await
+        .expect("session status query succeeds")
     }
 }
