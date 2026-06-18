@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
+  assertBrowserStoryArtifactFiles,
   assertReleaseBrowserEvidence,
   normalizeBrowserEvidence,
   shouldSkipMissingBrowserResult,
@@ -9,6 +13,7 @@ import {
 test("normalizes connected recap browser evidence from the current e2e schema", () => {
   const evidence = normalizeBrowserEvidence({
     artifact_dir: "artifacts/e2e-browser",
+    agent_provider: "synthetic",
     legacy_upload_visible: false,
     manuscript_ready: true,
     conductor_terminal_fold: true,
@@ -28,6 +33,7 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
 
   assert.deepEqual(evidence, {
     artifact_dir: "artifacts/e2e-browser",
+    agent_provider: "synthetic",
     legacy_upload_visible: false,
     manuscript_ready: true,
     conductor_terminal_fold: true,
@@ -42,17 +48,20 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
     local_only_actions_hidden: true,
     browser_story: {
       artifact_forbidden_hits: 0,
+      agent_provider: "synthetic",
+      command_provider: "synthetic",
       command_summary_present: true,
       fixture_hash_count: 1,
       frame_ids: [
         "pending_local_preview",
         "server_ready_study_set",
         "active_synthetic_manuscript",
+        "correction_marginalia",
         "recap",
       ],
       sanitized: true,
       schema: "viva.browser_story.v1",
-      screenshot_count: 4,
+      screenshot_count: 5,
       trace_retained: false,
       validation_run_id: "browser-story-synthetic",
     },
@@ -142,6 +151,42 @@ test("rejects browser evidence without every browser-story manuscript frame", ()
   );
 });
 
+test("requires browser-story evidence for correction marginalia", () => {
+  assert.throws(
+    () =>
+      assertReleaseBrowserEvidence(
+        normalizeBrowserEvidence(
+          completeBrowserResult({
+            browser_story: completeBrowserStory({ omitFrameId: "correction_marginalia" }),
+          }),
+        ),
+      ),
+    /correction_marginalia/,
+  );
+});
+
+test("rejects live provider browser-story evidence for the release artifact", () => {
+  assert.throws(
+    () =>
+      assertReleaseBrowserEvidence(
+        normalizeBrowserEvidence(
+          completeBrowserResult({
+            agent_provider: "cartesia_gemini",
+            browser_story: completeBrowserStory({
+              agent_provider: "cartesia_gemini",
+              command_summary: {
+                command: "bun run e2e:browser",
+                provider: "cartesia_gemini",
+                validation_run_id: "browser-story-cartesia_gemini",
+              },
+            }),
+          }),
+        ),
+      ),
+    /agent_provider|command_summary.provider/,
+  );
+});
+
 test("rejects browser-story artifacts without validation binding", () => {
   assert.throws(
     () =>
@@ -171,6 +216,55 @@ test("rejects browser-story artifacts with retained traces or forbidden audit hi
       ),
     /trace_retained|artifact_forbidden_hits/,
   );
+});
+
+test("verifies browser-story screenshot files exist and are non-empty", async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "viva-browser-story-"));
+  try {
+    const artifactDir = path.join(tempRoot, "artifacts/e2e-browser");
+    const result = completeBrowserResult();
+    await writeBrowserStoryScreenshots(artifactDir, result);
+
+    await assert.doesNotReject(() => assertBrowserStoryArtifactFiles(result, tempRoot));
+  } finally {
+    await rm(tempRoot, { force: true, recursive: true });
+  }
+});
+
+test("rejects browser-story frames whose screenshots are not in the result artifact list", async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "viva-browser-story-"));
+  try {
+    const artifactDir = path.join(tempRoot, "artifacts/e2e-browser");
+    const result = completeBrowserResult({
+      screenshots: completeScreenshotList().filter((name) => name !== "correction-marginalia.png"),
+    });
+    await writeBrowserStoryScreenshots(artifactDir, result);
+
+    await assert.rejects(
+      () => assertBrowserStoryArtifactFiles(result, tempRoot),
+      /correction-marginalia.png.*screenshots/,
+    );
+  } finally {
+    await rm(tempRoot, { force: true, recursive: true });
+  }
+});
+
+test("rejects browser-story frames whose screenshots are missing or empty", async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "viva-browser-story-"));
+  try {
+    const artifactDir = path.join(tempRoot, "artifacts/e2e-browser");
+    const result = completeBrowserResult();
+    await writeBrowserStoryScreenshots(artifactDir, result, {
+      empty: "correction-marginalia.png",
+    });
+
+    await assert.rejects(
+      () => assertBrowserStoryArtifactFiles(result, tempRoot),
+      /correction-marginalia.png.*non-empty/,
+    );
+  } finally {
+    await rm(tempRoot, { force: true, recursive: true });
+  }
 });
 
 test("rejects browser evidence that omits the bounded Source Folio proof", () => {
@@ -263,6 +357,7 @@ test("only missing browser result files are skippable in release-check skip mode
 function completeBrowserResult(overrides = {}) {
   return {
     artifact_dir: "artifacts/e2e-browser",
+    agent_provider: "synthetic",
     legacy_upload_visible: false,
     manuscript_ready: true,
     conductor_terminal_fold: true,
@@ -278,17 +373,19 @@ function completeBrowserResult(overrides = {}) {
     browser_story: completeBrowserStory(),
     console_errors: [],
     page_errors: [],
+    screenshots: completeScreenshotList(),
     ...overrides,
   };
 }
 
 function completeBrowserStory(overrides = {}) {
   const {
+    agent_provider = "synthetic",
     artifact_audit = { scanned_files: 8, forbidden_hits: 0 },
     command_summary = {
       command: "bun run e2e:browser",
-      provider: "synthetic",
-      validation_run_id: "browser-story-synthetic",
+      provider: agent_provider,
+      validation_run_id: `browser-story-${agent_provider}`,
     },
     fixture_hashes = {
       "synthetic-brain.json": {
@@ -316,6 +413,11 @@ function completeBrowserStory(overrides = {}) {
       kind: "browser_screen",
     },
     {
+      id: "correction_marginalia",
+      screenshot: "correction-marginalia.png",
+      kind: "browser_screen",
+    },
+    {
       id: "recap",
       screenshot: "connected-terminal-fold.png",
       kind: "browser_screen",
@@ -324,6 +426,7 @@ function completeBrowserStory(overrides = {}) {
 
   return {
     schema: "viva.browser_story.v1",
+    agent_provider,
     artifact_audit,
     command_summary,
     fixture_hashes,
@@ -334,6 +437,7 @@ function completeBrowserStory(overrides = {}) {
       Object.entries(overrides).filter(
         ([key]) =>
           ![
+            "agent_provider",
             "artifact_audit",
             "command_summary",
             "fixture_hashes",
@@ -343,4 +447,23 @@ function completeBrowserStory(overrides = {}) {
       ),
     ),
   };
+}
+
+function completeScreenshotList() {
+  return [
+    "pending-local-preview.png",
+    "server-ready-study-set.png",
+    "session-ready.png",
+    "source-folio.png",
+    "correction-marginalia.png",
+    "post-answer-source-folio.png",
+    "connected-terminal-fold.png",
+  ];
+}
+
+async function writeBrowserStoryScreenshots(artifactDir, result, options = {}) {
+  await mkdir(artifactDir, { recursive: true });
+  for (const screenshot of result.screenshots) {
+    await writeFile(path.join(artifactDir, screenshot), options.empty === screenshot ? "" : "png");
+  }
 }

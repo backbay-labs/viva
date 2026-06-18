@@ -19,12 +19,18 @@ const agentUrl = `http://127.0.0.1:${agentPort}`;
 const webUrl = `http://127.0.0.1:${webPort}`;
 const wsUrl = `ws://127.0.0.1:${agentPort}/ws`;
 const agentProvider = process.env.VIVA_E2E_AGENT_PROVIDER ?? "synthetic";
+if (agentProvider === "cartesia_gemini") {
+  throw new Error("BAC-307 browser-story capture must not use the gated live cartesia_gemini path.");
+}
 const stopToRecap = process.env.VIVA_E2E_STOP_TO_RECAP === "1";
-const validationRunId = `browser-story-${agentProvider}`;
+const validationRunId = `browser-story-${agentProvider}-${new Date()
+  .toISOString()
+  .replaceAll(/[:.]/g, "-")}`;
 const requirePostAnswerSourceFolio =
   process.env.VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO === undefined
     ? agentProvider === "synthetic"
     : process.env.VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO === "1";
+const requireCorrectionMarginalia = agentProvider === "synthetic" && !stopToRecap;
 const children = [];
 const consoleErrors = [];
 const pageErrors = [];
@@ -37,6 +43,7 @@ let traceArtifact = null;
 const storyFrames = [];
 let sourceFolioVisible = false;
 let boundedSourceVisible = false;
+let correctionMarginaliaVisible = false;
 let postAnswerSourceFolioVisible = false;
 let postAnswerBoundedSourceVisible = false;
 let postAnswerProtocolProof = {
@@ -169,11 +176,46 @@ try {
   } else {
     await page.getByRole("button", { name: /check it/i }).click();
     postAnswerProtocolProof = await waitForPostAnswerProtocolProof(serverEvents, 25_000);
-    if (requirePostAnswerSourceFolio) {
-      await page.getByRole("button", { name: "Show source" }).waitFor({
+    if (requireCorrectionMarginalia) {
+      await page.getByText("Marginalia").waitFor({
         state: "visible",
         timeout: 25_000,
       });
+      await page.getByRole("button", { name: "Try again" }).waitFor({
+        state: "visible",
+        timeout: 10_000,
+      });
+      await page.getByRole("button", { name: "Show source" }).waitFor({
+        state: "visible",
+        timeout: 10_000,
+      });
+      await page.getByRole("button", { name: "Next question" }).waitFor({
+        state: "visible",
+        timeout: 10_000,
+      });
+      await page.waitForTimeout(600);
+      correctionMarginaliaVisible =
+        (await isVisible(page.getByText("Marginalia").first())) &&
+        (await isVisible(page.getByRole("button", { name: "Try again" }).first())) &&
+        (await isVisible(page.getByRole("button", { name: "Show source" }).first())) &&
+        (await isVisible(page.getByRole("button", { name: "Next question" }).first()));
+      await page.screenshot({
+        path: path.join(artifactDir, "correction-marginalia.png"),
+        fullPage: true,
+      });
+      storyFrames.push({
+        id: "correction_marginalia",
+        kind: "browser_screen",
+        screenshot: "correction-marginalia.png",
+        checks: [
+          "correction_note",
+          "try_again_action",
+          "show_source_action",
+          "next_question_action",
+        ],
+      });
+    }
+    if (requirePostAnswerSourceFolio) {
       await page.getByRole("button", { name: "Show source" }).click();
       await page.getByText("Source Folio").waitFor({
         state: "visible",
@@ -260,10 +302,10 @@ try {
     traceStarted = false;
   }
 
-  const browserStory = await writeBrowserStoryManifest({
+  const browserStory = await buildBrowserStoryManifest({
     traceRetained: Boolean(traceArtifact),
   });
-  const result = {
+  let result = {
     artifact_dir: path.relative(root, artifactDir),
     agent_provider: agentProvider,
     agent_url: agentUrl,
@@ -276,6 +318,7 @@ try {
     next_session_recommendation_visible: nextSessionRecommendationVisible,
     source_folio_visible: sourceFolioVisible,
     bounded_source_visible: boundedSourceVisible,
+    correction_marginalia_visible: correctionMarginaliaVisible,
     post_answer_source_folio_visible: postAnswerSourceFolioVisible,
     post_answer_bounded_source_visible: postAnswerBoundedSourceVisible,
     post_answer_source_reference_event_seen: postAnswerProtocolProof.sourceReferenceEventSeen,
@@ -292,12 +335,13 @@ try {
       "server-ready-study-set.png",
       "session-ready.png",
       "source-folio.png",
+      ...(correctionMarginaliaVisible ? ["correction-marginalia.png"] : []),
       ...(!stopToRecap && requirePostAnswerSourceFolio ? ["post-answer-source-folio.png"] : []),
       "connected-terminal-fold.png",
     ],
     trace: traceArtifact,
   };
-  await writeFile(path.join(artifactDir, "result.json"), `${JSON.stringify(result, null, 2)}\n`);
+  result = await writeAuditedBrowserStoryResult(result);
 
   if (legacyUploadVisible) throw new Error("Landing mounted the retired legacy upload app.");
   if (!manuscriptReady) throw new Error("Landing did not enter the connected manuscript.");
@@ -311,6 +355,9 @@ try {
   }
   if (!boundedSourceVisible) {
     throw new Error("Connected session did not render bounded source folio proof.");
+  }
+  if (requireCorrectionMarginalia && !correctionMarginaliaVisible) {
+    throw new Error("Connected session did not render correction marginalia.");
   }
   if (!stopToRecap && requirePostAnswerSourceFolio && !postAnswerSourceFolioVisible) {
     throw new Error("Connected session did not render the post-answer Source Folio.");
@@ -541,9 +588,8 @@ function pendingPreviewHtml() {
 </html>`;
 }
 
-async function writeBrowserStoryManifest({ traceRetained }) {
-  const storyPath = path.join(artifactDir, "browser-story.json");
-  const storyBase = {
+async function buildBrowserStoryManifest({ traceRetained }) {
+  return {
     schema: "viva.browser_story.v1",
     generated_at: new Date().toISOString(),
     validation_run_id: validationRunId,
@@ -564,14 +610,27 @@ async function writeBrowserStoryManifest({ traceRetained }) {
     sanitized: true,
     trace_retained: traceRetained,
   };
-  await writeFile(storyPath, `${JSON.stringify(storyBase, null, 2)}\n`);
-  const artifactAudit = await auditBrowserStoryArtifacts(artifactDir);
-  const story = {
-    ...storyBase,
-    artifact_audit: artifactAudit,
-  };
-  await writeFile(storyPath, `${JSON.stringify(story, null, 2)}\n`);
-  return story;
+}
+
+async function writeAuditedBrowserStoryResult(baseResult) {
+  const storyPath = path.join(artifactDir, "browser-story.json");
+  const resultPath = path.join(artifactDir, "result.json");
+  let result = baseResult;
+  for (let pass = 0; pass < 2; pass += 1) {
+    await writeFile(storyPath, `${JSON.stringify(result.browser_story, null, 2)}\n`);
+    await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+    const artifactAudit = await auditBrowserStoryArtifacts(artifactDir);
+    result = {
+      ...result,
+      browser_story: {
+        ...result.browser_story,
+        artifact_audit: artifactAudit,
+      },
+    };
+  }
+  await writeFile(storyPath, `${JSON.stringify(result.browser_story, null, 2)}\n`);
+  await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+  return result;
 }
 
 async function launchChromium() {

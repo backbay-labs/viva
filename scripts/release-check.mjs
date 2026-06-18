@@ -12,6 +12,7 @@ import {
   PROVIDER_READINESS_TARGETS,
 } from "./provider-readiness-matrix.mjs";
 import {
+  assertBrowserStoryArtifactFiles,
   assertReleaseBrowserEvidence,
   normalizeBrowserEvidence,
   shouldSkipMissingBrowserResult,
@@ -138,6 +139,7 @@ async function readExistingBrowserResult() {
   const resultPath = path.join(root, "artifacts/e2e-browser/result.json");
   try {
     const result = JSON.parse(await readFile(resultPath, "utf8"));
+    await assertBrowserStoryArtifactFiles(result, root);
     const evidence = normalizeBrowserEvidence(result);
     assertReleaseBrowserEvidence(evidence);
     return evidence;
