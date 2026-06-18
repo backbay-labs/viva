@@ -96,6 +96,8 @@ export function LiveSessionPage() {
   const levelRef = useRef<VoiceTraceLevel>({ user: 0, agent: 0 });
   const captureRef = useRef<VivaAudioCaptureSource | null>(null);
   const captureStartedRef = useRef(false);
+  const micStartGenerationRef = useRef(0);
+  const textAnswerModeRef = useRef(false);
   const meterRef = useRef(createVoiceLevelMeter({ coefficient: 0.3 }));
   const playbackRef = useRef<VivaAudioPlaybackSink | null>(null);
   const handledAudioRef = useRef(0);
@@ -188,7 +190,7 @@ export function LiveSessionPage() {
   );
 
   const startMic = useCallback(async () => {
-    if (captureStartedRef.current || reducedMotion) return;
+    if (captureStartedRef.current || reducedMotion || textAnswerModeRef.current) return;
     if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       setMicState("unsupported");
       return;
@@ -200,20 +202,36 @@ export function LiveSessionPage() {
       return;
     }
     captureStartedRef.current = true;
+    const startGeneration = ++micStartGenerationRef.current;
     try {
       const source = await createBrowserVivaAudioCaptureSource({
         AudioContextCtor,
         mediaDevices: navigator.mediaDevices,
         sampleRateHz: VIVA_AUDIO_SAMPLE_RATE_HZ,
       });
+      if (textAnswerModeRef.current || startGeneration !== micStartGenerationRef.current) {
+        source.stop();
+        captureStartedRef.current = false;
+        levelRef.current.user = 0;
+        return;
+      }
       captureRef.current = source;
       setMicState("available");
       const meter = meterRef.current;
       // Samples drive the bloom ONLY — never sent to the brain.
       void source.start((samples) => {
+        if (textAnswerModeRef.current) {
+          levelRef.current.user = 0;
+          return;
+        }
         levelRef.current.user = meter.push(samples);
       });
     } catch {
+      if (textAnswerModeRef.current || startGeneration !== micStartGenerationRef.current) {
+        captureStartedRef.current = false;
+        levelRef.current.user = 0;
+        return;
+      }
       captureStartedRef.current = false; // allow another attempt on the next gesture
       levelRef.current.user = 0;
       setMicState("denied");
@@ -238,6 +256,12 @@ export function LiveSessionPage() {
     return () => window.removeEventListener("pointerdown", handler);
   }, [onUserGesture]);
 
+  const activateTextAnswerMode = useCallback(() => {
+    textAnswerModeRef.current = true;
+    micStartGenerationRef.current += 1;
+    enterTextAnswerMode(captureRef, captureStartedRef, levelRef, meterRef);
+  }, []);
+
   const submitSpokenTurn = useCallback(() => {
     onUserGesture();
     setSourceOpen(false);
@@ -251,14 +275,14 @@ export function LiveSessionPage() {
       const payload = textAnswerPayload(answer);
       if (!payload) return;
       unlockPlayback();
-      enterTextAnswerMode(captureRef, captureStartedRef, levelRef, meterRef);
+      activateTextAnswerMode();
       setSourceOpen(false);
       setHintShown(false);
       setTextAnswerEnabled(true);
       setSubmittedTextAnswer(payload);
       agentRef.current.sendText(payload);
     },
-    [unlockPlayback],
+    [activateTextAnswerMode, unlockPlayback],
   );
   const challengeSource = useCallback(() => {
     onUserGesture();
@@ -372,16 +396,19 @@ export function LiveSessionPage() {
       readinessProbe,
     ],
   );
-  const textAnswerRequired = micState === "denied" || micState === "unsupported";
-  const textAnswerActive = textAnswerRequired || textAnswerEnabled;
   const websocketReady = Boolean(agent.agentState.ready) && agent.status === "open";
+  const textAnswerRequired = micState === "denied" || micState === "unsupported";
+  const textAnswerAvailable = websocketReady;
+  const textAnswerActive = textAnswerAvailable && (textAnswerRequired || textAnswerEnabled);
   const studentHandAnswer = agent.derived.finalTranscript ?? submittedTextAnswer;
 
   useEffect(() => {
     if (textAnswerActive) {
-      enterTextAnswerMode(captureRef, captureStartedRef, levelRef, meterRef);
+      activateTextAnswerMode();
+    } else {
+      textAnswerModeRef.current = false;
     }
-  }, [textAnswerActive]);
+  }, [activateTextAnswerMode, textAnswerActive]);
 
   const sessionContextLabel =
     agent.readiness.reason === "trusted"
@@ -412,9 +439,10 @@ export function LiveSessionPage() {
       onTryAgain={submitSpokenTurn}
       onUseTextAnswer={() => {
         setTextAnswerEnabled(true);
-        enterTextAnswerMode(captureRef, captureStartedRef, levelRef, meterRef);
+        activateTextAnswerMode();
       }}
       onUseVoiceAnswer={() => {
+        textAnswerModeRef.current = false;
         setTextAnswerEnabled(false);
         onUserGesture();
       }}
@@ -425,12 +453,16 @@ export function LiveSessionPage() {
       scene={scene}
       sourceFolio={sourceFolio}
       state={effectiveState}
-      textAnswer={{
-        active: textAnswerActive,
-        disabled: !websocketReady,
-        lastAnswer: studentHandAnswer,
-        required: textAnswerRequired,
-      }}
+      textAnswer={
+        textAnswerAvailable
+          ? {
+              active: textAnswerActive,
+              disabled: false,
+              lastAnswer: studentHandAnswer,
+              required: textAnswerRequired,
+            }
+          : undefined
+      }
     />
   );
 }

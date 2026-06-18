@@ -1,6 +1,6 @@
 import type { ReviewScheduleItem, SessionRecap } from "@viva/core";
 import { Icon, Spark } from "@viva/ui-web";
-import { type FormEvent, useId, useState } from "react";
+import { type FormEvent, useEffect, useId, useRef, useState } from "react";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
 import { CorrectionMarginalia } from "./CorrectionMarginalia";
@@ -151,6 +151,18 @@ function ListeningNote({
   const [writtenAnswer, setWrittenAnswer] = useState("");
   const answerId = useId();
   const helpId = useId();
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const wasActiveRef = useRef(false);
+
+  useEffect(() => {
+    const active = Boolean(textAnswer?.active);
+    if (active && !textAnswer?.disabled && !wasActiveRef.current) {
+      textareaRef.current?.focus();
+      window.requestAnimationFrame(() => textareaRef.current?.focus());
+    }
+    wasActiveRef.current = active;
+  }, [textAnswer?.active, textAnswer?.disabled]);
+
   const submitWrittenAnswer = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const trimmed = writtenAnswer.trim();
@@ -197,6 +209,7 @@ function ListeningNote({
             disabled={textAnswer.disabled}
             id={answerId}
             onChange={(event) => setWrittenAnswer(event.currentTarget.value)}
+            ref={textareaRef}
             rows={4}
             value={writtenAnswer}
           />

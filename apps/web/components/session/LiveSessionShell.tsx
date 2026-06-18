@@ -97,6 +97,7 @@ export function LiveSessionShell({
               levelRef={levelRef}
               scene={scene}
               state={state}
+              textMode={Boolean(textAnswer?.active)}
             />
             <SessionBottomControls onEndSession={onEndSession} />
           </div>

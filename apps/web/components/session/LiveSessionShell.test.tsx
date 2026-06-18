@@ -16,7 +16,7 @@ import {
 import { MarginaliaPanel } from "./MarginaliaPanel";
 import { SessionHeader } from "./SessionHeader";
 import type { Question } from "./session-data";
-import { VoiceTraceCanvas } from "./VoiceTraceCanvas";
+import { VoiceTraceCanvas, voiceTraceBloomPulse } from "./VoiceTraceCanvas";
 
 const noop = () => {};
 
@@ -216,7 +216,7 @@ describe("LiveSessionShell scene intent wiring", () => {
 
   test("renders scene state onto the existing Canvas and marginalia surfaces", () => {
     const canvasMarkup = renderToStaticMarkup(
-      <VoiceTraceCanvas conceptNodes={[]} scene={scene} state="correction" />,
+      <VoiceTraceCanvas conceptNodes={[]} scene={scene} state="correction" textMode={true} />,
     );
     const marginaliaMarkup = renderToStaticMarkup(
       <MarginaliaPanel
@@ -238,10 +238,20 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(canvasMarkup).toContain('data-scene-register="correcting"');
     expect(canvasMarkup).toContain('data-scene-emphasis="marked"');
     expect(canvasMarkup).toContain('data-scene-entity-count="1"');
+    expect(canvasMarkup).toContain('data-text-mode="true"');
     expect(marginaliaMarkup).toContain('class="marginalia"');
     expect(marginaliaMarkup).toContain('data-scene-register="correcting"');
     expect(marginaliaMarkup).toContain('data-scene-marginalia-count="1"');
     expect(`${canvasMarkup}${marginaliaMarkup}`).not.toContain("Render instruction");
+  });
+
+  test("keeps the bloom at a constant floor in text mode", () => {
+    expect(voiceTraceBloomPulse({ textMode: true, time: 0, voice: 0 })).toBe(
+      voiceTraceBloomPulse({ textMode: true, time: 10, voice: 1 }),
+    );
+    expect(voiceTraceBloomPulse({ textMode: false, time: 0, voice: 0 })).not.toBe(
+      voiceTraceBloomPulse({ textMode: false, time: 10, voice: 0 }),
+    );
   });
 
   test("renders projected runtime copy in listening marginalia", () => {
