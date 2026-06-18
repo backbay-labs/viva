@@ -20,6 +20,8 @@ pub enum TerminalSessionReason {
     Drained,
     SessionCap,
     TurnCap,
+    RateLimit,
+    CostBudget,
 }
 
 impl TerminalSessionReason {
@@ -28,6 +30,8 @@ impl TerminalSessionReason {
             Self::Drained => "drained",
             Self::SessionCap => "session_cap",
             Self::TurnCap => "turn_cap",
+            Self::RateLimit => "rate_limit",
+            Self::CostBudget => "cost_budget",
         }
     }
 
@@ -36,6 +40,8 @@ impl TerminalSessionReason {
             Self::Drained => "drained",
             Self::SessionCap => "session cap",
             Self::TurnCap => "turn cap",
+            Self::RateLimit => "rate limit",
+            Self::CostBudget => "cost budget",
         }
     }
 }

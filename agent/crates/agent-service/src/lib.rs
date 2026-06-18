@@ -10,7 +10,7 @@ pub use app::{
 };
 pub use config::{
     build_brain, build_study_store, RealtimeProvider, ServiceConfig, ServiceConfigError,
-    VoiceWsAccess,
+    VoiceLimitConfig, VoiceWsAccess,
 };
 pub use protocol::{
     ClientFrame, ReadyFrame, ServerFrame, VivaServerEvent, VIVA_VOICE_INPUT_ENCODING,

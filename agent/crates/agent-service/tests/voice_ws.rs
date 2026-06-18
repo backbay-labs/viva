@@ -17,11 +17,12 @@ use agent_domain::{
 };
 use agent_service::{
     build_router, AppState, ClientFrame, ServerFrame, VivaServerEvent, VoiceDrainSignal,
-    VoiceEvidenceRecorder, VoiceWsAccess, WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
+    VoiceEvidenceRecorder, VoiceLimitConfig, VoiceWsAccess, WsTimeouts,
+    VIVA_VOICE_PROTOCOL_VERSION,
 };
 use axum::{
     body::Body,
-    http::{Request, StatusCode},
+    http::{HeaderValue, Request, StatusCode},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use futures_util::{SinkExt, StreamExt};
@@ -40,7 +41,9 @@ use tokio::{
 };
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{protocol::frame::coding::CloseCode, Message as WsMessage},
+    tungstenite::{
+        client::IntoClientRequest, protocol::frame::coding::CloseCode, Message as WsMessage,
+    },
     MaybeTlsStream, WebSocketStream,
 };
 use tower::ServiceExt;
@@ -2343,6 +2346,63 @@ async fn websocket_preflight_rejects_new_sessions_after_drain_begins() {
 }
 
 #[tokio::test]
+async fn websocket_preflight_enforces_ip_session_cap_and_releases_after_close() {
+    let state = test_state(4).with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(1),
+        ..VoiceLimitConfig::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let mut first_request = url.as_str().into_client_request().unwrap();
+    first_request
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
+    let (mut first_socket, _) = connect_async(first_request).await.unwrap();
+    assert_eq!(
+        read_server_frame(&mut first_socket).await,
+        ServerFrame::ready()
+    );
+
+    let mut second_request = url.as_str().into_client_request().unwrap();
+    second_request
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
+    let error = connect_async(second_request)
+        .await
+        .expect_err("same IP should be rejected while first socket holds the lease");
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        other => panic!("expected HTTP 429 from IP capacity preflight, got {other:?}"),
+    }
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::PreflightRejected).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::PreflightRejected
+            && event.detail == "ip capacity exceeded"
+    }));
+
+    first_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut first_socket).await;
+
+    let mut third_request = url.as_str().into_client_request().unwrap();
+    third_request
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
+    let (mut third_socket, _) = connect_async(third_request)
+        .await
+        .expect("IP lease should be released after the first socket closes");
+    assert_eq!(
+        read_server_frame(&mut third_socket).await,
+        ServerFrame::ready()
+    );
+    third_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut third_socket).await;
+}
+
+#[tokio::test]
 async fn websocket_drain_latches_before_socket_subscribes() {
     let state = test_state(1).with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
@@ -2409,6 +2469,179 @@ async fn websocket_session_cap_emits_terminal_phase_before_close() {
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::TerminalReason && event.detail == "session_cap"
+    }));
+}
+
+#[tokio::test]
+async fn websocket_user_session_cap_emits_terminal_phase_and_releases_after_close() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(BackpressuredInputBrain {
+            dropped: dropped.clone(),
+        }),
+        "backpressured_input_probe",
+        VoiceWsAccess::default(),
+        4,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_user_sessions: Some(1),
+        ..VoiceLimitConfig::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut first_socket, "backpressured_input_probe").await;
+    first_socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+    })
+    .await;
+
+    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut second_socket, "backpressured_input_probe").await;
+    second_socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut second_socket).await,
+        TerminalSessionReason::SessionCap,
+    );
+    assert_close_code(&mut second_socket, CloseCode::Policy).await;
+
+    first_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut first_socket).await;
+
+    let (mut third_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut third_socket, "backpressured_input_probe").await;
+    third_socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .filter(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+            .count()
+            >= 2
+    })
+    .await;
+    third_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut third_socket).await;
+    wait_until(Duration::from_secs(2), || dropped.load(Ordering::SeqCst)).await;
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn websocket_audio_byte_cap_emits_rate_limit_terminal_phase() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(BackpressuredInputBrain {
+            dropped: dropped.clone(),
+        }),
+        "backpressured_input_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_audio_bytes_per_minute: Some(3),
+        ..VoiceLimitConfig::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "backpressured_input_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![1_u8, 2, 3, 4].into()))
+        .await
+        .unwrap();
+
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::RateLimit,
+    );
+    assert_close_code(&mut socket, CloseCode::Policy).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason && event.detail == "rate_limit"
+    }));
+}
+
+#[tokio::test]
+async fn websocket_cost_budget_emits_cost_budget_terminal_phase() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(EventProbeBrain {
+            study_store: Some(brain_store),
+            events: vec![BrainEvent::Usage(BrainUsage {
+                text_output_tokens: 1,
+                ..BrainUsage::default()
+            })],
+        }),
+        "event_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_session_cost_usd: Some(0.000_001),
+        ..VoiceLimitConfig::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "event_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::CostBudget,
+    );
+    assert_close_code(&mut socket, CloseCode::Policy).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason && event.detail == "cost_budget"
     }));
 }
 

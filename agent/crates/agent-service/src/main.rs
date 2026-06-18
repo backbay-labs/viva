@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use agent_service::{
     build_brain, build_router, build_study_store, AppState, ServiceConfig, VoiceDrainSignal,
+    WsTimeouts,
 };
 
 const VOICE_DRAIN_GRACE_PERIOD: Duration = Duration::from_secs(2);
@@ -31,6 +32,12 @@ async fn main() -> anyhow::Result<()> {
     .with_trusted_user_id(config.trusted_user_id)
     .with_trusted_study_set_id(config.trusted_study_set_id)
     .with_trusted_session_id(config.trusted_session_id)
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: WsTimeouts::default().first_frame,
+        idle: config.max_turn_duration,
+        session: config.max_session_duration,
+    })
+    .with_voice_limits(config.voice_limits)
     .with_unauthenticated_paste_allowed(config.bind_addr.ip().is_loopback());
     let drain_signal = state.drain_signal.clone();
     let app = build_router(state);

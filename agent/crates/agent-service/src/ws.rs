@@ -2,7 +2,7 @@ use std::{collections::HashSet, time::Duration};
 
 use agent_domain::{
     AudioFrame, BrainInput, SessionConfig, SessionTokenNonceClaim, StudySessionPhase,
-    TerminalSessionReason,
+    TerminalSessionReason, VoiceUsageRecord,
 };
 use axum::{
     extract::{
@@ -23,8 +23,8 @@ use tokio::{
 };
 
 use crate::{
-    app::AppState,
-    config::{SessionTokenClaims, VoiceWsAccessError},
+    app::{AppState, VoiceLimitLease},
+    config::{SessionTokenClaims, VoiceLimitConfig, VoiceWsAccessError},
     protocol::{
         ClientFrame, ServerFrame, VIVA_VOICE_MAX_BINARY_FRAME_BYTES,
         VIVA_VOICE_MAX_TEXT_FRAME_BYTES, VIVA_VOICE_PROTOCOL_VERSION,
@@ -38,19 +38,19 @@ pub async fn voice_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let permit = match validate_ws_preflight(&state, &headers) {
+    let admission = match validate_ws_preflight(&state, &headers) {
         Ok(permit) => permit,
         Err(error) => return error.into_response(),
     };
 
     ws.protocols(["viva-voice"])
-        .on_upgrade(move |socket| handle_socket(socket, state, permit))
+        .on_upgrade(move |socket| handle_socket(socket, state, admission))
 }
 
 fn validate_ws_preflight(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<OwnedSemaphorePermit, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<VoiceAdmission, (StatusCode, Json<serde_json::Value>)> {
     if state.drain_signal.is_draining() {
         state.evidence.record(VoiceEvidenceEvent::new(
             VoiceEvidenceEventKind::PreflightRejected,
@@ -85,15 +85,100 @@ fn validate_ws_preflight(
                 Json(json!({ "error": "voice session capacity exceeded" })),
             )
         })?;
+    let ip_key = session_ip_key(headers);
+    let ip_lease = match state.voice_limits.max_ip_sessions {
+        Some(max) => match state.limit_state.try_acquire_ip(&ip_key, max) {
+            Some(lease) => Some(lease),
+            None => {
+                state.evidence.record(VoiceEvidenceEvent::new(
+                    VoiceEvidenceEventKind::PreflightRejected,
+                    None,
+                    "ip capacity exceeded",
+                ));
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({ "error": "voice session IP capacity exceeded" })),
+                ));
+            }
+        },
+        None => None,
+    };
     state.evidence.record(VoiceEvidenceEvent::new(
         VoiceEvidenceEventKind::PreflightAccepted,
         None,
         "websocket preflight accepted",
     ));
-    Ok(permit)
+    Ok(VoiceAdmission {
+        _permit: permit,
+        _ip_lease: ip_lease,
+    })
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemaphorePermit) {
+fn session_ip_key(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+struct VoiceAdmission {
+    _permit: OwnedSemaphorePermit,
+    _ip_lease: Option<VoiceLimitLease>,
+}
+
+struct SessionLimitRuntime {
+    audio_window_started_at: Instant,
+    audio_bytes_this_window: u64,
+    session_cost_usd: f64,
+}
+
+impl SessionLimitRuntime {
+    fn new() -> Self {
+        Self {
+            audio_window_started_at: Instant::now(),
+            audio_bytes_this_window: 0,
+            session_cost_usd: 0.0,
+        }
+    }
+
+    fn record_audio_bytes(&mut self, limits: &VoiceLimitConfig, bytes: u64) -> bool {
+        let Some(max_bytes) = limits.max_audio_bytes_per_minute else {
+            return true;
+        };
+        if self.audio_window_started_at.elapsed() >= Duration::from_secs(60) {
+            self.audio_window_started_at = Instant::now();
+            self.audio_bytes_this_window = 0;
+        }
+        if self.audio_bytes_this_window.saturating_add(bytes) > max_bytes {
+            return false;
+        }
+        self.audio_bytes_this_window = self.audio_bytes_this_window.saturating_add(bytes);
+        true
+    }
+
+    fn record_session_cost(&mut self, limits: &VoiceLimitConfig, cost_usd: f64) -> bool {
+        if cost_usd.is_finite() && cost_usd > 0.0 {
+            self.session_cost_usd += cost_usd;
+        }
+        match limits.max_session_cost_usd {
+            Some(max_cost_usd) => self.session_cost_usd <= max_cost_usd,
+            None => true,
+        }
+    }
+}
+
+async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmission) {
     let (mut sender, mut receiver) = socket.split();
     if send_json(
         &mut sender,
@@ -149,6 +234,25 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
             return;
         }
     };
+    let _user_lease = match state.voice_limits.max_user_sessions {
+        Some(max) => match state
+            .limit_state
+            .try_acquire_user(&session_binding.user_id, max)
+        {
+            Some(lease) => Some(lease),
+            None => {
+                let terminal_reason = close_with_terminal_session_phase_only(
+                    &mut sender,
+                    TerminalSessionReason::SessionCap,
+                    close_code::POLICY,
+                )
+                .await;
+                record_terminal(&state, None, terminal_reason).await;
+                return;
+            }
+        },
+        None => None,
+    };
     if let Some(claim) = initial.token_nonce_claim.take() {
         if state
             .study_store
@@ -187,6 +291,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
     ));
     let mut terminal_reason = "event_stream_closed";
     let mut cancelled_response_ids = HashSet::new();
+    let mut session_limits = SessionLimitRuntime::new();
     let session_cap = tokio::time::sleep(state.ws_timeouts.session);
     tokio::pin!(session_cap);
     let turn_cap = tokio::time::sleep(state.ws_timeouts.idle);
@@ -256,6 +361,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
                     message,
                     &session.input,
                     &session_binding,
+                    &state.voice_limits,
+                    &mut session_limits,
                     &mut drain_signal,
                 )
                 .await
@@ -265,10 +372,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
                         match action {
                             ClientAction::Stop => {
                                 terminal_reason = "client_stop";
+                                let mut forward_context = BrainForwardContext {
+                                    state: &state,
+                                    voice_session_id: voice_session_id.clone(),
+                                    session_binding: &session_binding,
+                                    limits: &state.voice_limits,
+                                    session_limits: &mut session_limits,
+                                };
                                 match drain_terminal_events(
-                                    &state,
-                                    voice_session_id.clone(),
-                                    &session_binding,
+                                    &mut forward_context,
                                     &mut session.events,
                                     &mut cancelled_response_ids,
                                     session_started_at,
@@ -283,6 +395,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
                                             &mut sender,
                                             close_code::POLICY,
                                             "provider source authority rejected",
+                                        )
+                                        .await;
+                                        break;
+                                    }
+                                    Ok(ForwardBrainEvent::CostBudgetExceeded) => {
+                                        terminal_reason = close_with_terminal_session_phase(
+                                            &mut sender,
+                                            &session.input,
+                                            TerminalSessionReason::CostBudget,
+                                            close_code::POLICY,
                                         )
                                         .await;
                                         break;
@@ -314,6 +436,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
                         .await;
                         break;
                     }
+                    Err(ClientMessageError::RateLimit) => {
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            TerminalSessionReason::RateLimit,
+                            close_code::POLICY,
+                        )
+                        .await;
+                        break;
+                    }
                     Err(ClientMessageError::Frame(error)) => {
                         let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
                         let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
@@ -326,10 +458,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
                 let Some(event) = event else {
                     break;
                 };
+                let mut forward_context = BrainForwardContext {
+                    state: &state,
+                    voice_session_id: voice_session_id.clone(),
+                    session_binding: &session_binding,
+                    limits: &state.voice_limits,
+                    session_limits: &mut session_limits,
+                };
                 match forward_brain_event(
-                    &state,
-                    voice_session_id.clone(),
-                    &session_binding,
+                    &mut forward_context,
                     event,
                     &mut cancelled_response_ids,
                     session_started_at.elapsed(),
@@ -344,6 +481,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
                             &mut sender,
                             close_code::POLICY,
                             "provider source authority rejected",
+                        )
+                        .await;
+                        break;
+                    }
+                    Ok(ForwardBrainEvent::CostBudgetExceeded) => {
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            TerminalSessionReason::CostBudget,
+                            close_code::POLICY,
                         )
                         .await;
                         break;
@@ -379,6 +526,24 @@ where
     terminal_reason.as_str()
 }
 
+async fn close_with_terminal_session_phase_only<S>(
+    sender: &mut S,
+    terminal_reason: TerminalSessionReason,
+    close_code: u16,
+) -> &'static str
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    if send_terminal_session_phase(sender, terminal_reason)
+        .await
+        .is_err()
+    {
+        return "send_failed";
+    }
+    let _ = close_with(sender, close_code, terminal_reason.close_reason()).await;
+    terminal_reason.as_str()
+}
+
 async fn send_terminal_session_phase<S>(
     sender: &mut S,
     terminal_reason: TerminalSessionReason,
@@ -396,10 +561,16 @@ where
     .await
 }
 
-async fn drain_terminal_events<S>(
-    state: &AppState,
+struct BrainForwardContext<'a> {
+    state: &'a AppState,
     voice_session_id: Option<String>,
-    session_binding: &AuthorizedClientSession,
+    session_binding: &'a AuthorizedClientSession,
+    limits: &'a VoiceLimitConfig,
+    session_limits: &'a mut SessionLimitRuntime,
+}
+
+async fn drain_terminal_events<S>(
+    context: &mut BrainForwardContext<'_>,
     events: &mut mpsc::Receiver<agent_domain::BrainEvent>,
     cancelled_response_ids: &mut HashSet<String>,
     session_started_at: Instant,
@@ -416,19 +587,16 @@ where
         else {
             return Ok(ForwardBrainEvent::Continue);
         };
-        if forward_brain_event(
-            state,
-            voice_session_id.clone(),
-            session_binding,
+        let result = forward_brain_event(
+            context,
             event,
             cancelled_response_ids,
             session_started_at.elapsed(),
             sender,
         )
-        .await?
-            == ForwardBrainEvent::Rejected
-        {
-            return Ok(ForwardBrainEvent::Rejected);
+        .await?;
+        if result != ForwardBrainEvent::Continue {
+            return Ok(result);
         }
     }
 }
@@ -437,12 +605,11 @@ where
 enum ForwardBrainEvent {
     Continue,
     Rejected,
+    CostBudgetExceeded,
 }
 
 async fn forward_brain_event<S>(
-    state: &AppState,
-    voice_session_id: Option<String>,
-    session_binding: &AuthorizedClientSession,
+    context: &mut BrainForwardContext<'_>,
     event: agent_domain::BrainEvent,
     cancelled_response_ids: &mut HashSet<String>,
     session_elapsed: Duration,
@@ -454,7 +621,7 @@ where
     if should_suppress_cancelled_response(cancelled_response_ids, &event) {
         return Ok(ForwardBrainEvent::Continue);
     }
-    if !authorize_browser_event(state, session_binding, &event).await {
+    if !authorize_browser_event(context.state, context.session_binding, &event).await {
         send_json(
             sender,
             &ServerFrame::error("provider source authority rejected"),
@@ -462,7 +629,21 @@ where
         .await?;
         return Ok(ForwardBrainEvent::Rejected);
     }
-    record_brain_event(state, voice_session_id, &event, session_elapsed).await;
+    if let Some(usage_record) = record_brain_event(
+        context.state,
+        context.voice_session_id.clone(),
+        &event,
+        session_elapsed,
+    )
+    .await
+    {
+        if !context
+            .session_limits
+            .record_session_cost(context.limits, usage_record.cost_estimate_usd)
+        {
+            return Ok(ForwardBrainEvent::CostBudgetExceeded);
+        }
+    }
     let Some(frame) = ServerFrame::browser_event(event) else {
         return Ok(ForwardBrainEvent::Continue);
     };
@@ -636,15 +817,24 @@ async fn handle_client_message_with_drain(
     message: Message,
     input: &mpsc::Sender<BrainInput>,
     session_binding: &AuthorizedClientSession,
+    limits: &VoiceLimitConfig,
+    session_limits: &mut SessionLimitRuntime,
     drain_signal: &mut watch::Receiver<bool>,
 ) -> Result<ClientAction, ClientMessageError> {
     match client_input_action(message, session_binding).map_err(ClientMessageError::Frame)? {
         ClientInputAction::Send {
             brain_input,
             action,
-        } => send_brain_input_with_drain(input, brain_input, drain_signal)
-            .await
-            .map(|_| action),
+        } => {
+            if let Some(bytes) = brain_input_audio_bytes(&brain_input) {
+                if !session_limits.record_audio_bytes(limits, bytes) {
+                    return Err(ClientMessageError::RateLimit);
+                }
+            }
+            send_brain_input_with_drain(input, brain_input, drain_signal)
+                .await
+                .map(|_| action)
+        }
         ClientInputAction::TrySend {
             brain_input,
             action,
@@ -653,6 +843,13 @@ async fn handle_client_message_with_drain(
             Ok(action)
         }
         ClientInputAction::Keepalive => Ok(ClientAction::Keepalive),
+    }
+}
+
+fn brain_input_audio_bytes(brain_input: &BrainInput) -> Option<u64> {
+    match brain_input {
+        BrainInput::Audio(frame) => Some(frame.pcm16_bytes().len().try_into().unwrap_or(u64::MAX)),
+        _ => None,
     }
 }
 
@@ -936,6 +1133,7 @@ enum ClientInputAction {
 enum ClientMessageError {
     Frame(ClientFrameError),
     Drained,
+    RateLimit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1058,7 +1256,7 @@ async fn record_brain_event(
     voice_session_id: Option<String>,
     event: &agent_domain::BrainEvent,
     session_elapsed: Duration,
-) {
+) -> Option<VoiceUsageRecord> {
     if let agent_domain::BrainEvent::Usage(usage) = event {
         let elapsed_ms = session_elapsed.as_millis().try_into().unwrap_or(u64::MAX);
         let usage_record = state.usage.record(
@@ -1069,16 +1267,20 @@ async fn record_brain_event(
             session_elapsed.as_secs().max(1),
             Some(elapsed_ms),
         );
-        if let Err(error) = state.study_store.record_voice_usage(usage_record).await {
+        if let Err(error) = state
+            .study_store
+            .record_voice_usage(usage_record.clone())
+            .await
+        {
             state.evidence.record(VoiceEvidenceEvent::new(
                 VoiceEvidenceEventKind::StoreCounts,
                 voice_session_id,
                 format!("usage_persist_failed: {error}"),
             ));
         }
-        return;
+        return Some(usage_record);
     }
-    let Some((kind, detail)) = (match event {
+    let (kind, detail) = (match event {
         agent_domain::BrainEvent::QuestionStarted { response_id, .. } => Some((
             VoiceEvidenceEventKind::QuestionEmitted,
             response_id.as_str(),
@@ -1097,12 +1299,11 @@ async fn record_brain_event(
             Some((VoiceEvidenceEventKind::CancelReceived, "response cancelled"))
         }
         _ => None,
-    }) else {
-        return;
-    };
+    })?;
     state
         .evidence
         .record(VoiceEvidenceEvent::new(kind, voice_session_id, detail));
+    None
 }
 
 async fn record_terminal(state: &AppState, voice_session_id: Option<String>, reason: &str) {
@@ -1644,12 +1845,20 @@ mod tests {
         let (_events_tx, mut events) = mpsc::channel(1);
         let mut cancelled_response_ids = HashSet::new();
         let mut sender = RecordingSink::new();
+        let limits = VoiceLimitConfig::default();
+        let mut session_limits = SessionLimitRuntime::new();
+        let binding = fixture_binding();
+        let mut context = BrainForwardContext {
+            state: &state,
+            voice_session_id: Some("voice-session-1".to_owned()),
+            session_binding: &binding,
+            limits: &limits,
+            session_limits: &mut session_limits,
+        };
         let started_at = Instant::now();
 
         let result = drain_terminal_events(
-            &state,
-            Some("voice-session-1".to_owned()),
-            &fixture_binding(),
+            &mut context,
             &mut events,
             &mut cancelled_response_ids,
             started_at,
@@ -1675,7 +1884,7 @@ mod tests {
             crate::VoiceWsAccess::default(),
             1,
         );
-        record_brain_event(
+        let record = record_brain_event(
             &state,
             Some("voice-session-1".to_owned()),
             &agent_domain::BrainEvent::Usage(agent_domain::BrainUsage {
@@ -1685,7 +1894,8 @@ mod tests {
             }),
             Duration::from_secs(2),
         )
-        .await;
+        .await
+        .expect("usage events should return a usage record");
 
         let usage = state.usage.snapshot();
         assert_eq!(usage.len(), 1);
@@ -1694,6 +1904,7 @@ mod tests {
         assert_eq!(usage[0].duration_seconds, 2);
         assert_eq!(usage[0].answer_eval_latency_ms, Some(2_000));
         assert_eq!(usage[0].text_input_tokens, 20);
+        assert_eq!(record.cost_estimate_usd, usage[0].cost_estimate_usd);
         assert!(state.evidence.snapshot().is_empty());
     }
 }

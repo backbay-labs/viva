@@ -2,7 +2,7 @@ use std::{
     env,
     net::SocketAddr,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use agent_adapters::{
@@ -28,6 +28,9 @@ pub struct ServiceConfig {
     pub trusted_session_id: String,
     pub ws_access: VoiceWsAccess,
     pub max_sessions: usize,
+    pub max_session_duration: Duration,
+    pub max_turn_duration: Duration,
+    pub voice_limits: VoiceLimitConfig,
 }
 
 impl Default for ServiceConfig {
@@ -43,6 +46,9 @@ impl Default for ServiceConfig {
             trusted_session_id: "voice-session-1".to_owned(),
             ws_access: VoiceWsAccess::default(),
             max_sessions: 32,
+            max_session_duration: Duration::from_secs(6 * 60 * 60),
+            max_turn_duration: Duration::from_secs(60),
+            voice_limits: VoiceLimitConfig::default(),
         }
     }
 }
@@ -101,6 +107,25 @@ impl ServiceConfig {
         {
             config.max_sessions = max_sessions;
         }
+        if let Some(seconds) =
+            env_value("VIVA_VOICE_WS_SESSION_SECONDS").and_then(|value| parse_positive_u64(&value))
+        {
+            config.max_session_duration = Duration::from_secs(seconds);
+        }
+        if let Some(seconds) =
+            env_value("VIVA_VOICE_WS_TURN_SECONDS").and_then(|value| parse_positive_u64(&value))
+        {
+            config.max_turn_duration = Duration::from_secs(seconds);
+        }
+        config.voice_limits.max_user_sessions = env_value("VIVA_VOICE_WS_MAX_USER_SESSIONS")
+            .and_then(|value| parse_positive_usize(&value));
+        config.voice_limits.max_ip_sessions = env_value("VIVA_VOICE_WS_MAX_IP_SESSIONS")
+            .and_then(|value| parse_positive_usize(&value));
+        config.voice_limits.max_audio_bytes_per_minute =
+            env_value("VIVA_VOICE_WS_MAX_AUDIO_BYTES_PER_MINUTE")
+                .and_then(|value| parse_positive_u64(&value));
+        config.voice_limits.max_session_cost_usd = env_value("VIVA_VOICE_WS_MAX_SESSION_COST_USD")
+            .and_then(|value| parse_positive_f64(&value));
         config.validate()?;
         Ok(config)
     }
@@ -120,6 +145,14 @@ impl ServiceConfig {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VoiceLimitConfig {
+    pub max_user_sessions: Option<usize>,
+    pub max_ip_sessions: Option<usize>,
+    pub max_audio_bytes_per_minute: Option<u64>,
+    pub max_session_cost_usd: Option<f64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,6 +216,21 @@ pub fn build_brain(
             Arc::new(CartesiaGeminiBrain::new(CartesiaGeminiConfig::from_env()))
         }
     }
+}
+
+fn parse_positive_u64(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok().filter(|parsed| *parsed > 0)
+}
+
+fn parse_positive_usize(value: &str) -> Option<usize> {
+    value.parse::<usize>().ok().filter(|parsed| *parsed > 0)
+}
+
+fn parse_positive_f64(value: &str) -> Option<f64> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|parsed| parsed.is_finite() && *parsed > 0.0)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -436,6 +484,48 @@ mod tests {
             ..ServiceConfig::default()
         };
         assert_eq!(ipv6_loopback.validate(), Ok(()));
+    }
+
+    #[test]
+    fn from_env_parses_voice_timeout_and_limit_knobs() {
+        let config = ServiceConfig::from_env_with(|name| match name {
+            "VIVA_VOICE_WS_SESSION_SECONDS" => Some("1800".to_owned()),
+            "VIVA_VOICE_WS_TURN_SECONDS" => Some("45".to_owned()),
+            "VIVA_VOICE_WS_MAX_USER_SESSIONS" => Some("2".to_owned()),
+            "VIVA_VOICE_WS_MAX_IP_SESSIONS" => Some("5".to_owned()),
+            "VIVA_VOICE_WS_MAX_AUDIO_BYTES_PER_MINUTE" => Some("48000".to_owned()),
+            "VIVA_VOICE_WS_MAX_SESSION_COST_USD" => Some("0.75".to_owned()),
+            _ => None,
+        })
+        .expect("loopback voice limit config should validate");
+
+        assert_eq!(config.max_session_duration, Duration::from_secs(1800));
+        assert_eq!(config.max_turn_duration, Duration::from_secs(45));
+        assert_eq!(config.voice_limits.max_user_sessions, Some(2));
+        assert_eq!(config.voice_limits.max_ip_sessions, Some(5));
+        assert_eq!(config.voice_limits.max_audio_bytes_per_minute, Some(48_000));
+        assert_eq!(config.voice_limits.max_session_cost_usd, Some(0.75));
+
+        let disabled = ServiceConfig::from_env_with(|name| match name {
+            "VIVA_VOICE_WS_SESSION_SECONDS" => Some("0".to_owned()),
+            "VIVA_VOICE_WS_TURN_SECONDS" => Some("-1".to_owned()),
+            "VIVA_VOICE_WS_MAX_USER_SESSIONS" => Some("0".to_owned()),
+            "VIVA_VOICE_WS_MAX_IP_SESSIONS" => Some("0".to_owned()),
+            "VIVA_VOICE_WS_MAX_AUDIO_BYTES_PER_MINUTE" => Some("0".to_owned()),
+            "VIVA_VOICE_WS_MAX_SESSION_COST_USD" => Some("NaN".to_owned()),
+            _ => None,
+        })
+        .expect("invalid loopback voice limit values should be ignored");
+
+        assert_eq!(
+            disabled.max_session_duration,
+            ServiceConfig::default().max_session_duration
+        );
+        assert_eq!(
+            disabled.max_turn_duration,
+            ServiceConfig::default().max_turn_duration
+        );
+        assert_eq!(disabled.voice_limits, VoiceLimitConfig::default());
     }
 
     #[test]
