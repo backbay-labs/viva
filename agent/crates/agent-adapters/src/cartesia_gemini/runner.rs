@@ -54,11 +54,14 @@ impl CartesiaGeminiRunner<FakeCartesiaGeminiTransports> {
 }
 
 impl CartesiaGeminiRunner<GatedNoNetworkCartesiaGeminiTransports> {
-    pub(crate) fn gated_live(config: CartesiaGeminiConfig) -> Self {
+    pub(crate) fn gated_live(
+        store: Arc<dyn StudyMemoryStore>,
+        config: CartesiaGeminiConfig,
+    ) -> Self {
         Self {
             config,
             transports: GatedNoNetworkCartesiaGeminiTransports,
-            store: None,
+            store: Some(store),
         }
     }
 }
@@ -317,6 +320,20 @@ where
                 return;
             }
         };
+        if !transcript.interim_text.trim().is_empty()
+            && transcript.interim_text != transcript.final_text
+            && !send_fake_unless_cancelled(
+                &job.event_tx,
+                BrainEvent::TranscriptDelta {
+                    response_id: job.response_id.clone(),
+                    text: transcript.interim_text.clone(),
+                },
+                &job.cancelled,
+            )
+            .await
+        {
+            return;
+        }
         if !send_fake_unless_cancelled(
             &job.event_tx,
             BrainEvent::TranscriptFinal {
@@ -394,14 +411,11 @@ where
         input: &RunnerInput,
     ) -> Result<RunnerTranscript, BrainError> {
         match input {
-            RunnerInput::Audio(frame) => self
-                .transports
-                .transcribe_audio(&self.config, response_id, frame)
-                .await
-                .map(|transcript| RunnerTranscript {
-                    final_text: transcript.interim_text.clone(),
-                    ..transcript
-                }),
+            RunnerInput::Audio(frame) => {
+                self.transports
+                    .transcribe_audio(&self.config, response_id, frame)
+                    .await
+            }
             RunnerInput::Text(text) => Ok(RunnerTranscript {
                 interim_text: text.clone(),
                 final_text: text.clone(),

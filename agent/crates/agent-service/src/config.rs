@@ -211,10 +211,10 @@ pub fn build_brain(
         RealtimeProvider::FakeCartesiaGemini => {
             Arc::new(FakeCartesiaGeminiRuntime::new(study_store))
         }
-        RealtimeProvider::CartesiaGemini => {
-            let _ = study_store;
-            Arc::new(CartesiaGeminiBrain::new(CartesiaGeminiConfig::from_env()))
-        }
+        RealtimeProvider::CartesiaGemini => Arc::new(CartesiaGeminiBrain::new(
+            CartesiaGeminiConfig::from_env(),
+            study_store,
+        )),
     }
 }
 

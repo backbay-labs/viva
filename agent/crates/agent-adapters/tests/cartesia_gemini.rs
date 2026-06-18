@@ -16,6 +16,9 @@ use tokio::{
     time::{timeout, Duration},
 };
 
+const FAKE_INK_INTERIM_TRANSCRIPT: &str = "received 4 PCM16 bytes";
+const FAKE_INK_FINAL_TRANSCRIPT: &str = "NADH donates electrons to the electron transport chain.";
+
 #[test]
 fn adapter_defaults_are_viva_native_and_live_keys_are_explicit() {
     let config = CartesiaGeminiConfig::default();
@@ -66,14 +69,18 @@ fn provider_urls_keep_cartesia_realtime_defaults() {
 
 #[test]
 fn cartesia_gemini_brain_stays_unselectable_until_live_runtime_is_proven() {
-    let capabilities = CartesiaGeminiBrain::new(CartesiaGeminiConfig {
-        cartesia_api_key: "cartesia-key".to_owned(),
-        gemini: GeminiConfig {
-            api_key: "gemini-key".to_owned(),
-            ..GeminiConfig::default()
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let capabilities = CartesiaGeminiBrain::new(
+        CartesiaGeminiConfig {
+            cartesia_api_key: "cartesia-key".to_owned(),
+            gemini: GeminiConfig {
+                api_key: "gemini-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            ..CartesiaGeminiConfig::default()
         },
-        ..CartesiaGeminiConfig::default()
-    })
+        store,
+    )
     .capabilities();
 
     assert_eq!(capabilities.provider, "cartesia_gemini");
@@ -84,14 +91,18 @@ fn cartesia_gemini_brain_stays_unselectable_until_live_runtime_is_proven() {
 
 #[tokio::test]
 async fn cartesia_gemini_brain_open_reaches_shared_no_network_runner_gate() {
-    let brain = CartesiaGeminiBrain::new(CartesiaGeminiConfig {
-        cartesia_api_key: "cartesia-key".to_owned(),
-        gemini: GeminiConfig {
-            api_key: "gemini-key".to_owned(),
-            ..GeminiConfig::default()
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let brain = CartesiaGeminiBrain::new(
+        CartesiaGeminiConfig {
+            cartesia_api_key: "cartesia-key".to_owned(),
+            gemini: GeminiConfig {
+                api_key: "gemini-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            ..CartesiaGeminiConfig::default()
         },
-        ..CartesiaGeminiConfig::default()
-    });
+        store.clone(),
+    );
 
     let error = match brain.open(fixture_session_config()).await {
         Ok(_) => panic!("live Cartesia/Gemini brain unexpectedly opened"),
@@ -101,6 +112,8 @@ async fn cartesia_gemini_brain_open_reaches_shared_no_network_runner_gate() {
     assert!(error
         .to_string()
         .contains("shared Cartesia/Gemini runner is wired"));
+    assert!(!error.to_string().contains("without a study-memory store"));
+    assert!(store.snapshot().sessions.is_empty());
     assert!(!brain.capabilities().selectable);
 }
 
@@ -140,7 +153,7 @@ async fn fake_runtime_is_selectable_realtime_brain_without_live_keys() {
     for _ in 0..12 {
         match next_event(&mut session).await {
             BrainEvent::AnswerEvaluated { evaluation, .. } => {
-                assert_eq!(evaluation.answer_text, "received 4 PCM16 bytes");
+                assert_eq!(evaluation.answer_text, FAKE_INK_FINAL_TRANSCRIPT);
                 saw_evaluation = true;
             }
             BrainEvent::AudioDelta { frame, .. } => {
@@ -194,10 +207,8 @@ async fn fake_runtime_open_cancel_aborts_active_tool_write_before_commit() {
         next_event(&mut session).await,
         BrainEvent::InputSpeechStarted
     );
-    assert!(matches!(
-        next_event(&mut session).await,
-        BrainEvent::TranscriptFinal { response_id, .. } if response_id == "response-1"
-    ));
+    expect_fake_interim_delta(&mut session, "response-1").await;
+    expect_fake_final_transcript(&mut session, "response-1").await;
     timeout(Duration::from_secs(2), answer_started)
         .await
         .unwrap()
@@ -243,6 +254,71 @@ async fn fake_runtime_open_cancel_aborts_active_tool_write_before_commit() {
 }
 
 #[tokio::test]
+async fn fake_runtime_session_emits_interim_delta_but_evaluates_only_final_transcript() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let runtime = FakeCartesiaGeminiRuntime::new(store.clone());
+    let mut session = runtime.open(fixture_session_config()).await.unwrap();
+
+    assert!(matches!(
+        next_event(&mut session).await,
+        BrainEvent::SessionPhase {
+            phase: agent_domain::StudySessionPhase::Ready
+        }
+    ));
+    assert!(matches!(
+        next_event(&mut session).await,
+        BrainEvent::QuestionStarted { response_id, .. } if response_id == "response-1"
+    ));
+    session
+        .input
+        .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+            1_u8, 2, 3, 4,
+        ])))
+        .await
+        .unwrap();
+
+    let mut saw_interim_delta = false;
+    let mut saw_final_transcript = false;
+    let mut saw_final_evaluation = false;
+    for _ in 0..12 {
+        match next_event(&mut session).await {
+            BrainEvent::TranscriptDelta { response_id, text } => {
+                if response_id == "response-1" {
+                    assert_eq!(text, FAKE_INK_INTERIM_TRANSCRIPT);
+                    saw_interim_delta = true;
+                }
+            }
+            BrainEvent::TranscriptFinal {
+                response_id, text, ..
+            } => {
+                if response_id == "response-1" {
+                    assert_eq!(text, FAKE_INK_FINAL_TRANSCRIPT);
+                    saw_final_transcript = true;
+                }
+            }
+            BrainEvent::AnswerEvaluated {
+                response_id,
+                evaluation,
+            } => {
+                if response_id == "response-1" {
+                    assert_eq!(evaluation.answer_text, FAKE_INK_FINAL_TRANSCRIPT);
+                    saw_final_evaluation = true;
+                }
+            }
+            _ => {}
+        }
+        if saw_interim_delta && saw_final_transcript && saw_final_evaluation {
+            break;
+        }
+    }
+
+    assert!(saw_interim_delta);
+    assert!(saw_final_transcript);
+    assert!(saw_final_evaluation);
+    assert_eq!(store.snapshot().answer_attempts.len(), 1);
+}
+
+#[tokio::test]
 async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() {
     let inner_store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let (store, answer_started, release_answer) = BlockingAnswerStore::new(inner_store.clone());
@@ -270,10 +346,8 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
         next_event(&mut session).await,
         BrainEvent::InputSpeechStarted
     );
-    assert!(matches!(
-        next_event(&mut session).await,
-        BrainEvent::TranscriptFinal { response_id, .. } if response_id == "response-1"
-    ));
+    expect_fake_interim_delta(&mut session, "response-1").await;
+    expect_fake_final_transcript(&mut session, "response-1").await;
     timeout(Duration::from_secs(2), answer_started)
         .await
         .unwrap()
@@ -288,6 +362,7 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
         .unwrap();
 
     let mut saw_old_cancel = false;
+    let mut saw_new_interim = false;
     let mut saw_new_transcript = false;
     let mut saw_new_evaluation = false;
     let mut saw_new_audio = false;
@@ -299,11 +374,17 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
                     saw_old_cancel = true;
                 }
             }
+            BrainEvent::TranscriptDelta { response_id, text } => {
+                if response_id == "response-2" {
+                    assert_eq!(text, FAKE_INK_INTERIM_TRANSCRIPT);
+                    saw_new_interim = true;
+                }
+            }
             BrainEvent::TranscriptFinal {
                 response_id, text, ..
             } => {
                 if response_id == "response-2" {
-                    assert_eq!(text, "received 4 PCM16 bytes");
+                    assert_eq!(text, FAKE_INK_FINAL_TRANSCRIPT);
                     saw_new_transcript = true;
                 }
             }
@@ -312,7 +393,7 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
                 evaluation,
             } => {
                 if response_id == "response-2" {
-                    assert_eq!(evaluation.answer_text, "received 4 PCM16 bytes");
+                    assert_eq!(evaluation.answer_text, FAKE_INK_FINAL_TRANSCRIPT);
                     saw_new_evaluation = true;
                 }
             }
@@ -331,6 +412,7 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
             _ => {}
         }
         if saw_old_cancel
+            && saw_new_interim
             && saw_new_transcript
             && saw_new_evaluation
             && saw_new_audio
@@ -341,6 +423,7 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
     }
 
     assert!(saw_old_cancel);
+    assert!(saw_new_interim);
     assert!(saw_new_transcript);
     assert!(saw_new_evaluation);
     assert!(saw_new_audio);
@@ -366,9 +449,16 @@ async fn fake_runtime_replays_provider_shaped_pipeline_without_live_selection() 
     assert!(events
         .iter()
         .any(|event| matches!(event, BrainEvent::TranscriptFinal { .. })));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, BrainEvent::AnswerEvaluated { .. })));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        BrainEvent::AnswerEvaluated { evaluation, .. }
+            if evaluation.answer_text == "NADH donates electrons to the electron transport chain."
+    )));
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        BrainEvent::AnswerEvaluated { evaluation, .. }
+            if evaluation.answer_text == "received 4 PCM16 bytes"
+    )));
     assert!(events.iter().any(|event| matches!(
         event,
         BrainEvent::Usage(usage)
@@ -780,6 +870,28 @@ async fn next_event(session: &mut RealtimeSession) -> BrainEvent {
         .await
         .unwrap()
         .unwrap()
+}
+
+async fn expect_fake_interim_delta(session: &mut RealtimeSession, expected_response_id: &str) {
+    match next_event(session).await {
+        BrainEvent::TranscriptDelta { response_id, text } => {
+            assert_eq!(response_id, expected_response_id);
+            assert_eq!(text, FAKE_INK_INTERIM_TRANSCRIPT);
+        }
+        event => panic!("expected fake interim transcript delta, got {event:?}"),
+    }
+}
+
+async fn expect_fake_final_transcript(session: &mut RealtimeSession, expected_response_id: &str) {
+    match next_event(session).await {
+        BrainEvent::TranscriptFinal {
+            response_id, text, ..
+        } => {
+            assert_eq!(response_id, expected_response_id);
+            assert_eq!(text, FAKE_INK_FINAL_TRANSCRIPT);
+        }
+        event => panic!("expected fake final transcript, got {event:?}"),
+    }
 }
 
 async fn remaining_events(session: &mut RealtimeSession) -> Vec<BrainEvent> {

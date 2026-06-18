@@ -106,9 +106,18 @@
       "type": "event",
       "version": 2,
       "event": {
+        "type": "transcript_delta",
+        "response_id": "response-1",
+        "text": "received 4 PCM16 bytes"
+      }
+    },
+    {
+      "type": "event",
+      "version": 2,
+      "event": {
         "type": "transcript_final",
         "response_id": "response-1",
-        "text": "received 4 PCM16 bytes",
+        "text": "NADH donates electrons to the electron transport chain.",
         "confidence": 0.91
       }
     },
@@ -128,9 +137,9 @@
         "response_id": "response-1",
         "evaluation": {
           "question_id": "q-oxidative-phosphorylation-nadh",
-          "answer_text": "received 4 PCM16 bytes",
-          "label": "insufficient evidence",
-          "concise_feedback": "Add the source-backed terms electron donor, electron transport chain before moving on.",
+          "answer_text": "NADH donates electrons to the electron transport chain.",
+          "label": "vague",
+          "concise_feedback": "Add the source-backed terms electron donor, proton gradient before moving on.",
           "retry_prompt": "Now connect that electron flow to ATP synthase in one precise sentence.",
           "source": {
             "source_id": "src-lecture-5-slide-18",
@@ -140,8 +149,8 @@
             "confidence": "high",
             "retrieval_reason": "server fixture source for oxidative phosphorylation"
           },
-          "concept_status": "missed",
-          "confidence_score": 0.2
+          "concept_status": "review",
+          "confidence_score": 0.375
         }
       }
     },

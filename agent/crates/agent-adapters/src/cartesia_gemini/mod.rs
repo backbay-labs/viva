@@ -117,9 +117,9 @@ pub struct CartesiaGeminiBrain {
 }
 
 impl CartesiaGeminiBrain {
-    pub fn new(config: CartesiaGeminiConfig) -> Self {
+    pub fn new(config: CartesiaGeminiConfig, store: Arc<dyn StudyMemoryStore>) -> Self {
         Self {
-            runner: CartesiaGeminiRunner::gated_live(config.clone()),
+            runner: CartesiaGeminiRunner::gated_live(store, config.clone()),
             config,
         }
     }

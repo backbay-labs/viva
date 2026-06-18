@@ -629,7 +629,7 @@ mod tests {
             .send(BrainInput::Audio(audio_frame))
             .await
             .expect("sends audio");
-        for _ in 0..11 {
+        for _ in 0..12 {
             push_next_browser_frame(&mut actual, &mut session).await;
         }
         session
