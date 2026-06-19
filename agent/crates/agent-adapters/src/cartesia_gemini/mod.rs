@@ -241,6 +241,9 @@ pub enum FakeRuntimeInterrupt {
     CancelDuringGeminiToolCall,
     BargeInDuringSonicAudio,
     WriterFailureBeforeSonicAudio,
+    MalformedGeminiManuscriptIntent,
+    UnauthorizedGeminiManuscriptIntent,
+    NoGeminiManuscriptIntent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

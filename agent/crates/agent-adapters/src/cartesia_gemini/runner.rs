@@ -12,9 +12,10 @@ use tokio::{sync::mpsc, task::AbortHandle};
 
 use agent_domain::{
     AnswerEvaluation, AudioFrame, AuthorizedStudySession, BrainError, BrainEvent, BrainInput,
-    BrainUsage, ConceptStatus, RealtimeSession, RealtimeSessionTaskGuard, SessionConfig,
-    StudyMemoryStore, StudyQuestion, StudySessionPhase, StudySessionRecap, StudySourceReference,
-    ToolProposal, VivaToolExecutor,
+    BrainUsage, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent,
+    ManuscriptRegister, RealtimeSession, RealtimeSessionTaskGuard, SessionConfig, StudyMemoryStore,
+    StudyQuestion, StudySessionPhase, StudySessionRecap, StudySourceReference, ToolProposal,
+    ToolResult, VivaToolExecutor,
 };
 
 use super::llm::{stream_gemini_http, GeminiConversation};
@@ -457,7 +458,10 @@ where
                 conversation.snapshot(),
                 &self.config.tools,
             );
-            let stream = self.transports.stream_gemini(&self.config, request).await?;
+            let stream = fake_interrupt_gemini_stream(
+                self.transports.stream_gemini(&self.config, request).await?,
+                interrupt,
+            );
             let mut saw_tool_call = false;
             for event in stream {
                 match event {
@@ -468,6 +472,30 @@ where
                         }
                         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
                             return Ok(response_prompt);
+                        }
+                        if name == "emit_manuscript_intent" {
+                            let accepted =
+                                if let Some(intent) = parse_gemini_manuscript_intent(&args) {
+                                    if self
+                                        .authorize_gemini_manuscript_intent(session, &intent)
+                                        .await
+                                    {
+                                        events.push(BrainEvent::ManuscriptIntent {
+                                            response_id: response_id.to_owned(),
+                                            intent,
+                                        });
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+                            conversation.push_function_response(&ToolResult {
+                                proposal: ToolProposal::new(name, args).with_call_id(id),
+                                result: json!({ "accepted": accepted }),
+                            });
+                            continue;
                         }
                         let proposal = if name == "evaluate_spoken_answer" {
                             ToolProposal::evaluate_spoken_answer(
@@ -532,6 +560,25 @@ where
         } else {
             Ok(response_prompt)
         }
+    }
+
+    async fn authorize_gemini_manuscript_intent(
+        &self,
+        session: &AuthorizedStudySession,
+        intent: &ManuscriptIntent,
+    ) -> bool {
+        let Some(store) = self.store.as_ref() else {
+            return false;
+        };
+        store
+            .authorize_manuscript_intent(
+                &session.user_id,
+                &session.study_set_id,
+                &session.voice_session_id,
+                intent,
+            )
+            .await
+            .is_ok()
     }
 
     async fn emit_deterministic_study_tool_events(
@@ -730,6 +777,83 @@ struct GeminiToolLoopJob<'a> {
     cancelled: Option<&'a AtomicBool>,
 }
 
+fn fake_interrupt_gemini_stream(
+    stream: Vec<GeminiStreamEvent>,
+    interrupt: FakeRuntimeInterrupt,
+) -> Vec<GeminiStreamEvent> {
+    match interrupt {
+        FakeRuntimeInterrupt::NoGeminiManuscriptIntent => stream
+            .into_iter()
+            .filter(|event| {
+                !matches!(
+                    event,
+                    GeminiStreamEvent::FunctionCall { name, .. }
+                        if name == "emit_manuscript_intent"
+                )
+            })
+            .collect(),
+        FakeRuntimeInterrupt::MalformedGeminiManuscriptIntent => stream
+            .into_iter()
+            .map(|event| match event {
+                GeminiStreamEvent::FunctionCall { id, name, .. }
+                    if name == "emit_manuscript_intent" =>
+                {
+                    let args = json!({
+                        "type": "entity_intent",
+                        "entity_id": "<script>raw-markup</script>",
+                        "entity_kind": "concept",
+                        "register": "correcting",
+                        "emphasis": "marked",
+                    });
+                    GeminiStreamEvent::FunctionCall {
+                        id,
+                        name,
+                        args: args.clone(),
+                        part: json!({
+                            "functionCall": {
+                                "id": "call-manuscript-invalid",
+                                "name": "emit_manuscript_intent",
+                                "args": args,
+                            }
+                        }),
+                    }
+                }
+                event => event,
+            })
+            .collect(),
+        FakeRuntimeInterrupt::UnauthorizedGeminiManuscriptIntent => stream
+            .into_iter()
+            .map(|event| match event {
+                GeminiStreamEvent::FunctionCall { id, name, .. }
+                    if name == "emit_manuscript_intent" =>
+                {
+                    let args = json!({
+                        "type": "entity_intent",
+                        "entity_id": "unknown-concept",
+                        "entity_kind": "concept",
+                        "register": "correcting",
+                        "emphasis": "marked",
+                    });
+                    GeminiStreamEvent::FunctionCall {
+                        id,
+                        name,
+                        args: args.clone(),
+                        part: json!({
+                            "functionCall": {
+                                "id": "call-manuscript-unauthorized",
+                                "name": "emit_manuscript_intent",
+                                "args": args,
+                            }
+                        }),
+                    }
+                }
+                event => event,
+            })
+            .collect(),
+        _ => stream,
+    }
+}
+
 struct StudyToolEventJob<'a> {
     event_tx: &'a mpsc::Sender<BrainEvent>,
     executor: &'a VivaToolExecutor,
@@ -865,6 +989,13 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
                 "question_id": "q-oxidative-phosphorylation-nadh",
                 "answer_text": answer_text,
             });
+            let manuscript_args = json!({
+                "type": "entity_intent",
+                "entity_id": "nadh",
+                "entity_kind": "concept",
+                "register": "correcting",
+                "emphasis": "marked",
+            });
             Ok(vec![
                 GeminiStreamEvent::FunctionCall {
                     id: "call-eval-1".to_owned(),
@@ -875,6 +1006,18 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
                             "id": "call-eval-1",
                             "name": "evaluate_spoken_answer",
                             "args": args,
+                        }
+                    }),
+                },
+                GeminiStreamEvent::FunctionCall {
+                    id: "call-manuscript-1".to_owned(),
+                    name: "emit_manuscript_intent".to_owned(),
+                    args: manuscript_args.clone(),
+                    part: json!({
+                        "functionCall": {
+                            "id": "call-manuscript-1",
+                            "name": "emit_manuscript_intent",
+                            "args": manuscript_args,
                         }
                     }),
                 },
@@ -935,6 +1078,103 @@ fn concept_status_tool_arg(status: &ConceptStatus) -> &'static str {
         ConceptStatus::Missed => "missed",
         ConceptStatus::Review => "review",
     }
+}
+
+fn parse_gemini_manuscript_intent(args: &Value) -> Option<ManuscriptIntent> {
+    let intent = args.as_object()?;
+    let intent_type = intent.get("type")?.as_str()?;
+    let register = parse_manuscript_register(intent.get("register")?)?;
+    let emphasis = parse_manuscript_emphasis(intent.get("emphasis")?)?;
+    match intent_type {
+        "scene_intent" => {
+            require_only_manuscript_keys(intent, &["type", "register", "emphasis"])?;
+            Some(ManuscriptIntent::Scene { register, emphasis })
+        }
+        "entity_intent" => {
+            require_only_manuscript_keys(
+                intent,
+                &["type", "entity_id", "entity_kind", "register", "emphasis"],
+            )?;
+            Some(ManuscriptIntent::Entity {
+                entity_id: parse_manuscript_id(intent.get("entity_id")?)?,
+                entity_kind: parse_manuscript_entity_kind(intent.get("entity_kind")?)?,
+                register,
+                emphasis,
+            })
+        }
+        "marginalia_intent" => {
+            require_only_manuscript_keys(
+                intent,
+                &[
+                    "type",
+                    "marginalia_id",
+                    "anchor_entity_id",
+                    "register",
+                    "emphasis",
+                ],
+            )?;
+            Some(ManuscriptIntent::Marginalia {
+                marginalia_id: parse_manuscript_id(intent.get("marginalia_id")?)?,
+                anchor_entity_id: parse_manuscript_id(intent.get("anchor_entity_id")?)?,
+                register,
+                emphasis,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn require_only_manuscript_keys(
+    intent: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> Option<()> {
+    intent
+        .keys()
+        .all(|key| allowed.iter().any(|allowed| key == allowed))
+        .then_some(())
+}
+
+fn parse_manuscript_register(value: &Value) -> Option<ManuscriptRegister> {
+    match value.as_str()? {
+        "examining" => Some(ManuscriptRegister::Examining),
+        "reflecting" => Some(ManuscriptRegister::Reflecting),
+        "correcting" => Some(ManuscriptRegister::Correcting),
+        "sourcing" => Some(ManuscriptRegister::Sourcing),
+        "recapping" => Some(ManuscriptRegister::Recapping),
+        _ => None,
+    }
+}
+
+fn parse_manuscript_emphasis(value: &Value) -> Option<ManuscriptEmphasis> {
+    match value.as_str()? {
+        "quiet" => Some(ManuscriptEmphasis::Quiet),
+        "measured" => Some(ManuscriptEmphasis::Measured),
+        "marked" => Some(ManuscriptEmphasis::Marked),
+        _ => None,
+    }
+}
+
+fn parse_manuscript_entity_kind(value: &Value) -> Option<ManuscriptEntityKind> {
+    match value.as_str()? {
+        "concept" => Some(ManuscriptEntityKind::Concept),
+        "source" => Some(ManuscriptEntityKind::Source),
+        _ => None,
+    }
+}
+
+fn parse_manuscript_id(value: &Value) -> Option<String> {
+    let text = value.as_str()?;
+    is_valid_manuscript_id(text).then(|| text.to_owned())
+}
+
+fn is_valid_manuscript_id(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    text.len() <= 96
+        && first.is_ascii_alphanumeric()
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-'))
 }
 
 #[derive(Clone, Copy, Debug)]

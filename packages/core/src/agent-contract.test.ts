@@ -337,6 +337,7 @@ describe("Viva voice agent contract", () => {
       "transcript_final",
       "session_phase",
       "answer_evaluated",
+      "manuscript_intent",
       "source_reference",
       "concept_status",
       "audio_delta",
@@ -384,6 +385,8 @@ describe("Viva voice agent contract", () => {
   });
 
   test("keeps fake Cartesia/Gemini evidence pack sanitized and tied to release contract", () => {
+    expect(fakeEvidencePackFixture.client_frame_count).toBe(fakeSessionFixture.client.length);
+    expect(fakeEvidencePackFixture.server_frame_count).toBe(fakeSessionFixture.server.length - 1);
     expect(fakeEvidencePackFixture.store_snapshot).toEqual({
       sessions: 1,
       answer_attempts: 1,
