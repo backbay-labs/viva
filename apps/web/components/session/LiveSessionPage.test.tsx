@@ -7,6 +7,7 @@ import {
   captureLevelForBloom,
   derivedStateWithProjectedRecap,
   enterTextAnswerMode,
+  isSessionOver,
   micStateForAudioCaptureError,
   micStateForCaptureEndReason,
   pcm16ChunksToBase64,
@@ -14,6 +15,21 @@ import {
   stopCaptureForRecap,
   textAnswerPayload,
 } from "./LiveSessionPage";
+
+describe("isSessionOver", () => {
+  test("a delivered recap freezes the session clock and stops the readiness probe", () => {
+    expect(isSessionOver({ recap: { headline: "done" }, status: "open" })).toBe(true);
+  });
+
+  test("a terminal socket close freezes the clock even without a recap payload", () => {
+    expect(isSessionOver({ recap: undefined, status: "closed" })).toBe(true);
+  });
+
+  test("an active, connected session keeps the clock running", () => {
+    expect(isSessionOver({ recap: undefined, status: "open" })).toBe(false);
+    expect(isSessionOver({ recap: undefined, status: "connecting" })).toBe(false);
+  });
+});
 
 describe("LiveSessionPage recap cleanup", () => {
   test("stops microphone capture when a terminal recap appears", () => {
