@@ -28,6 +28,18 @@ function render(prompt: string, state: SessionState, highlightedTokens: string[]
   );
 }
 
+test("announces the question via a dedicated live region, not the heading itself", () => {
+  const markup = render("Explain the role of NADH.", "listening", []);
+  // A separate visually-hidden polite region speaks the plain prompt, so a new
+  // question is read aloud in a voice-first product.
+  expect(markup).toContain('class="sr-only"');
+  expect(/<p[^>]*aria-live="polite"[^>]*>/.test(markup)).toBe(true);
+  expect(markup).toContain("Explain the role of NADH.");
+  // The heading itself is NOT a live region — the post-answer source-term reveal
+  // must never re-announce the whole question.
+  expect(/<h1[^>]*aria-live/.test(markup)).toBe(false);
+});
+
 test("reveals a source term inside the prompt once the answer is being reviewed", () => {
   const markup = render("Describe how the proton gradient drives ATP synthase.", "correction", [
     "ATP synthase",

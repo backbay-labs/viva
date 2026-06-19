@@ -35,7 +35,13 @@ export function QuestionStage({
           </Fragment>
         ))}
       </h1>
-      <p className="question-stage__status" aria-live="polite">
+      {/* The heading stays a clean heading; a dedicated live region speaks the
+          plain prompt so assistive tech hears a new question without the
+          source-term reveal re-announcing the whole line. */}
+      <p aria-atomic="true" aria-live="polite" className="sr-only">
+        {question.prompt}
+      </p>
+      <p aria-hidden="true" className="question-stage__status">
         <Spark className="question-stage__spark" color="var(--viva-gold)" size={13} />
         <span>{STATUS_LINE[state]}</span>
       </p>

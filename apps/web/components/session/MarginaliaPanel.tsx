@@ -87,7 +87,10 @@ export function MarginaliaPanel({
           strokeWidth={1.6}
         />
       </div>
-      <div className="marginalia__body" aria-live="polite">
+      <p className="marginalia__announcer" aria-live="polite">
+        {marginaliaAnnouncement(state, recap)}
+      </p>
+      <div className="marginalia__body">
         {state !== "listening" && !isSource && !isRecap && studentHandAnswer ? (
           <StudentHand answer={studentHandAnswer} />
         ) : null}
@@ -396,6 +399,28 @@ function RecapFold({
 
 function joinRecapItems(items: string[]) {
   return items.length > 0 ? items.join(", ") : "none yet";
+}
+
+/**
+ * A concise, stable per-state line for the visually-hidden live region — so a
+ * screen reader hears what changed (listening, correction ready, recap) without
+ * the panel re-reading the readiness ladder, the answer textarea, or the rings,
+ * and without churning on the 5s readiness probe (the copy is state-derived, not
+ * runtime-derived).
+ */
+function marginaliaAnnouncement(state: SessionState, recap?: SessionRecap): string {
+  switch (state) {
+    case "listening":
+      return "Listening for your answer.";
+    case "thinking":
+      return "Checking your answer against your sources.";
+    case "correction":
+      return "A correction is ready in the margin.";
+    case "source":
+      return "The source folio is open.";
+    case "recap":
+      return recap ? `Session recap ready. ${recap.headline}` : "The session has closed.";
+  }
 }
 
 type RecapMasteryTier = { label: string; count: number; pct: number; color: string };
