@@ -23,16 +23,17 @@ describe("drainAgentAudio", () => {
   const out = (responseId: string): VivaAgentAudioOutput =>
     ({ responseId, frame: {} }) as unknown as VivaAgentAudioOutput;
 
-  test("flushes new cancellations, enqueues pending audio, and acknowledges the consumed count", () => {
+  test("flushes new cancellations, enqueues pending audio, and acknowledges the exact frames", () => {
     const enqueued: string[] = [];
     const cancelled: string[] = [];
-    let acked = -1;
+    let acked: readonly VivaAgentAudioOutput[] = [];
+    const audio = [out("r1"), out("r1"), out("r2")];
 
     const next = drainAgentAudio({
-      acknowledgeAudio: (count) => {
-        acked = count;
+      acknowledgeAudio: (consumed) => {
+        acked = consumed;
       },
-      audio: [out("r1"), out("r1"), out("r2")],
+      audio,
       cancellations: ["rX"],
       handledCancel: 0,
       sink: {
@@ -44,7 +45,8 @@ describe("drainAgentAudio", () => {
     // Cancellations flush before enqueue so barge-in stops a response in time.
     expect(cancelled).toEqual(["rX"]);
     expect(enqueued).toEqual(["r1", "r1", "r2"]);
-    expect(acked).toBe(3);
+    // The exact frame objects are acknowledged (by reference, not a count).
+    expect(acked).toBe(audio);
     expect(next).toBe(1);
   });
 

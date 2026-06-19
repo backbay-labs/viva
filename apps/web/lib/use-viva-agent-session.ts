@@ -25,6 +25,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   createVivaAgentSessionController,
   initialVivaAgentSessionState,
+  type VivaAgentAudioOutput,
   type VivaAgentClientOptions,
   type VivaAgentSessionController,
   type VivaAgentSessionState,
@@ -104,7 +105,8 @@ export function useVivaAgentSession(options: UseVivaAgentSessionOptions) {
   );
 
   return {
-    acknowledgeAudio: (count: number) => controllerRef.current?.acknowledgeAudio(count),
+    acknowledgeAudio: (consumed: readonly VivaAgentAudioOutput[]) =>
+      controllerRef.current?.acknowledgeAudio(consumed),
     agentState,
     cancel: () => controllerRef.current?.cancel(),
     close: () => controllerRef.current?.close(),

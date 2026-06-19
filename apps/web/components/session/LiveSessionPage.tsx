@@ -177,7 +177,7 @@ export function LiveSessionPage() {
     const cancellations = agent.agentState.cancelledResponseIds;
     if (audio.length === 0 && cancellations.length === handledCancelRef.current) return;
     handledCancelRef.current = drainAgentAudio({
-      acknowledgeAudio: (count) => agentRef.current.acknowledgeAudio(count),
+      acknowledgeAudio: (consumed) => agentRef.current.acknowledgeAudio(consumed),
       audio,
       cancellations,
       handledCancel: handledCancelRef.current,
@@ -600,8 +600,11 @@ export function isSessionOver(input: { recap: unknown; status: string }): boolea
  * controller drops the consumed frames (keeping `agentState.audio` a bounded
  * queue rather than an ever-growing log). New cancellations are flushed first so
  * barge-in stops a response before its remaining frames play. Returns the new
- * handled-cancellation count. Pure: all effects go through the injected sink and
- * acknowledge callback.
+ * handled-cancellation count. Side-effects are injected (sink + acknowledge), so
+ * it is deterministic and unit-testable without a socket. The exact frames
+ * enqueued are handed back to `acknowledgeAudio` (by reference) so the controller
+ * drops precisely those — never a positional count that a concurrent cancellation
+ * could make over-remove a not-yet-enqueued survivor.
  */
 export function drainAgentAudio(input: {
   audio: readonly VivaAgentAudioOutput[];
@@ -611,13 +614,13 @@ export function drainAgentAudio(input: {
     enqueue: (output: VivaAgentAudioOutput) => unknown;
     cancel: (responseId: string) => unknown;
   };
-  acknowledgeAudio: (count: number) => void;
+  acknowledgeAudio: (consumed: readonly VivaAgentAudioOutput[]) => void;
 }): number {
   for (const responseId of input.cancellations.slice(input.handledCancel)) {
     input.sink.cancel(responseId);
   }
   for (const output of input.audio) input.sink.enqueue(output);
-  if (input.audio.length > 0) input.acknowledgeAudio(input.audio.length);
+  if (input.audio.length > 0) input.acknowledgeAudio(input.audio);
   return input.cancellations.length;
 }
 
