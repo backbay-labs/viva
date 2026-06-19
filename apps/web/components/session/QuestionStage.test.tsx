@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { QuestionStage } from "./QuestionStage";
 import type { Question, SessionState } from "./session-data";
 
-function makeQuestion(prompt: string): Question {
+function makeQuestion(prompt: string, pending = false): Question {
   return {
     prompt,
     checklist: [],
@@ -15,8 +15,34 @@ function makeQuestion(prompt: string): Question {
     sourceFooter: "",
     status: "",
     highlights: [],
+    pending,
   };
 }
+
+test("renders a calm warming-up state for a pending connecting placeholder", () => {
+  const markup = renderToStaticMarkup(
+    <QuestionStage
+      highlightedTokens={[]}
+      question={makeQuestion("Connecting to your examiner…", true)}
+      state="listening"
+    />,
+  );
+  // The plate flags itself as a loading region rather than a real question.
+  expect(markup).toContain('data-pending="true"');
+  expect(markup).toContain('aria-busy="true"');
+});
+
+test("a real question is not flagged pending or busy", () => {
+  const markup = renderToStaticMarkup(
+    <QuestionStage
+      highlightedTokens={[]}
+      question={makeQuestion("Explain NADH.")}
+      state="listening"
+    />,
+  );
+  expect(markup).not.toContain('data-pending="true"');
+  expect(markup).not.toContain('aria-busy="true"');
+});
 
 function render(prompt: string, state: SessionState, highlightedTokens: string[]): string {
   return renderToStaticMarkup(

@@ -36,6 +36,9 @@ export type Question = {
   status: string;
   /** Concept terms to glow across the trace/manuscript for this prompt. */
   highlights: string[];
+  /** True while the examiner is connecting/preparing — the plate renders a calm
+   * warming-up state instead of dressing the placeholder up as a real question. */
+  pending?: boolean;
   /** Which marking family the correction belongs to (set once evaluated). */
   correctionFamily?: CorrectionFamily;
   /** Hypercorrection ink weight 0..1 — heavier when the student was confident and wrong. */

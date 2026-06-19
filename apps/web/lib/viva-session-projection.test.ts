@@ -694,6 +694,18 @@ describe("projectSessionQuestion", () => {
     expect(projected.correctionBody).toBe("");
     expect(projected.status).toBe("");
     expect(projected.correctionFamily).toBeUndefined();
+    // The placeholder is marked pending so the plate can render a warming-up
+    // state instead of dressing it up as a real question.
+    expect(projected.pending).toBe(true);
+  });
+
+  test("marks the warming-up placeholder pending, but never a terminal or real question", () => {
+    expect(projectSessionQuestion(derived({ phase: "ready" }), "idle", NOW).pending).toBe(true);
+    expect(projectSessionQuestion(derived({ phase: "ready" }), "error", NOW).pending).toBe(false);
+    expect(projectSessionQuestion(derived({ phase: "ready" }), "closed", NOW).pending).toBe(false);
+    // A real agent question is never pending.
+    const real = projectSessionQuestion(derived({ phase: "listening", question }), "open", NOW);
+    expect(real.pending ?? false).toBe(false);
   });
 
   test("projects the live agent question with no verdict before evaluation", () => {
