@@ -525,6 +525,49 @@ pub fn viva_tool_declarations() -> Vec<Value> {
         }),
         json!({
             "type": "function",
+            "name": "emit_manuscript_intent",
+            "description": "Emit a bounded Listening Manuscript intent for the active response. Use only semantic register, emphasis, and stable concept/source/marginalia anchors; never emit markup, coordinates, colors, CSS, drawing commands, or other render instructions.",
+            "parameters": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "type": { "type": "string", "enum": ["scene_intent"] },
+                            "register": { "type": "string", "enum": ["examining", "reflecting", "correcting", "sourcing", "recapping"] },
+                            "emphasis": { "type": "string", "enum": ["quiet", "measured", "marked"] }
+                        },
+                        "required": ["type", "register", "emphasis"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "type": { "type": "string", "enum": ["entity_intent"] },
+                            "entity_id": { "type": "string" },
+                            "entity_kind": { "type": "string", "enum": ["concept", "source"] },
+                            "register": { "type": "string", "enum": ["examining", "reflecting", "correcting", "sourcing", "recapping"] },
+                            "emphasis": { "type": "string", "enum": ["quiet", "measured", "marked"] }
+                        },
+                        "required": ["type", "entity_id", "entity_kind", "register", "emphasis"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "type": { "type": "string", "enum": ["marginalia_intent"] },
+                            "marginalia_id": { "type": "string" },
+                            "anchor_entity_id": { "type": "string" },
+                            "register": { "type": "string", "enum": ["examining", "reflecting", "correcting", "sourcing", "recapping"] },
+                            "emphasis": { "type": "string", "enum": ["quiet", "measured", "marked"] }
+                        },
+                        "required": ["type", "marginalia_id", "anchor_entity_id", "register", "emphasis"],
+                        "additionalProperties": false
+                    }
+                ]
+            }
+        }),
+        json!({
+            "type": "function",
             "name": "build_session_recap",
             "description": "Build the learner-facing recap after a voice session.",
             "parameters": {

@@ -158,6 +158,21 @@
       "type": "event",
       "version": 2,
       "event": {
+        "type": "manuscript_intent",
+        "response_id": "response-1",
+        "intent": {
+          "type": "entity_intent",
+          "entity_id": "nadh",
+          "entity_kind": "concept",
+          "register": "correcting",
+          "emphasis": "marked"
+        }
+      }
+    },
+    {
+      "type": "event",
+      "version": 2,
+      "event": {
         "type": "source_reference",
         "response_id": "response-1",
         "source": {

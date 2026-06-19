@@ -5,8 +5,9 @@ use agent_adapters::cartesia_gemini::{
 };
 use agent_domain::{
     AnswerEvaluation, AudioFrame, AuthorizedStudySession, BrainEvent, BrainInput, ConceptStatus,
-    PortError, RealtimeBrain, RealtimeSession, SessionConfig, SessionId, StudyMemoryStore,
-    StudyMode, StudyQuestion, StudySessionRecap, StudySourceReference, StudyStoreCapabilities,
+    ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent, ManuscriptRegister, PortError,
+    RealtimeBrain, RealtimeSession, SessionConfig, SessionId, StudyMemoryStore, StudyMode,
+    StudyQuestion, StudySessionRecap, StudySourceReference, StudyStoreCapabilities,
     StudyStoreWriteCounts, ToolProposal, VivaToolExecutor, VoiceUsageRecord,
 };
 use serde_json::json;
@@ -54,6 +55,62 @@ fn fake_provider_request_json_matches_viva_tool_contract() {
         request["tools"][0]["functionDeclarations"][1]["name"],
         "evaluate_spoken_answer"
     );
+}
+
+#[test]
+fn manuscript_intent_tool_schema_exposes_semantic_fields_only() {
+    let tools = viva_tool_declarations();
+    let declaration = tools
+        .iter()
+        .find(|tool| tool["name"] == "emit_manuscript_intent")
+        .expect("missing manuscript intent tool declaration");
+    let parameters = &declaration["parameters"];
+    let branches = parameters["anyOf"]
+        .as_array()
+        .expect("manuscript intent branch schemas");
+
+    assert_eq!(branches.len(), 3);
+    let entity_branch = branches
+        .iter()
+        .find(|branch| branch["properties"]["type"]["enum"][0] == "entity_intent")
+        .expect("entity intent branch");
+    assert_eq!(
+        entity_branch["required"],
+        json!(["type", "entity_id", "entity_kind", "register", "emphasis"])
+    );
+    assert_eq!(
+        entity_branch["properties"]["entity_kind"]["enum"],
+        json!(["concept", "source"])
+    );
+    let marginalia_branch = branches
+        .iter()
+        .find(|branch| branch["properties"]["type"]["enum"][0] == "marginalia_intent")
+        .expect("marginalia intent branch");
+    assert_eq!(
+        marginalia_branch["required"],
+        json!([
+            "type",
+            "marginalia_id",
+            "anchor_entity_id",
+            "register",
+            "emphasis"
+        ])
+    );
+    for branch in branches {
+        let properties = branch["properties"]
+            .as_object()
+            .expect("manuscript intent branch properties");
+        assert_eq!(branch["additionalProperties"], false);
+        assert!(properties.contains_key("type"));
+        assert!(properties.contains_key("register"));
+        assert!(properties.contains_key("emphasis"));
+    }
+    for forbidden in ["x", "y", "color", "css", "markup", "draw", "pixels"] {
+        assert!(branches.iter().all(|branch| !branch["properties"]
+            .as_object()
+            .expect("branch properties")
+            .contains_key(forbidden)));
+    }
 }
 
 #[test]
@@ -259,13 +316,28 @@ async fn fake_runtime_is_selectable_realtime_brain_without_live_keys() {
         .unwrap();
 
     let mut saw_evaluation = false;
+    let mut saw_manuscript_intent = false;
     let mut saw_audio = false;
     let mut saw_recap = false;
-    for _ in 0..12 {
+    for _ in 0..16 {
         match next_event(&mut session).await {
             BrainEvent::AnswerEvaluated { evaluation, .. } => {
                 assert_eq!(evaluation.answer_text, FAKE_INK_FINAL_TRANSCRIPT);
                 saw_evaluation = true;
+            }
+            BrainEvent::ManuscriptIntent {
+                response_id,
+                intent:
+                    ManuscriptIntent::Entity {
+                        entity_id,
+                        entity_kind: ManuscriptEntityKind::Concept,
+                        register: ManuscriptRegister::Correcting,
+                        emphasis: ManuscriptEmphasis::Marked,
+                    },
+            } => {
+                assert_eq!(response_id, "response-1");
+                assert_eq!(entity_id, "nadh");
+                saw_manuscript_intent = true;
             }
             BrainEvent::AudioDelta { frame, .. } => {
                 assert_eq!(frame.pcm16_bytes(), [1, 2, 3, 4]);
@@ -277,9 +349,13 @@ async fn fake_runtime_is_selectable_realtime_brain_without_live_keys() {
             }
             _ => {}
         }
+        if saw_evaluation && saw_manuscript_intent && saw_audio && saw_recap {
+            break;
+        }
     }
 
     assert!(saw_evaluation);
+    assert!(saw_manuscript_intent);
     assert!(saw_audio);
     assert!(saw_recap);
     let snapshot = store.snapshot();
@@ -574,6 +650,18 @@ async fn fake_runtime_replays_provider_shaped_pipeline_without_live_selection() 
         BrainEvent::AnswerEvaluated { evaluation, .. }
             if evaluation.answer_text == FAKE_INK_FINAL_TRANSCRIPT
     )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        BrainEvent::ManuscriptIntent {
+            response_id,
+            intent: ManuscriptIntent::Entity {
+                entity_id,
+                entity_kind: ManuscriptEntityKind::Concept,
+                register: ManuscriptRegister::Correcting,
+                emphasis: ManuscriptEmphasis::Marked,
+            },
+        } if response_id == "fake-cartesia-gemini-response-1" && entity_id == "nadh"
+    )));
     assert!(events.iter().all(|event| !matches!(
         event,
         BrainEvent::AnswerEvaluated { evaluation, .. }
@@ -588,6 +676,94 @@ async fn fake_runtime_replays_provider_shaped_pipeline_without_live_selection() 
         event,
         BrainEvent::AudioDelta { frame, .. } if frame.pcm16_bytes() == [1, 2, 3, 4]
     )));
+    assert_eq!(store.snapshot().answer_attempts.len(), 1);
+    assert!(CartesiaGeminiConfig::default().missing_live_keys());
+}
+
+#[tokio::test]
+async fn fake_runtime_drops_invalid_gemini_manuscript_intent_without_blocking_v1_events() {
+    let (store, session) = fixture_store_and_session().await;
+    let runtime = FakeCartesiaGeminiRuntime::new(store.clone());
+
+    let report = runtime
+        .replay_audio_turn_with_interrupt(
+            session,
+            AudioFrame::from_pcm16_bytes(vec![1_u8, 2, 3, 4]),
+            FakeRuntimeInterrupt::MalformedGeminiManuscriptIntent,
+        )
+        .await
+        .unwrap();
+
+    assert!(report
+        .events
+        .iter()
+        .all(|event| !matches!(event, BrainEvent::ManuscriptIntent { .. })));
+    assert!(report
+        .events
+        .iter()
+        .any(|event| matches!(event, BrainEvent::AnswerEvaluated { .. })));
+    assert!(report
+        .events
+        .iter()
+        .any(|event| matches!(event, BrainEvent::AudioDelta { .. })));
+    assert_eq!(store.snapshot().answer_attempts.len(), 1);
+}
+
+#[tokio::test]
+async fn fake_runtime_drops_unauthorized_gemini_manuscript_intent_without_blocking_v1_events() {
+    let (store, session) = fixture_store_and_session().await;
+    let runtime = FakeCartesiaGeminiRuntime::new(store.clone());
+
+    let report = runtime
+        .replay_audio_turn_with_interrupt(
+            session,
+            AudioFrame::from_pcm16_bytes(vec![1_u8, 2, 3, 4]),
+            FakeRuntimeInterrupt::UnauthorizedGeminiManuscriptIntent,
+        )
+        .await
+        .unwrap();
+
+    assert!(report
+        .events
+        .iter()
+        .all(|event| !matches!(event, BrainEvent::ManuscriptIntent { .. })));
+    assert!(report
+        .events
+        .iter()
+        .any(|event| matches!(event, BrainEvent::AnswerEvaluated { .. })));
+    assert!(report
+        .events
+        .iter()
+        .any(|event| matches!(event, BrainEvent::AudioDelta { .. })));
+    assert_eq!(store.snapshot().answer_attempts.len(), 1);
+}
+
+#[tokio::test]
+async fn fake_runtime_falls_back_to_v1_events_when_gemini_omits_manuscript_intent() {
+    let (store, session) = fixture_store_and_session().await;
+    let runtime = FakeCartesiaGeminiRuntime::new(store.clone());
+
+    let report = runtime
+        .replay_audio_turn_with_interrupt(
+            session,
+            AudioFrame::from_pcm16_bytes(vec![1_u8, 2, 3, 4]),
+            FakeRuntimeInterrupt::NoGeminiManuscriptIntent,
+        )
+        .await
+        .unwrap();
+
+    assert!(report
+        .events
+        .iter()
+        .all(|event| !matches!(event, BrainEvent::ManuscriptIntent { .. })));
+    assert!(report
+        .events
+        .iter()
+        .any(|event| matches!(event, BrainEvent::AnswerEvaluated { .. })));
+    assert!(report
+        .events
+        .iter()
+        .any(|event| matches!(event, BrainEvent::AudioDelta { .. })));
     assert_eq!(store.snapshot().answer_attempts.len(), 1);
     assert!(CartesiaGeminiConfig::default().missing_live_keys());
 }

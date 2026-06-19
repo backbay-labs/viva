@@ -2,7 +2,7 @@
   "client_fixture": "fake-cartesia-gemini-study-session.json#client",
   "server_fixture": "fake-cartesia-gemini-study-session.json#server",
   "client_frame_count": 4,
-  "server_frame_count": 15,
+  "server_frame_count": 16,
   "store_snapshot": {
     "sessions": 1,
     "answer_attempts": 1,
