@@ -249,7 +249,29 @@ curl -fsS "$AGENT_ORIGIN/ready" | jq '.brain.provider, .brain.selectable, .brain
 
 Do not call that live until `/ready` reports `cartesia_gemini`, `selectable: true`,
 and `live_runtime: true`, and an opt-in `/ws` session reaches a sanitized
-`recap_ready` event through the real provider cascade.
+`recap_ready` event through the real provider cascade. The harness is disabled
+unless `VIVA_LIVE_PROVIDER_SMOKE=1` is present, reads spoken PCM input only from
+an explicit local file, and writes sanitized counters to
+`artifacts/live-provider-smoke/evidence.json`:
+
+```sh
+export VIVA_LIVE_PROVIDER_SMOKE=1
+export VIVA_LIVE_SMOKE_AGENT_HTTP_URL="$AGENT_ORIGIN"
+export VIVA_LIVE_SMOKE_ORIGIN="https://app.viva.example.com"
+export VIVA_LIVE_SMOKE_AUDIO_FILE="$PWD/artifacts/live-smoke/answer.pcm"
+export VIVA_LIVE_SMOKE_MAX_DURATION_MS=90000
+export VIVA_LIVE_SMOKE_MAX_TURNS=1
+export VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES=262144
+export VIVA_VOICE_WS_MAX_SESSION_COST_USD=0.25
+bun run live:smoke
+jq '.status, .websocket.required_events, .usage.events_delta' \
+  artifacts/live-provider-smoke/evidence.json
+```
+
+That evidence may record readiness flags, terminal reason, event-class counts,
+and usage-event deltas only. It must not retain provider keys, raw audio,
+transcript content, answer content, prompts, full notes, raw provider responses,
+or source excerpts.
 
 ## Rollback And Drain
 
