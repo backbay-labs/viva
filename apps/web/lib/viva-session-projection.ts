@@ -735,9 +735,9 @@ function runtimeReadinessNotes(
     });
   }
 
-  if (context.readinessProbe) {
+  if (context.readinessProbe && !probeContradictsLiveReady(context.readinessProbe, context.ready)) {
     notes.push(...probeNotes(context.readinessProbe));
-  } else if (!context.ready) {
+  } else if (!context.readinessProbe && !context.ready) {
     const waiting = context.status === "connecting" || context.status === "idle";
     notes.push({
       label: "Socket",
@@ -794,6 +794,17 @@ function runtimeReadinessNotes(
   }
 
   return notes;
+}
+
+/**
+ * A live WebSocket `ready` frame is authoritative proof the agent is reachable.
+ * A stale 5s HTTP poll that is still "checking" or has gone "offline" would only
+ * contradict it — a red "agent offline" line above the green Provider/Store
+ * notes on a healthy session. Drop those once we have the live facts; keep
+ * "observed"/"api_missing" probes, which add information rather than contradict.
+ */
+function probeContradictsLiveReady(probe: VivaAgentReadinessProbe, ready: unknown): boolean {
+  return Boolean(ready) && (probe.status === "offline" || probe.status === "checking");
 }
 
 function probeNotes(probe: VivaAgentReadinessProbe): RuntimeReadinessNote[] {

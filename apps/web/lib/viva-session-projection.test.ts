@@ -338,6 +338,56 @@ describe("projectRuntimeCopy", () => {
     expect(copy.marginaliaTitle).toBe("Agent unavailable: live provider gated.");
   });
 
+  test("a dropped readiness poll never contradicts a live, ready socket", () => {
+    const copy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      readinessProbe: {
+        apiBaseUrl: "http://127.0.0.1:4318",
+        error: "fetch failed",
+        status: "offline",
+      },
+      status: "open",
+    });
+
+    // The live WS ready frame already proves the agent is reachable, so a stale
+    // HTTP poll must not inject a contradicting "agent offline" line above the
+    // green Provider/Store notes.
+    expect(
+      copy.readinessNotes.some((note) => note.label === "Agent" && note.state === "unavailable"),
+    ).toBe(false);
+    expect(
+      copy.readinessNotes.some((note) => note.label === "Provider" && note.state === "ready"),
+    ).toBe(true);
+  });
+
+  test("a still-checking poll is suppressed once the live ready frame has arrived", () => {
+    const copy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      readinessProbe: { apiBaseUrl: "http://127.0.0.1:4318", status: "checking" },
+      status: "open",
+    });
+
+    expect(copy.readinessNotes.some((note) => note.state === "checking")).toBe(false);
+  });
+
+  test("the readiness probe still surfaces offline when there is no live ready frame", () => {
+    const copy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      readinessProbe: {
+        apiBaseUrl: "http://127.0.0.1:4318",
+        error: "fetch failed",
+        status: "offline",
+      },
+      status: "connecting",
+    });
+
+    expect(
+      copy.readinessNotes.some((note) => note.label === "Agent" && note.state === "unavailable"),
+    ).toBe(true);
+  });
+
   test("surfaces REST readiness as quiet marginalia for gated providers", () => {
     const copy = projectRuntimeCopy({
       readiness: trustedReadiness,
