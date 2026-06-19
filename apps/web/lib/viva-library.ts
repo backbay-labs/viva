@@ -112,12 +112,21 @@ export type ProjectedLibraryRow = {
   delete: ProjectedLibraryAction;
 };
 
+export type ProjectedSessionMastery = {
+  strong: number;
+  shaky: number;
+  missed: number;
+  total: number;
+  strongPct: number;
+};
+
 export type ProjectedSessionRow = {
   id: string;
   studySetId: string;
   studySetTitle: string;
   statusLabel: string;
   recapLabel: string;
+  mastery: ProjectedSessionMastery | null;
   nextReview: ProjectedNextReview | null;
 };
 
@@ -183,8 +192,27 @@ function projectSessionRow(session: VivaLibrarySession): ProjectedSessionRow {
     studySetTitle: session.study_set_title,
     statusLabel: sessionStatusLabel(session),
     recapLabel: recapLabel(session.recap),
+    mastery: projectSessionMastery(session.recap),
     nextReview: projectNextReview(session.next_review),
   };
+}
+
+/**
+ * Reduce a recap's graded buckets to the at-a-glance mastery a session card
+ * rings: the share of graded concepts the student held. `review_later` is a
+ * scheduling overlay (and overlaps the graded buckets), so it never inflates
+ * the total. Returns null when nothing was graded, so the ring stays silent.
+ */
+function projectSessionMastery(
+  recap: VivaLibrarySessionRecap | null,
+): ProjectedSessionMastery | null {
+  if (!recap) return null;
+  const strong = recap.strong_concepts.length;
+  const shaky = recap.shaky_concepts.length;
+  const missed = recap.missed_concepts.length;
+  const total = strong + shaky + missed;
+  if (total === 0) return null;
+  return { strong, shaky, missed, total, strongPct: Math.round((strong / total) * 100) };
 }
 
 function projectSessionAction(action: VivaLibraryAction): ProjectedLibraryAction {

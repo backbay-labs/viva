@@ -1,5 +1,6 @@
 "use client";
 
+import { MasteryRing } from "@viva/ui-web";
 import { useEffect, useState } from "react";
 import {
   deleteVivaSessionHistory,
@@ -120,7 +121,17 @@ export function LibraryStatusPanel({
           </header>
           <div className="viva-library__grid">
             {projection.sessionRows.map((row) => (
-              <article className="viva-library__row" key={row.id}>
+              <article className="viva-library__row viva-library__row--session" key={row.id}>
+                {row.mastery ? (
+                  <MasteryRing
+                    color="var(--sage)"
+                    pct={row.mastery.strongPct}
+                    size={52}
+                    stroke={5}
+                  />
+                ) : (
+                  <span className="viva-library__ring-placeholder" aria-hidden="true" />
+                )}
                 <div>
                   <h3>{row.studySetTitle}</h3>
                   <p>{row.statusLabel}</p>
@@ -128,8 +139,9 @@ export function LibraryStatusPanel({
                 <div className="viva-library__meta">
                   <span>{row.recapLabel}</span>
                   {row.nextReview ? (
-                    <span>
-                      {row.nextReview.label} · {row.nextReview.intervalLabel} · server schedule
+                    <span className="viva-library__next-drill">
+                      Next drill: {row.nextReview.label} · {row.nextReview.intervalLabel} · server
+                      schedule
                     </span>
                   ) : (
                     <span>No scheduled review</span>
@@ -138,6 +150,7 @@ export function LibraryStatusPanel({
                 <div className="viva-library__actions">
                   <button
                     aria-label={`Delete recap for ${row.studySetTitle}`}
+                    className="viva-library__action--danger"
                     disabled={!projection.privacy.export.available || busyAction === "Delete recap"}
                     onClick={() => deleteSession(row)}
                     type="button"
@@ -179,6 +192,7 @@ function LibraryStudySetRow({
       <div className="viva-library__actions">
         <button
           aria-label={`Start ${row.title}`}
+          className="viva-library__action--primary"
           data-session-target={startTarget}
           disabled={!row.start.available}
           onClick={() => navigateToSession(startTarget)}
@@ -188,6 +202,7 @@ function LibraryStudySetRow({
         </button>
         <button
           aria-label={`Resume ${row.title}`}
+          className="viva-library__action--primary"
           data-session-target={resumeTarget}
           disabled={!row.resume.available}
           onClick={() => navigateToSession(resumeTarget)}
@@ -197,6 +212,7 @@ function LibraryStudySetRow({
         </button>
         <button
           aria-label={`Delete source for ${row.title}`}
+          className="viva-library__action--danger"
           disabled={!row.delete.available || busy}
           onClick={() => onDelete(row)}
           type="button"
