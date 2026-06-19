@@ -236,4 +236,40 @@ describe("Viva library projection", () => {
     expect(session?.nextReview?.intervalLabel).toBe("due Jan 1, 2099");
     expect(session?.nextReview?.persistedDueAt).toBe("2099-01-01T00:00:00Z");
   });
+
+  test("derives a session mastery ring shape from the graded recap buckets", () => {
+    const projection = projectLibrarySnapshot(snapshot, {
+      now: new Date("2026-06-17T12:00:00Z"),
+    });
+
+    const mastery = projection.sessionRows[0]?.mastery;
+    // strong 1 / shaky 1 / missed 0 -> 2 graded -> 50% held. review_later overlaps
+    // shaky and is a scheduling overlay, so it never inflates the graded total.
+    expect(mastery).not.toBe(null);
+    expect(mastery?.strong).toBe(1);
+    expect(mastery?.shaky).toBe(1);
+    expect(mastery?.missed).toBe(0);
+    expect(mastery?.total).toBe(2);
+    expect(mastery?.strongPct).toBe(50);
+  });
+
+  test("leaves session mastery null when a recap graded nothing", () => {
+    const noRecapSnapshot: VivaLibrarySnapshot = {
+      ...snapshot,
+      sessions: [
+        {
+          voice_session_id: "voice-session-2",
+          study_set_id: "biology-midterm",
+          study_set_title: "Biology Midterm",
+          status: "closed",
+          terminal_reason: "completed",
+          recap: null,
+          next_review: null,
+        },
+      ],
+    };
+
+    const projection = projectLibrarySnapshot(noRecapSnapshot);
+    expect(projection.sessionRows[0]?.mastery).toBe(null);
+  });
 });

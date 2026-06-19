@@ -2779,6 +2779,53 @@ button {
   cursor: not-allowed;
 }
 
+/* Destructive actions are real but quiet — a ghost affordance that only warms to
+   a danger tint on intent, so the card leads with study, not deletion. */
+.viva-library__actions button.viva-library__action--danger:not(:disabled) {
+  background: transparent;
+  border-color: rgba(64, 42, 82, 0.16);
+  color: var(--viva-muted);
+  font-weight: 650;
+}
+
+.viva-library__actions button.viva-library__action--danger:not(:disabled):hover {
+  background: rgba(176, 74, 74, 0.07);
+  border-color: rgba(176, 74, 74, 0.4);
+  color: #a14a4a;
+}
+
+/* Session recap card: a held-mastery ring leads, then title, recap, next drill. */
+.viva-library__row--session {
+  grid-template-columns: auto minmax(9rem, 1fr) minmax(12rem, 2fr) auto;
+}
+
+.viva-library__ring-placeholder {
+  width: 52px;
+  height: 52px;
+}
+
+.viva-library__mastery {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.2rem;
+}
+
+.viva-library__mastery-caption {
+  font-family: var(--sans);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--sage);
+}
+
+.viva-library__meta span.viva-library__next-drill {
+  background: rgba(129, 84, 189, 0.12);
+  border-color: rgba(129, 84, 189, 0.28);
+  color: var(--viva-amethyst-deep);
+}
+
 @keyframes vivaFadeUp {
   from {
     opacity: 0;
@@ -2819,6 +2866,11 @@ button {
   .viva-library__row {
     align-items: stretch;
     grid-template-columns: 1fr;
+  }
+
+  .viva-library__row--session {
+    grid-template-columns: 1fr;
+    justify-items: start;
   }
 
   .viva-library__actions {

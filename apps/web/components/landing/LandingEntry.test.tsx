@@ -129,4 +129,22 @@ describe("LandingEntry", () => {
       "/session?user_id=user-1&amp;study_set_id=biology-midterm&amp;session_id=server-session&amp;session_token=viva1.server-token",
     );
   });
+
+  test("session cards surface a mastery ring, emphasise the next drill, and quiet the delete", () => {
+    const markup = renderToStaticMarkup(
+      <LandingEntry initialLibrarySnapshot={librarySnapshot} onEnter={() => {}} />,
+    );
+
+    // The completed session recap (1 strong / 1 shaky) rings its held share,
+    // captioned so the bare percentage never reads as overall mastery.
+    expect(markup).toContain("mastery-ring");
+    expect(markup).toContain("viva-library__mastery-caption");
+    // The persisted next review reads as the card's next action, not flat metadata.
+    expect(markup).toContain("Next drill");
+    expect(markup).toContain("server schedule");
+    // Destructive actions are demoted to a quiet danger affordance.
+    expect(markup).toContain("viva-library__action--danger");
+    // The study-set primary action keeps its emphasis.
+    expect(markup).toContain("viva-library__action--primary");
+  });
 });
