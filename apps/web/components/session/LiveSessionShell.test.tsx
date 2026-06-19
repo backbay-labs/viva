@@ -697,10 +697,13 @@ describe("LiveSessionShell scene intent wiring", () => {
 
     // Three mastery rings summarise the session shape at a glance.
     expect((markup.match(/class="mastery-ring"/g) ?? []).length).toBe(3);
-    // strong 2 / shaky 1+1 missed / review 1 -> total 4 concepts -> 50% / 50% / 25%.
+    // strong 2 / shaky (1 shaky + 1 missed) / review 1 -> 5 graded -> 40% / 40% / 20%.
     expect(markup).toContain("recap-stat");
     expect(markup).toContain("2 concepts");
     expect(markup).toContain("1 concept<");
+    // The ring percentages are each tier's honest share of the graded concepts.
+    expect(markup).toContain(">40</span>%");
+    expect(markup).toContain(">20</span>%");
     // The generated study plan renders as a real timeline, not comma-joined text.
     expect((markup.match(/class="timeline-item /g) ?? []).length).toBe(3);
     expect(markup).toContain("Study plan");

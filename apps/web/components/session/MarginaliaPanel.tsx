@@ -334,7 +334,7 @@ function RecapFold({
             {recap.plan.map((item, index) => (
               <TimelineItem
                 day={item.day}
-                key={`${item.day}-${item.topics}`}
+                key={`${item.day}-${item.topics}-${item.meta}`}
                 last={index === recap.plan.length - 1}
                 meta={item.meta}
                 status={item.status}
