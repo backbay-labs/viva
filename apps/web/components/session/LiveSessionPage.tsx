@@ -141,13 +141,17 @@ export function LiveSessionPage() {
     return () => window.clearTimeout(id);
   }, []);
 
-  // Mocked session clock (cosmetic, counts up).
+  // Session duration clock — counts up while the session is live, then freezes
+  // on its final duration once a recap arrives or the socket terminally closes.
+  const sessionOver = isSessionOver({ recap: agent.derived.recap, status: agent.status });
   useEffect(() => {
+    if (sessionOver) return;
     const id = window.setInterval(() => setElapsed((value) => value + 1), 1000);
     return () => window.clearInterval(id);
-  }, []);
+  }, [sessionOver]);
 
   useEffect(() => {
+    if (sessionOver) return;
     let cancelled = false;
     const refreshReadiness = async () => {
       const next = await fetchVivaAgentReadinessProbe();
@@ -159,7 +163,7 @@ export function LiveSessionPage() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, []);
+  }, [sessionOver]);
 
   // Play the examiner's streamed audio (synthetic emits none yet; wired for the
   // real provider) and honour cancellations/barge-in.
@@ -577,6 +581,16 @@ export function LiveSessionPage() {
       }
     />
   );
+}
+
+/**
+ * The session is over once the Conductor has delivered a recap or the socket has
+ * terminally closed. Session-lifecycle effects (the duration clock, the 5s
+ * readiness probe) stop here so the closed manuscript doesn't keep ticking or
+ * polling — the clock freezes on its final duration, not climbing forever.
+ */
+export function isSessionOver(input: { recap: unknown; status: string }): boolean {
+  return Boolean(input.recap) || input.status === "closed";
 }
 
 export function stopCaptureForRecap(
