@@ -85,6 +85,28 @@ describe("Viva voice agent contract", () => {
       terminal_reason: "turn_cap",
     });
 
+    for (const terminalReason of [
+      "provider_auth_failed",
+      "provider_rate_limited",
+      "provider_timeout",
+      "provider_malformed_stream",
+      "provider_network_disconnect",
+      "slow_client",
+      "provider_cancelled",
+      "partial_stage_success",
+    ] as const) {
+      const parsed = parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "session_phase",
+          phase: "recap",
+          terminal_reason: terminalReason,
+        },
+      });
+      expect(parsed.type).toBe("event");
+    }
+
     expect(() =>
       parseVivaServerFrame({
         type: "event",

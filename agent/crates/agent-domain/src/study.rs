@@ -22,6 +22,14 @@ pub enum TerminalSessionReason {
     TurnCap,
     RateLimit,
     CostBudget,
+    ProviderAuthFailed,
+    ProviderRateLimited,
+    ProviderTimeout,
+    ProviderMalformedStream,
+    ProviderNetworkDisconnect,
+    SlowClient,
+    ProviderCancelled,
+    PartialStageSuccess,
 }
 
 impl TerminalSessionReason {
@@ -32,6 +40,14 @@ impl TerminalSessionReason {
             Self::TurnCap => "turn_cap",
             Self::RateLimit => "rate_limit",
             Self::CostBudget => "cost_budget",
+            Self::ProviderAuthFailed => "provider_auth_failed",
+            Self::ProviderRateLimited => "provider_rate_limited",
+            Self::ProviderTimeout => "provider_timeout",
+            Self::ProviderMalformedStream => "provider_malformed_stream",
+            Self::ProviderNetworkDisconnect => "provider_network_disconnect",
+            Self::SlowClient => "slow_client",
+            Self::ProviderCancelled => "provider_cancelled",
+            Self::PartialStageSuccess => "partial_stage_success",
         }
     }
 
@@ -42,6 +58,14 @@ impl TerminalSessionReason {
             Self::TurnCap => "turn cap",
             Self::RateLimit => "rate limit",
             Self::CostBudget => "cost budget",
+            Self::ProviderAuthFailed => "provider auth failed",
+            Self::ProviderRateLimited => "provider rate limited",
+            Self::ProviderTimeout => "provider timeout",
+            Self::ProviderMalformedStream => "provider malformed stream",
+            Self::ProviderNetworkDisconnect => "provider network disconnect",
+            Self::SlowClient => "slow client",
+            Self::ProviderCancelled => "provider cancelled",
+            Self::PartialStageSuccess => "partial stage success",
         }
     }
 }

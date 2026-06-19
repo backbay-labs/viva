@@ -1,8 +1,8 @@
 use std::{collections::HashSet, time::Duration};
 
 use agent_domain::{
-    AudioFrame, BrainInput, SessionConfig, SessionTokenNonceClaim, StudySessionPhase,
-    TerminalSessionReason, VoiceUsageRecord,
+    AudioFrame, BrainError, BrainInput, BrainProviderError, SessionConfig, SessionTokenNonceClaim,
+    StudySessionPhase, TerminalSessionReason, VoiceUsageRecord,
 };
 use axum::{
     extract::{
@@ -279,8 +279,13 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
     let mut session = match state.brain.open(initial_config).await {
         Ok(session) => session,
         Err(error) => {
-            let _ = send_json(&mut sender, &ServerFrame::error(error.to_string())).await;
-            record_terminal(&state, voice_session_id, "brain_open_error").await;
+            let terminal_reason = close_with_terminal_session_phase_only(
+                &mut sender,
+                terminal_reason_for_brain_error(&error),
+                close_code::ERROR,
+            )
+            .await;
+            record_terminal(&state, voice_session_id, terminal_reason).await;
             return;
         }
     };
@@ -409,6 +414,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
                                         .await;
                                         break;
                                     }
+                                    Ok(ForwardBrainEvent::ProviderFailure(reason)) => {
+                                        terminal_reason = close_with_terminal_session_phase(
+                                            &mut sender,
+                                            &session.input,
+                                            reason,
+                                            close_code::ERROR,
+                                        )
+                                        .await;
+                                        break;
+                                    }
                                     Err(_) => {
                                         terminal_reason = "send_failed";
                                     }
@@ -491,6 +506,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
                             &session.input,
                             TerminalSessionReason::CostBudget,
                             close_code::POLICY,
+                        )
+                        .await;
+                        break;
+                    }
+                    Ok(ForwardBrainEvent::ProviderFailure(reason)) => {
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            reason,
+                            close_code::ERROR,
                         )
                         .await;
                         break;
@@ -606,6 +631,7 @@ enum ForwardBrainEvent {
     Continue,
     Rejected,
     CostBudgetExceeded,
+    ProviderFailure(TerminalSessionReason),
 }
 
 async fn forward_brain_event<S>(
@@ -620,6 +646,11 @@ where
 {
     if should_suppress_cancelled_response(cancelled_responses, &event) {
         return Ok(ForwardBrainEvent::Continue);
+    }
+    if let agent_domain::BrainEvent::Error(error) = &event {
+        return Ok(ForwardBrainEvent::ProviderFailure(
+            terminal_reason_for_provider_error(error),
+        ));
     }
     if !authorize_browser_event(context.state, context.session_binding, &event).await {
         send_json(
@@ -649,6 +680,61 @@ where
     };
     send_json(sender, &frame).await?;
     Ok(ForwardBrainEvent::Continue)
+}
+
+fn terminal_reason_for_brain_error(error: &BrainError) -> TerminalSessionReason {
+    match error {
+        BrainError::MissingApiKey => TerminalSessionReason::ProviderAuthFailed,
+        BrainError::Connection(message) => terminal_reason_for_provider_message(message),
+        BrainError::Protocol(message) => {
+            let reason = terminal_reason_for_provider_message(message);
+            if reason == TerminalSessionReason::ProviderNetworkDisconnect {
+                TerminalSessionReason::ProviderMalformedStream
+            } else {
+                reason
+            }
+        }
+    }
+}
+
+fn terminal_reason_for_provider_error(error: &BrainProviderError) -> TerminalSessionReason {
+    let combined = format!("{} {}", error.source, error.message);
+    terminal_reason_for_provider_message(&combined)
+}
+
+fn terminal_reason_for_provider_message(message: &str) -> TerminalSessionReason {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("auth")
+        || normalized.contains("api key")
+        || normalized.contains("_api_key")
+        || normalized.contains("unauthorized")
+        || normalized.contains("forbidden")
+        || normalized.contains("permission")
+    {
+        return TerminalSessionReason::ProviderAuthFailed;
+    }
+    if normalized.contains("rate")
+        || normalized.contains("quota")
+        || normalized.contains("budget")
+        || normalized.contains("429")
+    {
+        return TerminalSessionReason::ProviderRateLimited;
+    }
+    if normalized.contains("timeout") || normalized.contains("timed out") {
+        return TerminalSessionReason::ProviderTimeout;
+    }
+    if normalized.contains("cancel") || normalized.contains("abort") {
+        return TerminalSessionReason::ProviderCancelled;
+    }
+    if normalized.contains("protocol")
+        || normalized.contains("invalid")
+        || normalized.contains("malformed")
+        || normalized.contains("parse")
+        || normalized.contains("schema")
+    {
+        return TerminalSessionReason::ProviderMalformedStream;
+    }
+    TerminalSessionReason::ProviderNetworkDisconnect
 }
 
 async fn authorize_browser_event(

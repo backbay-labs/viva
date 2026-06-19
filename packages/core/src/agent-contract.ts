@@ -44,7 +44,15 @@ export type AgentTerminalSessionReason =
   | "session_cap"
   | "turn_cap"
   | "rate_limit"
-  | "cost_budget";
+  | "cost_budget"
+  | "provider_auth_failed"
+  | "provider_rate_limited"
+  | "provider_timeout"
+  | "provider_malformed_stream"
+  | "provider_network_disconnect"
+  | "slow_client"
+  | "provider_cancelled"
+  | "partial_stage_success";
 
 export type AgentStudySourceReference = {
   source_id: string;
@@ -609,7 +617,15 @@ function requireTerminalSessionReason(value: unknown): AgentTerminalSessionReaso
     value !== "session_cap" &&
     value !== "turn_cap" &&
     value !== "rate_limit" &&
-    value !== "cost_budget"
+    value !== "cost_budget" &&
+    value !== "provider_auth_failed" &&
+    value !== "provider_rate_limited" &&
+    value !== "provider_timeout" &&
+    value !== "provider_malformed_stream" &&
+    value !== "provider_network_disconnect" &&
+    value !== "slow_client" &&
+    value !== "provider_cancelled" &&
+    value !== "partial_stage_success"
   ) {
     throw new Error("Invalid terminal session reason");
   }

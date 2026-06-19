@@ -303,6 +303,38 @@ describe("Viva agent browser client", () => {
     expect(state.terminalReason).toBe("drained");
   });
 
+  test("reducer sanitizes server error frames before projection can render them", () => {
+    const rawProviderMessage =
+      "provider prompt transcript with bearer viva1.secret-token and raw answer text";
+    const state = vivaAgentReducer(initialVivaAgentSessionState(), {
+      type: "error",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      message: rawProviderMessage,
+    });
+
+    expect(state.errors).toEqual(["sanitized provider error"]);
+    expect(JSON.stringify(state)).not.toContain("viva1.secret-token");
+    expect(JSON.stringify(state)).not.toContain("raw answer text");
+  });
+
+  test("reducer sanitizes structured provider errors before projection can render them", () => {
+    const rawProviderMessage =
+      "structured_error prompt transcript with CARTESIA_API_KEY and source excerpt";
+    const state = vivaAgentReducer(initialVivaAgentSessionState(), {
+      type: "event",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      event: {
+        type: "structured_error",
+        source: "cartesia_gemini",
+        message: rawProviderMessage,
+      },
+    });
+
+    expect(state.errors).toEqual(["sanitized provider error"]);
+    expect(JSON.stringify(state)).not.toContain("CARTESIA_API_KEY");
+    expect(JSON.stringify(state)).not.toContain("source excerpt");
+  });
+
   test("controller records sanitized close diagnostics when the server closes the socket", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
