@@ -3876,6 +3876,57 @@ button {
   text-transform: uppercase;
 }
 
+.recap-fold__rings {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin: 0.1rem 0 0.2rem;
+  padding: 0;
+  list-style: none;
+}
+
+.recap-stat {
+  display: grid;
+  justify-items: center;
+  gap: 0.34rem;
+  padding: 0.62rem 0.3rem 0.66rem;
+  border-radius: 15px;
+  background: linear-gradient(180deg, rgba(255, 253, 250, 0.72), rgba(248, 243, 252, 0.46));
+  border: 1px solid rgba(93, 52, 127, 0.1);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.5) inset,
+    0 6px 16px -12px rgba(46, 33, 64, 0.32);
+}
+
+.recap-stat__label {
+  font-family: var(--sans);
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  line-height: 1;
+}
+
+.recap-stat__count {
+  font-family: var(--sans);
+  font-size: 0.67rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--viva-muted);
+  line-height: 1;
+}
+
+.recap-fold__plan {
+  display: grid;
+  gap: 0.5rem;
+  padding-top: 0.55rem;
+  border-top: 1px solid rgba(93, 52, 127, 0.12);
+  font-family: var(--sans);
+}
+
+.recap-fold__timeline {
+  display: grid;
+  gap: 0.1rem;
+}
+
 .recap-fold__next {
   display: grid;
   gap: 0.42rem;
