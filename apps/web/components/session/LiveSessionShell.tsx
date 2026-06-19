@@ -90,7 +90,11 @@ export function LiveSessionShell({
       <div className="live-session__stage-wrap">
         <div className="live-session__stage">
           <div className="session-plate" data-state={state}>
-            <QuestionStage question={question} state={state} />
+            <QuestionStage
+              highlightedTokens={highlightedTokens}
+              question={question}
+              state={state}
+            />
             <VoiceTraceCanvas
               conceptNodes={conceptNodes}
               highlightedTokens={highlightedTokens}
