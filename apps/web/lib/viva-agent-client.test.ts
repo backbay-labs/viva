@@ -336,24 +336,24 @@ describe("Viva agent browser client", () => {
     retrieval_reason: "bounded source moment",
   });
 
-  test("cancelling the active turn clears its bounded source so it can't bleed into the folio", () => {
+  test("cancelling the active turn discards its examiner-response artifacts (no folio bleed)", () => {
+    const src = sourceFixture("src-1", "NADH donates electrons to the electron transport chain.");
     const withSource = vivaAgentReducer(
       { ...initialVivaAgentSessionState(), activeResponseId: "resp-1" },
       parseVivaServerFrame({
         type: "event",
         version: VIVA_VOICE_PROTOCOL_VERSION,
-        event: {
-          type: "source_reference",
-          response_id: "resp-1",
-          source: sourceFixture("src-1", "NADH donates electrons to the electron transport chain."),
-        },
+        event: { type: "source_reference", response_id: "resp-1", source: src },
       }),
     );
     expect(withSource.currentSource?.source_id).toBe("src-1");
     expect(withSource.sources).toHaveLength(1);
 
+    // The cancelled turn also carries a verdict + concept status. Its source would
+    // otherwise re-surface via the folio's currentSource -> evaluation.source
+    // fallback, so the cancel must discard the whole examiner-response set.
     const afterCancel = vivaAgentReducer(
-      withSource,
+      { ...withSource, currentConceptStatus: "shaky", evaluation: { source: src } as never },
       parseVivaServerFrame({
         type: "event",
         version: VIVA_VOICE_PROTOCOL_VERSION,
@@ -363,6 +363,8 @@ describe("Viva agent browser client", () => {
 
     expect(afterCancel.currentSource).toBeUndefined();
     expect(afterCancel.sources).toEqual([]);
+    expect(afterCancel.evaluation).toBeUndefined();
+    expect(afterCancel.currentConceptStatus).toBeUndefined();
     expect(afterCancel.activeResponseId).toBeUndefined();
   });
 

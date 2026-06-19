@@ -598,11 +598,18 @@ export function vivaAgentReducer(
         audio: cancelledResponseId
           ? state.audio.filter((output) => output.responseId !== cancelledResponseId)
           : state.audio,
-        // The cancelled turn's bounded citation must not linger in the source
-        // folio — clear it like the other per-turn artifacts above (source_reference
-        // only ever sets these for the active turn, gated by the staleness guard).
+        // Discard the cancelled turn's examiner-response artifacts so none bleed
+        // into the manuscript: not just `currentSource`, but `evaluation` and
+        // `currentConceptStatus` too — the source folio falls back through
+        // `currentSource -> evaluation.source -> question.source`, so clearing only
+        // the first layer would still surface the cancelled verdict's citation.
+        // These are all active-turn-only (gated by the staleness guard) and are
+        // exactly what `question_started` resets; `question` + the student's
+        // transcript persist (the question is still the one being answered).
         currentSource: cancellingActive ? undefined : state.currentSource,
         sources: cancellingActive ? [] : state.sources,
+        evaluation: cancellingActive ? undefined : state.evaluation,
+        currentConceptStatus: cancellingActive ? undefined : state.currentConceptStatus,
         cancelledResponseIds,
       };
     }
