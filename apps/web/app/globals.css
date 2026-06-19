@@ -3894,6 +3894,64 @@ button {
   margin: 0;
 }
 
+/* The cited excerpt as a museum label: a gold authority rule and faint wash,
+   the source words set in the manuscript serif behind a quiet quotation mark.
+   Scoped to the real Source Folio so the recap source-moment list keeps its
+   compact plum-rule treatment. */
+.source-folio .source-folio__excerpt {
+  position: relative;
+  border-left: 3px solid var(--viva-gold);
+  border-radius: 0 9px 9px 0;
+  padding: 0.55rem 0.85rem 0.6rem 0.95rem;
+  background: linear-gradient(90deg, rgba(214, 168, 95, 0.12), rgba(214, 168, 95, 0.02));
+}
+
+.source-folio .source-folio__excerpt::before {
+  content: "\201C";
+  position: absolute;
+  top: -0.15rem;
+  left: 0.5rem;
+  font-family: var(--serif);
+  font-size: 1.5rem;
+  line-height: 1;
+  color: rgba(189, 154, 85, 0.55);
+}
+
+.source-folio .source-folio__excerpt p {
+  color: var(--viva-ink);
+  font-family: var(--serif);
+  font-size: 0.98rem;
+  line-height: 1.5;
+  text-indent: 0.85rem;
+}
+
+/* Low-confidence and conflicting citations soften the gold to a humble amber —
+   the page is honest that this is a prompt to re-check, not a verdict. */
+.source-folio[data-source-state="low_confidence"] .source-folio__excerpt,
+.source-folio[data-source-state="conflicting"] .source-folio__excerpt {
+  border-left-color: var(--amber);
+  background: linear-gradient(90deg, rgba(193, 134, 74, 0.12), rgba(193, 134, 74, 0.02));
+}
+
+.source-folio[data-source-state="low_confidence"] .source-folio__excerpt::before,
+.source-folio[data-source-state="conflicting"] .source-folio__excerpt::before {
+  color: rgba(155, 106, 52, 0.5);
+}
+
+.source-folio[data-source-state="unavailable"] .source-folio__excerpt {
+  border-left-color: rgba(64, 42, 82, 0.2);
+  background: rgba(64, 42, 82, 0.03);
+}
+
+.source-folio[data-source-state="unavailable"] .source-folio__excerpt::before {
+  color: rgba(64, 42, 82, 0.22);
+}
+
+.source-folio[data-source-state="unavailable"] .source-folio__excerpt p {
+  font-style: italic;
+  color: var(--viva-muted);
+}
+
 .source-folio__caveat {
   color: #6b3f92;
   font-family: var(--sans);
