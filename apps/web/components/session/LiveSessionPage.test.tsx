@@ -1,10 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import type { SessionRecap } from "@viva/core";
 import type { VivaAgentDerivedState } from "../../lib/use-viva-agent-session";
+import { VivaAudioWorkletUnavailableError } from "../../lib/viva-audio-capture";
 import { projectTrace } from "../../lib/viva-session-projection";
 import {
+  captureLevelForBloom,
   derivedStateWithProjectedRecap,
   enterTextAnswerMode,
+  micStateForAudioCaptureError,
+  micStateForCaptureEndReason,
+  pcm16ChunksToBase64,
+  shouldUseLiveMicAudioTransport,
   stopCaptureForRecap,
   textAnswerPayload,
 } from "./LiveSessionPage";
@@ -21,19 +27,25 @@ describe("LiveSessionPage recap cleanup", () => {
     };
     const captureStartedRef = { current: true };
     const levelRef = { current: { agent: 0.2, user: 0.8 } };
+    const capturedTurnPcm16Ref = { current: [new Uint8Array([1, 2])] };
 
-    stopCaptureForRecap(captureRef, captureStartedRef, levelRef);
+    stopCaptureForRecap(captureRef, captureStartedRef, levelRef, capturedTurnPcm16Ref);
 
     expect(stops).toBe(1);
     expect(captureRef.current).toBe(null);
     expect(captureStartedRef.current).toBe(false);
     expect(levelRef.current).toEqual({ agent: 0.2, user: 0 });
+    expect(capturedTurnPcm16Ref.current).toEqual([]);
   });
 
   test("stops microphone capture and leaves the bloom at floor in text answer mode", () => {
     let stops = 0;
+    let cancels = 0;
     const captureRef = {
       current: {
+        cancel: () => {
+          cancels += 1;
+        },
         stop: () => {
           stops += 1;
         },
@@ -49,14 +61,27 @@ describe("LiveSessionPage recap cleanup", () => {
         },
       },
     };
+    const capturedTurnPcm16Ref = { current: [new Uint8Array([3, 4])] };
 
-    enterTextAnswerMode(captureRef, captureStartedRef, levelRef, meterRef);
+    enterTextAnswerMode(captureRef, captureStartedRef, levelRef, meterRef, capturedTurnPcm16Ref);
 
-    expect(stops).toBe(1);
+    expect(cancels).toBe(1);
+    expect(stops).toBe(0);
     expect(resets).toBe(1);
     expect(captureRef.current).toBe(null);
     expect(captureStartedRef.current).toBe(false);
     expect(levelRef.current).toEqual({ agent: 0.1, user: 0 });
+    expect(capturedTurnPcm16Ref.current).toEqual([]);
+  });
+
+  test("classifies Worklet support failures separately from mic permission denial", () => {
+    expect(micStateForAudioCaptureError(new VivaAudioWorkletUnavailableError())).toBe(
+      "unsupported",
+    );
+    expect(micStateForAudioCaptureError(new Error("permission denied"))).toBe("denied");
+    expect(micStateForCaptureEndReason("processor_error", "available")).toBe("unsupported");
+    expect(micStateForCaptureEndReason("devicechange", "available")).toBe("unknown");
+    expect(micStateForCaptureEndReason("stopped", "available")).toBe("available");
   });
 
   test("normalizes written answers before sending them to the agent text frame", () => {
@@ -64,6 +89,77 @@ describe("LiveSessionPage recap cleanup", () => {
       "NADH donates electrons to the ETC.",
     );
     expect(textAnswerPayload("   \n\t   ")).toBe(null);
+  });
+
+  test("only streams buffered mic PCM to selectable live runtimes", () => {
+    expect(
+      shouldUseLiveMicAudioTransport({
+        ready: { brain: { live_runtime: true, selectable: true } },
+        status: "open",
+        textAnswerMode: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldUseLiveMicAudioTransport({
+        ready: { brain: { live_runtime: false, selectable: true } },
+        status: "open",
+        textAnswerMode: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldUseLiveMicAudioTransport({
+        ready: { brain: { live_runtime: true, selectable: true } },
+        status: "closed",
+        textAnswerMode: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldUseLiveMicAudioTransport({
+        ready: { brain: { live_runtime: true, selectable: true } },
+        status: "open",
+        textAnswerMode: true,
+      }),
+    ).toBe(false);
+  });
+
+  test("merges buffered worklet PCM chunks into one live audio turn", () => {
+    expect(pcm16ChunksToBase64([])).toBe(null);
+    expect(pcm16ChunksToBase64([new Uint8Array([1, 2]), new Uint8Array([3, 4])])).toBe("AQIDBA==");
+  });
+
+  test("uses worklet-computed RMS for the user bloom while reduced motion keeps it at floor", () => {
+    const calls: string[] = [];
+    const meter = {
+      push: () => {
+        calls.push("samples");
+        return 0.4;
+      },
+      pushRms: (rms: number) => {
+        calls.push(`rms:${rms}`);
+        return 0.7;
+      },
+    };
+
+    expect(
+      captureLevelForBloom({
+        frame: { rms: 0.12, sampleRateHz: 24_000, samples: Float32Array.from([0.5]) },
+        meter,
+        reducedMotion: false,
+        samples: Float32Array.from([0.5]),
+        textAnswerMode: false,
+      }),
+    ).toBe(0.7);
+    expect(calls).toEqual(["rms:0.12"]);
+    expect(
+      captureLevelForBloom({
+        frame: { rms: 0.12, sampleRateHz: 24_000, samples: Float32Array.from([0.5]) },
+        meter,
+        reducedMotion: true,
+        samples: Float32Array.from([0.5]),
+        textAnswerMode: false,
+      }),
+    ).toBe(0);
+    expect(calls).toEqual(["rms:0.12"]);
   });
 
   test("uses projected recap buckets for center trace highlights", () => {

@@ -22,6 +22,7 @@ export type VoiceLevelMeterOptions = VoiceLevelOptions & {
 
 export type VoiceLevelMeter = {
   push: (samples: ArrayLike<number>) => number;
+  pushRms: (rms: number) => number;
   get: () => number;
   reset: () => void;
 };
@@ -64,11 +65,17 @@ export function voiceLevelFromRms(rms: number, options: VoiceLevelOptions = {}):
 export function createVoiceLevelMeter(options: VoiceLevelMeterOptions = {}): VoiceLevelMeter {
   const coefficient = options.coefficient ?? DEFAULT_COEFFICIENT;
   let level = 0;
+  function pushTargetRms(rms: number): number {
+    const target = voiceLevelFromRms(rms, options);
+    level = smoothLevel(level, target, coefficient);
+    return level;
+  }
   return {
     push(samples) {
-      const target = voiceLevelFromRms(computeRms(samples), options);
-      level = smoothLevel(level, target, coefficient);
-      return level;
+      return pushTargetRms(computeRms(samples));
+    },
+    pushRms(rms) {
+      return pushTargetRms(rms);
     },
     get() {
       return level;

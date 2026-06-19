@@ -17,14 +17,34 @@ export type VivaPcm16Chunk = {
   sequence: number;
 };
 
+export type VivaAudioCaptureEndReason = "devicechange" | "processor_error" | "stopped";
+
+export type VivaAudioCaptureSampleFrame = {
+  samples: Float32Array;
+  sampleRateHz: number;
+  rms: number;
+};
+
+export type VivaAudioCaptureStartOptions = {
+  onEnded?: (reason: VivaAudioCaptureEndReason) => void;
+};
+
 export type VivaAudioCaptureSource = {
   sampleRateHz: number;
-  start: (onSamples: (samples: Float32Array, sampleRateHz: number) => void) => void | Promise<void>;
+  start: (
+    onSamples: (
+      samples: Float32Array,
+      sampleRateHz: number,
+      frame?: VivaAudioCaptureSampleFrame,
+    ) => void,
+    options?: VivaAudioCaptureStartOptions,
+  ) => void | Promise<void>;
   stop: () => void | Promise<void>;
 };
 
 export type VivaAudioCaptureFrame = {
   pcm16Base64: string;
+  pcm16Bytes: Uint8Array;
   sequence: number;
   byteLength: number;
 };
@@ -32,6 +52,8 @@ export type VivaAudioCaptureFrame = {
 export type VivaPcm16StreamingCaptureOptions = {
   source: VivaAudioCaptureSource;
   onFrame: (frame: VivaAudioCaptureFrame) => void;
+  onSampleFrame?: (frame: VivaAudioCaptureSampleFrame) => void;
+  onEnded?: (reason: VivaAudioCaptureEndReason) => void;
   onError?: (error: unknown) => void;
   sampleRateHz?: number;
   frameDurationMs?: number;
@@ -46,9 +68,25 @@ export type VivaPcm16StreamingCaptureController = {
 
 export type VivaBrowserAudioCaptureOptions = {
   AudioContextCtor: typeof AudioContext;
-  mediaDevices: Pick<MediaDevices, "getUserMedia">;
+  AudioWorkletNodeCtor?: typeof AudioWorkletNode;
+  mediaDevices: Pick<MediaDevices, "getUserMedia"> &
+    Partial<Pick<MediaDevices, "addEventListener" | "removeEventListener">>;
   sampleRateHz?: number;
+  workletModuleUrl?: string;
 };
+
+export class VivaAudioWorkletUnavailableError extends Error {
+  constructor(message = "AudioWorklet capture is unavailable") {
+    super(message);
+    this.name = "VivaAudioWorkletUnavailableError";
+  }
+}
+
+export function isVivaAudioWorkletUnavailableError(
+  error: unknown,
+): error is VivaAudioWorkletUnavailableError {
+  return error instanceof VivaAudioWorkletUnavailableError;
+}
 
 export function float32ToPcm16LeBytes(samples: Float32Array | readonly number[]): Uint8Array {
   const pcm16 = new Uint8Array(samples.length * VIVA_PCM16_BYTES_PER_SAMPLE);
@@ -209,9 +247,11 @@ export function startVivaPcm16StreamingCapture(
   let sequence = 0;
 
   function emitFrame(bytes: Uint8Array) {
+    const pcm16Bytes = bytes.slice();
     options.onFrame({
       byteLength: bytes.byteLength,
-      pcm16Base64: pcm16LeBytesToBase64(bytes),
+      pcm16Base64: pcm16LeBytesToBase64(pcm16Bytes),
+      pcm16Bytes,
       sequence,
     });
     sequence += 1;
@@ -248,14 +288,29 @@ export function startVivaPcm16StreamingCapture(
 
   try {
     void Promise.resolve(
-      options.source.start((samples, sourceSampleRateHz) => {
-        if (!active) return;
-        pushPcm16(
-          float32ToPcm16LeBytes(
-            resampleFloat32ToSampleRate(samples, sourceSampleRateHz, targetSampleRateHz),
-          ),
-        );
-      }),
+      options.source.start(
+        (samples, sourceSampleRateHz, frame) => {
+          if (!active) return;
+          options.onSampleFrame?.({
+            rms: frame?.rms ?? Number.NaN,
+            sampleRateHz: sourceSampleRateHz,
+            samples,
+          });
+          pushPcm16(
+            float32ToPcm16LeBytes(
+              resampleFloat32ToSampleRate(samples, sourceSampleRateHz, targetSampleRateHz),
+            ),
+          );
+        },
+        {
+          onEnded: (reason) => {
+            if (!active) return;
+            active = false;
+            pendingPcm16 = new Uint8Array(0);
+            options.onEnded?.(reason);
+          },
+        },
+      ),
     ).catch((error) => {
       if (!active) return;
       active = false;
@@ -289,42 +344,107 @@ export async function createBrowserVivaAudioCaptureSource(
   options: VivaBrowserAudioCaptureOptions,
 ): Promise<VivaAudioCaptureSource> {
   const sampleRateHz = options.sampleRateHz ?? VIVA_AUDIO_SAMPLE_RATE_HZ;
-  const stream = await options.mediaDevices.getUserMedia({
-    audio: {
-      channelCount: 1,
-      echoCancellation: true,
-      noiseSuppression: true,
-      sampleRate: sampleRateHz,
-    },
-  });
   const context = new options.AudioContextCtor({ sampleRate: sampleRateHz });
-  const streamSource = context.createMediaStreamSource(stream);
-  const processor = context.createScriptProcessor(2048, 1, 1);
-  let sampleHandler: ((samples: Float32Array, sampleRateHz: number) => void) | null = null;
+  if (!context.audioWorklet) {
+    await context.close();
+    throw new VivaAudioWorkletUnavailableError();
+  }
+  let moduleUrlCleanup: (() => void) | undefined;
+  let stream: MediaStream | undefined;
+  try {
+    const module = createAudioCaptureWorkletModule(options.workletModuleUrl);
+    moduleUrlCleanup = module.cleanup;
+    await context.audioWorklet.addModule(module.url);
+    stream = await options.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        sampleRate: sampleRateHz,
+      },
+    });
+  } catch (error) {
+    moduleUrlCleanup?.();
+    for (const track of stream?.getTracks() ?? []) track.stop();
+    await context.close();
+    throw error;
+  } finally {
+    moduleUrlCleanup?.();
+  }
+  if (!stream) {
+    await context.close();
+    throw new Error("Microphone stream was not opened");
+  }
+  const activeStream = stream;
+
+  const streamSource = context.createMediaStreamSource(activeStream);
+  const AudioWorkletNodeCtor =
+    options.AudioWorkletNodeCtor ??
+    (typeof AudioWorkletNode === "function" ? AudioWorkletNode : undefined);
+  if (!AudioWorkletNodeCtor) {
+    for (const track of activeStream.getTracks()) track.stop();
+    await context.close();
+    throw new VivaAudioWorkletUnavailableError("AudioWorkletNode capture is unavailable");
+  }
+  const processor = new AudioWorkletNodeCtor(context, AUDIO_CAPTURE_WORKLET_NAME, {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+  });
+  let sampleHandler:
+    | ((samples: Float32Array, sampleRateHz: number, frame?: VivaAudioCaptureSampleFrame) => void)
+    | null = null;
+  let endedHandler: ((reason: VivaAudioCaptureEndReason) => void) | null = null;
   let stopped = false;
 
-  processor.onaudioprocess = (event) => {
+  processor.port.onmessage = (event: MessageEvent<VivaAudioCaptureWorkletMessage>) => {
     if (stopped || !sampleHandler) return;
-    sampleHandler(event.inputBuffer.getChannelData(0), context.sampleRate);
+    const message = event.data;
+    if (message?.type !== "samples" || !(message.samples instanceof Float32Array)) return;
+    const sampleRate = validSampleRate(message.sampleRateHz)
+      ? message.sampleRateHz
+      : context.sampleRate;
+    const rms = Number.isFinite(message.rms) && message.rms >= 0 ? message.rms : 0;
+    sampleHandler(message.samples, sampleRate, {
+      rms,
+      sampleRateHz: sampleRate,
+      samples: message.samples,
+    });
   };
+  processor.onprocessorerror = () => {
+    stop("processor_error");
+  };
+
+  const onDeviceChange = () => {
+    stop("devicechange");
+  };
+  options.mediaDevices.addEventListener?.("devicechange", onDeviceChange);
+
+  function stop(reason: VivaAudioCaptureEndReason = "stopped") {
+    if (stopped) return;
+    stopped = true;
+    sampleHandler = null;
+    options.mediaDevices.removeEventListener?.("devicechange", onDeviceChange);
+    processor.port.onmessage = null;
+    processor.onprocessorerror = null;
+    processor.disconnect();
+    streamSource.disconnect();
+    for (const track of activeStream.getTracks()) track.stop();
+    void context.close();
+    endedHandler?.(reason);
+    endedHandler = null;
+  }
 
   return {
     sampleRateHz: context.sampleRate,
-    start(onSamples) {
+    start(onSamples, startOptions) {
       if (stopped) return;
       sampleHandler = onSamples;
+      endedHandler = startOptions?.onEnded ?? null;
       streamSource.connect(processor);
       processor.connect(context.destination);
     },
-    stop() {
-      if (stopped) return;
-      stopped = true;
-      sampleHandler = null;
-      processor.disconnect();
-      streamSource.disconnect();
-      for (const track of stream.getTracks()) track.stop();
-      void context.close();
-    },
+    stop,
   };
 }
 
@@ -339,3 +459,59 @@ type BufferConstructor = {
   from(bytes: Uint8Array): { toString(encoding: "base64"): string };
   from(base64: string, encoding: "base64"): Uint8Array;
 };
+
+const AUDIO_CAPTURE_WORKLET_NAME = "viva-audio-capture";
+
+type VivaAudioCaptureWorkletMessage = {
+  type: "samples";
+  samples: Float32Array;
+  sampleRateHz: number;
+  rms: number;
+};
+
+function createAudioCaptureWorkletModule(explicitUrl?: string): {
+  url: string;
+  cleanup: () => void;
+} {
+  if (explicitUrl) return { url: explicitUrl, cleanup: () => {} };
+  if (typeof Blob !== "function" || !globalThis.URL?.createObjectURL) {
+    throw new VivaAudioWorkletUnavailableError("AudioWorklet module URLs are unavailable");
+  }
+  const url = URL.createObjectURL(
+    new Blob([AUDIO_CAPTURE_WORKLET_SOURCE], { type: "text/javascript" }),
+  );
+  return {
+    cleanup: () => URL.revokeObjectURL(url),
+    url,
+  };
+}
+
+function validSampleRate(sampleRateHz: number): boolean {
+  return Number.isFinite(sampleRateHz) && sampleRateHz > 0;
+}
+
+const AUDIO_CAPTURE_WORKLET_SOURCE = `
+class VivaAudioCaptureProcessor extends AudioWorkletProcessor {
+  process(inputs, outputs) {
+    const input = inputs[0]?.[0];
+    const output = outputs[0]?.[0];
+    if (!input) return true;
+    if (output) output.fill(0);
+    const samples = new Float32Array(input.length);
+    let sumOfSquares = 0;
+    for (let index = 0; index < input.length; index += 1) {
+      const sample = Number.isFinite(input[index]) ? input[index] : 0;
+      samples[index] = sample;
+      sumOfSquares += sample * sample;
+    }
+    const rms = input.length === 0 ? 0 : Math.sqrt(sumOfSquares / input.length);
+    this.port.postMessage(
+      { type: "samples", samples, sampleRateHz: sampleRate, rms },
+      [samples.buffer],
+    );
+    return true;
+  }
+}
+
+registerProcessor("${AUDIO_CAPTURE_WORKLET_NAME}", VivaAudioCaptureProcessor);
+`;
