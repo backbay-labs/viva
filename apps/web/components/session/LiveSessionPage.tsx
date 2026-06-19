@@ -150,8 +150,13 @@ export function LiveSessionPage() {
     return () => window.clearInterval(id);
   }, [sessionOver]);
 
+  const stopReadinessPolling = shouldStopReadinessPolling({
+    recap: agent.derived.recap,
+    status: agent.status,
+    ready: Boolean(agent.agentState.ready),
+  });
   useEffect(() => {
-    if (sessionOver) return;
+    if (stopReadinessPolling) return;
     let cancelled = false;
     const refreshReadiness = async () => {
       const next = await fetchVivaAgentReadinessProbe();
@@ -163,7 +168,7 @@ export function LiveSessionPage() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [sessionOver]);
+  }, [stopReadinessPolling]);
 
   // Play the examiner's streamed audio (synthetic emits none yet; wired for the
   // real provider) and honour cancellations/barge-in.
@@ -591,6 +596,24 @@ export function LiveSessionPage() {
  */
 export function isSessionOver(input: { recap: unknown; status: string }): boolean {
   return Boolean(input.recap) || input.status === "closed";
+}
+
+/**
+ * The 5s HTTP readiness probe is the only signal while connecting, but once a
+ * live WebSocket `ready` frame has arrived on an open socket it's authoritative
+ * — the projection already discards contradicting probe notes — so we stop the
+ * redundant polling (and on a session that's over). It resumes if the socket
+ * drops back below ready.
+ */
+export function shouldStopReadinessPolling(input: {
+  recap: unknown;
+  status: string;
+  ready: boolean;
+}): boolean {
+  return (
+    isSessionOver({ recap: input.recap, status: input.status }) ||
+    (input.ready && input.status === "open")
+  );
 }
 
 export function stopCaptureForRecap(
