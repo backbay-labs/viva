@@ -2746,17 +2746,25 @@ button {
   padding: 0.9rem;
 }
 
+/* Grid cells default to min-width:auto; without this a long unbreakable title
+   would force the track wider and break the row layout. */
+.viva-library__row > div {
+  min-width: 0;
+}
+
 .viva-library__row h3 {
   color: var(--viva-ink);
   font-size: 1rem;
   line-height: 1.15;
   margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .viva-library__row p {
   color: var(--viva-muted);
   font-size: 0.84rem;
   margin: 0.2rem 0 0;
+  overflow-wrap: anywhere;
 }
 
 .viva-library__meta {
@@ -3212,6 +3220,8 @@ button {
   line-height: 1.12;
   letter-spacing: 0;
   color: var(--viva-ink);
+  overflow-wrap: anywhere;
+  hyphens: auto;
 }
 
 /* Warming up: the placeholder reads as a quiet, breathing status — italic and
@@ -3536,6 +3546,7 @@ button {
   line-height: 1.05;
   letter-spacing: -0.02em;
   color: var(--viva-ink);
+  overflow-wrap: anywhere;
 }
 
 .correction__title {
@@ -3552,6 +3563,7 @@ button {
   font-size: 0.9rem;
   line-height: 1.5;
   color: var(--viva-ink-soft);
+  overflow-wrap: anywhere;
 }
 
 .margin-note__hint {
