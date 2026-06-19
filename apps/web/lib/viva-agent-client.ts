@@ -145,6 +145,7 @@ export type VivaAgentSessionController = {
   reset: () => void;
   sendText: (text: string) => void;
   sendAudio: (pcm16Base64: string) => void;
+  acknowledgeAudio: (count: number) => void;
   cancel: () => void;
   stop: () => void;
   getState: () => VivaAgentSessionState;
@@ -690,6 +691,13 @@ export function createVivaAgentSessionController(
     },
     sendAudio(pcm16Base64: string) {
       sendFrame(audioClientFrame(pcm16Base64));
+    },
+    acknowledgeAudio(count: number) {
+      // The consumer has enqueued the first `count` audio frames to the playback
+      // sink, so drop them from state — `audio` is a pending-to-play queue, not an
+      // ever-growing log (which on the live provider was O(n^2) copies + a leak).
+      if (count <= 0 || state.audio.length === 0) return;
+      setState({ ...state, audio: state.audio.slice(count) });
     },
     cancel() {
       sendFrame({ type: "cancel", version: VIVA_VOICE_PROTOCOL_VERSION });

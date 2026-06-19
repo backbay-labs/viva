@@ -241,6 +241,29 @@ describe("Viva agent browser client", () => {
     expect(controller.getState().transcript).toBe("");
   });
 
+  test("acknowledgeAudio drops the consumed prefix so the audio buffer stays bounded", () => {
+    const audio = [
+      { responseId: "r1", frame: {} },
+      { responseId: "r1", frame: {} },
+      { responseId: "r2", frame: {} },
+    ] as unknown as ReturnType<typeof initialVivaAgentSessionState>["audio"];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      session: sessionFixture as AgentSessionConfig,
+      initialState: { ...initialVivaAgentSessionState(), audio },
+    });
+
+    controller.acknowledgeAudio(2);
+    expect(controller.getState().audio.map((output) => output.responseId)).toEqual(["r2"]);
+    // No-op guards: zero/negative never mutates; over-count clears without error.
+    controller.acknowledgeAudio(0);
+    expect(controller.getState().audio).toHaveLength(1);
+    controller.acknowledgeAudio(9);
+    expect(controller.getState().audio).toHaveLength(0);
+    controller.acknowledgeAudio(3);
+    expect(controller.getState().audio).toHaveLength(0);
+  });
+
   test("controller preserves terminal recap when the server closes after stop", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({

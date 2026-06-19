@@ -104,6 +104,7 @@ export function useVivaAgentSession(options: UseVivaAgentSessionOptions) {
   );
 
   return {
+    acknowledgeAudio: (count: number) => controllerRef.current?.acknowledgeAudio(count),
     agentState,
     cancel: () => controllerRef.current?.cancel(),
     close: () => controllerRef.current?.close(),
