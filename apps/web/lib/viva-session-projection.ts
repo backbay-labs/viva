@@ -962,7 +962,10 @@ export function projectSessionQuestion(
 
   const agentQuestion = derived.question;
   if (!agentQuestion) {
-    return { ...EMPTY_QUESTION, prompt: connectionPlaceholderPrompt(status), status: "" };
+    // Connecting / idle / open-without-a-question is a warming-up placeholder;
+    // error and closed are terminal copy, not a pending question.
+    const pending = status !== "error" && status !== "closed";
+    return { ...EMPTY_QUESTION, prompt: connectionPlaceholderPrompt(status), status: "", pending };
   }
 
   const evaluation = derived.evaluation;

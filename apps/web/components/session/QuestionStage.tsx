@@ -22,11 +22,16 @@ export function QuestionStage({
   highlightedTokens?: string[];
 }) {
   const lines = question.prompt.split("\n");
-  const reveal = REVEALING_STATES.has(state) && highlightedTokens.length > 0;
+  const pending = Boolean(question.pending);
+  const reveal = !pending && REVEALING_STATES.has(state) && highlightedTokens.length > 0;
   const matcher = reveal ? buildTokenMatcher(highlightedTokens) : null;
 
   return (
-    <div className="question-stage">
+    <div
+      className="question-stage"
+      data-pending={pending ? "true" : undefined}
+      aria-busy={pending ? "true" : undefined}
+    >
       <h1 className="question-stage__text">
         {lines.map((line, index) => (
           <Fragment key={line}>
