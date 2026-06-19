@@ -36,8 +36,7 @@ export function SessionBottomControls({
             <p className="session-controls__transcript-text">{transcript}</p>
           ) : (
             <p className="session-controls__empty">
-              No transcript captured yet — your spoken answers appear here once the Conductor
-              finalizes them.
+              No transcript yet — your spoken answers appear here as the Conductor transcribes them.
             </p>
           )}
         </section>
