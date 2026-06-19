@@ -32,9 +32,7 @@ pub use llm::{
 pub use stt::{audio_frame_bytes, parse_ink_event, InkConfig, InkEvent};
 pub use tts::{parse_sonic_event, sonic_generation_request, SonicConfig, SonicEvent};
 
-use runner::{
-    CartesiaGeminiRunner, FakeCartesiaGeminiTransports, GatedNoNetworkCartesiaGeminiTransports,
-};
+use runner::{CartesiaGeminiRunner, FakeCartesiaGeminiTransports, LiveCartesiaGeminiTransports};
 
 pub(crate) const FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT: &str =
     "NADH donates electrons to the electron transport chain.";
@@ -45,6 +43,7 @@ pub struct CartesiaGeminiConfig {
     pub gemini: GeminiConfig,
     pub ink: InkConfig,
     pub sonic: SonicConfig,
+    pub live_runtime_enabled: bool,
     pub tools: Vec<serde_json::Value>,
 }
 
@@ -56,6 +55,7 @@ impl fmt::Debug for CartesiaGeminiConfig {
             .field("gemini", &self.gemini)
             .field("ink", &self.ink)
             .field("sonic", &self.sonic)
+            .field("live_runtime_enabled", &self.live_runtime_enabled)
             .field("tool_count", &self.tools.len())
             .finish()
     }
@@ -68,6 +68,7 @@ impl Default for CartesiaGeminiConfig {
             gemini: GeminiConfig::default(),
             ink: InkConfig::default(),
             sonic: SonicConfig::default(),
+            live_runtime_enabled: false,
             tools: viva_tool_declarations(),
         }
     }
@@ -92,6 +93,8 @@ impl CartesiaGeminiConfig {
             },
             ..Self::default()
         };
+        config.live_runtime_enabled =
+            env_value("VIVA_CARTESIA_GEMINI_LIVE_RUNTIME").as_deref() == Some("1");
         if let Some(model) =
             env_value("GEMINI_MODEL").or_else(|| env_value("GEMINI_REALTIME_MODEL"))
         {
@@ -169,18 +172,28 @@ impl CartesiaGeminiConfig {
     pub fn missing_live_keys(&self) -> bool {
         self.cartesia_api_key.trim().is_empty() || self.gemini.api_key.trim().is_empty()
     }
+
+    pub fn selectable_live_keys(&self) -> bool {
+        !self.missing_live_keys()
+            && !is_placeholder_live_key(&self.cartesia_api_key)
+            && !is_placeholder_live_key(&self.gemini.api_key)
+    }
+
+    pub fn live_runtime_selectable(&self) -> bool {
+        self.live_runtime_enabled && self.selectable_live_keys()
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct CartesiaGeminiBrain {
     config: CartesiaGeminiConfig,
-    runner: CartesiaGeminiRunner<GatedNoNetworkCartesiaGeminiTransports>,
+    runner: CartesiaGeminiRunner<LiveCartesiaGeminiTransports>,
 }
 
 impl CartesiaGeminiBrain {
     pub fn new(config: CartesiaGeminiConfig, store: Arc<dyn StudyMemoryStore>) -> Self {
         Self {
-            runner: CartesiaGeminiRunner::gated_live(store, config.clone()),
+            runner: CartesiaGeminiRunner::live(store, config.clone()),
             config,
         }
     }
@@ -193,17 +206,24 @@ impl CartesiaGeminiBrain {
 #[async_trait]
 impl RealtimeBrain for CartesiaGeminiBrain {
     fn capabilities(&self) -> RealtimeBrainCapabilities {
+        let selectable = self.config.live_runtime_selectable();
         RealtimeBrainCapabilities {
             provider: "cartesia_gemini".to_owned(),
             configured: !self.config.missing_live_keys(),
-            selectable: false,
-            live_runtime: false,
+            selectable,
+            live_runtime: selectable,
         }
     }
 
     async fn open(&self, _config: SessionConfig) -> Result<RealtimeSession, BrainError> {
         if self.config.missing_live_keys() {
             return Err(BrainError::MissingApiKey);
+        }
+        if !self.config.selectable_live_keys() {
+            return Err(BrainError::Protocol(
+                "live Cartesia/Gemini keys must be real provider credentials; placeholder release-check keys cannot open live transports"
+                    .to_owned(),
+            ));
         }
 
         self.runner.open(_config).await
@@ -480,6 +500,11 @@ fn env_value(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn is_placeholder_live_key(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.starts_with("viva-release-check-") || normalized.contains("placeholder")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +565,25 @@ mod tests {
         assert_eq!(config.sonic.sample_rate, 16_000);
         assert_eq!(config.sonic.max_buffer_delay_ms, 40);
         assert_eq!(config.sonic.cartesia_version, "2026-03-01");
+    }
+
+    #[test]
+    fn from_env_parses_live_runtime_gate_conservatively() {
+        let enabled = CartesiaGeminiConfig::from_env_with(|name| match name {
+            "VIVA_CARTESIA_GEMINI_LIVE_RUNTIME" => Some(" 1 ".to_owned()),
+            _ => None,
+        });
+        let disabled = CartesiaGeminiConfig::from_env_with(|name| match name {
+            "VIVA_CARTESIA_GEMINI_LIVE_RUNTIME" => Some(" true ".to_owned()),
+            _ => None,
+        });
+        let alias = CartesiaGeminiConfig::from_env_with(|name| match name {
+            "VIVA_AGENT_CARTESIA_GEMINI_LIVE_RUNTIME" => Some(" 1 ".to_owned()),
+            _ => None,
+        });
+
+        assert!(enabled.live_runtime_enabled);
+        assert!(!disabled.live_runtime_enabled);
+        assert!(!alias.live_runtime_enabled);
     }
 }

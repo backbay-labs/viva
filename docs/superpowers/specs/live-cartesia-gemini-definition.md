@@ -17,6 +17,8 @@ Live is Act 3 work. The default product proof remains the no-secret synthetic br
 
 `live_runtime` means the provider path is backed by real Cartesia/Gemini transports rather than synthetic or fake adapters. This flag is necessary, but still not sufficient by itself.
 
+The server-side runtime gate is `VIVA_CARTESIA_GEMINI_LIVE_RUNTIME=1`. The gate has no effect without non-placeholder Cartesia/Gemini credentials, and placeholder release-check keys must never make the provider selectable.
+
 `full live session proof` means both of these are true:
 
 1. `/ready` succeeds for `cartesia_gemini` with `configured=true`, `selectable=true`, and `live_runtime=true`.
@@ -48,11 +50,11 @@ The live smoke harness must remain opt-in. It may never record provider keys, be
 
 ## Current Baseline
 
-The 2026-06-16 baseline state for `cartesia_gemini` is:
+The default release-check baseline state for `cartesia_gemini` is:
 
 - `/health/brain`: `configured=true`, `selectable=false`, `live_runtime=false`, status unavailable.
 - `/ready`: HTTP 503.
 
-That baseline means the live provider is configured enough to be described and gated, but it is not selectable, not a live runtime, and not proven by a full live session. This is intentional until Act 3 opens the gate.
+That baseline means the live provider is configured enough to be described and gated, but it is not selectable, not a live runtime, and not proven by a full live session. This remains intentional for default validation even though an operator can open the explicit runtime gate for opt-in live smoke.
 
 See also `docs/superpowers/specs/provider-readiness-matrix.md`, which records the sanitized matrix evidence and the no-network gate proof.

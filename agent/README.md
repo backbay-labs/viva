@@ -16,8 +16,9 @@ Default local mode is `VIVA_AGENT_PROVIDER=synthetic`, which requires no provide
 keys and is the only provider used unless explicitly overridden. Use
 `VIVA_AGENT_PROVIDER=fake_cartesia_gemini` to exercise the no-key/no-network
 Cartesia/Gemini-shaped runtime through the real WebSocket service boundary. Live
-`cartesia_gemini` remains rejected until the live STT -> Gemini -> TTS pipeline
-is proven.
+`cartesia_gemini` requires `VIVA_AGENT_PROVIDER=cartesia_gemini`, real
+Cartesia/Gemini credentials, and the explicit
+`VIVA_CARTESIA_GEMINI_LIVE_RUNTIME=1` transport gate.
 
 `bun run dev:agent` is the no-secret loopback path. It defaults
 `VIVA_AGENT_BIND_ADDR` to `127.0.0.1:4318`, defaults the provider to

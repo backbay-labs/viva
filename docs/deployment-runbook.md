@@ -90,7 +90,10 @@ export VIVA_VOICE_WS_MAX_SESSION_COST_USD="0.75"
 The live Cartesia/Gemini provider remains opt-in Act 3 work. Do not set
 `VIVA_AGENT_PROVIDER=cartesia_gemini` for default beta validation. The
 `fake_cartesia_gemini` provider is a deterministic no-key provider-shaped smoke
-path; it is not live.
+path; it is not live. The server-side live transport gate is
+`VIVA_CARTESIA_GEMINI_LIVE_RUNTIME=1`; it must stay unset unless real
+Cartesia/Gemini credentials, budget caps, and the opt-in live smoke proof are
+being run.
 
 ## Managed Postgres
 
@@ -242,6 +245,7 @@ for `cartesia_gemini` and after budget/time caps are set. The minimum proof is:
 ```sh
 AGENT_ORIGIN="https://agent.viva.example.com"
 export VIVA_AGENT_PROVIDER="cartesia_gemini"
+export VIVA_CARTESIA_GEMINI_LIVE_RUNTIME=1
 : "${CARTESIA_API_KEY:?set CARTESIA_API_KEY in the secret store before live smoke}"
 : "${GEMINI_API_KEY:?set GEMINI_API_KEY in the secret store before live smoke}"
 curl -fsS "$AGENT_ORIGIN/ready" | jq '.brain.provider, .brain.selectable, .brain.live_runtime'
