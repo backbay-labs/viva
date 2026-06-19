@@ -377,10 +377,204 @@ test("runLiveProviderSmoke fails closed when the live provider is not selectable
 
   assert.equal(evidence.status, "failed");
   assert.equal(evidence.failure_stage, "readiness");
+  assert.equal(evidence.failure.failure_class, "provider_auth_failure");
+  assert.equal(evidence.failure.terminal_reason, "provider_auth_failed");
+  assert.deepEqual(evidence.failure.terminal_session_phase, {
+    type: "session_phase",
+    phase: "recap",
+    terminal_reason: "provider_auth_failed",
+  });
+  assert.equal(evidence.failure.sanitized_evidence, true);
+  assert.equal(evidence.failure.user_copy.next_action_label, "Check provider access");
   assert.equal(evidence.readiness.ready, false);
   assert.equal(evidence.readiness.brain.selectable, false);
   assert.equal(evidence.readiness.brain.live_runtime, false);
   assert.equal(socketOpened, false);
+});
+
+test("runLiveProviderSmoke classifies malformed-stream failures without retaining payloads", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "viva-live-smoke-"));
+  const audioPath = path.join(tempDir, "answer.pcm");
+  await writeFile(audioPath, Buffer.from([1, 2, 3, 4]));
+  const socket = new MalformedStreamSocket();
+
+  try {
+    const evidence = await runLiveProviderSmoke({
+      env: {
+        VIVA_LIVE_PROVIDER_SMOKE: "1",
+        CARTESIA_API_KEY: "cartesia-secret-value",
+        GEMINI_API_KEY: "gemini-secret-value",
+        VIVA_LIVE_SMOKE_AUDIO_FILE: audioPath,
+        VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
+        VIVA_LIVE_SMOKE_MAX_TURNS: "1",
+        VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
+        VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
+        VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "https://agent.viva.test",
+      },
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/health/brain")) {
+          return jsonResponse(200, brainHealth());
+        }
+        if (String(url).endsWith("/ready")) {
+          return jsonResponse(200, readyBody());
+        }
+        if (String(url).endsWith("/study-sets/paste")) {
+          return jsonResponse(201, {
+            study_set: {
+              id: "server-study-set",
+              user_id: "user-1",
+              ingestion_status: "ready",
+            },
+            session_id: "server-session",
+            session_token: "viva1.server-token-secret",
+          });
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      },
+      createWebSocket: () => {
+        queueMicrotask(() => {
+          socket.open();
+          socket.message(readyFrame());
+        });
+        return socket;
+      },
+      now: () => new Date("2026-06-18T00:00:00.000Z"),
+    });
+
+    assert.equal(evidence.status, "failed");
+    assert.equal(evidence.failure_stage, "websocket");
+    assert.equal(evidence.websocket.terminal_reason, "server_error_frame");
+    assert.equal(evidence.failure.failure_class, "malformed_stream");
+    assert.equal(evidence.failure.terminal_reason, "provider_malformed_stream");
+    assert.equal(evidence.failure.sanitized_evidence, true);
+
+    const serialized = JSON.stringify(evidence);
+    assert.doesNotMatch(serialized, /provider raw payload with prompt text/);
+    assert.doesNotMatch(serialized, /cartesia-secret-value/);
+    assert.doesNotMatch(serialized, /gemini-secret-value/);
+    assert.doesNotMatch(serialized, /viva1\.server-token-secret/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("runLiveProviderSmoke classifies invalid JSON frames as malformed stream failures", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "viva-live-smoke-"));
+  const audioPath = path.join(tempDir, "answer.pcm");
+  await writeFile(audioPath, Buffer.from([1, 2, 3, 4]));
+  const socket = new InvalidJsonSocket();
+
+  try {
+    const evidence = await runLiveProviderSmoke({
+      env: {
+        VIVA_LIVE_PROVIDER_SMOKE: "1",
+        CARTESIA_API_KEY: "cartesia-secret-value",
+        GEMINI_API_KEY: "gemini-secret-value",
+        VIVA_LIVE_SMOKE_AUDIO_FILE: audioPath,
+        VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
+        VIVA_LIVE_SMOKE_MAX_TURNS: "1",
+        VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
+        VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
+        VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "https://agent.viva.test",
+      },
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/health/brain")) {
+          return jsonResponse(200, brainHealth());
+        }
+        if (String(url).endsWith("/ready")) {
+          return jsonResponse(200, readyBody());
+        }
+        if (String(url).endsWith("/study-sets/paste")) {
+          return jsonResponse(201, {
+            study_set: {
+              id: "server-study-set",
+              user_id: "user-1",
+              ingestion_status: "ready",
+            },
+            session_id: "server-session",
+            session_token: "viva1.server-token-secret",
+          });
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      },
+      createWebSocket: () => {
+        queueMicrotask(() => {
+          socket.open();
+          socket.message(readyFrame());
+        });
+        return socket;
+      },
+      now: () => new Date("2026-06-18T00:00:00.000Z"),
+    });
+
+    assert.equal(evidence.status, "failed");
+    assert.equal(evidence.failure_stage, "websocket");
+    assert.equal(evidence.websocket.terminal_reason, "invalid_server_frame");
+    assert.equal(evidence.failure.failure_class, "malformed_stream");
+    assert.equal(evidence.failure.terminal_reason, "provider_malformed_stream");
+    assert.equal(evidence.websocket.event_counts.structured_error, 1);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("runLiveProviderSmoke maps runtime rate terminal phases to quota-rate failures", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "viva-live-smoke-"));
+  const audioPath = path.join(tempDir, "answer.pcm");
+  await writeFile(audioPath, Buffer.from([1, 2, 3, 4]));
+  const socket = new TerminalReasonSocket("rate_limit");
+
+  try {
+    const evidence = await runLiveProviderSmoke({
+      env: {
+        VIVA_LIVE_PROVIDER_SMOKE: "1",
+        CARTESIA_API_KEY: "cartesia-secret-value",
+        GEMINI_API_KEY: "gemini-secret-value",
+        VIVA_LIVE_SMOKE_AUDIO_FILE: audioPath,
+        VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
+        VIVA_LIVE_SMOKE_MAX_TURNS: "1",
+        VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
+        VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
+        VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "https://agent.viva.test",
+      },
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/health/brain")) {
+          return jsonResponse(200, brainHealth());
+        }
+        if (String(url).endsWith("/ready")) {
+          return jsonResponse(200, readyBody());
+        }
+        if (String(url).endsWith("/study-sets/paste")) {
+          return jsonResponse(201, {
+            study_set: {
+              id: "server-study-set",
+              user_id: "user-1",
+              ingestion_status: "ready",
+            },
+            session_id: "server-session",
+            session_token: "viva1.server-token-secret",
+          });
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      },
+      createWebSocket: () => {
+        queueMicrotask(() => {
+          socket.open();
+          socket.message(readyFrame());
+        });
+        return socket;
+      },
+      now: () => new Date("2026-06-18T00:00:00.000Z"),
+    });
+
+    assert.equal(evidence.status, "failed");
+    assert.equal(evidence.failure_stage, "websocket");
+    assert.equal(evidence.websocket.terminal_reason, "rate_limit");
+    assert.equal(evidence.failure.failure_class, "quota_rate_failure");
+    assert.equal(evidence.failure.terminal_reason, "provider_rate_limited");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });
 
 function jsonResponse(status, body) {
@@ -553,9 +747,87 @@ class FakeSocket {
     this.emit("message", { data: JSON.stringify(payload) });
   }
 
+  rawMessage(data) {
+    this.emit("message", { data });
+  }
+
   emit(type, event) {
     for (const listener of this.listeners.get(type) ?? []) {
       listener(event);
+    }
+  }
+}
+
+class MalformedStreamSocket extends FakeSocket {
+  send(data) {
+    this.sent.push(data);
+    if (typeof data === "string") {
+      const frame = JSON.parse(data);
+      if (frame.type === "session_config") {
+        queueMicrotask(() => {
+          this.message(eventFrame("session_phase", { phase: "listening" }));
+          this.message(eventFrame("question_started", { response_id: "response-1", question: {} }));
+        });
+      }
+    } else if (Buffer.isBuffer(data)) {
+      queueMicrotask(() => {
+        this.message({
+          type: "error",
+          version: 2,
+          message: "provider raw payload with prompt text must not be retained",
+        });
+        this.close(1011, "provider stream failed");
+      });
+    }
+  }
+}
+
+class InvalidJsonSocket extends FakeSocket {
+  send(data) {
+    this.sent.push(data);
+    if (typeof data === "string") {
+      const frame = JSON.parse(data);
+      if (frame.type === "session_config") {
+        queueMicrotask(() => {
+          this.message(eventFrame("session_phase", { phase: "listening" }));
+          this.message(eventFrame("question_started", { response_id: "response-1", question: {} }));
+        });
+      }
+    } else if (Buffer.isBuffer(data)) {
+      queueMicrotask(() => {
+        this.rawMessage('{"type":"event","version":2,"event":');
+        this.close(1011, "provider stream failed");
+      });
+    }
+  }
+}
+
+class TerminalReasonSocket extends FakeSocket {
+  constructor(terminalReason) {
+    super();
+    this.terminalReason = terminalReason;
+  }
+
+  send(data) {
+    this.sent.push(data);
+    if (typeof data === "string") {
+      const frame = JSON.parse(data);
+      if (frame.type === "session_config") {
+        queueMicrotask(() => {
+          this.message(eventFrame("session_phase", { phase: "listening" }));
+          this.message(eventFrame("question_started", { response_id: "response-1", question: {} }));
+        });
+      }
+    } else if (Buffer.isBuffer(data)) {
+      queueMicrotask(() => {
+        this.message(
+          eventFrame("session_phase", {
+            phase: "recap",
+            terminal_reason: this.terminalReason,
+          }),
+        );
+        this.close(1008, this.terminalReason);
+      });
     }
   }
 }

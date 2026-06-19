@@ -268,15 +268,19 @@ impl VoiceWsAccess {
             }
         }
 
-        if let Some(required) = &self.required_bearer {
-            let Some(provided) = bearer_from_headers(headers) else {
-                return Err(VoiceWsAccessError::MissingBearer);
-            };
-            if !constant_time_eq(required.as_bytes(), provided.as_bytes()) {
-                return Err(VoiceWsAccessError::InvalidBearer);
-            }
-        }
+        self.validate_bearer_headers(headers)
+    }
 
+    pub fn validate_bearer_headers(&self, headers: &HeaderMap) -> Result<(), VoiceWsAccessError> {
+        let Some(required) = &self.required_bearer else {
+            return Ok(());
+        };
+        let Some(provided) = bearer_from_headers(headers) else {
+            return Err(VoiceWsAccessError::MissingBearer);
+        };
+        if !constant_time_eq(required.as_bytes(), provided.as_bytes()) {
+            return Err(VoiceWsAccessError::InvalidBearer);
+        }
         Ok(())
     }
 }

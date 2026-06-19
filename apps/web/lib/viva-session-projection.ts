@@ -72,9 +72,17 @@ export type RuntimeCopyCause =
   | "live_provider_gated"
   | "live_runtime"
   | "mic_denied"
+  | "partial_stage_success"
+  | "provider_auth_failed"
+  | "provider_cancelled"
+  | "provider_malformed_stream"
+  | "provider_network_disconnect"
+  | "provider_rate_limited"
+  | "provider_timeout"
   | "rate_limit"
   | "session_cap"
   | "session_disconnected"
+  | "slow_client"
   | "store_unavailable"
   | "synthetic"
   | "turn_cap"
@@ -185,9 +193,11 @@ export function projectRuntimeCopy({
   close?: VivaAgentCloseDiagnostics;
   terminalReason?: AgentTerminalSessionReason;
 }): RuntimeCopy {
-  const newestError = errors.at(-1) ?? "";
-  const closeReason = close?.reason ?? "";
-  const diagnosticText = `${newestError} ${closeReason}`;
+  const rawNewestError = errors.at(-1) ?? "";
+  const rawCloseReason = close?.reason ?? "";
+  const newestError = sanitizeRuntimeDiagnostic(rawNewestError);
+  const closeReason = sanitizeRuntimeDiagnostic(rawCloseReason);
+  const diagnosticText = `${rawNewestError} ${rawCloseReason}`;
   const authFailed = /auth|token|claim|unauthori[sz]ed/i.test(diagnosticText);
   const endpointReady = readinessProbe?.status === "observed" ? readinessProbe.ready : undefined;
   const readinessFacts = ready ?? endpointReady;
@@ -201,6 +211,10 @@ export function projectRuntimeCopy({
     terminalReason,
     websocketReady: Boolean(ready) && status === "open",
   };
+
+  if (status === "closed" && terminalReason) {
+    return controlledTerminalCopy(terminalReason, context);
+  }
 
   if (authFailed) {
     return runtimeCopy(
@@ -300,12 +314,8 @@ export function projectRuntimeCopy({
     );
   }
 
-  if (status === "closed" && terminalReason) {
-    return controlledTerminalCopy(terminalReason, context);
-  }
-
   if (status === "closed" && close && !context.websocketReady && isUnexpectedClose(close)) {
-    const reason = close.reason ? ` Reason: ${close.reason}.` : "";
+    const reason = closeReason ? ` Reason: ${closeReason}.` : "";
     return runtimeCopy(
       {
         capsuleLabel: "Session interrupted",
@@ -519,13 +529,109 @@ function controlledTerminalCopy(
       statusLabel: "budget cap",
       cause: "cost_budget",
     },
+    provider_auth_failed: {
+      capsuleLabel: "Provider auth failed",
+      marginaliaTitle: "Live provider access was denied.",
+      marginaliaText:
+        "The live provider rejected access before the manuscript could open another trusted turn.",
+      statusLabel: "provider auth failed",
+      cause: "provider_auth_failed",
+    },
+    provider_rate_limited: {
+      capsuleLabel: "Provider rate limited",
+      marginaliaTitle: "Live provider quota stopped this turn.",
+      marginaliaText:
+        "The provider quota or rate limit closed the manuscript before a complete live response.",
+      statusLabel: "provider rate limited",
+      cause: "provider_rate_limited",
+    },
+    provider_timeout: {
+      capsuleLabel: "Provider timeout",
+      marginaliaTitle: "Live provider timed out.",
+      marginaliaText:
+        "The live stream did not reach the next required stage within the configured cap.",
+      statusLabel: "provider timeout",
+      cause: "provider_timeout",
+    },
+    provider_malformed_stream: {
+      capsuleLabel: "Provider stream failed",
+      marginaliaTitle: "Live provider stream was malformed.",
+      marginaliaText:
+        "The stream produced an invalid or structured error frame, so Viva closed it without retaining provider contents.",
+      statusLabel: "provider stream failed",
+      cause: "provider_malformed_stream",
+    },
+    provider_network_disconnect: {
+      capsuleLabel: "Provider disconnected",
+      marginaliaTitle: "Live provider connection dropped.",
+      marginaliaText:
+        "The provider transport disconnected before the manuscript received a complete terminal phase.",
+      statusLabel: "provider disconnected",
+      cause: "provider_network_disconnect",
+    },
+    slow_client: {
+      capsuleLabel: "Client too slow",
+      marginaliaTitle: "The client missed the live-turn cap.",
+      marginaliaText:
+        "The client did not finish the live turn within the configured turn or audio cap.",
+      statusLabel: "client too slow",
+      cause: "slow_client",
+    },
+    provider_cancelled: {
+      capsuleLabel: "Provider cancelled",
+      marginaliaTitle: "Live provider cancelled the turn.",
+      marginaliaText: "The live response was cancelled before Viva could produce a complete recap.",
+      statusLabel: "provider cancelled",
+      cause: "provider_cancelled",
+    },
+    partial_stage_success: {
+      capsuleLabel: "Partial live result",
+      marginaliaTitle: "Live provider reached only part of the turn.",
+      marginaliaText:
+        "The stream reached a later stage but missed at least one required live-smoke proof event.",
+      statusLabel: "partial live result",
+      cause: "partial_stage_success",
+    },
   };
-  return runtimeCopy(copyByReason[reason], context, {
-    disabled: false,
-    intent: "start_session",
-    nextActionLabel: "Start a new session",
-    primaryActionLabel: "Start again",
-  });
+  const actionByReason: Record<
+    AgentTerminalSessionReason,
+    {
+      disabled: boolean;
+      intent: RuntimePrimaryActionIntent;
+      nextActionLabel: string;
+      primaryActionLabel: string;
+    }
+  > = {
+    drained: startAgainAction(),
+    session_cap: startAgainAction(),
+    turn_cap: startAgainAction(),
+    rate_limit: startAgainAction(),
+    cost_budget: startAgainAction(),
+    provider_auth_failed: {
+      disabled: false,
+      intent: "retry_agent",
+      nextActionLabel: "Check provider access",
+      primaryActionLabel: "Check provider access",
+    },
+    provider_rate_limited: {
+      disabled: false,
+      intent: "retry_agent",
+      nextActionLabel: "Retry after quota resets",
+      primaryActionLabel: "Retry after quota resets",
+    },
+    provider_timeout: retryAgentAction(),
+    provider_malformed_stream: retryAgentAction(),
+    provider_network_disconnect: retryAgentAction(),
+    slow_client: startAgainAction(),
+    provider_cancelled: startAgainAction(),
+    partial_stage_success: {
+      disabled: false,
+      intent: "start_session",
+      nextActionLabel: "Review partial recap",
+      primaryActionLabel: "Review partial recap",
+    },
+  };
+  return runtimeCopy(copyByReason[reason], context, actionByReason[reason]);
 }
 
 function runtimeCopy(
@@ -553,6 +659,17 @@ function runtimeCopy(
     primaryActionLabel: action.primaryActionLabel ?? action.nextActionLabel,
     readinessNotes: runtimeReadinessNotes(context, copy.cause),
   };
+}
+
+function sanitizeRuntimeDiagnostic(value: string): string {
+  if (
+    /pcm16_base64|answer_text|transcript|prompt|source_context|pasted_text|session_token|viva1\.|bearer|cartesia_api_key|gemini_api_key|secret|raw answer|source excerpt/i.test(
+      value,
+    )
+  ) {
+    return "sanitized provider error";
+  }
+  return value;
 }
 
 function isUnexpectedClose(close: VivaAgentCloseDiagnostics): boolean {
@@ -587,6 +704,20 @@ function retryAgentAction(): {
     intent: "retry_agent",
     nextActionLabel: "Retry agent",
     primaryActionLabel: "Retry agent",
+  };
+}
+
+function startAgainAction(): {
+  disabled: boolean;
+  intent: RuntimePrimaryActionIntent;
+  nextActionLabel: string;
+  primaryActionLabel: string;
+} {
+  return {
+    disabled: false,
+    intent: "start_session",
+    nextActionLabel: "Start a new session",
+    primaryActionLabel: "Start again",
   };
 }
 

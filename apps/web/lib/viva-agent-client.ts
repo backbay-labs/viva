@@ -499,7 +499,11 @@ export function vivaAgentReducer(
     return { ...state, status: "open", ready: frame };
   }
   if (frame.type === "error") {
-    return { ...state, status: "error", errors: [...state.errors, frame.message] };
+    return {
+      ...state,
+      status: "error",
+      errors: [...state.errors, sanitizeAgentError(frame.message)],
+    };
   }
 
   const event = frame.event;
@@ -598,10 +602,26 @@ export function vivaAgentReducer(
       };
     }
     case "structured_error":
-      return { ...state, status: "error", errors: [...state.errors, event.message] };
+      return {
+        ...state,
+        status: "error",
+        errors: [...state.errors, sanitizeAgentError(event.message)],
+      };
     default:
       return state;
   }
+}
+
+function sanitizeAgentError(message: string): string {
+  if (!message) return "agent error";
+  if (
+    /pcm16_base64|answer_text|transcript|prompt|source_context|pasted_text|session_token|viva1\.|bearer|cartesia_api_key|gemini_api_key|secret|raw answer|source excerpt/i.test(
+      message,
+    )
+  ) {
+    return "sanitized provider error";
+  }
+  return message.replace(/\s+/g, " ").slice(0, 160);
 }
 
 export function createVivaAgentSessionController(

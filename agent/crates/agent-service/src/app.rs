@@ -417,10 +417,15 @@ async fn ready(
         Ok(headers) => headers,
         Err(error) => return cors_json_error(error),
     };
+    if let Err(error) = state.ws_access.validate_bearer_headers(&headers) {
+        return readiness_access_json_error(error, response_headers);
+    }
     let brain = state.brain.capabilities();
     let store = state.study_store.capabilities();
     let writes = state.study_store.write_counts();
     let ready = state.is_ready();
+    let readiness_status =
+        readiness_status(ready, state.drain_signal.is_draining(), &brain, &store);
     let status = if ready {
         StatusCode::OK
     } else {
@@ -431,6 +436,11 @@ async fn ready(
         response_headers,
         Json(json!({
             "ready": ready,
+            "readiness_status": readiness_status,
+            "failure_kind": readiness_failure_kind(readiness_status),
+            "access": {
+                "status": "allowed",
+            },
             "brain": {
                 "provider": brain.provider,
                 "configured": brain.configured,
@@ -464,15 +474,26 @@ async fn brain_health(
         Ok(headers) => headers,
         Err(error) => return cors_json_error(error),
     };
+    if let Err(error) = state.ws_access.validate_bearer_headers(&headers) {
+        return readiness_access_json_error(error, response_headers);
+    }
     let brain = state.brain.capabilities();
     let store = state.study_store.capabilities();
     let writes = state.study_store.write_counts();
+    let ready = state.is_ready();
+    let readiness_status =
+        readiness_status(ready, state.drain_signal.is_draining(), &brain, &store);
 
     (
         StatusCode::OK,
         response_headers,
         Json(json!({
             "provider": state.provider,
+            "readiness_status": readiness_status,
+            "failure_kind": readiness_failure_kind(readiness_status),
+            "access": {
+                "status": "allowed",
+            },
             "brain": {
                 "provider": brain.provider,
                 "configured": brain.configured,
@@ -497,13 +518,82 @@ async fn brain_health(
             "usage": {
                 "events": state.usage.snapshot().len(),
             },
-            "status": if brain.configured && brain.selectable && store.available {
+            "status": if ready {
                 "configured"
             } else {
                 "unavailable"
             },
         })),
     )
+}
+
+fn readiness_status(
+    ready: bool,
+    draining: bool,
+    brain: &agent_domain::RealtimeBrainCapabilities,
+    store: &agent_domain::StudyStoreCapabilities,
+) -> &'static str {
+    if ready {
+        return "ready";
+    }
+    if draining {
+        return "draining";
+    }
+    if !brain.configured {
+        return "provider_unconfigured";
+    }
+    if !brain.selectable {
+        return "provider_unselectable";
+    }
+    if !store.available {
+        return "store_unavailable";
+    }
+    "dependency_unavailable"
+}
+
+fn readiness_failure_kind(readiness_status: &str) -> &'static str {
+    match readiness_status {
+        "ready" => "none",
+        "draining" => "service_draining",
+        "access_denied" => "access_denied",
+        _ => "dependency_unavailable",
+    }
+}
+
+fn readiness_access_json_error(
+    error: crate::config::VoiceWsAccessError,
+    response_headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    (
+        access_error_status(&error),
+        response_headers,
+        Json(json!({
+            "error": access_error_code(&error),
+            "message": error.to_string(),
+            "readiness_status": "access_denied",
+            "failure_kind": readiness_failure_kind("access_denied"),
+            "access": {
+                "status": "denied",
+                "reason": access_error_code(&error),
+            },
+        })),
+    )
+}
+
+fn access_error_status(error: &crate::config::VoiceWsAccessError) -> StatusCode {
+    match error {
+        crate::config::VoiceWsAccessError::OriginDenied => StatusCode::FORBIDDEN,
+        crate::config::VoiceWsAccessError::MissingBearer
+        | crate::config::VoiceWsAccessError::InvalidBearer => StatusCode::UNAUTHORIZED,
+    }
+}
+
+fn access_error_code(error: &crate::config::VoiceWsAccessError) -> &'static str {
+    match error {
+        crate::config::VoiceWsAccessError::OriginDenied => "origin_denied",
+        crate::config::VoiceWsAccessError::MissingBearer => "missing_bearer",
+        crate::config::VoiceWsAccessError::InvalidBearer => "invalid_bearer",
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1427,11 +1517,17 @@ fn cors_json_error(
     error: crate::config::VoiceWsAccessError,
 ) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
     (
-        StatusCode::FORBIDDEN,
+        access_error_status(&error),
         HeaderMap::new(),
         Json(json!({
-            "error": "origin_denied",
+            "error": access_error_code(&error),
             "message": error.to_string(),
+            "readiness_status": "access_denied",
+            "failure_kind": readiness_failure_kind("access_denied"),
+            "access": {
+                "status": "denied",
+                "reason": access_error_code(&error),
+            },
         })),
     )
 }

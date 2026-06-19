@@ -3,6 +3,11 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import {
+  failureMatrixEvidence,
+  liveProviderFailureForSmokeReason,
+} from "./live-provider-failure-matrix.mjs";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PROTOCOL_VERSION = 2;
 const LIVE_PROVIDER = "cartesia_gemini";
@@ -131,6 +136,7 @@ export async function runLiveProviderSmoke({
       ...base,
       status: "failed",
       failure_stage: "readiness",
+      failure: liveProviderFailureForSmokeReason("readiness_unavailable"),
       readiness: readinessUnavailable(),
       terminal_reason: "readiness_unavailable",
     };
@@ -143,6 +149,7 @@ export async function runLiveProviderSmoke({
       ...base,
       status: "failed",
       failure_stage: "readiness",
+      failure: liveProviderFailureForSmokeReason("readiness_not_live_selectable"),
       readiness,
       terminal_reason: "readiness_not_live_selectable",
     };
@@ -161,6 +168,7 @@ export async function runLiveProviderSmoke({
       ...base,
       status: "failed",
       failure_stage: "audio_input",
+      failure: liveProviderFailureForSmokeReason("audio_input_unavailable"),
       readiness,
       terminal_reason: "audio_input_unavailable",
     };
@@ -176,6 +184,7 @@ export async function runLiveProviderSmoke({
       ...base,
       status: "failed",
       failure_stage: "bootstrap",
+      failure: liveProviderFailureForSmokeReason("bootstrap_failed"),
       readiness,
       terminal_reason: "bootstrap_failed",
     };
@@ -203,6 +212,13 @@ export async function runLiveProviderSmoke({
     ...base,
     status,
     ...(status === "failed" ? { failure_stage: "websocket" } : {}),
+    ...(status === "failed"
+      ? {
+          failure: liveProviderFailureForSmokeReason(
+            websocket.terminal_reason ?? "websocket_failed",
+          ),
+        }
+      : {}),
     readiness,
     bootstrap: {
       server_study_created: bootstrap.serverStudyCreated,
@@ -294,9 +310,12 @@ async function collectReadiness(config, fetchImpl) {
   const healthStore = health.body?.store ?? {};
   const readyStore = ready.body?.store ?? {};
   return {
+    access: summarizeAccess(ready.body?.access ?? health.body?.access),
+    failure_kind: stringOrNull(ready.body?.failure_kind ?? health.body?.failure_kind),
     health_http_status: health.http_status,
     ready_http_status: ready.http_status,
     ready: ready.body?.ready === true,
+    readiness_status: stringOrNull(ready.body?.readiness_status ?? health.body?.readiness_status),
     brain: {
       provider: healthBrain.provider ?? readyBrain.provider ?? null,
       configured: healthBrain.configured === true && readyBrain.configured === true,
@@ -396,6 +415,17 @@ async function collectWebSocketProof({ audioBytes, bootstrap, config, createWebS
   const questionDeferred = deferred();
   const recapDeferred = deferred();
   let settled = false;
+  const completeWithTerminalFailure = (reason) => {
+    proof.terminal_reason = reason;
+    readyDeferred.resolve();
+    questionDeferred.resolve();
+    recapDeferred.resolve();
+  };
+  const throwIfTerminalFailure = () => {
+    if (proof.terminal_reason && proof.terminal_reason !== "recap_observed") {
+      throw new Error(proof.terminal_reason);
+    }
+  };
 
   cleanup.push(
     onSocket(socket, "open", () => {
@@ -410,6 +440,7 @@ async function collectWebSocketProof({ audioBytes, bootstrap, config, createWebS
         frame = parseSocketMessage(event);
       } catch {
         eventCounts.structured_error += 1;
+        completeWithTerminalFailure("invalid_server_frame");
         return;
       }
       const summary = summarizeServerFrame(frame);
@@ -434,7 +465,7 @@ async function collectWebSocketProof({ audioBytes, bootstrap, config, createWebS
       if (code === "session_phase" && summary.phase) {
         phaseCounts[summary.phase] = (phaseCounts[summary.phase] ?? 0) + 1;
         if (summary.terminal_reason) {
-          proof.terminal_reason = summary.terminal_reason;
+          completeWithTerminalFailure(summary.terminal_reason);
         }
       }
       if (code === "question") {
@@ -481,15 +512,19 @@ async function collectWebSocketProof({ audioBytes, bootstrap, config, createWebS
 
   try {
     await withTimeout(openDeferred.promise, config.caps.max_duration_ms, "socket_open_timeout");
+    throwIfTerminalFailure();
     await withTimeout(readyDeferred.promise, config.caps.max_duration_ms, "ready_frame_timeout");
+    throwIfTerminalFailure();
     sendJson(socket, sessionConfigFrame(bootstrap.session));
     await withTimeout(
       questionDeferred.promise,
       config.caps.max_duration_ms,
       "question_event_timeout",
     );
+    throwIfTerminalFailure();
     socket.send(Buffer.from(audioBytes));
     await withTimeout(recapDeferred.promise, config.caps.max_duration_ms, "recap_timeout");
+    throwIfTerminalFailure();
     settled = true;
   } catch (error) {
     proof.terminal_reason = safeEnum(error instanceof Error ? error.message : "websocket_failed");
@@ -637,6 +672,7 @@ function baseEvidence(config, now) {
     schema: "viva.live_provider_smoke.v1",
     generated_at: now().toISOString(),
     enabled: true,
+    failure_matrix: failureMatrixEvidence(),
     provider: config.provider,
     caps: { ...config.caps },
     privacy: privacyEvidence(),
@@ -669,9 +705,15 @@ function privacyEvidence() {
 
 function readinessUnavailable() {
   return {
+    access: {
+      reason: null,
+      status: "unknown",
+    },
+    failure_kind: "dependency_unavailable",
     health_http_status: null,
     ready: false,
     ready_http_status: null,
+    readiness_status: "dependency_unavailable",
     brain: {
       configured: false,
       live_runtime: false,
@@ -701,6 +743,13 @@ function summarizeStore(store) {
     available: store?.available === true,
     backend: typeof store?.backend === "string" ? store.backend : null,
     durable: store?.durable === true,
+  };
+}
+
+function summarizeAccess(access) {
+  return {
+    reason: stringOrNull(access?.reason),
+    status: stringOrNull(access?.status) ?? "unknown",
   };
 }
 
@@ -789,6 +838,10 @@ function integerOrNull(value) {
   return Number.isInteger(value) ? value : null;
 }
 
+function stringOrNull(value) {
+  return typeof value === "string" ? safeEnum(value) : null;
+}
+
 function safeEnum(value) {
   return String(value)
     .replace(/[^a-z0-9_.-]+/gi, "_")
@@ -842,6 +895,7 @@ async function main() {
       status: "failed",
       provider: LIVE_PROVIDER,
       failure_stage: "configuration",
+      failure: liveProviderFailureForSmokeReason("configuration_error"),
       terminal_reason: "configuration_error",
       privacy: privacyEvidence(),
     };

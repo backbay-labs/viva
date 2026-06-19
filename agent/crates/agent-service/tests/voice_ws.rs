@@ -10,9 +10,9 @@ use std::{
 
 use agent_adapters::{cartesia_gemini::FakeCartesiaGeminiRuntime, SyntheticBrain};
 use agent_domain::{
-    AudioFrame, BrainError, BrainEvent, BrainInput, BrainUsage, ConceptStatus, RealtimeBrain,
-    RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard, RecapSourceMoment,
-    SessionConfig, SessionId, StudyMemoryStore, StudyMode, StudySessionRecap,
+    AudioFrame, BrainError, BrainEvent, BrainInput, BrainProviderError, BrainUsage, ConceptStatus,
+    RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard,
+    RecapSourceMoment, SessionConfig, SessionId, StudyMemoryStore, StudyMode, StudySessionRecap,
     StudySetIngestionStatus, TerminalSessionReason,
 };
 use agent_service::{
@@ -305,6 +305,138 @@ async fn ready_route_reports_unavailable_during_voice_drain() {
     assert_eq!(payload["ready"], false);
     assert_eq!(payload["brain"]["selectable"], true);
     assert_eq!(payload["store"]["available"], true);
+}
+
+#[tokio::test]
+async fn ready_route_distinguishes_dependency_failure_from_access_denial() {
+    let origin = "https://viva.example";
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(CapabilityProbeBrain {
+            capabilities: RealtimeBrainCapabilities {
+                provider: "cartesia_gemini".to_owned(),
+                configured: false,
+                selectable: false,
+                live_runtime: false,
+            },
+        }),
+        "cartesia_gemini",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: None,
+            allowed_origins: vec![origin.to_owned()],
+        },
+        4,
+        store,
+    );
+    let app = build_router(state);
+
+    let dependency_failure = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .header("origin", origin)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(dependency_failure.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = dependency_failure
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["ready"], false);
+    assert_eq!(payload["readiness_status"], "provider_unconfigured");
+    assert_eq!(payload["failure_kind"], "dependency_unavailable");
+    assert_eq!(payload["access"]["status"], "allowed");
+
+    let access_denied = app
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .header("origin", "https://evil.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(access_denied.status(), StatusCode::FORBIDDEN);
+    let body = access_denied
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["readiness_status"], "access_denied");
+    assert_eq!(payload["failure_kind"], "access_denied");
+    assert_eq!(payload["access"]["status"], "denied");
+    assert_eq!(payload["access"]["reason"], "origin_denied");
+
+    let bearer_state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(Arc::new(
+            data::InMemoryStudyStore::seeded_fixture(),
+        ))),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: Some("rest-secret".to_owned()),
+            session_token_secret: None,
+            allowed_origins: vec![],
+        },
+        4,
+        Arc::new(data::InMemoryStudyStore::seeded_fixture()),
+    );
+    let bearer_app = build_router(bearer_state);
+    let missing_bearer = bearer_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(missing_bearer.status(), StatusCode::UNAUTHORIZED);
+    let body = missing_bearer
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["readiness_status"], "access_denied");
+    assert_eq!(payload["failure_kind"], "access_denied");
+    assert_eq!(payload["access"]["reason"], "missing_bearer");
+
+    let invalid_bearer = bearer_app
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .header("authorization", "Bearer wrong-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(invalid_bearer.status(), StatusCode::UNAUTHORIZED);
+    let body = invalid_bearer
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["access"]["reason"], "invalid_bearer");
 }
 
 #[tokio::test]
@@ -2482,6 +2614,76 @@ async fn websocket_checks_study_set_access_before_brain_open() {
 }
 
 #[tokio::test]
+async fn websocket_brain_open_auth_failure_emits_terminal_phase_without_raw_error() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(OpenAuthFailureBrain),
+        "cartesia_gemini",
+        VoiceWsAccess::default(),
+        4,
+        store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/synthetic-study-session.json"
+    ))
+    .unwrap();
+
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let _ = read_server_frame(&mut socket).await;
+    send_client_frame(&mut socket, &fixture.client[0]).await;
+
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::ProviderAuthFailed,
+    );
+    assert_close_code(&mut socket, CloseCode::Error).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "provider_auth_failed"
+    }));
+}
+
+#[tokio::test]
+async fn websocket_provider_error_event_emits_terminal_phase_without_raw_message() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(EventProbeBrain {
+            study_store: None,
+            events: vec![BrainEvent::Error(BrainProviderError {
+                source: "cartesia_gemini".to_owned(),
+                message: "raw answer transcript with CARTESIA_API_KEY must not surface".to_owned(),
+            })],
+        }),
+        "event_probe",
+        VoiceWsAccess::default(),
+        4,
+        store,
+    );
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/synthetic-study-session.json"
+    ))
+    .unwrap();
+
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut socket, "event_probe").await;
+    send_client_frame(&mut socket, &fixture.client[0]).await;
+
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::ProviderAuthFailed,
+    );
+    assert_close_code(&mut socket, CloseCode::Error).await;
+}
+
+#[tokio::test]
 async fn websocket_rejects_browser_tool_result_as_untrusted() {
     let state = test_state(1);
     let evidence = state.evidence.clone();
@@ -4018,6 +4220,45 @@ async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
         tokio::task::yield_now().await;
     }
     assert!(condition(), "condition was not met before timeout");
+}
+
+struct CapabilityProbeBrain {
+    capabilities: RealtimeBrainCapabilities,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for CapabilityProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        self.capabilities.clone()
+    }
+
+    async fn open(
+        &self,
+        _config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        Err(BrainError::MissingApiKey)
+    }
+}
+
+struct OpenAuthFailureBrain;
+
+#[async_trait::async_trait]
+impl RealtimeBrain for OpenAuthFailureBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "cartesia_gemini".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: true,
+        }
+    }
+
+    async fn open(
+        &self,
+        _config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        Err(BrainError::MissingApiKey)
+    }
 }
 
 struct AbortProbeBrain {

@@ -223,6 +223,20 @@ describe("projectRuntimeCopy", () => {
     expect(copy.marginaliaText).not.toContain("Synthetic examiner");
   });
 
+  test("sanitizes raw-looking provider diagnostics before rendering unavailable copy", () => {
+    const copy = projectRuntimeCopy({
+      errors: ["provider prompt transcript with bearer viva1.secret-token and raw answer text"],
+      readiness: trustedReadiness,
+      ready: ready("cartesia_gemini", { live_runtime: true }),
+      status: "error",
+    });
+
+    expect(copy.cause).toBe("auth_failed");
+    expect(copy.marginaliaText).not.toContain("viva1.secret-token");
+    expect(copy.marginaliaText).not.toContain("raw answer text");
+    expect(copy.marginaliaText).not.toContain("prompt transcript");
+  });
+
   test("uses readiness facts before provider names for generic live runtimes", () => {
     const copy = projectRuntimeCopy({
       readiness: trustedReadiness,
@@ -466,6 +480,59 @@ describe("projectRuntimeCopy", () => {
     expect(drained.cause).toBe("drained");
     expect(drained.capsuleLabel).toBe("Session drained");
     expect(drained.marginaliaText).toContain("deploy");
+  });
+
+  test("maps live provider terminal failures to user-facing degradation copy", () => {
+    const cases = [
+      [
+        "provider_auth_failed",
+        "provider_auth_failed",
+        "Provider auth failed",
+        "Check provider access",
+      ],
+      [
+        "provider_rate_limited",
+        "provider_rate_limited",
+        "Provider rate limited",
+        "Retry after quota resets",
+      ],
+      ["provider_timeout", "provider_timeout", "Provider timeout", "Retry agent"],
+      [
+        "provider_malformed_stream",
+        "provider_malformed_stream",
+        "Provider stream failed",
+        "Retry agent",
+      ],
+      [
+        "provider_network_disconnect",
+        "provider_network_disconnect",
+        "Provider disconnected",
+        "Retry agent",
+      ],
+      ["slow_client", "slow_client", "Client too slow", "Start a new session"],
+      ["provider_cancelled", "provider_cancelled", "Provider cancelled", "Start a new session"],
+      [
+        "partial_stage_success",
+        "partial_stage_success",
+        "Partial live result",
+        "Review partial recap",
+      ],
+    ] as const;
+
+    for (const [terminalReason, cause, capsuleLabel, nextActionLabel] of cases) {
+      const copy = projectRuntimeCopy({
+        close: { code: 1011, reason: terminalReason, wasClean: true },
+        readiness: trustedReadiness,
+        ready: ready("cartesia_gemini", { live_runtime: true }),
+        status: "closed",
+        terminalReason,
+      });
+
+      expect(copy.cause).toBe(cause);
+      expect(copy.capsuleLabel).toBe(capsuleLabel);
+      expect(copy.nextActionLabel).toBe(nextActionLabel);
+      expect(/payload|prompt|transcript|pcm16|secret/i.test(copy.marginaliaText)).toBe(false);
+    }
   });
 
   test("classifies close-only auth failures before generic interruption recovery", () => {
