@@ -316,6 +316,7 @@ export function MasteryRing({
           strokeWidth={stroke}
         />
         <circle
+          className="mastery-ring__progress"
           cx={size / 2}
           cy={size / 2}
           fill="none"
@@ -325,6 +326,12 @@ export function MasteryRing({
           strokeDashoffset={offset}
           strokeLinecap="round"
           strokeWidth={stroke}
+          style={
+            {
+              "--ring-circ": circumference,
+              "--ring-offset": offset,
+            } as CSSProperties
+          }
         />
       </svg>
       <span className="mastery-ring__label">
