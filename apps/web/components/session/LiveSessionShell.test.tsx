@@ -586,6 +586,54 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).not.toContain("Back to question");
   });
 
+  test("scopes the marginalia live region to a concise status announcer, not the whole panel", () => {
+    const markup = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        runtime={runtime}
+        state="listening"
+        textAnswer={{ active: true, disabled: false, required: false }}
+      />,
+    );
+
+    // The panel body (readiness ladder, the answer textarea/form) is no longer a
+    // live region, so the 5s readiness probe and a focused textarea aren't re-read.
+    expect(markup).not.toContain('class="marginalia__body" aria-live');
+    // A small visually-hidden announcer carries the concise, stable status instead.
+    expect(markup).toContain("marginalia__announcer");
+    expect(markup).toContain("Listening for your answer.");
+  });
+
+  test("the marginalia announcer names the recap without re-reading the closing fold", () => {
+    const markup = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        recap={trustedRecap}
+        reviewPlan={trustedReviewPlan}
+        runtime={runtime}
+        state="recap"
+      />,
+    );
+
+    expect(markup).toContain("marginalia__announcer");
+    expect(markup).toContain("Session recap ready");
+    expect(markup).toContain("Server recap headline");
+  });
+
   test("renders controlled terminal copy when a terminal phase has no recap payload", () => {
     const runtimeCopy = projectRuntimeCopy({
       close: { code: 1008, reason: "session cap", wasClean: true },

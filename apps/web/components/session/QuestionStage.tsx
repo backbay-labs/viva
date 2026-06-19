@@ -27,7 +27,7 @@ export function QuestionStage({
 
   return (
     <div className="question-stage">
-      <h1 className="question-stage__text">
+      <h1 aria-atomic="true" aria-live="polite" className="question-stage__text">
         {lines.map((line, index) => (
           <Fragment key={line}>
             {index > 0 ? <br /> : null}

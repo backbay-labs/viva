@@ -3384,6 +3384,20 @@ button {
 }
 
 /* Marginalia */
+/* Visually hidden but available to assistive tech (live-region announcers). */
+.sr-only,
+.marginalia__announcer {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .marginalia {
   display: flex;
   flex-direction: column;

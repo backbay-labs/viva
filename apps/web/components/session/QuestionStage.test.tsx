@@ -28,6 +28,15 @@ function render(prompt: string, state: SessionState, highlightedTokens: string[]
   );
 }
 
+test("announces the question to assistive tech as a polite, atomic live region", () => {
+  const markup = render("Explain the role of NADH.", "listening", []);
+  // The question heading itself is the live region, so a new prompt is read aloud
+  // in a voice-first product (the small status line alone never speaks the question).
+  expect(/<h1[^>]*aria-live="polite"[^>]*>/.test(markup)).toBe(true);
+  expect(/<h1[^>]*aria-atomic="true"[^>]*>/.test(markup)).toBe(true);
+  expect(markup).toContain('class="question-stage__text"');
+});
+
 test("reveals a source term inside the prompt once the answer is being reviewed", () => {
   const markup = render("Describe how the proton gradient drives ATP synthase.", "correction", [
     "ATP synthase",
