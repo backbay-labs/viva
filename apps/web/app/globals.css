@@ -3733,7 +3733,8 @@ button {
   /* Each mark ticks in after the one before — Viva cross-referencing, not a
      static list dumped in one frame. --i is the item's index. */
   animation: checklistMark 440ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  animation-delay: calc(var(--i, 0) * 110ms);
+  /* Cap the cascade so a long checklist never lags before its last mark. */
+  animation-delay: calc(min(var(--i, 0), 5) * 110ms);
 }
 
 @keyframes checklistMark {
