@@ -634,6 +634,30 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("Server recap headline");
   });
 
+  test("the thinking margin weighs the answer as a whole when a question surfaces no terms", () => {
+    // A valid agent question may carry zero expected_terms (the contract allows
+    // it), so the checklist is empty — the margin must not claim it's
+    // cross-referencing while showing nothing.
+    const markup = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={{ ...question, checklist: [] }}
+        runtime={runtime}
+        state="thinking"
+      />,
+    );
+
+    expect(markup).toContain("Weighing your answer as a whole.");
+    // No empty checklist list is rendered when there are no terms.
+    expect(markup).not.toContain('class="checklist"');
+  });
+
   test("the thinking checklist carries a per-item index so its marks stagger in", () => {
     const thinkingQuestion: Question = {
       ...question,
