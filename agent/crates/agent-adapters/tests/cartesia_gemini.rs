@@ -89,6 +89,52 @@ fn cartesia_gemini_brain_stays_unselectable_until_live_runtime_is_proven() {
     assert!(!capabilities.live_runtime);
 }
 
+#[test]
+fn cartesia_gemini_brain_becomes_selectable_only_with_explicit_live_runtime_gate() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let capabilities = CartesiaGeminiBrain::new(
+        CartesiaGeminiConfig {
+            cartesia_api_key: "cartesia-key".to_owned(),
+            gemini: GeminiConfig {
+                api_key: "gemini-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            live_runtime_enabled: true,
+            ..CartesiaGeminiConfig::default()
+        },
+        store,
+    )
+    .capabilities();
+
+    assert_eq!(capabilities.provider, "cartesia_gemini");
+    assert!(capabilities.configured);
+    assert!(capabilities.selectable);
+    assert!(capabilities.live_runtime);
+}
+
+#[test]
+fn cartesia_gemini_brain_rejects_placeholder_keys_even_when_live_runtime_gate_is_set() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let capabilities = CartesiaGeminiBrain::new(
+        CartesiaGeminiConfig {
+            cartesia_api_key: "viva-release-check-cartesia-placeholder-key".to_owned(),
+            gemini: GeminiConfig {
+                api_key: "viva-release-check-gemini-placeholder-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            live_runtime_enabled: true,
+            ..CartesiaGeminiConfig::default()
+        },
+        store,
+    )
+    .capabilities();
+
+    assert_eq!(capabilities.provider, "cartesia_gemini");
+    assert!(capabilities.configured);
+    assert!(!capabilities.selectable);
+    assert!(!capabilities.live_runtime);
+}
+
 #[tokio::test]
 async fn cartesia_gemini_brain_open_reaches_shared_no_network_runner_gate() {
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
@@ -113,6 +159,71 @@ async fn cartesia_gemini_brain_open_reaches_shared_no_network_runner_gate() {
         .to_string()
         .contains("shared Cartesia/Gemini runner is wired"));
     assert!(!error.to_string().contains("without a study-memory store"));
+    assert!(store.snapshot().sessions.is_empty());
+    assert!(!brain.capabilities().selectable);
+}
+
+#[tokio::test]
+async fn cartesia_gemini_brain_open_authorizes_explicit_live_runtime_without_network_until_audio() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let brain = CartesiaGeminiBrain::new(
+        CartesiaGeminiConfig {
+            cartesia_api_key: "cartesia-key".to_owned(),
+            gemini: GeminiConfig {
+                api_key: "gemini-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            live_runtime_enabled: true,
+            ..CartesiaGeminiConfig::default()
+        },
+        store.clone(),
+    );
+
+    let mut session = brain
+        .open(fixture_session_config())
+        .await
+        .expect("explicit live runtime gate should authorize opening the session");
+
+    assert!(brain.capabilities().selectable);
+    assert!(brain.capabilities().live_runtime);
+    assert_eq!(store.snapshot().sessions.len(), 1);
+    assert!(matches!(
+        next_event(&mut session).await,
+        BrainEvent::SessionPhase {
+            phase: agent_domain::StudySessionPhase::Ready
+        }
+    ));
+    assert!(matches!(
+        next_event(&mut session).await,
+        BrainEvent::QuestionStarted { response_id, .. } if response_id == "response-1"
+    ));
+    session.input.send(BrainInput::Stop).await.unwrap();
+}
+
+#[tokio::test]
+async fn cartesia_gemini_brain_open_rejects_placeholder_keys_before_network_or_store_writes() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let brain = CartesiaGeminiBrain::new(
+        CartesiaGeminiConfig {
+            cartesia_api_key: "viva-release-check-cartesia-placeholder-key".to_owned(),
+            gemini: GeminiConfig {
+                api_key: "viva-release-check-gemini-placeholder-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            live_runtime_enabled: true,
+            ..CartesiaGeminiConfig::default()
+        },
+        store.clone(),
+    );
+
+    let error = match brain.open(fixture_session_config()).await {
+        Ok(_) => panic!("placeholder Cartesia/Gemini keys unexpectedly opened"),
+        Err(error) => error,
+    };
+
+    assert!(error
+        .to_string()
+        .contains("live Cartesia/Gemini keys must be real provider credentials"));
     assert!(store.snapshot().sessions.is_empty());
     assert!(!brain.capabilities().selectable);
 }

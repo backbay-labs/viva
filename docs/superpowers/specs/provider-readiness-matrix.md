@@ -16,11 +16,19 @@ The command writes `artifacts/release-check/evidence.json`. The artifact directo
 | `fake_cartesia_gemini` | Deterministic fake provider for replay and browser evidence | 200 | 200 | true | true | false |
 | `cartesia_gemini` | Gated Act 3 live provider, configured with placeholder key material during the check | 200 | 503 | true | false | false |
 
-The live provider row must stay unavailable until Act 3 explicitly opens the gate. BAC-305 does not make the live provider selectable. The written definition of live provider proof is `docs/superpowers/specs/live-cartesia-gemini-definition.md`.
+The live provider row must stay unavailable in default release evidence. BAC-305
+does not make the live provider selectable, and the placeholder key material
+used here must remain non-selectable even if the live runtime gate exists. The
+written definition of live provider proof is
+`docs/superpowers/specs/live-cartesia-gemini-definition.md`.
 
 ## No-Network Gate Proof
 
-`release:check` also runs the `live_provider_no_network_gate_tests` command, which executes the adapter tests matching `cartesia_gemini_brain`. Those tests prove a live open attempt fails at the shared gated runner before provider network calls are reachable.
+`release:check` also runs the `live_provider_no_network_gate_tests` command,
+which executes the adapter tests matching `cartesia_gemini_brain`. Those tests
+prove that default live open attempts fail at the shared gated runner before
+provider network calls are reachable, and that the explicit live runtime gate
+requires non-placeholder provider credentials.
 
 ## Sanitization Rules
 

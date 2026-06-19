@@ -55,14 +55,12 @@ impl CartesiaGeminiRunner<FakeCartesiaGeminiTransports> {
     }
 }
 
-impl CartesiaGeminiRunner<GatedNoNetworkCartesiaGeminiTransports> {
-    pub(crate) fn gated_live(
-        store: Arc<dyn StudyMemoryStore>,
-        config: CartesiaGeminiConfig,
-    ) -> Self {
+impl CartesiaGeminiRunner<LiveCartesiaGeminiTransports> {
+    pub(crate) fn live(store: Arc<dyn StudyMemoryStore>, config: CartesiaGeminiConfig) -> Self {
+        let transports = LiveCartesiaGeminiTransports::new(config.live_runtime_enabled);
         Self {
             config,
-            transports: GatedNoNetworkCartesiaGeminiTransports,
+            transports,
             store: Some(store),
         }
     }
@@ -940,11 +938,24 @@ fn concept_status_tool_arg(status: &ConceptStatus) -> &'static str {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct GatedNoNetworkCartesiaGeminiTransports;
+pub(crate) struct LiveCartesiaGeminiTransports {
+    live_runtime_enabled: bool,
+}
+
+impl LiveCartesiaGeminiTransports {
+    pub(crate) fn new(live_runtime_enabled: bool) -> Self {
+        Self {
+            live_runtime_enabled,
+        }
+    }
+}
 
 #[async_trait]
-impl CartesiaGeminiTransports for GatedNoNetworkCartesiaGeminiTransports {
+impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
     async fn authorize_open(&self) -> Result<(), BrainError> {
+        if self.live_runtime_enabled {
+            return Ok(());
+        }
         Err(BrainError::Protocol(
             "shared Cartesia/Gemini runner is wired but live transports remain gated; no network connection was attempted"
                 .to_owned(),
