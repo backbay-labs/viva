@@ -583,22 +583,33 @@ export function vivaAgentReducer(
       };
     case "cancellation": {
       const cancelledResponseId = event.response_id ?? state.activeResponseId;
+      const cancellingActive =
+        Boolean(cancelledResponseId) && cancelledResponseId === state.activeResponseId;
       const cancelledResponseIds =
         cancelledResponseId && !state.cancelledResponseIds.includes(cancelledResponseId)
           ? [...state.cancelledResponseIds, cancelledResponseId]
           : state.cancelledResponseIds;
       return {
         ...state,
-        activeResponseId:
-          cancelledResponseId && cancelledResponseId === state.activeResponseId
-            ? undefined
-            : state.activeResponseId,
+        activeResponseId: cancellingActive ? undefined : state.activeResponseId,
         manuscriptIntents: cancelledResponseId
           ? state.manuscriptIntents.filter((intent) => intent.responseId !== cancelledResponseId)
           : state.manuscriptIntents,
         audio: cancelledResponseId
           ? state.audio.filter((output) => output.responseId !== cancelledResponseId)
           : state.audio,
+        // Discard the cancelled turn's examiner-response artifacts so none bleed
+        // into the manuscript: not just `currentSource`, but `evaluation` and
+        // `currentConceptStatus` too — the source folio falls back through
+        // `currentSource -> evaluation.source -> question.source`, so clearing only
+        // the first layer would still surface the cancelled verdict's citation.
+        // These are all active-turn-only (gated by the staleness guard) and are
+        // exactly what `question_started` resets; `question` + the student's
+        // transcript persist (the question is still the one being answered).
+        currentSource: cancellingActive ? undefined : state.currentSource,
+        sources: cancellingActive ? [] : state.sources,
+        evaluation: cancellingActive ? undefined : state.evaluation,
+        currentConceptStatus: cancellingActive ? undefined : state.currentConceptStatus,
         cancelledResponseIds,
       };
     }

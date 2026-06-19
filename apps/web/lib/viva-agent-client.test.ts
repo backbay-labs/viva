@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   type AgentSessionConfig,
+  type AgentStudySourceReference,
   parseVivaClientFrame,
   parseVivaServerFrame,
   VIVA_VOICE_PROTOCOL_VERSION,
@@ -324,6 +325,68 @@ describe("Viva agent browser client", () => {
 
     expect(afterStalePhase.phase).toBe("recap");
     expect(afterStalePhase.recap?.voice_session_id).toBe("voice-session-1");
+  });
+
+  const sourceFixture = (sourceId: string, excerpt: string): AgentStudySourceReference => ({
+    source_id: sourceId,
+    document_id: "lec-5",
+    span: "slide:18",
+    excerpt,
+    confidence: "high",
+    retrieval_reason: "bounded source moment",
+  });
+
+  test("cancelling the active turn discards its examiner-response artifacts (no folio bleed)", () => {
+    const src = sourceFixture("src-1", "NADH donates electrons to the electron transport chain.");
+    const withSource = vivaAgentReducer(
+      { ...initialVivaAgentSessionState(), activeResponseId: "resp-1" },
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "source_reference", response_id: "resp-1", source: src },
+      }),
+    );
+    expect(withSource.currentSource?.source_id).toBe("src-1");
+    expect(withSource.sources).toHaveLength(1);
+
+    // The cancelled turn also carries a verdict + concept status. Its source would
+    // otherwise re-surface via the folio's currentSource -> evaluation.source
+    // fallback, so the cancel must discard the whole examiner-response set.
+    const afterCancel = vivaAgentReducer(
+      { ...withSource, currentConceptStatus: "shaky", evaluation: { source: src } as never },
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "cancellation", response_id: "resp-1" },
+      }),
+    );
+
+    expect(afterCancel.currentSource).toBeUndefined();
+    expect(afterCancel.sources).toEqual([]);
+    expect(afterCancel.evaluation).toBeUndefined();
+    expect(afterCancel.currentConceptStatus).toBeUndefined();
+    expect(afterCancel.activeResponseId).toBeUndefined();
+  });
+
+  test("cancelling a stale (non-active) response leaves the active turn's source intact", () => {
+    const active = sourceFixture("src-active", "Active turn excerpt.");
+    const afterCancel = vivaAgentReducer(
+      {
+        ...initialVivaAgentSessionState(),
+        activeResponseId: "resp-2",
+        currentSource: active,
+        sources: [active],
+      },
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "cancellation", response_id: "resp-1" },
+      }),
+    );
+
+    expect(afterCancel.currentSource?.source_id).toBe("src-active");
+    expect(afterCancel.sources).toHaveLength(1);
+    expect(afterCancel.activeResponseId).toBe("resp-2");
   });
 
   test("reducer records controlled terminal phase reasons without inventing a recap", () => {
