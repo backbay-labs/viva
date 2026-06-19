@@ -135,8 +135,10 @@ describe("LandingEntry", () => {
       <LandingEntry initialLibrarySnapshot={librarySnapshot} onEnter={() => {}} />,
     );
 
-    // The completed session recap (1 strong / 1 shaky) rings its held share.
+    // The completed session recap (1 strong / 1 shaky) rings its held share,
+    // captioned so the bare percentage never reads as overall mastery.
     expect(markup).toContain("mastery-ring");
+    expect(markup).toContain("viva-library__mastery-caption");
     // The persisted next review reads as the card's next action, not flat metadata.
     expect(markup).toContain("Next drill");
     expect(markup).toContain("server schedule");

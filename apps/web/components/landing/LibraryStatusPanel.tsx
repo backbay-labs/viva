@@ -123,12 +123,15 @@ export function LibraryStatusPanel({
             {projection.sessionRows.map((row) => (
               <article className="viva-library__row viva-library__row--session" key={row.id}>
                 {row.mastery ? (
-                  <MasteryRing
-                    color="var(--sage)"
-                    pct={row.mastery.strongPct}
-                    size={52}
-                    stroke={5}
-                  />
+                  <div className="viva-library__mastery">
+                    <MasteryRing
+                      color="var(--sage)"
+                      pct={row.mastery.strongPct}
+                      size={52}
+                      stroke={5}
+                    />
+                    <span className="viva-library__mastery-caption">held</span>
+                  </div>
                 ) : (
                   <span className="viva-library__ring-placeholder" aria-hidden="true" />
                 )}
