@@ -743,6 +743,28 @@ button {
   margin-top: 0.15rem;
 }
 
+/* The ring draws on from empty to its mastery share as the fold/card opens —
+   the manuscript "settling" into its verdict. var(--ring-circ/-offset) are set
+   inline per ring so one keyframe serves every value. */
+.mastery-ring__progress {
+  animation: masteryRingDraw 900ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes masteryRingDraw {
+  from {
+    stroke-dashoffset: var(--ring-circ);
+  }
+  to {
+    stroke-dashoffset: var(--ring-offset);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mastery-ring__progress {
+    animation: none;
+  }
+}
+
 .action-card,
 .feedback-card {
   cursor: pointer;
