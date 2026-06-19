@@ -583,22 +583,26 @@ export function vivaAgentReducer(
       };
     case "cancellation": {
       const cancelledResponseId = event.response_id ?? state.activeResponseId;
+      const cancellingActive =
+        Boolean(cancelledResponseId) && cancelledResponseId === state.activeResponseId;
       const cancelledResponseIds =
         cancelledResponseId && !state.cancelledResponseIds.includes(cancelledResponseId)
           ? [...state.cancelledResponseIds, cancelledResponseId]
           : state.cancelledResponseIds;
       return {
         ...state,
-        activeResponseId:
-          cancelledResponseId && cancelledResponseId === state.activeResponseId
-            ? undefined
-            : state.activeResponseId,
+        activeResponseId: cancellingActive ? undefined : state.activeResponseId,
         manuscriptIntents: cancelledResponseId
           ? state.manuscriptIntents.filter((intent) => intent.responseId !== cancelledResponseId)
           : state.manuscriptIntents,
         audio: cancelledResponseId
           ? state.audio.filter((output) => output.responseId !== cancelledResponseId)
           : state.audio,
+        // The cancelled turn's bounded citation must not linger in the source
+        // folio — clear it like the other per-turn artifacts above (source_reference
+        // only ever sets these for the active turn, gated by the staleness guard).
+        currentSource: cancellingActive ? undefined : state.currentSource,
+        sources: cancellingActive ? [] : state.sources,
         cancelledResponseIds,
       };
     }

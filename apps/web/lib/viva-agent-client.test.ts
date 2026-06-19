@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   type AgentSessionConfig,
+  type AgentStudySourceReference,
   parseVivaClientFrame,
   parseVivaServerFrame,
   VIVA_VOICE_PROTOCOL_VERSION,
@@ -324,6 +325,66 @@ describe("Viva agent browser client", () => {
 
     expect(afterStalePhase.phase).toBe("recap");
     expect(afterStalePhase.recap?.voice_session_id).toBe("voice-session-1");
+  });
+
+  const sourceFixture = (sourceId: string, excerpt: string): AgentStudySourceReference => ({
+    source_id: sourceId,
+    document_id: "lec-5",
+    span: "slide:18",
+    excerpt,
+    confidence: "high",
+    retrieval_reason: "bounded source moment",
+  });
+
+  test("cancelling the active turn clears its bounded source so it can't bleed into the folio", () => {
+    const withSource = vivaAgentReducer(
+      { ...initialVivaAgentSessionState(), activeResponseId: "resp-1" },
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "source_reference",
+          response_id: "resp-1",
+          source: sourceFixture("src-1", "NADH donates electrons to the electron transport chain."),
+        },
+      }),
+    );
+    expect(withSource.currentSource?.source_id).toBe("src-1");
+    expect(withSource.sources).toHaveLength(1);
+
+    const afterCancel = vivaAgentReducer(
+      withSource,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "cancellation", response_id: "resp-1" },
+      }),
+    );
+
+    expect(afterCancel.currentSource).toBeUndefined();
+    expect(afterCancel.sources).toEqual([]);
+    expect(afterCancel.activeResponseId).toBeUndefined();
+  });
+
+  test("cancelling a stale (non-active) response leaves the active turn's source intact", () => {
+    const active = sourceFixture("src-active", "Active turn excerpt.");
+    const afterCancel = vivaAgentReducer(
+      {
+        ...initialVivaAgentSessionState(),
+        activeResponseId: "resp-2",
+        currentSource: active,
+        sources: [active],
+      },
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "cancellation", response_id: "resp-1" },
+      }),
+    );
+
+    expect(afterCancel.currentSource?.source_id).toBe("src-active");
+    expect(afterCancel.sources).toHaveLength(1);
+    expect(afterCancel.activeResponseId).toBe("resp-2");
   });
 
   test("reducer records controlled terminal phase reasons without inventing a recap", () => {
