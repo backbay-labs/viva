@@ -11,10 +11,38 @@ import {
   micStateForAudioCaptureError,
   micStateForCaptureEndReason,
   pcm16ChunksToBase64,
+  shouldStopReadinessPolling,
   shouldUseLiveMicAudioTransport,
   stopCaptureForRecap,
   textAnswerPayload,
 } from "./LiveSessionPage";
+
+describe("shouldStopReadinessPolling", () => {
+  test("keeps polling while connecting or open-but-not-yet-ready", () => {
+    expect(
+      shouldStopReadinessPolling({ recap: undefined, status: "connecting", ready: false }),
+    ).toBe(false);
+    // Open socket but no ready frame yet — the probe is still the only readiness signal.
+    expect(shouldStopReadinessPolling({ recap: undefined, status: "open", ready: false })).toBe(
+      false,
+    );
+  });
+
+  test("stops polling once the live ready frame proves the agent is reachable", () => {
+    expect(shouldStopReadinessPolling({ recap: undefined, status: "open", ready: true })).toBe(
+      true,
+    );
+  });
+
+  test("stops polling once the session is over, regardless of ready", () => {
+    expect(
+      shouldStopReadinessPolling({ recap: { headline: "x" }, status: "open", ready: false }),
+    ).toBe(true);
+    expect(shouldStopReadinessPolling({ recap: undefined, status: "closed", ready: false })).toBe(
+      true,
+    );
+  });
+});
 
 describe("isSessionOver", () => {
   test("a delivered recap freezes the session clock and stops the readiness probe", () => {
