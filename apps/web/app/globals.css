@@ -3306,6 +3306,61 @@ button {
   background: var(--viva-border);
 }
 
+/* Transcript disclosure — a quiet native <details> styled to match the rail,
+   opening upward as a parchment leaf over the manuscript. */
+.session-controls__transcript {
+  position: relative;
+}
+
+.session-controls__transcript > summary {
+  list-style: none;
+}
+
+.session-controls__transcript > summary::-webkit-details-marker {
+  display: none;
+}
+
+.session-controls__transcript[open] > summary {
+  color: var(--viva-ink-soft);
+  background: rgba(255, 255, 255, 0.42);
+}
+
+.session-controls__panel {
+  position: absolute;
+  bottom: calc(100% + 0.55rem);
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(26rem, 80vw);
+  max-height: 12rem;
+  overflow-y: auto;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--viva-border);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(255, 253, 248, 0.97), rgba(248, 242, 233, 0.95));
+  box-shadow: 0 8px 22px -14px rgba(46, 33, 64, 0.34);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+  text-align: left;
+}
+
+.session-controls__transcript-text {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 0.92rem;
+  line-height: 1.55;
+  color: var(--viva-ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.session-controls__empty {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--viva-muted);
+}
+
 /* Marginalia */
 .marginalia {
   display: flex;

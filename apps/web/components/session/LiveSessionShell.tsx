@@ -28,6 +28,7 @@ export function LiveSessionShell({
   sourceFolio,
   recap,
   reviewPlan,
+  transcript,
   contextLabel,
   clockLabel,
   elapsed,
@@ -56,6 +57,7 @@ export function LiveSessionShell({
   sourceFolio?: SourceFolioProjection;
   recap?: SessionRecap;
   reviewPlan?: ReviewScheduleItem[];
+  transcript?: string;
   contextLabel: string;
   clockLabel?: string;
   elapsed: number;
@@ -103,7 +105,11 @@ export function LiveSessionShell({
               state={state}
               textMode={Boolean(textAnswer?.active)}
             />
-            <SessionBottomControls onEndSession={onEndSession} />
+            <SessionBottomControls
+              onEndSession={onEndSession}
+              onShowSources={onShowSource}
+              transcript={transcript}
+            />
           </div>
 
           <MarginaliaPanel

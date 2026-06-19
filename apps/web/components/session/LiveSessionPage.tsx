@@ -564,6 +564,7 @@ export function LiveSessionPage() {
       scene={scene}
       sourceFolio={sourceFolio}
       state={effectiveState}
+      transcript={agent.derived.transcript}
       textAnswer={
         textAnswerAvailable
           ? {
