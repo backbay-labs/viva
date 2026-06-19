@@ -502,22 +502,29 @@ function ThinkingNote({ question }: { question: Question }) {
     <div className="margin-note">
       <p className="margin-note__title">Thinking…</p>
       <p className="margin-note__text">Cross-referencing your answer with your sources.</p>
-      <ul className="checklist">
-        {question.checklist.map((item, index) => (
-          <li
-            className={`checklist__item checklist__item--${item.status}`}
-            key={item.label}
-            style={{ "--i": index } as CSSProperties}
-          >
-            {item.status === "done" ? (
-              <Icon color="var(--viva-sage)" name="check" size={14} strokeWidth={2} />
-            ) : (
-              <span className={`checklist__ring checklist__ring--${item.status}`} />
-            )}
-            <span>{item.label}</span>
-          </li>
-        ))}
-      </ul>
+      {question.checklist.length > 0 ? (
+        <ul className="checklist">
+          {question.checklist.map((item, index) => (
+            <li
+              className={`checklist__item checklist__item--${item.status}`}
+              key={item.label}
+              style={{ "--i": index } as CSSProperties}
+            >
+              {item.status === "done" ? (
+                <Icon color="var(--viva-sage)" name="check" size={14} strokeWidth={2} />
+              ) : (
+                <span className={`checklist__ring checklist__ring--${item.status}`} />
+              )}
+              <span>{item.label}</span>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="checklist-empty">
+          <span className="checklist__ring checklist__ring--partial" />
+          Weighing your answer as a whole.
+        </p>
+      )}
       <p className="margin-note__hold">
         <Spark color="var(--viva-gold)" size={12} />
         Hold tight…
