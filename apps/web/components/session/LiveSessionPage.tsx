@@ -6,6 +6,7 @@ import { usePrefersReducedMotion } from "../../lib/use-prefers-reduced-motion";
 import { useVivaAgentSession, type VivaAgentDerivedState } from "../../lib/use-viva-agent-session";
 import {
   fetchVivaAgentReadinessProbe,
+  type VivaAgentAudioOutput,
   type VivaAgentReadinessProbe,
   vivaAgentHttpBaseUrl,
 } from "../../lib/viva-agent-client";
@@ -107,7 +108,6 @@ export function LiveSessionPage() {
   const textAnswerModeRef = useRef(false);
   const meterRef = useRef(createVoiceLevelMeter({ coefficient: 0.3 }));
   const playbackRef = useRef<VivaAudioPlaybackSink | null>(null);
-  const handledAudioRef = useRef(0);
   const handledCancelRef = useRef(0);
   const reducedMotionRef = useRef(reducedMotion);
 
@@ -175,17 +175,14 @@ export function LiveSessionPage() {
   useEffect(() => {
     const audio = agent.agentState.audio;
     const cancellations = agent.agentState.cancelledResponseIds;
-    if (
-      audio.length === handledAudioRef.current &&
-      cancellations.length === handledCancelRef.current
-    ) {
-      return;
-    }
-    const sink = getPlayback();
-    for (const responseId of cancellations.slice(handledCancelRef.current)) sink.cancel(responseId);
-    for (const output of audio.slice(handledAudioRef.current)) sink.enqueue(output);
-    handledAudioRef.current = audio.length;
-    handledCancelRef.current = cancellations.length;
+    if (audio.length === 0 && cancellations.length === handledCancelRef.current) return;
+    handledCancelRef.current = drainAgentAudio({
+      acknowledgeAudio: (consumed) => agentRef.current.acknowledgeAudio(consumed),
+      audio,
+      cancellations,
+      handledCancel: handledCancelRef.current,
+      sink: getPlayback(),
+    });
   }, [agent.agentState.audio, agent.agentState.cancelledResponseIds, getPlayback]);
 
   // Examiner amplitude → bloom "breathes back in gold" (off when reduced-motion).
@@ -596,6 +593,35 @@ export function LiveSessionPage() {
  */
 export function isSessionOver(input: { recap: unknown; status: string }): boolean {
   return Boolean(input.recap) || input.status === "closed";
+}
+
+/**
+ * Drain the agent's pending audio to the playback sink and acknowledge it so the
+ * controller drops the consumed frames (keeping `agentState.audio` a bounded
+ * queue rather than an ever-growing log). New cancellations are flushed first so
+ * barge-in stops a response before its remaining frames play. Returns the new
+ * handled-cancellation count. Side-effects are injected (sink + acknowledge), so
+ * it is deterministic and unit-testable without a socket. The exact frames
+ * enqueued are handed back to `acknowledgeAudio` (by reference) so the controller
+ * drops precisely those — never a positional count that a concurrent cancellation
+ * could make over-remove a not-yet-enqueued survivor.
+ */
+export function drainAgentAudio(input: {
+  audio: readonly VivaAgentAudioOutput[];
+  cancellations: readonly string[];
+  handledCancel: number;
+  sink: {
+    enqueue: (output: VivaAgentAudioOutput) => unknown;
+    cancel: (responseId: string) => unknown;
+  };
+  acknowledgeAudio: (consumed: readonly VivaAgentAudioOutput[]) => void;
+}): number {
+  for (const responseId of input.cancellations.slice(input.handledCancel)) {
+    input.sink.cancel(responseId);
+  }
+  for (const output of input.audio) input.sink.enqueue(output);
+  if (input.audio.length > 0) input.acknowledgeAudio(input.audio);
+  return input.cancellations.length;
 }
 
 /**

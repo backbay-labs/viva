@@ -145,6 +145,7 @@ export type VivaAgentSessionController = {
   reset: () => void;
   sendText: (text: string) => void;
   sendAudio: (pcm16Base64: string) => void;
+  acknowledgeAudio: (consumed: readonly VivaAgentAudioOutput[]) => void;
   cancel: () => void;
   stop: () => void;
   getState: () => VivaAgentSessionState;
@@ -690,6 +691,19 @@ export function createVivaAgentSessionController(
     },
     sendAudio(pcm16Base64: string) {
       sendFrame(audioClientFrame(pcm16Base64));
+    },
+    acknowledgeAudio(consumed: readonly VivaAgentAudioOutput[]) {
+      // Drop exactly the frames the consumer enqueued to the playback sink — by
+      // object identity, NOT a positional count: a cancellation can filter frames
+      // out of the middle of the live array between the consumer's snapshot and
+      // this call, so a `slice(count)` would over-remove a not-yet-enqueued
+      // survivor (the start of the next response). The reducer stores the same
+      // frame object refs the consumer reads, so a Set filter is exact. This keeps
+      // `audio` a bounded pending-to-play queue, not an ever-growing log (which on
+      // the live provider was O(n^2) copies + a leak).
+      if (consumed.length === 0 || state.audio.length === 0) return;
+      const drop = new Set<VivaAgentAudioOutput>(consumed);
+      setState({ ...state, audio: state.audio.filter((output) => !drop.has(output)) });
     },
     cancel() {
       sendFrame({ type: "cancel", version: VIVA_VOICE_PROTOCOL_VERSION });

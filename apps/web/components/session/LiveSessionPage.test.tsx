@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { SessionRecap } from "@viva/core";
 import type { VivaAgentDerivedState } from "../../lib/use-viva-agent-session";
+import type { VivaAgentAudioOutput } from "../../lib/viva-agent-client";
 import { VivaAudioWorkletUnavailableError } from "../../lib/viva-audio-capture";
 import { projectTrace } from "../../lib/viva-session-projection";
 import {
   captureLevelForBloom,
   derivedStateWithProjectedRecap,
+  drainAgentAudio,
   enterTextAnswerMode,
   isSessionOver,
   micStateForAudioCaptureError,
@@ -16,6 +18,60 @@ import {
   stopCaptureForRecap,
   textAnswerPayload,
 } from "./LiveSessionPage";
+
+describe("drainAgentAudio", () => {
+  const out = (responseId: string): VivaAgentAudioOutput =>
+    ({ responseId, frame: {} }) as unknown as VivaAgentAudioOutput;
+
+  test("flushes new cancellations, enqueues pending audio, and acknowledges the exact frames", () => {
+    const enqueued: string[] = [];
+    const cancelled: string[] = [];
+    let acked: readonly VivaAgentAudioOutput[] = [];
+    const audio = [out("r1"), out("r1"), out("r2")];
+
+    const next = drainAgentAudio({
+      acknowledgeAudio: (consumed) => {
+        acked = consumed;
+      },
+      audio,
+      cancellations: ["rX"],
+      handledCancel: 0,
+      sink: {
+        cancel: (id) => cancelled.push(id),
+        enqueue: (o) => enqueued.push(o.responseId),
+      },
+    });
+
+    // Cancellations flush before enqueue so barge-in stops a response in time.
+    expect(cancelled).toEqual(["rX"]);
+    expect(enqueued).toEqual(["r1", "r1", "r2"]);
+    // The exact frame objects are acknowledged (by reference, not a count).
+    expect(acked).toBe(audio);
+    expect(next).toBe(1);
+  });
+
+  test("only flushes new cancellations and skips acknowledge when no audio is pending", () => {
+    const cancelled: string[] = [];
+    let ackCalls = 0;
+
+    const next = drainAgentAudio({
+      acknowledgeAudio: () => {
+        ackCalls += 1;
+      },
+      audio: [],
+      cancellations: ["rA", "rB"],
+      handledCancel: 1,
+      sink: {
+        cancel: (id) => cancelled.push(id),
+        enqueue: () => {},
+      },
+    });
+
+    expect(cancelled).toEqual(["rB"]);
+    expect(ackCalls).toBe(0);
+    expect(next).toBe(2);
+  });
+});
 
 describe("shouldStopReadinessPolling", () => {
   test("keeps polling while connecting or open-but-not-yet-ready", () => {

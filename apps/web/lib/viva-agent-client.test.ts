@@ -241,6 +241,48 @@ describe("Viva agent browser client", () => {
     expect(controller.getState().transcript).toBe("");
   });
 
+  test("acknowledgeAudio drops exactly the consumed frames by identity so the buffer stays bounded", () => {
+    const audio = [
+      { responseId: "r1", frame: {} },
+      { responseId: "r1", frame: {} },
+      { responseId: "r2", frame: {} },
+    ] as unknown as ReturnType<typeof initialVivaAgentSessionState>["audio"];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      session: sessionFixture as AgentSessionConfig,
+      initialState: { ...initialVivaAgentSessionState(), audio },
+    });
+
+    controller.acknowledgeAudio([audio[0], audio[1]]);
+    expect(controller.getState().audio).toEqual([audio[2]]);
+    // No-op guards: empty consumed / empty state never mutate.
+    controller.acknowledgeAudio([]);
+    expect(controller.getState().audio).toHaveLength(1);
+    controller.acknowledgeAudio([audio[2]]);
+    expect(controller.getState().audio).toHaveLength(0);
+  });
+
+  test("acknowledgeAudio spares the next response when a stale ack races a cancellation", () => {
+    // The consumer's snapshot was [r1a, r1b]; meanwhile r2a arrived and a
+    // cancellation(r1) filtered r1's frames out, leaving live state = [r2a]. A
+    // positional slice(2) would wrongly clear r2a; an identity filter spares it.
+    const r1a = { responseId: "r1", frame: {} };
+    const r1b = { responseId: "r1", frame: {} };
+    const r2a = { responseId: "r2", frame: {} };
+    const liveAudio = [r2a] as unknown as ReturnType<typeof initialVivaAgentSessionState>["audio"];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      session: sessionFixture as AgentSessionConfig,
+      initialState: { ...initialVivaAgentSessionState(), audio: liveAudio },
+    });
+
+    controller.acknowledgeAudio([r1a, r1b] as unknown as ReturnType<
+      typeof initialVivaAgentSessionState
+    >["audio"]);
+
+    expect(controller.getState().audio).toEqual([r2a]);
+  });
+
   test("controller preserves terminal recap when the server closes after stop", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
