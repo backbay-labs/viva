@@ -372,6 +372,57 @@ describe("projectRuntimeCopy", () => {
     expect(copy.readinessNotes.some((note) => note.state === "checking")).toBe(false);
   });
 
+  test("a stale gated /ready probe does not contradict a live ready frame", () => {
+    const copy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      readinessProbe: {
+        apiBaseUrl: "http://127.0.0.1:4318",
+        health: {
+          provider: "synthetic",
+          brain: ready("synthetic").brain,
+          store: ready("synthetic").store,
+          status: "configured",
+        },
+        healthHttpStatus: 200,
+        ready: { ready: false, brain: ready("synthetic").brain, store: ready("synthetic").store },
+        readyHttpStatus: 503,
+        status: "observed",
+      },
+      status: "open",
+    });
+
+    // The frozen observed-503 probe would otherwise show a "blocked /ready" line
+    // alongside the green live Provider/Store notes — suppress it.
+    expect(copy.readinessNotes.some((note) => note.label === "/ready")).toBe(false);
+    expect(
+      copy.readinessNotes.some((note) => note.label === "Provider" && note.state === "ready"),
+    ).toBe(true);
+  });
+
+  test("a healthy observed probe still surfaces alongside a live ready frame", () => {
+    const copy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      readinessProbe: {
+        apiBaseUrl: "http://127.0.0.1:4318",
+        health: {
+          provider: "synthetic",
+          brain: ready("synthetic").brain,
+          store: ready("synthetic").store,
+          status: "configured",
+        },
+        healthHttpStatus: 200,
+        ready: { ready: true, brain: ready("synthetic").brain, store: ready("synthetic").store },
+        readyHttpStatus: 200,
+        status: "observed",
+      },
+      status: "open",
+    });
+
+    expect(copy.readinessNotes.some((note) => note.label === "/ready")).toBe(true);
+  });
+
   test("the readiness probe still surfaces offline when there is no live ready frame", () => {
     const copy = projectRuntimeCopy({
       readiness: trustedReadiness,

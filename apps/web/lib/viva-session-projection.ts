@@ -735,7 +735,10 @@ function runtimeReadinessNotes(
     });
   }
 
-  if (context.readinessProbe && !probeContradictsLiveReady(context.readinessProbe, context.ready)) {
+  if (
+    context.readinessProbe &&
+    !probeContradictsLiveReady(context.readinessProbe, context.websocketReady)
+  ) {
     notes.push(...probeNotes(context.readinessProbe));
   } else if (!context.readinessProbe && !context.ready) {
     const waiting = context.status === "connecting" || context.status === "idle";
@@ -798,13 +801,24 @@ function runtimeReadinessNotes(
 
 /**
  * A live WebSocket `ready` frame is authoritative proof the agent is reachable.
- * A stale 5s HTTP poll that is still "checking" or has gone "offline" would only
- * contradict it — a red "agent offline" line above the green Provider/Store
- * notes on a healthy session. Drop those once we have the live facts; keep
- * "observed"/"api_missing" probes, which add information rather than contradict.
+ * A stale 5s HTTP poll that is "checking", "offline", or an "observed" probe
+ * whose `/ready` reports not-ready would only contradict it — a red line above
+ * the green Provider/Store notes on a healthy session. Drop those once we have
+ * the live facts; a healthy "observed" probe and "api_missing" still add
+ * information rather than contradict. (Polling stops once the live frame lands,
+ * so a not-ready probe captured just before it must not freeze as a stale
+ * contradiction.)
  */
-function probeContradictsLiveReady(probe: VivaAgentReadinessProbe, ready: unknown): boolean {
-  return Boolean(ready) && (probe.status === "offline" || probe.status === "checking");
+function probeContradictsLiveReady(
+  probe: VivaAgentReadinessProbe,
+  websocketReady: boolean,
+): boolean {
+  // Key off the genuine WS ready frame, NOT readinessFacts — an "observed" probe
+  // is its own readiness source, so it must not self-suppress when it is the only
+  // signal (the gated-provider connecting case).
+  if (!websocketReady) return false;
+  if (probe.status === "offline" || probe.status === "checking") return true;
+  return probe.status === "observed" && !probe.ready.ready;
 }
 
 function probeNotes(probe: VivaAgentReadinessProbe): RuntimeReadinessNote[] {
