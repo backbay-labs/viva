@@ -664,6 +664,83 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).not.toContain("dashboard");
   });
 
+  test("recap closing fold renders mastery rings and the study-plan timeline", () => {
+    const richRecap: SessionRecap = {
+      ...trustedRecap,
+      missedConcepts: ["chemiosmosis"],
+      plan: [
+        { day: "Today", meta: "Completed", status: "done", topics: "Cellular respiration" },
+        { day: "Tomorrow · 15 min", meta: "Scheduled", status: "today", topics: "Proton gradient" },
+        { day: "Fri · 15 min", meta: "Pre-exam", status: "upcoming", topics: "ATP synthase" },
+      ],
+      reviewLater: ["ATP synthase"],
+      shakyConcepts: ["proton gradient"],
+      strongConcepts: ["electron donor", "redox pair"],
+    };
+
+    const markup = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        recap={richRecap}
+        reviewPlan={trustedReviewPlan}
+        runtime={runtime}
+        state="recap"
+      />,
+    );
+
+    // Three mastery rings summarise the session shape at a glance.
+    expect((markup.match(/class="mastery-ring"/g) ?? []).length).toBe(3);
+    // strong 2 / shaky 1+1 missed / review 1 -> total 4 concepts -> 50% / 50% / 25%.
+    expect(markup).toContain("recap-stat");
+    expect(markup).toContain("2 concepts");
+    expect(markup).toContain("1 concept<");
+    // The generated study plan renders as a real timeline, not comma-joined text.
+    expect((markup.match(/class="timeline-item /g) ?? []).length).toBe(3);
+    expect(markup).toContain("Study plan");
+    expect(markup).toContain("Cellular respiration");
+    expect(markup).toContain("Pre-exam");
+    // The precise FSRS-dated next session is preserved alongside the timeline.
+    expect(markup).toContain("Next session");
+    expect(markup).toContain("core FSRS");
+  });
+
+  test("recap closing fold omits the mastery rings when no concepts were graded", () => {
+    const emptyRecap: SessionRecap = {
+      ...trustedRecap,
+      missedConcepts: [],
+      reviewLater: [],
+      shakyConcepts: [],
+      strongConcepts: [],
+    };
+
+    const markup = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        recap={emptyRecap}
+        reviewPlan={[]}
+        runtime={runtime}
+        state="recap"
+      />,
+    );
+
+    expect(markup).not.toContain("mastery-ring");
+    expect(markup).toContain("Closing fold");
+  });
+
   test("renders source_reference folio as a bounded museum label", () => {
     const markup = renderSourceFolioSurface();
 

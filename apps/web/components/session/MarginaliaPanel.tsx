@@ -1,5 +1,5 @@
 import type { ReviewScheduleItem, SessionRecap } from "@viva/core";
-import { Icon, Spark } from "@viva/ui-web";
+import { Icon, MasteryRing, Spark, TimelineItem } from "@viva/ui-web";
 import { type FormEvent, useEffect, useId, useRef, useState } from "react";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
@@ -287,11 +287,28 @@ function RecapFold({
   recap: SessionRecap;
   reviewPlan: ReviewScheduleItem[];
 }) {
+  const masteryTiers = recapMasteryTiers(recap);
+
   return (
     <div className="folio recap-fold">
       <p className="folio__subtitle">Closing fold / Recap ready</p>
       <p className="folio__ref">{recap.headline}</p>
       <p className="folio__excerpt">{recap.summary}</p>
+      {masteryTiers ? (
+        <ul className="recap-fold__rings" aria-label="Mastery at a glance">
+          {masteryTiers.map((tier) => (
+            <li className="recap-stat" key={tier.label}>
+              <MasteryRing color={tier.color} pct={tier.pct} size={62} stroke={6} />
+              <span className="recap-stat__label" style={{ color: tier.color }}>
+                {tier.label}
+              </span>
+              <span className="recap-stat__count">
+                {tier.count} concept{tier.count === 1 ? "" : "s"}
+              </span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
       <ul className="recap-fold__list" aria-label="Conductor recap">
         <li>
           <span>Strong</span>
@@ -310,6 +327,23 @@ function RecapFold({
           <span>{joinRecapItems(recap.reviewLater)}</span>
         </li>
       </ul>
+      {recap.plan.length > 0 ? (
+        <div className="recap-fold__plan">
+          <p className="recap-fold__section-title">Study plan</p>
+          <div className="recap-fold__timeline">
+            {recap.plan.map((item, index) => (
+              <TimelineItem
+                day={item.day}
+                key={`${item.day}-${item.topics}`}
+                last={index === recap.plan.length - 1}
+                meta={item.meta}
+                status={item.status}
+                topics={item.topics}
+              />
+            ))}
+          </div>
+        </div>
+      ) : null}
       {reviewPlan.length > 0 ? (
         <div className="recap-fold__next">
           <p>Next session</p>
@@ -362,6 +396,30 @@ function RecapFold({
 
 function joinRecapItems(items: string[]) {
   return items.length > 0 ? items.join(", ") : "none yet";
+}
+
+type RecapMasteryTier = { label: string; count: number; pct: number; color: string };
+
+/**
+ * Reduce the four graded concept buckets into the three-ring emotional summary
+ * the manuscript closes on: Strong (held), Shaky (missed + unsure, needs another
+ * pass), and Review (scheduled for spaced recall). Percentages are each tier's
+ * honest share of the graded concepts, so the rings always read against the same
+ * whole. Returns null when nothing was graded, so the rings stay silent rather
+ * than drawing three empty zeros.
+ */
+function recapMasteryTiers(recap: SessionRecap): RecapMasteryTier[] | null {
+  const strong = recap.strongConcepts.length;
+  const shaky = recap.shakyConcepts.length + recap.missedConcepts.length;
+  const review = recap.reviewLater.length;
+  const total = strong + shaky + review;
+  if (total === 0) return null;
+  const share = (count: number) => Math.round((count / total) * 100);
+  return [
+    { color: "var(--sage)", count: strong, label: "Strong", pct: share(strong) },
+    { color: "var(--amber)", count: shaky, label: "Shaky", pct: share(shaky) },
+    { color: "var(--plum)", count: review, label: "Review", pct: share(review) },
+  ];
 }
 
 function recapSourceConfidenceLabel(
