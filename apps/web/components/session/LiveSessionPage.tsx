@@ -11,8 +11,13 @@ import {
 } from "../../lib/viva-agent-client";
 import {
   createBrowserVivaAudioCaptureSource,
+  isVivaAudioWorkletUnavailableError,
+  pcm16LeBytesToBase64,
+  startVivaPcm16StreamingCapture,
   VIVA_AUDIO_SAMPLE_RATE_HZ,
-  type VivaAudioCaptureSource,
+  type VivaAudioCaptureEndReason,
+  type VivaAudioCaptureSampleFrame,
+  type VivaPcm16StreamingCaptureController,
 } from "../../lib/viva-audio-capture";
 import {
   createVivaAudioPlaybackSink,
@@ -95,14 +100,21 @@ export function LiveSessionPage() {
   agentRef.current = agent;
 
   const levelRef = useRef<VoiceTraceLevel>({ user: 0, agent: 0 });
-  const captureRef = useRef<VivaAudioCaptureSource | null>(null);
+  const captureRef = useRef<VivaPcm16StreamingCaptureController | null>(null);
   const captureStartedRef = useRef(false);
   const micStartGenerationRef = useRef(0);
+  const capturedTurnPcm16Ref = useRef<Uint8Array[]>([]);
   const textAnswerModeRef = useRef(false);
   const meterRef = useRef(createVoiceLevelMeter({ coefficient: 0.3 }));
   const playbackRef = useRef<VivaAudioPlaybackSink | null>(null);
   const handledAudioRef = useRef(0);
   const handledCancelRef = useRef(0);
+  const reducedMotionRef = useRef(reducedMotion);
+
+  useEffect(() => {
+    reducedMotionRef.current = reducedMotion;
+    if (reducedMotion) levelRef.current.user = 0;
+  }, [reducedMotion]);
 
   const getPlayback = useCallback(() => {
     if (playbackRef.current) return playbackRef.current;
@@ -184,6 +196,7 @@ export function LiveSessionPage() {
     () => () => {
       captureRef.current?.stop();
       captureRef.current = null;
+      capturedTurnPcm16Ref.current = [];
       void playbackRef.current?.close();
       playbackRef.current = null;
     },
@@ -191,7 +204,7 @@ export function LiveSessionPage() {
   );
 
   const startMic = useCallback(async () => {
-    if (captureStartedRef.current || reducedMotion || textAnswerModeRef.current) return;
+    if (captureStartedRef.current || textAnswerModeRef.current) return;
     if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       setMicState("unsupported");
       return;
@@ -214,30 +227,64 @@ export function LiveSessionPage() {
         source.stop();
         captureStartedRef.current = false;
         levelRef.current.user = 0;
+        capturedTurnPcm16Ref.current = [];
         return;
       }
-      captureRef.current = source;
-      setMicState("available");
       const meter = meterRef.current;
-      // Samples drive the bloom ONLY — never sent to the brain.
-      void source.start((samples) => {
-        if (textAnswerModeRef.current) {
+      const capture = startVivaPcm16StreamingCapture({
+        onEnded: (reason) => {
+          if (startGeneration !== micStartGenerationRef.current) return;
+          captureRef.current = null;
+          captureStartedRef.current = false;
           levelRef.current.user = 0;
-          return;
-        }
-        levelRef.current.user = meter.push(samples);
+          capturedTurnPcm16Ref.current = [];
+          setMicState((current) => micStateForCaptureEndReason(reason, current));
+        },
+        onError: (error) => {
+          if (startGeneration !== micStartGenerationRef.current) return;
+          captureRef.current = null;
+          captureStartedRef.current = false;
+          levelRef.current.user = 0;
+          capturedTurnPcm16Ref.current = [];
+          setMicState(micStateForAudioCaptureError(error));
+        },
+        onFrame: (frame) => {
+          if (
+            shouldUseLiveMicAudioTransport({
+              ready: agentRef.current.agentState.ready,
+              status: agentRef.current.status,
+              textAnswerMode: textAnswerModeRef.current,
+            })
+          ) {
+            capturedTurnPcm16Ref.current.push(frame.pcm16Bytes);
+          }
+        },
+        onSampleFrame: (frame) => {
+          levelRef.current.user = captureLevelForBloom({
+            frame,
+            meter,
+            reducedMotion: reducedMotionRef.current,
+            samples: frame.samples,
+            textAnswerMode: textAnswerModeRef.current,
+          });
+        },
+        source,
       });
-    } catch {
+      captureRef.current = capture;
+      setMicState("available");
+    } catch (error) {
       if (textAnswerModeRef.current || startGeneration !== micStartGenerationRef.current) {
         captureStartedRef.current = false;
         levelRef.current.user = 0;
+        capturedTurnPcm16Ref.current = [];
         return;
       }
       captureStartedRef.current = false; // allow another attempt on the next gesture
       levelRef.current.user = 0;
-      setMicState("denied");
+      capturedTurnPcm16Ref.current = [];
+      setMicState(micStateForAudioCaptureError(error));
     }
-  }, [reducedMotion]);
+  }, []);
 
   const unlockPlayback = useCallback(() => {
     void getPlayback()
@@ -260,7 +307,7 @@ export function LiveSessionPage() {
   const activateTextAnswerMode = useCallback(() => {
     textAnswerModeRef.current = true;
     micStartGenerationRef.current += 1;
-    enterTextAnswerMode(captureRef, captureStartedRef, levelRef, meterRef);
+    enterTextAnswerMode(captureRef, captureStartedRef, levelRef, meterRef, capturedTurnPcm16Ref);
   }, []);
 
   const submitSpokenTurn = useCallback(() => {
@@ -268,8 +315,23 @@ export function LiveSessionPage() {
     setSourceOpen(false);
     setHintShown(false);
     setTextRetryOpen(false);
-    // Content is the student's turn signal; the synthetic brain runs its
-    // deterministic evaluation sequence. A real provider receives the transcript.
+    if (
+      shouldUseLiveMicAudioTransport({
+        ready: agentRef.current.agentState.ready,
+        status: agentRef.current.status,
+        textAnswerMode: textAnswerModeRef.current,
+      })
+    ) {
+      const payload = pcm16ChunksToBase64(capturedTurnPcm16Ref.current);
+      capturedTurnPcm16Ref.current = [];
+      if (payload) {
+        agentRef.current.sendAudio(payload);
+        return;
+      }
+    } else {
+      capturedTurnPcm16Ref.current = [];
+    }
+    // Synthetic/no-mic sessions keep the deterministic text turn signal.
     agentRef.current.sendText("(spoken answer)");
   }, [onUserGesture]);
   const submitTextTurn = useCallback(
@@ -311,13 +373,13 @@ export function LiveSessionPage() {
     setSourceOpen(false);
     setHintShown(false);
     setTextRetryOpen(false);
-    stopCaptureForRecap(captureRef, captureStartedRef, levelRef);
+    stopCaptureForRecap(captureRef, captureStartedRef, levelRef, capturedTurnPcm16Ref);
     agentRef.current.stop();
   }, []);
 
   useEffect(() => {
     if (!agent.derived.recap) return;
-    stopCaptureForRecap(captureRef, captureStartedRef, levelRef);
+    stopCaptureForRecap(captureRef, captureStartedRef, levelRef, capturedTurnPcm16Ref);
   }, [agent.derived.recap]);
 
   const activeQuestionId = agent.derived.question?.id;
@@ -326,6 +388,7 @@ export function LiveSessionPage() {
   useEffect(() => {
     if (previousQuestionIdRef.current === activeQuestionId) return;
     previousQuestionIdRef.current = activeQuestionId;
+    capturedTurnPcm16Ref.current = [];
     setSubmittedTextAnswer(undefined);
     setTextAnswerEnabled(false);
     setTextRetryOpen(false);
@@ -490,6 +553,7 @@ export function LiveSessionPage() {
       }}
       onUseVoiceAnswer={() => {
         textAnswerModeRef.current = false;
+        capturedTurnPcm16Ref.current = [];
         setTextAnswerEnabled(false);
         onUserGesture();
       }}
@@ -515,27 +579,99 @@ export function LiveSessionPage() {
 }
 
 export function stopCaptureForRecap(
-  captureRef: { current: Pick<VivaAudioCaptureSource, "stop"> | null },
+  captureRef: { current: LiveCaptureController | null },
   captureStartedRef: { current: boolean },
   levelRef: { current: { user: number } },
+  capturedTurnPcm16Ref?: Pcm16BufferRef,
 ) {
   captureRef.current?.stop();
   captureRef.current = null;
   captureStartedRef.current = false;
   levelRef.current.user = 0;
+  clearCapturedTurnPcm16(capturedTurnPcm16Ref);
 }
 
 export function enterTextAnswerMode(
-  captureRef: { current: Pick<VivaAudioCaptureSource, "stop"> | null },
+  captureRef: { current: LiveCaptureController | null },
   captureStartedRef: { current: boolean },
   levelRef: { current: { user: number } },
   meterRef?: { current: { reset: () => void } },
+  capturedTurnPcm16Ref?: Pcm16BufferRef,
 ) {
-  captureRef.current?.stop();
+  const capture = captureRef.current;
+  if (capture?.cancel) {
+    capture.cancel();
+  } else {
+    capture?.stop();
+  }
   captureRef.current = null;
   captureStartedRef.current = false;
   levelRef.current.user = 0;
   meterRef?.current.reset();
+  clearCapturedTurnPcm16(capturedTurnPcm16Ref);
+}
+
+type LiveCaptureController = Pick<VivaPcm16StreamingCaptureController, "stop"> &
+  Partial<Pick<VivaPcm16StreamingCaptureController, "cancel">>;
+
+type Pcm16BufferRef = { current: Uint8Array[] };
+
+function clearCapturedTurnPcm16(capturedTurnPcm16Ref?: Pcm16BufferRef) {
+  if (capturedTurnPcm16Ref) capturedTurnPcm16Ref.current = [];
+}
+
+export function micStateForAudioCaptureError(error: unknown): RuntimeMicState {
+  return isVivaAudioWorkletUnavailableError(error) ? "unsupported" : "denied";
+}
+
+export function micStateForCaptureEndReason(
+  reason: VivaAudioCaptureEndReason,
+  current: RuntimeMicState,
+): RuntimeMicState {
+  if (reason === "processor_error") return "unsupported";
+  if (reason === "devicechange") return "unknown";
+  return current;
+}
+
+export function shouldUseLiveMicAudioTransport(input: {
+  ready?: { brain?: { live_runtime?: boolean; selectable?: boolean } } | null;
+  status: string;
+  textAnswerMode: boolean;
+}): boolean {
+  return (
+    input.status === "open" &&
+    !input.textAnswerMode &&
+    input.ready?.brain?.live_runtime === true &&
+    input.ready.brain.selectable === true
+  );
+}
+
+export function captureLevelForBloom(input: {
+  samples: Float32Array;
+  frame?: VivaAudioCaptureSampleFrame;
+  meter: {
+    push: (samples: Float32Array) => number;
+    pushRms: (rms: number) => number;
+  };
+  reducedMotion: boolean;
+  textAnswerMode: boolean;
+}): number {
+  if (input.reducedMotion || input.textAnswerMode) return 0;
+  const rms = input.frame?.rms;
+  if (typeof rms === "number" && Number.isFinite(rms)) return input.meter.pushRms(rms);
+  return input.meter.push(input.samples);
+}
+
+export function pcm16ChunksToBase64(chunks: readonly Uint8Array[]): string | null {
+  const byteLength = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  if (byteLength === 0) return null;
+  const merged = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return pcm16LeBytesToBase64(merged);
 }
 
 export function textAnswerPayload(answer: string): string | null {

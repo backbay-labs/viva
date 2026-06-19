@@ -79,4 +79,12 @@ describe("createVoiceLevelMeter", () => {
     meter.reset();
     expect(meter.get()).toBe(0);
   });
+
+  test("smooths worklet-computed RMS without requiring main-thread samples", () => {
+    const meter = createVoiceLevelMeter({ coefficient: 0.5, noiseFloor: 0, ceiling: 1 });
+
+    expect(meter.pushRms(0.5)).toBe(0.25);
+    expect(meter.pushRms(1)).toBe(0.625);
+    expect(meter.get()).toBe(0.625);
+  });
 });
