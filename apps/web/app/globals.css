@@ -3989,6 +3989,24 @@ button {
     0 0 0 4px var(--viva-gold);
 }
 
+/* Windows High Contrast Mode strips box-shadow, so every box-shadow-only focus
+   ring above becomes invisible. Restore a real outline (the UA forces its colour
+   to a system highlight) so keyboard focus stays visible for forced-colors users. */
+@media (forced-colors: active) {
+  .field input:focus,
+  .field textarea:focus,
+  .viva-command:has(:focus-visible),
+  .viva-command__mic:focus-visible,
+  .viva-command__submit:focus-visible,
+  .viva-chip:focus-visible,
+  .session-controls__btn:focus-visible,
+  .written-answer__input:focus-visible,
+  .session-action:focus-visible {
+    outline: 2px solid;
+    outline-offset: 2px;
+  }
+}
+
 .flip-x {
   display: inline-flex;
   transform: scaleX(-1);
