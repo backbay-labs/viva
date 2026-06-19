@@ -1,6 +1,6 @@
 import type { ReviewScheduleItem, SessionRecap } from "@viva/core";
 import { Icon, MasteryRing, Spark, TimelineItem } from "@viva/ui-web";
-import { type FormEvent, useEffect, useId, useRef, useState } from "react";
+import { type CSSProperties, type FormEvent, useEffect, useId, useRef, useState } from "react";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
 import { CorrectionMarginalia } from "./CorrectionMarginalia";
@@ -503,8 +503,12 @@ function ThinkingNote({ question }: { question: Question }) {
       <p className="margin-note__title">Thinking…</p>
       <p className="margin-note__text">Cross-referencing your answer with your sources.</p>
       <ul className="checklist">
-        {question.checklist.map((item) => (
-          <li className={`checklist__item checklist__item--${item.status}`} key={item.label}>
+        {question.checklist.map((item, index) => (
+          <li
+            className={`checklist__item checklist__item--${item.status}`}
+            key={item.label}
+            style={{ "--i": index } as CSSProperties}
+          >
             {item.status === "done" ? (
               <Icon color="var(--viva-sage)" name="check" size={14} strokeWidth={2} />
             ) : (

@@ -3730,6 +3730,22 @@ button {
   font-family: var(--sans);
   font-size: 0.86rem;
   color: var(--viva-ink-soft);
+  /* Each mark ticks in after the one before — Viva cross-referencing, not a
+     static list dumped in one frame. --i is the item's index. */
+  animation: checklistMark 440ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  /* Cap the cascade so a long checklist never lags before its last mark. */
+  animation-delay: calc(min(var(--i, 0), 5) * 110ms);
+}
+
+@keyframes checklistMark {
+  from {
+    opacity: 0;
+    transform: translateX(-5px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .checklist__item--done {
@@ -3763,6 +3779,30 @@ button {
   margin-top: auto;
   align-self: flex-end;
   opacity: 0.7;
+}
+
+/* The hourglass tips slowly while Viva works — a quiet sign of time passing. */
+.margin-note__hourglass svg {
+  transform-origin: 50% 50%;
+  animation: hourglassTurn 3.4s ease-in-out infinite;
+}
+
+@keyframes hourglassTurn {
+  0%,
+  68% {
+    transform: rotate(0deg);
+  }
+  84%,
+  100% {
+    transform: rotate(180deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .checklist__item,
+  .margin-note__hourglass svg {
+    animation: none;
+  }
 }
 
 .correction__meta {
