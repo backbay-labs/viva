@@ -634,6 +634,38 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("Server recap headline");
   });
 
+  test("the thinking checklist carries a per-item index so its marks stagger in", () => {
+    const thinkingQuestion: Question = {
+      ...question,
+      checklist: [
+        { label: "NADH identified", status: "done" },
+        { label: "Mechanism partial", status: "partial" },
+        { label: "Proton gradient missing", status: "missing" },
+      ],
+    };
+
+    const markup = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={thinkingQuestion}
+        runtime={runtime}
+        state="thinking"
+      />,
+    );
+
+    expect(markup).toContain("NADH identified");
+    // The CSS stagger keys off a per-item index custom property.
+    expect(markup).toContain("--i:0");
+    expect(markup).toContain("--i:1");
+    expect(markup).toContain("--i:2");
+  });
+
   test("renders controlled terminal copy when a terminal phase has no recap payload", () => {
     const runtimeCopy = projectRuntimeCopy({
       close: { code: 1008, reason: "session cap", wasClean: true },
