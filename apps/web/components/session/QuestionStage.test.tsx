@@ -28,13 +28,16 @@ function render(prompt: string, state: SessionState, highlightedTokens: string[]
   );
 }
 
-test("announces the question to assistive tech as a polite, atomic live region", () => {
+test("announces the question via a dedicated live region, not the heading itself", () => {
   const markup = render("Explain the role of NADH.", "listening", []);
-  // The question heading itself is the live region, so a new prompt is read aloud
-  // in a voice-first product (the small status line alone never speaks the question).
-  expect(/<h1[^>]*aria-live="polite"[^>]*>/.test(markup)).toBe(true);
-  expect(/<h1[^>]*aria-atomic="true"[^>]*>/.test(markup)).toBe(true);
-  expect(markup).toContain('class="question-stage__text"');
+  // A separate visually-hidden polite region speaks the plain prompt, so a new
+  // question is read aloud in a voice-first product.
+  expect(markup).toContain('class="sr-only"');
+  expect(/<p[^>]*aria-live="polite"[^>]*>/.test(markup)).toBe(true);
+  expect(markup).toContain("Explain the role of NADH.");
+  // The heading itself is NOT a live region — the post-answer source-term reveal
+  // must never re-announce the whole question.
+  expect(/<h1[^>]*aria-live/.test(markup)).toBe(false);
 });
 
 test("reveals a source term inside the prompt once the answer is being reviewed", () => {
