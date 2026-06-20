@@ -37,6 +37,7 @@ export type VivaAgentDerivedState = {
   question?: SessionQuestion;
   transcript: string;
   finalTranscript?: string;
+  transcriptConfidence?: number;
   evaluation?: AnswerEvaluation;
   currentSource?: SourceReference;
   currentConceptStatus?: ConceptStatus;
@@ -148,6 +149,7 @@ export function deriveVivaAgentUiState(state: VivaAgentSessionState): VivaAgentD
     currentConceptStatus: state.currentConceptStatus,
     conceptStatuses: state.conceptStatuses,
     finalTranscript: state.finalTranscript,
+    transcriptConfidence: state.transcriptConfidence,
     manuscriptIntents: state.manuscriptIntents.map((event) => event.intent),
     phase: state.question && state.phase === "ready" ? "listening" : state.phase,
     question,

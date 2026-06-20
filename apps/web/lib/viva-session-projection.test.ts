@@ -23,6 +23,7 @@ import {
   projectSessionState,
   projectSourceFolio,
   projectTrace,
+  transcriptionWasUncertain,
 } from "./viva-session-projection";
 
 const NOW = new Date("2026-06-17T12:00:00.000Z");
@@ -715,6 +716,20 @@ describe("expectedTermsRevealed", () => {
     expect(expectedTermsRevealed("thinking")).toBe(true);
     expect(expectedTermsRevealed("correction")).toBe(true);
     expect(expectedTermsRevealed("source")).toBe(true);
+  });
+});
+
+describe("transcriptionWasUncertain", () => {
+  test("flags only genuinely low transcription confidence", () => {
+    expect(transcriptionWasUncertain(0.4)).toBe(true);
+    expect(transcriptionWasUncertain(0.69)).toBe(true);
+    // 0.7 threshold (exclusive) and the fixture values (0.78 / 0.91) stay quiet.
+    expect(transcriptionWasUncertain(0.7)).toBe(false);
+    expect(transcriptionWasUncertain(0.78)).toBe(false);
+    expect(transcriptionWasUncertain(0.91)).toBe(false);
+    // Missing / null confidence is never "uncertain".
+    expect(transcriptionWasUncertain(undefined)).toBe(false);
+    expect(transcriptionWasUncertain(null)).toBe(false);
   });
 });
 

@@ -120,6 +120,7 @@ export type VivaAgentSessionState = {
   question?: AgentStudyQuestion;
   transcript: string;
   finalTranscript?: string;
+  transcriptConfidence?: number;
   evaluation?: AgentAnswerEvaluation;
   currentSource?: AgentStudySourceReference;
   sources: AgentStudySourceReference[];
@@ -545,6 +546,7 @@ export function vivaAgentReducer(
         transcript: "",
         terminalReason: undefined,
         finalTranscript: undefined,
+        transcriptConfidence: undefined,
         evaluation: undefined,
         currentSource: undefined,
         sources: [],
@@ -555,7 +557,12 @@ export function vivaAgentReducer(
     case "transcript_delta":
       return { ...state, transcript: state.transcript + event.text };
     case "transcript_final":
-      return { ...state, transcript: event.text, finalTranscript: event.text };
+      return {
+        ...state,
+        transcript: event.text,
+        finalTranscript: event.text,
+        transcriptConfidence: event.confidence ?? undefined,
+      };
     case "answer_evaluated":
       return { ...state, evaluation: event.evaluation };
     case "source_reference":
