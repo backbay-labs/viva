@@ -1,4 +1,5 @@
 import { Icon } from "@viva/ui-web";
+import type { RefObject } from "react";
 import type { SourceFolioProjection } from "../../lib/viva-session-projection";
 import { SessionActionButton } from "./SessionActionButton";
 import { SourceChip } from "./SourceChip";
@@ -15,16 +16,26 @@ export function SourceFolio({
   sourceFolio,
   onBack,
   onChallenge,
+  rootRef,
 }: {
   question: Question;
   sourceFolio?: SourceFolioProjection;
   onBack: () => void;
   onChallenge?: () => void;
+  rootRef?: RefObject<HTMLElement | null>;
 }) {
   const folio = sourceFolio ?? sourceFolioFromQuestion(question);
 
   return (
-    <div className="folio source-folio" data-source-state={folio.state}>
+    // tabIndex=-1 + aria-label so keyboard focus can land in this region when the
+    // margin opens the folio, instead of falling to <body>.
+    <section
+      aria-label="Source folio"
+      className="folio source-folio"
+      data-source-state={folio.state}
+      ref={rootRef}
+      tabIndex={-1}
+    >
       <p className="folio__subtitle">Source Folio</p>
       <p className="folio__ref">{folio.source.label}</p>
       <div className="source-folio__chips">
@@ -60,7 +71,7 @@ export function SourceFolio({
         }
         onClick={onBack}
       />
-    </div>
+    </section>
   );
 }
 

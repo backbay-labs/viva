@@ -4089,6 +4089,12 @@ button {
   color: var(--viva-ink);
 }
 
+/* The folio is a focus landing target (tabIndex=-1) when it opens; suppress the
+   ring on the container itself — its interactive controls keep their own. */
+.source-folio:focus {
+  outline: none;
+}
+
 .source-folio__excerpt {
   border-left: 2px solid rgba(129, 84, 189, 0.28);
   padding-left: 0.75rem;

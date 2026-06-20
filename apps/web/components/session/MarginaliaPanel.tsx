@@ -68,6 +68,19 @@ export function MarginaliaPanel({
   const showsRuntimeNote = state === "listening" || (state === "recap" && !isRecap);
   const studentHandAnswer = textAnswer?.lastAnswer;
 
+  // Opening the Source Folio replaces the margin content and unmounts the
+  // "Show source" trigger; move keyboard focus into the folio so it doesn't fall
+  // to <body> and force a keyboard user to tab from the top again.
+  const sourceFolioRef = useRef<HTMLElement>(null);
+  const wasSourceRef = useRef(false);
+  useEffect(() => {
+    if (isSource && !wasSourceRef.current) {
+      sourceFolioRef.current?.focus();
+      window.requestAnimationFrame(() => sourceFolioRef.current?.focus());
+    }
+    wasSourceRef.current = isSource;
+  }, [isSource]);
+
   return (
     <aside
       className="marginalia"
@@ -122,6 +135,7 @@ export function MarginaliaPanel({
             onBack={onBackToQuestion}
             onChallenge={onChallengeSource ?? onTryAgain}
             question={question}
+            rootRef={sourceFolioRef}
             sourceFolio={sourceFolio}
           />
         ) : null}

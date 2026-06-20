@@ -860,6 +860,10 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("Challenge citation");
     expect(markup).not.toContain("Full document");
     expect(markup).not.toContain("page/bbox");
+    // The folio is a focus landing target so opening it moves keyboard focus
+    // here instead of dropping it to <body>.
+    expect(/<section[^>]*class="folio source-folio"[^>]*tabindex="-1"/.test(markup)).toBe(true);
+    expect(markup).toContain('aria-label="Source folio"');
   });
 
   test("renders low-confidence, conflicting, and unavailable source states honestly", () => {
