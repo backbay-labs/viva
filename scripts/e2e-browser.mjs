@@ -189,7 +189,7 @@ try {
     await page.getByRole("button", { name: /check it/i }).click();
     postAnswerProtocolProof = await waitForPostAnswerProtocolProof(serverEvents, 25_000);
     if (requireCorrectionMarginalia) {
-      await page.getByText("Marginalia").waitFor({
+      await page.getByText("Marginalia", { exact: true }).waitFor({
         state: "visible",
         timeout: 25_000,
       });
@@ -207,7 +207,7 @@ try {
       });
       await page.waitForTimeout(600);
       correctionMarginaliaVisible =
-        (await isVisible(page.getByText("Marginalia").first())) &&
+        (await isVisible(page.getByText("Marginalia", { exact: true }).first())) &&
         (await isVisible(page.getByRole("button", { name: "Try again" }).first())) &&
         (await isVisible(page.getByRole("button", { name: "Show source" }).first())) &&
         (await isVisible(page.getByRole("button", { name: "Next question" }).first()));
