@@ -152,6 +152,18 @@ export function expectedTermsRevealed(state: SessionState): boolean {
   return state !== "listening";
 }
 
+/**
+ * The agent emits a transcription confidence on `transcript_final`. Below this
+ * threshold the Conductor genuinely may have misheard the spoken answer, so the
+ * manuscript flags it honestly (REQUIREMENTS §8.4) rather than grading silently
+ * against a possibly-wrong transcript. Decent/high confidence stays quiet.
+ */
+export const LOW_TRANSCRIPTION_CONFIDENCE = 0.7;
+
+export function transcriptionWasUncertain(confidence: number | null | undefined): boolean {
+  return typeof confidence === "number" && confidence < LOW_TRANSCRIPTION_CONFIDENCE;
+}
+
 export function projectHighlightedTokens(
   state: SessionState,
   derived: VivaAgentDerivedState,

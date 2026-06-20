@@ -389,6 +389,51 @@ describe("Viva agent browser client", () => {
     expect(afterCancel.activeResponseId).toBe("resp-2");
   });
 
+  test("reducer keeps the transcript_final confidence and resets it on the next question", () => {
+    const withTranscript = vivaAgentReducer(
+      { ...initialVivaAgentSessionState(), activeResponseId: "resp-1" },
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "transcript_final",
+          response_id: "resp-1",
+          text: "NADH donates electrons",
+          confidence: 0.42,
+        },
+      }),
+    );
+    expect(withTranscript.finalTranscript).toBe("NADH donates electrons");
+    expect(withTranscript.transcriptConfidence).toBe(0.42);
+
+    const nextQuestion = vivaAgentReducer(
+      withTranscript,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "question_started",
+          response_id: "resp-2",
+          question: {
+            question_id: "q2",
+            prompt: "Next question.",
+            expected_terms: [],
+            follow_up: "x",
+            source: {
+              source_id: "s2",
+              document_id: "lec-6",
+              span: "slide:4",
+              excerpt: "next excerpt",
+              confidence: "high",
+              retrieval_reason: "next",
+            },
+          },
+        },
+      }),
+    );
+    expect(nextQuestion.transcriptConfidence).toBeUndefined();
+  });
+
   test("reducer records controlled terminal phase reasons without inventing a recap", () => {
     const state = vivaAgentReducer(
       initialVivaAgentSessionState(),

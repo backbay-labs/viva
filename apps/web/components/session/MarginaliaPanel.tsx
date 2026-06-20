@@ -14,6 +14,8 @@ export type TextAnswerState = {
   active: boolean;
   disabled: boolean;
   lastAnswer?: string;
+  /** The voice transcription of lastAnswer came back low-confidence. */
+  lastAnswerUncertain?: boolean;
   required: boolean;
 };
 
@@ -105,7 +107,7 @@ export function MarginaliaPanel({
       </p>
       <div className="marginalia__body">
         {state !== "listening" && !isSource && !isRecap && studentHandAnswer ? (
-          <StudentHand answer={studentHandAnswer} />
+          <StudentHand answer={studentHandAnswer} uncertain={textAnswer?.lastAnswerUncertain} />
         ) : null}
         {showsRuntimeNote ? (
           <ListeningNote
@@ -198,7 +200,9 @@ function ListeningNote({
       </span>
       <p className="margin-note__title">{runtime.marginaliaTitle}</p>
       <p className="margin-note__text">{runtime.marginaliaText}</p>
-      {textAnswer?.lastAnswer ? <StudentHand answer={textAnswer.lastAnswer} /> : null}
+      {textAnswer?.lastAnswer ? (
+        <StudentHand answer={textAnswer.lastAnswer} uncertain={textAnswer.lastAnswerUncertain} />
+      ) : null}
       <ul className="readiness-ladder" aria-label="Connected session readiness">
         {runtime.readinessNotes.map((note) => (
           <li className="readiness-ladder__item" data-state={note.state} key={note.label}>
@@ -288,11 +292,16 @@ function ListeningNote({
   );
 }
 
-function StudentHand({ answer }: { answer: string }) {
+function StudentHand({ answer, uncertain }: { answer: string; uncertain?: boolean }) {
   return (
     <figure className="student-hand" aria-label="Student hand answer">
       <figcaption>Student's hand</figcaption>
       <p>{answer}</p>
+      {uncertain ? (
+        <p className="student-hand__caveat">
+          Heard with some uncertainty — correct me if I misheard.
+        </p>
+      ) : null}
     </figure>
   );
 }

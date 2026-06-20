@@ -690,6 +690,49 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("--i:2");
   });
 
+  test("flags a low-confidence voice transcription in the student-hand echo", () => {
+    const base = {
+      hintShown: false,
+      onBackToQuestion: noop,
+      onHint: noop,
+      onNextQuestion: noop,
+      onShowSource: noop,
+      onSubmitAnswer: noop,
+      onTryAgain: noop,
+      question,
+      runtime,
+      state: "correction" as const,
+    };
+
+    const uncertain = renderToStaticMarkup(
+      <MarginaliaPanel
+        {...base}
+        textAnswer={{
+          active: false,
+          disabled: false,
+          lastAnswer: "NADH donates electrons",
+          lastAnswerUncertain: true,
+          required: false,
+        }}
+      />,
+    );
+    expect(uncertain).toContain("Heard with some uncertainty");
+
+    const confident = renderToStaticMarkup(
+      <MarginaliaPanel
+        {...base}
+        textAnswer={{
+          active: false,
+          disabled: false,
+          lastAnswer: "NADH donates electrons",
+          lastAnswerUncertain: false,
+          required: false,
+        }}
+      />,
+    );
+    expect(confident).not.toContain("Heard with some uncertainty");
+  });
+
   test("renders controlled terminal copy when a terminal phase has no recap payload", () => {
     const runtimeCopy = projectRuntimeCopy({
       close: { code: 1008, reason: "session cap", wasClean: true },

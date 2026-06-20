@@ -34,6 +34,7 @@ import {
   projectSourceFolio,
   projectTrace,
   type RuntimeMicState,
+  transcriptionWasUncertain,
 } from "../../lib/viva-session-projection";
 import { createVoiceLevelMeter } from "../../lib/viva-voice-level";
 import { LiveSessionShell } from "./LiveSessionShell";
@@ -502,6 +503,12 @@ export function LiveSessionPage() {
   const studentHandAnswer = textRetryOpen
     ? undefined
     : (agent.derived.finalTranscript ?? submittedTextAnswer);
+  // The caveat only applies when the shown answer IS the voice transcription
+  // (not a typed answer), and the agent reported low confidence in hearing it.
+  const studentHandUncertain =
+    studentHandAnswer !== undefined &&
+    studentHandAnswer === agent.derived.finalTranscript &&
+    transcriptionWasUncertain(agent.derived.transcriptConfidence);
   const submitRuntimePrimaryAction =
     runtime.primaryActionIntent === "retry_agent"
       ? retryAgent
@@ -577,6 +584,7 @@ export function LiveSessionPage() {
               active: textAnswerActive,
               disabled: false,
               lastAnswer: studentHandAnswer,
+              lastAnswerUncertain: studentHandUncertain,
               required: textAnswerRequired,
             }
           : undefined
