@@ -27,6 +27,7 @@ import {
   initialVivaAgentSessionState,
   type VivaAgentAudioOutput,
   type VivaAgentClientOptions,
+  type VivaAgentCloseDiagnostics,
   type VivaAgentSessionController,
   type VivaAgentSessionState,
 } from "./viva-agent-client";
@@ -34,6 +35,7 @@ import {
 export type VivaAgentDerivedState = {
   phase: VivaAgentSessionState["phase"];
   terminalReason?: AgentTerminalSessionReason;
+  close?: VivaAgentCloseDiagnostics;
   question?: SessionQuestion;
   transcript: string;
   finalTranscript?: string;
@@ -141,6 +143,7 @@ export function deriveVivaAgentUiState(state: VivaAgentSessionState): VivaAgentD
   const question = state.question ? agentQuestionToSessionQuestion(state.question) : undefined;
   return {
     canSubmitAnswer: state.status === "open",
+    close: state.close,
     errors: state.errors,
     evaluation: state.evaluation
       ? agentAnswerEvaluationToUiEvaluation(state.evaluation)

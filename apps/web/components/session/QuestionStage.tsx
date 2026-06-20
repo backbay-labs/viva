@@ -23,6 +23,10 @@ export function QuestionStage({
 }) {
   const lines = question.prompt.split("\n");
   const pending = Boolean(question.pending);
+  // The live examiner status ("Listening…", "Checking…") belongs to a real
+  // exchange only. While connecting (pending) or after a close/error (terminal)
+  // there is nothing to listen to — showing it contradicts the headline.
+  const showStatus = !pending && !question.terminal;
   const reveal = !pending && REVEALING_STATES.has(state) && highlightedTokens.length > 0;
   const matcher = reveal ? buildTokenMatcher(highlightedTokens) : null;
 
@@ -46,10 +50,12 @@ export function QuestionStage({
       <p aria-atomic="true" aria-live="polite" className="sr-only">
         {question.prompt}
       </p>
-      <p aria-hidden="true" className="question-stage__status">
-        <Spark className="question-stage__spark" color="var(--viva-gold)" size={13} />
-        <span>{STATUS_LINE[state]}</span>
-      </p>
+      {showStatus ? (
+        <p aria-hidden="true" className="question-stage__status">
+          <Spark className="question-stage__spark" color="var(--viva-gold)" size={13} />
+          <span>{STATUS_LINE[state]}</span>
+        </p>
+      ) : null}
     </div>
   );
 }

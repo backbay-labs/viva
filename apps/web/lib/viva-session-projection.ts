@@ -966,14 +966,23 @@ export function checklistFromExpectedTerms(
   }));
 }
 
-function connectionPlaceholderPrompt(status: VivaAgentConnectionStatus): string {
+function connectionPlaceholderPrompt(
+  status: VivaAgentConnectionStatus,
+  gracefullyEnded: boolean,
+): string {
   switch (status) {
     case "connecting":
       return "Connecting to your examiner…";
     case "error":
       return "The connection was interrupted.";
     case "closed":
-      return "This session has ended.";
+      // A graceful end is a clean close (the student or the server closed the
+      // socket deliberately — code 1000 / wasClean, or a delivered terminal
+      // reason; a finished drill is handled earlier as a recap). A close that is
+      // neither — most often the examiner was never reachable (unclean 1006) —
+      // is an interruption, not a finished session; don't dress an infra failure
+      // up as completed study.
+      return gracefullyEnded ? "This session has ended." : "The connection was interrupted.";
     default:
       return "Your examiner is preparing the first question…";
   }
@@ -1001,8 +1010,22 @@ export function projectSessionQuestion(
   if (!agentQuestion) {
     // Connecting / idle / open-without-a-question is a warming-up placeholder;
     // error and closed are terminal copy, not a pending question.
-    const pending = status !== "error" && status !== "closed";
-    return { ...EMPTY_QUESTION, prompt: connectionPlaceholderPrompt(status), status: "", pending };
+    const terminal = status === "error" || status === "closed";
+    const pending = !terminal;
+    // Graceful only on a clean close: a deliberate 1000/wasClean teardown or a
+    // server-delivered terminal reason. An `error` status or an unclean close
+    // (1006, never reached) is an interruption. The production brain ends a
+    // user-initiated stop with a clean close and no terminal reason, so the
+    // close cleanliness — not the terminal reason alone — is the real signal.
+    const gracefullyEnded =
+      status === "closed" && (Boolean(derived.terminalReason) || derived.close?.wasClean === true);
+    return {
+      ...EMPTY_QUESTION,
+      prompt: connectionPlaceholderPrompt(status, gracefullyEnded),
+      status: "",
+      pending,
+      terminal,
+    };
   }
 
   const evaluation = derived.evaluation;

@@ -39,6 +39,10 @@ export type Question = {
   /** True while the examiner is connecting/preparing — the plate renders a calm
    * warming-up state instead of dressing the placeholder up as a real question. */
   pending?: boolean;
+  /** True once the connection has closed or errored without a live question —
+   * the plate shows calm terminal copy and suppresses the live status line, so a
+   * closed/unreachable session never reads as "Listening…". */
+  terminal?: boolean;
   /** Which marking family the correction belongs to (set once evaluated). */
   correctionFamily?: CorrectionFamily;
   /** Hypercorrection ink weight 0..1 — heavier when the student was confident and wrong. */

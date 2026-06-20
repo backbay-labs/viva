@@ -19,6 +19,42 @@ function makeQuestion(prompt: string, pending = false): Question {
   };
 }
 
+test("shows the live examiner status line only for a real, live question", () => {
+  const live = renderToStaticMarkup(
+    <QuestionStage
+      highlightedTokens={[]}
+      question={makeQuestion("Explain NADH.")}
+      state="listening"
+    />,
+  );
+  expect(live).toContain("question-stage__status");
+  expect(live).toContain("Listening…");
+});
+
+test("hides the live status line while warming up — never 'Listening…' under 'Connecting…'", () => {
+  const markup = renderToStaticMarkup(
+    <QuestionStage
+      highlightedTokens={[]}
+      question={makeQuestion("Connecting to your examiner…", true)}
+      state="listening"
+    />,
+  );
+  expect(markup).not.toContain("question-stage__status");
+  expect(markup).not.toContain("Listening…");
+});
+
+test("hides the live status line for a terminal placeholder — no 'Listening…' on a closed session", () => {
+  const markup = renderToStaticMarkup(
+    <QuestionStage
+      highlightedTokens={[]}
+      question={{ ...makeQuestion("The connection was interrupted."), terminal: true }}
+      state="listening"
+    />,
+  );
+  expect(markup).not.toContain("question-stage__status");
+  expect(markup).not.toContain("Listening…");
+});
+
 test("renders a calm warming-up state for a pending connecting placeholder", () => {
   const markup = renderToStaticMarkup(
     <QuestionStage
