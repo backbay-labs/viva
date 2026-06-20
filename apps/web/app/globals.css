@@ -3925,6 +3925,12 @@ button {
   }
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .correction__retry-cue {
+    animation: none;
+  }
+}
+
 .source-chip,
 .status-chip {
   display: inline-flex;

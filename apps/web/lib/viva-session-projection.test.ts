@@ -861,6 +861,20 @@ describe("projectSessionQuestion", () => {
     // not a bare repeat of the original prompt.
     expect(projected.retryPrompt).toBe("Try again naming the gradient.");
   });
+
+  test("collapses an empty re-prompt to undefined so the cue is omitted, not blank", () => {
+    const projected = projectSessionQuestion(
+      derived({
+        phase: "correction",
+        question,
+        evaluation: evaluation({ retryPrompt: "" }),
+        finalTranscript: "NADH",
+      }),
+      "open",
+      NOW,
+    );
+    expect(projected.retryPrompt).toBe(undefined);
+  });
 });
 
 describe("projectTrace", () => {
