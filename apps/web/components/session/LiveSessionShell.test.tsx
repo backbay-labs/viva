@@ -293,6 +293,49 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(`${canvasMarkup}${marginaliaMarkup}`).not.toContain("Render instruction");
   });
 
+  test("surfaces the agent's re-prompt as guidance for the retry, omitting it when absent", () => {
+    const guided = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={{
+          ...question,
+          correctionBody: "You named ATP, but skipped the mechanism.",
+          retryPrompt: "Now connect that electron flow to ATP synthase in one precise sentence.",
+        }}
+        runtime={runtime}
+        scene={scene}
+        state="correction"
+      />,
+    );
+    expect(guided).toContain("correction__retry-cue");
+    expect(guided).toContain(
+      "Now connect that electron flow to ATP synthase in one precise sentence.",
+    );
+
+    const bare = renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={{ ...question, correctionBody: "Missed it." }}
+        runtime={runtime}
+        scene={scene}
+        state="correction"
+      />,
+    );
+    expect(bare).not.toContain("correction__retry-cue");
+  });
+
   test("keeps the bloom at a constant floor in text mode", () => {
     expect(voiceTraceBloomPulse({ textMode: true, time: 0, voice: 0 })).toBe(
       voiceTraceBloomPulse({ textMode: true, time: 10, voice: 1 }),
