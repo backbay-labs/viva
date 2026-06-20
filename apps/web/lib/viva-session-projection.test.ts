@@ -846,6 +846,18 @@ describe("projectSessionQuestion", () => {
     expect(ended.terminal).toBe(true);
   });
 
+  test("a clean user-initiated close reads as ended even without a terminal reason", () => {
+    // The production brain ends a student-initiated stop with a clean 1000 close
+    // and NO terminal reason and NO recap (e.g. ending during warm-up). That is a
+    // deliberate end, not an interruption — the close cleanliness is the signal.
+    const ended = projectSessionQuestion(
+      derived({ phase: "ready", close: { code: 1000, reason: "client_stop", wasClean: true } }),
+      "closed",
+      NOW,
+    );
+    expect(ended.prompt).toBe("This session has ended.");
+  });
+
   test("a live question and the warming-up placeholder are never terminal", () => {
     expect(
       projectSessionQuestion(derived({ phase: "listening", question }), "open", NOW).terminal ??
