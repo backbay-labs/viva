@@ -133,10 +133,16 @@ try {
   });
   await page.getByRole("button", { name: "Review missed concepts" }).click();
   await page.waitForURL(`${webUrl}/session`, { timeout: 20_000 });
-  await page.getByText("Explain the role of NADH in oxidative phosphorylation.").waitFor({
-    state: "visible",
-    timeout: 20_000,
-  });
+  // Scope to the visible heading: the prompt is also mirrored into an sr-only
+  // aria-live paragraph (so assistive tech hears a new question), so a plain
+  // getByText matches two nodes and trips strict mode. The heading is the one
+  // the student actually reads.
+  await page
+    .getByRole("heading", { name: "Explain the role of NADH in oxidative phosphorylation." })
+    .waitFor({
+      state: "visible",
+      timeout: 20_000,
+    });
   const listeningText =
     agentProvider === "synthetic"
       ? "Synthetic examiner is listening."
@@ -152,13 +158,13 @@ try {
   });
 
   await page.getByRole("button", { name: "Show source" }).click();
-  await page.getByText("Source Folio").waitFor({
+  await page.getByText("Source Folio", { exact: true }).waitFor({
     state: "visible",
     timeout: 10_000,
   });
   await page.waitForTimeout(600);
   sourceFolioVisible =
-    (await isVisible(page.getByText("Source Folio").first())) &&
+    (await isVisible(page.getByText("Source Folio", { exact: true }).first())) &&
     (await isVisible(page.getByRole("button", { name: "Challenge citation" }).first()));
   boundedSourceVisible =
     (await isVisible(page.getByText("NADH donates", { exact: false }).first())) &&
@@ -224,13 +230,13 @@ try {
     }
     if (requirePostAnswerSourceFolio) {
       await page.getByRole("button", { name: "Show source" }).click();
-      await page.getByText("Source Folio").waitFor({
+      await page.getByText("Source Folio", { exact: true }).waitFor({
         state: "visible",
         timeout: 10_000,
       });
       await page.waitForTimeout(600);
       postAnswerSourceFolioVisible =
-        (await isVisible(page.getByText("Source Folio").first())) &&
+        (await isVisible(page.getByText("Source Folio", { exact: true }).first())) &&
         (await isVisible(page.getByRole("button", { name: "Challenge citation" }).first())) &&
         (await isVisible(
           page.getByText(conceptStatusText(postAnswerProtocolProof.conceptStatus), {
@@ -253,7 +259,7 @@ try {
     agentProvider === "synthetic"
       ? "Next, make the proton-gradient-to-ATP-synthase link explicit."
       : "The session stayed grounded to the server-owned source span.";
-  await page.getByText("Recap ready").waitFor({
+  await page.getByText("Closing fold / Recap ready").waitFor({
     state: "visible",
     timeout: 25_000,
   });
@@ -261,7 +267,7 @@ try {
     state: "visible",
     timeout: 10_000,
   });
-  await page.getByText("Review later").waitFor({
+  await page.getByText("Review later").first().waitFor({
     state: "visible",
     timeout: 10_000,
   });
@@ -281,7 +287,7 @@ try {
     (await isVisible(page.getByText("Next session", { exact: false }).first())) &&
     (await isVisible(page.getByText("core FSRS", { exact: false }).first()));
   const recapPayloadVisible =
-    (await isVisible(page.getByText("Recap ready").first())) &&
+    (await isVisible(page.getByText("Closing fold / Recap ready").first())) &&
     (await isVisible(page.getByText(recapSummaryText, { exact: false }).first())) &&
     Boolean(postAnswerProtocolProof.conceptId) &&
     (await isVisible(
@@ -292,7 +298,7 @@ try {
   const localScheduleVisible = await isVisible(
     page.getByRole("button", { name: /Schedule a short source-backed review tomorrow/ }),
   );
-  await page.getByText("Recap ready").first().scrollIntoViewIfNeeded();
+  await page.getByText("Closing fold / Recap ready").first().scrollIntoViewIfNeeded();
   await redactRecapForSanitizedScreenshot(page);
   await page.waitForTimeout(600);
   await page.screenshot({
