@@ -824,6 +824,38 @@ describe("projectSessionQuestion", () => {
     expect(real.pending ?? false).toBe(false);
   });
 
+  test("an unreachable or interrupted close is honest copy, never a finished session", () => {
+    // Agent offline / unclean 1006 close: no graceful terminal reason was ever
+    // delivered. Calling this "This session has ended." misframes an infra
+    // failure as a completed session — say it was interrupted instead.
+    const offline = projectSessionQuestion(derived({ phase: "ready" }), "closed", NOW);
+    expect(offline.prompt).toBe("The connection was interrupted.");
+    expect(offline.terminal).toBe(true);
+    const errored = projectSessionQuestion(derived({ phase: "ready" }), "error", NOW);
+    expect(errored.prompt).toBe("The connection was interrupted.");
+    expect(errored.terminal).toBe(true);
+  });
+
+  test("a graceful end (terminal reason delivered) still reads as a finished session", () => {
+    const ended = projectSessionQuestion(
+      derived({ phase: "ready", terminalReason: "session_cap" }),
+      "closed",
+      NOW,
+    );
+    expect(ended.prompt).toBe("This session has ended.");
+    expect(ended.terminal).toBe(true);
+  });
+
+  test("a live question and the warming-up placeholder are never terminal", () => {
+    expect(
+      projectSessionQuestion(derived({ phase: "listening", question }), "open", NOW).terminal ??
+        false,
+    ).toBe(false);
+    expect(
+      projectSessionQuestion(derived({ phase: "ready" }), "connecting", NOW).terminal ?? false,
+    ).toBe(false);
+  });
+
   test("projects the live agent question with no verdict before evaluation", () => {
     const projected = projectSessionQuestion(
       derived({ phase: "listening", question, finalTranscript: "NADH gives electrons" }),
