@@ -3215,10 +3215,13 @@ button {
   margin: 0;
   max-width: 18ch;
   font-family: var(--serif);
-  font-weight: 400;
+  /* The hero question is the centerpiece; Cormorant 400 is a hairline at 3rem and
+     washes out on the parchment veil. Medium + slight negative tracking gives it
+     the engraved, confident weight the rest of the display register already uses. */
+  font-weight: 500;
   font-size: 3rem;
   line-height: 1.12;
-  letter-spacing: 0;
+  letter-spacing: -0.01em;
   color: var(--viva-ink);
   overflow-wrap: anywhere;
   hyphens: auto;
@@ -3228,6 +3231,9 @@ button {
    muted, smaller than a real question — so "the examiner is preparing" never
    looks like a question stuck on the plate. */
 .question-stage[data-pending="true"] .question-stage__text {
+  /* The warming-up placeholder stays a quiet hairline — the deliberate contrast
+     against the engraved, resolved question. */
+  font-weight: 400;
   font-style: italic;
   font-size: clamp(1.5rem, 3.4vw, 2.1rem);
   color: var(--viva-muted);
