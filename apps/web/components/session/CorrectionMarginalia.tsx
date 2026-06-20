@@ -49,6 +49,12 @@ export function CorrectionMarginalia({
         <SourceChip label={question.sourceRef} />
         <StatusChip label={question.status} />
       </div>
+      {question.retryPrompt ? (
+        <p className="correction__retry-cue">
+          <span className="correction__retry-label">Try it this way</span>
+          {question.retryPrompt}
+        </p>
+      ) : null}
       <div className="correction__actions">
         <SessionActionButton
           label="Try again"

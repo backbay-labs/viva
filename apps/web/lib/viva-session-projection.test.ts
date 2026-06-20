@@ -835,6 +835,8 @@ describe("projectSessionQuestion", () => {
     expect(projected.highlights).toEqual(question.expectedTerms);
     expect(projected.status).toBe("");
     expect(projected.correctionFamily).toBeUndefined();
+    // No agent re-prompt before the answer is marked.
+    expect(projected.retryPrompt ?? "").toBe("");
   });
 
   test("projects the evaluation into family, emphasis, verdict and correction copy", () => {
@@ -855,6 +857,23 @@ describe("projectSessionQuestion", () => {
     expect(projected.status).toContain("Missed");
     expect(projected.correctionFamily).toBe("reprompt");
     expect(projected.correctionEmphasis ?? 0).toBeGreaterThan(0.6);
+    // The agent's Socratic re-prompt is carried through so the retry is guided,
+    // not a bare repeat of the original prompt.
+    expect(projected.retryPrompt).toBe("Try again naming the gradient.");
+  });
+
+  test("collapses an empty re-prompt to undefined so the cue is omitted, not blank", () => {
+    const projected = projectSessionQuestion(
+      derived({
+        phase: "correction",
+        question,
+        evaluation: evaluation({ retryPrompt: "" }),
+        finalTranscript: "NADH",
+      }),
+      "open",
+      NOW,
+    );
+    expect(projected.retryPrompt).toBe(undefined);
   });
 });
 

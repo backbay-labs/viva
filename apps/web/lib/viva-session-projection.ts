@@ -1024,6 +1024,7 @@ export function projectSessionQuestion(
     correctionEmphasis: evaluation
       ? correctionEmphasis(evaluation.confidenceScore, evaluation.label)
       : undefined,
+    retryPrompt: evaluation?.retryPrompt || undefined,
   };
 }
 

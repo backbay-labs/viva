@@ -43,6 +43,8 @@ export type Question = {
   correctionFamily?: CorrectionFamily;
   /** Hypercorrection ink weight 0..1 — heavier when the student was confident and wrong. */
   correctionEmphasis?: number;
+  /** The agent's Socratic re-prompt — actionable guidance for the next attempt. */
+  retryPrompt?: string;
 };
 
 /** Source terms that drift through the voice trace and manuscript. */
