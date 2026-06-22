@@ -4,10 +4,10 @@ use std::{
 };
 
 use agent_domain::{
-    AnswerEvaluation, ConceptStatus, CreateFileStudySet, CreatePasteStudySet,
-    LibraryNextReviewSummary, LibrarySessionRecapSummary, LibrarySessionSummary,
-    LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError, SessionConfig,
-    SessionTokenNonceClaim, StudyLibrarySnapshot, StudyMemoryStore, StudyQuestion,
+    AnswerAttemptEnvelope, AnswerEvaluation, ConceptStatus, CreateFileStudySet,
+    CreatePasteStudySet, LibraryNextReviewSummary, LibrarySessionRecapSummary,
+    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
+    SessionConfig, SessionTokenNonceClaim, StudyLibrarySnapshot, StudyMemoryStore, StudyQuestion,
     StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus, StudySourceReference,
     StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts, VoiceUsageRecord,
 };
@@ -424,6 +424,7 @@ impl PostgresStudyStore {
         user_id: &str,
         study_set_uuid: Uuid,
         voice_session_uuid: Uuid,
+        response_id: &str,
         evaluation: &AnswerEvaluation,
     ) -> Result<bool, PortError> {
         let source_span_uuid = Self::uuid_for(&evaluation.source.source_id)?;
@@ -435,16 +436,18 @@ impl PostgresStudyStore {
                 WHERE aa.voice_session_id = $1
                   AND vs.user_id = $2
                   AND vs.study_set_id = $3
-                  AND aa.question_id = $4
-                  AND aa.evaluation_label = $5
-                  AND aa.concept_status = $6
-                  AND ABS(aa.confidence_score - $7) <= 0.000001
-                  AND aa.source_span_id = $8
+                  AND aa.response_id = $4
+                  AND aa.question_id = $5
+                  AND aa.evaluation_label = $6
+                  AND aa.concept_status = $7
+                  AND ABS(aa.confidence_score - $8) <= 0.000001
+                  AND aa.source_span_id = $9
              )",
         )
         .bind(voice_session_uuid)
         .bind(user_id)
         .bind(study_set_uuid)
+        .bind(response_id)
         .bind(&evaluation.question_id)
         .bind(&evaluation.label)
         .bind(concept_status_str(&evaluation.concept_status))
@@ -1493,7 +1496,13 @@ impl StudyMemoryStore for PostgresStudyStore {
             ));
         }
         if !self
-            .answer_evaluation_was_recorded(user_id, study_set_uuid, voice_session_uuid, evaluation)
+            .answer_evaluation_was_recorded(
+                user_id,
+                study_set_uuid,
+                voice_session_uuid,
+                response_id,
+                evaluation,
+            )
             .await?
         {
             return Err(PortError::adapter(
@@ -1709,6 +1718,142 @@ impl StudyMemoryStore for PostgresStudyStore {
         Ok(())
     }
 
+    async fn record_answer_attempt_envelope(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        envelope: AnswerAttemptEnvelope,
+    ) -> Result<Value, PortError> {
+        envelope
+            .validate_fail_closed()
+            .map_err(|reason| PortError::adapter("postgres", reason))?;
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
+            .await?;
+        self.active_question_source(user_id, study_set_id, &envelope.question_id)
+            .await?;
+        let submission_sequence = i32::try_from(envelope.submission_sequence).map_err(|_| {
+            PortError::adapter(
+                "postgres",
+                "answer submission sequence exceeds postgres integer",
+            )
+        })?;
+        let byte_count = optional_u64_to_i64(envelope.byte_count, "answer byte count")?;
+        let char_count = optional_u64_to_i64(envelope.char_count, "answer char count")?;
+        let duration_ms = optional_u64_to_i64(envelope.duration_ms, "answer duration")?;
+
+        let inserted = sqlx::query(
+            "INSERT INTO answer_attempts (
+                id,
+                voice_session_id,
+                response_id,
+                question_id,
+                submission_sequence,
+                idempotency_key,
+                capture_mode,
+                byte_count,
+                char_count,
+                duration_ms,
+                client_generation_id,
+                locale,
+                capture_status,
+                answer_content_policy,
+                answer_digest_hmac,
+                transcript_status,
+                transcript_confidence_bucket,
+                pre_provider_state
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+             ON CONFLICT (voice_session_id, response_id) DO NOTHING",
+        )
+        .bind(Uuid::new_v4())
+        .bind(voice_session_uuid)
+        .bind(&envelope.response_id)
+        .bind(&envelope.question_id)
+        .bind(submission_sequence)
+        .bind(&envelope.idempotency_key)
+        .bind(envelope.capture_mode.as_str())
+        .bind(byte_count)
+        .bind(char_count)
+        .bind(duration_ms)
+        .bind(&envelope.client_generation_id)
+        .bind(&envelope.locale)
+        .bind(envelope.capture_status.as_str())
+        .bind(envelope.content_policy.as_str())
+        .bind(&envelope.answer_digest_hmac)
+        .bind(&envelope.transcript_status)
+        .bind(&envelope.transcript_confidence_bucket)
+        .bind(&envelope.pre_provider_state)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_error)?;
+        if inserted.rows_affected() == 0 {
+            let matches = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM answer_attempts
+                    WHERE voice_session_id = $1
+                      AND response_id = $2
+                      AND question_id = $3
+                      AND submission_sequence = $4
+                      AND idempotency_key = $5
+                      AND capture_mode = $6
+                      AND byte_count IS NOT DISTINCT FROM $7
+                      AND char_count IS NOT DISTINCT FROM $8
+                      AND duration_ms IS NOT DISTINCT FROM $9
+                      AND client_generation_id IS NOT DISTINCT FROM $10
+                      AND locale IS NOT DISTINCT FROM $11
+                      AND capture_status = $12
+                      AND answer_content_policy = $13
+                      AND answer_digest_hmac IS NOT DISTINCT FROM $14
+                      AND transcript_status IS NOT DISTINCT FROM $15
+                      AND transcript_confidence_bucket IS NOT DISTINCT FROM $16
+                      AND pre_provider_state = $17
+                )",
+            )
+            .bind(voice_session_uuid)
+            .bind(&envelope.response_id)
+            .bind(&envelope.question_id)
+            .bind(submission_sequence)
+            .bind(&envelope.idempotency_key)
+            .bind(envelope.capture_mode.as_str())
+            .bind(byte_count)
+            .bind(char_count)
+            .bind(duration_ms)
+            .bind(&envelope.client_generation_id)
+            .bind(&envelope.locale)
+            .bind(envelope.capture_status.as_str())
+            .bind(envelope.content_policy.as_str())
+            .bind(&envelope.answer_digest_hmac)
+            .bind(&envelope.transcript_status)
+            .bind(&envelope.transcript_confidence_bucket)
+            .bind(&envelope.pre_provider_state)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(pg_error)?;
+            if !matches {
+                return Err(PortError::adapter(
+                    "postgres",
+                    "answer attempt envelope cannot be changed",
+                ));
+            }
+        } else {
+            self.increment_count(WriteCountKind::AnswerAttempt)?;
+        }
+
+        Ok(json!({
+            "voice_session_id": voice_session_id,
+            "response_id": envelope.response_id,
+            "question_id": envelope.question_id,
+            "submission_sequence": envelope.submission_sequence,
+            "capture_mode": envelope.capture_mode.as_str(),
+            "capture_status": envelope.capture_status.as_str(),
+            "answer_content_policy": envelope.content_policy.as_str(),
+        }))
+    }
+
     async fn record_answer_evaluation(
         &self,
         user_id: &str,
@@ -1736,21 +1881,80 @@ impl StudyMemoryStore for PostgresStudyStore {
         self.ensure_active_question(study_set_uuid, &evaluation.question_id)
             .await?;
         let source_span_uuid = Self::uuid_for(&evaluation.source.source_id)?;
-        sqlx::query(
-            "INSERT INTO answer_attempts (id, voice_session_id, question_id, evaluation_label, concept_status, confidence_score, source_span_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        let updated = sqlx::query(
+            "UPDATE answer_attempts
+             SET evaluation_label = $1,
+                 concept_status = $2,
+                 confidence_score = $3,
+                 source_span_id = $4
+             WHERE voice_session_id = $5
+               AND response_id = $6
+               AND question_id = $7",
         )
-        .bind(Uuid::new_v4())
-        .bind(voice_session_uuid)
-        .bind(&evaluation.question_id)
         .bind(&evaluation.label)
         .bind(concept_status_str(&evaluation.concept_status))
         .bind(f64::from(evaluation.confidence_score))
         .bind(source_span_uuid)
+        .bind(voice_session_uuid)
+        .bind(response_id)
+        .bind(&evaluation.question_id)
         .execute(&self.pool)
         .await
         .map_err(pg_error)?;
-        self.increment_count(WriteCountKind::AnswerAttempt)?;
+        if updated.rows_affected() == 0 {
+            let existing_response = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(
+                    SELECT 1 FROM answer_attempts
+                    WHERE voice_session_id = $1 AND response_id = $2
+                )",
+            )
+            .bind(voice_session_uuid)
+            .bind(response_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(pg_error)?;
+            if existing_response {
+                return Err(PortError::adapter(
+                    "postgres",
+                    "answer evaluation question does not match persisted attempt envelope",
+                ));
+            }
+            sqlx::query(
+                "INSERT INTO answer_attempts (
+                    id,
+                    voice_session_id,
+                    response_id,
+                    question_id,
+                    submission_sequence,
+                    idempotency_key,
+                    capture_mode,
+                    capture_status,
+                    answer_content_policy,
+                    pre_provider_state,
+                    evaluation_label,
+                    concept_status,
+                    confidence_score,
+                    source_span_id
+                 )
+                 VALUES ($1, $2, $3, $4, 1, $5, 'typed', 'accepted', 'none', 'evaluation_only_compat', $6, $7, $8, $9)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(voice_session_uuid)
+            .bind(response_id)
+            .bind(&evaluation.question_id)
+            .bind(format!(
+                "{voice_session_id}:{}:1:{response_id}:compat",
+                evaluation.question_id
+            ))
+            .bind(&evaluation.label)
+            .bind(concept_status_str(&evaluation.concept_status))
+            .bind(f64::from(evaluation.confidence_score))
+            .bind(source_span_uuid)
+            .execute(&self.pool)
+            .await
+            .map_err(pg_error)?;
+            self.increment_count(WriteCountKind::AnswerAttempt)?;
+        }
         self.record_event_authorization(
             user_id,
             study_set_id,
@@ -2130,6 +2334,10 @@ fn source_confidence_str(confidence: &agent_domain::SourceConfidence) -> &'stati
 fn to_i64(value: u64, label: &str) -> Result<i64, PortError> {
     i64::try_from(value)
         .map_err(|_| PortError::adapter("postgres", format!("{label} exceeds BIGINT range")))
+}
+
+fn optional_u64_to_i64(value: Option<u64>, label: &str) -> Result<Option<i64>, PortError> {
+    value.map(|value| to_i64(value, label)).transpose()
 }
 
 fn pg_error(error: sqlx::Error) -> PortError {

@@ -4,11 +4,12 @@ use agent_adapters::cartesia_gemini::{
     SonicConfig, ThinkingLevel,
 };
 use agent_domain::{
-    AnswerEvaluation, AudioFrame, AuthorizedStudySession, BrainEvent, BrainInput, ConceptStatus,
-    ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent, ManuscriptRegister, PortError,
-    RealtimeBrain, RealtimeSession, SessionConfig, SessionId, StudyMemoryStore, StudyMode,
-    StudyQuestion, StudySessionRecap, StudySourceReference, StudyStoreCapabilities,
-    StudyStoreWriteCounts, ToolProposal, VivaToolExecutor, VoiceUsageRecord,
+    AnswerAttemptEnvelope, AnswerEvaluation, AudioFrame, AuthorizedStudySession, BrainEvent,
+    BrainInput, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent,
+    ManuscriptRegister, PortError, RealtimeBrain, RealtimeSession, SessionConfig, SessionId,
+    StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap, StudySourceReference,
+    StudyStoreCapabilities, StudyStoreWriteCounts, ToolProposal, VivaToolExecutor,
+    VoiceUsageRecord,
 };
 use serde_json::json;
 use std::sync::{Arc, Mutex};
@@ -417,14 +418,14 @@ async fn fake_runtime_open_cancel_aborts_active_tool_write_before_commit() {
         }
     }
     assert!(saw_cancel);
-    assert_eq!(inner_store.snapshot().answer_attempts.len(), 0);
+    assert_single_pending_attempt(&inner_store.snapshot(), "response-1");
 
     let _ = release_answer.send(());
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
     let snapshot = inner_store.snapshot();
-    assert_eq!(snapshot.answer_attempts.len(), 0);
+    assert_single_pending_attempt(&snapshot, "response-1");
     assert_eq!(snapshot.concept_statuses.len(), 0);
     assert_eq!(snapshot.review_items.len(), 0);
     assert_eq!(snapshot.recaps.len(), 0);
@@ -438,6 +439,54 @@ async fn fake_runtime_open_cancel_aborts_active_tool_write_before_commit() {
                 | BrainEvent::AudioDelta { .. }
                 | BrainEvent::RecapReady { .. }
         )));
+}
+
+#[tokio::test]
+async fn fake_runtime_records_attempt_envelope_before_evaluation_commit() {
+    let inner_store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let (store, answer_started, release_answer) = BlockingAnswerStore::new(inner_store.clone());
+    let runtime = FakeCartesiaGeminiRuntime::new(store);
+    let mut session = runtime.open(fixture_session_config()).await.unwrap();
+
+    assert!(matches!(
+        next_event(&mut session).await,
+        BrainEvent::SessionPhase {
+            phase: agent_domain::StudySessionPhase::Ready
+        }
+    ));
+    assert!(matches!(
+        next_event(&mut session).await,
+        BrainEvent::QuestionStarted { response_id, .. } if response_id == "response-1"
+    ));
+    session
+        .input
+        .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+            1_u8, 2, 3, 4,
+        ])))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut session).await,
+        BrainEvent::InputSpeechStarted
+    );
+    expect_fake_interim_delta(&mut session, "response-1").await;
+    expect_fake_final_transcript(&mut session, "response-1").await;
+    timeout(Duration::from_secs(2), answer_started)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let snapshot = inner_store.snapshot();
+    assert_eq!(
+        snapshot.answer_attempts.len(),
+        1,
+        "the privacy-safe answer attempt envelope must be durable before evaluation commits"
+    );
+    let persisted = serde_json::to_string(&snapshot.answer_attempts).unwrap();
+    assert!(!persisted.contains(FAKE_INK_FINAL_TRANSCRIPT));
+    assert!(!persisted.contains("(spoken answer)"));
+
+    let _ = release_answer.send(());
 }
 
 #[tokio::test]
@@ -617,7 +666,15 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
     assert!(saw_new_recap);
     let _ = release_answer.send(());
     let snapshot = inner_store.snapshot();
-    assert_eq!(snapshot.answer_attempts.len(), 1);
+    assert_eq!(snapshot.answer_attempts.len(), 2);
+    assert!(snapshot
+        .answer_attempts
+        .iter()
+        .any(|attempt| attempt.response_id == "response-1" && attempt.evaluation.is_none()));
+    assert!(snapshot
+        .answer_attempts
+        .iter()
+        .any(|attempt| attempt.response_id == "response-2" && attempt.evaluation.is_some()));
     assert_eq!(snapshot.concept_statuses.len(), 1);
     assert_eq!(snapshot.review_items.len(), 1);
     assert_eq!(snapshot.recaps.len(), 1);
@@ -791,7 +848,7 @@ async fn fake_runtime_cancel_during_gemini_tool_call_suppresses_tool_writes() {
         .events
         .iter()
         .all(|event| !matches!(event, BrainEvent::AnswerEvaluated { .. })));
-    assert_eq!(store.snapshot().answer_attempts.len(), 0);
+    assert_single_pending_attempt(&store.snapshot(), "fake-cartesia-gemini-response-1");
 }
 
 #[tokio::test]
@@ -885,7 +942,10 @@ async fn fake_runtime_session_cancel_during_gemini_tool_call_suppresses_tool_wri
         BrainEvent::ResponseCancelledFor { response_id }
             if response_id == "fake-cartesia-gemini-session-response-1"
     ));
-    assert_eq!(inner_store.snapshot().answer_attempts.len(), 0);
+    assert_single_pending_attempt(
+        &inner_store.snapshot(),
+        "fake-cartesia-gemini-session-response-1",
+    );
     assert!(remaining_events(&mut session)
         .await
         .iter()
@@ -897,7 +957,10 @@ async fn fake_runtime_session_cancel_during_gemini_tool_call_suppresses_tool_wri
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
-    assert_eq!(inner_store.snapshot().answer_attempts.len(), 0);
+    assert_single_pending_attempt(
+        &inner_store.snapshot(),
+        "fake-cartesia-gemini-session-response-1",
+    );
 }
 
 #[tokio::test]
@@ -1013,6 +1076,18 @@ fn fixture_session_config() -> SessionConfig {
     }
 }
 
+fn assert_single_pending_attempt(snapshot: &data::InMemoryStudyState, response_id: &str) {
+    assert_eq!(snapshot.answer_attempts.len(), 1);
+    let attempt = &snapshot.answer_attempts[0];
+    assert_eq!(attempt.response_id, response_id);
+    assert_eq!(attempt.envelope.response_id, response_id);
+    assert!(attempt.evaluation.is_none());
+    assert!(attempt.envelope.answer_digest_hmac.is_none());
+    let persisted = serde_json::to_string(&snapshot.answer_attempts).unwrap();
+    assert!(!persisted.contains(FAKE_INK_FINAL_TRANSCRIPT));
+    assert!(!persisted.contains("(spoken answer)"));
+}
+
 struct BlockingAnswerStore {
     inner: Arc<data::InMemoryStudyStore>,
     answer_started: Mutex<Option<oneshot::Sender<()>>>,
@@ -1065,6 +1140,18 @@ impl StudyMemoryStore for BlockingAnswerStore {
         study_set_id: &str,
     ) -> Result<Option<StudyQuestion>, PortError> {
         self.inner.active_question(user_id, study_set_id).await
+    }
+
+    async fn record_answer_attempt_envelope(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        envelope: AnswerAttemptEnvelope,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_attempt_envelope(user_id, study_set_id, voice_session_id, envelope)
+            .await
     }
 
     async fn record_answer_evaluation(

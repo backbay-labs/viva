@@ -46,6 +46,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0010_voice_session_token_nonces.sql",
         include_str!("../../../migrations/0010_voice_session_token_nonces.sql"),
     ),
+    (
+        "0011_answer_attempt_envelopes.sql",
+        include_str!("../../../migrations/0011_answer_attempt_envelopes.sql"),
+    ),
 ];
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
@@ -282,6 +286,10 @@ mod tests {
         assert!(sql.contains("CREATE TABLE source_spans"));
         assert!(sql.contains("question_id TEXT NOT NULL"));
         assert!(sql.contains("evaluation_label TEXT NOT NULL"));
+        assert!(sql.contains("response_id TEXT"));
+        assert!(sql.contains("answer_content_policy TEXT NOT NULL DEFAULT 'none'"));
+        assert!(sql.contains("ALTER COLUMN evaluation_label DROP NOT NULL"));
+        assert!(sql.contains("answer_attempts_voice_session_response_id_idx"));
         assert!(!sql.contains("answer_text TEXT"));
         assert!(!sql.contains("evaluation JSONB"));
         assert!(sql.contains("CREATE TABLE voice_usage_events"));

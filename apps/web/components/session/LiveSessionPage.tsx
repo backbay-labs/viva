@@ -338,9 +338,17 @@ export function LiveSessionPage() {
     } else {
       capturedTurnPcm16Ref.current = [];
     }
-    // Synthetic/no-mic sessions keep the deterministic text turn signal.
-    agentRef.current.sendText("(spoken answer)");
-  }, [onUserGesture]);
+    if (
+      spokenTurnFallbackAction({
+        websocketReady:
+          Boolean(agentRef.current.agentState.ready) && agentRef.current.status === "open",
+      }) === "open_text_answer"
+    ) {
+      activateTextAnswerMode();
+      setTextAnswerEnabled(true);
+      setTextRetryOpen(true);
+    }
+  }, [activateTextAnswerMode, onUserGesture]);
   const submitTextTurn = useCallback(
     (answer: string) => {
       const payload = textAnswerPayload(answer);
@@ -744,6 +752,12 @@ export function pcm16ChunksToBase64(chunks: readonly Uint8Array[]): string | nul
     offset += chunk.byteLength;
   }
   return pcm16LeBytesToBase64(merged);
+}
+
+export function spokenTurnFallbackAction(input: {
+  websocketReady: boolean;
+}): "open_text_answer" | "ignore" {
+  return input.websocketReady ? "open_text_answer" : "ignore";
 }
 
 export function textAnswerPayload(answer: string): string | null {

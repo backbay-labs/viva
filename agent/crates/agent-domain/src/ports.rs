@@ -57,6 +57,96 @@ pub struct StudyStoreWriteCounts {
     pub recaps: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerCaptureMode {
+    Audio,
+    Typed,
+}
+
+impl AnswerCaptureMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Typed => "typed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerCaptureStatus {
+    Accepted,
+}
+
+impl AnswerCaptureStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerContentPolicy {
+    None,
+    DigestOnly,
+}
+
+impl AnswerContentPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::DigestOnly => "digest_only",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AnswerAttemptEnvelope {
+    pub response_id: String,
+    pub question_id: String,
+    pub submission_sequence: u32,
+    pub idempotency_key: String,
+    pub capture_mode: AnswerCaptureMode,
+    pub byte_count: Option<u64>,
+    pub char_count: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub client_generation_id: Option<String>,
+    pub locale: Option<String>,
+    pub capture_status: AnswerCaptureStatus,
+    pub content_policy: AnswerContentPolicy,
+    pub answer_digest_hmac: Option<String>,
+    pub transcript_status: Option<String>,
+    pub transcript_confidence_bucket: Option<String>,
+    pub pre_provider_state: String,
+}
+
+impl AnswerAttemptEnvelope {
+    pub fn validate_fail_closed(&self) -> Result<(), &'static str> {
+        if self.response_id.trim().is_empty() {
+            return Err("answer attempt envelope is missing response_id");
+        }
+        if self.question_id.trim().is_empty() {
+            return Err("answer attempt envelope is missing question_id");
+        }
+        if self.submission_sequence == 0 {
+            return Err("answer attempt envelope is missing submission_sequence");
+        }
+        if self.idempotency_key.trim().is_empty() {
+            return Err("answer attempt envelope is missing idempotency_key");
+        }
+        if self.pre_provider_state.trim().is_empty() {
+            return Err("answer attempt envelope is missing pre_provider_state");
+        }
+        if self.content_policy == AnswerContentPolicy::None && self.answer_digest_hmac.is_some() {
+            return Err("answer digest requires digest_only content policy");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VoiceUsageRecord {
     pub voice_session_id: Option<String>,
@@ -477,6 +567,20 @@ pub trait StudyMemoryStore: Send + Sync {
             "study_store",
             response_id,
             "recap authorization is not implemented by this store",
+        ))
+    }
+
+    async fn record_answer_attempt_envelope(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        envelope: AnswerAttemptEnvelope,
+    ) -> Result<Value, PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            &envelope.response_id,
+            "answer attempt envelope recording is not implemented by this store",
         ))
     }
 

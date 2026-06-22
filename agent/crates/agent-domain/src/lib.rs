@@ -24,6 +24,7 @@ pub use brain::{
 };
 pub use ids::{CallId, SessionId, ToolName};
 pub use ports::{
+    AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
     CreateFileStudySet, CreatePasteStudySet, LibraryNextReviewSummary, LibrarySessionRecapSummary,
     LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
     SessionStore, SessionTokenNonceClaim, StudyConceptSummary, StudyDocumentSummary,
