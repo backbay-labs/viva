@@ -411,6 +411,15 @@ export function LiveSessionPage() {
     stopCaptureForRecap(captureRef, captureStartedRef, levelRef, capturedTurnPcm16Ref);
     agentRef.current.stop();
   }, []);
+  const cancelCheckingTurn = useCallback(() => {
+    setSourceOpen(false);
+    setHintShown(false);
+    setTextRetryOpen(false);
+    setSubmittedTextAnswer(undefined);
+    capturedTurnPcm16Ref.current = [];
+    levelRef.current.user = 0;
+    agentRef.current.cancel();
+  }, []);
 
   useEffect(() => {
     if (!agent.derived.recap) return;
@@ -579,6 +588,11 @@ export function LiveSessionPage() {
       glyphState={glyphStateFor(effectiveState)}
       highlightedTokens={highlightedTokens}
       hintShown={hintShown}
+      checkingControl={
+        effectiveState === "thinking" && websocketReady
+          ? { onCancelTurn: cancelCheckingTurn }
+          : undefined
+      }
       levelRef={levelRef}
       onBackToQuestion={() => setSourceOpen(false)}
       onChallengeSource={challengeSource}

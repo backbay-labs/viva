@@ -31,6 +31,22 @@ test("shows the live examiner status line only for a real, live question", () =>
   expect(live).toContain("Listening…");
 });
 
+test("renders thinking as staged progress copy instead of one frozen checking string", () => {
+  const markup = renderToStaticMarkup(
+    <QuestionStage
+      highlightedTokens={[]}
+      question={makeQuestion("Explain NADH.")}
+      state="thinking"
+    />,
+  );
+
+  expect(markup).toContain("question-stage__status");
+  expect(markup).not.toContain("Checking against your sources…");
+  expect(markup).toContain("Answer saved");
+  expect(markup).toContain("Checking sources");
+  expect(markup).toContain("Preparing feedback");
+});
+
 test("hides the live status line while warming up — never 'Listening…' under 'Connecting…'", () => {
   const markup = renderToStaticMarkup(
     <QuestionStage

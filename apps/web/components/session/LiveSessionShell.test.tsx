@@ -733,6 +733,31 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("--i:2");
   });
 
+  test("the thinking margin exposes bounded progress and a distinct cancel control", () => {
+    const markup = renderToStaticMarkup(
+      <MarginaliaPanel
+        checkingControl={{ onCancelTurn: noop }}
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={{ ...question, checklist: [] }}
+        runtime={runtime}
+        state="thinking"
+      />,
+    );
+
+    expect(markup).toContain('aria-label="Checking progress"');
+    expect(markup).toContain("Saved");
+    expect(markup).toContain("Checking");
+    expect(markup).toContain("Feedback");
+    expect(markup).toContain("Cancel this turn");
+    expect(markup).not.toContain("End session");
+  });
+
   test("flags a low-confidence voice transcription in the student-hand echo", () => {
     const base = {
       hintShown: false,
