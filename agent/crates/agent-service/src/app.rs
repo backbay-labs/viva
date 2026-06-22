@@ -42,6 +42,7 @@ pub struct AppState {
     pub ws_access: VoiceWsAccess,
     pub session_slots: Arc<Semaphore>,
     pub ws_timeouts: WsTimeouts,
+    pub turn_cap_override: bool,
     pub voice_limits: VoiceLimitConfig,
     pub limit_state: VoiceLimitState,
     pub drain_signal: VoiceDrainSignal,
@@ -84,6 +85,7 @@ impl AppState {
             ws_access,
             session_slots: Arc::new(Semaphore::new(max_sessions)),
             ws_timeouts: WsTimeouts::default(),
+            turn_cap_override: false,
             voice_limits: VoiceLimitConfig::default(),
             limit_state: VoiceLimitState::default(),
             drain_signal: VoiceDrainSignal::default(),
@@ -117,7 +119,13 @@ impl AppState {
     }
 
     pub fn with_ws_timeouts(mut self, ws_timeouts: WsTimeouts) -> Self {
+        self.turn_cap_override = ws_timeouts.idle != WsTimeouts::default().idle;
         self.ws_timeouts = ws_timeouts;
+        self
+    }
+
+    pub fn with_turn_cap_override(mut self, turn_cap_override: bool) -> Self {
+        self.turn_cap_override = turn_cap_override;
         self
     }
 
