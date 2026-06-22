@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
     })
     .with_turn_cap_override(config.max_turn_duration_overridden)
     .with_voice_limits(config.voice_limits)
+    .with_failure_control(config.failure_control)
     .with_unauthenticated_paste_allowed(config.bind_addr.ip().is_loopback());
     let drain_signal = state.drain_signal.clone();
     let app = build_router(state);

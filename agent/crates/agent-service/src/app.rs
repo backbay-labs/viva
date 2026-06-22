@@ -26,7 +26,10 @@ use tokio::sync::{watch, Semaphore};
 use uuid::Uuid;
 
 use crate::{
-    config::{bac_510_max_turn_duration, SessionTokenClaims, VoiceLimitConfig, VoiceWsAccess},
+    config::{
+        bac_510_max_turn_duration, FailureControlClaim, FailureControlClaimRequest,
+        FailureControlConfig, SessionTokenClaims, VoiceLimitConfig, VoiceWsAccess,
+    },
     ws::voice_ws,
 };
 
@@ -49,6 +52,7 @@ pub struct AppState {
     pub evidence: VoiceEvidenceRecorder,
     pub usage: VoiceUsageRecorder,
     pub unauthenticated_paste_allowed: bool,
+    pub failure_control: FailureControlConfig,
 }
 
 impl AppState {
@@ -92,6 +96,7 @@ impl AppState {
             evidence: VoiceEvidenceRecorder::default(),
             usage: VoiceUsageRecorder::default(),
             unauthenticated_paste_allowed: true,
+            failure_control: FailureControlConfig::default(),
         }
     }
 
@@ -136,6 +141,11 @@ impl AppState {
 
     pub fn with_unauthenticated_paste_allowed(mut self, allowed: bool) -> Self {
         self.unauthenticated_paste_allowed = allowed;
+        self
+    }
+
+    pub fn with_failure_control(mut self, failure_control: FailureControlConfig) -> Self {
+        self.failure_control = failure_control;
         self
     }
 
@@ -780,6 +790,7 @@ async fn library_snapshot(
             );
         }
     };
+    let request_origin = request_origin(&headers).map(ToOwned::to_owned);
     let study_sets = snapshot
         .study_sets
         .into_iter()
@@ -790,14 +801,24 @@ async fn library_snapshot(
                 Some(reason) => unavailable_action(reason),
                 None => {
                     let session_id = Uuid::new_v4().to_string();
-                    signed_library_action(&state, &study_set.user_id, &study_set.id, session_id)
+                    signed_library_action(
+                        &state,
+                        &study_set.user_id,
+                        &study_set.id,
+                        session_id,
+                        request_origin.as_deref(),
+                    )
                 }
             };
             let resume = match (unavailable_reason, study_set.open_session_id.clone()) {
                 (Some(reason), _) => unavailable_action(reason),
-                (None, Some(session_id)) => {
-                    signed_library_action(&state, &study_set.user_id, &study_set.id, session_id)
-                }
+                (None, Some(session_id)) => signed_library_action(
+                    &state,
+                    &study_set.user_id,
+                    &study_set.id,
+                    session_id,
+                    request_origin.as_deref(),
+                ),
                 (None, None) => unavailable_action("no_open_session"),
             };
             let mutation_auth_unavailable_reason =
@@ -1045,7 +1066,7 @@ async fn create_paste_study_set(
             );
         }
     };
-    if let Err(error) = attach_ready_session_token(&state, &mut record) {
+    if let Err(error) = attach_ready_session_token(&state, &mut record, request_origin(&headers)) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             response_headers,
@@ -1152,7 +1173,7 @@ async fn create_file_study_set(
             );
         }
     };
-    if let Err(error) = attach_ready_session_token(&state, &mut record) {
+    if let Err(error) = attach_ready_session_token(&state, &mut record, request_origin(&headers)) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             response_headers,
@@ -1222,7 +1243,7 @@ async fn retry_file_study_set(
         Ok(record) => record,
         Err(error) => return store_json_error(response_headers, error, "file_retry_failed"),
     };
-    if let Err(error) = attach_ready_session_token(&state, &mut record) {
+    if let Err(error) = attach_ready_session_token(&state, &mut record, request_origin(&headers)) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             response_headers,
@@ -1249,10 +1270,11 @@ async fn retry_file_study_set(
 fn attach_ready_session_token(
     state: &AppState,
     record: &mut StudySetIngestionRecord,
+    origin: Option<&str>,
 ) -> Result<(), crate::config::SessionTokenError> {
     if record.study_set.ingestion_status == StudySetIngestionStatus::Ready {
         if let Some(secret) = state.ws_access.session_token_secret.as_deref() {
-            record.session_token = Some(signed_session_token(record, secret)?);
+            record.session_token = Some(signed_session_token(record, secret, state, origin)?);
         }
     }
     Ok(())
@@ -1305,11 +1327,18 @@ fn signed_library_action(
     user_id: &str,
     study_set_id: &str,
     session_id: String,
+    origin: Option<&str>,
 ) -> LibraryAction {
     let Some(secret) = state.ws_access.session_token_secret.as_deref() else {
         return unavailable_action("session_token_unavailable");
     };
-    let Ok(session_token) = signed_session_token_for(user_id, study_set_id, &session_id, secret)
+    let Ok(failure_control) =
+        failure_control_claim_for(state, user_id, study_set_id, &session_id, origin)
+    else {
+        return unavailable_action("session_token_unavailable");
+    };
+    let Ok(session_token) =
+        signed_session_token_for(user_id, study_set_id, &session_id, secret, failure_control)
     else {
         return unavailable_action("session_token_unavailable");
     };
@@ -1329,6 +1358,7 @@ fn signed_library_control_token(state: &AppState, user_id: &str) -> Option<Strin
         "__library_control__",
         &Uuid::new_v4().to_string(),
         secret,
+        None,
     )
     .ok()
 }
@@ -1336,12 +1366,22 @@ fn signed_library_control_token(state: &AppState, user_id: &str) -> Option<Strin
 fn signed_session_token(
     record: &StudySetIngestionRecord,
     secret: &str,
+    state: &AppState,
+    origin: Option<&str>,
 ) -> Result<String, crate::config::SessionTokenError> {
+    let failure_control = failure_control_claim_for(
+        state,
+        &record.study_set.user_id,
+        &record.study_set.id,
+        &record.session_id,
+        origin,
+    )?;
     signed_session_token_for(
         &record.study_set.user_id,
         &record.study_set.id,
         &record.session_id,
         secret,
+        failure_control,
     )
 }
 
@@ -1350,6 +1390,7 @@ fn signed_session_token_for(
     study_set_id: &str,
     session_id: &str,
     secret: &str,
+    failure_control: Option<FailureControlClaim>,
 ) -> Result<String, crate::config::SessionTokenError> {
     let expires_at = unix_timestamp_now().unwrap_or(0) + 15 * 60;
     SessionTokenClaims {
@@ -1358,8 +1399,52 @@ fn signed_session_token_for(
         session_id: session_id.to_owned(),
         expires_at,
         nonce: Uuid::new_v4().to_string(),
+        failure_control,
     }
     .sign(secret)
+}
+
+fn failure_control_claim_for(
+    state: &AppState,
+    user_id: &str,
+    study_set_id: &str,
+    session_id: &str,
+    origin: Option<&str>,
+) -> Result<Option<FailureControlClaim>, crate::config::SessionTokenError> {
+    if !state.failure_control.enabled() {
+        return Ok(None);
+    }
+    let Some(origin) = origin.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if !state
+        .failure_control
+        .allows_identity(user_id, study_set_id, origin)
+    {
+        return Ok(None);
+    }
+    let now = unix_timestamp_now()?;
+    let run_id = Uuid::new_v4().to_string();
+    let nonce = Uuid::new_v4().to_string();
+    Ok(Some(state.failure_control.signed_claim_for(
+        FailureControlClaimRequest {
+            user_id,
+            study_set_id,
+            session_id,
+            origin,
+            run_id: &run_id,
+            now,
+            nonce: &nonce,
+        },
+    )?))
+}
+
+fn request_origin(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn unix_timestamp_now() -> Result<u64, crate::config::SessionTokenError> {

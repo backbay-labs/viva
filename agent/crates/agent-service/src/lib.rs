@@ -9,8 +9,8 @@ pub use app::{
     build_router, AppState, VoiceDrainSignal, VoiceEvidenceRecorder, VoiceUsageRecorder, WsTimeouts,
 };
 pub use config::{
-    build_brain, build_study_store, RealtimeProvider, ServiceConfig, ServiceConfigError,
-    VoiceLimitConfig, VoiceWsAccess,
+    build_brain, build_study_store, FailureControlConfig, FailureControlScenario, RealtimeProvider,
+    ServiceConfig, ServiceConfigError, VoiceLimitConfig, VoiceWsAccess,
 };
 pub use protocol::{
     ClientFrame, ReadyFrame, ServerFrame, VivaServerEvent, VIVA_VOICE_INPUT_ENCODING,

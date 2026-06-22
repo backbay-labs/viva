@@ -17,6 +17,10 @@ import {
   normalizeBrowserEvidence,
   shouldSkipMissingBrowserResult,
 } from "./browser-evidence.mjs";
+import {
+  buildFailureControlPlan,
+  failureControlHarnessEvidence,
+} from "./failure-control-harness.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactDir = path.resolve(
@@ -35,12 +39,21 @@ await rm(artifactDir, { recursive: true, force: true });
 await mkdir(artifactDir, { recursive: true });
 
 try {
+  const failureControlPlan = buildFailureControlPlan();
+  const failureControlEvidence = failureControlHarnessEvidence(failureControlPlan);
+  if (failureControlPlan.enabled) {
+    throw new Error("failure-control harness must be disabled for release evidence generation");
+  }
   await run("generated_artifact_hygiene", "bun", ["run", "release:hygiene"]);
   await run("provider_readiness_matrix_unit_tests", "node", [
     "--test",
     "scripts/provider-readiness-matrix.test.mjs",
   ]);
   await run("browser_evidence_unit_tests", "node", ["--test", "scripts/browser-evidence.test.mjs"]);
+  await run("failure_control_harness_unit_tests", "node", [
+    "--test",
+    "scripts/failure-control-harness.test.mjs",
+  ]);
   await run("provider_gate_tests", "cargo", [
     "test",
     "--manifest-path",
@@ -87,6 +100,7 @@ try {
     commands,
     fixture_hashes: fixtureHashes,
     provider_readiness: providerReadiness,
+    failure_control_harness: failureControlEvidence,
     browser_e2e: browserResult,
     artifact_audit: artifactAudit,
     release_bundle: buildReleaseBundleManifest(outputPath, commands, browserResult),
