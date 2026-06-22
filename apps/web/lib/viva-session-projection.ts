@@ -849,7 +849,7 @@ export function projectSessionQuestion(
   now: Date,
 ): Question {
   if (derived.recap) return recapClosingQuestion(derived.recap);
-  const terminalWithoutRecap = derived.phase === "recap" && Boolean(derived.terminalReason);
+  const terminalWithoutRecap = terminalReasonWithoutRecap(derived);
   if (terminalWithoutRecap) {
     return {
       ...EMPTY_QUESTION,
@@ -1034,14 +1034,20 @@ export function projectTrace(
   status: VivaAgentConnectionStatus,
   now: Date,
 ): TraceProjection {
-  const terminalWithoutRecap =
-    derived.phase === "recap" && Boolean(derived.terminalReason) && !derived.recap;
+  const terminalWithoutRecap = terminalReasonWithoutRecap(derived);
   const hasAgentQuestion = Boolean(derived.question) && !terminalWithoutRecap;
-  const state = derived.recap ? "recap" : projectSessionState(derived.phase, hasAgentQuestion);
+  const state =
+    derived.recap || terminalWithoutRecap
+      ? "recap"
+      : projectSessionState(derived.phase, hasAgentQuestion);
   return {
     state,
     question: projectSessionQuestion(derived, status, now),
     highlightedTokens: terminalWithoutRecap ? [] : projectHighlightedTokens(state, derived),
     hasAgentQuestion,
   };
+}
+
+function terminalReasonWithoutRecap(derived: VivaAgentDerivedState): boolean {
+  return Boolean(derived.terminalReason) && !derived.recap;
 }
