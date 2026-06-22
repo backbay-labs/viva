@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use tokio::{sync::mpsc, task::AbortHandle};
 
 use agent_domain::{
+    AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
     AnswerEvaluation, AudioFrame, AuthorizedStudySession, BrainError, BrainEvent, BrainInput,
     BrainUsage, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent,
     ManuscriptRegister, RealtimeSession, RealtimeSessionTaskGuard, SessionConfig, StudyMemoryStore,
@@ -122,6 +123,7 @@ where
                                 .send(BrainEvent::ResponseCancelledFor { response_id })
                                 .await;
                         }
+                        let submission_sequence = turn as u32;
                         let response_id = format!("response-{turn}");
                         turn += 1;
                         active_response = Some(runner.spawn_turn(
@@ -131,6 +133,7 @@ where
                                 session: session.clone(),
                                 question: question.clone(),
                                 response_id: response_id.clone(),
+                                submission_sequence,
                                 input: RunnerInput::Audio(frame),
                                 confidence: Some(0.91),
                                 cancelled: Arc::new(AtomicBool::new(false)),
@@ -147,6 +150,7 @@ where
                                 .send(BrainEvent::ResponseCancelledFor { response_id })
                                 .await;
                         }
+                        let submission_sequence = turn as u32;
                         let response_id = format!("response-{turn}");
                         turn += 1;
                         active_response = Some(runner.spawn_turn(
@@ -156,6 +160,7 @@ where
                                 session: session.clone(),
                                 question: question.clone(),
                                 response_id: response_id.clone(),
+                                submission_sequence,
                                 input: RunnerInput::Text(text),
                                 confidence: Some(1.0),
                                 cancelled: Arc::new(AtomicBool::new(false)),
@@ -219,6 +224,16 @@ where
         let executor = VivaToolExecutor::new(store, session.clone());
         let question = select_next_question(&executor, &session).await?;
         let response_id = "fake-cartesia-gemini-response-1".to_owned();
+        executor
+            .record_answer_attempt_envelope(answer_attempt_envelope(
+                &session,
+                &question,
+                &response_id,
+                1,
+                &RunnerInput::Audio(frame.clone()),
+            ))
+            .await
+            .map_err(|error| BrainError::Protocol(error.to_string()))?;
         let transcript = self
             .transports
             .transcribe_audio(&self.config, &response_id, &frame)
@@ -309,6 +324,20 @@ where
     }
 
     async fn emit_turn(&self, job: RunnerTurnJob) {
+        if let Err(error) = job
+            .executor
+            .record_answer_attempt_envelope(answer_attempt_envelope(
+                &job.session,
+                &job.question,
+                &job.response_id,
+                job.submission_sequence,
+                &job.input,
+            ))
+            .await
+        {
+            emit_fake_provider_error(&job.event_tx, error.to_string()).await;
+            return;
+        }
         if !send_fake_unless_cancelled(
             &job.event_tx,
             BrainEvent::InputSpeechStarted,
@@ -758,10 +787,55 @@ pub(crate) struct RunnerTurnJob {
     pub(crate) session: AuthorizedStudySession,
     pub(crate) question: StudyQuestion,
     pub(crate) response_id: String,
+    pub(crate) submission_sequence: u32,
     pub(crate) input: RunnerInput,
     pub(crate) confidence: Option<f32>,
     pub(crate) cancelled: Arc<AtomicBool>,
     pub(crate) completed: Arc<AtomicBool>,
+}
+
+pub(crate) fn answer_attempt_envelope(
+    session: &AuthorizedStudySession,
+    question: &StudyQuestion,
+    response_id: &str,
+    submission_sequence: u32,
+    input: &RunnerInput,
+) -> AnswerAttemptEnvelope {
+    let (capture_mode, byte_count, char_count, pre_provider_state) = match input {
+        RunnerInput::Audio(frame) => (
+            AnswerCaptureMode::Audio,
+            Some(audio_frame_bytes(frame).len() as u64),
+            None,
+            "before_ink_stt",
+        ),
+        RunnerInput::Text(text) => (
+            AnswerCaptureMode::Typed,
+            Some(text.len() as u64),
+            Some(text.chars().count() as u64),
+            "before_text_evaluation",
+        ),
+    };
+    AnswerAttemptEnvelope {
+        response_id: response_id.to_owned(),
+        question_id: question.question_id.clone(),
+        submission_sequence,
+        idempotency_key: format!(
+            "{}:{}:{submission_sequence}:{response_id}",
+            session.voice_session_id, question.question_id
+        ),
+        capture_mode,
+        byte_count,
+        char_count,
+        duration_ms: None,
+        client_generation_id: None,
+        locale: None,
+        capture_status: AnswerCaptureStatus::Accepted,
+        content_policy: AnswerContentPolicy::None,
+        answer_digest_hmac: None,
+        transcript_status: None,
+        transcript_confidence_bucket: None,
+        pre_provider_state: pre_provider_state.to_owned(),
+    }
 }
 
 struct GeminiToolLoopJob<'a> {

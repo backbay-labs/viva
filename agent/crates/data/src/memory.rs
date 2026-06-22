@@ -5,6 +5,7 @@ use std::{
 };
 
 use agent_domain::{
+    AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
     AnswerEvaluation, ConceptStatus, CreateFileStudySet, CreatePasteStudySet,
     LibraryNextReviewSummary, LibrarySessionRecapSummary, LibrarySessionSummary,
     LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError, SessionConfig, SessionStore,
@@ -224,11 +225,57 @@ impl From<&AnswerEvaluation> for PersistedAnswerEvaluation {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PersistedAnswerAttemptEnvelope {
+    pub response_id: String,
+    pub question_id: String,
+    pub submission_sequence: u32,
+    pub idempotency_key: String,
+    pub capture_mode: AnswerCaptureMode,
+    pub byte_count: Option<u64>,
+    pub char_count: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub client_generation_id: Option<String>,
+    pub locale: Option<String>,
+    pub capture_status: AnswerCaptureStatus,
+    pub content_policy: AnswerContentPolicy,
+    pub answer_digest_hmac: Option<String>,
+    pub transcript_status: Option<String>,
+    pub transcript_confidence_bucket: Option<String>,
+    pub pre_provider_state: String,
+}
+
+impl From<&AnswerAttemptEnvelope> for PersistedAnswerAttemptEnvelope {
+    fn from(envelope: &AnswerAttemptEnvelope) -> Self {
+        Self {
+            response_id: envelope.response_id.clone(),
+            question_id: envelope.question_id.clone(),
+            submission_sequence: envelope.submission_sequence,
+            idempotency_key: envelope.idempotency_key.clone(),
+            capture_mode: envelope.capture_mode,
+            byte_count: envelope.byte_count,
+            char_count: envelope.char_count,
+            duration_ms: envelope.duration_ms,
+            client_generation_id: envelope.client_generation_id.clone(),
+            locale: envelope.locale.clone(),
+            capture_status: envelope.capture_status,
+            content_policy: envelope.content_policy,
+            answer_digest_hmac: envelope.answer_digest_hmac.clone(),
+            transcript_status: envelope.transcript_status.clone(),
+            transcript_confidence_bucket: envelope.transcript_confidence_bucket.clone(),
+            pre_provider_state: envelope.pre_provider_state.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AnswerAttemptRecord {
     pub user_id: String,
+    pub study_set_id: String,
     pub voice_session_id: String,
-    pub evaluation: PersistedAnswerEvaluation,
+    pub response_id: String,
+    pub envelope: PersistedAnswerAttemptEnvelope,
+    pub evaluation: Option<PersistedAnswerEvaluation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2435,8 +2482,10 @@ impl StudyMemoryStore for InMemoryStudyStore {
         let persisted = PersistedAnswerEvaluation::from(evaluation);
         if !state.answer_attempts.iter().any(|record| {
             record.user_id == user_id
+                && record.study_set_id == study_set_id
                 && record.voice_session_id == voice_session_id
-                && record.evaluation == persisted
+                && record.response_id == response_id
+                && record.evaluation.as_ref() == Some(&persisted)
         }) {
             return Err(PortError::adapter(
                 "memory",
@@ -2669,6 +2718,59 @@ impl StudyMemoryStore for InMemoryStudyStore {
         Ok(())
     }
 
+    async fn record_answer_attempt_envelope(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        envelope: AnswerAttemptEnvelope,
+    ) -> Result<Value, PortError> {
+        envelope
+            .validate_fail_closed()
+            .map_err(|reason| PortError::adapter("memory", reason))?;
+        {
+            let state = self
+                .inner
+                .read()
+                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+            Self::active_question_source_locked(study_set, &state, user_id, &envelope.question_id)?;
+        }
+        let persisted = PersistedAnswerAttemptEnvelope::from(&envelope);
+        let record = AnswerAttemptRecord {
+            user_id: user_id.to_owned(),
+            study_set_id: study_set_id.to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            response_id: envelope.response_id.clone(),
+            envelope: persisted,
+            evaluation: None,
+        };
+        let result = serde_json::to_value(&record)
+            .map_err(|error| PortError::adapter("memory", error.to_string()))?;
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        if let Some(existing) = state.answer_attempts.iter_mut().find(|existing| {
+            existing.user_id == user_id
+                && existing.study_set_id == study_set_id
+                && existing.voice_session_id == voice_session_id
+                && existing.response_id == envelope.response_id
+        }) {
+            if existing.envelope != record.envelope {
+                return Err(PortError::adapter(
+                    "memory",
+                    "answer attempt envelope cannot be changed",
+                ));
+            }
+            return serde_json::to_value(existing)
+                .map_err(|error| PortError::adapter("memory", error.to_string()));
+        }
+        state.answer_attempts.push(record);
+        Ok(result)
+    }
+
     async fn record_answer_evaluation(
         &self,
         user_id: &str,
@@ -2695,11 +2797,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 "answer evaluation source tuple does not match active question source",
             ));
         }
-        let record = AnswerAttemptRecord {
-            user_id: user_id.to_owned(),
-            voice_session_id: voice_session_id.to_owned(),
-            evaluation: PersistedAnswerEvaluation::from(&evaluation),
-        };
+        let persisted_evaluation = PersistedAnswerEvaluation::from(&evaluation);
         let authorization = event_authorization_record(
             user_id,
             study_set_id,
@@ -2708,13 +2806,59 @@ impl StudyMemoryStore for InMemoryStudyStore {
             EventAuthorizationKind::AnswerEvaluation,
             &evaluation,
         )?;
-        let result = serde_json::to_value(&record)
-            .map_err(|error| PortError::adapter("memory", error.to_string()))?;
         let mut state = self
             .inner
             .write()
             .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-        state.answer_attempts.push(record);
+        let result = if let Some(existing) = state.answer_attempts.iter_mut().find(|record| {
+            record.user_id == user_id
+                && record.study_set_id == study_set_id
+                && record.voice_session_id == voice_session_id
+                && record.response_id == response_id
+        }) {
+            if existing.envelope.question_id != evaluation.question_id {
+                return Err(PortError::adapter(
+                    "memory",
+                    "answer evaluation question does not match attempt envelope",
+                ));
+            }
+            existing.evaluation = Some(persisted_evaluation);
+            serde_json::to_value(existing)
+                .map_err(|error| PortError::adapter("memory", error.to_string()))?
+        } else {
+            let record = AnswerAttemptRecord {
+                user_id: user_id.to_owned(),
+                study_set_id: study_set_id.to_owned(),
+                voice_session_id: voice_session_id.to_owned(),
+                response_id: response_id.to_owned(),
+                envelope: PersistedAnswerAttemptEnvelope {
+                    response_id: response_id.to_owned(),
+                    question_id: evaluation.question_id.clone(),
+                    submission_sequence: 1,
+                    idempotency_key: format!(
+                        "{voice_session_id}:{}:1:{response_id}:compat",
+                        evaluation.question_id
+                    ),
+                    capture_mode: AnswerCaptureMode::Typed,
+                    byte_count: None,
+                    char_count: None,
+                    duration_ms: None,
+                    client_generation_id: None,
+                    locale: None,
+                    capture_status: AnswerCaptureStatus::Accepted,
+                    content_policy: AnswerContentPolicy::None,
+                    answer_digest_hmac: None,
+                    transcript_status: None,
+                    transcript_confidence_bucket: None,
+                    pre_provider_state: "evaluation_only_compat".to_owned(),
+                },
+                evaluation: Some(persisted_evaluation),
+            };
+            let result = serde_json::to_value(&record)
+                .map_err(|error| PortError::adapter("memory", error.to_string()))?;
+            state.answer_attempts.push(record);
+            result
+        };
         state.event_authorizations.push(authorization);
         Ok(result)
     }

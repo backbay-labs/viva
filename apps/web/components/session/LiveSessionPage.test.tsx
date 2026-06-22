@@ -15,6 +15,7 @@ import {
   pcm16ChunksToBase64,
   shouldStopReadinessPolling,
   shouldUseLiveMicAudioTransport,
+  spokenTurnFallbackAction,
   stopCaptureForRecap,
   textAnswerPayload,
 } from "./LiveSessionPage";
@@ -225,6 +226,11 @@ describe("LiveSessionPage recap cleanup", () => {
   test("merges buffered worklet PCM chunks into one live audio turn", () => {
     expect(pcm16ChunksToBase64([])).toBe(null);
     expect(pcm16ChunksToBase64([new Uint8Array([1, 2]), new Uint8Array([3, 4])])).toBe("AQIDBA==");
+  });
+
+  test("opens typed answer mode instead of synthesizing a spoken-answer placeholder", () => {
+    expect(spokenTurnFallbackAction({ websocketReady: true })).toBe("open_text_answer");
+    expect(spokenTurnFallbackAction({ websocketReady: false })).toBe("ignore");
   });
 
   test("uses worklet-computed RMS for the user bloom while reduced motion keeps it at floor", () => {

@@ -3,8 +3,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::{
-    ConceptStatus, PortError, RecapSourceMoment, SessionConfig, StudyMemoryStore, StudyMode,
-    StudyQuestion, StudySessionRecap, StudySourceReference, ToolProposal, ToolResult,
+    AnswerAttemptEnvelope, ConceptStatus, PortError, RecapSourceMoment, SessionConfig,
+    StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap, StudySourceReference,
+    ToolProposal, ToolResult,
 };
 
 #[derive(Clone)]
@@ -60,6 +61,21 @@ impl VivaToolExecutor {
             }
         };
         Ok(ToolResult { proposal, result })
+    }
+
+    pub async fn record_answer_attempt_envelope(
+        &self,
+        envelope: AnswerAttemptEnvelope,
+    ) -> Result<Value, ToolExecutionError> {
+        self.store
+            .record_answer_attempt_envelope(
+                &self.session.user_id,
+                &self.session.study_set_id,
+                &self.session.voice_session_id,
+                envelope,
+            )
+            .await
+            .map_err(ToolExecutionError::from)
     }
 
     async fn select_next_question(&self) -> Result<Value, ToolExecutionError> {

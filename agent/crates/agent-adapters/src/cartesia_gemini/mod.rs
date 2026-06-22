@@ -32,7 +32,10 @@ pub use llm::{
 pub use stt::{audio_frame_bytes, parse_ink_event, InkConfig, InkEvent};
 pub use tts::{parse_sonic_event, sonic_generation_request, SonicConfig, SonicEvent};
 
-use runner::{CartesiaGeminiRunner, FakeCartesiaGeminiTransports, LiveCartesiaGeminiTransports};
+use runner::{
+    answer_attempt_envelope, CartesiaGeminiRunner, FakeCartesiaGeminiTransports,
+    LiveCartesiaGeminiTransports, RunnerInput,
+};
 
 pub(crate) const FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT: &str =
     "NADH donates electrons to the electron transport chain.";
@@ -301,13 +304,38 @@ impl FakeCartesiaGeminiRuntime {
         let (event_tx, events) = mpsc::channel::<BrainEvent>(32);
         let task = tokio::spawn(async move {
             while let Some(input) = input_rx.recv().await {
-                let final_transcript = match input {
-                    BrainInput::Audio(_) => FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT.to_owned(),
-                    BrainInput::Text(text) => text,
+                let runner_input = match input {
+                    BrainInput::Audio(frame) => RunnerInput::Audio(frame),
+                    BrainInput::Text(text) => RunnerInput::Text(text),
                     BrainInput::Stop => break,
                     _ => continue,
                 };
                 let response_id = "fake-cartesia-gemini-session-response-1".to_owned();
+                let executor = VivaToolExecutor::new(store.clone(), session.clone());
+                let question = match select_next_question(&executor, &session).await {
+                    Ok(question) => question,
+                    Err(error) => {
+                        emit_fake_provider_error(&event_tx, error.to_string()).await;
+                        break;
+                    }
+                };
+                if let Err(error) = executor
+                    .record_answer_attempt_envelope(answer_attempt_envelope(
+                        &session,
+                        &question,
+                        &response_id,
+                        1,
+                        &runner_input,
+                    ))
+                    .await
+                {
+                    emit_fake_provider_error(&event_tx, error.to_string()).await;
+                    break;
+                }
+                let final_transcript = match runner_input {
+                    RunnerInput::Audio(_) => FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT.to_owned(),
+                    RunnerInput::Text(text) => text,
+                };
                 let _ = event_tx.send(BrainEvent::InputSpeechStarted).await;
                 let _ = event_tx
                     .send(BrainEvent::TranscriptFinal {
@@ -319,7 +347,6 @@ impl FakeCartesiaGeminiRuntime {
 
                 match scenario {
                     FakeSessionScenario::CancelDuringGeminiToolCall => {
-                        let executor = VivaToolExecutor::new(store.clone(), session.clone());
                         let args = json!({
                             "study_set_id": session.study_set_id.clone(),
                             "voice_session_id": session.voice_session_id.clone(),
@@ -363,7 +390,6 @@ impl FakeCartesiaGeminiRuntime {
                         }
                     }
                     FakeSessionScenario::BargeInDuringSonicAudio => {
-                        let executor = VivaToolExecutor::new(store.clone(), session.clone());
                         let args = json!({
                             "study_set_id": session.study_set_id.clone(),
                             "voice_session_id": session.voice_session_id.clone(),
