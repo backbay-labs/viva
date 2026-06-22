@@ -434,7 +434,7 @@ describe("Viva agent browser client", () => {
     expect(nextQuestion.transcriptConfidence).toBeUndefined();
   });
 
-  test("reducer records controlled terminal phase reasons without inventing a recap", () => {
+  test("reducer records controlled terminal phase reasons as authoritative recap state without inventing a recap", () => {
     const state = vivaAgentReducer(
       initialVivaAgentSessionState(),
       parseVivaServerFrame({
@@ -448,7 +448,7 @@ describe("Viva agent browser client", () => {
       }),
     );
 
-    expect(state.phase).toBe("ready");
+    expect(state.phase).toBe("recap");
     expect(state.recap).toBeUndefined();
     expect(state.terminalReason).toBe("drained");
   });

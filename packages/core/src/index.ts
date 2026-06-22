@@ -1,4 +1,5 @@
 export * from "./agent-contract";
+export * from "./learner-loop-contract";
 export * from "./scheduling";
 
 export type StudyMode = "quiz" | "teach" | "mock" | "cram";

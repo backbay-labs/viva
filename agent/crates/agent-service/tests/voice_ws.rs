@@ -3139,6 +3139,10 @@ async fn websocket_turn_cap_emits_terminal_phase_before_close() {
         ))
         .await
         .unwrap();
+    socket
+        .send(WsMessage::Binary(Vec::new().into()))
+        .await
+        .unwrap();
     let _ = read_server_frame(&mut socket).await;
     let _ = read_server_frame(&mut socket).await;
 
@@ -3156,6 +3160,471 @@ async fn websocket_turn_cap_emits_terminal_phase_before_close() {
             && event.detail
                 == "sessions=1 answer_attempts=0 concept_statuses=0 review_items=0 recaps=0"
     }));
+}
+
+#[tokio::test]
+async fn websocket_turn_cap_waits_for_answer_frame() {
+    let state = test_state(1).with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(200),
+        session: Duration::from_secs(5),
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+
+    let pre_answer_turn_cap = tokio::time::timeout(Duration::from_millis(60), async {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                WsMessage::Text(text) => {
+                    let frame = serde_json::from_str::<ServerFrame>(&text).unwrap();
+                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                        return frame;
+                    }
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
+                other => panic!("unexpected close before answer frame: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        pre_answer_turn_cap.is_err(),
+        "turn cap fired before an answer-bearing frame"
+    );
+
+    socket
+        .send(WsMessage::Binary(Vec::new().into()))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::TurnCap,
+    );
+}
+
+#[tokio::test]
+async fn websocket_post_config_idle_timeout_closes_without_answer_frame() {
+    let state = test_state(1).with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(25),
+        session: Duration::from_secs(5),
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                WsMessage::Text(text) => {
+                    let frame = serde_json::from_str::<ServerFrame>(&text).unwrap();
+                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                        return frame;
+                    }
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
+                other => panic!("expected pre-answer idle timeout, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("post-config idle socket remained open without an answer frame");
+
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
+}
+
+#[tokio::test]
+async fn websocket_turn_cap_disarms_after_answer_resolution() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(AnswerResolutionProbeBrain),
+        "answer_resolution_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(25),
+        session: Duration::from_secs(5),
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "answer_resolution_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(Vec::new().into()))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = read_server_frame(&mut socket).await;
+            if matches!(
+                &frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(
+                        event.as_ref(),
+                        VivaServerEvent::SessionPhase {
+                            phase: agent_domain::StudySessionPhase::Feedback,
+                            terminal_reason: None,
+                        }
+                    )
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("answer evaluation should arrive before the turn cap");
+
+    let post_resolution_turn_cap = tokio::time::timeout(Duration::from_millis(60), async {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                WsMessage::Text(text) => {
+                    let frame = serde_json::from_str::<ServerFrame>(&text).unwrap();
+                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                        return frame;
+                    }
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
+                other => panic!("unexpected close after answer resolution: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        post_resolution_turn_cap.is_err(),
+        "turn cap fired after the submitted answer resolved"
+    );
+}
+
+#[tokio::test]
+async fn websocket_turn_cap_stays_armed_for_newer_submission_after_one_resolution() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(DelayedSingleResolutionProbeBrain),
+        "delayed_single_resolution_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(40),
+        session: Duration::from_secs(5),
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "delayed_single_resolution_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![1_u8, 2].into()))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![3_u8, 4].into()))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = read_server_frame(&mut socket).await;
+            if matches!(
+                &frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(
+                        event.as_ref(),
+                        VivaServerEvent::SessionPhase {
+                            phase: agent_domain::StudySessionPhase::Feedback,
+                            terminal_reason: None,
+                        }
+                    )
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("first answer resolution should arrive before the turn cap");
+
+    let terminal = tokio::time::timeout(Duration::from_millis(80), async {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                WsMessage::Text(text) => {
+                    let frame = serde_json::from_str::<ServerFrame>(&text).unwrap();
+                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                        return frame;
+                    }
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
+                other => panic!(
+                    "expected terminal turn cap for unresolved newer submission, got {other:?}"
+                ),
+            }
+        }
+    })
+    .await
+    .expect("first answer resolution cleared the newer pending submission cap");
+
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
+}
+
+#[tokio::test]
+async fn websocket_turn_cap_dedupes_duplicate_response_resolution_ids() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(DuplicateResolutionProbeBrain),
+        "duplicate_resolution_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(40),
+        session: Duration::from_secs(5),
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "duplicate_resolution_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![1_u8, 2].into()))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![3_u8, 4].into()))
+        .await
+        .unwrap();
+
+    let terminal = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                WsMessage::Text(text) => {
+                    let frame = serde_json::from_str::<ServerFrame>(&text).unwrap();
+                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                        return frame;
+                    }
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
+                other => panic!("expected turn cap for unresolved second answer, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("duplicate response resolution IDs cleared multiple pending answers");
+
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
+}
+
+#[tokio::test]
+async fn websocket_turn_cap_ignores_response_less_phase_after_new_submission() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(ResponseThenPhaseProbeBrain),
+        "response_then_phase_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(40),
+        session: Duration::from_secs(5),
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "response_then_phase_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![1_u8, 2].into()))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = read_server_frame(&mut socket).await;
+            if matches!(
+                &frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(
+                        event.as_ref(),
+                        VivaServerEvent::SessionPhase {
+                            phase: agent_domain::StudySessionPhase::Feedback,
+                            terminal_reason: None,
+                        }
+                    )
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("first answer resolution should arrive before the second submission");
+
+    socket
+        .send(WsMessage::Binary(vec![3_u8, 4].into()))
+        .await
+        .unwrap();
+
+    let terminal = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                WsMessage::Text(text) => {
+                    let frame = serde_json::from_str::<ServerFrame>(&text).unwrap();
+                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                        return frame;
+                    }
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
+                other => {
+                    panic!("expected terminal turn cap after response-less phase, got {other:?}")
+                }
+            }
+        }
+    })
+    .await
+    .expect("response-less feedback phase cleared the newer pending submission cap");
+
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
+}
+
+#[tokio::test]
+async fn websocket_turn_cap_ignores_suppressed_stale_resolution_after_new_submission() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(CancelledThenStaleResolutionProbeBrain),
+        "cancelled_then_stale_resolution_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(40),
+        session: Duration::from_secs(5),
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "cancelled_then_stale_resolution_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![1_u8, 2].into()))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = read_server_frame(&mut socket).await;
+            if matches!(
+                &frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(
+                        event.as_ref(),
+                        VivaServerEvent::Cancellation {
+                            response_id: Some(response_id),
+                        } if response_id == "response-a"
+                    )
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("first answer cancellation should arrive before the second submission");
+
+    socket
+        .send(WsMessage::Binary(vec![3_u8, 4].into()))
+        .await
+        .unwrap();
+
+    let terminal = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                WsMessage::Text(text) => {
+                    let frame = serde_json::from_str::<ServerFrame>(&text).unwrap();
+                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                        return frame;
+                    }
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
+                other => {
+                    panic!("expected terminal turn cap after stale suppressed event, got {other:?}")
+                }
+            }
+        }
+    })
+    .await
+    .expect("suppressed stale completion cleared the newer pending submission cap");
+
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
 }
 
 #[tokio::test]
@@ -3185,6 +3654,10 @@ async fn websocket_turn_cap_is_not_postponed_by_provider_events() {
         .send(WsMessage::Text(
             format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
         ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(Vec::new().into()))
         .await
         .unwrap();
 
@@ -3220,6 +3693,159 @@ async fn websocket_turn_cap_is_not_postponed_by_provider_events() {
     }
 
     panic!("provider events postponed the terminal turn_cap phase");
+}
+
+#[tokio::test]
+async fn websocket_turn_cap_is_not_postponed_by_extra_audio_frames() {
+    let state = test_state(1).with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(40),
+        session: Duration::from_secs(5),
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![1_u8, 2].into()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    socket
+        .send(WsMessage::Binary(vec![3_u8, 4].into()))
+        .await
+        .unwrap();
+
+    let terminal = tokio::time::timeout(Duration::from_millis(30), async {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                WsMessage::Text(text) => {
+                    let frame = serde_json::from_str::<ServerFrame>(&text).unwrap();
+                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                        return frame;
+                    }
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
+                other => {
+                    panic!("expected terminal turn cap despite extra audio frames, got {other:?}")
+                }
+            }
+        }
+    })
+    .await
+    .expect("extra audio frames extended the submitted-answer cap");
+
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
+}
+
+#[tokio::test]
+async fn websocket_turn_cap_includes_backpressured_answer_send() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(BackpressuredInputBrain {
+            dropped: Arc::new(AtomicBool::new(false)),
+        }),
+        "backpressured_input_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(25),
+        session: Duration::from_secs(5),
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "backpressured_input_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![1_u8, 2].into()))
+        .await
+        .unwrap();
+
+    assert_terminal_session_phase(
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = read_server_frame(&mut socket).await;
+                if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("back-pressured answer send escaped the submitted-answer cap"),
+        TerminalSessionReason::TurnCap,
+    );
+}
+
+#[tokio::test]
+async fn websocket_turn_cap_is_not_postponed_by_client_keepalives() {
+    let state = test_state(1).with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(25),
+        session: Duration::from_secs(5),
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(Vec::new().into()))
+        .await
+        .unwrap();
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(80) {
+        let _ = socket.send(WsMessage::Ping(Vec::new().into())).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let terminal = tokio::time::timeout(Duration::from_millis(20), async {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                WsMessage::Text(text) => {
+                    let frame = serde_json::from_str::<ServerFrame>(&text).unwrap();
+                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                        return frame;
+                    }
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
+                other => panic!("expected terminal turn cap frame before close, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("client keepalives postponed the terminal turn_cap phase");
+
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
 }
 
 #[tokio::test]
@@ -4715,6 +5341,243 @@ impl RealtimeBrain for ChattyPhaseProbeBrain {
                 event_task.abort_handle(),
                 input_task.abort_handle(),
             ])),
+        })
+    }
+}
+
+struct AnswerResolutionProbeBrain;
+
+#[async_trait::async_trait]
+impl RealtimeBrain for AnswerResolutionProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "answer_resolution_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        _config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let mut sent = false;
+            while let Some(input) = input_rx.recv().await {
+                if sent {
+                    continue;
+                }
+                if matches!(input, BrainInput::Audio(_) | BrainInput::Text(_)) {
+                    let _ = event_tx
+                        .send(BrainEvent::ResponseCompleted {
+                            response_id: "response-1".to_owned(),
+                        })
+                        .await;
+                    sent = true;
+                }
+            }
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+struct DelayedSingleResolutionProbeBrain;
+
+#[async_trait::async_trait]
+impl RealtimeBrain for DelayedSingleResolutionProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "delayed_single_resolution_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        _config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let mut sent = false;
+            while let Some(input) = input_rx.recv().await {
+                if sent {
+                    continue;
+                }
+                if matches!(input, BrainInput::Audio(_) | BrainInput::Text(_)) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let _ = event_tx
+                        .send(BrainEvent::ResponseCompleted {
+                            response_id: "response-1".to_owned(),
+                        })
+                        .await;
+                    sent = true;
+                }
+            }
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+struct DuplicateResolutionProbeBrain;
+
+#[async_trait::async_trait]
+impl RealtimeBrain for DuplicateResolutionProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "duplicate_resolution_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        _config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let mut answer_count = 0_u8;
+            while let Some(input) = input_rx.recv().await {
+                if !matches!(input, BrainInput::Audio(_) | BrainInput::Text(_)) {
+                    continue;
+                }
+                answer_count = answer_count.saturating_add(1);
+                if answer_count == 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    for _ in 0..2 {
+                        let _ = event_tx
+                            .send(BrainEvent::ResponseCompleted {
+                                response_id: "response-a".to_owned(),
+                            })
+                            .await;
+                    }
+                }
+            }
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+struct ResponseThenPhaseProbeBrain;
+
+#[async_trait::async_trait]
+impl RealtimeBrain for ResponseThenPhaseProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "response_then_phase_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        _config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let mut sent = false;
+            while let Some(input) = input_rx.recv().await {
+                if sent {
+                    continue;
+                }
+                if matches!(input, BrainInput::Audio(_) | BrainInput::Text(_)) {
+                    let _ = event_tx
+                        .send(BrainEvent::ResponseCompleted {
+                            response_id: "response-1".to_owned(),
+                        })
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    let _ = event_tx
+                        .send(BrainEvent::SessionPhase {
+                            phase: agent_domain::StudySessionPhase::Feedback,
+                        })
+                        .await;
+                    sent = true;
+                }
+            }
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+struct CancelledThenStaleResolutionProbeBrain;
+
+#[async_trait::async_trait]
+impl RealtimeBrain for CancelledThenStaleResolutionProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "cancelled_then_stale_resolution_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        _config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let mut answer_count = 0_u8;
+            while let Some(input) = input_rx.recv().await {
+                if !matches!(input, BrainInput::Audio(_) | BrainInput::Text(_)) {
+                    continue;
+                }
+                answer_count = answer_count.saturating_add(1);
+                if answer_count == 1 {
+                    let _ = event_tx
+                        .send(BrainEvent::ResponseCancelledFor {
+                            response_id: "response-a".to_owned(),
+                        })
+                        .await;
+                } else if answer_count == 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let _ = event_tx
+                        .send(BrainEvent::ResponseCompleted {
+                            response_id: "response-a".to_owned(),
+                        })
+                        .await;
+                }
+            }
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
         })
     }
 }

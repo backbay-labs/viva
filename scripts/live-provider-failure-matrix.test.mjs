@@ -6,6 +6,9 @@ import {
   failureMatrixEvidence,
   liveProviderFailureForSmokeReason,
 } from "./live-provider-failure-matrix.mjs";
+import learnerLoopContract from "../packages/core/src/learner-loop-contract.json" with {
+  type: "json",
+};
 
 const REQUIRED_FAILURE_CLASSES = Object.freeze([
   "provider_auth_failure",
@@ -38,6 +41,26 @@ test("live provider failure matrix covers every Act 3 degradation class", () => 
     assert.equal(typeof entry.user_copy.marginalia_text, "string");
     assert.equal(typeof entry.user_copy.next_action_label, "string");
     assert(entry.user_copy.next_action_label.length > 0);
+  }
+});
+
+test("live provider failure matrix is reconciled with the BAC-510 learner-loop contract", () => {
+  for (const entry of LIVE_PROVIDER_FAILURE_MATRIX) {
+    const contractState = learnerLoopContract.states.find(
+      (state) =>
+        state.failure_class === entry.failure_class &&
+        state.terminal_reason === entry.terminal_reason,
+    );
+
+    assert(
+      contractState,
+      `missing learner-loop contract state for ${entry.failure_class}/${entry.terminal_reason}`,
+    );
+    assert.equal(contractState.stage, entry.stage);
+    assert.equal(contractState.copy.capsule_label, entry.user_copy.capsule_label);
+    assert.equal(contractState.copy.next_action_label, entry.user_copy.next_action_label);
+    assert.equal(contractState.copy.status_label, entry.user_copy.status_label);
+    assert.equal(contractState.sanitized_evidence, true);
   }
 });
 

@@ -26,7 +26,7 @@ use tokio::sync::{watch, Semaphore};
 use uuid::Uuid;
 
 use crate::{
-    config::{SessionTokenClaims, VoiceLimitConfig, VoiceWsAccess},
+    config::{bac_510_max_turn_duration, SessionTokenClaims, VoiceLimitConfig, VoiceWsAccess},
     ws::voice_ws,
 };
 
@@ -257,7 +257,7 @@ impl Default for WsTimeouts {
     fn default() -> Self {
         Self {
             first_frame: Duration::from_secs(10),
-            idle: Duration::from_secs(60),
+            idle: bac_510_max_turn_duration(),
             session: Duration::from_secs(6 * 60 * 60),
         }
     }

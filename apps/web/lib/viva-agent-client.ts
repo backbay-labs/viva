@@ -530,6 +530,7 @@ export function vivaAgentReducer(
       if (event.terminal_reason && event.phase === "recap" && !state.recap) {
         return {
           ...state,
+          phase: event.phase,
           terminalReason: event.terminal_reason,
         };
       }
