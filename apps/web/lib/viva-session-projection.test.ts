@@ -1074,6 +1074,21 @@ describe("projectTrace", () => {
     expect(projection.question.prompt).toBe("This session has ended.");
     expect(projection.question.terminal).toBe(true);
   });
+
+  test("terminal provider rate limit overrides a stale thinking question", () => {
+    const projection = projectTrace(
+      derived({ phase: "thinking", terminalReason: "provider_rate_limited", question }),
+      "open",
+      NOW,
+    );
+
+    expect(projection.state).toBe("recap");
+    expect(projection.hasAgentQuestion).toBe(false);
+    expect(projection.highlightedTokens).toEqual([]);
+    expect(projection.question.prompt).toBe("This session has ended.");
+    expect(projection.question.terminal).toBe(true);
+    expect(projection.question.pending).toBe(false);
+  });
 });
 
 describe("projectSourceFolio", () => {
