@@ -24,7 +24,7 @@ use tokio::{
 
 use crate::{
     app::{AppState, VoiceLimitLease},
-    config::{SessionTokenClaims, VoiceLimitConfig, VoiceWsAccessError},
+    config::{bac_510_max_turn_duration, SessionTokenClaims, VoiceLimitConfig, VoiceWsAccessError},
     protocol::{
         ClientFrame, ServerFrame, VIVA_VOICE_MAX_BINARY_FRAME_BYTES,
         VIVA_VOICE_MAX_TEXT_FRAME_BYTES, VIVA_VOICE_PROTOCOL_VERSION,
@@ -274,6 +274,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
         voice_session_id.clone(),
         "session config accepted",
     ));
+    record_turn_cap_config(&state, voice_session_id.clone());
     let session_started_at = Instant::now();
 
     let mut session = match state.brain.open(initial_config).await {
@@ -345,6 +346,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
                 break;
             }
             _ = &mut pre_answer_idle, if pre_answer_idle_armed => {
+                abort_realtime_session_tasks(&mut session);
                 terminal_reason = close_with_terminal_session_phase(
                     &mut sender,
                     &session.input,
@@ -355,6 +357,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
                 break;
             }
             _ = &mut turn_cap, if turn_cap_deadline.is_some() => {
+                abort_realtime_session_tasks(&mut session);
                 terminal_reason = close_with_terminal_session_phase(
                     &mut sender,
                     &session.input,
@@ -526,6 +529,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
                         break;
                     }
                     Err(ClientMessageError::TurnCap) => {
+                        abort_realtime_session_tasks(&mut session);
                         terminal_reason = close_with_terminal_session_phase(
                             &mut sender,
                             &session.input,
@@ -622,6 +626,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
         }
     }
     record_terminal(&state, voice_session_id, terminal_reason).await;
+}
+
+fn abort_realtime_session_tasks(session: &mut agent_domain::RealtimeSession) {
+    drop(session.task_guard.take());
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1526,6 +1534,24 @@ fn record_client_action(state: &AppState, voice_session_id: Option<String>, acti
     state
         .evidence
         .record(VoiceEvidenceEvent::new(kind, voice_session_id, detail));
+}
+
+fn record_turn_cap_config(state: &AppState, voice_session_id: Option<String>) {
+    let source = if state.turn_cap_override {
+        "explicit_override"
+    } else {
+        "contract_default"
+    };
+    state.evidence.record(VoiceEvidenceEvent::new(
+        VoiceEvidenceEventKind::ConfigAccepted,
+        voice_session_id,
+        format!(
+            "turn_cap_ms={} source={} contract_max_ms={}",
+            state.ws_timeouts.idle.as_millis(),
+            source,
+            bac_510_max_turn_duration().as_millis()
+        ),
+    ));
 }
 
 async fn record_brain_event(

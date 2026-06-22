@@ -3163,6 +3163,38 @@ async fn websocket_turn_cap_emits_terminal_phase_before_close() {
 }
 
 #[tokio::test]
+async fn websocket_records_configured_turn_cap_evidence() {
+    let state = test_state(1).with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(25),
+        session: Duration::from_secs(5),
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+
+    wait_until(Duration::from_secs(2), || {
+        evidence.snapshot().iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::ConfigAccepted
+                && event.detail == "turn_cap_ms=25 source=explicit_override contract_max_ms=45000"
+        })
+    })
+    .await;
+    socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
 async fn websocket_turn_cap_waits_for_answer_frame() {
     let state = test_state(1).with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
@@ -3795,6 +3827,75 @@ async fn websocket_turn_cap_includes_backpressured_answer_send() {
         .expect("back-pressured answer send escaped the submitted-answer cap"),
         TerminalSessionReason::TurnCap,
     );
+}
+
+#[tokio::test]
+async fn websocket_turn_cap_aborts_provider_before_stop_can_write_late_answer() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let stop_write_attempted = Arc::new(AtomicBool::new(false));
+    let state = AppState::with_study_store(
+        Arc::new(StopWritesAnswerProbeBrain {
+            study_store: brain_store,
+            stop_write_attempted: stop_write_attempted.clone(),
+        }),
+        "stop_writes_answer_probe",
+        VoiceWsAccess::default(),
+        1,
+        store.clone(),
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(25),
+        session: Duration::from_secs(5),
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "stop_writes_answer_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![1_u8, 2, 3, 4].into()))
+        .await
+        .unwrap();
+
+    assert_terminal_session_phase(
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = read_server_frame(&mut socket).await;
+                if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("watchdog did not emit turn_cap"),
+        TerminalSessionReason::TurnCap,
+    );
+    assert_close_code(&mut socket, CloseCode::Policy).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        !stop_write_attempted.load(Ordering::SeqCst),
+        "watchdog sent Stop to a provider task that then attempted a late durable answer write"
+    );
+    let counts = store.write_counts();
+    assert_eq!(counts.answer_attempts, 0);
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::StoreCounts).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::StoreCounts
+            && event.detail
+                == "sessions=1 answer_attempts=0 concept_statuses=0 review_items=0 recaps=0"
+    }));
 }
 
 #[tokio::test]
@@ -4957,6 +5058,92 @@ impl RealtimeBrain for BackpressuredInputBrain {
             task_guard: Some(RealtimeSessionTaskGuard::new(vec![
                 input_task.abort_handle()
             ])),
+        })
+    }
+}
+
+struct StopWritesAnswerProbeBrain {
+    study_store: Arc<dyn StudyMemoryStore>,
+    stop_write_attempted: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for StopWritesAnswerProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "stop_writes_answer_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(&self, config: SessionConfig) -> Result<RealtimeSession, BrainError> {
+        self.study_store
+            .record_voice_session(&config)
+            .await
+            .map_err(|error| BrainError::Connection(error.to_string()))?;
+        let user_id = config
+            .user_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .to_owned();
+        let study_set_id = config
+            .study_set_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .to_owned();
+        let voice_session_id = config
+            .session_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .to_owned();
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let study_store = self.study_store.clone();
+        let stop_write_attempted = self.stop_write_attempted.clone();
+        let task = tokio::spawn(async move {
+            let _event_tx = event_tx;
+            let mut accepted_answer = false;
+            while let Some(input) = input_rx.recv().await {
+                match input {
+                    BrainInput::Audio(_) | BrainInput::Text(_) => {
+                        accepted_answer = true;
+                    }
+                    BrainInput::Stop if accepted_answer => {
+                        stop_write_attempted.store(true, Ordering::SeqCst);
+                        let question = agent_domain::fixture_question();
+                        let evaluation = agent_domain::AnswerEvaluation {
+                            question_id: question.question_id.clone(),
+                            answer_text: "late provider answer".to_owned(),
+                            label: "mostly correct".to_owned(),
+                            concise_feedback: "Late feedback should not persist.".to_owned(),
+                            retry_prompt: question.follow_up.clone(),
+                            source: question.source,
+                            concept_status: agent_domain::ConceptStatus::Strong,
+                            confidence_score: 0.84,
+                        };
+                        let _ = study_store
+                            .record_answer_evaluation(
+                                &user_id,
+                                &study_set_id,
+                                &voice_session_id,
+                                "late-response",
+                                evaluation,
+                            )
+                            .await;
+                        break;
+                    }
+                    BrainInput::Stop => break,
+                    _ => {}
+                }
+            }
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
         })
     }
 }

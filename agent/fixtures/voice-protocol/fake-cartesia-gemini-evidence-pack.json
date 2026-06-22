@@ -36,6 +36,11 @@
       "detail": "session config accepted"
     },
     {
+      "kind": "config_accepted",
+      "voice_session_id": "voice-session-1",
+      "detail": "turn_cap_ms=45000 source=contract_default contract_max_ms=45000"
+    },
+    {
       "kind": "session_opened",
       "voice_session_id": "voice-session-1",
       "detail": "session opened"

@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         idle: config.max_turn_duration,
         session: config.max_session_duration,
     })
+    .with_turn_cap_override(config.max_turn_duration_overridden)
     .with_voice_limits(config.voice_limits)
     .with_unauthenticated_paste_allowed(config.bind_addr.ip().is_loopback());
     let drain_signal = state.drain_signal.clone();

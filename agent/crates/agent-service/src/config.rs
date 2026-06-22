@@ -32,6 +32,7 @@ pub struct ServiceConfig {
     pub max_sessions: usize,
     pub max_session_duration: Duration,
     pub max_turn_duration: Duration,
+    pub max_turn_duration_overridden: bool,
     pub voice_limits: VoiceLimitConfig,
 }
 
@@ -50,6 +51,7 @@ impl Default for ServiceConfig {
             max_sessions: 32,
             max_session_duration: Duration::from_secs(6 * 60 * 60),
             max_turn_duration: bac_510_max_turn_duration(),
+            max_turn_duration_overridden: false,
             voice_limits: VoiceLimitConfig::default(),
         }
     }
@@ -119,6 +121,7 @@ impl ServiceConfig {
         {
             config.max_turn_duration =
                 Duration::from_secs(seconds).min(bac_510_max_turn_duration());
+            config.max_turn_duration_overridden = true;
         }
         config.voice_limits.max_user_sessions = env_value("VIVA_VOICE_WS_MAX_USER_SESSIONS")
             .and_then(|value| parse_positive_usize(&value));
@@ -539,6 +542,7 @@ mod tests {
         .expect("loopback turn timeout config should validate");
 
         assert_eq!(config.max_turn_duration, bac_510_max_turn_duration());
+        assert!(config.max_turn_duration_overridden);
     }
 
     #[test]
@@ -556,6 +560,7 @@ mod tests {
 
         assert_eq!(config.max_session_duration, Duration::from_secs(1800));
         assert_eq!(config.max_turn_duration, Duration::from_secs(45));
+        assert!(config.max_turn_duration_overridden);
         assert_eq!(config.voice_limits.max_user_sessions, Some(2));
         assert_eq!(config.voice_limits.max_ip_sessions, Some(5));
         assert_eq!(config.voice_limits.max_audio_bytes_per_minute, Some(48_000));
@@ -580,6 +585,7 @@ mod tests {
             disabled.max_turn_duration,
             ServiceConfig::default().max_turn_duration
         );
+        assert!(!disabled.max_turn_duration_overridden);
         assert_eq!(disabled.voice_limits, VoiceLimitConfig::default());
     }
 
