@@ -126,7 +126,7 @@ describe("LandingEntry", () => {
     expect(markup).toContain("NADH");
     expect(markup).toContain("server schedule");
     expect(markup).toContain(
-      "/session?user_id=user-1&amp;study_set_id=biology-midterm&amp;session_id=server-session&amp;session_token=viva1.server-token",
+      "/session?user_id=user-1&amp;study_set_id=biology-midterm&amp;session_id=server-session#session_token=viva1.server-token",
     );
   });
 

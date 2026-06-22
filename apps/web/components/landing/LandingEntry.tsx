@@ -24,8 +24,8 @@ export function LandingEntry({
   );
 }
 
-export function landingEntryTarget(search = currentSearch()): string {
-  return landingSessionTarget(search);
+export function landingEntryTarget(search = currentSearch(), hash = currentHash()): string {
+  return landingSessionTarget(search, hash);
 }
 
 function enterSession() {
@@ -34,4 +34,8 @@ function enterSession() {
 
 function currentSearch(): string {
   return typeof window === "undefined" ? "" : window.location.search;
+}
+
+function currentHash(): string {
+  return typeof window === "undefined" ? "" : window.location.hash;
 }
