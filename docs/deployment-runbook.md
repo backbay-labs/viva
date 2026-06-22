@@ -158,6 +158,31 @@ deployment secret store, not through git. A public bind with neither
 `VIVA_VOICE_SESSION_TOKEN_SECRET` nor `VIVA_VOICE_WS_BEARER_TOKEN` must fail
 startup validation.
 
+### Deterministic failure controls
+
+Failure controls are for hosted test environments and budget-capped synthetic
+monitor identities only. They are unavailable to normal learner traffic unless
+all gates are deliberately enabled: `VIVA_FAILURE_CONTROL_ENABLED=1`,
+`VIVA_FAILURE_CONTROL_SCENARIO`, `VIVA_FAILURE_CONTROL_SECRET`,
+`VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS`,
+`VIVA_FAILURE_CONTROL_STUDY_SET_IDS`,
+`VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS`, and
+`VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY`. The control claim is signed
+separately from the session token and bound to user, study set, session, origin,
+run id, expiry, and nonce. Do not create a public generic force-failure endpoint.
+
+For browser proof, select one scenario deterministically:
+
+```sh
+VIVA_E2E_FAILURE_CONTROL_SCENARIO=provider_rate_limited \
+  bun run e2e:browser
+```
+
+The browser evidence records scenario id, failure class, stage, terminal reason,
+event index, validation run id, screenshots, and sanitized harness state. It
+must not contain raw audio, transcripts, learner answers, provider payloads,
+session tokens, control secrets, API keys, or bearer tokens.
+
 ### REST bootstrap bearer path
 
 Public REST paste/library bootstrap and control operations require
@@ -239,9 +264,19 @@ VIVA_RELEASE_CHECK_SKIP_BROWSER=1 \
   bun run release:check
 ```
 
+To prove one deterministic failure path without live-provider flakiness, run:
+
+```sh
+VIVA_E2E_FAILURE_CONTROL_SCENARIO=provider_rate_limited \
+  bun run e2e:browser
+```
+
 The release evidence bundle is sanitized output only: command summaries,
 fixture hashes, browser story filenames/screenshots, provider readiness matrix,
-and artifact audit summary. It must show forbidden hits equal to zero.
+failure_control_harness disabled state, and artifact audit summary. It must show
+forbidden hits equal to zero. `bun run release:check` must fail if
+`VIVA_FAILURE_CONTROL_ENABLED=1`; deterministic provider failure coverage must
+come from the signed harness, not flaky real outages.
 
 Opt-in live smoke is separate. Only run it after Act 3 makes `/ready` selectable
 for `cartesia_gemini` and after budget/time caps are set. The minimum proof is:

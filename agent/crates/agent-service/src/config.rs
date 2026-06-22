@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, fmt,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -34,6 +34,7 @@ pub struct ServiceConfig {
     pub max_turn_duration: Duration,
     pub max_turn_duration_overridden: bool,
     pub voice_limits: VoiceLimitConfig,
+    pub failure_control: FailureControlConfig,
 }
 
 impl Default for ServiceConfig {
@@ -53,6 +54,7 @@ impl Default for ServiceConfig {
             max_turn_duration: bac_510_max_turn_duration(),
             max_turn_duration_overridden: false,
             voice_limits: VoiceLimitConfig::default(),
+            failure_control: FailureControlConfig::default(),
         }
     }
 }
@@ -132,11 +134,17 @@ impl ServiceConfig {
                 .and_then(|value| parse_positive_u64(&value));
         config.voice_limits.max_session_cost_usd = env_value("VIVA_VOICE_WS_MAX_SESSION_COST_USD")
             .and_then(|value| parse_positive_f64(&value));
+        config.failure_control = FailureControlConfig::from_env_with(&env_value)?;
         config.validate()?;
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<(), ServiceConfigError> {
+        if self.failure_control.enabled() && self.ws_access.session_token_secret.is_none() {
+            return Err(ServiceConfigError::FailureControlMisconfigured(
+                "session token signing secret required",
+            ));
+        }
         if self.bind_addr.ip().is_loopback() {
             return Ok(());
         }
@@ -173,6 +181,325 @@ pub struct VoiceLimitConfig {
     pub max_ip_sessions: Option<usize>,
     pub max_audio_bytes_per_minute: Option<u64>,
     pub max_session_cost_usd: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureControlScenario {
+    ProviderRateLimited,
+    ProviderAuthFailed,
+    ProviderTimeout,
+    SilentStall,
+    ProviderMalformedStream,
+    ProviderNetworkDisconnect,
+    SonicTtsTimeout,
+    RecapTimeout,
+    InvalidToken,
+    ExpiredToken,
+    ReplayedToken,
+    MalformedToken,
+    SlowStaleSocketClose,
+    DoubleSubmitRace,
+    MicDenied,
+    TypedFallback,
+}
+
+impl FailureControlScenario {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "provider_rate_limited" => Some(Self::ProviderRateLimited),
+            "provider_auth_failed" => Some(Self::ProviderAuthFailed),
+            "provider_timeout" => Some(Self::ProviderTimeout),
+            "silent_stall" => Some(Self::SilentStall),
+            "provider_malformed_stream" => Some(Self::ProviderMalformedStream),
+            "provider_network_disconnect" => Some(Self::ProviderNetworkDisconnect),
+            "sonic_tts_timeout" => Some(Self::SonicTtsTimeout),
+            "recap_timeout" => Some(Self::RecapTimeout),
+            "invalid_token" => Some(Self::InvalidToken),
+            "expired_token" => Some(Self::ExpiredToken),
+            "replayed_token" => Some(Self::ReplayedToken),
+            "malformed_token" => Some(Self::MalformedToken),
+            "slow_stale_socket_close" => Some(Self::SlowStaleSocketClose),
+            "double_submit_race" => Some(Self::DoubleSubmitRace),
+            "mic_denied" => Some(Self::MicDenied),
+            "typed_fallback" => Some(Self::TypedFallback),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderRateLimited => "provider_rate_limited",
+            Self::ProviderAuthFailed => "provider_auth_failed",
+            Self::ProviderTimeout => "provider_timeout",
+            Self::SilentStall => "silent_stall",
+            Self::ProviderMalformedStream => "provider_malformed_stream",
+            Self::ProviderNetworkDisconnect => "provider_network_disconnect",
+            Self::SonicTtsTimeout => "sonic_tts_timeout",
+            Self::RecapTimeout => "recap_timeout",
+            Self::InvalidToken => "invalid_token",
+            Self::ExpiredToken => "expired_token",
+            Self::ReplayedToken => "replayed_token",
+            Self::MalformedToken => "malformed_token",
+            Self::SlowStaleSocketClose => "slow_stale_socket_close",
+            Self::DoubleSubmitRace => "double_submit_race",
+            Self::MicDenied => "mic_denied",
+            Self::TypedFallback => "typed_fallback",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FailureControlClaim {
+    pub scenario: FailureControlScenario,
+    pub run_id: String,
+    pub expires_at: u64,
+    pub nonce: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct FailureControlConfig {
+    enabled: bool,
+    scenario: Option<FailureControlScenario>,
+    secret: Option<String>,
+    synthetic_user_ids: Vec<String>,
+    study_set_ids: Vec<String>,
+    allowed_origins: Vec<String>,
+    max_sessions_per_identity: Option<usize>,
+}
+
+impl fmt::Debug for FailureControlConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailureControlConfig")
+            .field("enabled", &self.enabled)
+            .field("scenario", &self.scenario)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("synthetic_user_ids", &self.synthetic_user_ids)
+            .field("study_set_ids", &self.study_set_ids)
+            .field("allowed_origins", &self.allowed_origins)
+            .field("max_sessions_per_identity", &self.max_sessions_per_identity)
+            .finish()
+    }
+}
+
+impl FailureControlConfig {
+    pub fn enabled_for_synthetic_identities(
+        scenario: FailureControlScenario,
+        secret: impl Into<String>,
+        synthetic_user_ids: Vec<String>,
+        study_set_ids: Vec<String>,
+        allowed_origins: Vec<String>,
+        max_sessions_per_identity: usize,
+    ) -> Result<Self, ServiceConfigError> {
+        let secret = secret.into();
+        if max_sessions_per_identity == 0 {
+            return Err(ServiceConfigError::FailureControlMisconfigured(
+                "per-identity cap required",
+            ));
+        }
+        if secret.trim().is_empty()
+            || synthetic_user_ids.is_empty()
+            || study_set_ids.is_empty()
+            || allowed_origins.is_empty()
+        {
+            return Err(ServiceConfigError::FailureControlMisconfigured(
+                "all failure-control gates required",
+            ));
+        }
+        Ok(Self {
+            enabled: true,
+            scenario: Some(scenario),
+            secret: Some(secret),
+            synthetic_user_ids,
+            study_set_ids,
+            allowed_origins,
+            max_sessions_per_identity: Some(max_sessions_per_identity),
+        })
+    }
+
+    fn from_env_with(
+        env_value: &impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, ServiceConfigError> {
+        if env_value("VIVA_FAILURE_CONTROL_ENABLED").as_deref() != Some("1") {
+            return Ok(Self::default());
+        }
+        let scenario = env_value("VIVA_FAILURE_CONTROL_SCENARIO")
+            .as_deref()
+            .and_then(FailureControlScenario::parse)
+            .ok_or(ServiceConfigError::FailureControlMisconfigured(
+                "valid scenario required",
+            ))?;
+        let secret = required_failure_control_value(
+            env_value,
+            "VIVA_FAILURE_CONTROL_SECRET",
+            "control secret required",
+        )?;
+        let synthetic_user_ids = required_failure_control_list(
+            env_value,
+            "VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS",
+            "synthetic identity allowlist required",
+        )?;
+        let study_set_ids = required_failure_control_list(
+            env_value,
+            "VIVA_FAILURE_CONTROL_STUDY_SET_IDS",
+            "study-set allowlist required",
+        )?;
+        let allowed_origins = required_failure_control_list(
+            env_value,
+            "VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS",
+            "origin allowlist required",
+        )?;
+        let max_sessions_per_identity = env_value("VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY")
+            .and_then(|value| parse_positive_usize(&value))
+            .ok_or(ServiceConfigError::FailureControlMisconfigured(
+                "per-identity cap required",
+            ))?;
+
+        Ok(Self {
+            enabled: true,
+            scenario: Some(scenario),
+            secret: Some(secret),
+            synthetic_user_ids,
+            study_set_ids,
+            allowed_origins,
+            max_sessions_per_identity: Some(max_sessions_per_identity),
+        })
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn scenario(&self) -> Option<FailureControlScenario> {
+        self.scenario
+    }
+
+    pub fn max_sessions_per_identity(&self) -> Option<usize> {
+        self.max_sessions_per_identity
+    }
+
+    pub fn allows_identity(&self, user_id: &str, study_set_id: &str, origin: &str) -> bool {
+        self.enabled
+            && contains_str(&self.synthetic_user_ids, user_id)
+            && contains_str(&self.study_set_ids, study_set_id)
+            && self
+                .allowed_origins
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
+    }
+
+    pub fn signed_claim_for(
+        &self,
+        request: FailureControlClaimRequest<'_>,
+    ) -> Result<FailureControlClaim, SessionTokenError> {
+        if !self.allows_identity(request.user_id, request.study_set_id, request.origin) {
+            return Err(SessionTokenError::Invalid);
+        }
+        let scenario = self.scenario.ok_or(SessionTokenError::Invalid)?;
+        let expires_at = request
+            .now
+            .checked_add(15 * 60)
+            .ok_or(SessionTokenError::Invalid)?;
+        let signature = self.sign_claim_payload(&FailureControlClaimPayload {
+            scenario,
+            user_id: request.user_id,
+            study_set_id: request.study_set_id,
+            session_id: request.session_id,
+            origin: request.origin,
+            run_id: request.run_id,
+            expires_at,
+            nonce: request.nonce,
+        })?;
+        Ok(FailureControlClaim {
+            scenario,
+            run_id: request.run_id.to_owned(),
+            expires_at,
+            nonce: request.nonce.to_owned(),
+            signature,
+        })
+    }
+
+    pub fn validate_claim(
+        &self,
+        claim: &FailureControlClaim,
+        user_id: &str,
+        study_set_id: &str,
+        session_id: &str,
+        origin: &str,
+        now: u64,
+    ) -> Result<FailureControlScenario, SessionTokenError> {
+        if !self.allows_identity(user_id, study_set_id, origin) {
+            return Err(SessionTokenError::Invalid);
+        }
+        if Some(claim.scenario) != self.scenario {
+            return Err(SessionTokenError::Invalid);
+        }
+        if claim.run_id.trim().is_empty() || claim.nonce.trim().is_empty() {
+            return Err(SessionTokenError::Invalid);
+        }
+        if claim.expires_at <= now {
+            return Err(SessionTokenError::Expired);
+        }
+        let expected = self.sign_claim_payload(&FailureControlClaimPayload {
+            scenario: claim.scenario,
+            user_id,
+            study_set_id,
+            session_id,
+            origin,
+            run_id: &claim.run_id,
+            expires_at: claim.expires_at,
+            nonce: &claim.nonce,
+        })?;
+        if !constant_time_eq(expected.as_bytes(), claim.signature.as_bytes()) {
+            return Err(SessionTokenError::Invalid);
+        }
+        Ok(claim.scenario)
+    }
+
+    fn sign_claim_payload(
+        &self,
+        payload: &FailureControlClaimPayload<'_>,
+    ) -> Result<String, SessionTokenError> {
+        let secret = self.secret.as_deref().ok_or(SessionTokenError::Invalid)?;
+        let payload = format!(
+            "viva-failure-control.v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            payload.scenario.as_str(),
+            payload.user_id,
+            payload.study_set_id,
+            payload.session_id,
+            payload.origin,
+            payload.run_id,
+            payload.expires_at,
+            payload.nonce
+        );
+        let signature = sign_payload(secret, payload.as_bytes())?;
+        Ok(URL_SAFE_NO_PAD.encode(signature))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FailureControlClaimRequest<'a> {
+    pub user_id: &'a str,
+    pub study_set_id: &'a str,
+    pub session_id: &'a str,
+    pub origin: &'a str,
+    pub run_id: &'a str,
+    pub now: u64,
+    pub nonce: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FailureControlClaimPayload<'a> {
+    scenario: FailureControlScenario,
+    user_id: &'a str,
+    study_set_id: &'a str,
+    session_id: &'a str,
+    origin: &'a str,
+    run_id: &'a str,
+    expires_at: u64,
+    nonce: &'a str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -253,6 +580,35 @@ fn parse_positive_f64(value: &str) -> Option<f64> {
         .filter(|parsed| parsed.is_finite() && *parsed > 0.0)
 }
 
+fn required_failure_control_value(
+    env_value: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    error: &'static str,
+) -> Result<String, ServiceConfigError> {
+    env_value(name).ok_or(ServiceConfigError::FailureControlMisconfigured(error))
+}
+
+fn required_failure_control_list(
+    env_value: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    error: &'static str,
+) -> Result<Vec<String>, ServiceConfigError> {
+    let values = required_failure_control_value(env_value, name, error)?
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return Err(ServiceConfigError::FailureControlMisconfigured(error));
+    }
+    Ok(values)
+}
+
+fn contains_str(values: &[String], needle: &str) -> bool {
+    values.iter().any(|value| value == needle)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ServiceConfigError {
     #[error("unsupported realtime provider `{0}`; selectable providers are `synthetic`, `fake_cartesia_gemini`, and gated `cartesia_gemini`")]
@@ -263,6 +619,8 @@ pub enum ServiceConfigError {
     PublicBindMissingAuth(SocketAddr),
     #[error("public or non-loopback bind `{0}` requires VIVA_VOICE_WS_ALLOWED_ORIGINS")]
     PublicBindMissingAllowedOrigins(SocketAddr),
+    #[error("failure-control misconfigured: {0}")]
+    FailureControlMisconfigured(&'static str),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -313,6 +671,8 @@ pub struct SessionTokenClaims {
     pub session_id: String,
     pub expires_at: u64,
     pub nonce: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_control: Option<FailureControlClaim>,
 }
 
 impl SessionTokenClaims {
@@ -377,6 +737,15 @@ impl SessionTokenClaims {
             && !self.study_set_id.trim().is_empty()
             && !self.session_id.trim().is_empty()
             && !self.nonce.trim().is_empty()
+            && self
+                .failure_control
+                .as_ref()
+                .map(|claim| {
+                    !claim.run_id.trim().is_empty()
+                        && !claim.nonce.trim().is_empty()
+                        && !claim.signature.trim().is_empty()
+                })
+                .unwrap_or(true)
     }
 }
 
@@ -590,6 +959,141 @@ mod tests {
     }
 
     #[test]
+    fn from_env_parses_failure_control_gate_fail_closed() {
+        let disabled = ServiceConfig::from_env_with(|_| None)
+            .expect("default failure controls should stay hard off");
+        assert!(!disabled.failure_control.enabled());
+
+        let missing_secret = ServiceConfig::from_env_with(|name| match name {
+            "VIVA_FAILURE_CONTROL_ENABLED" => Some("1".to_owned()),
+            "VIVA_FAILURE_CONTROL_SCENARIO" => Some("provider_rate_limited".to_owned()),
+            "VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS" => Some("synthetic-user".to_owned()),
+            "VIVA_FAILURE_CONTROL_STUDY_SET_IDS" => Some("biology-midterm".to_owned()),
+            "VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS" => Some("https://viva.example".to_owned()),
+            "VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY" => Some("1".to_owned()),
+            _ => None,
+        })
+        .expect_err("enabled failure control must require a signed-control secret");
+        assert_eq!(
+            missing_secret,
+            ServiceConfigError::FailureControlMisconfigured("control secret required")
+        );
+
+        let enabled = ServiceConfig::from_env_with(|name| match name {
+            "VIVA_FAILURE_CONTROL_ENABLED" => Some("1".to_owned()),
+            "VIVA_FAILURE_CONTROL_SCENARIO" => Some(" provider_rate_limited ".to_owned()),
+            "VIVA_FAILURE_CONTROL_SECRET" => Some(" control-secret ".to_owned()),
+            "VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS" => Some(" synthetic-user ".to_owned()),
+            "VIVA_FAILURE_CONTROL_STUDY_SET_IDS" => Some(" biology-midterm ".to_owned()),
+            "VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS" => Some(" https://viva.example ".to_owned()),
+            "VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY" => Some("1".to_owned()),
+            "VIVA_VOICE_SESSION_TOKEN_SECRET" => Some("session-secret".to_owned()),
+            _ => None,
+        })
+        .expect("fully gated failure control should parse");
+
+        assert!(enabled.failure_control.enabled());
+        assert_eq!(
+            enabled.failure_control.scenario(),
+            Some(FailureControlScenario::ProviderRateLimited)
+        );
+        assert!(enabled.failure_control.allows_identity(
+            "synthetic-user",
+            "biology-midterm",
+            "https://viva.example"
+        ));
+        assert!(!enabled.failure_control.allows_identity(
+            "learner-user",
+            "biology-midterm",
+            "https://viva.example"
+        ));
+    }
+
+    #[test]
+    fn from_env_rejects_enabled_failure_control_without_session_token_signing() {
+        let error = ServiceConfig::from_env_with(|name| match name {
+            "VIVA_FAILURE_CONTROL_ENABLED" => Some("1".to_owned()),
+            "VIVA_FAILURE_CONTROL_SCENARIO" => Some("provider_rate_limited".to_owned()),
+            "VIVA_FAILURE_CONTROL_SECRET" => Some("control-secret".to_owned()),
+            "VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS" => Some("synthetic-user".to_owned()),
+            "VIVA_FAILURE_CONTROL_STUDY_SET_IDS" => Some("biology-midterm".to_owned()),
+            "VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS" => Some("https://viva.example".to_owned()),
+            "VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY" => Some("1".to_owned()),
+            _ => None,
+        })
+        .expect_err("enabled failure control must require signed session-token auth");
+
+        assert_eq!(
+            error,
+            ServiceConfigError::FailureControlMisconfigured(
+                "session token signing secret required"
+            )
+        );
+    }
+
+    #[test]
+    fn failure_control_claim_is_signed_and_bound_to_synthetic_identity() {
+        let config = ServiceConfig::from_env_with(|name| match name {
+            "VIVA_FAILURE_CONTROL_ENABLED" => Some("1".to_owned()),
+            "VIVA_FAILURE_CONTROL_SCENARIO" => Some("provider_rate_limited".to_owned()),
+            "VIVA_FAILURE_CONTROL_SECRET" => Some("control-secret".to_owned()),
+            "VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS" => Some("synthetic-user".to_owned()),
+            "VIVA_FAILURE_CONTROL_STUDY_SET_IDS" => Some("biology-midterm".to_owned()),
+            "VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS" => Some("https://viva.example".to_owned()),
+            "VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY" => Some("1".to_owned()),
+            "VIVA_VOICE_SESSION_TOKEN_SECRET" => Some("session-secret".to_owned()),
+            _ => None,
+        })
+        .expect("fully gated failure control should parse");
+        let claim = config
+            .failure_control
+            .signed_claim_for(FailureControlClaimRequest {
+                user_id: "synthetic-user",
+                study_set_id: "biology-midterm",
+                session_id: "voice-session-control",
+                origin: "https://viva.example",
+                run_id: "run-1",
+                now: 100,
+                nonce: "nonce-1",
+            })
+            .expect("allowed synthetic identity should receive a signed control claim");
+
+        assert_eq!(
+            config.failure_control.validate_claim(
+                &claim,
+                "synthetic-user",
+                "biology-midterm",
+                "voice-session-control",
+                "https://viva.example",
+                100
+            ),
+            Ok(FailureControlScenario::ProviderRateLimited)
+        );
+        assert!(config
+            .failure_control
+            .validate_claim(
+                &claim,
+                "learner-user",
+                "biology-midterm",
+                "voice-session-control",
+                "https://viva.example",
+                100
+            )
+            .is_err());
+        assert!(config
+            .failure_control
+            .validate_claim(
+                &claim,
+                "synthetic-user",
+                "biology-midterm",
+                "voice-session-control",
+                "https://evil.example",
+                100
+            )
+            .is_err());
+    }
+
+    #[test]
     fn service_config_validation_rejects_public_bind_without_bearer_or_origins() {
         for bind_addr in ["0.0.0.0:4318", "[::]:4318", "203.0.113.10:4318"] {
             let bind_addr: SocketAddr = bind_addr.parse().expect("valid public bind");
@@ -707,6 +1211,7 @@ mod tests {
             session_id: "voice-session-1".to_owned(),
             expires_at: 100,
             nonce: "nonce-1".to_owned(),
+            failure_control: None,
         };
         let token = claims.sign("secret").expect("token should sign");
 

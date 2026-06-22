@@ -16,9 +16,9 @@ use agent_domain::{
     StudySetIngestionStatus, TerminalSessionReason,
 };
 use agent_service::{
-    build_router, AppState, ClientFrame, ServerFrame, VivaServerEvent, VoiceDrainSignal,
-    VoiceEvidenceRecorder, VoiceLimitConfig, VoiceWsAccess, WsTimeouts,
-    VIVA_VOICE_PROTOCOL_VERSION,
+    build_router, AppState, ClientFrame, FailureControlConfig, FailureControlScenario, ServerFrame,
+    VivaServerEvent, VoiceDrainSignal, VoiceEvidenceRecorder, VoiceLimitConfig, VoiceWsAccess,
+    WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
 };
 use axum::{
     body::Body,
@@ -2378,6 +2378,158 @@ async fn websocket_accepts_signed_session_token_matching_initial_config() {
         ServerFrame::Event { .. }
     ));
     socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_failure_control_claim_forces_sanitized_provider_terminal_path() {
+    let origin = "https://control.example";
+    let state = test_state_with_session_token("session-secret").with_failure_control(
+        FailureControlConfig::enabled_for_synthetic_identities(
+            FailureControlScenario::ProviderRateLimited,
+            "control-secret",
+            vec!["user-1".to_owned()],
+            vec!["biology-midterm".to_owned()],
+            vec![origin.to_owned()],
+            1,
+        )
+        .unwrap(),
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let token = signed_session_token_with_failure_control(FailureControlTokenFixture {
+        session_secret: "session-secret",
+        control_secret: "control-secret",
+        user_id: "user-1",
+        study_set_id: "biology-midterm",
+        session_id: "voice-session-1",
+        origin,
+        scenario: FailureControlScenario::ProviderRateLimited,
+        expires_at: unix_timestamp_now() + 60,
+        nonce: "nonce-control-session",
+        run_id: "run-control-1",
+        control_nonce: "nonce-control-claim",
+    });
+    let mut request = url.as_str().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("origin", HeaderValue::from_str(origin).unwrap());
+
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&token).into(),
+        ))
+        .await
+        .unwrap();
+    let ready = read_server_frame(&mut socket).await;
+    assert!(matches!(
+        ready,
+        ServerFrame::Event { event, .. }
+            if matches!(
+                event.as_ref(),
+                VivaServerEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                    terminal_reason: None,
+                }
+            )
+    ));
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Event { event, .. }
+            if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+    ));
+
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "synthetic answer".to_owned(),
+        },
+    )
+    .await;
+
+    let terminal = loop {
+        let frame = read_server_frame(&mut socket).await;
+        if terminal_session_reason(&frame) == Some(TerminalSessionReason::ProviderRateLimited) {
+            break frame;
+        }
+    };
+    assert_terminal_session_phase(terminal, TerminalSessionReason::ProviderRateLimited);
+    assert_close_code(&mut socket, CloseCode::Error).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "provider_rate_limited"
+    }));
+}
+
+#[tokio::test]
+async fn websocket_rejects_failure_control_claim_from_wrong_origin_before_brain_open() {
+    let opened = Arc::new(AtomicBool::new(false));
+    let allowed_origin = "https://control.example";
+    let state = AppState::new(
+        Arc::new(OpenProbeBrain {
+            opened: opened.clone(),
+            captured_config: None,
+        }),
+        "open_probe",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        1,
+    )
+    .with_failure_control(
+        FailureControlConfig::enabled_for_synthetic_identities(
+            FailureControlScenario::ProviderRateLimited,
+            "control-secret",
+            vec!["user-1".to_owned()],
+            vec!["biology-midterm".to_owned()],
+            vec![allowed_origin.to_owned()],
+            1,
+        )
+        .unwrap(),
+    );
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let token = signed_session_token_with_failure_control(FailureControlTokenFixture {
+        session_secret: "session-secret",
+        control_secret: "control-secret",
+        user_id: "user-1",
+        study_set_id: "biology-midterm",
+        session_id: "voice-session-1",
+        origin: allowed_origin,
+        scenario: FailureControlScenario::ProviderRateLimited,
+        expires_at: unix_timestamp_now() + 60,
+        nonce: "nonce-origin-session",
+        run_id: "run-origin-1",
+        control_nonce: "nonce-origin-claim",
+    });
+    let mut request = url.as_str().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("origin", HeaderValue::from_static("https://evil.example"));
+
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    assert_ready_provider(&mut socket, "open_probe").await;
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&token).into(),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Error { message, .. } if message == "invalid session token"
+    ));
+    assert_close_code(&mut socket, CloseCode::Policy).await;
+    assert!(!opened.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -4812,6 +4964,53 @@ fn signed_session_token(
         "expires_at": expires_at,
         "nonce": nonce,
     });
+    signed_session_token_claims(secret, claims)
+}
+
+struct FailureControlTokenFixture<'a> {
+    session_secret: &'a str,
+    control_secret: &'a str,
+    user_id: &'a str,
+    study_set_id: &'a str,
+    session_id: &'a str,
+    origin: &'a str,
+    scenario: FailureControlScenario,
+    expires_at: u64,
+    nonce: &'a str,
+    run_id: &'a str,
+    control_nonce: &'a str,
+}
+
+fn signed_session_token_with_failure_control(fixture: FailureControlTokenFixture<'_>) -> String {
+    let failure_control = serde_json::json!({
+        "scenario": fixture.scenario.as_str(),
+        "run_id": fixture.run_id,
+        "expires_at": fixture.expires_at,
+        "nonce": fixture.control_nonce,
+        "signature": failure_control_signature(
+            fixture.control_secret,
+            fixture.scenario,
+            fixture.user_id,
+            fixture.study_set_id,
+            fixture.session_id,
+            fixture.origin,
+            fixture.run_id,
+            fixture.expires_at,
+            fixture.control_nonce,
+        ),
+    });
+    let claims = serde_json::json!({
+        "user_id": fixture.user_id,
+        "study_set_id": fixture.study_set_id,
+        "session_id": fixture.session_id,
+        "expires_at": fixture.expires_at,
+        "nonce": fixture.nonce,
+        "failure_control": failure_control,
+    });
+    signed_session_token_claims(fixture.session_secret, claims)
+}
+
+fn signed_session_token_claims(secret: &str, claims: serde_json::Value) -> String {
     let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
     let payload = format!("viva1.{claims}");
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
@@ -4820,6 +5019,34 @@ fn signed_session_token(
         "{payload}.{}",
         URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn failure_control_signature(
+    secret: &str,
+    scenario: FailureControlScenario,
+    user_id: &str,
+    study_set_id: &str,
+    session_id: &str,
+    origin: &str,
+    run_id: &str,
+    expires_at: u64,
+    nonce: &str,
+) -> String {
+    let payload = format!(
+        "viva-failure-control.v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        scenario.as_str(),
+        user_id,
+        study_set_id,
+        session_id,
+        origin,
+        run_id,
+        expires_at,
+        nonce
+    );
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(payload.as_bytes());
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
 
 fn unix_timestamp_now() -> u64 {

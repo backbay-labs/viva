@@ -1,7 +1,11 @@
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use agent_domain::{
-    AudioFrame, BrainError, BrainInput, BrainProviderError, SessionConfig, SessionTokenNonceClaim,
+    fixture_question, AudioFrame, BrainError, BrainEvent, BrainInput, BrainProviderError,
+    RealtimeSession, RealtimeSessionTaskGuard, SessionConfig, SessionTokenNonceClaim,
     StudySessionPhase, TerminalSessionReason, VoiceUsageRecord,
 };
 use axum::{
@@ -24,7 +28,10 @@ use tokio::{
 
 use crate::{
     app::{AppState, VoiceLimitLease},
-    config::{bac_510_max_turn_duration, SessionTokenClaims, VoiceLimitConfig, VoiceWsAccessError},
+    config::{
+        bac_510_max_turn_duration, FailureControlScenario, SessionTokenClaims, VoiceLimitConfig,
+        VoiceWsAccessError,
+    },
     protocol::{
         ClientFrame, ServerFrame, VIVA_VOICE_MAX_BINARY_FRAME_BYTES,
         VIVA_VOICE_MAX_TEXT_FRAME_BYTES, VIVA_VOICE_PROTOCOL_VERSION,
@@ -42,9 +49,10 @@ pub async fn voice_ws(
         Ok(permit) => permit,
         Err(error) => return error.into_response(),
     };
+    let request_origin = request_origin(&headers).unwrap_or_default();
 
     ws.protocols(["viva-voice"])
-        .on_upgrade(move |socket| handle_socket(socket, state, admission))
+        .on_upgrade(move |socket| handle_socket(socket, state, admission, request_origin))
 }
 
 fn validate_ws_preflight(
@@ -132,6 +140,15 @@ fn session_ip_key(headers: &HeaderMap) -> String {
         .to_owned()
 }
 
+fn request_origin(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 struct VoiceAdmission {
     _permit: OwnedSemaphorePermit,
     _ip_lease: Option<VoiceLimitLease>,
@@ -178,7 +195,12 @@ impl SessionLimitRuntime {
     }
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmission) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    _admission: VoiceAdmission,
+    request_origin: String,
+) {
     let (mut sender, mut receiver) = socket.split();
     if send_json(
         &mut sender,
@@ -205,17 +227,19 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
             return;
         }
         Ok(incoming) => match incoming {
-            Some(Ok(message)) => match initial_session_config_from_message(message)
-                .and_then(|config| authorize_initial_session_config(config, &state))
-            {
-                Ok(config) => config,
-                Err(error) => {
-                    let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
-                    let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
-                    record_terminal(&state, None, error.terminal_reason).await;
-                    return;
+            Some(Ok(message)) => {
+                match initial_session_config_from_message(message).and_then(|config| {
+                    authorize_initial_session_config(config, &state, &request_origin)
+                }) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+                        let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
+                        record_terminal(&state, None, error.terminal_reason).await;
+                        return;
+                    }
                 }
-            },
+            }
             _ => {
                 record_terminal(&state, None, "closed_before_config").await;
                 return;
@@ -234,7 +258,19 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
             return;
         }
     };
-    let _user_lease = match state.voice_limits.max_user_sessions {
+    let max_user_sessions = match initial.failure_control {
+        Some(_) => match (
+            state.voice_limits.max_user_sessions,
+            state.failure_control.max_sessions_per_identity(),
+        ) {
+            (Some(global), Some(control)) => Some(global.min(control)),
+            (Some(global), None) => Some(global),
+            (None, Some(control)) => Some(control),
+            (None, None) => None,
+        },
+        None => state.voice_limits.max_user_sessions,
+    };
+    let _user_lease = match max_user_sessions {
         Some(max) => match state
             .limit_state
             .try_acquire_user(&session_binding.user_id, max)
@@ -269,6 +305,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
     }
     let mut initial_config = initial.config;
     initial_config.active_concepts = server_active_concepts(&study_context);
+    let failure_control = initial.failure_control;
     state.evidence.record(VoiceEvidenceEvent::new(
         VoiceEvidenceEventKind::ConfigAccepted,
         voice_session_id.clone(),
@@ -277,7 +314,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
     record_turn_cap_config(&state, voice_session_id.clone());
     let session_started_at = Instant::now();
 
-    let mut session = match state.brain.open(initial_config).await {
+    let session_result = match failure_control {
+        Some(scenario) => open_failure_control_session(&state, initial_config, scenario).await,
+        None => state.brain.open(initial_config).await,
+    };
+    let mut session = match session_result {
         Ok(session) => session,
         Err(error) => {
             let terminal_reason = close_with_terminal_session_phase_only(
@@ -856,6 +897,16 @@ fn terminal_reason_for_provider_message(message: &str) -> TerminalSessionReason 
     if normalized.contains("timeout") || normalized.contains("timed out") {
         return TerminalSessionReason::ProviderTimeout;
     }
+    if normalized.contains("slow client")
+        || normalized.contains("stale socket")
+        || normalized.contains("double submit")
+        || normalized.contains("mic denied")
+    {
+        return TerminalSessionReason::SlowClient;
+    }
+    if normalized.contains("partial stage success") || normalized.contains("typed fallback") {
+        return TerminalSessionReason::PartialStageSuccess;
+    }
     if normalized.contains("cancel") || normalized.contains("abort") {
         return TerminalSessionReason::ProviderCancelled;
     }
@@ -868,6 +919,134 @@ fn terminal_reason_for_provider_message(message: &str) -> TerminalSessionReason 
         return TerminalSessionReason::ProviderMalformedStream;
     }
     TerminalSessionReason::ProviderNetworkDisconnect
+}
+
+async fn open_failure_control_session(
+    state: &AppState,
+    config: SessionConfig,
+    scenario: FailureControlScenario,
+) -> Result<RealtimeSession, BrainError> {
+    state
+        .study_store
+        .record_voice_session(&config)
+        .await
+        .map_err(|error| BrainError::Connection(error.to_string()))?;
+
+    let (input, mut input_rx) = mpsc::channel::<BrainInput>(32);
+    let (event_tx, events) = mpsc::channel::<BrainEvent>(32);
+    let response_id = format!("failure-control-{}", scenario.as_str());
+    let task = tokio::spawn(async move {
+        let _ = event_tx
+            .send(BrainEvent::SessionPhase {
+                phase: StudySessionPhase::Ready,
+            })
+            .await;
+        let _ = event_tx
+            .send(BrainEvent::QuestionStarted {
+                response_id: response_id.clone(),
+                question: fixture_question(),
+            })
+            .await;
+
+        while let Some(input) = input_rx.recv().await {
+            match input {
+                BrainInput::Audio(_) | BrainInput::Text(_) => {
+                    let _ = event_tx.send(BrainEvent::InputSpeechStarted).await;
+                    let _ = event_tx.send(BrainEvent::InputSpeechStopped).await;
+                    if scenario == FailureControlScenario::SilentStall {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    let _ = event_tx
+                        .send(BrainEvent::Error(failure_control_provider_error(scenario)))
+                        .await;
+                    break;
+                }
+                BrainInput::CancelResponse => {
+                    let _ = event_tx
+                        .send(BrainEvent::ResponseCancelledFor {
+                            response_id: response_id.clone(),
+                        })
+                        .await;
+                }
+                BrainInput::Stop => break,
+                BrainInput::ToolResult(_)
+                | BrainInput::SessionContextRefresh(_)
+                | BrainInput::ProactiveTurn { .. } => {}
+                _ => {}
+            }
+        }
+    });
+
+    Ok(RealtimeSession {
+        input,
+        events,
+        task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+    })
+}
+
+fn failure_control_provider_error(scenario: FailureControlScenario) -> BrainProviderError {
+    BrainProviderError {
+        source: "failure_control".to_owned(),
+        message: failure_control_provider_message(scenario),
+    }
+}
+
+fn failure_control_provider_message(scenario: FailureControlScenario) -> String {
+    let message = match scenario {
+        FailureControlScenario::ProviderRateLimited => {
+            "synthetic provider 429 rate limit; retry_after_ms=250; request_id=synth"
+        }
+        FailureControlScenario::ProviderAuthFailed => "synthetic provider auth failed",
+        FailureControlScenario::ProviderTimeout
+        | FailureControlScenario::SonicTtsTimeout
+        | FailureControlScenario::RecapTimeout
+        | FailureControlScenario::SilentStall => "synthetic provider timeout",
+        FailureControlScenario::ProviderMalformedStream => "synthetic provider malformed stream",
+        FailureControlScenario::ProviderNetworkDisconnect => {
+            "synthetic provider network disconnect"
+        }
+        FailureControlScenario::InvalidToken
+        | FailureControlScenario::ExpiredToken
+        | FailureControlScenario::ReplayedToken
+        | FailureControlScenario::MalformedToken => "synthetic provider auth failed",
+        FailureControlScenario::SlowStaleSocketClose => "synthetic slow client stale socket close",
+        FailureControlScenario::DoubleSubmitRace => "synthetic slow client double submit race",
+        FailureControlScenario::MicDenied => "synthetic slow client mic denied",
+        FailureControlScenario::TypedFallback => "synthetic partial stage success typed fallback",
+    };
+    format!(
+        "{message}; scenario={}; stage={}",
+        scenario.as_str(),
+        failure_control_stage(scenario)
+    )
+}
+
+fn failure_control_stage(scenario: FailureControlScenario) -> &'static str {
+    match scenario {
+        FailureControlScenario::ProviderRateLimited | FailureControlScenario::ProviderTimeout => {
+            "gemini"
+        }
+        FailureControlScenario::ProviderAuthFailed => "provider_auth",
+        FailureControlScenario::SilentStall
+        | FailureControlScenario::ProviderMalformedStream
+        | FailureControlScenario::ProviderNetworkDisconnect => "provider_stream",
+        FailureControlScenario::SonicTtsTimeout => "sonic_tts",
+        FailureControlScenario::RecapTimeout => "recap",
+        FailureControlScenario::InvalidToken
+        | FailureControlScenario::ExpiredToken
+        | FailureControlScenario::ReplayedToken
+        | FailureControlScenario::MalformedToken => "session_auth",
+        FailureControlScenario::SlowStaleSocketClose => "websocket_generation",
+        FailureControlScenario::DoubleSubmitRace => "answer_submission",
+        FailureControlScenario::MicDenied => "browser_mic",
+        FailureControlScenario::TypedFallback => "browser_fallback",
+    }
+}
+
+fn unix_timestamp_now() -> Result<u64, std::time::SystemTimeError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
 }
 
 async fn authorize_browser_event(
@@ -1281,8 +1460,10 @@ fn sanitize_client_session_config(
 fn authorize_initial_session_config(
     initial: InitialSessionConfig,
     state: &AppState,
+    request_origin: &str,
 ) -> Result<AuthorizedInitialSessionConfig, ClientFrameError> {
     let mut rotate_trusted_session = false;
+    let mut failure_control = None;
     let (binding, token_nonce_claim) =
         if let Some(secret) = state.ws_access.session_token_secret.as_deref() {
             let token = initial
@@ -1291,6 +1472,22 @@ fn authorize_initial_session_config(
                 .ok_or_else(ClientFrameError::invalid_session_token)?;
             let claims = SessionTokenClaims::verify(token, secret)
                 .map_err(|_| ClientFrameError::invalid_session_token())?;
+            if let Some(claim) = claims.failure_control.as_ref() {
+                failure_control = Some(
+                    state
+                        .failure_control
+                        .validate_claim(
+                            claim,
+                            &claims.user_id,
+                            &claims.study_set_id,
+                            &claims.session_id,
+                            request_origin,
+                            unix_timestamp_now()
+                                .map_err(|_| ClientFrameError::invalid_session_token())?,
+                        )
+                        .map_err(|_| ClientFrameError::invalid_session_token())?,
+                );
+            }
             (
                 AuthorizedClientSession {
                     user_id: claims.user_id.clone(),
@@ -1325,6 +1522,7 @@ fn authorize_initial_session_config(
     Ok(AuthorizedInitialSessionConfig {
         config,
         token_nonce_claim,
+        failure_control,
     })
 }
 
@@ -1352,6 +1550,7 @@ struct InitialSessionConfig {
 struct AuthorizedInitialSessionConfig {
     config: SessionConfig,
     token_nonce_claim: Option<SessionTokenNonceClaim>,
+    failure_control: Option<FailureControlScenario>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1694,6 +1893,51 @@ mod tests {
             study_set_id: "biology-midterm".to_owned(),
             session_id: "voice-session-1".to_owned(),
         }
+    }
+
+    #[test]
+    fn provider_message_classifier_covers_failure_control_terminal_reasons() {
+        assert_eq!(
+            terminal_reason_for_provider_message("synthetic provider 429 rate limit"),
+            TerminalSessionReason::ProviderRateLimited
+        );
+        assert_eq!(
+            terminal_reason_for_provider_message("synthetic provider auth failed"),
+            TerminalSessionReason::ProviderAuthFailed
+        );
+        assert_eq!(
+            terminal_reason_for_provider_message("synthetic provider timeout"),
+            TerminalSessionReason::ProviderTimeout
+        );
+        assert_eq!(
+            terminal_reason_for_provider_message("synthetic provider malformed stream"),
+            TerminalSessionReason::ProviderMalformedStream
+        );
+        assert_eq!(
+            terminal_reason_for_provider_message("synthetic provider network disconnect"),
+            TerminalSessionReason::ProviderNetworkDisconnect
+        );
+        assert_eq!(
+            terminal_reason_for_provider_message("synthetic slow client double submit race"),
+            TerminalSessionReason::SlowClient
+        );
+        assert_eq!(
+            terminal_reason_for_provider_message("synthetic partial stage success typed fallback"),
+            TerminalSessionReason::PartialStageSuccess
+        );
+    }
+
+    #[test]
+    fn failure_control_provider_message_includes_scenario_and_stage_marker() {
+        let message = failure_control_provider_message(FailureControlScenario::SonicTtsTimeout);
+
+        assert!(message.contains("timeout"));
+        assert!(message.contains("scenario=sonic_tts_timeout"));
+        assert!(message.contains("stage=sonic_tts"));
+        assert_eq!(
+            terminal_reason_for_provider_message(&message),
+            TerminalSessionReason::ProviderTimeout
+        );
     }
 
     struct FailingSink;

@@ -7,6 +7,15 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import {
+  buildFailureControlPlan,
+  failureControlScenarioMarker,
+  failureControlSessionTargetForScenario,
+  failureControlStartIdentity,
+  failureControlHarnessEvidence,
+  isFailureControlSessionTokenScenario,
+  parseFailureControlSessionTarget,
+} from "./failure-control-harness.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactDir = path.resolve(
@@ -19,6 +28,16 @@ const agentUrl = `http://127.0.0.1:${agentPort}`;
 const webUrl = `http://127.0.0.1:${webPort}`;
 const wsUrl = `ws://127.0.0.1:${agentPort}/ws`;
 const agentProvider = process.env.VIVA_E2E_AGENT_PROVIDER ?? "synthetic";
+const failureControlEnv = buildE2EFailureControlEnv();
+const failureControlPlan = buildFailureControlPlan({
+  env: { ...process.env, ...failureControlEnv },
+});
+const failureControlEvidence = failureControlHarnessEvidence(failureControlPlan);
+const failureControlIdentity = failureControlPlan.enabled
+  ? failureControlStartIdentity(failureControlPlan)
+  : null;
+const sessionTokenFailureScenario =
+  failureControlPlan.enabled && isFailureControlSessionTokenScenario(failureControlPlan.scenario);
 const allowedBrowserStoryProviders = new Set(["synthetic", "fake_cartesia_gemini"]);
 if (!allowedBrowserStoryProviders.has(agentProvider)) {
   throw new Error(
@@ -60,6 +79,7 @@ let postAnswerProtocolProof = {
   responseId: null,
   sourceReferenceEventSeen: false,
 };
+let failureControlTerminalProof = null;
 
 await rm(artifactDir, { recursive: true, force: true });
 await mkdir(artifactDir, { recursive: true });
@@ -72,7 +92,11 @@ try {
     {
       VIVA_AGENT_BIND_ADDR: `127.0.0.1:${agentPort}`,
       VIVA_AGENT_PROVIDER: agentProvider,
-      VIVA_VOICE_SESSION_TOKEN_SECRET: "",
+      VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan.enabled
+        ? failureControlEnv.VIVA_VOICE_SESSION_TOKEN_SECRET
+        : "",
+      VIVA_VOICE_WS_ALLOWED_ORIGINS: failureControlPlan.enabled ? webUrl : "",
+      ...failureControlEnv,
     },
   );
   await waitForHttpJson(
@@ -91,8 +115,9 @@ try {
     {
       NEXT_PUBLIC_VIVA_AGENT_WS_URL: wsUrl,
       NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: agentUrl,
-      NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID: "user-1",
-      NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID: "biology-midterm",
+      NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID: failureControlIdentity?.userId ?? "user-1",
+      NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID:
+        failureControlIdentity?.studySetId ?? "biology-midterm",
       NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID: "voice-session-1",
     },
   );
@@ -118,7 +143,10 @@ try {
 
   await capturePendingLocalPreview(page);
   await page.goto(webUrl, { waitUntil: "networkidle" });
-  await page.getByRole("button", { name: "Review missed concepts" }).waitFor({
+  const startActionButton = failureControlPlan.enabled
+    ? page.getByRole("button", { name: /^Start / }).first()
+    : page.getByRole("button", { name: "Review missed concepts" });
+  await startActionButton.waitFor({
     state: "visible",
     timeout: 20_000,
   });
@@ -133,32 +161,68 @@ try {
     screenshot: "server-ready-study-set.png",
     checks: ["server_owned_study_set", "library_entry", "ready_session_action"],
   });
-  await page.getByRole("button", { name: "Review missed concepts" }).click();
-  await page.waitForURL(`${webUrl}/session`, { timeout: 20_000 });
-  // Scope to the visible heading: the prompt is also mirrored into an sr-only
-  // aria-live paragraph (so assistive tech hears a new question), so a plain
-  // getByText matches two nodes and trips strict mode. The heading is the one
-  // the student actually reads.
-  await page
-    .getByRole("heading", { name: "Explain the role of NADH in oxidative phosphorylation." })
-    .waitFor({
+  let manuscriptReady = false;
+  if (failureControlPlan.enabled) {
+    const signedStartTarget = await fetchFailureControlStartTarget(page);
+    const scenarioStartTarget = failureControlSessionTargetForScenario(
+      signedStartTarget,
+      failureControlPlan.scenario,
+      {
+        sessionSecret: failureControlEnv.VIVA_VOICE_SESSION_TOKEN_SECRET,
+      },
+    );
+    if (scenarioStartTarget.preconsume_replay) {
+      await consumeFailureControlReplayToken(page, signedStartTarget);
+    }
+    await page.goto(`${webUrl}${scenarioStartTarget.target}`, { waitUntil: "domcontentloaded" });
+  } else {
+    await startActionButton.click();
+  }
+  await page.waitForURL((url) => url.toString().startsWith(`${webUrl}/session`), {
+    timeout: 20_000,
+  });
+  if (sessionTokenFailureScenario) {
+    failureControlTerminalProof = await waitForFailureControlTerminal(
+      serverEvents,
+      failureControlPlan,
+      25_000,
+    );
+    await page.waitForTimeout(600);
+    await page.screenshot({
+      path: path.join(artifactDir, "failure-control-terminal.png"),
+      fullPage: true,
+    });
+    storyFrames.push({
+      id: "failure_control_terminal",
+      kind: "browser_screen",
+      screenshot: "failure-control-terminal.png",
+      checks: ["auth_rejected", "sanitized_failure_control", "auth_material_recovery_path"],
+    });
+  } else {
+    // Scope to the visible heading: the prompt is also mirrored into an sr-only
+    // aria-live paragraph (so assistive tech hears a new question), so a plain
+    // getByText matches two nodes and trips strict mode. The heading is the one
+    // the student actually reads.
+    await page
+      .getByRole("heading", { name: "Explain the role of NADH in oxidative phosphorylation." })
+      .waitFor({
+        state: "visible",
+        timeout: 20_000,
+      });
+    await page.getByRole("button", { name: "Acknowledge" }).click();
+    await page.getByRole("button", { name: "Acknowledge" }).waitFor({
+      state: "hidden",
+      timeout: 10_000,
+    });
+    const listeningText =
+      agentProvider === "synthetic"
+        ? "Synthetic examiner is listening."
+        : "Non-live provider test is listening.";
+    await page.getByText(listeningText).waitFor({
       state: "visible",
       timeout: 20_000,
     });
-  await page.getByRole("button", { name: "Acknowledge" }).click();
-  await page.getByRole("button", { name: "Acknowledge" }).waitFor({
-    state: "hidden",
-    timeout: 10_000,
-  });
-  const listeningText =
-    agentProvider === "synthetic"
-      ? "Synthetic examiner is listening."
-      : "Non-live provider test is listening.";
-  await page.getByText(listeningText).waitFor({
-    state: "visible",
-    timeout: 20_000,
-  });
-  const manuscriptReady = await isVisible(page.getByText(listeningText));
+    manuscriptReady = await isVisible(page.getByText(listeningText));
   await page.screenshot({
     path: path.join(artifactDir, "session-ready.png"),
     fullPage: true,
@@ -195,133 +259,161 @@ try {
   } else {
     await page.getByRole("button", { name: /check it/i }).click();
     writtenAnswerFallbackUsed = await submitWrittenAnswerIfFallbackOpens(page);
-    postAnswerProtocolProof = await waitForPostAnswerProtocolProof(serverEvents, 25_000);
-    if (requireCorrectionMarginalia) {
-      await page.getByText("Marginalia", { exact: true }).waitFor({
-        state: "visible",
-        timeout: 25_000,
-      });
-      await page.getByRole("button", { name: "Try again" }).waitFor({
-        state: "visible",
-        timeout: 10_000,
-      });
-      await page.getByRole("button", { name: "Show source" }).waitFor({
-        state: "visible",
-        timeout: 10_000,
-      });
-      await page.getByRole("button", { name: "Next question" }).waitFor({
-        state: "visible",
-        timeout: 10_000,
-      });
+    if (failureControlPlan.enabled) {
+      failureControlTerminalProof = await waitForFailureControlTerminal(
+        serverEvents,
+        failureControlPlan,
+        25_000,
+      );
       await page.waitForTimeout(600);
-      correctionMarginaliaVisible =
-        (await isVisible(page.getByText("Marginalia", { exact: true }).first())) &&
-        (await isVisible(page.getByRole("button", { name: "Try again" }).first())) &&
-        (await isVisible(page.getByRole("button", { name: "Show source" }).first())) &&
-        (await isVisible(page.getByRole("button", { name: "Next question" }).first()));
-      await redactCorrectionMarginaliaForSanitizedScreenshot(page);
       await page.screenshot({
-        path: path.join(artifactDir, "correction-marginalia.png"),
+        path: path.join(artifactDir, "failure-control-terminal.png"),
         fullPage: true,
       });
       storyFrames.push({
-        id: "correction_marginalia",
+        id: "failure_control_terminal",
         kind: "browser_screen",
-        screenshot: "correction-marginalia.png",
-        checks: [
-          "correction_note",
-          "try_again_action",
-          "show_source_action",
-          "next_question_action",
-        ],
+        screenshot: "failure-control-terminal.png",
+        checks: ["terminal_reason", "sanitized_failure_control", "same_session_recovery_path"],
       });
+    } else {
+      postAnswerProtocolProof = await waitForPostAnswerProtocolProof(serverEvents, 25_000);
+      if (requireCorrectionMarginalia) {
+        await page.getByText("Marginalia", { exact: true }).waitFor({
+          state: "visible",
+          timeout: 25_000,
+        });
+        await page.getByRole("button", { name: "Try again" }).waitFor({
+          state: "visible",
+          timeout: 10_000,
+        });
+        await page.getByRole("button", { name: "Show source" }).waitFor({
+          state: "visible",
+          timeout: 10_000,
+        });
+        await page.getByRole("button", { name: "Next question" }).waitFor({
+          state: "visible",
+          timeout: 10_000,
+        });
+        await page.waitForTimeout(600);
+        correctionMarginaliaVisible =
+          (await isVisible(page.getByText("Marginalia", { exact: true }).first())) &&
+          (await isVisible(page.getByRole("button", { name: "Try again" }).first())) &&
+          (await isVisible(page.getByRole("button", { name: "Show source" }).first())) &&
+          (await isVisible(page.getByRole("button", { name: "Next question" }).first()));
+        await redactCorrectionMarginaliaForSanitizedScreenshot(page);
+        await page.screenshot({
+          path: path.join(artifactDir, "correction-marginalia.png"),
+          fullPage: true,
+        });
+        storyFrames.push({
+          id: "correction_marginalia",
+          kind: "browser_screen",
+          screenshot: "correction-marginalia.png",
+          checks: [
+            "correction_note",
+            "try_again_action",
+            "show_source_action",
+            "next_question_action",
+          ],
+        });
+      }
+      if (requirePostAnswerSourceFolio) {
+        await page.getByRole("button", { name: "Show source" }).click();
+        await page.getByText("Source Folio", { exact: true }).waitFor({
+          state: "visible",
+          timeout: 10_000,
+        });
+        await page.waitForTimeout(600);
+        postAnswerSourceFolioVisible =
+          (await isVisible(page.getByText("Source Folio", { exact: true }).first())) &&
+          (await isVisible(page.getByRole("button", { name: "Challenge citation" }).first())) &&
+          (await isVisible(
+            page
+              .getByText(conceptStatusText(postAnswerProtocolProof.conceptStatus), {
+                exact: false,
+              })
+              .first(),
+          ));
+        postAnswerBoundedSourceVisible =
+          (await isVisible(
+            page.getByText("Source citation is bounded to this span", { exact: false }).first(),
+          )) && (await isVisible(page.getByText("Document span only", { exact: false }).first()));
+        await redactSourceFolioForSanitizedScreenshot(page);
+        await page.screenshot({
+          path: path.join(artifactDir, "post-answer-source-folio.png"),
+          fullPage: true,
+        });
+        await page.getByRole("button", { name: "Back to question" }).click();
+      }
+      await page.getByRole("button", { name: "End session" }).click();
     }
-    if (requirePostAnswerSourceFolio) {
-      await page.getByRole("button", { name: "Show source" }).click();
-      await page.getByText("Source Folio", { exact: true }).waitFor({
-        state: "visible",
-        timeout: 10_000,
-      });
-      await page.waitForTimeout(600);
-      postAnswerSourceFolioVisible =
-        (await isVisible(page.getByText("Source Folio", { exact: true }).first())) &&
-        (await isVisible(page.getByRole("button", { name: "Challenge citation" }).first())) &&
-        (await isVisible(
-          page
-            .getByText(conceptStatusText(postAnswerProtocolProof.conceptStatus), {
-              exact: false,
-            })
-            .first(),
-        ));
-      postAnswerBoundedSourceVisible =
-        (await isVisible(
-          page.getByText("Source citation is bounded to this span", { exact: false }).first(),
-        )) && (await isVisible(page.getByText("Document span only", { exact: false }).first()));
-      await redactSourceFolioForSanitizedScreenshot(page);
-      await page.screenshot({
-        path: path.join(artifactDir, "post-answer-source-folio.png"),
-        fullPage: true,
-      });
-      await page.getByRole("button", { name: "Back to question" }).click();
-    }
-    await page.getByRole("button", { name: "End session" }).click();
+  }
   }
   const recapSummaryText =
     agentProvider === "synthetic"
       ? "Next, make the proton-gradient-to-ATP-synthase link explicit."
       : "The session stayed grounded to the server-owned source span.";
-  await page.getByText("Closing fold / Recap ready").waitFor({
-    state: "visible",
-    timeout: 25_000,
-  });
-  await page.getByText(recapSummaryText, { exact: false }).waitFor({
-    state: "visible",
-    timeout: 10_000,
-  });
-  await page.getByText("Review later").first().waitFor({
-    state: "visible",
-    timeout: 10_000,
-  });
-  await page.getByText("Next session", { exact: false }).first().waitFor({
-    state: "visible",
-    timeout: 10_000,
-  });
-  await page.getByText("core FSRS", { exact: false }).first().waitFor({
-    state: "visible",
-    timeout: 10_000,
-  });
-  await page.getByText("Lecture 5", { exact: false }).first().waitFor({
-    state: "visible",
-    timeout: 10_000,
-  });
-  const nextSessionRecommendationVisible =
-    (await isVisible(page.getByText("Next session", { exact: false }).first())) &&
-    (await isVisible(page.getByText("core FSRS", { exact: false }).first()));
-  const recapPayloadVisible =
-    (await isVisible(page.getByText("Closing fold / Recap ready").first())) &&
-    (await isVisible(page.getByText(recapSummaryText, { exact: false }).first())) &&
-    Boolean(postAnswerProtocolProof.conceptId) &&
-    (await isVisible(
-      page.getByText(conceptLabelText(postAnswerProtocolProof.conceptId), { exact: true }).first(),
-    )) &&
-    (await isVisible(page.getByText("Conductor next action", { exact: false }).first()));
+  let nextSessionRecommendationVisible = false;
+  let recapPayloadVisible = false;
+  if (!failureControlPlan.enabled) {
+    await page.getByText("Closing fold / Recap ready").waitFor({
+      state: "visible",
+      timeout: 25_000,
+    });
+    await page.getByText(recapSummaryText, { exact: false }).waitFor({
+      state: "visible",
+      timeout: 10_000,
+    });
+    await page.getByText("Review later").first().waitFor({
+      state: "visible",
+      timeout: 10_000,
+    });
+    await page.getByText("Next session", { exact: false }).first().waitFor({
+      state: "visible",
+      timeout: 10_000,
+    });
+    await page.getByText("core FSRS", { exact: false }).first().waitFor({
+      state: "visible",
+      timeout: 10_000,
+    });
+    await page.getByText("Lecture 5", { exact: false }).first().waitFor({
+      state: "visible",
+      timeout: 10_000,
+    });
+    nextSessionRecommendationVisible =
+      (await isVisible(page.getByText("Next session", { exact: false }).first())) &&
+      (await isVisible(page.getByText("core FSRS", { exact: false }).first()));
+    recapPayloadVisible =
+      (await isVisible(page.getByText("Closing fold / Recap ready").first())) &&
+      (await isVisible(page.getByText(recapSummaryText, { exact: false }).first())) &&
+      Boolean(postAnswerProtocolProof.conceptId) &&
+      (await isVisible(
+        page
+          .getByText(conceptLabelText(postAnswerProtocolProof.conceptId), { exact: true })
+          .first(),
+      )) &&
+      (await isVisible(page.getByText("Conductor next action", { exact: false }).first()));
+  }
   const shareVisible = await isVisible(page.getByRole("button", { name: "Share" }));
   const localScheduleVisible = await isVisible(
     page.getByRole("button", { name: /Schedule a short source-backed review tomorrow/ }),
   );
-  await page.getByText("Closing fold / Recap ready").first().scrollIntoViewIfNeeded();
-  await redactRecapForSanitizedScreenshot(page);
-  await page.waitForTimeout(600);
-  await page.screenshot({
-    path: path.join(artifactDir, "connected-terminal-fold.png"),
-    fullPage: true,
-  });
-  storyFrames.push({
-    id: "recap",
-    kind: "browser_screen",
-    screenshot: "connected-terminal-fold.png",
-    checks: ["recap_ready", "server_schedule_visible", "next_session_recommendation"],
-  });
+  if (!failureControlPlan.enabled) {
+    await page.getByText("Closing fold / Recap ready").first().scrollIntoViewIfNeeded();
+    await redactRecapForSanitizedScreenshot(page);
+    await page.waitForTimeout(600);
+    await page.screenshot({
+      path: path.join(artifactDir, "connected-terminal-fold.png"),
+      fullPage: true,
+    });
+    storyFrames.push({
+      id: "recap",
+      kind: "browser_screen",
+      screenshot: "connected-terminal-fold.png",
+      checks: ["recap_ready", "server_schedule_visible", "next_session_recommendation"],
+    });
+  }
   if (traceStarted) {
     await context.tracing.stop({ path: path.join(artifactDir, "trace.zip") });
     traceArtifact = "trace.zip";
@@ -352,6 +444,8 @@ try {
     post_answer_concept_status_event_seen: postAnswerProtocolProof.conceptStatusEventSeen,
     post_answer_concept_id: postAnswerProtocolProof.conceptId,
     post_answer_protocol_response_id: postAnswerProtocolProof.responseId,
+    failure_control_harness: failureControlEvidence,
+    failure_control_terminal: failureControlTerminalProof,
     written_answer_fallback_used: writtenAnswerFallbackUsed,
     local_only_actions_hidden: !shareVisible && !localScheduleVisible,
     session_url_lifecycle: sessionUrlLifecycle,
@@ -362,39 +456,70 @@ try {
     screenshots: [
       "pending-local-preview.png",
       "server-ready-study-set.png",
-      "session-ready.png",
-      "source-folio.png",
+      ...(!sessionTokenFailureScenario ? ["session-ready.png", "source-folio.png"] : []),
       ...(correctionMarginaliaVisible ? ["correction-marginalia.png"] : []),
-      ...(!stopToRecap && requirePostAnswerSourceFolio ? ["post-answer-source-folio.png"] : []),
-      "connected-terminal-fold.png",
+      ...(!failureControlPlan.enabled && !stopToRecap && requirePostAnswerSourceFolio
+        ? ["post-answer-source-folio.png"]
+        : []),
+      ...(failureControlPlan.enabled
+        ? ["failure-control-terminal.png"]
+        : ["connected-terminal-fold.png"]),
     ],
     trace: traceArtifact,
   };
   result = await writeAuditedBrowserStoryResult(result);
 
   if (legacyUploadVisible) throw new Error("Landing mounted the retired legacy upload app.");
-  if (!manuscriptReady) throw new Error("Landing did not enter the connected manuscript.");
-  if (!recapPayloadVisible)
-    throw new Error("Connected fake-provider session did not render the recap_ready payload.");
-  if (!nextSessionRecommendationVisible) {
-    throw new Error("Connected session did not render next-session review recommendations.");
+  if (!sessionTokenFailureScenario && !manuscriptReady) {
+    throw new Error("Landing did not enter the connected manuscript.");
   }
-  if (!sourceFolioVisible) {
+  if (failureControlPlan.enabled) {
+    if (failureControlTerminalProof?.terminal_reason !== failureControlPlan.scenario.terminal_reason) {
+      throw new Error("Failure-control run did not observe the selected terminal reason.");
+    }
+    if (
+      sessionTokenFailureScenario &&
+      failureControlTerminalProof?.token_recovery_path_verified !== true
+    ) {
+      throw new Error("Failure-control token scenario did not prove the token recovery path.");
+    }
+    if (!sessionTokenFailureScenario && failureControlTerminalProof?.stage_verified !== true) {
+      throw new Error("Failure-control provider scenario did not prove the scenario stage marker.");
+    }
+  } else {
+    if (!recapPayloadVisible)
+      throw new Error("Connected fake-provider session did not render the recap_ready payload.");
+    if (!nextSessionRecommendationVisible) {
+      throw new Error("Connected session did not render next-session review recommendations.");
+    }
+  }
+  if (!sessionTokenFailureScenario && !sourceFolioVisible) {
     throw new Error("Connected session did not render the Source Folio.");
   }
-  if (!boundedSourceVisible) {
+  if (!sessionTokenFailureScenario && !boundedSourceVisible) {
     throw new Error("Connected session did not render bounded source folio proof.");
   }
-  if (requireCorrectionMarginalia && !correctionMarginaliaVisible) {
+  if (!failureControlPlan.enabled && requireCorrectionMarginalia && !correctionMarginaliaVisible) {
     throw new Error("Connected session did not render correction marginalia.");
   }
-  if (!stopToRecap && requirePostAnswerSourceFolio && !postAnswerSourceFolioVisible) {
+  if (
+    !failureControlPlan.enabled &&
+    !stopToRecap &&
+    requirePostAnswerSourceFolio &&
+    !postAnswerSourceFolioVisible
+  ) {
     throw new Error("Connected session did not render the post-answer Source Folio.");
   }
-  if (!stopToRecap && requirePostAnswerSourceFolio && !postAnswerBoundedSourceVisible) {
+  if (
+    !failureControlPlan.enabled &&
+    !stopToRecap &&
+    requirePostAnswerSourceFolio &&
+    !postAnswerBoundedSourceVisible
+  ) {
     throw new Error("Connected session did not render post-answer bounded source folio proof.");
   }
   if (
+    !failureControlPlan.enabled &&
     !stopToRecap &&
     requirePostAnswerSourceFolio &&
     !postAnswerProtocolProof.sourceReferenceEventSeen
@@ -402,6 +527,7 @@ try {
     throw new Error("Post-answer Source Folio did not observe a source_reference event.");
   }
   if (
+    !failureControlPlan.enabled &&
     !stopToRecap &&
     requirePostAnswerSourceFolio &&
     !postAnswerProtocolProof.conceptStatusEventSeen
@@ -462,6 +588,120 @@ async function capturePendingLocalPreview(targetPage) {
     checks: ["extraction_pending", "server_not_contacted", "sanitized_summary_only"],
     note: "Rendered from the sanitized pending-preview contract because the retired local upload UI is not mounted in the Listening Manuscript app.",
   });
+}
+
+async function fetchFailureControlStartTarget(targetPage) {
+  const identity = failureControlStartIdentity(failureControlPlan);
+  return targetPage.evaluate(async ({ userId, studySetId }) => {
+    const libraryParams = new URLSearchParams({ user_id: userId });
+    const response = await fetch(`/api/viva-library/study-sets/library?${libraryParams.toString()}`, {
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      throw new Error(`failure-control library token fetch failed with HTTP ${response.status}`);
+    }
+    const snapshot = await response.json();
+    const studySet = snapshot.study_sets?.find((entry) => entry.id === studySetId);
+    const action = studySet?.actions?.start;
+    if (!studySet || !action?.session_id || !action?.session_token) {
+      throw new Error("failure-control library token fetch did not return a start token");
+    }
+    const params = new URLSearchParams({
+      user_id: studySet.user_id,
+      study_set_id: studySet.id,
+      session_id: action.session_id,
+    });
+    return `/session?${params.toString()}#session_token=${encodeURIComponent(
+      action.session_token,
+    )}`;
+  }, identity);
+}
+
+async function consumeFailureControlReplayToken(targetPage, signedStartTarget) {
+  const session = parseFailureControlSessionTarget(signedStartTarget);
+  return targetPage.evaluate(
+    async ({ session, wsUrl }) =>
+      new Promise((resolve, reject) => {
+        const socket = new WebSocket(wsUrl, ["viva-voice"]);
+        const timeout = window.setTimeout(() => {
+          socket.close();
+          reject(new Error("failure-control replay nonce preconsume timed out"));
+        }, 10_000);
+        let sentConfig = false;
+        let observedQuestionMarker = false;
+        socket.addEventListener("message", (event) => {
+          let frame;
+          try {
+            frame = JSON.parse(String(event.data));
+          } catch {
+            return;
+          }
+          if (frame?.type === "ready" && !sentConfig) {
+            sentConfig = true;
+            socket.send(
+              JSON.stringify({
+                type: "session_config",
+                version: 2,
+                session: {
+                  active_concepts: [],
+                  session_id: session.sessionId,
+                  source_context: [],
+                  study_set_id: session.studySetId,
+                  user_id: session.userId,
+                },
+                session_token: session.sessionToken,
+              }),
+            );
+            return;
+          }
+          if (frame?.type === "event" && frame.event?.type === "question_started") {
+            observedQuestionMarker = true;
+            socket.close();
+          }
+        });
+        socket.addEventListener("close", () => {
+          window.clearTimeout(timeout);
+          if (!sentConfig || !observedQuestionMarker) {
+            reject(new Error("failure-control replay nonce preconsume did not open a control turn"));
+            return;
+          }
+          resolve({ observed_question_marker: true, sanitized: true });
+        });
+        socket.addEventListener("error", () => {
+          window.clearTimeout(timeout);
+          reject(new Error("failure-control replay nonce preconsume websocket failed"));
+        });
+      }),
+    { session, wsUrl },
+  );
+}
+
+function buildE2EFailureControlEnv() {
+  const scenario =
+    process.env.VIVA_E2E_FAILURE_CONTROL_SCENARIO ?? process.env.VIVA_FAILURE_CONTROL_SCENARIO;
+  const enabled =
+    process.env.VIVA_FAILURE_CONTROL_ENABLED === "1" ||
+    Boolean(process.env.VIVA_E2E_FAILURE_CONTROL_SCENARIO);
+  if (!enabled) return {};
+  if (!scenario?.trim()) {
+    throw new Error("VIVA_E2E_FAILURE_CONTROL_SCENARIO is required when failure control is enabled");
+  }
+  return {
+    VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS:
+      process.env.VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS ?? webUrl,
+    VIVA_FAILURE_CONTROL_ENABLED: "1",
+    VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY:
+      process.env.VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY ?? "1",
+    VIVA_FAILURE_CONTROL_SCENARIO: scenario.trim(),
+    VIVA_FAILURE_CONTROL_SECRET:
+      process.env.VIVA_FAILURE_CONTROL_SECRET ?? "local-e2e-failure-control-secret",
+    VIVA_FAILURE_CONTROL_STUDY_SET_IDS:
+      process.env.VIVA_FAILURE_CONTROL_STUDY_SET_IDS ?? "biology-midterm",
+    VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS:
+      process.env.VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS ?? "user-1",
+    VIVA_VOICE_SESSION_TOKEN_SECRET:
+      process.env.VIVA_VOICE_SESSION_TOKEN_SECRET ?? "local-e2e-session-token-secret",
+  };
 }
 
 async function submitWrittenAnswerIfFallbackOpens(targetPage) {
@@ -1004,6 +1244,14 @@ function recordServerFramePayload(payload, events) {
   } catch {
     return;
   }
+  if (frame?.type === "error") {
+    events.push({
+      message: frame.message === "invalid session token" ? frame.message : "[redacted]",
+      terminalReason: frame.message === "invalid session token" ? "session_auth_rejected" : null,
+      type: "server_error",
+    });
+    return;
+  }
   if (frame?.type !== "event" || typeof frame.event?.type !== "string") return;
 
   events.push({
@@ -1011,8 +1259,74 @@ function recordServerFramePayload(payload, events) {
     conceptStatus: frame.event.status ?? null,
     responseId: frame.event.response_id ?? null,
     sourceId: frame.event.source?.source_id ?? null,
+    terminalReason: frame.event.terminal_reason ?? null,
     type: frame.event.type,
   });
+}
+
+async function waitForFailureControlTerminal(events, plan, timeoutMs) {
+  const expectedTerminalReason = plan.scenario.terminal_reason;
+  const scenarioMarker = failureControlScenarioMarker(plan.scenario);
+  const tokenScenario = isFailureControlSessionTokenScenario(plan.scenario);
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (tokenScenario) {
+      const eventIndex = events.findIndex(
+        (event) =>
+          event.type === "server_error" && event.terminalReason === expectedTerminalReason,
+      );
+      if (eventIndex >= 0) {
+        return {
+          scenario_id: plan.scenario.id,
+          failure_class: plan.scenario.failure_class,
+          stage: plan.scenario.stage,
+          terminal_reason: expectedTerminalReason,
+          event_index: eventIndex,
+          token_recovery_path_verified: true,
+          validation_run_id: validationRunId,
+          sanitized: true,
+        };
+      }
+    } else {
+      const markerIndex = events.findIndex(
+        (event) => event.type === "question_started" && event.responseId === scenarioMarker,
+      );
+      const eventIndex = events.findIndex(
+        (event, index) =>
+          index > markerIndex &&
+          event.type === "session_phase" &&
+          event.terminalReason === expectedTerminalReason,
+      );
+      if (markerIndex >= 0 && eventIndex >= 0) {
+        return {
+          scenario_id: plan.scenario.id,
+          failure_class: plan.scenario.failure_class,
+          stage: plan.scenario.stage,
+          terminal_reason: expectedTerminalReason,
+          event_index: eventIndex,
+          scenario_marker_response_id: scenarioMarker,
+          scenario_marker_event_index: markerIndex,
+          stage_verified: true,
+          validation_run_id: validationRunId,
+          sanitized: true,
+        };
+      }
+    }
+    await delay(100);
+  }
+  const terminalReasons = events
+    .filter((event) => event.type === "session_phase" && event.terminalReason)
+    .map((event) => event.terminalReason)
+    .join(" -> ");
+  const serverErrors = events
+    .filter((event) => event.type === "server_error")
+    .map((event) => event.terminalReason ?? event.message)
+    .join(" -> ");
+  throw new Error(
+    `Timed out waiting for failure-control ${plan.scenario.id} terminal reason ${expectedTerminalReason}. Saw terminal: ${
+      terminalReasons || "none"
+    }; server_errors: ${serverErrors || "none"}`,
+  );
 }
 
 async function waitForPostAnswerProtocolProof(events, timeoutMs) {

@@ -41,6 +41,18 @@ required for public/non-loopback deployments and is paired with BAC-338 nonce
 replay hardening. Public binds still fail closed without auth and
 `VIVA_VOICE_WS_ALLOWED_ORIGINS` configured, per BAC-337.
 
+Deterministic failure controls are hard-off by default. To run a hosted
+test/monitor scenario, enable all gates together: `VIVA_FAILURE_CONTROL_ENABLED=1`,
+one `VIVA_FAILURE_CONTROL_SCENARIO`, `VIVA_FAILURE_CONTROL_SECRET`,
+`VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS`,
+`VIVA_FAILURE_CONTROL_STUDY_SET_IDS`,
+`VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS`, and
+`VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY`. The selected scenario is
+embedded as a separately signed claim inside the normal signed session token and
+is accepted only for the configured synthetic identity, study set, origin,
+session, expiry, and nonce. Do not enable it for learner identities or release
+evidence generation.
+
 Running from `agent/` directly is still supported for service-only work:
 
 ```sh
