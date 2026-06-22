@@ -83,6 +83,9 @@ export function LibraryStatusPanel({
           <div>
             <p>Privacy controls</p>
             <span>{projection.privacy.copy}</span>
+            <span>{projection.privacy.dataHandlingStatement}</span>
+            <span>{projection.privacy.retentionStatement}</span>
+            <span>{projection.privacy.deletionStatement}</span>
           </div>
           <button
             disabled={!projection.privacy.export.available || busyAction === "Export data"}

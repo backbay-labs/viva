@@ -26,6 +26,7 @@ fn adapter_defaults_are_viva_native_and_live_keys_are_explicit() {
     let config = CartesiaGeminiConfig::default();
 
     assert!(config.missing_live_keys());
+    assert!(!config.provider_zero_data_retention_confirmed());
     assert!(config
         .gemini
         .system_instruction
@@ -158,6 +159,8 @@ fn cartesia_gemini_brain_becomes_selectable_only_with_explicit_live_runtime_gate
                 ..GeminiConfig::default()
             },
             live_runtime_enabled: true,
+            cartesia_zero_data_retention_enabled: true,
+            gemini_zero_data_retention_approved: true,
             ..CartesiaGeminiConfig::default()
         },
         store,
@@ -171,6 +174,29 @@ fn cartesia_gemini_brain_becomes_selectable_only_with_explicit_live_runtime_gate
 }
 
 #[test]
+fn cartesia_gemini_brain_requires_zero_retention_confirmation_for_live_selection() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let capabilities = CartesiaGeminiBrain::new(
+        CartesiaGeminiConfig {
+            cartesia_api_key: "cartesia-key".to_owned(),
+            gemini: GeminiConfig {
+                api_key: "gemini-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            live_runtime_enabled: true,
+            ..CartesiaGeminiConfig::default()
+        },
+        store,
+    )
+    .capabilities();
+
+    assert_eq!(capabilities.provider, "cartesia_gemini");
+    assert!(capabilities.configured);
+    assert!(!capabilities.selectable);
+    assert!(!capabilities.live_runtime);
+}
+
+#[test]
 fn cartesia_gemini_brain_rejects_placeholder_keys_even_when_live_runtime_gate_is_set() {
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let capabilities = CartesiaGeminiBrain::new(
@@ -181,6 +207,8 @@ fn cartesia_gemini_brain_rejects_placeholder_keys_even_when_live_runtime_gate_is
                 ..GeminiConfig::default()
             },
             live_runtime_enabled: true,
+            cartesia_zero_data_retention_enabled: true,
+            gemini_zero_data_retention_approved: true,
             ..CartesiaGeminiConfig::default()
         },
         store,
@@ -203,6 +231,8 @@ async fn cartesia_gemini_brain_open_reaches_shared_no_network_runner_gate() {
                 api_key: "gemini-key".to_owned(),
                 ..GeminiConfig::default()
             },
+            cartesia_zero_data_retention_enabled: true,
+            gemini_zero_data_retention_approved: true,
             ..CartesiaGeminiConfig::default()
         },
         store.clone(),
@@ -232,6 +262,8 @@ async fn cartesia_gemini_brain_open_authorizes_explicit_live_runtime_without_net
                 ..GeminiConfig::default()
             },
             live_runtime_enabled: true,
+            cartesia_zero_data_retention_enabled: true,
+            gemini_zero_data_retention_approved: true,
             ..CartesiaGeminiConfig::default()
         },
         store.clone(),

@@ -21,6 +21,7 @@ export function LiveSessionShell({
   state,
   scene,
   runtime,
+  consentDisclosure,
   glyphState,
   highlightedTokens,
   conceptNodes,
@@ -50,6 +51,10 @@ export function LiveSessionShell({
   state: SessionState;
   scene?: VivaSceneState;
   runtime: RuntimeCopy;
+  consentDisclosure?: {
+    acknowledged: boolean;
+    onAcknowledge: () => void;
+  };
   glyphState: MuseGlyphState;
   highlightedTokens: string[];
   conceptNodes: ConceptNode[];
@@ -90,6 +95,23 @@ export function LiveSessionShell({
       />
 
       <div className="live-session__stage-wrap">
+        {consentDisclosure && !consentDisclosure.acknowledged ? (
+          <section aria-label="Recording disclosure" className="session-consent">
+            <div>
+              <p className="session-consent__label">Recording disclosure</p>
+              <p className="session-consent__copy">
+                Before Viva uses the microphone, acknowledge that this study session may collect
+                microphone audio, derived transcripts, answers, source-linked study events,
+                answer-attempt envelopes, nonces, and session metadata. Live mode sends audio and
+                answers to Cartesia Ink/Sonic and Google Gemini; synthetic mode stays within the
+                configured agent.
+              </p>
+            </div>
+            <button onClick={consentDisclosure.onAcknowledge} type="button">
+              Acknowledge
+            </button>
+          </section>
+        ) : null}
         <div className="live-session__stage">
           <div className="session-plate" data-state={state}>
             <QuestionStage

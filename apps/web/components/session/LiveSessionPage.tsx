@@ -93,6 +93,7 @@ export function LiveSessionPage() {
   const [textAnswerEnabled, setTextAnswerEnabled] = useState(false);
   const [textRetryOpen, setTextRetryOpen] = useState(false);
   const [submittedTextAnswer, setSubmittedTextAnswer] = useState<string>();
+  const [recordingConsentAcknowledged, setRecordingConsentAcknowledged] = useState(false);
 
   const agent = useVivaAgentSession({
     mode: "quiz",
@@ -111,6 +112,7 @@ export function LiveSessionPage() {
   const micStartGenerationRef = useRef(0);
   const capturedTurnPcm16Ref = useRef<Uint8Array[]>([]);
   const textAnswerModeRef = useRef(false);
+  const recordingConsentAcknowledgedRef = useRef(false);
   const meterRef = useRef(createVoiceLevelMeter({ coefficient: 0.3 }));
   const playbackRef = useRef<VivaAudioPlaybackSink | null>(null);
   const handledCancelRef = useRef(0);
@@ -215,7 +217,15 @@ export function LiveSessionPage() {
   );
 
   const startMic = useCallback(async () => {
-    if (captureStartedRef.current || textAnswerModeRef.current) return;
+    if (
+      !canStartMicrophoneCapture({
+        captureStarted: captureStartedRef.current,
+        consentAcknowledged: recordingConsentAcknowledgedRef.current,
+        textAnswerMode: textAnswerModeRef.current,
+      })
+    ) {
+      return;
+    }
     if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       setMicState("unsupported");
       return;
@@ -307,6 +317,12 @@ export function LiveSessionPage() {
     unlockPlayback();
     void startMic();
   }, [startMic, unlockPlayback]);
+
+  const acknowledgeRecordingDisclosure = useCallback(() => {
+    recordingConsentAcknowledgedRef.current = true;
+    setRecordingConsentAcknowledged(true);
+    onUserGesture();
+  }, [onUserGesture]);
 
   // Start listening (mic + playback unlock) on the first interaction anywhere.
   useEffect(() => {
@@ -554,6 +570,10 @@ export function LiveSessionPage() {
     <LiveSessionShell
       clockLabel="Local session clock"
       conceptNodes={conceptNodes}
+      consentDisclosure={{
+        acknowledged: recordingConsentAcknowledged,
+        onAcknowledge: acknowledgeRecordingDisclosure,
+      }}
       contextLabel={sessionContextLabel}
       elapsed={elapsed}
       glyphState={glyphStateFor(effectiveState)}
@@ -728,6 +748,14 @@ export function shouldUseLiveMicAudioTransport(input: {
     input.ready?.brain?.live_runtime === true &&
     input.ready.brain.selectable === true
   );
+}
+
+export function canStartMicrophoneCapture(input: {
+  captureStarted: boolean;
+  consentAcknowledged: boolean;
+  textAnswerMode: boolean;
+}): boolean {
+  return input.consentAcknowledged && !input.captureStarted && !input.textAnswerMode;
 }
 
 export function captureLevelForBloom(input: {

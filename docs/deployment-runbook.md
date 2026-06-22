@@ -92,8 +92,12 @@ The live Cartesia/Gemini provider remains opt-in Act 3 work. Do not set
 `fake_cartesia_gemini` provider is a deterministic no-key provider-shaped smoke
 path; it is not live. The server-side live transport gate is
 `VIVA_CARTESIA_GEMINI_LIVE_RUNTIME=1`; it must stay unset unless real
-Cartesia/Gemini credentials, budget caps, and the opt-in live smoke proof are
-being run.
+Cartesia/Gemini credentials, provider zero-data-retention confirmations, budget
+caps, and the opt-in live smoke proof are being run. Set
+`CARTESIA_ZERO_DATA_RETENTION_ENABLED=1` only after Cartesia Enterprise ZDR is
+enabled for the Viva organization. Set `GEMINI_ZERO_DATA_RETENTION_APPROVED=1`
+only after the Gemini Developer API project has ZDR approval, as described in
+`docs/data-governance.md`.
 
 ## Managed Postgres
 
@@ -246,6 +250,8 @@ for `cartesia_gemini` and after budget/time caps are set. The minimum proof is:
 AGENT_ORIGIN="https://agent.viva.example.com"
 export VIVA_AGENT_PROVIDER="cartesia_gemini"
 export VIVA_CARTESIA_GEMINI_LIVE_RUNTIME=1
+export CARTESIA_ZERO_DATA_RETENTION_ENABLED=1
+export GEMINI_ZERO_DATA_RETENTION_APPROVED=1
 : "${CARTESIA_API_KEY:?set CARTESIA_API_KEY in the secret store before live smoke}"
 : "${GEMINI_API_KEY:?set GEMINI_API_KEY in the secret store before live smoke}"
 curl -fsS "$AGENT_ORIGIN/ready" | jq '.brain.provider, .brain.selectable, .brain.live_runtime'

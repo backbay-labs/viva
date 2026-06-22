@@ -145,6 +145,11 @@ try {
       state: "visible",
       timeout: 20_000,
     });
+  await page.getByRole("button", { name: "Acknowledge" }).click();
+  await page.getByRole("button", { name: "Acknowledge" }).waitFor({
+    state: "hidden",
+    timeout: 10_000,
+  });
   const listeningText =
     agentProvider === "synthetic"
       ? "Synthetic examiner is listening."

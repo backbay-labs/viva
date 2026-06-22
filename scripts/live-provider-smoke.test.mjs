@@ -29,6 +29,20 @@ test("enabled live provider smoke requires explicit caps and audio input", () =>
           GEMINI_API_KEY: "gemini-secret",
         },
       }),
+    /zero-data-retention confirmation/,
+  );
+
+  assert.throws(
+    () =>
+      buildLiveSmokeConfig({
+        env: {
+          VIVA_LIVE_PROVIDER_SMOKE: "1",
+          CARTESIA_API_KEY: "cartesia-secret",
+          GEMINI_API_KEY: "gemini-secret",
+          CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+          GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
+        },
+      }),
     /missing live smoke cap/,
   );
 
@@ -39,6 +53,8 @@ test("enabled live provider smoke requires explicit caps and audio input", () =>
           VIVA_LIVE_PROVIDER_SMOKE: "1",
           CARTESIA_API_KEY: "cartesia-secret",
           GEMINI_API_KEY: "gemini-secret",
+          CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+          GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
           VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
           VIVA_LIVE_SMOKE_MAX_TURNS: "1",
           VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
@@ -253,6 +269,8 @@ test("runLiveProviderSmoke proves readiness, bootstrap, websocket events, and us
         VIVA_LIVE_PROVIDER_SMOKE: "1",
         CARTESIA_API_KEY: "cartesia-secret-value",
         GEMINI_API_KEY: "gemini-secret-value",
+        CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+        GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
         VIVA_VOICE_WS_BEARER_TOKEN: "bearer-secret-value",
         VIVA_LIVE_SMOKE_AUDIO_FILE: audioPath,
         VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
@@ -349,6 +367,8 @@ test("runLiveProviderSmoke fails closed when the live provider is not selectable
       VIVA_LIVE_PROVIDER_SMOKE: "1",
       CARTESIA_API_KEY: "cartesia-secret-value",
       GEMINI_API_KEY: "gemini-secret-value",
+      CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+      GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
       VIVA_LIVE_SMOKE_AUDIO_FILE: "/tmp/not-read-before-readiness.pcm",
       VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
       VIVA_LIVE_SMOKE_MAX_TURNS: "1",
@@ -404,6 +424,8 @@ test("runLiveProviderSmoke classifies malformed-stream failures without retainin
         VIVA_LIVE_PROVIDER_SMOKE: "1",
         CARTESIA_API_KEY: "cartesia-secret-value",
         GEMINI_API_KEY: "gemini-secret-value",
+        CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+        GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
         VIVA_LIVE_SMOKE_AUDIO_FILE: audioPath,
         VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
         VIVA_LIVE_SMOKE_MAX_TURNS: "1",
@@ -470,6 +492,8 @@ test("runLiveProviderSmoke classifies invalid JSON frames as malformed stream fa
         VIVA_LIVE_PROVIDER_SMOKE: "1",
         CARTESIA_API_KEY: "cartesia-secret-value",
         GEMINI_API_KEY: "gemini-secret-value",
+        CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+        GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
         VIVA_LIVE_SMOKE_AUDIO_FILE: audioPath,
         VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
         VIVA_LIVE_SMOKE_MAX_TURNS: "1",
@@ -530,6 +554,8 @@ test("runLiveProviderSmoke maps runtime rate terminal phases to quota-rate failu
         VIVA_LIVE_PROVIDER_SMOKE: "1",
         CARTESIA_API_KEY: "cartesia-secret-value",
         GEMINI_API_KEY: "gemini-secret-value",
+        CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+        GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
         VIVA_LIVE_SMOKE_AUDIO_FILE: audioPath,
         VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
         VIVA_LIVE_SMOKE_MAX_TURNS: "1",
