@@ -47,6 +47,8 @@ pub struct CartesiaGeminiConfig {
     pub ink: InkConfig,
     pub sonic: SonicConfig,
     pub live_runtime_enabled: bool,
+    pub cartesia_zero_data_retention_enabled: bool,
+    pub gemini_zero_data_retention_approved: bool,
     pub tools: Vec<serde_json::Value>,
 }
 
@@ -59,6 +61,14 @@ impl fmt::Debug for CartesiaGeminiConfig {
             .field("ink", &self.ink)
             .field("sonic", &self.sonic)
             .field("live_runtime_enabled", &self.live_runtime_enabled)
+            .field(
+                "cartesia_zero_data_retention_enabled",
+                &self.cartesia_zero_data_retention_enabled,
+            )
+            .field(
+                "gemini_zero_data_retention_approved",
+                &self.gemini_zero_data_retention_approved,
+            )
             .field("tool_count", &self.tools.len())
             .finish()
     }
@@ -72,6 +82,8 @@ impl Default for CartesiaGeminiConfig {
             ink: InkConfig::default(),
             sonic: SonicConfig::default(),
             live_runtime_enabled: false,
+            cartesia_zero_data_retention_enabled: false,
+            gemini_zero_data_retention_approved: false,
             tools: viva_tool_declarations(),
         }
     }
@@ -98,6 +110,10 @@ impl CartesiaGeminiConfig {
         };
         config.live_runtime_enabled =
             env_value("VIVA_CARTESIA_GEMINI_LIVE_RUNTIME").as_deref() == Some("1");
+        config.cartesia_zero_data_retention_enabled =
+            env_value("CARTESIA_ZERO_DATA_RETENTION_ENABLED").as_deref() == Some("1");
+        config.gemini_zero_data_retention_approved =
+            env_value("GEMINI_ZERO_DATA_RETENTION_APPROVED").as_deref() == Some("1");
         if let Some(model) =
             env_value("GEMINI_MODEL").or_else(|| env_value("GEMINI_REALTIME_MODEL"))
         {
@@ -182,8 +198,14 @@ impl CartesiaGeminiConfig {
             && !is_placeholder_live_key(&self.gemini.api_key)
     }
 
+    pub fn provider_zero_data_retention_confirmed(&self) -> bool {
+        self.cartesia_zero_data_retention_enabled && self.gemini_zero_data_retention_approved
+    }
+
     pub fn live_runtime_selectable(&self) -> bool {
-        self.live_runtime_enabled && self.selectable_live_keys()
+        self.live_runtime_enabled
+            && self.selectable_live_keys()
+            && self.provider_zero_data_retention_confirmed()
     }
 }
 
@@ -225,6 +247,12 @@ impl RealtimeBrain for CartesiaGeminiBrain {
         if !self.config.selectable_live_keys() {
             return Err(BrainError::Protocol(
                 "live Cartesia/Gemini keys must be real provider credentials; placeholder release-check keys cannot open live transports"
+                    .to_owned(),
+            ));
+        }
+        if !self.config.provider_zero_data_retention_confirmed() {
+            return Err(BrainError::Protocol(
+                "live Cartesia/Gemini requires provider zero-data-retention confirmation; set CARTESIA_ZERO_DATA_RETENTION_ENABLED=1 and GEMINI_ZERO_DATA_RETENTION_APPROVED=1 only after provider-side configuration is complete"
                     .to_owned(),
             ));
         }
@@ -600,10 +628,14 @@ mod tests {
     fn from_env_parses_live_runtime_gate_conservatively() {
         let enabled = CartesiaGeminiConfig::from_env_with(|name| match name {
             "VIVA_CARTESIA_GEMINI_LIVE_RUNTIME" => Some(" 1 ".to_owned()),
+            "CARTESIA_ZERO_DATA_RETENTION_ENABLED" => Some(" 1 ".to_owned()),
+            "GEMINI_ZERO_DATA_RETENTION_APPROVED" => Some(" 1 ".to_owned()),
             _ => None,
         });
         let disabled = CartesiaGeminiConfig::from_env_with(|name| match name {
             "VIVA_CARTESIA_GEMINI_LIVE_RUNTIME" => Some(" true ".to_owned()),
+            "CARTESIA_ZERO_DATA_RETENTION_ENABLED" => Some(" true ".to_owned()),
+            "GEMINI_ZERO_DATA_RETENTION_APPROVED" => Some(" true ".to_owned()),
             _ => None,
         });
         let alias = CartesiaGeminiConfig::from_env_with(|name| match name {
@@ -612,7 +644,10 @@ mod tests {
         });
 
         assert!(enabled.live_runtime_enabled);
+        assert!(enabled.provider_zero_data_retention_confirmed());
         assert!(!disabled.live_runtime_enabled);
+        assert!(!disabled.provider_zero_data_retention_confirmed());
         assert!(!alias.live_runtime_enabled);
+        assert!(!alias.provider_zero_data_retention_confirmed());
     }
 }

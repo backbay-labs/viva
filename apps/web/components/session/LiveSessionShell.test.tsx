@@ -934,6 +934,35 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("Closing fold");
   });
 
+  test("renders recording disclosure before microphone capture is acknowledged", () => {
+    const markup = renderToStaticMarkup(
+      <LiveSessionShell
+        clockLabel="Fixture clock"
+        conceptNodes={[...denseConceptNodes]}
+        consentDisclosure={{ acknowledged: false, onAcknowledge: noop }}
+        contextLabel="Trusted server set: Biology Midterm"
+        elapsed={12}
+        glyphState="idle"
+        highlightedTokens={["NADH"]}
+        hintShown={false}
+        onBackToQuestion={noop}
+        onEndSession={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        runtime={runtime}
+        state="listening"
+      />,
+    );
+
+    expect(markup).toContain("Recording disclosure");
+    expect(markup).toContain("Cartesia Ink/Sonic and Google Gemini");
+    expect(markup).toContain("Acknowledge");
+  });
+
   test("renders source_reference folio as a bounded museum label", () => {
     const markup = renderSourceFolioSurface();
 

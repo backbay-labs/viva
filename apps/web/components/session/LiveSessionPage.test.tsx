@@ -5,6 +5,7 @@ import type { VivaAgentAudioOutput } from "../../lib/viva-agent-client";
 import { VivaAudioWorkletUnavailableError } from "../../lib/viva-audio-capture";
 import { projectTrace } from "../../lib/viva-session-projection";
 import {
+  canStartMicrophoneCapture,
   captureLevelForBloom,
   derivedStateWithProjectedRecap,
   drainAgentAudio,
@@ -218,6 +219,37 @@ describe("LiveSessionPage recap cleanup", () => {
       shouldUseLiveMicAudioTransport({
         ready: { brain: { live_runtime: true, selectable: true } },
         status: "open",
+        textAnswerMode: true,
+      }),
+    ).toBe(false);
+  });
+
+  test("does not start microphone capture before recording disclosure acknowledgement", () => {
+    expect(
+      canStartMicrophoneCapture({
+        captureStarted: false,
+        consentAcknowledged: false,
+        textAnswerMode: false,
+      }),
+    ).toBe(false);
+    expect(
+      canStartMicrophoneCapture({
+        captureStarted: false,
+        consentAcknowledged: true,
+        textAnswerMode: false,
+      }),
+    ).toBe(true);
+    expect(
+      canStartMicrophoneCapture({
+        captureStarted: true,
+        consentAcknowledged: true,
+        textAnswerMode: false,
+      }),
+    ).toBe(false);
+    expect(
+      canStartMicrophoneCapture({
+        captureStarted: false,
+        consentAcknowledged: true,
         textAnswerMode: true,
       }),
     ).toBe(false);

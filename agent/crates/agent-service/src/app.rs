@@ -665,6 +665,9 @@ struct LibraryPrivacyResponse {
     export_contains_raw_provider_payloads: bool,
     export: LibraryAction,
     copy: &'static str,
+    data_handling_statement: &'static str,
+    retention_statement: &'static str,
+    deletion_statement: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1484,6 +1487,9 @@ fn privacy_response(state: &AppState, export: LibraryAction) -> LibraryPrivacyRe
         } else {
             "Voice recordings and transcripts are not saved; Viva stores sanitized study meaning only."
         },
+        data_handling_statement: "Viva records sanitized study-set records, source summaries, session status, recaps, review items, usage rows, answer-attempt envelopes, and nonce rows; this configured store does not retain raw microphone audio or raw transcripts.",
+        retention_statement: "Durable Postgres rows remain until the tester deletes the session recap or the study set; local in-memory rows expire with the process.",
+        deletion_statement: "Delete recap removes the session recap, review items, usage rows, answer-attempt envelopes, and nonce rows while marking the session deleted. Delete source tombstones source material and purges the set's session artifacts.",
     }
 }
 

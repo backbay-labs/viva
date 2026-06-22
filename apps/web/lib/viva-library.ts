@@ -74,6 +74,9 @@ export type VivaLibraryPrivacy = {
   export_contains_raw_provider_payloads: boolean;
   export: VivaLibraryAction;
   copy: string;
+  data_handling_statement?: string;
+  retention_statement?: string;
+  deletion_statement?: string;
 };
 
 export type VivaLibrarySnapshot = {
@@ -148,6 +151,9 @@ export type ProjectedLibraryPrivacy = {
   exportContainsRawProviderPayloads: boolean;
   export: ProjectedLibraryAction;
   copy: string;
+  dataHandlingStatement: string;
+  retentionStatement: string;
+  deletionStatement: string;
 };
 
 export type VivaLibraryProjection = {
@@ -260,6 +266,9 @@ function projectPrivacy(privacy: VivaLibraryPrivacy): ProjectedLibraryPrivacy {
     exportContainsRawProviderPayloads: privacy.export_contains_raw_provider_payloads,
     export: projectMutationAction(privacy.export),
     copy: privacy.copy,
+    dataHandlingStatement: privacy.data_handling_statement ?? privacy.copy,
+    retentionStatement: privacy.retention_statement ?? privacy.copy,
+    deletionStatement: privacy.deletion_statement ?? privacy.copy,
   };
 }
 

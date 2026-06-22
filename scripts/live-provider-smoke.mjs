@@ -74,6 +74,14 @@ export function buildLiveSmokeConfig({ env = process.env, rootDir = root } = {})
   if (!hasValue(env.CARTESIA_API_KEY) || !hasValue(env.GEMINI_API_KEY)) {
     throw new Error("live provider secrets are required when smoke is enabled");
   }
+  if (
+    env.CARTESIA_ZERO_DATA_RETENTION_ENABLED !== "1" ||
+    env.GEMINI_ZERO_DATA_RETENTION_APPROVED !== "1"
+  ) {
+    throw new Error(
+      "live provider zero-data-retention confirmation is required when smoke is enabled",
+    );
+  }
 
   const caps = {
     max_duration_ms: requiredPositiveInteger(env, "VIVA_LIVE_SMOKE_MAX_DURATION_MS"),

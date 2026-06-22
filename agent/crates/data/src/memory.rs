@@ -899,6 +899,11 @@ fn remove_session_artifacts(
             || record.study_set_id != study_set_id
             || !voice_session_ids.contains(&record.voice_session_id)
     });
+    state.session_token_nonces.retain(|record| {
+        record.user_id != user_id
+            || record.study_set_id != study_set_id
+            || !voice_session_ids.contains(&record.voice_session_id)
+    });
 }
 
 pub(crate) fn source_reference_to_summary(source: &StudySourceReference) -> StudySourceSpanSummary {
@@ -2342,12 +2347,15 @@ impl StudyMemoryStore for InMemoryStudyStore {
 
         let mut hidden_sessions = 0usize;
         let mut affected_sessions = HashSet::new();
-        for session in state.sessions.iter_mut().filter(|session| {
-            session.user_id == user_id
-                && session.study_set_id == study_set_id
-                && session.status != "deleted"
-        }) {
+        for session in state
+            .sessions
+            .iter_mut()
+            .filter(|session| session.user_id == user_id && session.study_set_id == study_set_id)
+        {
             affected_sessions.insert(session.voice_session_id.clone());
+            if session.status == "deleted" {
+                continue;
+            }
             session.status = "deleted".to_owned();
             session.ended_at.get_or_insert_with(|| "deleted".to_owned());
             session.terminal_reason = Some("deleted".to_owned());
@@ -3083,6 +3091,91 @@ mod tests {
             mode: Some(StudyMode::Quiz),
             ..SessionConfig::default()
         }
+    }
+
+    async fn record_fixture_answer(store: &InMemoryStudyStore, voice_session_id: &str) {
+        let question = fixture_question();
+        store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                voice_session_id,
+                "response-1",
+                AnswerEvaluation {
+                    question_id: question.question_id,
+                    answer_text: "NADH gives electrons.".to_owned(),
+                    label: "mostly correct".to_owned(),
+                    concise_feedback: "Source-backed correction.".to_owned(),
+                    retry_prompt: question.follow_up,
+                    source: question.source,
+                    concept_status: ConceptStatus::Strong,
+                    confidence_score: 0.84,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deletion_removes_session_nonces_and_answer_envelopes() {
+        let store = seeded_store();
+        record_fixture_session(&store).await;
+        let session_nonce = SessionTokenNonceClaim {
+            user_id: "user-1".to_owned(),
+            study_set_id: "biology-midterm".to_owned(),
+            voice_session_id: "voice-session-1".to_owned(),
+            nonce: "nonce-session-delete".to_owned(),
+            expires_at: 1_800_000_000,
+        };
+        store
+            .claim_session_token_nonce(session_nonce)
+            .await
+            .expect("records nonce for session deletion");
+        record_fixture_answer(&store, "voice-session-1").await;
+        assert_eq!(store.snapshot().session_token_nonces.len(), 1);
+        assert_eq!(store.snapshot().answer_attempts.len(), 1);
+
+        store
+            .delete_session_history("user-1", "biology-midterm", "voice-session-1")
+            .await
+            .expect("deletes session history");
+        let session_deleted = store.snapshot();
+        assert!(session_deleted.session_token_nonces.is_empty());
+        assert!(session_deleted.answer_attempts.is_empty());
+
+        let study_delete_session_id = "voice-session-study-delete";
+        store
+            .record_voice_session(&SessionConfig {
+                session_id: Some(SessionId::new(study_delete_session_id)),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .expect("records study-delete session");
+        let study_nonce = SessionTokenNonceClaim {
+            user_id: "user-1".to_owned(),
+            study_set_id: "biology-midterm".to_owned(),
+            voice_session_id: study_delete_session_id.to_owned(),
+            nonce: "nonce-study-delete".to_owned(),
+            expires_at: 1_800_000_000,
+        };
+        store
+            .claim_session_token_nonce(study_nonce)
+            .await
+            .expect("records nonce for study deletion");
+        record_fixture_answer(&store, study_delete_session_id).await;
+        assert_eq!(store.snapshot().session_token_nonces.len(), 1);
+        assert_eq!(store.snapshot().answer_attempts.len(), 1);
+
+        store
+            .delete_study_set("user-1", "biology-midterm")
+            .await
+            .expect("deletes study set");
+        let study_deleted = store.snapshot();
+        assert!(study_deleted.session_token_nonces.is_empty());
+        assert!(study_deleted.answer_attempts.is_empty());
     }
 
     fn add_second_active_question_with_source(store: &InMemoryStudyStore) -> StudyQuestion {

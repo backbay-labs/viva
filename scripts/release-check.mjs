@@ -91,11 +91,44 @@ try {
     artifact_audit: artifactAudit,
     release_bundle: buildReleaseBundleManifest(outputPath, commands, browserResult),
     privacy: {
+      consent_disclosure_in_product: true,
+      data_handling_statement: "docs/data-governance.md",
+      tester_deletion_procedure: "docs/data-governance.md#delete-this-testers-session-data",
+      provider_retention_statement: "docs/data-governance.md#provider-retention-and-zero-retention",
       raw_audio_persisted: false,
       transcripts_persisted: false,
       answers_persisted: false,
       raw_source_excerpts_in_bundle: false,
       secrets_in_bundle: false,
+      consent_records_contain_raw_payloads: false,
+      governance_artifacts_contain_raw_payloads: false,
+      deletion_proof: {
+        in_memory_unit_test: "deletion_removes_session_nonces_and_answer_envelopes",
+        optional_postgres_test:
+          "optional_postgres_privacy_deletes_purge_usage_and_preserve_deleted_sessions_when_database_url_is_set",
+        proves_removed: [
+          "nonce rows",
+          "answer-attempt envelopes",
+          "usage rows",
+          "recaps",
+          "review items",
+        ],
+        proves_session_tombstoned: true,
+      },
+      provider_zero_retention: {
+        cartesia: {
+          services: ["Ink STT", "Sonic TTS"],
+          account_setting_required: true,
+          confirmation_flag: "CARTESIA_ZERO_DATA_RETENTION_ENABLED=1",
+          confirmed_in_default_release_evidence: false,
+        },
+        gemini: {
+          service: "Gemini Developer API",
+          project_approval_required: true,
+          confirmation_flag: "GEMINI_ZERO_DATA_RETENTION_APPROVED=1",
+          confirmed_in_default_release_evidence: false,
+        },
+      },
     },
   };
 

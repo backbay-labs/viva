@@ -90,6 +90,10 @@ test("provider readiness matrix keeps gated live configured but not selectable",
   assert.equal(live.observed.configured, true);
   assert.equal(live.observed.selectable, false);
   assert.equal(live.observed.live_runtime, false);
+  assert.equal(live.data_governance.external_provider_zero_retention_required, true);
+  assert.equal(live.data_governance.cartesia_zero_data_retention_enabled, false);
+  assert.equal(live.data_governance.gemini_zero_data_retention_approved, false);
+  assert.equal(live.data_governance.live_selectability_requires_zero_retention, true);
   assert.equal(
     live.live_open_attempt_before_network.proved_by_command,
     "live_provider_no_network_gate_tests",

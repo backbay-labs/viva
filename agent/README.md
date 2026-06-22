@@ -18,7 +18,10 @@ keys and is the only provider used unless explicitly overridden. Use
 Cartesia/Gemini-shaped runtime through the real WebSocket service boundary. Live
 `cartesia_gemini` requires `VIVA_AGENT_PROVIDER=cartesia_gemini`, real
 Cartesia/Gemini credentials, and the explicit
-`VIVA_CARTESIA_GEMINI_LIVE_RUNTIME=1` transport gate.
+`VIVA_CARTESIA_GEMINI_LIVE_RUNTIME=1` transport gate. Live selection also
+requires `CARTESIA_ZERO_DATA_RETENTION_ENABLED=1` and
+`GEMINI_ZERO_DATA_RETENTION_APPROVED=1`; set those only after the provider-side
+controls described in `docs/data-governance.md` are confirmed.
 
 `bun run dev:agent` is the no-secret loopback path. It defaults
 `VIVA_AGENT_BIND_ADDR` to `127.0.0.1:4318`, defaults the provider to

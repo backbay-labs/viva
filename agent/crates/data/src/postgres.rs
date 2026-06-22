@@ -1265,6 +1265,15 @@ impl StudyMemoryStore for PostgresStudyStore {
         .execute(&mut *tx)
         .await
         .map_err(pg_error)?;
+        sqlx::query(
+            "DELETE FROM voice_session_token_nonces
+             WHERE user_id = $1 AND study_set_id = $2",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
 
         tx.commit().await.map_err(pg_error)?;
         self.event_authorizations
@@ -1354,6 +1363,16 @@ impl StudyMemoryStore for PostgresStudyStore {
             .execute(&mut *tx)
             .await
             .map_err(pg_error)?;
+        sqlx::query(
+            "DELETE FROM voice_session_token_nonces
+             WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
         tx.commit().await.map_err(pg_error)?;
 
         self.event_authorizations

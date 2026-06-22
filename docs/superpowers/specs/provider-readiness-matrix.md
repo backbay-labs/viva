@@ -22,6 +22,12 @@ used here must remain non-selectable even if the live runtime gate exists. The
 written definition of live provider proof is
 `docs/superpowers/specs/live-cartesia-gemini-definition.md`.
 
+The live provider row also records sanitized provider-governance flags. Default
+release evidence must report `cartesia_zero_data_retention_enabled=false` and
+`gemini_zero_data_retention_approved=false`; production-like live selection may
+set those flags only after the provider-side confirmations in
+`docs/data-governance.md`.
+
 ## No-Network Gate Proof
 
 `release:check` also runs the `live_provider_no_network_gate_tests` command,

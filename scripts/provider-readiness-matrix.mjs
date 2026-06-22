@@ -5,6 +5,13 @@ export const PROVIDER_READINESS_TARGETS = Object.freeze([
     provider: "synthetic",
     role: "default no-key synthetic brain",
     configuredWithPlaceholderKeys: false,
+    dataGovernance: Object.freeze({
+      external_provider_zero_retention_required: false,
+      cartesia_zero_data_retention_enabled: false,
+      gemini_zero_data_retention_approved: false,
+      live_selectability_requires_zero_retention: false,
+      source_document: "docs/data-governance.md",
+    }),
     env: Object.freeze({}),
     expected: Object.freeze({
       health_http_status: 200,
@@ -22,6 +29,13 @@ export const PROVIDER_READINESS_TARGETS = Object.freeze([
     provider: "fake_cartesia_gemini",
     role: "deterministic fake Cartesia/Gemini provider",
     configuredWithPlaceholderKeys: false,
+    dataGovernance: Object.freeze({
+      external_provider_zero_retention_required: false,
+      cartesia_zero_data_retention_enabled: false,
+      gemini_zero_data_retention_approved: false,
+      live_selectability_requires_zero_retention: false,
+      source_document: "docs/data-governance.md",
+    }),
     env: Object.freeze({}),
     expected: Object.freeze({
       health_http_status: 200,
@@ -39,6 +53,13 @@ export const PROVIDER_READINESS_TARGETS = Object.freeze([
     provider: "cartesia_gemini",
     role: "gated Act 3 live Cartesia/Gemini provider",
     configuredWithPlaceholderKeys: true,
+    dataGovernance: Object.freeze({
+      external_provider_zero_retention_required: true,
+      cartesia_zero_data_retention_enabled: false,
+      gemini_zero_data_retention_approved: false,
+      live_selectability_requires_zero_retention: true,
+      source_document: "docs/data-governance.md",
+    }),
     env: Object.freeze({
       CARTESIA_API_KEY: "viva-release-check-cartesia-placeholder-key",
       GEMINI_API_KEY: "viva-release-check-gemini-placeholder-key",
@@ -113,6 +134,7 @@ function buildProviderReadinessRow(target, entry) {
     role: target.role,
     configured_with_placeholder_keys: target.configuredWithPlaceholderKeys,
     key_values_recorded: false,
+    data_governance: cloneJson(target.dataGovernance),
     expected: cloneJson(target.expected),
     observed,
     endpoints: {
@@ -204,6 +226,24 @@ function validateProviderReadinessRow(target, row) {
       errors,
       "live provider network requirement",
       row.live_open_attempt_before_network?.provider_network_required,
+      false,
+    );
+    expectEqual(
+      errors,
+      "live provider zero retention required",
+      row.data_governance.external_provider_zero_retention_required,
+      true,
+    );
+    expectEqual(
+      errors,
+      "live provider Cartesia ZDR not asserted by placeholder evidence",
+      row.data_governance.cartesia_zero_data_retention_enabled,
+      false,
+    );
+    expectEqual(
+      errors,
+      "live provider Gemini ZDR not asserted by placeholder evidence",
+      row.data_governance.gemini_zero_data_retention_approved,
       false,
     );
   }

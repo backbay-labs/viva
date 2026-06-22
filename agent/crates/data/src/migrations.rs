@@ -781,13 +781,32 @@ mod tests {
             })
             .await
             .expect("records privacy usage");
+        let session_delete_nonce = SessionTokenNonceClaim {
+            user_id: "user-1".to_owned(),
+            study_set_id: "biology-midterm".to_owned(),
+            voice_session_id: session_id.to_owned(),
+            nonce: "nonce-session-delete".to_owned(),
+            expires_at: 1_800_000_000,
+        };
+        store
+            .claim_session_token_nonce(session_delete_nonce.clone())
+            .await
+            .expect("records nonce for session deletion proof");
         assert_eq!(usage_rows_for_session(&pool, session_id).await, 1);
+        assert_eq!(
+            session_token_nonce_rows(&pool, &session_delete_nonce).await,
+            1
+        );
 
         store
             .delete_session_history("user-1", "biology-midterm", session_id)
             .await
             .expect("deletes session history");
         assert_eq!(usage_rows_for_session(&pool, session_id).await, 0);
+        assert_eq!(
+            session_token_nonce_rows(&pool, &session_delete_nonce).await,
+            0
+        );
         store
             .record_voice_usage(VoiceUsageRecord {
                 voice_session_id: Some(session_id.to_owned()),
@@ -845,8 +864,23 @@ mod tests {
             })
             .await
             .expect("records study delete usage");
+        let study_delete_nonce = SessionTokenNonceClaim {
+            user_id: "user-1".to_owned(),
+            study_set_id: "biology-midterm".to_owned(),
+            voice_session_id: study_delete_session_id.to_owned(),
+            nonce: "nonce-study-delete".to_owned(),
+            expires_at: 1_800_000_000,
+        };
+        store
+            .claim_session_token_nonce(study_delete_nonce.clone())
+            .await
+            .expect("records nonce for study set deletion proof");
         assert_eq!(
             usage_rows_for_session(&pool, study_delete_session_id).await,
+            1
+        );
+        assert_eq!(
+            session_token_nonce_rows(&pool, &study_delete_nonce).await,
             1
         );
 
@@ -856,6 +890,10 @@ mod tests {
             .expect("deletes study set privacy artifacts");
         assert_eq!(
             usage_rows_for_session(&pool, study_delete_session_id).await,
+            0
+        );
+        assert_eq!(
+            session_token_nonce_rows(&pool, &study_delete_nonce).await,
             0
         );
         store

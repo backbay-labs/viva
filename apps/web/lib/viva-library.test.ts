@@ -5,9 +5,12 @@ const snapshot: VivaLibrarySnapshot = {
   user_id: "user-1",
   privacy: {
     copy: "Voice recordings and transcripts are not saved; Viva stores sanitized study meaning only.",
+    data_handling_statement: "Viva stores sanitized session records and answer-attempt envelopes.",
+    deletion_statement: "Delete recap removes session artifacts and nonce rows.",
     export: { available: true, control_token: "viva1.control-token" },
     export_contains_raw_provider_payloads: false,
     raw_audio_persistence: false,
+    retention_statement: "Durable rows remain until deletion.",
     transcript_persistence: false,
     transcripts_saved: false,
     voice_recordings_saved: false,
@@ -168,6 +171,9 @@ describe("Viva library projection", () => {
     expect(projection.privacy.exportContainsRawProviderPayloads).toBe(false);
     expect(projection.privacy.export.available).toBe(true);
     expect(projection.privacy.copy).toContain("Voice recordings and transcripts are not saved");
+    expect(projection.privacy.dataHandlingStatement).toContain("answer-attempt envelopes");
+    expect(projection.privacy.retentionStatement).toContain("until deletion");
+    expect(projection.privacy.deletionStatement).toContain("nonce rows");
     expect(projection.libraryRows.map((row) => row.id)).toEqual([
       "biology-midterm",
       "pending-set",
