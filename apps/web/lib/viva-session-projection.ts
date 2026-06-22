@@ -4,8 +4,10 @@ import {
   type Concept,
   type ConceptStatus,
   type EvaluationLabel,
+  type RuntimeCopyCause,
   reviewIntervalForStatus,
   type SourceReference,
+  VIVA_LEARNER_LOOP_CONTRACT,
   type VivaReadyFrame,
 } from "@viva/core";
 import type {
@@ -59,34 +61,6 @@ export type SourceFolioProjection = {
   challengeLabel: string;
   regionNavigation: string;
 };
-
-export type RuntimeCopyCause =
-  | "api_missing"
-  | "agent_offline"
-  | "auth_failed"
-  | "cost_budget"
-  | "drained"
-  | "fake_provider"
-  | "ingestion_failed"
-  | "ingestion_pending"
-  | "live_provider_gated"
-  | "live_runtime"
-  | "mic_denied"
-  | "partial_stage_success"
-  | "provider_auth_failed"
-  | "provider_cancelled"
-  | "provider_malformed_stream"
-  | "provider_network_disconnect"
-  | "provider_rate_limited"
-  | "provider_timeout"
-  | "rate_limit"
-  | "session_cap"
-  | "session_disconnected"
-  | "slow_client"
-  | "store_unavailable"
-  | "synthetic"
-  | "turn_cap"
-  | "unexpected_close";
 
 export type RuntimeCopy = {
   capsuleLabel: string;
@@ -224,7 +198,7 @@ export function projectRuntimeCopy({
     websocketReady: Boolean(ready) && status === "open",
   };
 
-  if (status === "closed" && terminalReason) {
+  if (terminalReason) {
     return controlledTerminalCopy(terminalReason, context);
   }
 
@@ -494,156 +468,40 @@ function controlledTerminalCopy(
   reason: AgentTerminalSessionReason,
   context: RuntimeProjectionContext,
 ): RuntimeCopy {
-  const copyByReason: Record<
-    AgentTerminalSessionReason,
-    Pick<
-      RuntimeCopy,
-      "capsuleLabel" | "marginaliaTitle" | "marginaliaText" | "statusLabel" | "cause"
-    >
-  > = {
-    drained: {
-      capsuleLabel: "Session drained",
-      marginaliaTitle: "The deploy drain closed this manuscript.",
-      marginaliaText:
-        "The Conductor entered deploy drain and closed the manuscript after emitting a terminal phase.",
-      statusLabel: "drained",
-      cause: "drained",
-    },
-    session_cap: {
-      capsuleLabel: "Session cap reached",
-      marginaliaTitle: "The session cap closed this manuscript.",
-      marginaliaText:
-        "The Conductor reached the session cap and closed the manuscript after emitting a terminal phase.",
-      statusLabel: "session cap",
-      cause: "session_cap",
-    },
-    turn_cap: {
-      capsuleLabel: "Turn cap reached",
-      marginaliaTitle: "The turn cap closed this manuscript.",
-      marginaliaText:
-        "The Conductor reached the turn cap and closed the manuscript after emitting a terminal phase.",
-      statusLabel: "turn cap",
-      cause: "turn_cap",
-    },
-    rate_limit: {
-      capsuleLabel: "Rate limit reached",
-      marginaliaTitle: "The rate limit closed this manuscript.",
-      marginaliaText:
-        "The Conductor reached the voice rate limit and closed the manuscript after emitting a terminal phase.",
-      statusLabel: "rate limit",
-      cause: "rate_limit",
-    },
-    cost_budget: {
-      capsuleLabel: "Budget cap reached",
-      marginaliaTitle: "The cost budget closed this manuscript.",
-      marginaliaText:
-        "The Conductor reached the live-provider cost budget and closed the manuscript after emitting a terminal phase.",
-      statusLabel: "budget cap",
-      cause: "cost_budget",
-    },
-    provider_auth_failed: {
-      capsuleLabel: "Provider auth failed",
-      marginaliaTitle: "Live provider access was denied.",
-      marginaliaText:
-        "The live provider rejected access before the manuscript could open another trusted turn.",
-      statusLabel: "provider auth failed",
-      cause: "provider_auth_failed",
-    },
-    provider_rate_limited: {
-      capsuleLabel: "Provider rate limited",
-      marginaliaTitle: "Live provider quota stopped this turn.",
-      marginaliaText:
-        "The provider quota or rate limit closed the manuscript before a complete live response.",
-      statusLabel: "provider rate limited",
-      cause: "provider_rate_limited",
-    },
-    provider_timeout: {
-      capsuleLabel: "Provider timeout",
-      marginaliaTitle: "Live provider timed out.",
-      marginaliaText:
-        "The live stream did not reach the next required stage within the configured cap.",
-      statusLabel: "provider timeout",
-      cause: "provider_timeout",
-    },
-    provider_malformed_stream: {
-      capsuleLabel: "Provider stream failed",
-      marginaliaTitle: "Live provider stream was malformed.",
-      marginaliaText:
-        "The stream produced an invalid or structured error frame, so Viva closed it without retaining provider contents.",
-      statusLabel: "provider stream failed",
-      cause: "provider_malformed_stream",
-    },
-    provider_network_disconnect: {
-      capsuleLabel: "Provider disconnected",
-      marginaliaTitle: "Live provider connection dropped.",
-      marginaliaText:
-        "The provider transport disconnected before the manuscript received a complete terminal phase.",
-      statusLabel: "provider disconnected",
-      cause: "provider_network_disconnect",
-    },
-    slow_client: {
-      capsuleLabel: "Client too slow",
-      marginaliaTitle: "The client missed the live-turn cap.",
-      marginaliaText:
-        "The client did not finish the live turn within the configured turn or audio cap.",
-      statusLabel: "client too slow",
-      cause: "slow_client",
-    },
-    provider_cancelled: {
-      capsuleLabel: "Provider cancelled",
-      marginaliaTitle: "Live provider cancelled the turn.",
-      marginaliaText: "The live response was cancelled before Viva could produce a complete recap.",
-      statusLabel: "provider cancelled",
-      cause: "provider_cancelled",
-    },
-    partial_stage_success: {
-      capsuleLabel: "Partial live result",
-      marginaliaTitle: "Live provider reached only part of the turn.",
-      marginaliaText:
-        "The stream reached a later stage but missed at least one required live-smoke proof event.",
-      statusLabel: "partial live result",
-      cause: "partial_stage_success",
-    },
-  };
-  const actionByReason: Record<
-    AgentTerminalSessionReason,
+  const contractState = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+    (state) => state.terminal_reason === reason,
+  );
+  if (!contractState) {
+    return runtimeCopy(
+      {
+        capsuleLabel: "Session closed",
+        marginaliaTitle: "The session closed.",
+        marginaliaText: "The Conductor emitted a terminal phase for this manuscript.",
+        statusLabel: reason.replaceAll("_", " "),
+        cause: reason as RuntimeCopyCause,
+      },
+      context,
+      retryAgentAction(),
+    );
+  }
+  const { copy } = contractState;
+  const intent = copy.primary_action_intent;
+  return runtimeCopy(
     {
-      disabled: boolean;
-      intent: RuntimePrimaryActionIntent;
-      nextActionLabel: string;
-      primaryActionLabel: string;
-    }
-  > = {
-    drained: startAgainAction(),
-    session_cap: startAgainAction(),
-    turn_cap: startAgainAction(),
-    rate_limit: startAgainAction(),
-    cost_budget: startAgainAction(),
-    provider_auth_failed: {
-      disabled: false,
-      intent: "retry_agent",
-      nextActionLabel: "Check provider access",
-      primaryActionLabel: "Check provider access",
+      capsuleLabel: copy.capsule_label,
+      marginaliaTitle: copy.marginalia_title,
+      marginaliaText: copy.marginalia_text,
+      statusLabel: copy.status_label,
+      cause: contractState.runtime_copy_causes[0] ?? (reason as RuntimeCopyCause),
     },
-    provider_rate_limited: {
-      disabled: false,
-      intent: "retry_agent",
-      nextActionLabel: "Retry after quota resets",
-      primaryActionLabel: "Retry after quota resets",
+    context,
+    {
+      disabled: intent === "disabled",
+      intent,
+      nextActionLabel: copy.next_action_label,
+      primaryActionLabel: copy.primary_action_label,
     },
-    provider_timeout: retryAgentAction(),
-    provider_malformed_stream: retryAgentAction(),
-    provider_network_disconnect: retryAgentAction(),
-    slow_client: startAgainAction(),
-    provider_cancelled: startAgainAction(),
-    partial_stage_success: {
-      disabled: false,
-      intent: "start_session",
-      nextActionLabel: "Review partial recap",
-      primaryActionLabel: "Review partial recap",
-    },
-  };
-  return runtimeCopy(copyByReason[reason], context, actionByReason[reason]);
+  );
 }
 
 function runtimeCopy(
@@ -716,20 +574,6 @@ function retryAgentAction(): {
     intent: "retry_agent",
     nextActionLabel: "Retry agent",
     primaryActionLabel: "Retry agent",
-  };
-}
-
-function startAgainAction(): {
-  disabled: boolean;
-  intent: RuntimePrimaryActionIntent;
-  nextActionLabel: string;
-  primaryActionLabel: string;
-} {
-  return {
-    disabled: false,
-    intent: "start_session",
-    nextActionLabel: "Start a new session",
-    primaryActionLabel: "Start again",
   };
 }
 
@@ -1005,6 +849,16 @@ export function projectSessionQuestion(
   now: Date,
 ): Question {
   if (derived.recap) return recapClosingQuestion(derived.recap);
+  const terminalWithoutRecap = derived.phase === "recap" && Boolean(derived.terminalReason);
+  if (terminalWithoutRecap) {
+    return {
+      ...EMPTY_QUESTION,
+      prompt: "This session has ended.",
+      status: "",
+      pending: false,
+      terminal: true,
+    };
+  }
 
   const agentQuestion = derived.question;
   if (!agentQuestion) {
@@ -1180,12 +1034,14 @@ export function projectTrace(
   status: VivaAgentConnectionStatus,
   now: Date,
 ): TraceProjection {
-  const hasAgentQuestion = Boolean(derived.question);
+  const terminalWithoutRecap =
+    derived.phase === "recap" && Boolean(derived.terminalReason) && !derived.recap;
+  const hasAgentQuestion = Boolean(derived.question) && !terminalWithoutRecap;
   const state = derived.recap ? "recap" : projectSessionState(derived.phase, hasAgentQuestion);
   return {
     state,
     question: projectSessionQuestion(derived, status, now),
-    highlightedTokens: projectHighlightedTokens(state, derived),
+    highlightedTokens: terminalWithoutRecap ? [] : projectHighlightedTokens(state, derived),
     hasAgentQuestion,
   };
 }

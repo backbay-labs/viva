@@ -301,6 +301,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
     tokio::pin!(session_cap);
     let turn_cap = tokio::time::sleep(state.ws_timeouts.idle);
     tokio::pin!(turn_cap);
+    let pre_answer_idle = tokio::time::sleep(state.ws_timeouts.idle);
+    tokio::pin!(pre_answer_idle);
+    let mut pre_answer_idle_armed = true;
+    let mut turn_cap_deadline: Option<Instant> = None;
+    let mut pending_submitted_answers = 0_u32;
+    let mut resolved_submitted_answer_response_ids = HashSet::<String>::new();
     let mut drain_signal = state.drain_signal.subscribe();
     if *drain_signal.borrow_and_update() {
         terminal_reason = close_with_terminal_session_phase(
@@ -338,7 +344,17 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
                 .await;
                 break;
             }
-            _ = &mut turn_cap => {
+            _ = &mut pre_answer_idle, if pre_answer_idle_armed => {
+                terminal_reason = close_with_terminal_session_phase(
+                    &mut sender,
+                    &session.input,
+                    TerminalSessionReason::TurnCap,
+                    close_code::POLICY,
+                )
+                .await;
+                break;
+            }
+            _ = &mut turn_cap, if turn_cap_deadline.is_some() => {
                 terminal_reason = close_with_terminal_session_phase(
                     &mut sender,
                     &session.input,
@@ -359,16 +375,58 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
                     terminal_reason = "client_disconnect";
                     break;
                 };
-                turn_cap
-                    .as_mut()
-                    .reset(Instant::now() + state.ws_timeouts.idle);
-                match handle_client_message_with_drain(
+                let client_input = match prepare_client_message_with_drain(
                     message,
-                    &session.input,
                     &session_binding,
                     &state.voice_limits,
                     &mut session_limits,
+                ) {
+                    Ok(client_input) => client_input,
+                    Err(ClientMessageError::Drained) => {
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            TerminalSessionReason::Drained,
+                            close_code::NORMAL,
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(ClientMessageError::RateLimit) => {
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            TerminalSessionReason::RateLimit,
+                            close_code::POLICY,
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(ClientMessageError::Frame(error)) => {
+                        let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+                        let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
+                        terminal_reason = error.terminal_reason;
+                        break;
+                    }
+                    Err(ClientMessageError::TurnCap) => unreachable!("pre-send parsing cannot trip turn cap"),
+                };
+                let parsed_action = client_input.action();
+                let turn_send_deadline = if parsed_action.arms_turn_cap() {
+                    pre_answer_idle_armed = false;
+                    pending_submitted_answers = pending_submitted_answers.saturating_add(1);
+                    Some(*turn_cap_deadline.get_or_insert_with(|| {
+                        let deadline = Instant::now() + state.ws_timeouts.idle;
+                        turn_cap.as_mut().reset(deadline);
+                        deadline
+                    }))
+                } else {
+                    None
+                };
+                match send_client_input_action_with_drain(
+                    &session.input,
+                    client_input,
                     &mut drain_signal,
+                    turn_send_deadline,
                 )
                 .await
                 {
@@ -393,7 +451,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
                                 )
                                 .await
                                 {
-                                    Ok(ForwardBrainEvent::Continue) => {}
+                                    Ok(ForwardBrainEvent::Continue | ForwardBrainEvent::Suppressed) => {}
                                     Ok(ForwardBrainEvent::Rejected) => {
                                         terminal_reason = "provider_source_authority_rejected";
                                         let _ = close_with(
@@ -467,12 +525,23 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
                         terminal_reason = error.terminal_reason;
                         break;
                     }
+                    Err(ClientMessageError::TurnCap) => {
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            TerminalSessionReason::TurnCap,
+                            close_code::POLICY,
+                        )
+                        .await;
+                        break;
+                    }
                 }
             }
             event = session.events.recv() => {
                 let Some(event) = event else {
                     break;
                 };
+                let submitted_answer_resolution = brain_event_submitted_answer_resolution(&event);
                 let mut forward_context = BrainForwardContext {
                     state: &state,
                     voice_session_id: voice_session_id.clone(),
@@ -489,7 +558,31 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
                 )
                 .await
                 {
-                    Ok(ForwardBrainEvent::Continue) => {}
+                    Ok(ForwardBrainEvent::Continue) => {
+                        if let Some(resolution) = submitted_answer_resolution {
+                            match resolution {
+                                SubmittedAnswerResolution::One { response_id } => {
+                                    let count_resolution = match response_id {
+                                        Some(response_id) => resolved_submitted_answer_response_ids
+                                            .insert(response_id),
+                                        None => true,
+                                    };
+                                    if count_resolution {
+                                        pending_submitted_answers =
+                                            pending_submitted_answers.saturating_sub(1);
+                                    }
+                                }
+                                SubmittedAnswerResolution::All => {
+                                    pending_submitted_answers = 0;
+                                    resolved_submitted_answer_response_ids.clear();
+                                }
+                            }
+                            if pending_submitted_answers == 0 {
+                                turn_cap_deadline = None;
+                            }
+                        }
+                    }
+                    Ok(ForwardBrainEvent::Suppressed) => {}
                     Ok(ForwardBrainEvent::Rejected) => {
                         terminal_reason = "provider_source_authority_rejected";
                         let _ = close_with(
@@ -529,6 +622,34 @@ async fn handle_socket(socket: WebSocket, state: AppState, _admission: VoiceAdmi
         }
     }
     record_terminal(&state, voice_session_id, terminal_reason).await;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SubmittedAnswerResolution {
+    One { response_id: Option<String> },
+    All,
+}
+
+fn brain_event_submitted_answer_resolution(
+    event: &agent_domain::BrainEvent,
+) -> Option<SubmittedAnswerResolution> {
+    match event {
+        agent_domain::BrainEvent::RecapReady { .. }
+        | agent_domain::BrainEvent::TerminalSessionPhase { .. } => {
+            Some(SubmittedAnswerResolution::All)
+        }
+        agent_domain::BrainEvent::AnswerEvaluated { .. }
+        | agent_domain::BrainEvent::ResponseCompleted { .. }
+        | agent_domain::BrainEvent::ResponseCancelledFor { .. } => {
+            Some(SubmittedAnswerResolution::One {
+                response_id: event.response_id().map(ToOwned::to_owned),
+            })
+        }
+        agent_domain::BrainEvent::ResponseCancelled => {
+            Some(SubmittedAnswerResolution::One { response_id: None })
+        }
+        _ => None,
+    }
 }
 
 async fn close_with_terminal_session_phase<S>(
@@ -620,7 +741,10 @@ where
             sender,
         )
         .await?;
-        if result != ForwardBrainEvent::Continue {
+        if !matches!(
+            result,
+            ForwardBrainEvent::Continue | ForwardBrainEvent::Suppressed
+        ) {
             return Ok(result);
         }
     }
@@ -629,6 +753,7 @@ where
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ForwardBrainEvent {
     Continue,
+    Suppressed,
     Rejected,
     CostBudgetExceeded,
     ProviderFailure(TerminalSessionReason),
@@ -645,7 +770,7 @@ where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
     if should_suppress_cancelled_response(cancelled_responses, &event) {
-        return Ok(ForwardBrainEvent::Continue);
+        return Ok(ForwardBrainEvent::Suppressed);
     }
     if let agent_domain::BrainEvent::Error(error) = &event {
         return Ok(ForwardBrainEvent::ProviderFailure(
@@ -924,28 +1049,37 @@ async fn handle_client_message(
     }
 }
 
-async fn handle_client_message_with_drain(
+fn prepare_client_message_with_drain(
     message: Message,
-    input: &mpsc::Sender<BrainInput>,
     session_binding: &AuthorizedClientSession,
     limits: &VoiceLimitConfig,
     session_limits: &mut SessionLimitRuntime,
+) -> Result<ClientInputAction, ClientMessageError> {
+    let action =
+        client_input_action(message, session_binding).map_err(ClientMessageError::Frame)?;
+    if let ClientInputAction::Send { brain_input, .. } = &action {
+        if let Some(bytes) = brain_input_audio_bytes(brain_input) {
+            if !session_limits.record_audio_bytes(limits, bytes) {
+                return Err(ClientMessageError::RateLimit);
+            }
+        }
+    }
+    Ok(action)
+}
+
+async fn send_client_input_action_with_drain(
+    input: &mpsc::Sender<BrainInput>,
+    client_input: ClientInputAction,
     drain_signal: &mut watch::Receiver<bool>,
+    turn_deadline: Option<Instant>,
 ) -> Result<ClientAction, ClientMessageError> {
-    match client_input_action(message, session_binding).map_err(ClientMessageError::Frame)? {
+    match client_input {
         ClientInputAction::Send {
             brain_input,
             action,
-        } => {
-            if let Some(bytes) = brain_input_audio_bytes(&brain_input) {
-                if !session_limits.record_audio_bytes(limits, bytes) {
-                    return Err(ClientMessageError::RateLimit);
-                }
-            }
-            send_brain_input_with_drain(input, brain_input, drain_signal)
-                .await
-                .map(|_| action)
-        }
+        } => send_brain_input_with_deadline(input, brain_input, drain_signal, turn_deadline)
+            .await
+            .map(|_| action),
         ClientInputAction::TrySend {
             brain_input,
             action,
@@ -1048,6 +1182,22 @@ async fn send_brain_input_with_drain(
                 }
             }
         }
+    }
+}
+
+async fn send_brain_input_with_deadline(
+    input: &mpsc::Sender<BrainInput>,
+    brain_input: BrainInput,
+    drain_signal: &mut watch::Receiver<bool>,
+    turn_deadline: Option<Instant>,
+) -> Result<(), ClientMessageError> {
+    let send = send_brain_input_with_drain(input, brain_input, drain_signal);
+    match turn_deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline, send).await {
+            Ok(result) => result,
+            Err(_) => Err(ClientMessageError::TurnCap),
+        },
+        None => send.await,
     }
 }
 
@@ -1227,6 +1377,12 @@ enum ClientAction {
     Stop,
 }
 
+impl ClientAction {
+    fn arms_turn_cap(self) -> bool {
+        matches!(self, Self::Audio | Self::AnswerText)
+    }
+}
+
 #[derive(Debug)]
 enum ClientInputAction {
     Send {
@@ -1240,11 +1396,21 @@ enum ClientInputAction {
     Keepalive,
 }
 
+impl ClientInputAction {
+    fn action(&self) -> ClientAction {
+        match self {
+            Self::Send { action, .. } | Self::TrySend { action, .. } => *action,
+            Self::Keepalive => ClientAction::Keepalive,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ClientMessageError {
     Frame(ClientFrameError),
     Drained,
     RateLimit,
+    TurnCap,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

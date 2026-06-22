@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
+const BAC_510_LEARNER_LOOP_CONTRACT_JSON: &str =
+    include_str!("../../../../packages/core/src/learner-loop-contract.json");
 
 #[derive(Clone, Debug)]
 pub struct ServiceConfig {
@@ -47,7 +49,7 @@ impl Default for ServiceConfig {
             ws_access: VoiceWsAccess::default(),
             max_sessions: 32,
             max_session_duration: Duration::from_secs(6 * 60 * 60),
-            max_turn_duration: Duration::from_secs(60),
+            max_turn_duration: bac_510_max_turn_duration(),
             voice_limits: VoiceLimitConfig::default(),
         }
     }
@@ -115,7 +117,8 @@ impl ServiceConfig {
         if let Some(seconds) =
             env_value("VIVA_VOICE_WS_TURN_SECONDS").and_then(|value| parse_positive_u64(&value))
         {
-            config.max_turn_duration = Duration::from_secs(seconds);
+            config.max_turn_duration =
+                Duration::from_secs(seconds).min(bac_510_max_turn_duration());
         }
         config.voice_limits.max_user_sessions = env_value("VIVA_VOICE_WS_MAX_USER_SESSIONS")
             .and_then(|value| parse_positive_usize(&value));
@@ -145,6 +148,20 @@ impl ServiceConfig {
         }
         Ok(())
     }
+}
+
+pub(crate) fn bac_510_max_turn_duration() -> Duration {
+    let contract: serde_json::Value = serde_json::from_str(BAC_510_LEARNER_LOOP_CONTRACT_JSON)
+        .expect("BAC-510 learner loop contract JSON must parse");
+    let max_resolution_ms = contract
+        .get("max_submitted_answer_resolution_ms")
+        .and_then(serde_json::Value::as_u64)
+        .expect("BAC-510 learner loop contract must define max_submitted_answer_resolution_ms");
+    assert!(
+        max_resolution_ms <= 45_000,
+        "BAC-510 learner loop contract max turn bound must be <= 45 seconds"
+    );
+    Duration::from_millis(max_resolution_ms)
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -434,6 +451,8 @@ fn unix_timestamp_now() -> Result<u64, SessionTokenError> {
 mod tests {
     use axum::http::HeaderValue;
 
+    use crate::WsTimeouts;
+
     use super::*;
 
     #[test]
@@ -488,6 +507,38 @@ mod tests {
             ..ServiceConfig::default()
         };
         assert_eq!(ipv6_loopback.validate(), Ok(()));
+    }
+
+    #[test]
+    fn default_turn_timeout_matches_bac_510_outer_bound() {
+        assert_eq!(
+            ServiceConfig::default().max_turn_duration,
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn default_turn_timeout_is_loaded_from_bac_510_contract() {
+        assert_eq!(
+            ServiceConfig::default().max_turn_duration,
+            bac_510_max_turn_duration()
+        );
+    }
+
+    #[test]
+    fn default_websocket_turn_timeout_matches_bac_510_outer_bound() {
+        assert_eq!(WsTimeouts::default().idle, bac_510_max_turn_duration());
+    }
+
+    #[test]
+    fn from_env_caps_turn_timeout_to_bac_510_outer_bound() {
+        let config = ServiceConfig::from_env_with(|name| match name {
+            "VIVA_VOICE_WS_TURN_SECONDS" => Some("120".to_owned()),
+            _ => None,
+        })
+        .expect("loopback turn timeout config should validate");
+
+        assert_eq!(config.max_turn_duration, bac_510_max_turn_duration());
     }
 
     #[test]

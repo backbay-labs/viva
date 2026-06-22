@@ -94,6 +94,7 @@ describe("Viva voice agent contract", () => {
       "slow_client",
       "provider_cancelled",
       "partial_stage_success",
+      "rollback",
     ] as const) {
       const parsed = parseVivaServerFrame({
         type: "event",

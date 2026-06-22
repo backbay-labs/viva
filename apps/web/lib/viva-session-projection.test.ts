@@ -7,7 +7,7 @@ import type {
   SourceReference,
   VivaReadyFrame,
 } from "@viva/core";
-import { VIVA_VOICE_PROTOCOL_VERSION } from "@viva/core";
+import { VIVA_LEARNER_LOOP_CONTRACT, VIVA_VOICE_PROTOCOL_VERSION } from "@viva/core";
 import type { VivaAgentDerivedState } from "./use-viva-agent-session";
 import {
   checklistFromExpectedTerms,
@@ -637,6 +637,43 @@ describe("projectRuntimeCopy", () => {
     }
   });
 
+  test("surfaces terminal runtime copy as soon as the authoritative terminal event arrives", () => {
+    const copy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("cartesia_gemini", { live_runtime: true }),
+      status: "open",
+      terminalReason: "provider_timeout",
+    });
+
+    expect(copy.cause).toBe("provider_timeout");
+    expect(copy.capsuleLabel).toBe("Provider timeout");
+    expect(copy.primaryActionIntent).toBe("retry_agent");
+  });
+
+  test("keeps terminal runtime copy reconciled with the BAC-510 contract", () => {
+    for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {
+      if (!state.terminal_reason) continue;
+
+      const copy = projectRuntimeCopy({
+        close: { code: 1011, reason: state.terminal_reason, wasClean: true },
+        readiness: trustedReadiness,
+        ready: ready("cartesia_gemini", { live_runtime: true }),
+        status: "closed",
+        terminalReason: state.terminal_reason,
+      });
+
+      expect(copy.capsuleLabel).toBe(state.copy.capsule_label);
+      expect(copy.marginaliaTitle).toBe(state.copy.marginalia_title);
+      expect(copy.marginaliaText).toBe(state.copy.marginalia_text);
+      expect(copy.nextActionLabel).toBe(state.copy.next_action_label);
+      expect(copy.primaryActionIntent).toBe(state.copy.primary_action_intent);
+      expect(copy.primaryActionLabel).toBe(state.copy.primary_action_label);
+      expect(copy.statusLabel).toBe(state.copy.status_label);
+      expect(state.runtime_copy_causes).toContain(copy.cause);
+      expect(/payload|prompt|transcript|pcm16|secret/i.test(copy.marginaliaText)).toBe(false);
+    }
+  });
+
   test("classifies close-only auth failures before generic interruption recovery", () => {
     const copy = projectRuntimeCopy({
       close: {
@@ -919,6 +956,22 @@ describe("projectSessionQuestion", () => {
     );
     expect(projected.retryPrompt).toBe(undefined);
   });
+
+  test("terminal session phases suppress stale active questions", () => {
+    const projected = projectSessionQuestion(
+      derived({
+        phase: "recap",
+        terminalReason: "provider_timeout",
+        question,
+      }),
+      "open",
+      NOW,
+    );
+
+    expect(projected.prompt).toBe("This session has ended.");
+    expect(projected.terminal).toBe(true);
+    expect(projected.pending).toBe(false);
+  });
 });
 
 describe("projectTrace", () => {
@@ -973,6 +1026,53 @@ describe("projectTrace", () => {
       "Oxidative phosphorylation",
       "ATP synthase",
     ]);
+  });
+
+  test("preserves recap highlights after a later terminal close", () => {
+    const projection = projectTrace(
+      derived({
+        phase: "recap",
+        terminalReason: "session_cap",
+        question,
+        recap: {
+          durationLabel: "Agent session",
+          headline: "Good session, Ananya.",
+          summary: "The completed recap should stay visible after terminal close.",
+          strongConcepts: ["NADH"],
+          shakyConcepts: ["Oxidative phosphorylation"],
+          missedConcepts: ["ATP synthase"],
+          reviewLater: ["Oxidative phosphorylation", "ATP synthase"],
+          nextAction: "Rebuild ATP synthase from the source.",
+          plan: [],
+          sourceMoments: [],
+        },
+      }),
+      "open",
+      NOW,
+    );
+
+    expect(projection.state).toBe("recap");
+    expect(projection.question.prompt).toBe("Good session,\nAnanya.");
+    expect(projection.question.highlights).toEqual([
+      "NADH",
+      "Oxidative phosphorylation",
+      "ATP synthase",
+    ]);
+    expect(projection.highlightedTokens).toEqual(question.expectedTerms);
+  });
+
+  test("terminal session phases become one learner-safe trace state", () => {
+    const projection = projectTrace(
+      derived({ phase: "recap", terminalReason: "provider_timeout", question }),
+      "open",
+      NOW,
+    );
+
+    expect(projection.state).toBe("recap");
+    expect(projection.hasAgentQuestion).toBe(false);
+    expect(projection.highlightedTokens).toEqual([]);
+    expect(projection.question.prompt).toBe("This session has ended.");
+    expect(projection.question.terminal).toBe(true);
   });
 });
 

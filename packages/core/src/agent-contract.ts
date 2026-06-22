@@ -52,7 +52,8 @@ export type AgentTerminalSessionReason =
   | "provider_network_disconnect"
   | "slow_client"
   | "provider_cancelled"
-  | "partial_stage_success";
+  | "partial_stage_success"
+  | "rollback";
 
 export type AgentStudySourceReference = {
   source_id: string;
@@ -625,7 +626,8 @@ function requireTerminalSessionReason(value: unknown): AgentTerminalSessionReaso
     value !== "provider_network_disconnect" &&
     value !== "slow_client" &&
     value !== "provider_cancelled" &&
-    value !== "partial_stage_success"
+    value !== "partial_stage_success" &&
+    value !== "rollback"
   ) {
     throw new Error("Invalid terminal session reason");
   }
