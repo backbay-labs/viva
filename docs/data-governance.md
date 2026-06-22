@@ -115,3 +115,18 @@ The live provider is selectable only when all are true:
 4. provider ZDR confirmation flags,
 5. negative checks that raw payloads, signed values, provider keys, and source
    excerpts are absent from generated evidence.
+
+## Continuous Redaction Control
+
+Viva treats structural allowlist serialization as the primary defense. Runtime
+agent evidence details flow through `SanitizedEvidenceDetail`; web-visible log
+payloads flow through `redactForVivaLog`; Node evidence scripts call the shared
+`scripts/redaction-control.mjs` audit before writing or promoting evidence.
+
+The forbidden-marker denylist in `scripts/redaction-control.mjs` is a backstop,
+not the main control. It exists to fail generated artifacts and changed
+logging/evidence code when a raw audio, transcript, answer, prompt, source,
+signed-token, bearer, provider-key, or secret marker escapes the structural
+boundary. `bun run redaction:check` runs on every PR and scans added lines in
+changed logging/evidence code while exempting tests, fixtures, docs, and the
+central denylist module itself.

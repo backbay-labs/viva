@@ -17,6 +17,7 @@
     "agent:replay:ws": "cargo test --manifest-path agent/Cargo.toml -p agent-service --test voice_ws real_websocket_replays -- --nocapture",
     "agent:build": "cargo build --manifest-path agent/Cargo.toml --workspace",
     "agent:purity": "scripts/check-agent-domain-purity.sh",
+    "redaction:check": "node scripts/redaction-control-check.mjs",
     "release:hygiene": "sh scripts/check-generated-artifact-hygiene.sh",
     "release:check": "node scripts/release-check.mjs",
     "live:smoke": "node scripts/live-provider-smoke.mjs",

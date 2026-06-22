@@ -1,3 +1,5 @@
+import { assertNoForbiddenEvidenceMarkers as assertSharedRedactionControl } from "./redaction-control.mjs";
+
 export const LIVE_PROVIDER_GATE_COMMAND_NAME = "live_provider_no_network_gate_tests";
 
 export const PROVIDER_READINESS_TARGETS = Object.freeze([
@@ -76,24 +78,6 @@ export const PROVIDER_READINESS_TARGETS = Object.freeze([
       }),
     }),
   }),
-]);
-
-const FORBIDDEN_EVIDENCE_MARKERS = Object.freeze([
-  "pcm16_base64",
-  "answer_text",
-  "transcript_final",
-  "source_context",
-  "pasted_text",
-  "session_token",
-  "viva1.",
-  "session-secret",
-  "NADH donates high-energy electrons",
-  "received 4 PCM16 bytes",
-  "CARTESIA_API_KEY",
-  "GEMINI_API_KEY",
-  "viva-release-check-cartesia-placeholder-key",
-  "viva-release-check-gemini-placeholder-key",
-  "Bearer ",
 ]);
 
 const LIVE_PROVIDER_GATE_PROOF = Object.freeze({
@@ -262,12 +246,7 @@ function expectEqual(errors, label, actual, expected) {
 }
 
 function assertNoForbiddenEvidenceMarkers(value) {
-  const serialized = JSON.stringify(value);
-  for (const needle of FORBIDDEN_EVIDENCE_MARKERS) {
-    if (serialized.includes(needle)) {
-      throw new Error(`provider readiness evidence includes forbidden payload marker: ${needle}`);
-    }
-  }
+  assertSharedRedactionControl(value, { context: "provider readiness evidence", env: {} });
 }
 
 function cloneJson(value) {

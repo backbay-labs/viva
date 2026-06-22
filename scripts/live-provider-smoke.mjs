@@ -7,6 +7,7 @@ import {
   failureMatrixEvidence,
   liveProviderFailureForSmokeReason,
 } from "./live-provider-failure-matrix.mjs";
+import { assertNoForbiddenEvidenceMarkers } from "./redaction-control.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PROTOCOL_VERSION = 2;
@@ -36,24 +37,6 @@ const SAFE_EVENT_CODES = Object.freeze({
   cancellation: "cancellation",
   structured_error: "structured_error",
 });
-const FORBIDDEN_EVIDENCE_MARKERS = Object.freeze([
-  "pcm16_base64",
-  "answer_text",
-  "transcript_final",
-  "source_context",
-  "pasted_text",
-  "session_token",
-  "viva1.",
-  "session-secret",
-  "NADH donates high-energy electrons",
-  "received 4 PCM16 bytes",
-  "CARTESIA_API_KEY",
-  "GEMINI_API_KEY",
-  "viva-release-check-cartesia-placeholder-key",
-  "viva-release-check-gemini-placeholder-key",
-  "Bearer ",
-]);
-
 export function buildLiveSmokeConfig({ env = process.env, rootDir = root } = {}) {
   const artifactDir = liveSmokeArtifactDir(env, rootDir);
   const outputPath = liveSmokeOutputPath(env, rootDir);
@@ -292,18 +275,7 @@ export function summarizeServerFrame(frame) {
 }
 
 export function auditLiveSmokeEvidence(evidence, env = process.env) {
-  const serialized = JSON.stringify(evidence);
-  for (const marker of FORBIDDEN_EVIDENCE_MARKERS) {
-    if (serialized.includes(marker)) {
-      throw new Error(`live smoke evidence includes forbidden payload marker: ${marker}`);
-    }
-  }
-  for (const [name, value] of Object.entries(env)) {
-    if (!/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) continue;
-    if (value && value.length >= 8 && serialized.includes(value)) {
-      throw new Error(`live smoke evidence includes secret value from ${name}`);
-    }
-  }
+  assertNoForbiddenEvidenceMarkers(evidence, { context: "live smoke evidence", env });
 }
 
 async function collectReadiness(config, fetchImpl) {

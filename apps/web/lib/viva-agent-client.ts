@@ -24,6 +24,7 @@ import {
   type VivaServerFrame,
 } from "@viva/core";
 import type { VivaLibraryExport, VivaLibrarySnapshot } from "./viva-library";
+import { isRedactedVivaLogValue, redactForVivaLog } from "./viva-redaction";
 
 export type VivaAgentClientOptions = {
   url?: string;
@@ -635,14 +636,13 @@ export function vivaAgentReducer(
 
 function sanitizeAgentError(message: string): string {
   if (!message) return "agent error";
-  if (
-    /pcm16_base64|answer_text|transcript|prompt|source_context|pasted_text|session_token|viva1\.|bearer|cartesia_api_key|gemini_api_key|secret|raw answer|source excerpt/i.test(
-      message,
-    )
-  ) {
+  const redacted = redactForVivaLog({ message });
+  if (isRecord(redacted) && isRedactedVivaLogValue(redacted.message)) {
     return "sanitized provider error";
   }
-  return message.replace(/\s+/g, " ").slice(0, 160);
+  return String(isRecord(redacted) ? redacted.message : message)
+    .replace(/\s+/g, " ")
+    .slice(0, 160);
 }
 
 export function createVivaAgentSessionController(
@@ -681,10 +681,11 @@ export function createVivaAgentSessionController(
         try {
           setState(vivaAgentReducer(state, parseVivaAgentMessage(event.data)));
         } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
           setState({
             ...state,
             status: "error",
-            errors: [...state.errors, error instanceof Error ? error.message : String(error)],
+            errors: [...state.errors, sanitizeAgentError(message)],
           });
         }
       });

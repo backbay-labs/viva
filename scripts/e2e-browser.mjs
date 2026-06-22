@@ -16,6 +16,7 @@ import {
   isFailureControlSessionTokenScenario,
   parseFailureControlSessionTarget,
 } from "./failure-control-harness.mjs";
+import { auditTextArtifacts } from "./redaction-control.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactDir = path.resolve(
@@ -1391,73 +1392,11 @@ async function hashFixtureFiles(dir) {
 }
 
 async function auditBrowserStoryArtifacts(dir) {
-  const forbidden = [
-    "pcm16_base64",
-    "answer_text",
-    "transcript_final",
-    "source_context",
-    "pasted_text",
-    "session_token",
-    "viva1.",
-    "session-secret",
-    "preload stroke volume cardiac output",
-    "Stroke volume rises as ventricular preload",
-    "NADH donates high-energy electrons",
-    "received 4 PCM16 bytes",
-    "CARTESIA_API_KEY",
-    "GEMINI_API_KEY",
-    "viva-release-check-cartesia-placeholder-key",
-    "viva-release-check-gemini-placeholder-key",
-    "Bearer ",
-  ];
-  let scanned_files = 0;
-  for (const file of await listFiles(dir)) {
-    if (file.endsWith(".zip")) {
-      throw new Error(
-        `Browser story artifact includes retained trace archive: ${path.relative(root, file)}`,
-      );
-    }
-    if (!isTextArtifact(file)) continue;
-    scanned_files += 1;
-    const text = await readFile(file, "utf8");
-    for (const needle of forbidden) {
-      if (text.includes(needle)) {
-        throw new Error(
-          `Browser story artifact ${path.relative(root, file)} includes forbidden marker: ${needle}`,
-        );
-      }
-    }
-    for (const [name, value] of Object.entries(process.env)) {
-      if (!/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) continue;
-      if (value && value.length >= 8 && text.includes(value)) {
-        throw new Error(
-          `Browser story artifact ${path.relative(root, file)} includes secret value from ${name}`,
-        );
-      }
-    }
-  }
-  return {
-    scanned_files,
-    forbidden_hits: 0,
-  };
-}
-
-async function listFiles(dir) {
-  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-  const files = [];
-  for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      files.push(...(await listFiles(fullPath)));
-    } else if (entry.isFile()) {
-      files.push(fullPath);
-    }
-  }
-  return files;
-}
-
-function isTextArtifact(file) {
-  return /\.(json|log|txt|stdout|stderr)$/i.test(file);
+  return auditTextArtifacts([dir], {
+    context: "Browser story artifact",
+    rootDir: root,
+    zipMessage: (relative) => `Browser story artifact includes retained trace archive: ${relative}`,
+  });
 }
 
 function delay(ms) {

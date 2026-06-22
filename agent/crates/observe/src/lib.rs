@@ -5,6 +5,22 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+const REDACTED_EVIDENCE_DETAIL: &str = "redacted_evidence_detail";
+const FORBIDDEN_EVIDENCE_DETAIL_MARKERS: &[&str] = &[
+    "pcm16_base64",
+    "answer_text",
+    "transcript_final",
+    "source_context",
+    "pasted_text",
+    "session_token",
+    "viva1.",
+    "bearer ",
+    "cartesia_api_key",
+    "gemini_api_key",
+    "raw answer",
+    "source excerpt",
+];
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VoiceEvidenceEventKind {
@@ -44,6 +60,35 @@ impl VoiceEvidenceEvent {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SanitizedEvidenceDetail(String);
+
+impl SanitizedEvidenceDetail {
+    pub fn from_raw(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        if contains_forbidden_evidence_detail_marker(&detail) {
+            return Self(REDACTED_EVIDENCE_DETAIL.to_owned());
+        }
+        Self(
+            detail
+                .chars()
+                .filter(|character| {
+                    character.is_ascii_alphanumeric()
+                        || matches!(
+                            character,
+                            ' ' | '-' | '_' | ':' | '.' | '/' | '=' | ',' | ';' | '(' | ')'
+                        )
+                })
+                .take(240)
+                .collect(),
+        )
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VoiceEvidenceStoreCounts {
     pub sessions: usize,
@@ -54,17 +99,14 @@ pub struct VoiceEvidenceStoreCounts {
 }
 
 pub fn sanitize_evidence_detail(detail: String) -> String {
-    detail
-        .chars()
-        .filter(|character| {
-            character.is_ascii_alphanumeric()
-                || matches!(
-                    character,
-                    ' ' | '-' | '_' | ':' | '.' | '/' | '=' | ',' | ';' | '(' | ')'
-                )
-        })
-        .take(240)
-        .collect()
+    SanitizedEvidenceDetail::from_raw(detail).into_string()
+}
+
+fn contains_forbidden_evidence_detail_marker(detail: &str) -> bool {
+    let normalized = detail.to_ascii_lowercase();
+    FORBIDDEN_EVIDENCE_DETAIL_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -199,5 +241,16 @@ mod tests {
         assert_eq!(event.audio_output_tokens, 96);
         assert_eq!(event.cost_estimate_usd, expected_cost_estimate);
         assert_eq!(event.source_grounded_correction_count, 1);
+    }
+
+    #[test]
+    fn evidence_detail_redacts_raw_payload_markers() {
+        let event = VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::AnswerReceived,
+            None,
+            "answer_text=NADH transcript_final=raw CARTESIA_API_KEY",
+        );
+
+        assert_eq!(event.detail, "redacted_evidence_detail");
     }
 }
