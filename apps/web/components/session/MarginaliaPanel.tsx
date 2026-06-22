@@ -8,7 +8,7 @@ import { SessionActionButton } from "./SessionActionButton";
 import { SourceChip } from "./SourceChip";
 import { SourceFolio } from "./SourceFolio";
 import { StatusChip } from "./StatusChip";
-import type { Question, SessionState } from "./session-data";
+import { CHECKING_PROGRESS_STEPS, type Question, type SessionState } from "./session-data";
 
 export type TextAnswerState = {
   active: boolean;
@@ -17,6 +17,11 @@ export type TextAnswerState = {
   /** The voice transcription of lastAnswer came back low-confidence. */
   lastAnswerUncertain?: boolean;
   required: boolean;
+};
+
+export type CheckingControl = {
+  disabled?: boolean;
+  onCancelTurn: () => void;
 };
 
 /**
@@ -34,6 +39,7 @@ export function MarginaliaPanel({
   reviewPlan = [],
   hintShown,
   textAnswer,
+  checkingControl,
   onHint,
   onShowSource,
   onChallengeSource,
@@ -54,6 +60,7 @@ export function MarginaliaPanel({
   reviewPlan?: ReviewScheduleItem[];
   hintShown: boolean;
   textAnswer?: TextAnswerState;
+  checkingControl?: CheckingControl;
   onHint: () => void;
   onShowSource: () => void;
   onChallengeSource?: () => void;
@@ -122,7 +129,9 @@ export function MarginaliaPanel({
             textAnswer={textAnswer}
           />
         ) : null}
-        {state === "thinking" ? <ThinkingNote question={question} /> : null}
+        {state === "thinking" ? (
+          <ThinkingNote checkingControl={checkingControl} question={question} />
+        ) : null}
         {state === "correction" ? (
           <CorrectionMarginalia
             onNextQuestion={onNextQuestion}
@@ -520,11 +529,30 @@ function formatRecapDueDate(dueAt: Date) {
   return `Due ${DUE_MONTHS[dueAt.getUTCMonth()]} ${dueAt.getUTCDate()}, ${dueAt.getUTCFullYear()}`;
 }
 
-function ThinkingNote({ question }: { question: Question }) {
+function ThinkingNote({
+  question,
+  checkingControl,
+}: {
+  question: Question;
+  checkingControl?: CheckingControl;
+}) {
   return (
     <div className="margin-note">
       <p className="margin-note__title">Thinking…</p>
       <p className="margin-note__text">Cross-referencing your answer with your sources.</p>
+      <ol aria-label="Checking progress" className="checking-progress">
+        {CHECKING_PROGRESS_STEPS.map((step, index) => (
+          <li
+            className="checking-progress__item"
+            key={step.label}
+            style={{ "--i": index } as CSSProperties}
+          >
+            <span className="checking-progress__mark" />
+            <span className="checking-progress__label">{step.label}</span>
+            <span className="checking-progress__detail">{step.detail}</span>
+          </li>
+        ))}
+      </ol>
       {question.checklist.length > 0 ? (
         <ul className="checklist">
           {question.checklist.map((item, index) => (
@@ -552,6 +580,16 @@ function ThinkingNote({ question }: { question: Question }) {
         <Spark color="var(--viva-gold)" size={12} />
         Hold tight…
       </p>
+      {checkingControl ? (
+        <div className="margin-note__actions margin-note__actions--checking">
+          <SessionActionButton
+            disabled={checkingControl.disabled}
+            label="Cancel this turn"
+            leading={<Icon color="var(--viva-amethyst)" name="x" size={15} strokeWidth={1.6} />}
+            onClick={checkingControl.onCancelTurn}
+          />
+        </div>
+      ) : null}
       <span aria-hidden="true" className="margin-note__hourglass">
         <HourglassMark />
       </span>

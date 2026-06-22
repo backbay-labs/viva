@@ -3,7 +3,7 @@ import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
 import { MuseBackdrop } from "../landing/MuseBackdrop";
 import { MuseGlyphCanvas, type MuseGlyphState } from "../landing/MuseGlyphCanvas";
-import type { TextAnswerState } from "./MarginaliaPanel";
+import type { CheckingControl, TextAnswerState } from "./MarginaliaPanel";
 import { MarginaliaPanel } from "./MarginaliaPanel";
 import { QuestionStage } from "./QuestionStage";
 import { SessionBottomControls } from "./SessionBottomControls";
@@ -35,6 +35,7 @@ export function LiveSessionShell({
   elapsed,
   hintShown,
   textAnswer,
+  checkingControl,
   levelRef,
   onEndSession,
   onHint,
@@ -68,6 +69,7 @@ export function LiveSessionShell({
   elapsed: number;
   hintShown: boolean;
   textAnswer?: TextAnswerState;
+  checkingControl?: CheckingControl;
   levelRef?: VoiceTraceLevelRef;
   onEndSession: () => void;
   onHint: () => void;
@@ -136,6 +138,7 @@ export function LiveSessionShell({
 
           <MarginaliaPanel
             hintShown={hintShown}
+            checkingControl={checkingControl}
             onBackToQuestion={onBackToQuestion}
             onHint={onHint}
             onChallengeSource={onChallengeSource}

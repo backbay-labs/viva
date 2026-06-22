@@ -736,6 +736,15 @@ describe("Viva agent browser client", () => {
     expect(state.activeResponseId).toBe("response-1");
     const source = state.question?.source;
     if (!source) throw new Error("Expected active question source");
+    state = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "session_phase", phase: "thinking" },
+      }),
+    );
+    expect(state.phase).toBe("thinking");
 
     state = vivaAgentReducer(
       state,
@@ -747,6 +756,7 @@ describe("Viva agent browser client", () => {
     );
 
     expect(state.activeResponseId).toBeUndefined();
+    expect(state.phase).toBe("listening");
     expect(state.cancelledResponseIds).toContain("response-1");
 
     const staleFrames = [

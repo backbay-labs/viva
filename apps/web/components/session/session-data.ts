@@ -128,13 +128,30 @@ export const QUESTIONS: Question[] = [
   },
 ];
 
-export const STATUS_LINE: Record<SessionState, string> = {
+export const STATUS_LINE: Record<Exclude<SessionState, "thinking">, string> = {
   listening: "Listening…",
-  thinking: "Checking against your sources…",
   correction: "Reviewing your answer…",
   source: "Use this to answer again.",
   recap: "The manuscript is folded for review.",
 };
+
+export const CHECKING_PROGRESS_STEPS = [
+  {
+    label: "Saved",
+    status: "Answer saved",
+    detail: "Your attempt is saved.",
+  },
+  {
+    label: "Checking",
+    status: "Checking sources",
+    detail: "Viva is matching it against your source spans.",
+  },
+  {
+    label: "Feedback",
+    status: "Preparing feedback",
+    detail: "Feedback or a retry prompt is next.",
+  },
+] as const;
 
 /** Map a session state onto the landing glyph layer's energy states. */
 export function glyphStateFor(state: SessionState): MuseGlyphState {

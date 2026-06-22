@@ -1,6 +1,11 @@
 import { Spark } from "@viva/ui-web";
-import { Fragment, type ReactNode } from "react";
-import { type Question, type SessionState, STATUS_LINE } from "./session-data";
+import { type CSSProperties, Fragment, type ReactNode } from "react";
+import {
+  CHECKING_PROGRESS_STEPS,
+  type Question,
+  type SessionState,
+  STATUS_LINE,
+} from "./session-data";
 
 /** States in which the answer has been given, so revealing source terms can't telegraph it. */
 const REVEALING_STATES: ReadonlySet<SessionState> = new Set(["correction", "source", "recap"]);
@@ -53,10 +58,26 @@ export function QuestionStage({
       {showStatus ? (
         <p aria-hidden="true" className="question-stage__status">
           <Spark className="question-stage__spark" color="var(--viva-gold)" size={13} />
-          <span>{STATUS_LINE[state]}</span>
+          {state === "thinking" ? <CheckingStatusSteps /> : <span>{STATUS_LINE[state]}</span>}
         </p>
       ) : null}
     </div>
+  );
+}
+
+function CheckingStatusSteps() {
+  return (
+    <span className="question-stage__status-steps">
+      {CHECKING_PROGRESS_STEPS.map((step, index) => (
+        <span
+          className="question-stage__status-step"
+          key={step.status}
+          style={{ "--i": index } as CSSProperties}
+        >
+          {step.status}
+        </span>
+      ))}
+    </span>
   );
 }
 
