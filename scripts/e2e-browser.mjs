@@ -46,9 +46,11 @@ let page;
 let traceStarted = false;
 let traceArtifact = null;
 const storyFrames = [];
+let sessionUrlLifecycle = null;
 let sourceFolioVisible = false;
 let boundedSourceVisible = false;
 let correctionMarginaliaVisible = false;
+let writtenAnswerFallbackUsed = false;
 let postAnswerSourceFolioVisible = false;
 let postAnswerBoundedSourceVisible = false;
 let postAnswerProtocolProof = {
@@ -187,6 +189,7 @@ try {
     await page.getByRole("button", { name: "End session" }).click();
   } else {
     await page.getByRole("button", { name: /check it/i }).click();
+    writtenAnswerFallbackUsed = await submitWrittenAnswerIfFallbackOpens(page);
     postAnswerProtocolProof = await waitForPostAnswerProtocolProof(serverEvents, 25_000);
     if (requireCorrectionMarginalia) {
       await page.getByText("Marginalia", { exact: true }).waitFor({
@@ -239,13 +242,16 @@ try {
         (await isVisible(page.getByText("Source Folio", { exact: true }).first())) &&
         (await isVisible(page.getByRole("button", { name: "Challenge citation" }).first())) &&
         (await isVisible(
-          page.getByText(conceptStatusText(postAnswerProtocolProof.conceptStatus), {
-            exact: false,
-          }).first(),
+          page
+            .getByText(conceptStatusText(postAnswerProtocolProof.conceptStatus), {
+              exact: false,
+            })
+            .first(),
         ));
       postAnswerBoundedSourceVisible =
-        (await isVisible(page.getByText("NADH donates", { exact: false }).first())) &&
-        (await isVisible(page.getByText("Document span only", { exact: false }).first()));
+        (await isVisible(
+          page.getByText("Source citation is bounded to this span", { exact: false }).first(),
+        )) && (await isVisible(page.getByText("Document span only", { exact: false }).first()));
       await redactSourceFolioForSanitizedScreenshot(page);
       await page.screenshot({
         path: path.join(artifactDir, "post-answer-source-folio.png"),
@@ -316,6 +322,7 @@ try {
     traceArtifact = "trace.zip";
     traceStarted = false;
   }
+  sessionUrlLifecycle = await auditSessionUrlLifecycle(context);
 
   const browserStory = await buildBrowserStoryManifest({
     traceRetained: Boolean(traceArtifact),
@@ -340,7 +347,9 @@ try {
     post_answer_concept_status_event_seen: postAnswerProtocolProof.conceptStatusEventSeen,
     post_answer_concept_id: postAnswerProtocolProof.conceptId,
     post_answer_protocol_response_id: postAnswerProtocolProof.responseId,
+    written_answer_fallback_used: writtenAnswerFallbackUsed,
     local_only_actions_hidden: !shareVisible && !localScheduleVisible,
+    session_url_lifecycle: sessionUrlLifecycle,
     browser_story: browserStory,
     browser_story_artifact: "browser-story.json",
     console_errors: consoleErrors,
@@ -380,10 +389,18 @@ try {
   if (!stopToRecap && requirePostAnswerSourceFolio && !postAnswerBoundedSourceVisible) {
     throw new Error("Connected session did not render post-answer bounded source folio proof.");
   }
-  if (!stopToRecap && requirePostAnswerSourceFolio && !postAnswerProtocolProof.sourceReferenceEventSeen) {
+  if (
+    !stopToRecap &&
+    requirePostAnswerSourceFolio &&
+    !postAnswerProtocolProof.sourceReferenceEventSeen
+  ) {
     throw new Error("Post-answer Source Folio did not observe a source_reference event.");
   }
-  if (!stopToRecap && requirePostAnswerSourceFolio && !postAnswerProtocolProof.conceptStatusEventSeen) {
+  if (
+    !stopToRecap &&
+    requirePostAnswerSourceFolio &&
+    !postAnswerProtocolProof.conceptStatusEventSeen
+  ) {
     throw new Error("Post-answer Source Folio did not observe a concept_status event.");
   }
   if (shareVisible || localScheduleVisible) {
@@ -442,7 +459,148 @@ async function capturePendingLocalPreview(targetPage) {
   });
 }
 
+async function submitWrittenAnswerIfFallbackOpens(targetPage) {
+  const answerInput = targetPage.getByRole("textbox", { name: "Student written answer" });
+  if (!(await isVisible(answerInput))) return false;
+  await answerInput.fill("NADH donates electrons to the electron transport chain.");
+  await targetPage.getByRole("button", { name: "Submit written answer" }).click();
+  return true;
+}
+
+async function auditSessionUrlLifecycle(browserContext) {
+  const auditPage = await browserContext.newPage();
+  auditPage.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+  auditPage.on("pageerror", (error) => pageErrors.push(error.message));
+  await auditPage.addInitScript(() => {
+    const tokenParamNames = ["session_token", "token"];
+    const hasTokenParam = (search, hash) => {
+      const searchParams = new URLSearchParams(search);
+      const rawHash = hash.startsWith("#") ? hash.slice(1) : hash;
+      const hashParams = rawHash.includes("=")
+        ? new URLSearchParams(rawHash)
+        : new URLSearchParams();
+      return tokenParamNames.some((name) => searchParams.has(name) || hashParams.has(name));
+    };
+    window.__vivaSessionUrlBfcacheEvents = [];
+    window.addEventListener("pageshow", (event) => {
+      if (!event.persisted) return;
+      window.__vivaSessionUrlBfcacheEvents.push({
+        pathname: location.pathname,
+        token_param_visible: hasTokenParam(location.search, location.hash),
+      });
+    });
+  });
+
+  const checks = [];
+  try {
+    for (const scenario of [
+      ["initial_load", `/session#session_token=${bootstrapToken("initial")}`],
+      ["expired_token", `/session#session_token=${bootstrapToken("expired")}`],
+      ["replayed_token", `/session#session_token=${bootstrapToken("replayed")}`],
+      ["malformed_token", "/session#session_token=%20%20"],
+      ["no_token_canonical_url", "/session"],
+    ]) {
+      await auditPage.goto(`${webUrl}/`, { waitUntil: "domcontentloaded" });
+      await auditPage.goto(`${webUrl}${scenario[1]}`, { waitUntil: "domcontentloaded" });
+      checks.push(await waitForCanonicalSessionUrl(auditPage, scenario[0]));
+    }
+
+    await auditPage.goto(`${webUrl}/`, { waitUntil: "domcontentloaded" });
+    await auditPage.goto(`${webUrl}/session#session_token=${bootstrapToken("history")}`, {
+      waitUntil: "domcontentloaded",
+    });
+    checks.push(await waitForCanonicalSessionUrl(auditPage, "history_entry"));
+    await auditPage.goBack({ waitUntil: "domcontentloaded" });
+    await auditPage.waitForFunction(() => location.pathname === "/", undefined, {
+      timeout: 10_000,
+    });
+    await auditPage.goForward({ waitUntil: "domcontentloaded" });
+    const forwardCheck = await waitForCanonicalSessionUrl(auditPage, "back_forward_restore");
+    checks.push(forwardCheck);
+    const bfcacheEvents = await auditPage.evaluate(
+      () => window.__vivaSessionUrlBfcacheEvents ?? [],
+    );
+    const bfcacheRestoreReplayedToken = bfcacheEvents.some((event) => event.token_param_visible);
+    if (bfcacheRestoreReplayedToken) {
+      throw new Error("BFCache restore replayed a token parameter in the visible session URL.");
+    }
+    await auditPage.reload({ waitUntil: "domcontentloaded" });
+    const refreshCheck = await waitForCanonicalSessionUrl(auditPage, "refresh_recovery");
+    checks.push(refreshCheck);
+    await auditPage.waitForFunction(
+      () =>
+        document.querySelector('meta[name="referrer"]')?.getAttribute("content") === "no-referrer",
+      undefined,
+      { timeout: 10_000 },
+    );
+
+    storyFrames.push({
+      id: "session_url_lifecycle",
+      kind: "browser_url_audit",
+      checks: checks.map((check) => check.id),
+      note: "Verified /session canonical URL lifecycle without retaining token values in browser evidence.",
+    });
+
+    return {
+      passed: true,
+      checks: checks.map((check) => check.id),
+      back_forward_replayed_token: forwardCheck.token_param_visible,
+      bfcache_restore_observed: bfcacheEvents.length > 0,
+      bfcache_restore_replayed_token: bfcacheRestoreReplayedToken,
+      refresh_replayed_token: refreshCheck.token_param_visible,
+      referrer_policy_meta: "no-referrer",
+      token_values_redacted: true,
+    };
+  } finally {
+    await auditPage.close().catch(() => {});
+  }
+}
+
+function bootstrapToken(label) {
+  return encodeURIComponent(`redacted-${label}-bootstrap`);
+}
+
+async function waitForCanonicalSessionUrl(targetPage, id) {
+  await targetPage.waitForFunction(
+    () => {
+      const tokenParamNames = ["session_token", "token"];
+      const searchParams = new URLSearchParams(location.search);
+      const rawHash = location.hash.startsWith("#") ? location.hash.slice(1) : location.hash;
+      const hashParams = rawHash.includes("=")
+        ? new URLSearchParams(rawHash)
+        : new URLSearchParams();
+      return (
+        location.pathname === "/session" &&
+        tokenParamNames.every((name) => !searchParams.has(name) && !hashParams.has(name))
+      );
+    },
+    undefined,
+    { timeout: 10_000 },
+  );
+  const state = await targetPage.evaluate(() => {
+    const tokenParamNames = ["session_token", "token"];
+    const searchParams = new URLSearchParams(location.search);
+    const rawHash = location.hash.startsWith("#") ? location.hash.slice(1) : location.hash;
+    const hashParams = rawHash.includes("=") ? new URLSearchParams(rawHash) : new URLSearchParams();
+    return {
+      pathname: location.pathname,
+      token_param_visible: tokenParamNames.some(
+        (name) => searchParams.has(name) || hashParams.has(name),
+      ),
+    };
+  });
+  if (state.pathname !== "/session" || state.token_param_visible) {
+    throw new Error(`Session URL canonicalization failed for ${id}.`);
+  }
+  return { id, token_param_visible: state.token_param_visible };
+}
+
 async function redactSourceFolioForSanitizedScreenshot(targetPage) {
+  await redactStudentHandForSanitizedScreenshot(targetPage);
   await redactLocatorText(
     targetPage.locator(".source-folio__excerpt p").first(),
     "Bounded source excerpt redacted in sanitized browser-story artifact.",
@@ -450,6 +608,7 @@ async function redactSourceFolioForSanitizedScreenshot(targetPage) {
 }
 
 async function redactCorrectionMarginaliaForSanitizedScreenshot(targetPage) {
+  await redactStudentHandForSanitizedScreenshot(targetPage);
   await redactLocatorText(
     targetPage.locator(".correction__body").first(),
     "Learner-answer reference redacted in sanitized browser-story artifact.",
@@ -461,6 +620,7 @@ async function redactCorrectionMarginaliaForSanitizedScreenshot(targetPage) {
 }
 
 async function redactRecapForSanitizedScreenshot(targetPage) {
+  await redactStudentHandForSanitizedScreenshot(targetPage);
   await redactLocatorText(
     targetPage.locator(".recap-fold .folio__excerpt").first(),
     "Session recap summary redacted in sanitized browser-story artifact.",
@@ -472,6 +632,13 @@ async function redactRecapForSanitizedScreenshot(targetPage) {
       "Bounded source moment redacted in sanitized browser-story artifact.",
     );
   }
+}
+
+async function redactStudentHandForSanitizedScreenshot(targetPage) {
+  await redactLocatorText(
+    targetPage.locator(".student-hand p").first(),
+    "Student answer redacted in sanitized browser-story artifact.",
+  );
 }
 
 async function redactLocatorText(locator, replacement) {

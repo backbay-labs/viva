@@ -26,7 +26,11 @@ import {
 } from "../../lib/viva-audio-playback";
 import { recapPlanFromSessionEvents } from "../../lib/viva-display";
 import { vivaSceneReducer } from "../../lib/viva-scene-reducer";
-import { sessionRouteIdentityFromSearch } from "../../lib/viva-session-entry";
+import {
+  canonicalizeSessionBrowserUrl,
+  sessionRouteIdentityFromLocationParts,
+  sessionRouteIdentityFromSearch,
+} from "../../lib/viva-session-entry";
 import {
   projectConceptNodes,
   projectHighlightedTokens,
@@ -781,7 +785,11 @@ function readBrowserSessionRouteIdentity() {
     };
   }
 
-  const routeIdentity = sessionRouteIdentityFromSearch(window.location.search);
+  const routeIdentity = sessionRouteIdentityFromLocationParts(
+    window.location.search,
+    window.location.hash,
+  );
+  canonicalizeSessionBrowserUrl(window);
   if (
     routeIdentity.userId ||
     routeIdentity.studySetId ||
