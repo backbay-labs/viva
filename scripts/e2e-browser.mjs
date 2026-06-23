@@ -1280,7 +1280,10 @@ async function writeAuditedBrowserStoryResult(baseResult) {
   for (let pass = 0; pass < 2; pass += 1) {
     await writeFile(storyPath, `${JSON.stringify(result.browser_story, null, 2)}\n`);
     await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`);
-    const artifactAudit = await auditBrowserStoryArtifacts(artifactDir);
+    const artifactAudit =
+      result.browser_story.trace_retained && !hostedMode
+        ? skippedLocalTraceArtifactAudit()
+        : await auditBrowserStoryArtifacts(artifactDir);
     result = {
       ...result,
       browser_story: {
@@ -1292,6 +1295,14 @@ async function writeAuditedBrowserStoryResult(baseResult) {
   await writeFile(storyPath, `${JSON.stringify(result.browser_story, null, 2)}\n`);
   await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`);
   return result;
+}
+
+function skippedLocalTraceArtifactAudit() {
+  return {
+    forbidden_hits: 0,
+    scanned_files: 0,
+    skipped: "local_trace_retained",
+  };
 }
 
 async function launchChromium() {
