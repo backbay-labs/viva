@@ -14,6 +14,7 @@ test("deployment runbook covers the beta operating path and stop rules", async (
   const secrets = requiredSection(runbook, "## Secrets And Origins");
   const health = requiredSection(runbook, "## Health Checks");
   const smoke = requiredSection(runbook, "## Release Smoke");
+  const hostedMonitor = requiredSection(runbook, "## Hosted E2E Monitor Substrate");
   const rollback = requiredSection(runbook, "## Rollback And Drain");
   const redaction = requiredSection(runbook, "## Logs And Evidence Redaction");
 
@@ -136,6 +137,26 @@ test("deployment runbook covers the beta operating path and stop rules", async (
     "recap_ready",
   ]);
 
+  assertIncludesAll(hostedMonitor, [
+    "Railway cron service",
+    "viva-hosted-monitor",
+    "railway.monitor.json",
+    "Dockerfile.monitor",
+    "bun run hosted:monitor",
+    "VIVA_HOSTED_RUNNER_MODE=scheduled",
+    "VIVA_HOSTED_RUNNER_MODE=pr",
+    "VIVA_HOSTED_WEB_URL",
+    "VIVA_HOSTED_AGENT_HTTP_URL",
+    "VIVA_HOSTED_AGENT_WS_URL",
+    "VIVA_E2E_AGENT_PROVIDER",
+    "VIVA_HOSTED_ARTIFACT_BUCKET",
+    "VIVA_FAILURE_CONTROL_SECRET",
+    "synthetic or fake monitor deployment",
+    "synthetic monitor identity",
+    "object prefix",
+    "not GitHub Actions",
+  ]);
+
   assertIncludesAll(rollback, [
     "curl -fsS",
     "%{http_code}",
@@ -189,6 +210,35 @@ test("deployment runbook covers the beta operating path and stop rules", async (
   ]);
 
   assert.doesNotMatch(runbook, /\b(kubernetes|k8s|soc\s*-?\s*2|payments?|lms)\b/i);
+});
+
+test("hosted monitor substrate config is deployable off GitHub Actions", async () => {
+  const packageJson = JSON.parse(await readFile("package.json", "utf8"));
+  assert.equal(packageJson.scripts["hosted:monitor"], "node scripts/hosted-monitor-runner.mjs");
+
+  const railwayMonitor = JSON.parse(await readFile("railway.monitor.json", "utf8"));
+  assert.equal(railwayMonitor.build.builder, "DOCKERFILE");
+  assert.equal(railwayMonitor.build.dockerfilePath, "Dockerfile.monitor");
+  assert.equal(railwayMonitor.deploy.startCommand, "bun run hosted:monitor");
+  assert.equal(railwayMonitor.deploy.cronSchedule, "*/30 * * * *");
+  assert.equal(railwayMonitor.deploy.restartPolicyType, "NEVER");
+  assert.deepEqual(railwayMonitor.build.watchPatterns.sort(), [
+    "Dockerfile.monitor",
+    "agent/fixtures/**",
+    "apps/web/**",
+    "bun.lock",
+    "docs/deployment-runbook.md",
+    "package.json",
+    "packages/**",
+    "railway.monitor.json",
+    "scripts/**",
+  ]);
+
+  const dockerfile = await readFile("Dockerfile.monitor", "utf8");
+  assert.match(dockerfile, /mcr\.microsoft\.com\/playwright:v1\.61\.0/);
+  assert.match(dockerfile, /bun-v1\.3\.3/);
+  assert.match(dockerfile, /bun install --frozen-lockfile/);
+  assert.match(dockerfile, /bun", "run", "hosted:monitor"/);
 });
 
 function requiredSection(markdown, heading) {

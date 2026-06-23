@@ -20,6 +20,7 @@
     "redaction:check": "node scripts/redaction-control-check.mjs",
     "release:hygiene": "sh scripts/check-generated-artifact-hygiene.sh",
     "release:check": "node scripts/release-check.mjs",
+    "hosted:monitor": "node scripts/hosted-monitor-runner.mjs",
     "live:smoke": "node scripts/live-provider-smoke.mjs",
     "e2e:browser": "node scripts/e2e-browser.mjs",
     "build": "turbo run build",

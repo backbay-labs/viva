@@ -23,11 +23,20 @@ const artifactDir = path.resolve(
   root,
   process.env.VIVA_E2E_ARTIFACT_DIR ?? "artifacts/e2e-browser",
 );
-const agentPort = await freePort();
-const webPort = await freePort();
-const agentUrl = `http://127.0.0.1:${agentPort}`;
-const webUrl = `http://127.0.0.1:${webPort}`;
-const wsUrl = `ws://127.0.0.1:${agentPort}/ws`;
+const hostedWebUrl = optionalHostedHttpUrl("VIVA_E2E_HOSTED_WEB_URL");
+const hostedAgentHttpUrl = optionalHostedHttpUrl("VIVA_E2E_HOSTED_AGENT_HTTP_URL");
+const hostedAgentWsUrl = optionalHostedWsUrl("VIVA_E2E_HOSTED_AGENT_WS_URL");
+const hostedMode = Boolean(hostedWebUrl || hostedAgentHttpUrl || hostedAgentWsUrl);
+if (hostedMode && !(hostedWebUrl && hostedAgentHttpUrl && hostedAgentWsUrl)) {
+  throw new Error(
+    "Hosted browser E2E requires VIVA_E2E_HOSTED_WEB_URL, VIVA_E2E_HOSTED_AGENT_HTTP_URL, and VIVA_E2E_HOSTED_AGENT_WS_URL together.",
+  );
+}
+const agentPort = hostedMode ? null : await freePort();
+const webPort = hostedMode ? null : await freePort();
+const agentUrl = hostedAgentHttpUrl ?? `http://127.0.0.1:${agentPort}`;
+const webUrl = hostedWebUrl ?? `http://127.0.0.1:${webPort}`;
+const wsUrl = hostedAgentWsUrl ?? `ws://127.0.0.1:${agentPort}/ws`;
 const agentProvider = process.env.VIVA_E2E_AGENT_PROVIDER ?? "synthetic";
 const failureControlEnv = buildE2EFailureControlEnv();
 const failureControlPlan = buildFailureControlPlan({
@@ -91,20 +100,22 @@ await rm(artifactDir, { recursive: true, force: true });
 await mkdir(artifactDir, { recursive: true });
 
 try {
-  const agent = spawnLogged(
-    "agent",
-    "cargo",
-    ["run", "--manifest-path", "agent/Cargo.toml", "-p", "agent-service"],
-    {
-      VIVA_AGENT_BIND_ADDR: `127.0.0.1:${agentPort}`,
-      VIVA_AGENT_PROVIDER: agentProvider,
-      VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan.enabled
-        ? failureControlEnv.VIVA_VOICE_SESSION_TOKEN_SECRET
-        : "",
-      VIVA_VOICE_WS_ALLOWED_ORIGINS: failureControlPlan.enabled ? webUrl : "",
-      ...failureControlEnv,
-    },
-  );
+  const agent = hostedMode
+    ? null
+    : spawnLogged(
+        "agent",
+        "cargo",
+        ["run", "--manifest-path", "agent/Cargo.toml", "-p", "agent-service"],
+        {
+          VIVA_AGENT_BIND_ADDR: `127.0.0.1:${agentPort}`,
+          VIVA_AGENT_PROVIDER: agentProvider,
+          VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan.enabled
+            ? failureControlEnv.VIVA_VOICE_SESSION_TOKEN_SECRET
+            : "",
+          VIVA_VOICE_WS_ALLOWED_ORIGINS: failureControlPlan.enabled ? webUrl : "",
+          ...failureControlEnv,
+        },
+      );
   const agentReadiness = await waitForHttpJson(
     `${agentUrl}/ready`,
     (json) => {
@@ -114,19 +125,31 @@ try {
     `${agentProvider} agent readiness`,
   );
 
-  const web = spawnLogged(
-    "web",
-    "bun",
-    ["run", "--cwd", "apps/web", "dev", "--", "--hostname", "127.0.0.1", "--port", String(webPort)],
-    {
-      NEXT_PUBLIC_VIVA_AGENT_WS_URL: wsUrl,
-      NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: agentUrl,
-      NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID: failureControlIdentity?.userId ?? "user-1",
-      NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID:
-        failureControlIdentity?.studySetId ?? "biology-midterm",
-      NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID: "voice-session-1",
-    },
-  );
+  const web = hostedMode
+    ? null
+    : spawnLogged(
+        "web",
+        "bun",
+        [
+          "run",
+          "--cwd",
+          "apps/web",
+          "dev",
+          "--",
+          "--hostname",
+          "127.0.0.1",
+          "--port",
+          String(webPort),
+        ],
+        {
+          NEXT_PUBLIC_VIVA_AGENT_WS_URL: wsUrl,
+          NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: agentUrl,
+          NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID: failureControlIdentity?.userId ?? "user-1",
+          NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID:
+            failureControlIdentity?.studySetId ?? "biology-midterm",
+          NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID: "voice-session-1",
+        },
+      );
   await waitForHttp(webUrl, 120_000, "Next.js app");
 
   browser = await launchChromium();
@@ -437,6 +460,7 @@ try {
     artifact_dir: path.relative(root, artifactDir),
     agent_provider: agentProvider,
     agent_url: agentUrl,
+    hosted_mode: hostedMode,
     store: summarizeStore(agentReadiness?.store),
     durable_state_release_claimed: durableStateReleaseClaimed,
     stop_to_recap: stopToRecap,
@@ -561,8 +585,8 @@ try {
   }
 
   console.log(JSON.stringify(result, null, 2));
-  web.stop();
-  agent.stop();
+  web?.stop();
+  agent?.stop();
 } catch (error) {
   if (context && traceStarted) {
     await context.tracing.stop({ path: path.join(artifactDir, "trace.zip") }).catch(() => {});
@@ -1155,7 +1179,7 @@ async function buildBrowserStoryManifest({ traceRetained }) {
       validation_run_id: validationRunId,
       artifact_dir: path.relative(root, artifactDir),
       browser: "playwright-chromium",
-      capture_mode: "loopback-local",
+      capture_mode: hostedMode ? "hosted" : "loopback-local",
       post_answer_source_folio_required: requirePostAnswerSourceFolio,
       stop_to_recap: stopToRecap,
     },
@@ -1496,6 +1520,31 @@ async function auditBrowserStoryArtifacts(dir) {
     rootDir: root,
     zipMessage: (relative) => `Browser story artifact includes retained trace archive: ${relative}`,
   });
+}
+
+function optionalHostedHttpUrl(name) {
+  const value = process.env[name]?.trim();
+  if (!value) return null;
+  const url = new URL(value);
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error(`${name} must use http:// or https://`);
+  }
+  url.hash = "";
+  url.search = "";
+  url.pathname = url.pathname.replace(/\/+$/g, "");
+  return url.toString().replace(/\/$/g, "");
+}
+
+function optionalHostedWsUrl(name) {
+  const value = process.env[name]?.trim();
+  if (!value) return null;
+  const url = new URL(value);
+  if (!["ws:", "wss:"].includes(url.protocol)) {
+    throw new Error(`${name} must use ws:// or wss://`);
+  }
+  url.hash = "";
+  url.search = "";
+  return url.toString().replace(/\/$/g, "");
 }
 
 function delay(ms) {
