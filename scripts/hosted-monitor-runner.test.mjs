@@ -27,6 +27,10 @@ const baseEnv = Object.freeze({
   VIVA_HOSTED_FAKE_PROVIDER_AGENT_HTTP_URL: "https://fake-agent.example.com/",
   VIVA_HOSTED_FAKE_PROVIDER_AGENT_WS_URL: "wss://fake-agent.example.com/ws",
   VIVA_HOSTED_FAKE_PROVIDER_WEB_URL: "https://fake-web.example.com/",
+  VIVA_HOSTED_FAILURE_CONTROL_AGENT_HTTP_URL: "https://failure-agent.example.com/",
+  VIVA_HOSTED_FAILURE_CONTROL_AGENT_WS_URL: "wss://failure-agent.example.com/ws",
+  VIVA_HOSTED_FAILURE_CONTROL_WEB_URL: "https://failure-web.example.com/",
+  VIVA_HOSTED_REST_BEARER_TOKEN: "redacted-rest-bearer",
   VIVA_HOSTED_RUN_ID: "run-2026-06-23T19-20-00Z",
   VIVA_HOSTED_SYNTHETIC_STUDY_SET_ID: "biology-midterm",
   VIVA_HOSTED_SYNTHETIC_USER_ID: "synthetic-monitor-user",
@@ -44,6 +48,7 @@ test("hosted monitor plan runs scheduled synthetic browser proof against hosted 
   assert.equal(plan.runs[0].env.VIVA_E2E_HOSTED_WEB_URL, "https://web.example.com");
   assert.equal(plan.runs[0].env.VIVA_E2E_HOSTED_AGENT_HTTP_URL, "https://agent.example.com");
   assert.equal(plan.runs[0].env.VIVA_E2E_HOSTED_AGENT_WS_URL, "wss://agent.example.com/ws");
+  assert.equal(plan.runs[0].env.VIVA_E2E_HOSTED_REST_BEARER_TOKEN, "redacted-rest-bearer");
   assert.equal(plan.runs[0].env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID, "synthetic-monitor-user");
   assert.equal(plan.runs[0].env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID, "biology-midterm");
   assert.equal(plan.runs[0].env.VIVA_E2E_SYNTHETIC_USER_ID, "synthetic-monitor-user");
@@ -73,6 +78,15 @@ test("hosted monitor PR mode includes the failure-control browser slice", () => 
   assert.equal(plan.runs[1].env.VIVA_E2E_AGENT_PROVIDER, "fake_cartesia_gemini");
   assert.equal(plan.runs[1].env.VIVA_E2E_HOSTED_WEB_URL, "https://fake-web.example.com");
   assert.equal(plan.runs[2].env.VIVA_E2E_FAILURE_CONTROL_SCENARIO, "provider_rate_limited");
+  assert.equal(plan.runs[2].env.VIVA_E2E_HOSTED_WEB_URL, "https://failure-web.example.com");
+  assert.equal(
+    plan.runs[2].env.VIVA_E2E_HOSTED_AGENT_HTTP_URL,
+    "https://failure-agent.example.com",
+  );
+  assert.equal(
+    plan.runs[2].env.VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS,
+    "https://failure-web.example.com",
+  );
   assert.equal(plan.runs[2].env.VIVA_FAILURE_CONTROL_ENABLED, "1");
   assert.equal(plan.runs[2].env.VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS, "synthetic-monitor-user");
   assert.equal(plan.runs[2].env.VIVA_FAILURE_CONTROL_STUDY_SET_IDS, "biology-midterm");
@@ -119,6 +133,14 @@ test("hosted monitor validates run timeout", () => {
       }),
     /VIVA_HOSTED_PUBLISH_TIMEOUT_MS must be a positive integer/,
   );
+  assert.throws(
+    () =>
+      buildHostedMonitorPlan({
+        ...baseEnv,
+        VIVA_HOSTED_RUN_ID: "..",
+      }),
+    /must not be empty or a dot path segment/,
+  );
 });
 
 test("hosted monitor writes final manifest for timed-out runs", async () => {
@@ -150,6 +172,7 @@ test("hosted monitor writes final manifest for timed-out runs", async () => {
         summarizeHostedRun(
           run,
           runDir,
+          runDir,
           {
             failure_class: "timeout",
             sanitized: true,
@@ -174,6 +197,36 @@ test("hosted monitor writes final manifest for timed-out runs", async () => {
     const stored = JSON.parse(await readFile(path.join(dir, "manifest.json"), "utf8"));
     assert.equal(stored.status, "failed");
     assert.equal(stored.runs[0].status, "timed_out");
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("hosted monitor summarizes browser artifacts below the run log directory", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "viva-hosted-monitor-summary-"));
+  try {
+    const run = { name: "scheduled_hosted_synthetic_monitor" };
+    const runDir = path.join(dir, run.name);
+    const browserDir = path.join(runDir, "browser");
+    await mkdir(browserDir, { recursive: true });
+
+    const summary = summarizeHostedRun(
+      run,
+      runDir,
+      browserDir,
+      { exit_code: 0, sanitized: true, status: "passed" },
+      {
+        browser_story_artifact: "browser-story.json",
+        browser_story: { frames: [{ id: "recap" }] },
+        manuscript_ready: true,
+        page_errors: [],
+      },
+      dir,
+    );
+
+    assert.equal(summary.artifact_dir, "scheduled_hosted_synthetic_monitor");
+    assert.equal(summary.browser_story_artifact, "browser/browser-story.json");
+    assert.deepEqual(summary.browser_story_frames, ["recap"]);
   } finally {
     await rm(dir, { force: true, recursive: true });
   }

@@ -378,7 +378,11 @@ Railway deployment config from the default-discoverable `railway.json`, and runs
 bun run hosted:monitor
 ```
 
-`railway.json` configures a short-lived Railway cron service with
+`railway.json` is intentionally scoped to the `viva-hosted-monitor` service. Do
+not connect hosted web or hosted agent services to the repo root without a
+service-specific Railway config path, or they will inherit the monitor
+Dockerfile, cron schedule, and start command. `railway.json` configures a
+short-lived Railway cron service with
 `cronSchedule: "*/30 * * * *"` and `restartPolicyType: "NEVER"`. Railway cron
 jobs must exit when the task finishes; a still-active prior execution causes the
 next scheduled execution to be skipped. Keep the monitor as a task process, not a
@@ -420,9 +424,13 @@ VIVA_HOSTED_WEB_URL="https://viva-web.example.com"
 VIVA_HOSTED_AGENT_HTTP_URL="https://viva-agent.example.com"
 VIVA_HOSTED_AGENT_WS_URL="wss://viva-agent.example.com/ws"
 VIVA_E2E_AGENT_PROVIDER="synthetic"
+VIVA_HOSTED_REST_BEARER_TOKEN="<from the hosted agent REST auth secret store>"
 VIVA_HOSTED_FAKE_PROVIDER_WEB_URL="https://viva-fake-web.example.com"
 VIVA_HOSTED_FAKE_PROVIDER_AGENT_HTTP_URL="https://viva-fake-agent.example.com"
 VIVA_HOSTED_FAKE_PROVIDER_AGENT_WS_URL="wss://viva-fake-agent.example.com/ws"
+VIVA_HOSTED_FAILURE_CONTROL_WEB_URL="https://viva-failure-control-web.example.com"
+VIVA_HOSTED_FAILURE_CONTROL_AGENT_HTTP_URL="https://viva-failure-control-agent.example.com"
+VIVA_HOSTED_FAILURE_CONTROL_AGENT_WS_URL="wss://viva-failure-control-agent.example.com/ws"
 VIVA_HOSTED_SYNTHETIC_USER_ID="synthetic-monitor-user"
 VIVA_HOSTED_SYNTHETIC_STUDY_SET_ID="biology-midterm"
 VIVA_VOICE_SESSION_TOKEN_SECRET="<from the hosted agent secret store>"
@@ -438,9 +446,12 @@ The hosted agent URL must point at a synthetic or fake monitor deployment whose
 provider matches `VIVA_E2E_AGENT_PROVIDER`; do not aim the scheduled monitor at a
 live learner tutor endpoint. The control secret and session signing secret must
 come from the deployment secret store and must match the hosted agent variables.
-The runner identity must be an allowlisted synthetic monitor identity, never a
-learner or real tester. Do not print secret values while checking variables;
-verify presence by key name and service configuration only.
+The PR failure-control leg must use its own hosted web and agent target that is
+preconfigured with matching `VIVA_FAILURE_CONTROL_*` gates; the normal synthetic
+leg and failure-control leg must not share one hosted agent origin. The runner
+identity must be an allowlisted synthetic monitor identity, never a learner or
+real tester. Do not print secret values while checking variables; verify presence
+by key name and service configuration only.
 
 The hosted monitor evidence is safe to attach only after `manifest.json` reports
 `learner_identity_used: false`, each run reports `sanitized: true`, and the

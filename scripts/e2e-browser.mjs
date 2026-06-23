@@ -32,6 +32,10 @@ if (hostedMode && !(hostedWebUrl && hostedAgentHttpUrl && hostedAgentWsUrl)) {
     "Hosted browser E2E requires VIVA_E2E_HOSTED_WEB_URL, VIVA_E2E_HOSTED_AGENT_HTTP_URL, and VIVA_E2E_HOSTED_AGENT_WS_URL together.",
   );
 }
+const hostedRestBearerToken = process.env.VIVA_E2E_HOSTED_REST_BEARER_TOKEN?.trim() ?? "";
+if (hostedMode && !hostedRestBearerToken) {
+  throw new Error("Hosted browser E2E requires VIVA_E2E_HOSTED_REST_BEARER_TOKEN.");
+}
 const agentPort = hostedMode ? null : await freePort();
 const webPort = hostedMode ? null : await freePort();
 const agentUrl = hostedAgentHttpUrl ?? `http://127.0.0.1:${agentPort}`;
@@ -212,18 +216,16 @@ try {
     if (scenarioStartTarget.preconsume_replay) {
       await consumeFailureControlReplayToken(page, signedStartTarget);
     }
-    await page.goto(`${webUrl}${scenarioStartTarget.target}`, { waitUntil: "domcontentloaded" });
+    await navigateToSessionTarget(page, scenarioStartTarget.target);
   } else if (hostedMode) {
     const identity = hostedSyntheticIdentity();
     assertHostedSyntheticIdentity(identity);
     const signedStartTarget = await fetchSignedSessionStartTarget(page, identity);
-    await page.goto(`${webUrl}${signedStartTarget}`, { waitUntil: "domcontentloaded" });
+    await navigateToSessionTarget(page, signedStartTarget);
   } else {
     await startActionButton.click();
   }
-  await page.waitForURL((url) => url.toString().startsWith(`${webUrl}/session`), {
-    timeout: 20_000,
-  });
+  await waitForSessionUrl(page, 20_000);
   if (sessionTokenFailureScenario) {
     failureControlTerminalProof = await waitForFailureControlTerminal(
       serverEvents,
@@ -613,6 +615,9 @@ try {
   web?.stop();
   agent?.stop();
 } catch (error) {
+  const sanitizedError = redactSensitiveDiagnostic(
+    error instanceof Error ? error.message : String(error),
+  );
   if (context && traceStarted) {
     await context.tracing.stop({ path: path.join(artifactDir, "trace.zip") }).catch(() => {});
     traceStarted = false;
@@ -626,21 +631,29 @@ try {
     path.join(artifactDir, "failure.json"),
     `${JSON.stringify(
       {
-        error: error instanceof Error ? error.message : String(error),
-        console_errors: consoleErrors,
-        page_errors: pageErrors,
+        error: sanitizedError,
+        console_errors: consoleErrors.map(redactSensitiveDiagnostic),
+        page_errors: pageErrors.map(redactSensitiveDiagnostic),
         artifact_dir: path.relative(root, artifactDir),
       },
       null,
       2,
     )}\n`,
   ).catch(() => {});
-  throw error;
+  throw new Error(sanitizedError);
 } finally {
   await browser?.close().catch(() => {});
   for (const child of children.reverse()) {
     child.stop();
   }
+}
+
+function redactSensitiveDiagnostic(value) {
+  return String(value)
+    .replace(/#session_token=[^\s"'<>)]*/gi, "#redacted-session-fragment")
+    .replace(/[?&]session_token=[^&\s"'<>)]*/gi, "?redacted_session_param=1")
+    .replace(/viva1\.[A-Za-z0-9._-]+/g, "redacted-viva-token")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer redacted");
 }
 
 async function capturePendingLocalPreview(targetPage) {
@@ -659,32 +672,68 @@ async function capturePendingLocalPreview(targetPage) {
 }
 
 async function fetchSignedSessionStartTarget(targetPage, identity) {
-  return targetPage.evaluate(async ({ userId, studySetId }) => {
-    const libraryParams = new URLSearchParams({ user_id: userId });
-    const response = await fetch(
-      `/api/viva-library/study-sets/library?${libraryParams.toString()}`,
-      {
-        cache: "no-store",
-      },
+  return targetPage.evaluate(
+    async ({ restBearerToken, userId, studySetId }) => {
+      const libraryParams = new URLSearchParams({ user_id: userId });
+      const headers = {};
+      if (restBearerToken) headers.authorization = `Bearer ${restBearerToken}`;
+      const response = await fetch(
+        `/api/viva-library/study-sets/library?${libraryParams.toString()}`,
+        {
+          cache: "no-store",
+          headers,
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`hosted library token fetch failed with HTTP ${response.status}`);
+      }
+      const snapshot = await response.json();
+      const studySet = snapshot.study_sets?.find((entry) => entry.id === studySetId);
+      const action = studySet?.actions?.start;
+      if (!studySet || !action?.session_id || !action?.session_token) {
+        throw new Error("failure-control library token fetch did not return a start token");
+      }
+      const params = new URLSearchParams({
+        user_id: studySet.user_id,
+        study_set_id: studySet.id,
+        session_id: action.session_id,
+      });
+      return `/session?${params.toString()}#session_token=${encodeURIComponent(
+        action.session_token,
+      )}`;
+    },
+    { ...identity, restBearerToken: hostedRestBearerToken },
+  );
+}
+
+async function navigateToSessionTarget(targetPage, target) {
+  const targetUrl = new URL(target, webUrl);
+  const webOrigin = new URL(webUrl).origin;
+  if (targetUrl.origin !== webOrigin) {
+    throw new Error("Hosted signed session target origin did not match configured web origin.");
+  }
+  try {
+    await targetPage.evaluate((href) => {
+      window.location.assign(href);
+    }, targetUrl.toString());
+  } catch (error) {
+    throw new Error(
+      `Hosted signed session navigation failed before load: ${redactSensitiveDiagnostic(
+        error instanceof Error ? error.message : String(error),
+      )}`,
     );
-    if (!response.ok) {
-      throw new Error(`failure-control library token fetch failed with HTTP ${response.status}`);
-    }
-    const snapshot = await response.json();
-    const studySet = snapshot.study_sets?.find((entry) => entry.id === studySetId);
-    const action = studySet?.actions?.start;
-    if (!studySet || !action?.session_id || !action?.session_token) {
-      throw new Error("failure-control library token fetch did not return a start token");
-    }
-    const params = new URLSearchParams({
-      user_id: studySet.user_id,
-      study_set_id: studySet.id,
-      session_id: action.session_id,
-    });
-    return `/session?${params.toString()}#session_token=${encodeURIComponent(
-      action.session_token,
-    )}`;
-  }, identity);
+  }
+}
+
+async function waitForSessionUrl(targetPage, timeoutMs) {
+  const webOrigin = new URL(webUrl).origin;
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const current = new URL(targetPage.url());
+    if (current.origin === webOrigin && current.pathname === "/session") return;
+    await delay(100);
+  }
+  throw new Error("Timed out waiting for signed hosted session navigation.");
 }
 
 function hostedSyntheticIdentity() {

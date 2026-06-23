@@ -59,6 +59,7 @@ export function buildHostedMonitorPlan(env = process.env) {
   const baseEnv = {
     NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID: syntheticStudySetId,
     NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID: syntheticUserId,
+    VIVA_E2E_HOSTED_REST_BEARER_TOKEN: requiredValue(env, "VIVA_HOSTED_REST_BEARER_TOKEN"),
     VIVA_E2E_SYNTHETIC_STUDY_SET_ID: syntheticStudySetId,
     VIVA_E2E_SYNTHETIC_USER_ID: syntheticUserId,
     VIVA_HOSTED_RUN_ID: runId,
@@ -75,6 +76,15 @@ export function buildHostedMonitorPlan(env = process.env) {
           agentWsName: "VIVA_HOSTED_FAKE_PROVIDER_AGENT_WS_URL",
           provider: "fake_cartesia_gemini",
           webName: "VIVA_HOSTED_FAKE_PROVIDER_WEB_URL",
+        })
+      : null;
+  const failureControlTarget =
+    mode === "pr"
+      ? hostedTargetFromEnv(env, {
+          agentHttpName: "VIVA_HOSTED_FAILURE_CONTROL_AGENT_HTTP_URL",
+          agentWsName: "VIVA_HOSTED_FAILURE_CONTROL_AGENT_WS_URL",
+          provider: "synthetic",
+          webName: "VIVA_HOSTED_FAILURE_CONTROL_WEB_URL",
         })
       : null;
   const runs =
@@ -105,11 +115,11 @@ export function buildHostedMonitorPlan(env = process.env) {
           },
           {
             name: "pr_hosted_failure_control_provider_rate_limited",
-            env: runEnv(baseEnv, syntheticTarget, {
+            env: runEnv(baseEnv, failureControlTarget, {
               VIVA_E2E_FAILURE_CONTROL_SCENARIO:
                 env.VIVA_E2E_FAILURE_CONTROL_SCENARIO || "provider_rate_limited",
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
-              VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS: baseTarget.webUrl,
+              VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS: failureControlTarget.webUrl,
               VIVA_FAILURE_CONTROL_ENABLED: "1",
               VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY:
                 env.VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY || "1",
@@ -209,18 +219,21 @@ async function main() {
 
   for (const run of plan.runs) {
     const runDir = path.join(outputDir, run.name);
+    const browserArtifactDir = path.join(runDir, "browser");
     await mkdir(runDir, { recursive: true });
-    let outcome = await runHostedE2E(run, runDir);
-    const resultRead = await readRunResult(runDir);
+    let outcome = await runHostedE2E(run, runDir, browserArtifactDir);
+    const resultRead = await readRunResult(browserArtifactDir);
     if (outcome.status === "passed" && !resultRead.result) {
       outcome = await writeRunOutcomeArtifact(
         runDir,
-        "failure.json",
+        "runner-failure.json",
         failedRunOutcome(run, resultRead.failureClass),
       );
     }
     await auditHostedArtifacts(runDir);
-    summary.runs.push(summarizeHostedRun(run, runDir, outcome, resultRead.result));
+    summary.runs.push(
+      summarizeHostedRun(run, runDir, browserArtifactDir, outcome, resultRead.result),
+    );
   }
 
   const failedRuns = summary.runs.filter((run) => run.status !== "passed").map((run) => run.name);
@@ -284,7 +297,12 @@ async function readRunResult(runDir) {
   }
 }
 
-export function summarizeHostedRun(run, runDir, outcome, result, rootDir = root) {
+export function summarizeHostedRun(run, runDir, resultDir, outcome, result, rootDir = root) {
+  const resultRelativeDir = path.relative(runDir, resultDir).replaceAll("\\", "/");
+  const browserStoryArtifact =
+    result?.browser_story_artifact && resultRelativeDir
+      ? `${resultRelativeDir}/${result.browser_story_artifact}`
+      : (result?.browser_story_artifact ?? null);
   return {
     name: run.name,
     artifact_dir: path.relative(rootDir, runDir),
@@ -293,7 +311,7 @@ export function summarizeHostedRun(run, runDir, outcome, result, rootDir = root)
     exit_code: outcome.exit_code ?? null,
     terminal_signal: outcome.terminal_signal ?? null,
     timeout_ms: outcome.timeout_ms ?? null,
-    browser_story_artifact: result?.browser_story_artifact ?? null,
+    browser_story_artifact: browserStoryArtifact,
     browser_story_frames: Array.isArray(result?.browser_story?.frames)
       ? result.browser_story.frames.map((frame) => frame.id).filter(Boolean)
       : [],
@@ -310,7 +328,7 @@ export function summarizeHostedRun(run, runDir, outcome, result, rootDir = root)
   };
 }
 
-async function runHostedE2E(run, runDir) {
+async function runHostedE2E(run, runDir, browserArtifactDir) {
   const stdout = createWriteStream(path.join(runDir, "e2e.stdout.log"));
   const stderr = createWriteStream(path.join(runDir, "e2e.stderr.log"));
   const stdoutFinished = finished(stdout);
@@ -320,7 +338,7 @@ async function runHostedE2E(run, runDir) {
     env: {
       ...process.env,
       ...run.env,
-      VIVA_E2E_ARTIFACT_DIR: runDir,
+      VIVA_E2E_ARTIFACT_DIR: browserArtifactDir,
       VIVA_E2E_TRACE: "0",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -346,7 +364,11 @@ async function runHostedE2E(run, runDir) {
     clearTimeout(timeout);
     if (killTimer) clearTimeout(killTimer);
     await flushHostedRunLogs(stdoutFinished, stderrFinished);
-    return writeRunOutcomeArtifact(runDir, "failure.json", failedRunOutcome(run, "spawn_error"));
+    return writeRunOutcomeArtifact(
+      runDir,
+      "runner-failure.json",
+      failedRunOutcome(run, "spawn_error"),
+    );
   }
   clearTimeout(timeout);
   if (killTimer) clearTimeout(killTimer);
@@ -364,14 +386,14 @@ async function runHostedE2E(run, runDir) {
   if (logFlushFailure) {
     return writeRunOutcomeArtifact(
       runDir,
-      "failure.json",
+      "runner-failure.json",
       failedRunOutcome(run, "log_flush_failed"),
     );
   }
   if (code !== 0) {
     return writeRunOutcomeArtifact(
       runDir,
-      "failure.json",
+      "runner-failure.json",
       failedRunOutcome(run, "process_exit", exitDetails(code)),
     );
   }
@@ -585,7 +607,11 @@ function positiveInteger(value, fallback, name) {
 }
 
 function sanitizeRunId(value) {
-  return value.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 96);
+  const sanitized = value.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 96);
+  if (!sanitized || sanitized === "." || sanitized === "..") {
+    throw new Error("VIVA_HOSTED_RUN_ID must not be empty or a dot path segment");
+  }
+  return sanitized;
 }
 
 function contentTypeFor(file) {
