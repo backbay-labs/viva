@@ -372,13 +372,13 @@ or source excerpts.
 BAC-530 uses a separate Railway cron service named `viva-hosted-monitor` as the
 off-GitHub execution substrate. It is not GitHub Actions and it does not consume
 blocked Actions minutes. The service builds from `Dockerfile.monitor`, reads
-Railway deployment config from `railway.monitor.json`, and runs:
+Railway deployment config from the default-discoverable `railway.json`, and runs:
 
 ```sh
 bun run hosted:monitor
 ```
 
-`railway.monitor.json` configures a short-lived Railway cron service with
+`railway.json` configures a short-lived Railway cron service with
 `cronSchedule: "*/30 * * * *"` and `restartPolicyType: "NEVER"`. Railway cron
 jobs must exit when the task finishes; a still-active prior execution causes the
 next scheduled execution to be skipped. Keep the monitor as a task process, not a
@@ -402,9 +402,10 @@ VIVA_HOSTED_RUNNER_MODE=pr
 ```
 
 Run that mode from a Railway deployment or manual service run for the branch
-under review. It executes the hosted synthetic matrix plus the BAC-528
-failure-control browser slice, including a deterministic provider-rate-limited
-terminal path. It publishes under `viva-hosted-monitor/pr/<run_id>/`.
+under review. It executes the hosted synthetic provider leg, hosted
+`fake_cartesia_gemini` provider leg, and the BAC-528 failure-control browser
+slice, including a deterministic provider-rate-limited terminal path. It
+publishes under `viva-hosted-monitor/pr/<run_id>/`.
 
 Required monitor variables:
 
@@ -413,6 +414,9 @@ VIVA_HOSTED_WEB_URL="https://viva-web.example.com"
 VIVA_HOSTED_AGENT_HTTP_URL="https://viva-agent.example.com"
 VIVA_HOSTED_AGENT_WS_URL="wss://viva-agent.example.com/ws"
 VIVA_E2E_AGENT_PROVIDER="synthetic"
+VIVA_HOSTED_FAKE_PROVIDER_WEB_URL="https://viva-fake-web.example.com"
+VIVA_HOSTED_FAKE_PROVIDER_AGENT_HTTP_URL="https://viva-fake-agent.example.com"
+VIVA_HOSTED_FAKE_PROVIDER_AGENT_WS_URL="wss://viva-fake-agent.example.com/ws"
 VIVA_HOSTED_SYNTHETIC_USER_ID="synthetic-monitor-user"
 VIVA_HOSTED_SYNTHETIC_STUDY_SET_ID="biology-midterm"
 VIVA_VOICE_SESSION_TOKEN_SECRET="<from the hosted agent secret store>"
@@ -434,10 +438,12 @@ verify presence by key name and service configuration only.
 
 The hosted monitor evidence is safe to attach only after `manifest.json` reports
 `learner_identity_used: false`, each run reports `sanitized: true`, and the
-artifact upload summary reports the expected durable object prefix. BAC-526 reads
-that object prefix as the hosted-browser evidence bundle; `/ready` alone, a
-local-only run, or `VIVA_RELEASE_CHECK_SKIP_BROWSER=1` is not production-ready
-evidence.
+artifact upload summary reports the expected durable object prefix. The durable
+bundle intentionally publishes only text, JSON, and log artifacts; screenshots,
+traces, archives, HAR files, and other binary browser captures are local-only and
+must not be uploaded as hosted evidence. BAC-526 reads that object prefix as the
+hosted-browser evidence bundle; `/ready` alone, a local-only run, or
+`VIVA_RELEASE_CHECK_SKIP_BROWSER=1` is not production-ready evidence.
 
 ## Rollback And Drain
 

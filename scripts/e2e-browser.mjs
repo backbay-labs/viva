@@ -61,6 +61,10 @@ if (!allowedBrowserStoryProviders.has(agentProvider)) {
   );
 }
 const stopToRecap = process.env.VIVA_E2E_STOP_TO_RECAP === "1";
+const traceRequested = process.env.VIVA_E2E_TRACE === "1";
+if (hostedMode && traceRequested) {
+  throw new Error("Hosted browser E2E cannot retain Playwright traces.");
+}
 const validationRunId = `browser-story-${agentProvider}-${new Date()
   .toISOString()
   .replaceAll(/[:.]/g, "-")}`;
@@ -73,6 +77,7 @@ const children = [];
 const consoleErrors = [];
 const pageErrors = [];
 const serverEvents = [];
+const websocketUrls = [];
 let browser;
 let context;
 let page;
@@ -155,7 +160,7 @@ try {
   browser = await launchChromium();
   context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   await context.grantPermissions(["microphone"], { origin: webUrl });
-  if (process.env.VIVA_E2E_TRACE === "1") {
+  if (traceRequested) {
     await context.tracing.start({ screenshots: false, snapshots: false, sources: false });
     traceStarted = true;
   }
@@ -167,6 +172,7 @@ try {
   });
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("websocket", (socket) => {
+    websocketUrls.push(socket.url());
     socket.on("framereceived", (frame) => recordServerFramePayload(frame.payload, serverEvents));
   });
 
@@ -192,7 +198,10 @@ try {
   });
   let manuscriptReady = false;
   if (failureControlPlan.enabled) {
-    const signedStartTarget = await fetchFailureControlStartTarget(page);
+    const signedStartTarget = await fetchSignedSessionStartTarget(
+      page,
+      failureControlStartIdentity(failureControlPlan),
+    );
     const scenarioStartTarget = failureControlSessionTargetForScenario(
       signedStartTarget,
       failureControlPlan.scenario,
@@ -204,6 +213,11 @@ try {
       await consumeFailureControlReplayToken(page, signedStartTarget);
     }
     await page.goto(`${webUrl}${scenarioStartTarget.target}`, { waitUntil: "domcontentloaded" });
+  } else if (hostedMode) {
+    const identity = hostedSyntheticIdentity();
+    assertHostedSyntheticIdentity(identity);
+    const signedStartTarget = await fetchSignedSessionStartTarget(page, identity);
+    await page.goto(`${webUrl}${signedStartTarget}`, { waitUntil: "domcontentloaded" });
   } else {
     await startActionButton.click();
   }
@@ -253,7 +267,11 @@ try {
     });
     manuscriptReady = await isVisible(page.getByText(listeningText));
     if (!failureControlPlan.enabled) {
-      secondTabSessionCap = await auditSecondTabSessionCap(context, page.url());
+      if (hostedMode) {
+        assertHostedWebSocketTarget(websocketUrls, wsUrl);
+      } else {
+        secondTabSessionCap = await auditSecondTabSessionCap(context, page.url());
+      }
     }
     await page.screenshot({
       path: path.join(artifactDir, "session-ready.png"),
@@ -461,6 +479,13 @@ try {
     agent_provider: agentProvider,
     agent_url: agentUrl,
     hosted_mode: hostedMode,
+    hosted_session_identity: hostedMode
+      ? {
+          study_set_id: hostedSyntheticIdentity().studySetId,
+          synthetic_user_id: hostedSyntheticIdentity().userId,
+        }
+      : null,
+    hosted_websocket_verified: hostedMode,
     store: summarizeStore(agentReadiness?.store),
     durable_state_release_claimed: durableStateReleaseClaimed,
     stop_to_recap: stopToRecap,
@@ -633,8 +658,7 @@ async function capturePendingLocalPreview(targetPage) {
   });
 }
 
-async function fetchFailureControlStartTarget(targetPage) {
-  const identity = failureControlStartIdentity(failureControlPlan);
+async function fetchSignedSessionStartTarget(targetPage, identity) {
   return targetPage.evaluate(async ({ userId, studySetId }) => {
     const libraryParams = new URLSearchParams({ user_id: userId });
     const response = await fetch(
@@ -661,6 +685,56 @@ async function fetchFailureControlStartTarget(targetPage) {
       action.session_token,
     )}`;
   }, identity);
+}
+
+function hostedSyntheticIdentity() {
+  return {
+    studySetId:
+      process.env.VIVA_E2E_SYNTHETIC_STUDY_SET_ID?.trim() ||
+      process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID?.trim() ||
+      "biology-midterm",
+    userId:
+      process.env.VIVA_E2E_SYNTHETIC_USER_ID?.trim() ||
+      process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID?.trim() ||
+      "user-1",
+  };
+}
+
+function assertHostedSyntheticIdentity(identity) {
+  if (
+    !/(synthetic|monitor|test)/i.test(identity.userId) ||
+    /(learner|student)/i.test(identity.userId)
+  ) {
+    throw new Error("Hosted browser E2E requires a synthetic monitor user identity.");
+  }
+}
+
+function assertHostedWebSocketTarget(urls, expectedUrl) {
+  const expected = normalizeComparableWsUrl(expectedUrl);
+  const observed = urls.map(normalizeComparableWsUrl);
+  if (!observed.includes(expected)) {
+    throw new Error(
+      `Hosted browser E2E did not connect to configured agent WebSocket. Expected ${expected}; observed ${
+        observed.map(redactedWebSocketUrl).join(", ") || "none"
+      }`,
+    );
+  }
+}
+
+function normalizeComparableWsUrl(value) {
+  const url = new URL(value);
+  url.hash = "";
+  url.search = "";
+  return url.toString().replace(/\/$/g, "");
+}
+
+function redactedWebSocketUrl(value) {
+  const url = new URL(value);
+  url.username = "";
+  url.password = "";
+  url.search = "";
+  url.hash = "";
+  return url.toString().replace(/\/$/g, "");
 }
 
 async function consumeFailureControlReplayToken(targetPage, signedStartTarget) {
@@ -1202,11 +1276,6 @@ function summarizeStore(store) {
 async function writeAuditedBrowserStoryResult(baseResult) {
   const storyPath = path.join(artifactDir, "browser-story.json");
   const resultPath = path.join(artifactDir, "result.json");
-  if (baseResult.trace) {
-    await writeFile(storyPath, `${JSON.stringify(baseResult.browser_story, null, 2)}\n`);
-    await writeFile(resultPath, `${JSON.stringify(baseResult, null, 2)}\n`);
-    return baseResult;
-  }
   let result = baseResult;
   for (let pass = 0; pass < 2; pass += 1) {
     await writeFile(storyPath, `${JSON.stringify(result.browser_story, null, 2)}\n`);

@@ -2,12 +2,14 @@
 import { spawn } from "node:child_process";
 import { createHmac, createHash } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { finished } from "node:stream/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const hostedArtifactRoot = path.join(root, "artifacts/hosted-monitor");
+const defaultRunTimeoutMs = 10 * 60 * 1000;
 const forbiddenArtifactMarkers = [
   "pcm16_base64",
   "answer_text",
@@ -29,62 +31,84 @@ export function buildHostedMonitorPlan(env = process.env) {
     throw new Error("VIVA_HOSTED_RUNNER_MODE must be scheduled or pr");
   }
 
-  const hostedWebUrl = normalizeHostedUrl(requiredValue(env, "VIVA_HOSTED_WEB_URL"));
-  const hostedAgentHttpUrl = normalizeHostedUrl(requiredValue(env, "VIVA_HOSTED_AGENT_HTTP_URL"));
-  const hostedAgentWsUrl = normalizeWebSocketUrl(requiredValue(env, "VIVA_HOSTED_AGENT_WS_URL"));
   const syntheticUserId = requiredValue(env, "VIVA_HOSTED_SYNTHETIC_USER_ID");
   const syntheticStudySetId = requiredValue(env, "VIVA_HOSTED_SYNTHETIC_STUDY_SET_ID");
   assertSyntheticIdentity(syntheticUserId);
+  const runTimeoutMs = positiveInteger(env.VIVA_HOSTED_RUN_TIMEOUT_MS, defaultRunTimeoutMs);
 
   const runId = sanitizeRunId(
     env.VIVA_HOSTED_RUN_ID || new Date().toISOString().replaceAll(/[:.]/g, "-"),
   );
   const artifactPrefix = `viva-hosted-monitor/${mode}/${runId}`;
+  const baseTarget = hostedTargetFromEnv(env, {
+    agentHttpName: "VIVA_HOSTED_AGENT_HTTP_URL",
+    agentWsName: "VIVA_HOSTED_AGENT_WS_URL",
+    provider: env.VIVA_E2E_AGENT_PROVIDER || "synthetic",
+    webName: "VIVA_HOSTED_WEB_URL",
+  });
   const baseEnv = {
     NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID: syntheticStudySetId,
     NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID: syntheticUserId,
-    VIVA_E2E_AGENT_PROVIDER: env.VIVA_E2E_AGENT_PROVIDER || "synthetic",
-    VIVA_E2E_HOSTED_AGENT_HTTP_URL: hostedAgentHttpUrl,
-    VIVA_E2E_HOSTED_AGENT_WS_URL: hostedAgentWsUrl,
-    VIVA_E2E_HOSTED_WEB_URL: hostedWebUrl,
+    VIVA_E2E_SYNTHETIC_STUDY_SET_ID: syntheticStudySetId,
+    VIVA_E2E_SYNTHETIC_USER_ID: syntheticUserId,
     VIVA_HOSTED_RUN_ID: runId,
     VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"),
   };
+  const syntheticTarget = {
+    ...baseTarget,
+    provider: "synthetic",
+  };
+  const fakeTarget =
+    mode === "pr"
+      ? hostedTargetFromEnv(env, {
+          agentHttpName: "VIVA_HOSTED_FAKE_PROVIDER_AGENT_HTTP_URL",
+          agentWsName: "VIVA_HOSTED_FAKE_PROVIDER_AGENT_WS_URL",
+          provider: "fake_cartesia_gemini",
+          webName: "VIVA_HOSTED_FAKE_PROVIDER_WEB_URL",
+        })
+      : null;
   const runs =
     mode === "scheduled"
       ? [
           {
             name: "scheduled_hosted_synthetic_monitor",
-            env: {
-              ...baseEnv,
+            env: runEnv(baseEnv, syntheticTarget, {
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
               VIVA_E2E_STOP_TO_RECAP: "1",
-            },
+            }),
+            timeoutMs: runTimeoutMs,
           },
         ]
       : [
           {
             name: "pr_hosted_synthetic_matrix",
-            env: {
-              ...baseEnv,
+            env: runEnv(baseEnv, syntheticTarget, {
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "1",
-            },
+            }),
+            timeoutMs: runTimeoutMs,
+          },
+          {
+            name: "pr_hosted_fake_provider_matrix",
+            env: runEnv(baseEnv, fakeTarget, {
+              VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
+            }),
+            timeoutMs: runTimeoutMs,
           },
           {
             name: "pr_hosted_failure_control_provider_rate_limited",
-            env: {
-              ...baseEnv,
+            env: runEnv(baseEnv, syntheticTarget, {
               VIVA_E2E_FAILURE_CONTROL_SCENARIO:
                 env.VIVA_E2E_FAILURE_CONTROL_SCENARIO || "provider_rate_limited",
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
-              VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS: hostedWebUrl,
+              VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS: baseTarget.webUrl,
               VIVA_FAILURE_CONTROL_ENABLED: "1",
               VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY:
                 env.VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY || "1",
               VIVA_FAILURE_CONTROL_SECRET: requiredValue(env, "VIVA_FAILURE_CONTROL_SECRET"),
               VIVA_FAILURE_CONTROL_STUDY_SET_IDS: syntheticStudySetId,
               VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS: syntheticUserId,
-            },
+            }),
+            timeoutMs: runTimeoutMs,
           },
         ];
 
@@ -97,14 +121,35 @@ export function buildHostedMonitorPlan(env = process.env) {
       region: env.VIVA_HOSTED_ARTIFACT_REGION || "auto",
       secretAccessKey: requiredValue(env, "VIVA_HOSTED_ARTIFACT_SECRET_KEY"),
     },
-    hostedAgentHttpUrl,
-    hostedAgentWsUrl,
-    hostedWebUrl,
+    hostedAgentHttpUrl: baseTarget.agentHttpUrl,
+    hostedAgentWsUrl: baseTarget.agentWsUrl,
+    hostedWebUrl: baseTarget.webUrl,
     mode,
     runId,
+    runTimeoutMs,
     runs,
     syntheticStudySetId,
     syntheticUserId,
+  };
+}
+
+function hostedTargetFromEnv(env, { agentHttpName, agentWsName, provider, webName }) {
+  return {
+    agentHttpUrl: normalizeHostedUrl(requiredValue(env, agentHttpName)),
+    agentWsUrl: normalizeWebSocketUrl(requiredValue(env, agentWsName)),
+    provider,
+    webUrl: normalizeHostedUrl(requiredValue(env, webName)),
+  };
+}
+
+function runEnv(baseEnv, target, extra = {}) {
+  return {
+    ...baseEnv,
+    VIVA_E2E_AGENT_PROVIDER: target.provider,
+    VIVA_E2E_HOSTED_AGENT_HTTP_URL: target.agentHttpUrl,
+    VIVA_E2E_HOSTED_AGENT_WS_URL: target.agentWsUrl,
+    VIVA_E2E_HOSTED_WEB_URL: target.webUrl,
+    ...extra,
   };
 }
 
@@ -178,39 +223,77 @@ async function main() {
     });
   }
 
-  const manifestPath = path.join(outputDir, "manifest.json");
-  await writeFile(manifestPath, `${JSON.stringify(summary, null, 2)}\n`);
+  const published = await writePublishedManifest(outputDir, summary, plan);
   await auditHostedArtifacts(outputDir);
   const uploaded = await publishDirectoryToS3(outputDir, plan.artifactPrefix, plan.artifactStore);
+  if (uploaded.length + 1 !== published.durable_artifact_store.uploaded_files) {
+    throw new Error("hosted monitor upload count drifted before manifest publication");
+  }
+  await putS3Object(
+    plan.artifactStore,
+    buildObjectKey(plan.artifactPrefix, "manifest.json"),
+    Buffer.from(`${JSON.stringify(published, null, 2)}\n`),
+    "application/json",
+  );
+  console.log(JSON.stringify(published, null, 2));
+}
+
+async function writePublishedManifest(outputDir, summary, plan) {
+  const manifestPath = path.join(outputDir, "manifest.json");
+  const publishable = await publishableHostedFiles(outputDir);
   const published = {
     ...summary,
     durable_artifact_store: {
       bucket: plan.artifactStore.bucket,
       object_prefix: plan.artifactPrefix,
-      uploaded_files: uploaded.length,
+      published_artifact_policy: "text_json_logs_only",
+      uploaded_files: publishable.length + 1,
     },
   };
   await writeFile(manifestPath, `${JSON.stringify(published, null, 2)}\n`);
-  console.log(JSON.stringify(published, null, 2));
+  return published;
 }
 
 async function runHostedE2E(run, runDir) {
   const stdout = createWriteStream(path.join(runDir, "e2e.stdout.log"));
   const stderr = createWriteStream(path.join(runDir, "e2e.stderr.log"));
+  const stdoutFinished = finished(stdout);
+  const stderrFinished = finished(stderr);
   const child = spawn("bun", ["run", "e2e:browser"], {
     cwd: root,
     env: {
       ...process.env,
       ...run.env,
       VIVA_E2E_ARTIFACT_DIR: runDir,
+      VIVA_E2E_TRACE: "0",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
   child.stdout.pipe(stdout);
   child.stderr.pipe(stderr);
-  const code = await new Promise((resolve) => child.once("exit", (exitCode) => resolve(exitCode)));
-  stdout.end();
-  stderr.end();
+  let timedOut = false;
+  let killTimer;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGTERM");
+    killTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
+    killTimer.unref?.();
+  }, run.timeoutMs);
+  timeout.unref?.();
+  const code = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (exitCode, signal) => resolve(exitCode ?? signal));
+  });
+  clearTimeout(timeout);
+  if (killTimer) clearTimeout(killTimer);
+  await Promise.all([stdoutFinished, stderrFinished]);
+  if (timedOut) {
+    await writeFile(
+      path.join(runDir, "timeout.json"),
+      `${JSON.stringify({ run: run.name, sanitized: true, timeout_ms: run.timeoutMs }, null, 2)}\n`,
+    );
+    throw new Error(`${run.name} timed out after ${run.timeoutMs}ms`);
+  }
   if (code !== 0) {
     throw new Error(`${run.name} failed with exit code ${code}`);
   }
@@ -218,7 +301,7 @@ async function runHostedE2E(run, runDir) {
 
 async function publishDirectoryToS3(directory, prefix, store) {
   const uploaded = [];
-  for (const file of await listFiles(directory)) {
+  for (const file of await publishableHostedFiles(directory)) {
     const relative = path.relative(directory, file);
     const key = buildObjectKey(prefix, relative);
     const body = await readFile(file);
@@ -261,7 +344,10 @@ async function putS3Object(store, key, body, contentType) {
     scope,
     sha256Hex(Buffer.from(canonicalRequest)),
   ].join("\n");
-  const signature = hmacHex(signingKey(store.secretAccessKey, dateStamp, store.region), stringToSign);
+  const signature = hmacHex(
+    signingKey(store.secretAccessKey, dateStamp, store.region),
+    stringToSign,
+  );
   const response = await fetch(endpoint, {
     body,
     headers: {
@@ -277,20 +363,44 @@ async function putS3Object(store, key, body, contentType) {
 
 async function auditHostedArtifacts(directory) {
   for (const file of await listFiles(directory)) {
+    if (isRejectedHostedArtifact(file)) {
+      throw new Error(`hosted monitor artifact ${path.relative(root, file)} is not allowed`);
+    }
     if (!isTextArtifact(file)) continue;
     const text = await readFile(file, "utf8");
     for (const marker of forbiddenArtifactMarkers) {
       if (text.includes(marker)) {
-        throw new Error(`hosted monitor artifact ${path.relative(root, file)} includes forbidden marker`);
+        throw new Error(
+          `hosted monitor artifact ${path.relative(root, file)} includes forbidden marker`,
+        );
       }
     }
     for (const [name, value] of Object.entries(process.env)) {
       if (!/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) continue;
       if (value && value.length >= 8 && text.includes(value)) {
-        throw new Error(`hosted monitor artifact ${path.relative(root, file)} includes secret value from ${name}`);
+        throw new Error(
+          `hosted monitor artifact ${path.relative(root, file)} includes secret value from ${name}`,
+        );
       }
     }
   }
+}
+
+export async function publishableHostedFiles(directory) {
+  const files = [];
+  for (const file of await listFiles(directory)) {
+    if (path.basename(file) === "manifest.json") continue;
+    if (isPublishableHostedArtifact(file)) files.push(file);
+  }
+  return files.sort();
+}
+
+export function isPublishableHostedArtifact(file) {
+  return isTextArtifact(file) && !isRejectedHostedArtifact(file);
+}
+
+export function isRejectedHostedArtifact(file) {
+  return /\.(zip|trace|har)$/i.test(file);
 }
 
 async function listFiles(dir) {
@@ -319,7 +429,9 @@ function normalizeWebSocketUrl(value) {
 
 function assertSyntheticIdentity(userId) {
   if (!/(synthetic|monitor|test)/i.test(userId) || /(learner|student)/i.test(userId)) {
-    throw new Error("VIVA_HOSTED_SYNTHETIC_USER_ID must be a synthetic monitor identity, never a learner");
+    throw new Error(
+      "VIVA_HOSTED_SYNTHETIC_USER_ID must be a synthetic monitor identity, never a learner",
+    );
   }
 }
 
@@ -327,6 +439,15 @@ function requiredValue(env, name) {
   const value = env[name];
   if (!value || !String(value).trim()) throw new Error(`${name} is required`);
   return String(value).trim();
+}
+
+function positiveInteger(value, fallback) {
+  if (value === undefined || value === null || String(value).trim() === "") return fallback;
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error("VIVA_HOSTED_RUN_TIMEOUT_MS must be a positive integer");
+  }
+  return parsed;
 }
 
 function sanitizeRunId(value) {

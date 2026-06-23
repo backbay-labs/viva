@@ -140,7 +140,7 @@ test("deployment runbook covers the beta operating path and stop rules", async (
   assertIncludesAll(hostedMonitor, [
     "Railway cron service",
     "viva-hosted-monitor",
-    "railway.monitor.json",
+    "railway.json",
     "Dockerfile.monitor",
     "bun run hosted:monitor",
     "VIVA_HOSTED_RUNNER_MODE=scheduled",
@@ -149,10 +149,13 @@ test("deployment runbook covers the beta operating path and stop rules", async (
     "VIVA_HOSTED_AGENT_HTTP_URL",
     "VIVA_HOSTED_AGENT_WS_URL",
     "VIVA_E2E_AGENT_PROVIDER",
+    "VIVA_HOSTED_FAKE_PROVIDER_WEB_URL",
+    "fake_cartesia_gemini",
     "VIVA_HOSTED_ARTIFACT_BUCKET",
     "VIVA_FAILURE_CONTROL_SECRET",
     "synthetic or fake monitor deployment",
     "synthetic monitor identity",
+    "publishes only text, JSON, and log artifacts",
     "object prefix",
     "not GitHub Actions",
   ]);
@@ -216,7 +219,7 @@ test("hosted monitor substrate config is deployable off GitHub Actions", async (
   const packageJson = JSON.parse(await readFile("package.json", "utf8"));
   assert.equal(packageJson.scripts["hosted:monitor"], "node scripts/hosted-monitor-runner.mjs");
 
-  const railwayMonitor = JSON.parse(await readFile("railway.monitor.json", "utf8"));
+  const railwayMonitor = JSON.parse(await readFile("railway.json", "utf8"));
   assert.equal(railwayMonitor.build.builder, "DOCKERFILE");
   assert.equal(railwayMonitor.build.dockerfilePath, "Dockerfile.monitor");
   assert.equal(railwayMonitor.deploy.startCommand, "bun run hosted:monitor");
@@ -230,7 +233,7 @@ test("hosted monitor substrate config is deployable off GitHub Actions", async (
     "docs/deployment-runbook.md",
     "package.json",
     "packages/**",
-    "railway.monitor.json",
+    "railway.json",
     "scripts/**",
   ]);
 

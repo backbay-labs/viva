@@ -11,7 +11,7 @@
       "docs/deployment-runbook.md",
       "package.json",
       "packages/**",
-      "railway.monitor.json",
+      "railway.json",
       "scripts/**"
     ]
   },
