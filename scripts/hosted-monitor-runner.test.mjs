@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,7 +9,11 @@ import {
   isPublishableHostedArtifact,
   isRejectedHostedArtifact,
   normalizeHostedUrl,
+  putS3Object,
   publishableHostedFiles,
+  remainingPublishMs,
+  summarizeHostedRun,
+  writePublishedManifest,
 } from "./hosted-monitor-runner.mjs";
 
 const baseEnv = Object.freeze({
@@ -47,6 +51,7 @@ test("hosted monitor plan runs scheduled synthetic browser proof against hosted 
   assert.equal(plan.runs[0].env.VIVA_E2E_STOP_TO_RECAP, undefined);
   assert.equal(plan.runs[0].env.VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO, "0");
   assert.equal(plan.runTimeoutMs, 600000);
+  assert.equal(plan.publishTimeoutMs, 120000);
 });
 
 test("hosted monitor PR mode includes the failure-control browser slice", () => {
@@ -104,8 +109,108 @@ test("hosted monitor validates run timeout", () => {
         ...baseEnv,
         VIVA_HOSTED_RUN_TIMEOUT_MS: "0",
       }),
-    /positive integer/,
+    /VIVA_HOSTED_RUN_TIMEOUT_MS must be a positive integer/,
   );
+  assert.throws(
+    () =>
+      buildHostedMonitorPlan({
+        ...baseEnv,
+        VIVA_HOSTED_PUBLISH_TIMEOUT_MS: "0",
+      }),
+    /VIVA_HOSTED_PUBLISH_TIMEOUT_MS must be a positive integer/,
+  );
+});
+
+test("hosted monitor writes final manifest for timed-out runs", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "viva-hosted-monitor-manifest-"));
+  try {
+    const run = { name: "scheduled_hosted_synthetic_monitor" };
+    const runDir = path.join(dir, run.name);
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      path.join(runDir, "timeout.json"),
+      `${JSON.stringify(
+        {
+          failure_class: "timeout",
+          run: run.name,
+          sanitized: true,
+          status: "timed_out",
+          timeout_ms: 120000,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const summary = {
+      schema: "viva.hosted_monitor_run.v1",
+      mode: "scheduled",
+      run_id: "run-id",
+      runs: [
+        summarizeHostedRun(
+          run,
+          runDir,
+          {
+            failure_class: "timeout",
+            sanitized: true,
+            status: "timed_out",
+            timeout_ms: 120000,
+          },
+          null,
+          dir,
+        ),
+      ],
+    };
+    const published = await writePublishedManifest(dir, summary, {
+      artifactPrefix: "viva-hosted-monitor/scheduled/run-id",
+      artifactStore: { bucket: "viva-monitor-evidence" },
+    });
+
+    assert.equal(published.status, "failed");
+    assert.equal(published.runs[0].status, "timed_out");
+    assert.equal(published.runs[0].failure_class, "timeout");
+    assert.equal(published.durable_artifact_store.uploaded_files, 2);
+
+    const stored = JSON.parse(await readFile(path.join(dir, "manifest.json"), "utf8"));
+    assert.equal(stored.status, "failed");
+    assert.equal(stored.runs[0].status, "timed_out");
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("hosted monitor S3 uploads honor the publication deadline", async () => {
+  assert.equal(remainingPublishMs(110, 100), 10);
+  assert.throws(() => remainingPublishMs(99, 100), /publication timed out/);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, options = {}) =>
+    new Promise((_resolve, reject) => {
+      options.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+        once: true,
+      });
+    });
+  try {
+    await assert.rejects(
+      () =>
+        putS3Object(
+          {
+            accessKeyId: "redacted-key-id",
+            bucket: "viva-monitor-evidence",
+            endpoint: "https://storage.example.com",
+            region: "auto",
+            secretAccessKey: "redacted-secret-key",
+          },
+          "viva-hosted-monitor/scheduled/run-id/result.json",
+          Buffer.from("{}\n"),
+          "application/json",
+          { deadlineMs: Date.now() + 20 },
+        ),
+      /timed out/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("hosted monitor normalizes URLs and object keys", () => {
@@ -130,6 +235,11 @@ test("hosted monitor only publishes text evidence files", async () => {
     assert.equal(isPublishableHostedArtifact("e2e.stdout.log"), true);
     assert.equal(isPublishableHostedArtifact("source-folio.png"), false);
     assert.equal(isRejectedHostedArtifact("trace.zip"), true);
+    assert.equal(isRejectedHostedArtifact("trace.tar"), true);
+    assert.equal(isRejectedHostedArtifact("trace.tgz"), true);
+    assert.equal(isRejectedHostedArtifact("trace.tar.gz"), true);
+    assert.equal(isRejectedHostedArtifact("trace.7z"), true);
+    assert.equal(isRejectedHostedArtifact("trace.rar"), true);
     assert.deepEqual(
       (await publishableHostedFiles(dir)).map((file) => path.basename(file)),
       ["e2e.stdout.log", "result.json"],

@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const hostedArtifactRoot = path.join(root, "artifacts/hosted-monitor");
 const defaultRunTimeoutMs = 10 * 60 * 1000;
+const defaultPublishTimeoutMs = 2 * 60 * 1000;
 const forbiddenArtifactMarkers = [
   "pcm16_base64",
   "answer_text",
@@ -34,7 +35,16 @@ export function buildHostedMonitorPlan(env = process.env) {
   const syntheticUserId = requiredValue(env, "VIVA_HOSTED_SYNTHETIC_USER_ID");
   const syntheticStudySetId = requiredValue(env, "VIVA_HOSTED_SYNTHETIC_STUDY_SET_ID");
   assertSyntheticIdentity(syntheticUserId);
-  const runTimeoutMs = positiveInteger(env.VIVA_HOSTED_RUN_TIMEOUT_MS, defaultRunTimeoutMs);
+  const runTimeoutMs = positiveInteger(
+    env.VIVA_HOSTED_RUN_TIMEOUT_MS,
+    defaultRunTimeoutMs,
+    "VIVA_HOSTED_RUN_TIMEOUT_MS",
+  );
+  const publishTimeoutMs = positiveInteger(
+    env.VIVA_HOSTED_PUBLISH_TIMEOUT_MS,
+    defaultPublishTimeoutMs,
+    "VIVA_HOSTED_PUBLISH_TIMEOUT_MS",
+  );
 
   const runId = sanitizeRunId(
     env.VIVA_HOSTED_RUN_ID || new Date().toISOString().replaceAll(/[:.]/g, "-"),
@@ -124,6 +134,7 @@ export function buildHostedMonitorPlan(env = process.env) {
     hostedAgentWsUrl: baseTarget.agentWsUrl,
     hostedWebUrl: baseTarget.webUrl,
     mode,
+    publishTimeoutMs,
     runId,
     runTimeoutMs,
     runs,
@@ -199,32 +210,36 @@ async function main() {
   for (const run of plan.runs) {
     const runDir = path.join(outputDir, run.name);
     await mkdir(runDir, { recursive: true });
-    await runHostedE2E(run, runDir);
-    const result = JSON.parse(await readFile(path.join(runDir, "result.json"), "utf8"));
+    let outcome = await runHostedE2E(run, runDir);
+    const resultRead = await readRunResult(runDir);
+    if (outcome.status === "passed" && !resultRead.result) {
+      outcome = await writeRunOutcomeArtifact(
+        runDir,
+        "failure.json",
+        failedRunOutcome(run, resultRead.failureClass),
+      );
+    }
     await auditHostedArtifacts(runDir);
-    summary.runs.push({
-      name: run.name,
-      artifact_dir: path.relative(root, runDir),
-      browser_story_artifact: result.browser_story_artifact,
-      browser_story_frames: Array.isArray(result.browser_story?.frames)
-        ? result.browser_story.frames.map((frame) => frame.id).filter(Boolean)
-        : [],
-      failure_control_terminal: result.failure_control_terminal
-        ? {
-            scenario_id: result.failure_control_terminal.scenario_id,
-            terminal_reason: result.failure_control_terminal.terminal_reason,
-            sanitized: result.failure_control_terminal.sanitized === true,
-          }
-        : null,
-      manuscript_ready: result.manuscript_ready === true,
-      page_error_count: Array.isArray(result.page_errors) ? result.page_errors.length : 0,
-      sanitized: true,
-    });
+    summary.runs.push(summarizeHostedRun(run, runDir, outcome, resultRead.result));
   }
 
+  const failedRuns = summary.runs.filter((run) => run.status !== "passed").map((run) => run.name);
+  const published = await publishHostedEvidence(outputDir, summary, plan);
+  console.log(JSON.stringify(published, null, 2));
+  if (failedRuns.length > 0) {
+    throw new Error(
+      `hosted monitor failed after publishing durable manifest: ${failedRuns.join(", ")}`,
+    );
+  }
+}
+
+async function publishHostedEvidence(outputDir, summary, plan) {
   const published = await writePublishedManifest(outputDir, summary, plan);
   await auditHostedArtifacts(outputDir);
-  const uploaded = await publishDirectoryToS3(outputDir, plan.artifactPrefix, plan.artifactStore);
+  const publishDeadlineMs = Date.now() + plan.publishTimeoutMs;
+  const uploaded = await publishDirectoryToS3(outputDir, plan.artifactPrefix, plan.artifactStore, {
+    deadlineMs: publishDeadlineMs,
+  });
   if (uploaded.length + 1 !== published.durable_artifact_store.uploaded_files) {
     throw new Error("hosted monitor upload count drifted before manifest publication");
   }
@@ -233,15 +248,17 @@ async function main() {
     buildObjectKey(plan.artifactPrefix, "manifest.json"),
     Buffer.from(`${JSON.stringify(published, null, 2)}\n`),
     "application/json",
+    { deadlineMs: publishDeadlineMs },
   );
-  console.log(JSON.stringify(published, null, 2));
+  return published;
 }
 
-async function writePublishedManifest(outputDir, summary, plan) {
+export async function writePublishedManifest(outputDir, summary, plan) {
   const manifestPath = path.join(outputDir, "manifest.json");
   const publishable = await publishableHostedFiles(outputDir);
   const published = {
     ...summary,
+    status: summary.runs.every((run) => run.status === "passed") ? "passed" : "failed",
     durable_artifact_store: {
       bucket: plan.artifactStore.bucket,
       object_prefix: plan.artifactPrefix,
@@ -251,6 +268,46 @@ async function writePublishedManifest(outputDir, summary, plan) {
   };
   await writeFile(manifestPath, `${JSON.stringify(published, null, 2)}\n`);
   return published;
+}
+
+async function readRunResult(runDir) {
+  try {
+    return {
+      failureClass: null,
+      result: JSON.parse(await readFile(path.join(runDir, "result.json"), "utf8")),
+    };
+  } catch (error) {
+    return {
+      failureClass: error?.code === "ENOENT" ? "missing_result" : "invalid_result_json",
+      result: null,
+    };
+  }
+}
+
+export function summarizeHostedRun(run, runDir, outcome, result, rootDir = root) {
+  return {
+    name: run.name,
+    artifact_dir: path.relative(rootDir, runDir),
+    status: outcome.status,
+    failure_class: outcome.failure_class ?? null,
+    exit_code: outcome.exit_code ?? null,
+    terminal_signal: outcome.terminal_signal ?? null,
+    timeout_ms: outcome.timeout_ms ?? null,
+    browser_story_artifact: result?.browser_story_artifact ?? null,
+    browser_story_frames: Array.isArray(result?.browser_story?.frames)
+      ? result.browser_story.frames.map((frame) => frame.id).filter(Boolean)
+      : [],
+    failure_control_terminal: result?.failure_control_terminal
+      ? {
+          scenario_id: result.failure_control_terminal.scenario_id,
+          terminal_reason: result.failure_control_terminal.terminal_reason,
+          sanitized: result.failure_control_terminal.sanitized === true,
+        }
+      : null,
+    manuscript_ready: result?.manuscript_ready === true,
+    page_error_count: Array.isArray(result?.page_errors) ? result.page_errors.length : 0,
+    sanitized: true,
+  };
 }
 
 async function runHostedE2E(run, runDir) {
@@ -279,38 +336,90 @@ async function runHostedE2E(run, runDir) {
     killTimer.unref?.();
   }, run.timeoutMs);
   timeout.unref?.();
-  const code = await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (exitCode, signal) => resolve(exitCode ?? signal));
-  });
+  let code;
+  try {
+    code = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (exitCode, signal) => resolve(exitCode ?? signal));
+    });
+  } catch {
+    clearTimeout(timeout);
+    if (killTimer) clearTimeout(killTimer);
+    await flushHostedRunLogs(stdoutFinished, stderrFinished);
+    return writeRunOutcomeArtifact(runDir, "failure.json", failedRunOutcome(run, "spawn_error"));
+  }
   clearTimeout(timeout);
   if (killTimer) clearTimeout(killTimer);
-  await Promise.all([stdoutFinished, stderrFinished]);
+  const logFlushFailure = await flushHostedRunLogs(stdoutFinished, stderrFinished);
   if (timedOut) {
-    await writeFile(
-      path.join(runDir, "timeout.json"),
-      `${JSON.stringify({ run: run.name, sanitized: true, timeout_ms: run.timeoutMs }, null, 2)}\n`,
+    return writeRunOutcomeArtifact(
+      runDir,
+      "timeout.json",
+      failedRunOutcome(run, "timeout", {
+        status: "timed_out",
+        timeout_ms: run.timeoutMs,
+      }),
     );
-    throw new Error(`${run.name} timed out after ${run.timeoutMs}ms`);
+  }
+  if (logFlushFailure) {
+    return writeRunOutcomeArtifact(
+      runDir,
+      "failure.json",
+      failedRunOutcome(run, "log_flush_failed"),
+    );
   }
   if (code !== 0) {
-    throw new Error(`${run.name} failed with exit code ${code}`);
+    return writeRunOutcomeArtifact(
+      runDir,
+      "failure.json",
+      failedRunOutcome(run, "process_exit", exitDetails(code)),
+    );
   }
+  return {
+    run: run.name,
+    status: "passed",
+    sanitized: true,
+    exit_code: 0,
+  };
 }
 
-async function publishDirectoryToS3(directory, prefix, store) {
+async function flushHostedRunLogs(stdoutFinished, stderrFinished) {
+  const results = await Promise.allSettled([stdoutFinished, stderrFinished]);
+  return results.some((result) => result.status === "rejected");
+}
+
+function failedRunOutcome(run, failureClass, extra = {}) {
+  return {
+    run: run.name,
+    status: "failed",
+    failure_class: failureClass,
+    sanitized: true,
+    ...extra,
+  };
+}
+
+function exitDetails(code) {
+  return typeof code === "number" ? { exit_code: code } : { terminal_signal: String(code) };
+}
+
+async function writeRunOutcomeArtifact(runDir, fileName, outcome) {
+  await writeFile(path.join(runDir, fileName), `${JSON.stringify(outcome, null, 2)}\n`);
+  return outcome;
+}
+
+async function publishDirectoryToS3(directory, prefix, store, options = {}) {
   const uploaded = [];
   for (const file of await publishableHostedFiles(directory)) {
     const relative = path.relative(directory, file);
     const key = buildObjectKey(prefix, relative);
     const body = await readFile(file);
-    await putS3Object(store, key, body, contentTypeFor(file));
+    await putS3Object(store, key, body, contentTypeFor(file), options);
     uploaded.push(key);
   }
   return uploaded;
 }
 
-async function putS3Object(store, key, body, contentType) {
+export async function putS3Object(store, key, body, contentType, options = {}) {
   const endpoint = new URL(store.endpoint);
   endpoint.hostname = `${store.bucket}.${endpoint.hostname}`;
   endpoint.pathname = `/${key.split("/").map(encodeURIComponent).join("/")}`;
@@ -347,17 +456,43 @@ async function putS3Object(store, key, body, contentType) {
     signingKey(store.secretAccessKey, dateStamp, store.region),
     stringToSign,
   );
-  const response = await fetch(endpoint, {
-    body,
-    headers: {
-      ...headers,
-      authorization: `AWS4-HMAC-SHA256 Credential=${store.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
-    },
-    method: "PUT",
-  });
+  const timeoutMs =
+    options.deadlineMs === undefined
+      ? defaultPublishTimeoutMs
+      : remainingPublishMs(options.deadlineMs);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  timeout.unref?.();
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      body,
+      headers: {
+        ...headers,
+        authorization: `AWS4-HMAC-SHA256 Credential=${store.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+      },
+      method: "PUT",
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`artifact upload timed out for ${key}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
   if (!response.ok) {
     throw new Error(`artifact upload failed for ${key} with HTTP ${response.status}`);
   }
+}
+
+export function remainingPublishMs(deadlineMs, nowMs = Date.now()) {
+  const remaining = Math.floor(deadlineMs - nowMs);
+  if (!Number.isFinite(deadlineMs) || remaining <= 0) {
+    throw new Error("hosted monitor publication timed out");
+  }
+  return remaining;
 }
 
 async function auditHostedArtifacts(directory) {
@@ -399,7 +534,7 @@ export function isPublishableHostedArtifact(file) {
 }
 
 export function isRejectedHostedArtifact(file) {
-  return /\.(zip|trace|har)$/i.test(file);
+  return /\.(zip|trace|har|tar|tgz|gz|bz2|xz|7z|rar)$/i.test(file);
 }
 
 async function listFiles(dir) {
@@ -440,11 +575,11 @@ function requiredValue(env, name) {
   return String(value).trim();
 }
 
-function positiveInteger(value, fallback) {
+function positiveInteger(value, fallback, name) {
   if (value === undefined || value === null || String(value).trim() === "") return fallback;
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    throw new Error("VIVA_HOSTED_RUN_TIMEOUT_MS must be a positive integer");
+    throw new Error(`${name} must be a positive integer`);
   }
   return parsed;
 }

@@ -384,6 +384,12 @@ jobs must exit when the task finishes; a still-active prior execution causes the
 next scheduled execution to be skipped. Keep the monitor as a task process, not a
 web server.
 
+Each execution writes and uploads a final sanitized `manifest.json`, including
+failed or timed-out browser legs, before returning a non-zero process status.
+Browser execution is bounded by `VIVA_HOSTED_RUN_TIMEOUT_MS`; durable evidence
+publication is separately bounded by `VIVA_HOSTED_PUBLISH_TIMEOUT_MS` so object
+storage stalls cannot pin the cron worker indefinitely.
+
 The scheduled production monitor uses:
 
 ```sh
