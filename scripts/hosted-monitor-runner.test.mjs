@@ -44,7 +44,8 @@ test("hosted monitor plan runs scheduled synthetic browser proof against hosted 
   assert.equal(plan.runs[0].env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID, "biology-midterm");
   assert.equal(plan.runs[0].env.VIVA_E2E_SYNTHETIC_USER_ID, "synthetic-monitor-user");
   assert.equal(plan.runs[0].env.VIVA_E2E_SYNTHETIC_STUDY_SET_ID, "biology-midterm");
-  assert.equal(plan.runs[0].env.VIVA_E2E_STOP_TO_RECAP, "1");
+  assert.equal(plan.runs[0].env.VIVA_E2E_STOP_TO_RECAP, undefined);
+  assert.equal(plan.runs[0].env.VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO, "0");
   assert.equal(plan.runTimeoutMs, 600000);
 });
 

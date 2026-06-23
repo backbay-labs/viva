@@ -74,7 +74,6 @@ export function buildHostedMonitorPlan(env = process.env) {
             name: "scheduled_hosted_synthetic_monitor",
             env: runEnv(baseEnv, syntheticTarget, {
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
-              VIVA_E2E_STOP_TO_RECAP: "1",
             }),
             timeoutMs: runTimeoutMs,
           },
