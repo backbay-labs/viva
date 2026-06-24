@@ -2076,6 +2076,20 @@ impl StudyMemoryStore for PostgresStudyStore {
         let concept_uuid = self.concept_uuid_for(study_set_uuid, concept_id).await?;
         self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
             .await?;
+        let payload = ConceptStatusEventPayload {
+            concept_id,
+            status: &status,
+        };
+        if self.has_event_authorization(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::ConceptStatus,
+            &payload,
+        )? {
+            return Ok(status);
+        }
         let result = sqlx::query(
             "UPDATE concepts SET status = $1, updated_at = NOW()
              WHERE id = $2
@@ -2100,10 +2114,6 @@ impl StudyMemoryStore for PostgresStudyStore {
             ));
         }
         self.increment_count(WriteCountKind::ConceptStatus)?;
-        let payload = ConceptStatusEventPayload {
-            concept_id,
-            status: &status,
-        };
         self.record_event_authorization(
             user_id,
             study_set_id,
@@ -2128,6 +2138,31 @@ impl StudyMemoryStore for PostgresStudyStore {
         let concept_uuid = self.concept_uuid_for(study_set_uuid, concept_id).await?;
         self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
             .await?;
+        let duplicate = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM review_items
+                WHERE user_id = $1
+                  AND study_set_id = $2
+                  AND concept_id = $3
+                  AND due_at = $4::timestamptz
+                  AND voice_session_id = $5
+                  AND status = 'scheduled'
+             )",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(concept_uuid)
+        .bind(due_at)
+        .bind(voice_session_uuid)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(pg_error)?;
+        if duplicate {
+            return Ok(
+                json!({ "concept_id": concept_id, "due_at": due_at, "status": "scheduled" }),
+            );
+        }
         let result = sqlx::query(
             "INSERT INTO review_items (id, user_id, study_set_id, concept_id, due_at, reason, status, voice_session_id)
              SELECT $1, $2, $3, $4, $5::timestamptz, 'voice_session', 'scheduled', $6
@@ -2194,6 +2229,33 @@ impl StudyMemoryStore for PostgresStudyStore {
                 ));
             }
             source_span_ids.push(Self::uuid_for(&moment.source.source_id)?);
+        }
+        if self
+            .recap_was_recorded(
+                user_id,
+                study_set_uuid,
+                voice_session_uuid,
+                &recap,
+                &source_span_ids,
+            )
+            .await?
+        {
+            self.record_event_authorization(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                EventAuthorizationKind::StudySessionRecap,
+                &recap,
+            )?;
+            return Ok(json!({
+                "voice_session_id": voice_session_id,
+                "strong_concepts": recap.strong_concepts,
+                "shaky_concepts": recap.shaky_concepts,
+                "missed_concepts": recap.missed_concepts,
+                "review_later": recap.review_later,
+                "source_span_ids": source_span_ids,
+            }));
         }
         sqlx::query(
             "INSERT INTO session_recaps (id, user_id, study_set_id, voice_session_id, strong_concepts, shaky_concepts, missed_concepts, review_later, source_span_ids)

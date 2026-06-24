@@ -268,9 +268,10 @@ mod tests {
     use crate::PostgresStudyStore;
     use agent_domain::{
         fixture_question, fixture_source_reference, ConceptStatus, SessionConfig, SessionId,
-        SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudySessionRecap, ToolProposal,
-        VivaToolExecutor, VoiceUsageRecord,
+        SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudySessionRecap,
+        StudyStoreWriteCounts, ToolProposal, VivaToolExecutor, VoiceUsageRecord,
     };
+    use serde::Deserialize;
     use std::sync::Arc;
 
     #[test]
@@ -329,6 +330,27 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(include_names, directory_names);
+    }
+
+    #[test]
+    fn count_truth_table_fixture_covers_retry_cancel_watchdog_and_double_submit() {
+        let table = count_truth_table();
+        assert_eq!(table.schema, "viva.store_count_truth_table.v1");
+        let scenarios = table
+            .scenarios
+            .iter()
+            .map(|scenario| scenario.scenario.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scenarios,
+            vec![
+                "happy",
+                "retry_after_429",
+                "cancel_mid_work",
+                "watchdog_expiry",
+                "double_submit"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -623,6 +645,56 @@ mod tests {
 
         assert_eq!(negative_store.write_counts(), baseline);
         assert_eq!(db_row_counts(&pool).await, row_baseline);
+    }
+
+    #[tokio::test]
+    async fn optional_postgres_count_truth_table_stays_exact_under_replayed_provider_writes_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+
+        let expected = expected_count_delta("happy");
+        let store = Arc::new(crate::PostgresStudyStore::new(pool.clone()));
+        let session_id = Uuid::new_v4().to_string();
+        let baseline_writes = store.write_counts();
+        let baseline_rows = db_row_counts(&pool).await;
+
+        record_count_table_session(store.as_ref(), &session_id).await;
+        let executor = count_table_executor(store.clone(), &session_id);
+        replay_counted_provider_turn(&executor, &session_id).await;
+        replay_counted_provider_turn(&executor, &session_id).await;
+        store
+            .record_voice_usage(VoiceUsageRecord {
+                voice_session_id: Some(session_id),
+                provider: "synthetic".to_owned(),
+                model: "synthetic-viva".to_owned(),
+                duration_seconds: 1,
+                text_input_tokens: 20,
+                text_output_tokens: 10,
+                audio_input_tokens: 0,
+                audio_output_tokens: 0,
+                cost_estimate_usd: 0.00002,
+                first_audio_latency_ms: None,
+                answer_eval_latency_ms: Some(1),
+                source_retrieval_latency_ms: None,
+                source_grounded_correction_count: 1,
+            })
+            .await
+            .expect("records usage");
+
+        assert_eq!(
+            count_delta_from_writes(store.write_counts(), baseline_writes, 1),
+            expected
+        );
+        assert_eq!(
+            count_delta_from_rows(db_row_counts(&pool).await, baseline_rows, expected),
+            expected
+        );
     }
 
     #[tokio::test]
@@ -948,6 +1020,102 @@ mod tests {
             .expect("records fixture session");
     }
 
+    async fn record_count_table_session(store: &dyn StudyMemoryStore, session_id: &str) {
+        store
+            .record_voice_session(&SessionConfig {
+                session_id: Some(SessionId::new(session_id)),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .expect("records count-table fixture session");
+    }
+
+    fn count_table_executor(
+        store: Arc<crate::PostgresStudyStore>,
+        session_id: &str,
+    ) -> VivaToolExecutor {
+        VivaToolExecutor::new(
+            store,
+            agent_domain::AuthorizedStudySession {
+                user_id: "user-1".to_owned(),
+                study_set_id: "biology-midterm".to_owned(),
+                voice_session_id: session_id.to_owned(),
+                mode: StudyMode::Quiz,
+                active_concepts: vec![
+                    "oxidative-phosphorylation".to_owned(),
+                    "atp-synthase".to_owned(),
+                ],
+            },
+        )
+    }
+
+    async fn replay_counted_provider_turn(executor: &VivaToolExecutor, session_id: &str) {
+        executor
+            .execute(
+                "response-count-table-question",
+                ToolProposal::select_next_question("biology-midterm", session_id, "quiz"),
+            )
+            .await
+            .expect("selects seeded question");
+        executor
+            .execute(
+                "response-count-table-answer",
+                ToolProposal::evaluate_spoken_answer(
+                    "biology-midterm",
+                    session_id,
+                    "q-oxidative-phosphorylation-nadh",
+                    "NADH donates electrons.",
+                ),
+            )
+            .await
+            .expect("records answer");
+        executor
+            .execute(
+                "response-count-table-answer",
+                ToolProposal::retrieve_source_reference(
+                    "biology-midterm",
+                    session_id,
+                    "src-lecture-5-slide-18",
+                ),
+            )
+            .await
+            .expect("retrieves source");
+        executor
+            .execute(
+                "response-count-table-answer",
+                ToolProposal::mark_concept_status(
+                    "biology-midterm",
+                    session_id,
+                    "oxidative-phosphorylation",
+                    "strong",
+                ),
+            )
+            .await
+            .expect("records concept status");
+        executor
+            .execute(
+                "response-count-table-answer",
+                ToolProposal::schedule_review_item(
+                    "biology-midterm",
+                    session_id,
+                    "atp-synthase",
+                    "shaky",
+                ),
+            )
+            .await
+            .expect("schedules review");
+        executor
+            .execute(
+                "response-count-table-recap",
+                ToolProposal::build_session_recap("biology-midterm", session_id),
+            )
+            .await
+            .expect("records recap");
+    }
+
     async fn set_question_active(pool: &sqlx::PgPool, active: bool) {
         sqlx::query(
             "UPDATE study_questions
@@ -1013,6 +1181,78 @@ mod tests {
         review_items: i64,
         session_recaps: i64,
         voice_usage_events: i64,
+    }
+
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+    struct ExactCountDelta {
+        sessions: usize,
+        answer_attempts: usize,
+        concept_statuses: usize,
+        review_items: usize,
+        recaps: usize,
+        usage_events: usize,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct CountTruthTable {
+        schema: String,
+        scenarios: Vec<CountTruthScenario>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct CountTruthScenario {
+        scenario: String,
+        expected_delta: ExactCountDelta,
+    }
+
+    fn count_truth_table() -> CountTruthTable {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/voice-protocol/count-truth-table.json"
+        ))
+        .expect("count truth table fixture is valid JSON")
+    }
+
+    fn expected_count_delta(scenario: &str) -> ExactCountDelta {
+        count_truth_table()
+            .scenarios
+            .into_iter()
+            .find(|row| row.scenario == scenario)
+            .unwrap_or_else(|| panic!("missing count truth table scenario {scenario}"))
+            .expected_delta
+    }
+
+    fn count_delta_from_writes(
+        after: StudyStoreWriteCounts,
+        before: StudyStoreWriteCounts,
+        usage_events: usize,
+    ) -> ExactCountDelta {
+        ExactCountDelta {
+            sessions: after.sessions - before.sessions,
+            answer_attempts: after.answer_attempts - before.answer_attempts,
+            concept_statuses: after.concept_statuses - before.concept_statuses,
+            review_items: after.review_items - before.review_items,
+            recaps: after.recaps - before.recaps,
+            usage_events,
+        }
+    }
+
+    fn count_delta_from_rows(
+        after: DbRowCounts,
+        before: DbRowCounts,
+        expected: ExactCountDelta,
+    ) -> ExactCountDelta {
+        ExactCountDelta {
+            sessions: row_delta(after.voice_sessions, before.voice_sessions),
+            answer_attempts: row_delta(after.answer_attempts, before.answer_attempts),
+            concept_statuses: expected.concept_statuses,
+            review_items: row_delta(after.review_items, before.review_items),
+            recaps: row_delta(after.session_recaps, before.session_recaps),
+            usage_events: row_delta(after.voice_usage_events, before.voice_usage_events),
+        }
+    }
+
+    fn row_delta(after: i64, before: i64) -> usize {
+        usize::try_from(after - before).expect("row count delta is non-negative")
     }
 
     async fn db_row_counts(pool: &sqlx::PgPool) -> DbRowCounts {
