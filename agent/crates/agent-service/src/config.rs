@@ -146,6 +146,25 @@ impl ServiceConfig {
         {
             config.voice_limits.max_session_cost_usd = Some(max_session_cost_usd);
         }
+        if let Some(enabled) =
+            env_value("VIVA_PROVIDER_LIMITER_ENABLED").and_then(|value| parse_bool(&value))
+        {
+            config.voice_limits.provider_limiter_enabled = enabled;
+        }
+        config.voice_limits.max_provider_concurrent_turns =
+            env_value("VIVA_PROVIDER_MAX_CONCURRENT_TURNS")
+                .and_then(|value| parse_positive_usize(&value))
+                .or(config.voice_limits.max_provider_concurrent_turns);
+        config.voice_limits.max_provider_queue_depth = env_value("VIVA_PROVIDER_MAX_QUEUE_DEPTH")
+            .and_then(|value| parse_positive_usize(&value))
+            .or(config.voice_limits.max_provider_queue_depth);
+        config.voice_limits.provider_backoff_default_ms =
+            env_value("VIVA_PROVIDER_BACKOFF_DEFAULT_MS")
+                .and_then(|value| parse_positive_u64(&value))
+                .unwrap_or(config.voice_limits.provider_backoff_default_ms);
+        config.voice_limits.provider_backoff_max_ms = env_value("VIVA_PROVIDER_BACKOFF_MAX_MS")
+            .and_then(|value| parse_positive_u64(&value))
+            .unwrap_or(config.voice_limits.provider_backoff_max_ms);
         config.failure_control = FailureControlConfig::from_env_with(&env_value)?;
         config.validate()?;
         Ok(config)
@@ -177,12 +196,33 @@ pub(crate) fn bac_510_max_turn_duration() -> Duration {
     viva_max_submitted_answer_resolution()
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct VoiceLimitConfig {
     pub max_user_sessions: Option<usize>,
     pub max_ip_sessions: Option<usize>,
     pub max_audio_bytes_per_minute: Option<u64>,
     pub max_session_cost_usd: Option<f64>,
+    pub provider_limiter_enabled: bool,
+    pub max_provider_concurrent_turns: Option<usize>,
+    pub max_provider_queue_depth: Option<usize>,
+    pub provider_backoff_default_ms: u64,
+    pub provider_backoff_max_ms: u64,
+}
+
+impl Default for VoiceLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_user_sessions: None,
+            max_ip_sessions: None,
+            max_audio_bytes_per_minute: None,
+            max_session_cost_usd: None,
+            provider_limiter_enabled: true,
+            max_provider_concurrent_turns: Some(8),
+            max_provider_queue_depth: Some(0),
+            provider_backoff_default_ms: 1_000,
+            provider_backoff_max_ms: 30_000,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -613,6 +653,14 @@ fn parse_positive_f64(value: &str) -> Option<f64> {
         .parse::<f64>()
         .ok()
         .filter(|parsed| parsed.is_finite() && *parsed > 0.0)
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 fn required_failure_control_value(
@@ -1097,6 +1145,11 @@ mod tests {
         assert_eq!(config.voice_limits.max_ip_sessions, Some(5));
         assert_eq!(config.voice_limits.max_audio_bytes_per_minute, Some(48_000));
         assert_eq!(config.voice_limits.max_session_cost_usd, Some(0.75));
+        assert!(config.voice_limits.provider_limiter_enabled);
+        assert_eq!(config.voice_limits.max_provider_concurrent_turns, Some(8));
+        assert_eq!(config.voice_limits.max_provider_queue_depth, Some(0));
+        assert_eq!(config.voice_limits.provider_backoff_default_ms, 1_000);
+        assert_eq!(config.voice_limits.provider_backoff_max_ms, 30_000);
 
         let disabled = ServiceConfig::from_env_with(|name| match name {
             "VIVA_VOICE_WS_SESSION_SECONDS" => Some("0".to_owned()),
@@ -1124,6 +1177,25 @@ mod tests {
     #[test]
     fn voice_limits_default_user_total_cap_to_opt_in() {
         assert_eq!(VoiceLimitConfig::default().max_user_sessions, None);
+    }
+
+    #[test]
+    fn from_env_parses_provider_limiter_knobs() {
+        let config = ServiceConfig::from_env_with(|name| match name {
+            "VIVA_PROVIDER_LIMITER_ENABLED" => Some("false".to_owned()),
+            "VIVA_PROVIDER_MAX_CONCURRENT_TURNS" => Some("2".to_owned()),
+            "VIVA_PROVIDER_MAX_QUEUE_DEPTH" => Some("3".to_owned()),
+            "VIVA_PROVIDER_BACKOFF_DEFAULT_MS" => Some("250".to_owned()),
+            "VIVA_PROVIDER_BACKOFF_MAX_MS" => Some("5000".to_owned()),
+            _ => None,
+        })
+        .expect("loopback provider limiter config should validate");
+
+        assert!(!config.voice_limits.provider_limiter_enabled);
+        assert_eq!(config.voice_limits.max_provider_concurrent_turns, Some(2));
+        assert_eq!(config.voice_limits.max_provider_queue_depth, Some(3));
+        assert_eq!(config.voice_limits.provider_backoff_default_ms, 250);
+        assert_eq!(config.voice_limits.provider_backoff_max_ms, 5_000);
     }
 
     #[test]

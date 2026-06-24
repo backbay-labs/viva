@@ -4,13 +4,14 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agent_domain::{
-    BrainUsage, CreateFileStudySet, CreatePasteStudySet, LibrarySessionSummary,
-    LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError, RealtimeBrain,
-    StudyMemoryStore, StudySetIngestionRecord, StudySetIngestionStatus, VoiceUsageRecord,
+    BrainProviderFailure, BrainUsage, CreateFileStudySet, CreatePasteStudySet,
+    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
+    RealtimeBrain, StudyMemoryStore, StudySetIngestionRecord, StudySetIngestionStatus,
+    TerminalSessionReason, VoiceUsageRecord,
 };
 use axum::{
     extract::{Path, Query},
@@ -167,6 +168,8 @@ struct ActiveVoiceLimits {
     failure_control_identities: HashMap<String, usize>,
     user_study_sets: HashMap<String, usize>,
     ips: HashMap<String, usize>,
+    provider_inflight: usize,
+    provider_backoff: Option<ProviderBackoffState>,
 }
 
 #[derive(Debug)]
@@ -182,6 +185,7 @@ enum VoiceLimitKind {
     FailureControlIdentity,
     UserStudySet,
     Ip,
+    Provider,
 }
 
 impl VoiceLimitState {
@@ -211,6 +215,94 @@ impl VoiceLimitState {
         self.try_acquire(VoiceLimitKind::Ip, ip, max)
     }
 
+    pub(crate) fn try_admit_provider_turn(&self, limits: &VoiceLimitConfig) -> ProviderAdmission {
+        if !limits.provider_limiter_enabled {
+            return ProviderAdmission::admitted(None, 0, "disabled");
+        }
+        let mut active = self.active.lock().expect("voice limit state lock poisoned");
+        let now = Instant::now();
+        if active
+            .provider_backoff
+            .as_ref()
+            .is_some_and(|backoff| backoff.until <= now)
+        {
+            active.provider_backoff = None;
+        }
+        if let Some(backoff) = &active.provider_backoff {
+            return ProviderAdmission::denied(ProviderAdmissionDenial {
+                reason: "provider_backoff",
+                terminal_reason: backoff.terminal_reason,
+                retry_after_ms: backoff.retry_after_ms,
+                reset_hint: backoff.reset_hint.clone(),
+                budget_state: backoff.budget_state.clone(),
+                queue_depth: active.provider_inflight,
+                queue_delay_ms: 0,
+            });
+        }
+        if let Some(max) = limits.max_provider_concurrent_turns {
+            if active.provider_inflight >= max {
+                let max_queue_depth = limits.max_provider_queue_depth.unwrap_or(0);
+                return ProviderAdmission::denied(ProviderAdmissionDenial {
+                    reason: if max_queue_depth == 0 {
+                        "provider_queue_full"
+                    } else {
+                        "provider_queue_saturated"
+                    },
+                    terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                    retry_after_ms: limits.provider_backoff_default_ms,
+                    reset_hint: "none".to_owned(),
+                    budget_state: "within_limit".to_owned(),
+                    queue_depth: active.provider_inflight,
+                    queue_delay_ms: 0,
+                });
+            }
+        }
+        let queue_depth = active.provider_inflight;
+        active.provider_inflight = active.provider_inflight.saturating_add(1);
+        ProviderAdmission::admitted(
+            Some(VoiceLimitLease {
+                state: self.clone(),
+                kind: VoiceLimitKind::Provider,
+                key: "global".to_owned(),
+            }),
+            queue_depth,
+            "within_limit",
+        )
+    }
+
+    pub(crate) fn record_provider_failure(
+        &self,
+        limits: &VoiceLimitConfig,
+        failure: &BrainProviderFailure,
+    ) {
+        if !limits.provider_limiter_enabled
+            || !matches!(
+                failure.terminal_reason,
+                TerminalSessionReason::ProviderRateLimited
+                    | TerminalSessionReason::ProviderAuthFailed
+                    | TerminalSessionReason::ProviderTimeout
+            )
+        {
+            return;
+        }
+        let retry_after_ms = metadata_u64(&failure.metadata, "retry_after_ms")
+            .unwrap_or(limits.provider_backoff_default_ms)
+            .min(limits.provider_backoff_max_ms);
+        let reset_hint =
+            metadata_value(&failure.metadata, "reset_hint").unwrap_or_else(|| "none".to_owned());
+        let budget_state = metadata_value(&failure.metadata, "budget_state")
+            .unwrap_or_else(|| "unknown".to_owned());
+        let until = Instant::now() + Duration::from_millis(retry_after_ms);
+        let mut active = self.active.lock().expect("voice limit state lock poisoned");
+        active.provider_backoff = Some(ProviderBackoffState {
+            until,
+            retry_after_ms,
+            reset_hint,
+            budget_state,
+            terminal_reason: failure.terminal_reason,
+        });
+    }
+
     fn try_acquire(&self, kind: VoiceLimitKind, key: &str, max: usize) -> Option<VoiceLimitLease> {
         let mut active = self.active.lock().expect("voice limit state lock poisoned");
         let counts = match kind {
@@ -218,6 +310,7 @@ impl VoiceLimitState {
             VoiceLimitKind::FailureControlIdentity => &mut active.failure_control_identities,
             VoiceLimitKind::UserStudySet => &mut active.user_study_sets,
             VoiceLimitKind::Ip => &mut active.ips,
+            VoiceLimitKind::Provider => unreachable!("provider admission uses provider counter"),
         };
         let count = counts.entry(key.to_owned()).or_default();
         if *count >= max {
@@ -238,6 +331,10 @@ impl VoiceLimitState {
             VoiceLimitKind::FailureControlIdentity => &mut active.failure_control_identities,
             VoiceLimitKind::UserStudySet => &mut active.user_study_sets,
             VoiceLimitKind::Ip => &mut active.ips,
+            VoiceLimitKind::Provider => {
+                active.provider_inflight = active.provider_inflight.saturating_sub(1);
+                return;
+            }
         };
         if let Some(count) = counts.get_mut(key) {
             *count = count.saturating_sub(1);
@@ -256,6 +353,76 @@ impl Drop for VoiceLimitLease {
     fn drop(&mut self) {
         self.state.release(self.kind, &self.key);
     }
+}
+
+#[derive(Clone, Debug)]
+struct ProviderBackoffState {
+    until: Instant,
+    retry_after_ms: u64,
+    reset_hint: String,
+    budget_state: String,
+    terminal_reason: TerminalSessionReason,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProviderAdmission {
+    pub(crate) decision: ProviderAdmissionDecision,
+    pub(crate) lease: Option<VoiceLimitLease>,
+    pub(crate) queue_depth: usize,
+    pub(crate) queue_delay_ms: u64,
+    pub(crate) budget_state: String,
+}
+
+impl ProviderAdmission {
+    fn admitted(lease: Option<VoiceLimitLease>, queue_depth: usize, budget_state: &str) -> Self {
+        Self {
+            decision: ProviderAdmissionDecision::Admitted,
+            lease,
+            queue_depth,
+            queue_delay_ms: 0,
+            budget_state: budget_state.to_owned(),
+        }
+    }
+
+    pub(crate) fn denied(denial: ProviderAdmissionDenial) -> Self {
+        Self {
+            queue_depth: denial.queue_depth,
+            queue_delay_ms: denial.queue_delay_ms,
+            budget_state: denial.budget_state.clone(),
+            decision: ProviderAdmissionDecision::Denied(denial),
+            lease: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ProviderAdmissionDecision {
+    Admitted,
+    Denied(ProviderAdmissionDenial),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderAdmissionDenial {
+    pub(crate) reason: &'static str,
+    pub(crate) terminal_reason: TerminalSessionReason,
+    pub(crate) retry_after_ms: u64,
+    pub(crate) reset_hint: String,
+    pub(crate) budget_state: String,
+    pub(crate) queue_depth: usize,
+    pub(crate) queue_delay_ms: u64,
+}
+
+fn metadata_value(metadata: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    metadata.split_whitespace().find_map(|part| {
+        part.strip_prefix(&prefix)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn metadata_u64(metadata: &str, key: &str) -> Option<u64> {
+    metadata_value(metadata, key).and_then(|value| value.parse().ok())
 }
 
 pub fn build_router(state: AppState) -> Router {

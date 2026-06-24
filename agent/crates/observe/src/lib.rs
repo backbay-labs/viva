@@ -75,6 +75,7 @@ pub enum VoiceEvidenceEventKind {
     StoreCounts,
     TerminalReason,
     ProviderStageFailure,
+    ProviderAdmission,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

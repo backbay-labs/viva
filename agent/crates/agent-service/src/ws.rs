@@ -27,7 +27,10 @@ use tokio::{
 };
 
 use crate::{
-    app::{AppState, VoiceLimitLease, VoiceLimitState},
+    app::{
+        AppState, ProviderAdmission, ProviderAdmissionDecision, ProviderAdmissionDenial,
+        VoiceLimitLease, VoiceLimitState,
+    },
     config::{
         bac_510_max_turn_duration, FailureControlScenario, SessionAuthFailureCode,
         SessionTokenClaims, VoiceLimitConfig, VoiceWsAccessError,
@@ -249,6 +252,12 @@ impl SessionLimitRuntime {
             Some(max_cost_usd) => self.session_cost_usd <= max_cost_usd,
             None => true,
         }
+    }
+
+    fn cost_budget_exhausted(&self, limits: &VoiceLimitConfig) -> bool {
+        limits
+            .max_session_cost_usd
+            .is_some_and(|max_cost_usd| self.session_cost_usd >= max_cost_usd)
     }
 }
 
@@ -514,6 +523,7 @@ async fn handle_socket(
     let mut pre_answer_idle_armed = true;
     let mut turn_cap_deadline: Option<Instant> = None;
     let mut pending_submitted_answers = 0_u32;
+    let mut pending_provider_admissions = Vec::<VoiceLimitLease>::new();
     let mut resolved_submitted_answer_response_ids = HashSet::<String>::new();
     let mut drain_signal = state.drain_signal.subscribe();
     if *drain_signal.borrow_and_update() {
@@ -644,6 +654,36 @@ async fn handle_socket(
                     Err(ClientMessageError::TurnCap) => unreachable!("pre-send parsing cannot trip turn cap"),
                 };
                 let parsed_action = client_input.action();
+                let mut provider_admission_lease = None;
+                if parsed_action.arms_turn_cap() {
+                    let mut admission = if session_limits.cost_budget_exhausted(&state.voice_limits) {
+                        ProviderAdmission::denied(ProviderAdmissionDenial {
+                            reason: "cost_budget",
+                            terminal_reason: TerminalSessionReason::CostBudget,
+                            retry_after_ms: 0,
+                            reset_hint: "none".to_owned(),
+                            budget_state: "exhausted".to_owned(),
+                            queue_depth: 0,
+                            queue_delay_ms: 0,
+                        })
+                    } else {
+                        state
+                            .limit_state
+                            .try_admit_provider_turn(&state.voice_limits)
+                    };
+                    record_provider_admission(&state, voice_session_id.clone(), &admission);
+                    if let ProviderAdmissionDecision::Denied(denial) = &admission.decision {
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            denial.terminal_reason,
+                            close_code::POLICY,
+                        )
+                        .await;
+                        break;
+                    }
+                    provider_admission_lease = admission.lease.take();
+                }
                 let turn_send_deadline = if parsed_action.arms_turn_cap() {
                     pre_answer_idle_armed = false;
                     pending_submitted_answers = pending_submitted_answers.saturating_add(1);
@@ -665,6 +705,11 @@ async fn handle_socket(
                 {
                     Ok(action) => {
                         record_client_action(&state, voice_session_id.clone(), action);
+                        if action.arms_turn_cap() {
+                            if let Some(lease) = provider_admission_lease.take() {
+                                pending_provider_admissions.push(lease);
+                            }
+                        }
                         match action {
                             ClientAction::Stop => {
                                 let mut forward_context = BrainForwardContext {
@@ -847,11 +892,13 @@ async fn handle_socket(
                                     if count_resolution {
                                         pending_submitted_answers =
                                             pending_submitted_answers.saturating_sub(1);
+                                        pending_provider_admissions.pop();
                                     }
                                 }
                                 SubmittedAnswerResolution::All => {
                                     pending_submitted_answers = 0;
                                     resolved_submitted_answer_response_ids.clear();
+                                    pending_provider_admissions.clear();
                                 }
                             }
                             if pending_submitted_answers == 0 {
@@ -1155,6 +1202,12 @@ where
                 "durability_degraded",
             ));
             return Ok(ForwardBrainEvent::DurabilityDegraded);
+        }
+        if let Some(failure) = &error.failure {
+            context
+                .state
+                .limit_state
+                .record_provider_failure(context.limits, failure);
         }
         return Ok(ForwardBrainEvent::ProviderFailure(
             terminal_reason_for_provider_error(error),
@@ -2649,6 +2702,34 @@ fn metadata_field<'a>(metadata: &'a str, key: &str) -> Option<&'a str> {
         .split_whitespace()
         .find_map(|field| field.strip_prefix(&prefix))
         .filter(|value| !value.is_empty())
+}
+
+fn record_provider_admission(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    admission: &ProviderAdmission,
+) {
+    let detail = match &admission.decision {
+        ProviderAdmissionDecision::Admitted => format!(
+            "admission_decision=admitted queue_depth={} queue_delay_ms={} budget_state={}",
+            admission.queue_depth, admission.queue_delay_ms, admission.budget_state
+        ),
+        ProviderAdmissionDecision::Denied(denial) => format!(
+            "admission_decision=denied reason={} terminal_reason={} queue_depth={} queue_delay_ms={} retry_after_ms={} reset_hint={} budget_state={}",
+            denial.reason,
+            denial.terminal_reason.as_str(),
+            denial.queue_depth,
+            denial.queue_delay_ms,
+            denial.retry_after_ms,
+            denial.reset_hint,
+            denial.budget_state
+        ),
+    };
+    state.evidence.record(VoiceEvidenceEvent::new(
+        VoiceEvidenceEventKind::ProviderAdmission,
+        voice_session_id,
+        detail,
+    ));
 }
 
 fn record_turn_cap_config(state: &AppState, voice_session_id: Option<String>) {
