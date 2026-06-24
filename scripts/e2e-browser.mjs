@@ -9,10 +9,10 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import {
   buildFailureControlPlan,
+  failureControlHarnessEvidence,
   failureControlScenarioMarker,
   failureControlSessionTargetForScenario,
   failureControlStartIdentity,
-  failureControlHarnessEvidence,
   isFailureControlSessionTokenScenario,
   parseFailureControlSessionTarget,
 } from "./failure-control-harness.mjs";
@@ -73,6 +73,7 @@ let correctionMarginaliaVisible = false;
 let writtenAnswerFallbackUsed = false;
 let postAnswerSourceFolioVisible = false;
 let postAnswerBoundedSourceVisible = false;
+let secondTabSessionCap = null;
 let postAnswerProtocolProof = {
   conceptId: null,
   conceptStatus: null,
@@ -224,132 +225,135 @@ try {
       timeout: 20_000,
     });
     manuscriptReady = await isVisible(page.getByText(listeningText));
-  await page.screenshot({
-    path: path.join(artifactDir, "session-ready.png"),
-    fullPage: true,
-  });
+    if (!failureControlPlan.enabled) {
+      secondTabSessionCap = await auditSecondTabSessionCap(context, page.url());
+    }
+    await page.screenshot({
+      path: path.join(artifactDir, "session-ready.png"),
+      fullPage: true,
+    });
 
-  await page.getByRole("button", { name: "Show source" }).click();
-  await page.getByText("Source Folio", { exact: true }).waitFor({
-    state: "visible",
-    timeout: 10_000,
-  });
-  await page.waitForTimeout(600);
-  sourceFolioVisible =
-    (await isVisible(page.getByText("Source Folio", { exact: true }).first())) &&
-    (await isVisible(page.getByRole("button", { name: "Challenge citation" }).first()));
-  boundedSourceVisible =
-    (await isVisible(page.getByText("NADH donates", { exact: false }).first())) &&
-    (await isVisible(page.getByText("Document span only", { exact: false }).first()));
-  await redactSourceFolioForSanitizedScreenshot(page);
-  await page.screenshot({
-    path: path.join(artifactDir, "source-folio.png"),
-    fullPage: true,
-  });
-  storyFrames.push({
-    id: "active_synthetic_manuscript",
-    kind: "browser_screen",
-    screenshot: "source-folio.png",
-    supporting_screenshots: ["session-ready.png"],
-    checks: ["synthetic_brain_listening", "voice_trace_canvas", "source_folio", "marginalia"],
-  });
-  await page.getByRole("button", { name: "Back to question" }).click();
+    await page.getByRole("button", { name: "Show source" }).click();
+    await page.getByText("Source Folio", { exact: true }).waitFor({
+      state: "visible",
+      timeout: 10_000,
+    });
+    await page.waitForTimeout(600);
+    sourceFolioVisible =
+      (await isVisible(page.getByText("Source Folio", { exact: true }).first())) &&
+      (await isVisible(page.getByRole("button", { name: "Challenge citation" }).first()));
+    boundedSourceVisible =
+      (await isVisible(page.getByText("NADH donates", { exact: false }).first())) &&
+      (await isVisible(page.getByText("Document span only", { exact: false }).first()));
+    await redactSourceFolioForSanitizedScreenshot(page);
+    await page.screenshot({
+      path: path.join(artifactDir, "source-folio.png"),
+      fullPage: true,
+    });
+    storyFrames.push({
+      id: "active_synthetic_manuscript",
+      kind: "browser_screen",
+      screenshot: "source-folio.png",
+      supporting_screenshots: ["session-ready.png"],
+      checks: ["synthetic_brain_listening", "voice_trace_canvas", "source_folio", "marginalia"],
+    });
+    await page.getByRole("button", { name: "Back to question" }).click();
 
-  if (stopToRecap) {
-    await page.getByRole("button", { name: "End session" }).click();
-  } else {
-    await page.getByRole("button", { name: /check it/i }).click();
-    writtenAnswerFallbackUsed = await submitWrittenAnswerIfFallbackOpens(page);
-    if (failureControlPlan.enabled) {
-      failureControlTerminalProof = await waitForFailureControlTerminal(
-        serverEvents,
-        failureControlPlan,
-        25_000,
-      );
-      await page.waitForTimeout(600);
-      await page.screenshot({
-        path: path.join(artifactDir, "failure-control-terminal.png"),
-        fullPage: true,
-      });
-      storyFrames.push({
-        id: "failure_control_terminal",
-        kind: "browser_screen",
-        screenshot: "failure-control-terminal.png",
-        checks: ["terminal_reason", "sanitized_failure_control", "same_session_recovery_path"],
-      });
+    if (stopToRecap) {
+      await page.getByRole("button", { name: "End session" }).click();
     } else {
-      postAnswerProtocolProof = await waitForPostAnswerProtocolProof(serverEvents, 25_000);
-      if (requireCorrectionMarginalia) {
-        await page.getByText("Marginalia", { exact: true }).waitFor({
-          state: "visible",
-          timeout: 25_000,
-        });
-        await page.getByRole("button", { name: "Try again" }).waitFor({
-          state: "visible",
-          timeout: 10_000,
-        });
-        await page.getByRole("button", { name: "Show source" }).waitFor({
-          state: "visible",
-          timeout: 10_000,
-        });
-        await page.getByRole("button", { name: "Next question" }).waitFor({
-          state: "visible",
-          timeout: 10_000,
-        });
+      await page.getByRole("button", { name: /check it/i }).click();
+      writtenAnswerFallbackUsed = await submitWrittenAnswerIfFallbackOpens(page);
+      if (failureControlPlan.enabled) {
+        failureControlTerminalProof = await waitForFailureControlTerminal(
+          serverEvents,
+          failureControlPlan,
+          25_000,
+        );
         await page.waitForTimeout(600);
-        correctionMarginaliaVisible =
-          (await isVisible(page.getByText("Marginalia", { exact: true }).first())) &&
-          (await isVisible(page.getByRole("button", { name: "Try again" }).first())) &&
-          (await isVisible(page.getByRole("button", { name: "Show source" }).first())) &&
-          (await isVisible(page.getByRole("button", { name: "Next question" }).first()));
-        await redactCorrectionMarginaliaForSanitizedScreenshot(page);
         await page.screenshot({
-          path: path.join(artifactDir, "correction-marginalia.png"),
+          path: path.join(artifactDir, "failure-control-terminal.png"),
           fullPage: true,
         });
         storyFrames.push({
-          id: "correction_marginalia",
+          id: "failure_control_terminal",
           kind: "browser_screen",
-          screenshot: "correction-marginalia.png",
-          checks: [
-            "correction_note",
-            "try_again_action",
-            "show_source_action",
-            "next_question_action",
-          ],
+          screenshot: "failure-control-terminal.png",
+          checks: ["terminal_reason", "sanitized_failure_control", "same_session_recovery_path"],
         });
+      } else {
+        postAnswerProtocolProof = await waitForPostAnswerProtocolProof(serverEvents, 25_000);
+        if (requireCorrectionMarginalia) {
+          await page.getByText("Marginalia", { exact: true }).waitFor({
+            state: "visible",
+            timeout: 25_000,
+          });
+          await page.getByRole("button", { name: "Try again" }).waitFor({
+            state: "visible",
+            timeout: 10_000,
+          });
+          await page.getByRole("button", { name: "Show source" }).waitFor({
+            state: "visible",
+            timeout: 10_000,
+          });
+          await page.getByRole("button", { name: "Next question" }).waitFor({
+            state: "visible",
+            timeout: 10_000,
+          });
+          await page.waitForTimeout(600);
+          correctionMarginaliaVisible =
+            (await isVisible(page.getByText("Marginalia", { exact: true }).first())) &&
+            (await isVisible(page.getByRole("button", { name: "Try again" }).first())) &&
+            (await isVisible(page.getByRole("button", { name: "Show source" }).first())) &&
+            (await isVisible(page.getByRole("button", { name: "Next question" }).first()));
+          await redactCorrectionMarginaliaForSanitizedScreenshot(page);
+          await page.screenshot({
+            path: path.join(artifactDir, "correction-marginalia.png"),
+            fullPage: true,
+          });
+          storyFrames.push({
+            id: "correction_marginalia",
+            kind: "browser_screen",
+            screenshot: "correction-marginalia.png",
+            checks: [
+              "correction_note",
+              "try_again_action",
+              "show_source_action",
+              "next_question_action",
+            ],
+          });
+        }
+        if (requirePostAnswerSourceFolio) {
+          await page.getByRole("button", { name: "Show source" }).click();
+          await page.getByText("Source Folio", { exact: true }).waitFor({
+            state: "visible",
+            timeout: 10_000,
+          });
+          await page.waitForTimeout(600);
+          postAnswerSourceFolioVisible =
+            (await isVisible(page.getByText("Source Folio", { exact: true }).first())) &&
+            (await isVisible(page.getByRole("button", { name: "Challenge citation" }).first())) &&
+            (await isVisible(
+              page
+                .getByText(conceptStatusText(postAnswerProtocolProof.conceptStatus), {
+                  exact: false,
+                })
+                .first(),
+            ));
+          postAnswerBoundedSourceVisible =
+            (await isVisible(
+              page.getByText("Source citation is bounded to this span", { exact: false }).first(),
+            )) && (await isVisible(page.getByText("Document span only", { exact: false }).first()));
+          await redactSourceFolioForSanitizedScreenshot(page);
+          await page.screenshot({
+            path: path.join(artifactDir, "post-answer-source-folio.png"),
+            fullPage: true,
+          });
+          await page.getByRole("button", { name: "Back to question" }).click();
+        }
+        await page.getByRole("button", { name: "End session" }).click();
       }
-      if (requirePostAnswerSourceFolio) {
-        await page.getByRole("button", { name: "Show source" }).click();
-        await page.getByText("Source Folio", { exact: true }).waitFor({
-          state: "visible",
-          timeout: 10_000,
-        });
-        await page.waitForTimeout(600);
-        postAnswerSourceFolioVisible =
-          (await isVisible(page.getByText("Source Folio", { exact: true }).first())) &&
-          (await isVisible(page.getByRole("button", { name: "Challenge citation" }).first())) &&
-          (await isVisible(
-            page
-              .getByText(conceptStatusText(postAnswerProtocolProof.conceptStatus), {
-                exact: false,
-              })
-              .first(),
-          ));
-        postAnswerBoundedSourceVisible =
-          (await isVisible(
-            page.getByText("Source citation is bounded to this span", { exact: false }).first(),
-          )) && (await isVisible(page.getByText("Document span only", { exact: false }).first()));
-        await redactSourceFolioForSanitizedScreenshot(page);
-        await page.screenshot({
-          path: path.join(artifactDir, "post-answer-source-folio.png"),
-          fullPage: true,
-        });
-        await page.getByRole("button", { name: "Back to question" }).click();
-      }
-      await page.getByRole("button", { name: "End session" }).click();
     }
-  }
   }
   const recapSummaryText =
     agentProvider === "synthetic"
@@ -445,6 +449,8 @@ try {
     post_answer_concept_status_event_seen: postAnswerProtocolProof.conceptStatusEventSeen,
     post_answer_concept_id: postAnswerProtocolProof.conceptId,
     post_answer_protocol_response_id: postAnswerProtocolProof.responseId,
+    second_tab_session_cap_observed: secondTabSessionCap?.terminal_reason === "session_cap",
+    second_tab_session_cap: secondTabSessionCap,
     failure_control_harness: failureControlEvidence,
     failure_control_terminal: failureControlTerminalProof,
     written_answer_fallback_used: writtenAnswerFallbackUsed,
@@ -458,6 +464,7 @@ try {
       "pending-local-preview.png",
       "server-ready-study-set.png",
       ...(!sessionTokenFailureScenario ? ["session-ready.png", "source-folio.png"] : []),
+      ...(secondTabSessionCap ? ["second-tab-session-cap.png"] : []),
       ...(correctionMarginaliaVisible ? ["correction-marginalia.png"] : []),
       ...(!failureControlPlan.enabled && !stopToRecap && requirePostAnswerSourceFolio
         ? ["post-answer-source-folio.png"]
@@ -475,7 +482,9 @@ try {
     throw new Error("Landing did not enter the connected manuscript.");
   }
   if (failureControlPlan.enabled) {
-    if (failureControlTerminalProof?.terminal_reason !== failureControlPlan.scenario.terminal_reason) {
+    if (
+      failureControlTerminalProof?.terminal_reason !== failureControlPlan.scenario.terminal_reason
+    ) {
       throw new Error("Failure-control run did not observe the selected terminal reason.");
     }
     if (
@@ -492,6 +501,9 @@ try {
       throw new Error("Connected fake-provider session did not render the recap_ready payload.");
     if (!nextSessionRecommendationVisible) {
       throw new Error("Connected session did not render next-session review recommendations.");
+    }
+    if (secondTabSessionCap?.terminal_reason !== "session_cap") {
+      throw new Error("Connected session did not prove second-tab session_cap rejection.");
     }
   }
   if (!sessionTokenFailureScenario && !sourceFolioVisible) {
@@ -595,9 +607,12 @@ async function fetchFailureControlStartTarget(targetPage) {
   const identity = failureControlStartIdentity(failureControlPlan);
   return targetPage.evaluate(async ({ userId, studySetId }) => {
     const libraryParams = new URLSearchParams({ user_id: userId });
-    const response = await fetch(`/api/viva-library/study-sets/library?${libraryParams.toString()}`, {
-      cache: "no-store",
-    });
+    const response = await fetch(
+      `/api/viva-library/study-sets/library?${libraryParams.toString()}`,
+      {
+        cache: "no-store",
+      },
+    );
     if (!response.ok) {
       throw new Error(`failure-control library token fetch failed with HTTP ${response.status}`);
     }
@@ -663,7 +678,9 @@ async function consumeFailureControlReplayToken(targetPage, signedStartTarget) {
         socket.addEventListener("close", () => {
           window.clearTimeout(timeout);
           if (!sentConfig || !observedQuestionMarker) {
-            reject(new Error("failure-control replay nonce preconsume did not open a control turn"));
+            reject(
+              new Error("failure-control replay nonce preconsume did not open a control turn"),
+            );
             return;
           }
           resolve({ observed_question_marker: true, sanitized: true });
@@ -677,6 +694,67 @@ async function consumeFailureControlReplayToken(targetPage, signedStartTarget) {
   );
 }
 
+async function auditSecondTabSessionCap(browserContext, targetUrl) {
+  const tabEvents = [];
+  const secondTab = await browserContext.newPage();
+  secondTab.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+  secondTab.on("pageerror", (error) => pageErrors.push(error.message));
+  secondTab.on("websocket", (socket) => {
+    socket.on("framereceived", (frame) => recordServerFramePayload(frame.payload, tabEvents));
+  });
+  try {
+    await secondTab.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    const proof = await waitForSecondTabSessionCap(tabEvents, 15_000);
+    await secondTab.waitForTimeout(600);
+    await secondTab.screenshot({
+      path: path.join(artifactDir, "second-tab-session-cap.png"),
+      fullPage: true,
+    });
+    storyFrames.push({
+      id: "second_tab_session_cap",
+      kind: "browser_screen",
+      screenshot: "second-tab-session-cap.png",
+      checks: ["single_active_session", "second_tab_rejected", "session_cap_terminal"],
+      note: "Verified a second live tab for the same learner and study set receives a sanitized session_cap terminal.",
+    });
+    return proof;
+  } finally {
+    await secondTab.close().catch(() => {});
+  }
+}
+
+async function waitForSecondTabSessionCap(events, timeoutMs) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const eventIndex = events.findIndex(
+      (event) => event.type === "session_phase" && event.terminalReason === "session_cap",
+    );
+    if (eventIndex >= 0) {
+      return {
+        outcome: "rejected",
+        terminal_reason: "session_cap",
+        event_index: eventIndex,
+        validation_run_id: validationRunId,
+        sanitized: true,
+      };
+    }
+    await delay(100);
+  }
+  const terminalReasons = events
+    .filter((event) => event.type === "session_phase" && event.terminalReason)
+    .map((event) => event.terminalReason)
+    .join(" -> ");
+  throw new Error(
+    `Timed out waiting for second-tab session_cap terminal. Saw terminal: ${
+      terminalReasons || "none"
+    }`,
+  );
+}
+
 function buildE2EFailureControlEnv() {
   const scenario =
     process.env.VIVA_E2E_FAILURE_CONTROL_SCENARIO ?? process.env.VIVA_FAILURE_CONTROL_SCENARIO;
@@ -685,7 +763,9 @@ function buildE2EFailureControlEnv() {
     Boolean(process.env.VIVA_E2E_FAILURE_CONTROL_SCENARIO);
   if (!enabled) return {};
   if (!scenario?.trim()) {
-    throw new Error("VIVA_E2E_FAILURE_CONTROL_SCENARIO is required when failure control is enabled");
+    throw new Error(
+      "VIVA_E2E_FAILURE_CONTROL_SCENARIO is required when failure control is enabled",
+    );
   }
   return {
     VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS:
@@ -1278,8 +1358,7 @@ async function waitForFailureControlTerminal(events, plan, timeoutMs) {
   while (Date.now() - started < timeoutMs) {
     if (tokenScenario) {
       const eventIndex = events.findIndex(
-        (event) =>
-          event.type === "server_error" && event.terminalReason === expectedTerminalReason,
+        (event) => event.type === "server_error" && event.terminalReason === expectedTerminalReason,
       );
       if (eventIndex >= 0) {
         return {

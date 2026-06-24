@@ -3580,6 +3580,181 @@ async fn websocket_user_session_cap_emits_terminal_phase_and_releases_after_clos
 }
 
 #[tokio::test]
+async fn websocket_default_user_session_cap_rejects_duplicate_study_set_tab_and_releases_after_close(
+) {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(BackpressuredInputBrain {
+            dropped: dropped.clone(),
+        }),
+        "backpressured_input_probe",
+        VoiceWsAccess::default(),
+        4,
+        store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut first_socket, "backpressured_input_probe").await;
+    first_socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+    })
+    .await;
+
+    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut second_socket, "backpressured_input_probe").await;
+    second_socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    let duplicate_frame = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_server_frame(&mut second_socket),
+    )
+    .await
+    .expect("duplicate live tab must receive a terminal session_cap frame");
+    assert_terminal_session_phase(duplicate_frame, TerminalSessionReason::SessionCap);
+    assert_close_code(&mut second_socket, CloseCode::Policy).await;
+
+    first_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut first_socket).await;
+
+    let (mut third_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut third_socket, "backpressured_input_probe").await;
+    third_socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .filter(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+            .count()
+            >= 2
+    })
+    .await;
+    third_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut third_socket).await;
+    wait_until(Duration::from_secs(2), || dropped.load(Ordering::SeqCst)).await;
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn websocket_user_session_cap_is_scoped_to_learner_and_study_set() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "chemistry-final".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Chemistry Final".to_owned(),
+        course: Some("Chemistry 201".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    let state = AppState::with_study_store(
+        Arc::new(BackpressuredInputBrain {
+            dropped: dropped.clone(),
+        }),
+        "backpressured_input_probe",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_user_sessions: Some(1),
+        ..VoiceLimitConfig::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let biology_token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() + 60,
+        "nonce-biology-live-session",
+    );
+    let chemistry_token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "chemistry-final",
+        "voice-session-2",
+        unix_timestamp_now() + 60,
+        "nonce-chemistry-live-session",
+    );
+    let biology_session = session_config_json_with_token(&biology_token);
+    let chemistry_session = session_config_json_with_ids_and_token(
+        "chemistry-final",
+        "voice-session-2",
+        &chemistry_token,
+    );
+
+    let (mut biology_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut biology_socket, "backpressured_input_probe").await;
+    biology_socket
+        .send(WsMessage::Text(biology_session.into()))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+    })
+    .await;
+
+    let (mut chemistry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut chemistry_socket, "backpressured_input_probe").await;
+    chemistry_socket
+        .send(WsMessage::Text(chemistry_session.into()))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .filter(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+            .count()
+            >= 2
+    })
+    .await;
+
+    biology_socket.close(None).await.unwrap();
+    chemistry_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut biology_socket).await;
+    let _ = read_server_frames_until_close(&mut chemistry_socket).await;
+    wait_until(Duration::from_secs(2), || dropped.load(Ordering::SeqCst)).await;
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn websocket_audio_byte_cap_emits_rate_limit_terminal_phase() {
     let dropped = Arc::new(AtomicBool::new(false));
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
@@ -5343,6 +5518,26 @@ fn session_config_json_with_token(token: &str) -> String {
         "../../../fixtures/voice-protocol/session-config.json"
     ))
     .unwrap();
+    serde_json::json!({
+        "type": "session_config",
+        "version": VIVA_VOICE_PROTOCOL_VERSION,
+        "session": session,
+        "session_token": token,
+    })
+    .to_string()
+}
+
+fn session_config_json_with_ids_and_token(
+    study_set_id: &str,
+    session_id: &str,
+    token: &str,
+) -> String {
+    let mut session: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/session-config.json"
+    ))
+    .unwrap();
+    session["study_set_id"] = serde_json::json!(study_set_id);
+    session["session_id"] = serde_json::json!(session_id);
     serde_json::json!({
         "type": "session_config",
         "version": VIVA_VOICE_PROTOCOL_VERSION,

@@ -125,15 +125,27 @@ impl ServiceConfig {
                 Duration::from_secs(seconds).min(bac_510_max_turn_duration());
             config.max_turn_duration_overridden = true;
         }
-        config.voice_limits.max_user_sessions = env_value("VIVA_VOICE_WS_MAX_USER_SESSIONS")
-            .and_then(|value| parse_positive_usize(&value));
-        config.voice_limits.max_ip_sessions = env_value("VIVA_VOICE_WS_MAX_IP_SESSIONS")
-            .and_then(|value| parse_positive_usize(&value));
-        config.voice_limits.max_audio_bytes_per_minute =
+        if let Some(max_user_sessions) = env_value("VIVA_VOICE_WS_MAX_USER_SESSIONS")
+            .and_then(|value| parse_positive_usize(&value))
+        {
+            config.voice_limits.max_user_sessions = Some(max_user_sessions);
+        }
+        if let Some(max_ip_sessions) = env_value("VIVA_VOICE_WS_MAX_IP_SESSIONS")
+            .and_then(|value| parse_positive_usize(&value))
+        {
+            config.voice_limits.max_ip_sessions = Some(max_ip_sessions);
+        }
+        if let Some(max_audio_bytes_per_minute) =
             env_value("VIVA_VOICE_WS_MAX_AUDIO_BYTES_PER_MINUTE")
-                .and_then(|value| parse_positive_u64(&value));
-        config.voice_limits.max_session_cost_usd = env_value("VIVA_VOICE_WS_MAX_SESSION_COST_USD")
-            .and_then(|value| parse_positive_f64(&value));
+                .and_then(|value| parse_positive_u64(&value))
+        {
+            config.voice_limits.max_audio_bytes_per_minute = Some(max_audio_bytes_per_minute);
+        }
+        if let Some(max_session_cost_usd) = env_value("VIVA_VOICE_WS_MAX_SESSION_COST_USD")
+            .and_then(|value| parse_positive_f64(&value))
+        {
+            config.voice_limits.max_session_cost_usd = Some(max_session_cost_usd);
+        }
         config.failure_control = FailureControlConfig::from_env_with(&env_value)?;
         config.validate()?;
         Ok(config)
@@ -175,12 +187,23 @@ pub(crate) fn bac_510_max_turn_duration() -> Duration {
     Duration::from_millis(max_resolution_ms)
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct VoiceLimitConfig {
     pub max_user_sessions: Option<usize>,
     pub max_ip_sessions: Option<usize>,
     pub max_audio_bytes_per_minute: Option<u64>,
     pub max_session_cost_usd: Option<f64>,
+}
+
+impl Default for VoiceLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_user_sessions: Some(1),
+            max_ip_sessions: None,
+            max_audio_bytes_per_minute: None,
+            max_session_cost_usd: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1076,6 +1099,11 @@ mod tests {
         );
         assert!(!disabled.max_turn_duration_overridden);
         assert_eq!(disabled.voice_limits, VoiceLimitConfig::default());
+    }
+
+    #[test]
+    fn voice_limits_default_to_one_active_session_per_learner_study_set() {
+        assert_eq!(VoiceLimitConfig::default().max_user_sessions, Some(1));
     }
 
     #[test]

@@ -274,10 +274,11 @@ async fn handle_socket(
         None => state.voice_limits.max_user_sessions,
     };
     let _user_lease = match max_user_sessions {
-        Some(max) => match state
-            .limit_state
-            .try_acquire_user(&session_binding.user_id, max)
-        {
+        Some(max) => match state.limit_state.try_acquire_user_study_set(
+            &session_binding.user_id,
+            &session_binding.study_set_id,
+            max,
+        ) {
             Some(lease) => Some(lease),
             None => {
                 let terminal_reason = close_with_terminal_session_phase_only(
