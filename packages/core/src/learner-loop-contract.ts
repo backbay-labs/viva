@@ -4,6 +4,14 @@ import {
 } from "./agent-contract";
 import contractData from "./learner-loop-contract.json";
 
+export const VIVA_PRE_LOOP_TERMINAL_REASONS = [
+  "pre_loop_upload_unavailable",
+  "pre_loop_ingestion_unavailable",
+  "pre_loop_session_unavailable",
+] as const;
+
+export type VivaPreLoopTerminalReason = (typeof VIVA_PRE_LOOP_TERMINAL_REASONS)[number];
+
 export const VIVA_RUNTIME_COPY_CAUSES = [
   "api_missing",
   "agent_offline",
@@ -63,7 +71,10 @@ export type LearnerLoopAuthority =
   | "server_control_event"
   | "session_event";
 
-export type LearnerLoopTerminalReason = AgentTerminalSessionReason | "durability_degraded";
+export type LearnerLoopTerminalReason =
+  | AgentTerminalSessionReason
+  | VivaPreLoopTerminalReason
+  | "durability_degraded";
 
 export type LearnerLoopCopy = {
   capsule_label: string;
@@ -135,7 +146,11 @@ export function validateLearnerLoopContract(contract: LearnerLoopContract): Lear
   const mappedRuntimeCauses = new Set<string>();
   const knownRuntimeCauses = new Set<string>(VIVA_RUNTIME_COPY_CAUSES);
   const knownEvidenceFields = new Set<string>(VIVA_LEARNER_LOOP_EVIDENCE_FIELDS);
-  const knownTerminalReasons = new Set<string>(VIVA_AGENT_TERMINAL_SESSION_REASONS);
+  const knownTerminalReasons = new Set<string>([
+    ...VIVA_AGENT_TERMINAL_SESSION_REASONS,
+    ...VIVA_PRE_LOOP_TERMINAL_REASONS,
+    "durability_degraded",
+  ]);
 
   for (const state of contract.states) {
     if (stateIds.has(state.id)) {

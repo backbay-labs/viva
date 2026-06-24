@@ -29,6 +29,8 @@ export function OPTIONS() {
   return new NextResponse(null, { headers: noStoreHeaders(), status: 204 });
 }
 
+const DEFAULT_LIBRARY_PROXY_TIMEOUT_MS = 30_000;
+
 async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibraryRouteContext) {
   const agentBaseUrl = vivaAgentServerHttpBaseUrl();
   if (!agentBaseUrl) {
@@ -51,15 +53,28 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
     serverBearerToken: serverBearer.token,
   });
   let response: Response;
+  let timedOut = false;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, vivaLibraryProxyTimeoutMs());
   try {
     response = await fetch(upstream, {
       body: request.method === "POST" ? await request.text() : undefined,
       cache: "no-store",
       headers,
       method: request.method,
+      signal: controller.signal,
     });
   } catch {
-    return vivaLibraryProxyJsonError(502, "viva_library_proxy_unavailable");
+    return libraryPreLoopJsonError(
+      timedOut ? 504 : 502,
+      timedOut ? "viva_library_pre_loop_timeout" : "viva_library_pre_loop_unavailable",
+      libraryPreLoopTerminalReason(path, request.method),
+    );
+  } finally {
+    clearTimeout(timeoutId);
   }
   if (serverBearer.snapshotFilter && !response.ok) {
     return vivaLibraryProxyJsonError(response.status, "viva_library_proxy_unavailable");
@@ -76,6 +91,35 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
     headers: responseHeaders,
     status: response.status,
   });
+}
+
+function libraryPreLoopJsonError(
+  status: number,
+  error: string,
+  terminalReason: string,
+): NextResponse {
+  return NextResponse.json(
+    {
+      error,
+      failure_class: "pre_loop_unavailable",
+      stage: "pre_loop",
+      terminal_reason: terminalReason,
+    },
+    { status },
+  );
+}
+
+function libraryPreLoopTerminalReason(path: string[], method: string): string {
+  const route = path.join("/");
+  if (method === "POST" && route === "study-sets/files") {
+    return "pre_loop_upload_unavailable";
+  }
+  return "pre_loop_ingestion_unavailable";
+}
+
+function vivaLibraryProxyTimeoutMs(): number {
+  const value = Number.parseInt(process.env.VIVA_LIBRARY_PROXY_TIMEOUT_MS ?? "", 10);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_LIBRARY_PROXY_TIMEOUT_MS;
 }
 
 function vivaAgentServerHttpBaseUrl(): string | null {

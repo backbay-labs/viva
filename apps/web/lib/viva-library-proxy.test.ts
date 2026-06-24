@@ -11,6 +11,7 @@ const originalRestBearer = process.env.VIVA_AGENT_REST_BEARER_TOKEN;
 const originalAllowedUsers = process.env.VIVA_SESSION_ALLOWED_USER_IDS;
 const originalAllowedStudySets = process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS;
 const originalBootstrapSecret = process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET;
+const originalProxyTimeout = process.env.VIVA_LIBRARY_PROXY_TIMEOUT_MS;
 
 describe("Viva library proxy", () => {
   test("forwards caller control tokens without injecting the private server bearer", async () => {
@@ -897,6 +898,61 @@ describe("Viva library proxy", () => {
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
       restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+    }
+  });
+
+  test("bounds file upload proxy work with a sanitized pre-loop terminal reason", async () => {
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_LIBRARY_PROXY_TIMEOUT_MS = "5";
+      let observedSignal: AbortSignal | undefined;
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        observedSignal = init?.signal ?? undefined;
+        if (!observedSignal) {
+          return new Response(JSON.stringify({ ok: true }), {
+            headers: { "content-type": "application/json" },
+            status: 201,
+          });
+        }
+        return new Promise<Response>((_resolve, reject) => {
+          observedSignal?.addEventListener("abort", () => {
+            reject(new Error("raw file_base64 JVBERi0xLjc= should stay private"));
+          });
+        });
+      }) as typeof fetch;
+
+      const request = new Request("http://localhost:3000/api/viva-library/study-sets/files", {
+        body: JSON.stringify({
+          content_type: "application/pdf",
+          file_base64: "JVBERi0xLjc=",
+          file_name: "Lecture 9.pdf",
+          title: "Bio PDF",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }) as unknown as NextRequest;
+      Object.defineProperty(request, "nextUrl", {
+        value: new URL("http://localhost:3000/api/viva-library/study-sets/files"),
+      });
+
+      const response = await POST(request, {
+        params: Promise.resolve({ path: ["study-sets", "files"] }),
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(504);
+      expect(observedSignal?.aborted).toBe(true);
+      expect(body).toEqual({
+        error: "viva_library_pre_loop_timeout",
+        failure_class: "pre_loop_unavailable",
+        stage: "pre_loop",
+        terminal_reason: "pre_loop_upload_unavailable",
+      });
+      expect(JSON.stringify(body)).not.toContain("JVBERi0xLjc=");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_LIBRARY_PROXY_TIMEOUT_MS", originalProxyTimeout);
     }
   });
 });
