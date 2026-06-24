@@ -175,6 +175,26 @@ export function projectLibrarySnapshot(
   };
 }
 
+export function redactVivaLibrarySessionTokens(snapshot: VivaLibrarySnapshot): VivaLibrarySnapshot {
+  return {
+    ...snapshot,
+    study_sets: snapshot.study_sets.map((studySet) => ({
+      ...studySet,
+      actions: {
+        ...studySet.actions,
+        resume: redactSessionToken(studySet.actions.resume),
+        start: redactSessionToken(studySet.actions.start),
+      },
+    })),
+  };
+}
+
+function redactSessionToken(action: VivaLibraryAction): VivaLibraryAction {
+  if (!action.available) return { ...action };
+  const { session_token: _sessionToken, ...rest } = action;
+  return rest;
+}
+
 function projectStudySetRow(studySet: VivaLibraryStudySet): ProjectedLibraryRow {
   return {
     id: studySet.id,
@@ -228,10 +248,10 @@ function projectSessionAction(action: VivaLibraryAction): ProjectedLibraryAction
       unavailableReason: action.unavailable_reason,
     };
   }
-  if (!action.session_token) {
+  if (!action.session_id) {
     return {
       available: false,
-      unavailableReason: "session_token_unavailable",
+      unavailableReason: "session_id_unavailable",
     };
   }
   return {

@@ -43,7 +43,8 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   const responseHeaders = new Headers();
   const contentType = response.headers.get("content-type");
   if (contentType) responseHeaders.set("content-type", contentType);
-  return new NextResponse(await response.arrayBuffer(), {
+  const responseBody = await browserSafeLibraryResponseBody(response, path, contentType);
+  return new NextResponse(responseBody, {
     headers: responseHeaders,
     status: response.status,
   });
@@ -84,4 +85,57 @@ function vivaLibraryProxyOrigin(request: NextRequest): string | null {
 
 function trimTrailingSlash(value: string): string {
   return value.endsWith("/") ? value.slice(0, -1) : value;
+}
+
+async function browserSafeLibraryResponseBody(
+  response: Response,
+  path: string[],
+  contentType: string | null,
+): Promise<ArrayBuffer | string> {
+  if (
+    response.ok &&
+    path.join("/") === "study-sets/library" &&
+    contentType?.toLowerCase().includes("application/json")
+  ) {
+    try {
+      const value = await response.json();
+      return JSON.stringify(stripLibrarySessionTokens(value));
+    } catch {
+      return "{}";
+    }
+  }
+  return response.arrayBuffer();
+}
+
+function stripLibrarySessionTokens(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const snapshot = value as Record<string, unknown>;
+  const studySets = Array.isArray(snapshot.study_sets)
+    ? snapshot.study_sets.map(stripStudySetSessionTokens)
+    : snapshot.study_sets;
+  return { ...snapshot, study_sets: studySets };
+}
+
+function stripStudySetSessionTokens(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const studySet = value as Record<string, unknown>;
+  const actions =
+    studySet.actions && typeof studySet.actions === "object" && !Array.isArray(studySet.actions)
+      ? stripSessionActionTokens(studySet.actions as Record<string, unknown>)
+      : studySet.actions;
+  return { ...studySet, actions };
+}
+
+function stripSessionActionTokens(actions: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...actions,
+    resume: stripSessionActionToken(actions.resume),
+    start: stripSessionActionToken(actions.start),
+  };
+}
+
+function stripSessionActionToken(action: unknown): unknown {
+  if (!action || typeof action !== "object" || Array.isArray(action)) return action;
+  const { session_token: _sessionToken, ...rest } = action as Record<string, unknown>;
+  return rest;
 }

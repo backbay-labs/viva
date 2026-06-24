@@ -1,6 +1,6 @@
 import { LandingEntry } from "../components/landing/LandingEntry";
 import { fetchVivaLibrarySnapshot } from "../lib/viva-agent-client";
-import type { VivaLibrarySnapshot } from "../lib/viva-library";
+import { redactVivaLibrarySessionTokens, type VivaLibrarySnapshot } from "../lib/viva-library";
 
 export default async function Page() {
   const initialLibrarySnapshot = await initialSnapshot();
@@ -9,7 +9,7 @@ export default async function Page() {
 
 async function initialSnapshot(): Promise<VivaLibrarySnapshot | null> {
   try {
-    return await fetchVivaLibrarySnapshot();
+    return redactVivaLibrarySessionTokens(await fetchVivaLibrarySnapshot());
   } catch {
     return null;
   }

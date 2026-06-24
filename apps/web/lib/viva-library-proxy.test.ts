@@ -44,6 +44,64 @@ describe("Viva library proxy", () => {
     }
   });
 
+  test("strips start and resume session tokens from browser library snapshots", async () => {
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({
+            user_id: "user-1",
+            study_sets: [
+              {
+                id: "biology-midterm",
+                actions: {
+                  start: {
+                    available: true,
+                    session_id: "server-session",
+                    session_token: "viva1.redacted-start-token",
+                  },
+                  resume: {
+                    available: true,
+                    session_id: "open-session",
+                    session_token: "viva1.redacted-resume-token",
+                  },
+                },
+              },
+            ],
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        )) as typeof fetch;
+
+      const request = {
+        headers: new Headers(),
+        method: "GET",
+        nextUrl: new URL(
+          "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-1",
+        ),
+      } as unknown as NextRequest;
+
+      const response = await GET(request, {
+        params: Promise.resolve({ path: ["study-sets", "library"] }),
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.study_sets[0].actions.start).toEqual({
+        available: true,
+        session_id: "server-session",
+      });
+      expect(body.study_sets[0].actions.resume).toEqual({
+        available: true,
+        session_id: "open-session",
+      });
+      expect(JSON.stringify(body)).not.toContain("session_token");
+      expect(JSON.stringify(body)).not.toContain("viva1.redacted");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+    }
+  });
+
   test("forwards file ingestion POST bodies without injecting the private server bearer", async () => {
     const calls: Array<{ input: string; init?: RequestInit; body: string }> = [];
     try {

@@ -203,6 +203,46 @@ browser signed-session path unless the browser/proxy sends the WebSocket
 trusted WSS proxy injects the token. The current `/session` page does not do
 that, so the direct browser signed-session path omits it.
 
+### Same-origin session bootstrap
+
+Production web must use server-only same-origin session bootstrap. Browser
+library snapshots served through `/api/viva-library/study-sets/library` keep
+start/resume availability and session ids, but strip start/resume session token
+fields before the snapshot reaches the client. The browser obtains the minimum
+signed material for `/ws` only by POSTing to `/api/viva-session/start` or
+`/api/viva-session/refresh`.
+
+Client-side library refresh, export, and delete controls must also use the
+same-origin `/api/viva-library` proxy, even when `NEXT_PUBLIC_VIVA_API_URL` or
+`NEXT_PUBLIC_VIVA_AGENT_HTTP_URL` points at the public agent origin for readiness
+and session transport.
+
+Configure the web service with the intended Railway agent URL and REST bearer in
+server-only variables. The web service must share the agent's session signing
+secret so `/api/viva-session/refresh` can validate existing token signatures
+before asking the agent for a fresh resume token:
+
+```sh
+VIVA_AGENT_HTTP_URL="https://agent.viva.example.com"
+VIVA_AGENT_REST_BEARER_TOKEN="<from the web service secret store>"
+VIVA_VOICE_SESSION_TOKEN_SECRET="<same value as the agent service>"
+VIVA_SESSION_ALLOWED_USER_IDS="synthetic-monitor-user"
+VIVA_SESSION_ALLOWED_STUDY_SET_IDS="biology-midterm"
+VIVA_SESSION_MINT_MAX_PER_MINUTE="12"
+```
+
+`NEXT_PUBLIC_VIVA_AGENT_HTTP_URL` may still identify the public readiness target,
+but it is not a credential. Do not expose the REST bearer through any
+`NEXT_PUBLIC_*` variable. The same-origin endpoints reject cross-origin callers,
+rate-limit minting by client IP plus session identity, and return only
+`session`, `session_token`, `token_refresh_outcome`, and `failure_class`.
+Refresh validates the HMAC signature locally, treats expired signed material as
+recoverable by minting a fresh resume token through the agent, and leaves nonce
+replay authority with `/ws`. Refresh outcomes such as `expired_refreshed`,
+`invalid_rejected`, `malformed_rejected`, `identity_mismatch`, and `blocked` are
+evidence fields; logs and artifacts must not include the token value, server
+bearer, agent URL secret, raw request body, or upstream error payload.
+
 ## Health Checks
 
 Use `/live` for process liveness and `/ready` for routing readiness.

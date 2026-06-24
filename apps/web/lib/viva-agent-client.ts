@@ -441,9 +441,9 @@ export async function deleteVivaSessionHistory(
 function vivaLibraryApiBaseUrl(options: VivaLibrarySnapshotOptions): string {
   const apiBaseUrl =
     options.apiBaseUrl ??
+    browserVivaLibraryProxyBaseUrl() ??
     vivaApiBaseUrl() ??
     configuredVivaAgentHttpBaseUrl() ??
-    browserVivaLibraryProxyBaseUrl() ??
     vivaAgentHttpBaseUrl();
   if (!apiBaseUrl) {
     throw new Error("Viva API URL is unavailable");

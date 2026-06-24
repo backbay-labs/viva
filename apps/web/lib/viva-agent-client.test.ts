@@ -953,6 +953,8 @@ describe("Viva agent browser client", () => {
 
   test("uses an absolute same-origin proxy URL for browser library calls", async () => {
     const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const originalEnv = process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL;
+    const originalApiEnv = process.env.NEXT_PUBLIC_VIVA_API_URL;
     const calls: Array<{ input: string; init?: RequestInit }> = [];
     const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ input: String(input), init });
@@ -977,10 +979,14 @@ describe("Viva agent browser client", () => {
         configurable: true,
         value: { location: { origin: "http://localhost:3000" } },
       });
+      process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
+      process.env.NEXT_PUBLIC_VIVA_API_URL = "https://agent.example";
 
       await fetchVivaLibrarySnapshot({ fetchImpl, userId: "user-1" });
     } finally {
       restoreGlobalProperty("window", originalWindow);
+      restoreEnv("NEXT_PUBLIC_VIVA_AGENT_HTTP_URL", originalEnv);
+      restoreEnv("NEXT_PUBLIC_VIVA_API_URL", originalApiEnv);
     }
 
     expect(calls[0]?.input).toBe(
@@ -1034,6 +1040,14 @@ function restoreGlobalProperty(name: string, descriptor: PropertyDescriptor | un
     Object.defineProperty(globalThis, name, descriptor);
   } else {
     delete (globalThis as Record<string, unknown>)[name];
+  }
+}
+
+function restoreEnv(name: string, value: string | undefined) {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
   }
 }
 

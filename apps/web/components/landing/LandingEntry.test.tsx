@@ -126,8 +126,10 @@ describe("LandingEntry", () => {
     expect(markup).toContain("NADH");
     expect(markup).toContain("server schedule");
     expect(markup).toContain(
-      "/session?user_id=user-1&amp;study_set_id=biology-midterm&amp;session_id=server-session#session_token=viva1.server-token",
+      "/session?user_id=user-1&amp;study_set_id=biology-midterm&amp;session_id=server-session",
     );
+    expect(markup).not.toContain("session_token=");
+    expect(markup).not.toContain("viva1.server-token");
   });
 
   test("session cards surface a mastery ring, emphasise the next drill, and quiet the delete", () => {

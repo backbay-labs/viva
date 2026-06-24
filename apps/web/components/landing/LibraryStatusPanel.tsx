@@ -201,7 +201,7 @@ function LibraryStudySetRow({
           className="viva-library__action--primary"
           data-session-target={startTarget}
           disabled={!row.start.available}
-          onClick={() => navigateToSession(startTarget)}
+          onClick={() => startServerSession(row, "start", row.start)}
           type="button"
         >
           Start
@@ -211,7 +211,7 @@ function LibraryStudySetRow({
           className="viva-library__action--primary"
           data-session-target={resumeTarget}
           disabled={!row.resume.available}
-          onClick={() => navigateToSession(resumeTarget)}
+          onClick={() => startServerSession(row, "resume", row.resume)}
           type="button"
         >
           Resume
@@ -234,10 +234,52 @@ function libraryActionTarget(row: LibraryRow, action: LibraryRow["start"]) {
   if (!action.available) return "/session";
   return librarySessionTarget({
     sessionId: action.sessionId,
-    sessionToken: action.sessionToken,
     studySetId: row.id,
     userId: row.userId,
   });
+}
+
+async function startServerSession(
+  row: LibraryRow,
+  actionName: "resume" | "start",
+  action: LibraryRow["start"],
+) {
+  if (!action.available) return;
+  const response = await fetch("/api/viva-session/start", {
+    body: JSON.stringify({
+      session_id: actionName === "resume" ? action.sessionId : undefined,
+      study_set_id: row.id,
+      user_id: row.userId,
+    }),
+    cache: "no-store",
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  if (!response.ok) return;
+  const payload = (await response.json()) as {
+    session?: {
+      session_id?: string;
+      study_set_id?: string;
+      user_id?: string;
+    };
+    session_token?: string;
+  };
+  if (
+    !payload.session?.session_id ||
+    !payload.session.study_set_id ||
+    !payload.session.user_id ||
+    !payload.session_token
+  ) {
+    return;
+  }
+  navigateToSession(
+    librarySessionTarget({
+      sessionId: payload.session.session_id,
+      sessionToken: payload.session_token,
+      studySetId: payload.session.study_set_id,
+      userId: payload.session.user_id,
+    }),
+  );
 }
 
 function navigateToSession(target: string) {
