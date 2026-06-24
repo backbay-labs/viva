@@ -650,6 +650,17 @@ where
                         text_output_tokens: output_tokens,
                         ..BrainUsage::default()
                     }),
+                    GeminiStreamEvent::FallbackActivated {
+                        from_model,
+                        to_model,
+                        reason,
+                    } => events.push(BrainEvent::ProviderFallbackActivated {
+                        response_id: response_id.to_owned(),
+                        provider: "gemini".to_owned(),
+                        from_model,
+                        to_model,
+                        reason,
+                    }),
                     GeminiStreamEvent::Error(message) => {
                         return Err(gemini_stream_event_error(
                             message,

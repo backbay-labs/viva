@@ -231,6 +231,13 @@ pub enum BrainEvent {
         proposal: ToolProposal,
     },
     Usage(BrainUsage),
+    ProviderFallbackActivated {
+        response_id: String,
+        provider: String,
+        from_model: String,
+        to_model: String,
+        reason: String,
+    },
     Error(BrainProviderError),
     SpeechIntent(SpeechIntent),
     InputSpeechStarted,
@@ -271,7 +278,8 @@ impl BrainEvent {
             | Self::ResponseTranscriptDelta { response_id, .. }
             | Self::ResponseTextStarted { response_id }
             | Self::ResponseCancelledFor { response_id }
-            | Self::TranscriptFinal { response_id, .. } => Some(response_id),
+            | Self::TranscriptFinal { response_id, .. }
+            | Self::ProviderFallbackActivated { response_id, .. } => Some(response_id),
             Self::Transcript(_)
             | Self::SessionPhase { .. }
             | Self::TerminalSessionPhase { .. }

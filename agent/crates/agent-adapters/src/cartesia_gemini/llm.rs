@@ -54,6 +54,7 @@ impl ThinkingLevel {
 pub struct GeminiConfig {
     pub api_key: String,
     pub model_id: String,
+    pub fallback_model_ids: Vec<String>,
     pub base_url: String,
     pub thinking_level: Option<ThinkingLevel>,
     pub system_instruction: String,
@@ -66,6 +67,7 @@ impl fmt::Debug for GeminiConfig {
             .debug_struct("GeminiConfig")
             .field("api_key", &"<redacted>")
             .field("model_id", &self.model_id)
+            .field("fallback_model_ids", &self.fallback_model_ids)
             .field("base_url", &self.base_url)
             .field("thinking_level", &self.thinking_level)
             .field("system_instruction", &self.system_instruction)
@@ -79,6 +81,7 @@ impl Default for GeminiConfig {
         Self {
             api_key: String::new(),
             model_id: DEFAULT_GEMINI_MODEL.to_owned(),
+            fallback_model_ids: Vec::new(),
             base_url: DEFAULT_GEMINI_BASE_URL.to_owned(),
             thinking_level: ThinkingLevel::parse(DEFAULT_GEMINI_THINKING_LEVEL),
             system_instruction: viva_system_instruction(),
@@ -190,6 +193,11 @@ pub enum GeminiStreamEvent {
         input_tokens: u64,
         output_tokens: u64,
     },
+    FallbackActivated {
+        from_model: String,
+        to_model: String,
+        reason: String,
+    },
 }
 
 pub(crate) struct GeminiStreamRequest {
@@ -246,28 +254,60 @@ pub(crate) async fn stream_gemini_with_client<C>(
 where
     C: GeminiSseClient,
 {
-    let stream_request = GeminiStreamRequest::new(config, request)?;
-    let started = Instant::now();
-    let response = timeout(config.stage_timeout, client.stream(stream_request))
-        .await
-        .map_err(|_| BrainError::Connection("Gemini generation stage timeout".to_owned()))?
-        .map_err(sanitize_gemini_stream_error)?;
-    if response.status == 429 {
-        return Err(gemini_rate_limit_stage_failure(
-            config,
-            &response,
-            started.elapsed(),
-        ));
+    let attempts = gemini_stream_attempts(config);
+    let mut last_rate_limit = None;
+    for (index, attempt_config) in attempts.iter().enumerate() {
+        let stream_request = GeminiStreamRequest::new(attempt_config, request.clone())?;
+        let started = Instant::now();
+        let response = timeout(attempt_config.stage_timeout, client.stream(stream_request))
+            .await
+            .map_err(|_| BrainError::Connection("Gemini generation stage timeout".to_owned()))?
+            .map_err(sanitize_gemini_stream_error)?;
+        if response.status == 429 {
+            let error =
+                gemini_rate_limit_stage_failure(attempt_config, &response, started.elapsed());
+            if index + 1 < attempts.len() {
+                last_rate_limit = Some(error);
+                continue;
+            }
+            return Err(error);
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(sanitized_gemini_http_status_error(response.status));
+        }
+        if response.body.trim().is_empty() {
+            return Err(BrainError::Protocol(
+                "Gemini stream returned no events".to_owned(),
+            ));
+        }
+        let mut events = parse_gemini_sse_stream(&response.body);
+        if index > 0 {
+            events.insert(
+                0,
+                GeminiStreamEvent::FallbackActivated {
+                    from_model: config.model_id.clone(),
+                    to_model: attempt_config.model_id.clone(),
+                    reason: "primary_429".to_owned(),
+                },
+            );
+        }
+        return Ok(events);
     }
-    if !(200..300).contains(&response.status) {
-        return Err(sanitized_gemini_http_status_error(response.status));
+    Err(last_rate_limit.unwrap_or_else(|| {
+        BrainError::Protocol("Gemini stream had no configured model attempts".to_owned())
+    }))
+}
+
+fn gemini_stream_attempts(config: &GeminiConfig) -> Vec<GeminiConfig> {
+    let mut attempts = Vec::with_capacity(config.fallback_model_ids.len() + 1);
+    attempts.push(config.clone());
+    for model_id in &config.fallback_model_ids {
+        let mut fallback = config.clone();
+        fallback.model_id = model_id.clone();
+        fallback.fallback_model_ids.clear();
+        attempts.push(fallback);
     }
-    if response.body.trim().is_empty() {
-        return Err(BrainError::Protocol(
-            "Gemini stream returned no events".to_owned(),
-        ));
-    }
-    Ok(parse_gemini_sse_stream(&response.body))
+    attempts
 }
 
 fn sanitize_gemini_stream_error(error: BrainError) -> BrainError {
@@ -1779,6 +1819,69 @@ data: [DONE]
     }
 
     #[tokio::test]
+    async fn streaming_transport_falls_back_to_second_gemini_model_after_primary_429() {
+        let client = SequencedGeminiSseClient {
+            captures: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(vec![
+                GeminiSseResponse {
+                    status: 429,
+                    body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"raw primary body"}}"#
+                        .to_owned(),
+                    retry_after: Some("3".to_owned()),
+                    reset_after: None,
+                },
+                GeminiSseResponse::ok(
+                    r#"data: {"candidates":[{"content":{"parts":[{"text":"fallback feedback"}]}}]}"#
+                        .to_owned(),
+                ),
+            ])),
+        };
+
+        let events = stream_gemini_with_client(
+            &client,
+            &GeminiConfig {
+                api_key: "gemini-test-key".to_owned(),
+                model_id: "gemini-3.5-pro".to_owned(),
+                fallback_model_ids: vec!["gemini-3.5-flash".to_owned()],
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [{ "parts": [{ "text": "raw prompt" }] }] }),
+        )
+        .await
+        .expect("fallback model succeeds");
+
+        assert_eq!(
+            events[0],
+            GeminiStreamEvent::FallbackActivated {
+                from_model: "gemini-3.5-pro".to_owned(),
+                to_model: "gemini-3.5-flash".to_owned(),
+                reason: "primary_429".to_owned(),
+            }
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GeminiStreamEvent::ModelPart {
+                text: Some(text),
+                ..
+            } if text == "fallback feedback"
+        )));
+        let captures = client.captures.lock().expect("capture lock poisoned");
+        assert_eq!(captures.len(), 2);
+        assert!(captures[0]
+            .url
+            .as_deref()
+            .expect("primary request url")
+            .contains("gemini-3.5-pro"));
+        assert!(captures[1]
+            .url
+            .as_deref()
+            .expect("fallback request url")
+            .contains("gemini-3.5-flash"));
+        assert!(!format!("{events:?}").contains("raw primary body"));
+        assert!(!format!("{events:?}").contains("raw prompt"));
+    }
+
+    #[tokio::test]
     async fn streaming_transport_503_redacts_unclassified_status_and_body() {
         let client = RecordingGeminiSseClient {
             capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
@@ -1874,6 +1977,11 @@ data: [DONE]
         response: RecordingGeminiResponse,
     }
 
+    struct SequencedGeminiSseClient {
+        captures: Arc<Mutex<Vec<GeminiRequestCapture>>>,
+        responses: Arc<Mutex<Vec<GeminiSseResponse>>>,
+    }
+
     struct DelayedGeminiSseClient;
 
     #[derive(Clone)]
@@ -1901,6 +2009,28 @@ data: [DONE]
                     Err(BrainError::Connection(message.clone()))
                 }
             }
+        }
+    }
+
+    #[async_trait]
+    impl GeminiSseClient for SequencedGeminiSseClient {
+        async fn stream(
+            &self,
+            request: GeminiStreamRequest,
+        ) -> Result<GeminiSseResponse, BrainError> {
+            self.captures
+                .lock()
+                .expect("captures lock poisoned")
+                .push(GeminiRequestCapture {
+                    url: Some(request.url),
+                    api_key: Some(request.api_key),
+                    body: Some(request.body),
+                });
+            Ok(self
+                .responses
+                .lock()
+                .expect("responses lock poisoned")
+                .remove(0))
         }
     }
 

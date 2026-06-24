@@ -349,6 +349,7 @@ impl ServerFrame {
             | BrainEvent::ResponseTextStarted { .. } => Some(Self::event(event)),
             BrainEvent::Usage(_)
             | BrainEvent::ResponseCompleted { .. }
+            | BrainEvent::ProviderFallbackActivated { .. }
             | BrainEvent::ResponseToolProposal { .. }
             | BrainEvent::Transcript(_)
             | BrainEvent::SpeechIntent(_) => None,

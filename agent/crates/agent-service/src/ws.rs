@@ -3370,6 +3370,21 @@ async fn record_brain_event(
         }
         return BrainEventRecordResult::Usage(usage_record);
     }
+    if let agent_domain::BrainEvent::ProviderFallbackActivated {
+        provider,
+        from_model,
+        to_model,
+        reason,
+        ..
+    } = event
+    {
+        state.evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::ProviderFallback,
+            voice_session_id,
+            format!("provider={provider} from_model={from_model} to_model={to_model} reason={reason}"),
+        ));
+        return BrainEventRecordResult::None;
+    }
     let Some((kind, detail)) = (match event {
         agent_domain::BrainEvent::QuestionStarted { response_id, .. } => Some((
             VoiceEvidenceEventKind::QuestionEmitted,
@@ -4996,5 +5011,47 @@ mod tests {
         assert_eq!(usage[0].text_input_tokens, 20);
         assert_eq!(record.cost_estimate_usd, usage[0].cost_estimate_usd);
         assert!(state.evidence.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn records_provider_fallback_activations_internally_without_browser_evidence() {
+        use std::sync::Arc;
+
+        use agent_adapters::SyntheticBrain;
+
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "cartesia_gemini",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let event = agent_domain::BrainEvent::ProviderFallbackActivated {
+            response_id: "response-1".to_owned(),
+            provider: "gemini".to_owned(),
+            from_model: "gemini-3.5-pro".to_owned(),
+            to_model: "gemini-3.5-flash".to_owned(),
+            reason: "primary_429".to_owned(),
+        };
+
+        assert!(record_brain_event(
+            &state,
+            Some("voice-session-1".to_owned()),
+            &event,
+            Duration::from_secs(1),
+        )
+        .await
+        .is_none());
+        assert!(crate::protocol::ServerFrame::browser_event(event).is_none());
+        let evidence = state.evidence.snapshot();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].kind, VoiceEvidenceEventKind::ProviderFallback);
+        assert_eq!(
+            evidence[0].voice_session_id.as_deref(),
+            Some("voice-session-1")
+        );
+        assert!(evidence[0].detail.contains("provider=gemini"));
+        assert!(evidence[0].detail.contains("from_model=gemini-3.5-pro"));
+        assert!(evidence[0].detail.contains("to_model=gemini-3.5-flash"));
+        assert!(evidence[0].detail.contains("reason=primary_429"));
     }
 }
