@@ -4,12 +4,12 @@ use agent_adapters::cartesia_gemini::{
     SonicConfig, ThinkingLevel,
 };
 use agent_domain::{
-    AnswerAttemptEnvelope, AnswerEvaluation, AudioFrame, AuthorizedStudySession, BrainEvent,
-    BrainInput, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent,
-    ManuscriptRegister, PortError, RealtimeBrain, RealtimeSession, SessionConfig, SessionId,
-    StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap, StudySourceReference,
-    StudyStoreCapabilities, StudyStoreWriteCounts, ToolProposal, VivaToolExecutor,
-    VoiceUsageRecord,
+    viva_max_submitted_answer_resolution, AnswerAttemptEnvelope, AnswerEvaluation, AudioFrame,
+    AuthorizedStudySession, BrainEvent, BrainInput, ConceptStatus, ManuscriptEmphasis,
+    ManuscriptEntityKind, ManuscriptIntent, ManuscriptRegister, PortError, RealtimeBrain,
+    RealtimeSession, SessionConfig, SessionId, StudyMemoryStore, StudyMode, StudyQuestion,
+    StudySessionRecap, StudySourceReference, StudyStoreCapabilities, StudyStoreWriteCounts,
+    TerminalSessionReason, ToolProposal, VivaToolExecutor, VoiceUsageRecord,
 };
 use serde_json::json;
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,21 @@ fn adapter_defaults_are_viva_native_and_live_keys_are_explicit() {
         .gemini
         .system_instruction
         .contains("source-grounded oral study coach"));
+}
+
+#[test]
+fn adapter_defaults_define_stage_deadlines_under_bac_510_turn_cap() {
+    let config = CartesiaGeminiConfig::default();
+
+    assert!(config.ink.stage_timeout > Duration::ZERO);
+    assert!(config.gemini.stage_timeout > Duration::ZERO);
+    assert!(config.sonic.stage_timeout > Duration::ZERO);
+    assert!(config.tool_stage_timeout > Duration::ZERO);
+    assert!(config.recap_stage_timeout > Duration::ZERO);
+    assert!(
+        config.total_live_stage_deadline() <= viva_max_submitted_answer_resolution(),
+        "live provider stage deadlines must stay inside the BAC-510 submitted-answer cap"
+    );
 }
 
 #[test]
@@ -859,6 +874,59 @@ async fn fake_runtime_replays_provider_shaped_pipeline_without_live_selection() 
 }
 
 #[tokio::test]
+async fn fake_runtime_reports_tool_source_failure_as_stage_failure() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let session = fixture_session_config();
+    inner.record_voice_session(&session).await.unwrap();
+    let store = Arc::new(FailSourceAfterQuestionStore::new(inner));
+    let runtime = FakeCartesiaGeminiRuntime::new(store);
+
+    let mut realtime = runtime.open(session).await.unwrap();
+    assert!(matches!(
+        next_event(&mut realtime).await,
+        BrainEvent::SessionPhase { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut realtime).await,
+        BrainEvent::QuestionStarted { .. }
+    ));
+    realtime
+        .input
+        .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+            1_u8, 2, 3, 4,
+        ])))
+        .await
+        .unwrap();
+
+    let error = loop {
+        match next_event(&mut realtime).await {
+            BrainEvent::Error(error) => break error,
+            BrainEvent::RecapReady { .. } => {
+                panic!("source tool failure unexpectedly reached recap")
+            }
+            _ => {}
+        }
+    };
+    let error_text = error.message.clone();
+    let failure = error
+        .failure
+        .expect("provider error includes stage failure");
+
+    assert_eq!(failure.failure_class, "tool_executor_failure");
+    assert_eq!(failure.stage, "tools");
+    assert_eq!(
+        failure.terminal_reason,
+        TerminalSessionReason::ToolExecutorFailure
+    );
+    assert!(failure.retry_eligible);
+    assert_eq!(failure.provider, "server");
+    assert_eq!(failure.model, "viva-tools");
+    assert!(failure.metadata.contains("tool=retrieve_source_reference"));
+    assert!(!error_text.contains("raw source excerpt"));
+    assert!(!failure.metadata.contains("raw source excerpt"));
+}
+
+#[tokio::test]
 async fn fake_runtime_drops_invalid_gemini_manuscript_intent_without_blocking_v1_events() {
     let (store, session) = fixture_store_and_session().await;
     let runtime = FakeCartesiaGeminiRuntime::new(store.clone());
@@ -1213,6 +1281,158 @@ struct BlockingAnswerStore {
     inner: Arc<data::InMemoryStudyStore>,
     answer_started: Mutex<Option<oneshot::Sender<()>>>,
     release_answer: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+struct FailSourceAfterQuestionStore {
+    inner: Arc<data::InMemoryStudyStore>,
+    source_reference_calls: Mutex<usize>,
+}
+
+impl FailSourceAfterQuestionStore {
+    fn new(inner: Arc<data::InMemoryStudyStore>) -> Self {
+        Self {
+            inner,
+            source_reference_calls: Mutex::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for FailSourceAfterQuestionStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
+        self.inner.record_voice_session(config).await
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn active_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<StudyQuestion>, PortError> {
+        self.inner.active_question(user_id, study_set_id).await
+    }
+
+    async fn record_answer_attempt_envelope(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        envelope: AnswerAttemptEnvelope,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_attempt_envelope(user_id, study_set_id, voice_session_id, envelope)
+            .await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        let should_fail = {
+            let mut calls = self
+                .source_reference_calls
+                .lock()
+                .expect("source reference calls lock poisoned");
+            *calls += 1;
+            *calls > 2
+        };
+        if should_fail {
+            return Err(PortError::adapter(
+                "study_store",
+                "raw source excerpt from adapter must not leak",
+            ));
+        }
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+
+    async fn record_voice_usage(&self, event: VoiceUsageRecord) -> Result<(), PortError> {
+        self.inner.record_voice_usage(event).await
+    }
 }
 
 impl BlockingAnswerStore {

@@ -7,7 +7,7 @@ use serde::{
     ser::SerializeStruct,
     Deserialize, Deserializer, Serialize, Serializer,
 };
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 mod brain;
 mod ids;
@@ -17,10 +17,11 @@ pub mod tool_executor;
 mod tools;
 
 pub use brain::{
-    BrainError, BrainEvent, BrainEventStream, BrainInput, BrainProviderError, BrainUsage,
-    ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent, ManuscriptRegister,
-    Planner, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard,
-    SessionConfig, SourceConfidence, SourceContext, SpeechIntent, StudyMode,
+    BrainError, BrainEvent, BrainEventStream, BrainInput, BrainProviderError, BrainProviderFailure,
+    BrainProviderFailureParts, BrainUsage, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind,
+    ManuscriptIntent, ManuscriptRegister, Planner, RealtimeBrain, RealtimeBrainCapabilities,
+    RealtimeSession, RealtimeSessionTaskGuard, SessionConfig, SourceConfidence, SourceContext,
+    SpeechIntent, StudyMode,
 };
 pub use ids::{CallId, SessionId, ToolName};
 pub use ports::{
@@ -38,6 +39,23 @@ pub use study::{
 };
 pub use tool_executor::{AuthorizedStudySession, ToolExecutionError, VivaToolExecutor};
 pub use tools::{ToolPlan, ToolProposal, ToolResult};
+
+const BAC_510_LEARNER_LOOP_CONTRACT_JSON: &str =
+    include_str!("../../../../packages/core/src/learner-loop-contract.json");
+
+pub fn viva_max_submitted_answer_resolution() -> Duration {
+    let contract: serde_json::Value = serde_json::from_str(BAC_510_LEARNER_LOOP_CONTRACT_JSON)
+        .expect("BAC-510 learner loop contract JSON must parse");
+    let max_resolution_ms = contract
+        .get("max_submitted_answer_resolution_ms")
+        .and_then(serde_json::Value::as_u64)
+        .expect("BAC-510 learner loop contract must define max_submitted_answer_resolution_ms");
+    assert!(
+        max_resolution_ms <= 45_000,
+        "BAC-510 learner loop contract max turn bound must be <= 45 seconds"
+    );
+    Duration::from_millis(max_resolution_ms)
+}
 
 #[derive(Clone, Debug)]
 pub struct AudioFrame {

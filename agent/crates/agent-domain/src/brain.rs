@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use futures_util::{stream::BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use tokio::{sync::mpsc, task::AbortHandle};
 
 use crate::{
@@ -288,6 +289,102 @@ impl BrainEvent {
 pub struct BrainProviderError {
     pub source: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<BrainProviderFailure>,
+}
+
+impl BrainProviderError {
+    pub fn new(source: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            message: message.into(),
+            failure: None,
+        }
+    }
+
+    pub fn from_stage_failure(failure: BrainProviderFailure) -> Self {
+        Self {
+            source: failure.provider.clone(),
+            message: failure.to_string(),
+            failure: Some(failure),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrainProviderFailureParts {
+    pub failure_class: String,
+    pub stage: String,
+    pub terminal_reason: TerminalSessionReason,
+    pub retry_eligible: bool,
+    pub latency_ms: u64,
+    pub provider: String,
+    pub model: String,
+    pub metadata: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BrainProviderFailure {
+    pub failure_class: String,
+    pub stage: String,
+    pub terminal_reason: TerminalSessionReason,
+    pub retry_eligible: bool,
+    pub latency_ms: u64,
+    pub provider: String,
+    pub model: String,
+    pub metadata: String,
+}
+
+impl BrainProviderFailure {
+    pub fn new(parts: BrainProviderFailureParts) -> Self {
+        Self {
+            failure_class: sanitize_stage_token(parts.failure_class),
+            stage: sanitize_stage_token(parts.stage),
+            terminal_reason: parts.terminal_reason,
+            retry_eligible: parts.retry_eligible,
+            latency_ms: parts.latency_ms,
+            provider: sanitize_stage_token(parts.provider),
+            model: sanitize_stage_token(parts.model),
+            metadata: sanitize_stage_metadata(parts.metadata),
+        }
+    }
+}
+
+impl fmt::Display for BrainProviderFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} stage failure: {}",
+            self.stage, self.failure_class
+        )
+    }
+}
+
+fn sanitize_stage_token(value: String) -> String {
+    let sanitized = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        .take(96)
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unknown".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn sanitize_stage_metadata(value: String) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    ' ' | '-' | '_' | ':' | '.' | '/' | '=' | ',' | ';' | '(' | ')'
+                )
+        })
+        .take(240)
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -335,6 +432,8 @@ pub enum BrainError {
     Connection(String),
     #[error("brain protocol error: {0}")]
     Protocol(String),
+    #[error("{0}")]
+    StageFailure(Box<BrainProviderFailure>),
 }
 
 #[async_trait]

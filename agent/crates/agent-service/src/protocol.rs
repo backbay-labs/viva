@@ -241,9 +241,9 @@ impl From<BrainEvent> for VivaServerEvent {
                 source: "agent-service".to_owned(),
                 message: "telemetry event suppressed".to_owned(),
             },
-            BrainEvent::Error(BrainProviderError { source, message }) => {
-                Self::StructuredError { source, message }
-            }
+            BrainEvent::Error(BrainProviderError {
+                source, message, ..
+            }) => Self::StructuredError { source, message },
             BrainEvent::InputSpeechStarted => Self::SessionPhase {
                 phase: StudySessionPhase::Listening,
                 terminal_reason: None,
@@ -441,6 +441,7 @@ mod tests {
         let frame = ServerFrame::event(BrainEvent::Error(BrainProviderError {
             source: "agent-service".to_owned(),
             message: "telemetry event suppressed".to_owned(),
+            failure: None,
         }));
 
         assert_eq!(

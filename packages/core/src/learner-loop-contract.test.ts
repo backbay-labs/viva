@@ -20,6 +20,7 @@ const REQUIRED_STATE_IDS = Object.freeze([
   "provider_rate_limit",
   "provider_timeout",
   "malformed_stream",
+  "tool_executor_failure",
   "network_disconnect",
   "invalid_expired_replayed_token",
   "back_forward_stale_session",

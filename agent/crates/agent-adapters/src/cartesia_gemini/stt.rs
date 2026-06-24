@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
@@ -33,6 +35,7 @@ pub struct InkConfig {
     pub min_volume: String,
     pub max_silence_duration_secs: String,
     pub cartesia_version: String,
+    pub stage_timeout: Duration,
 }
 
 impl Default for InkConfig {
@@ -46,6 +49,7 @@ impl Default for InkConfig {
             min_volume: "0.05".to_owned(),
             max_silence_duration_secs: "0.7".to_owned(),
             cartesia_version: DEFAULT_CARTESIA_VERSION.to_owned(),
+            stage_timeout: Duration::from_secs(8),
         }
     }
 }
@@ -137,8 +141,12 @@ where
     C: InkConnector,
 {
     let request = config.websocket_request(api_key)?;
-    let mut socket = connector.connect(request).await?;
-    transcribe_ink_turn(&mut socket, frame).await
+    timeout(config.stage_timeout, async {
+        let mut socket = connector.connect(request).await?;
+        transcribe_ink_turn(&mut socket, frame).await
+    })
+    .await
+    .map_err(|_| BrainError::Connection("Cartesia Ink stage timeout".to_owned()))?
 }
 
 pub(crate) async fn transcribe_ink_websocket(
@@ -349,6 +357,7 @@ fn transcript_text(value: &Value) -> Option<String> {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -522,6 +531,29 @@ mod tests {
         assert!(record.closed);
     }
 
+    #[tokio::test]
+    async fn connector_transport_times_out_without_leaking_audio_or_credentials() {
+        let connector = DelayedInkConnector;
+        let config = InkConfig {
+            stage_timeout: Duration::from_millis(5),
+            ..InkConfig::default()
+        };
+
+        let error = transcribe_ink_with_connector(
+            &connector,
+            &config,
+            "sk_car_timeout_secret",
+            &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Cartesia Ink stage timeout"));
+        assert!(!error.contains("sk_car_timeout_secret"));
+        assert!(!error.contains("9, 8, 7, 6"));
+    }
+
     struct FakeInkSocket {
         incoming: VecDeque<&'static str>,
         sent_binary: Vec<Bytes>,
@@ -542,6 +574,8 @@ mod tests {
     struct RecordingInkConnector {
         record: Arc<Mutex<SocketRecord>>,
     }
+
+    struct DelayedInkConnector;
 
     #[async_trait]
     impl InkConnector for RecordingInkConnector {
@@ -565,6 +599,18 @@ mod tests {
                     r#"{"type":"turn.end","transcript":"connected transport"}"#,
                 ]),
             })
+        }
+    }
+
+    #[async_trait]
+    impl InkConnector for DelayedInkConnector {
+        type Socket = FakeInkSocket;
+
+        async fn connect(&self, _request: Request<()>) -> Result<Self::Socket, BrainError> {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(FakeInkSocket::new(vec![
+                r#"{"type":"turn.end","transcript":"too late"}"#,
+            ]))
         }
     }
 

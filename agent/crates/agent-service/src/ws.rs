@@ -1131,6 +1131,7 @@ where
             ));
             return Ok(ForwardBrainEvent::DurabilityDegraded);
         }
+        record_provider_stage_failure(context.state, context.voice_session_id.clone(), error);
         return Ok(ForwardBrainEvent::ProviderFailure(
             terminal_reason_for_provider_error(error),
         ));
@@ -1185,6 +1186,7 @@ where
 fn terminal_reason_for_brain_error(error: &BrainError) -> TerminalSessionReason {
     match error {
         BrainError::MissingApiKey => TerminalSessionReason::ProviderAuthFailed,
+        BrainError::StageFailure(failure) => failure.terminal_reason,
         BrainError::Connection(message) => terminal_reason_for_provider_message(message),
         BrainError::Protocol(message) => {
             let reason = terminal_reason_for_provider_message(message);
@@ -1210,6 +1212,9 @@ fn brain_error_is_durability_degraded(state: &AppState, error: &BrainError) -> b
 }
 
 fn terminal_reason_for_provider_error(error: &BrainProviderError) -> TerminalSessionReason {
+    if let Some(failure) = &error.failure {
+        return failure.terminal_reason;
+    }
     let combined = format!("{} {}", error.source, error.message);
     terminal_reason_for_provider_message(&combined)
 }
@@ -1277,6 +1282,9 @@ fn terminal_reason_for_provider_message(message: &str) -> TerminalSessionReason 
     }
     if normalized.contains("partial stage success") || normalized.contains("typed fallback") {
         return TerminalSessionReason::PartialStageSuccess;
+    }
+    if normalized.contains("tool_executor_failure") || normalized.contains("tool executor") {
+        return TerminalSessionReason::ToolExecutorFailure;
     }
     if normalized.contains("cancel") || normalized.contains("abort") {
         return TerminalSessionReason::ProviderCancelled;
@@ -1362,6 +1370,7 @@ fn failure_control_provider_error(scenario: FailureControlScenario) -> BrainProv
     BrainProviderError {
         source: "failure_control".to_owned(),
         message: failure_control_provider_message(scenario),
+        failure: None,
     }
 }
 
@@ -2264,6 +2273,31 @@ async fn record_session_auth_failure(
     ));
 }
 
+fn record_provider_stage_failure(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    error: &BrainProviderError,
+) {
+    let Some(failure) = &error.failure else {
+        return;
+    };
+    state.evidence.record(VoiceEvidenceEvent::new(
+        VoiceEvidenceEventKind::ProviderStageFailure,
+        voice_session_id,
+        format!(
+            "failure_class={} stage={} terminal_reason={} retry_eligible={} latency_ms={} provider={} model={} metadata={}",
+            failure.failure_class,
+            failure.stage,
+            failure.terminal_reason.as_str(),
+            failure.retry_eligible,
+            failure.latency_ms,
+            failure.provider,
+            failure.model,
+            failure.metadata
+        ),
+    ));
+}
+
 fn record_turn_cap_config(state: &AppState, voice_session_id: Option<String>) {
     let source = if state.turn_cap_override {
         "explicit_override"
@@ -2509,6 +2543,7 @@ fn ws_access_error(error: VoiceWsAccessError) -> (StatusCode, Json<serde_json::V
 mod tests {
     use super::*;
     use agent_adapters::SyntheticBrain;
+    use agent_domain::{BrainProviderFailure, BrainProviderFailureParts};
     use std::{
         pin::Pin,
         sync::Arc,
@@ -2651,6 +2686,28 @@ mod tests {
         .await;
 
         assert!(lease.is_none());
+    }
+
+    #[test]
+    fn provider_error_stage_metadata_overrides_message_classifier() {
+        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+            BrainProviderFailureParts {
+                failure_class: "tool_executor_failure".to_owned(),
+                stage: "tools".to_owned(),
+                terminal_reason: TerminalSessionReason::ToolExecutorFailure,
+                retry_eligible: true,
+                latency_ms: 12,
+                provider: "server".to_owned(),
+                model: "viva-tools".to_owned(),
+                metadata: "tool=retrieve_source_reference error_kind=store".to_owned(),
+            },
+        ));
+
+        assert_eq!(
+            terminal_reason_for_provider_error(&error),
+            TerminalSessionReason::ToolExecutorFailure
+        );
+        assert!(!error.message.contains("retrieve_source_reference"));
     }
 
     struct FailingSink;

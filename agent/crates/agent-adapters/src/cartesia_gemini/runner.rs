@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -13,11 +14,13 @@ use tokio::{sync::mpsc, task::AbortHandle};
 use agent_domain::{
     AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
     AnswerEvaluation, AudioFrame, AuthorizedStudySession, BrainError, BrainEvent, BrainInput,
-    BrainUsage, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent,
-    ManuscriptRegister, RealtimeSession, RealtimeSessionTaskGuard, SessionConfig, StudyMemoryStore,
-    StudyQuestion, StudySessionPhase, StudySessionRecap, StudySourceReference, ToolProposal,
-    ToolResult, VivaToolExecutor,
+    BrainProviderFailure, BrainProviderFailureParts, BrainUsage, ConceptStatus, ManuscriptEmphasis,
+    ManuscriptEntityKind, ManuscriptIntent, ManuscriptRegister, RealtimeSession,
+    RealtimeSessionTaskGuard, SessionConfig, StudyMemoryStore, StudyQuestion, StudySessionPhase,
+    StudySessionRecap, StudySourceReference, TerminalSessionReason, ToolExecutionError,
+    ToolProposal, ToolResult, VivaToolExecutor,
 };
+use tokio::time::timeout;
 
 use super::llm::{stream_gemini_http, GeminiConversation};
 use super::stt::transcribe_ink_websocket;
@@ -354,7 +357,7 @@ where
             ))
             .await
         {
-            emit_fake_provider_error(&job.event_tx, error.to_string()).await;
+            emit_fake_provider_error(&job.event_tx, BrainError::Protocol(error.to_string())).await;
             return;
         }
         if !send_fake_unless_cancelled(
@@ -372,7 +375,7 @@ where
         {
             Ok(transcript) => transcript,
             Err(error) => {
-                emit_fake_provider_error(&job.event_tx, error.to_string()).await;
+                emit_fake_provider_error(&job.event_tx, error).await;
                 return;
             }
         };
@@ -432,7 +435,7 @@ where
         {
             Ok(response_prompt) => response_prompt,
             Err(error) => {
-                emit_fake_provider_error(&job.event_tx, error.to_string()).await;
+                emit_fake_provider_error(&job.event_tx, error).await;
                 return;
             }
         };
@@ -455,7 +458,7 @@ where
             })
             .await
         {
-            emit_fake_provider_error(&job.event_tx, error.to_string()).await;
+            emit_fake_provider_error(&job.event_tx, error).await;
             return;
         }
         job.completed.store(true, Ordering::SeqCst);
@@ -556,10 +559,15 @@ where
                         } else {
                             ToolProposal::new(name, args).with_call_id(id)
                         };
-                        let result = executor
-                            .execute(response_id, proposal)
-                            .await
-                            .map_err(|error| BrainError::Protocol(error.to_string()))?;
+                        let result = execute_tool_stage(
+                            executor,
+                            response_id,
+                            proposal,
+                            self.config.tool_stage_timeout,
+                            "tools",
+                            "tool_executor_failure",
+                        )
+                        .await?;
                         if result.proposal.name() == "evaluate_spoken_answer" {
                             let evaluation = parse_result_field::<AnswerEvaluation>(
                                 &result.result,
@@ -594,7 +602,15 @@ where
                         text_output_tokens: output_tokens,
                         ..BrainUsage::default()
                     }),
-                    GeminiStreamEvent::Error(message) => return Err(BrainError::Protocol(message)),
+                    GeminiStreamEvent::Error(message) => {
+                        return Err(provider_stage_error_from_brain_error(
+                            BrainError::Protocol(message),
+                            "gemini",
+                            "gemini",
+                            &self.config.gemini.model_id,
+                            Duration::ZERO,
+                        ))
+                    }
                     GeminiStreamEvent::ModelPart { text: None, .. } => {}
                 }
             }
@@ -643,20 +659,20 @@ where
             session,
             usage,
         } = job;
-        let source = executor
-            .execute(
-                response_id,
-                ToolProposal::retrieve_source_reference(
-                    &session.study_set_id,
-                    &session.voice_session_id,
-                    &question.source.source_id,
-                ),
-            )
-            .await
-            .map_err(|error| BrainError::Protocol(error.to_string()))
-            .and_then(|result| {
-                parse_result_field::<StudySourceReference>(&result.result, "source")
-            })?;
+        let source = execute_tool_stage(
+            executor,
+            response_id,
+            ToolProposal::retrieve_source_reference(
+                &session.study_set_id,
+                &session.voice_session_id,
+                &question.source.source_id,
+            ),
+            self.config.tool_stage_timeout,
+            "tools",
+            "tool_executor_failure",
+        )
+        .await
+        .and_then(|result| parse_result_field::<StudySourceReference>(&result.result, "source"))?;
         if !send_fake_unless_cancelled(
             event_tx,
             BrainEvent::SourceReference {
@@ -683,18 +699,20 @@ where
             }
         });
 
-        let status_result = executor
-            .execute(
-                response_id,
-                ToolProposal::mark_concept_status(
-                    &session.study_set_id,
-                    &session.voice_session_id,
-                    &status_concept_id,
-                    "strong",
-                ),
-            )
-            .await
-            .map_err(|error| BrainError::Protocol(error.to_string()))?;
+        let status_result = execute_tool_stage(
+            executor,
+            response_id,
+            ToolProposal::mark_concept_status(
+                &session.study_set_id,
+                &session.voice_session_id,
+                &status_concept_id,
+                "strong",
+            ),
+            self.config.tool_stage_timeout,
+            "tools",
+            "tool_executor_failure",
+        )
+        .await?;
         let concept_id = parse_result_field::<String>(&status_result.result, "concept_id")?;
         let status = parse_result_field::<ConceptStatus>(&status_result.result, "status")?;
         if !send_fake_unless_cancelled(
@@ -711,18 +729,20 @@ where
             return Ok(());
         }
 
-        executor
-            .execute(
-                response_id,
-                ToolProposal::schedule_review_item(
-                    &session.study_set_id,
-                    &session.voice_session_id,
-                    &review_concept_id,
-                    concept_status_tool_arg(&status),
-                ),
-            )
-            .await
-            .map_err(|error| BrainError::Protocol(error.to_string()))?;
+        execute_tool_stage(
+            executor,
+            response_id,
+            ToolProposal::schedule_review_item(
+                &session.study_set_id,
+                &session.voice_session_id,
+                &review_concept_id,
+                concept_status_tool_arg(&status),
+            ),
+            self.config.tool_stage_timeout,
+            "tools",
+            "tool_executor_failure",
+        )
+        .await?;
 
         if usage != BrainUsage::default()
             && !send_fake_unless_cancelled(event_tx, BrainEvent::Usage(usage), cancelled).await
@@ -762,14 +782,16 @@ where
             }
         }
 
-        let recap = executor
-            .execute(
-                response_id,
-                ToolProposal::build_session_recap(&session.study_set_id, &session.voice_session_id),
-            )
-            .await
-            .map_err(|error| BrainError::Protocol(error.to_string()))
-            .and_then(|result| parse_result_field::<StudySessionRecap>(&result.result, "recap"))?;
+        let recap = execute_tool_stage(
+            executor,
+            response_id,
+            ToolProposal::build_session_recap(&session.study_set_id, &session.voice_session_id),
+            self.config.recap_stage_timeout,
+            "recap",
+            "recap_projection_failure",
+        )
+        .await
+        .and_then(|result| parse_result_field::<StudySessionRecap>(&result.result, "recap"))?;
         if !send_fake_unless_cancelled(
             event_tx,
             BrainEvent::RecapReady {
@@ -913,6 +935,184 @@ struct GeminiToolLoopJob<'a> {
     usage: &'a mut BrainUsage,
     emit_text_delta: bool,
     cancelled: Option<&'a AtomicBool>,
+}
+
+async fn execute_tool_stage(
+    executor: &VivaToolExecutor,
+    response_id: &str,
+    proposal: ToolProposal,
+    deadline: Duration,
+    stage: &'static str,
+    failure_class: &'static str,
+) -> Result<ToolResult, BrainError> {
+    let tool_name = proposal.name().to_owned();
+    let started = Instant::now();
+    match timeout(deadline, executor.execute(response_id, proposal)).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => Err(tool_stage_error(
+            &tool_name,
+            failure_class,
+            stage,
+            TerminalSessionReason::ToolExecutorFailure,
+            !matches!(error, ToolExecutionError::InvalidArguments(_)),
+            started.elapsed(),
+            tool_execution_error_kind(&error),
+        )),
+        Err(_) => Err(tool_stage_error(
+            &tool_name,
+            "timeout",
+            stage,
+            TerminalSessionReason::ProviderTimeout,
+            true,
+            deadline,
+            "deadline_elapsed",
+        )),
+    }
+}
+
+fn tool_stage_error(
+    tool_name: &str,
+    failure_class: &'static str,
+    stage: &'static str,
+    terminal_reason: TerminalSessionReason,
+    retry_eligible: bool,
+    latency: Duration,
+    error_kind: &'static str,
+) -> BrainError {
+    BrainError::StageFailure(Box::new(BrainProviderFailure::new(
+        BrainProviderFailureParts {
+            failure_class: failure_class.to_owned(),
+            stage: stage.to_owned(),
+            terminal_reason,
+            retry_eligible,
+            latency_ms: duration_ms(latency),
+            provider: "server".to_owned(),
+            model: "viva-tools".to_owned(),
+            metadata: format!("tool={tool_name} error_kind={error_kind}"),
+        },
+    )))
+}
+
+fn provider_stage_error_from_brain_error(
+    error: BrainError,
+    stage: &'static str,
+    provider: &'static str,
+    model: &str,
+    latency: Duration,
+) -> BrainError {
+    if matches!(error, BrainError::StageFailure(_)) {
+        return error;
+    }
+    let (failure_class, terminal_reason, retry_eligible, metadata) =
+        provider_failure_classification(&error);
+    BrainError::StageFailure(Box::new(BrainProviderFailure::new(
+        BrainProviderFailureParts {
+            failure_class: failure_class.to_owned(),
+            stage: stage.to_owned(),
+            terminal_reason,
+            retry_eligible,
+            latency_ms: duration_ms(latency),
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            metadata: metadata.to_owned(),
+        },
+    )))
+}
+
+fn provider_failure_classification(
+    error: &BrainError,
+) -> (&'static str, TerminalSessionReason, bool, &'static str) {
+    match error {
+        BrainError::MissingApiKey => (
+            "provider_auth_failure",
+            TerminalSessionReason::ProviderAuthFailed,
+            false,
+            "error_kind=missing_api_key",
+        ),
+        BrainError::Connection(message) | BrainError::Protocol(message) => {
+            let normalized = message.to_ascii_lowercase();
+            if normalized.contains("auth")
+                || normalized.contains("api key")
+                || normalized.contains("_api_key")
+                || normalized.contains("unauthorized")
+                || normalized.contains("forbidden")
+                || normalized.contains("permission")
+            {
+                return (
+                    "provider_auth_failure",
+                    TerminalSessionReason::ProviderAuthFailed,
+                    false,
+                    "error_kind=provider_auth",
+                );
+            }
+            if normalized.contains("rate")
+                || normalized.contains("quota")
+                || normalized.contains("budget")
+                || normalized.contains("429")
+            {
+                return (
+                    "quota_rate_failure",
+                    TerminalSessionReason::ProviderRateLimited,
+                    true,
+                    "error_kind=provider_rate_limited",
+                );
+            }
+            if normalized.contains("timeout") || normalized.contains("timed out") {
+                return (
+                    "timeout",
+                    TerminalSessionReason::ProviderTimeout,
+                    true,
+                    "error_kind=deadline_elapsed",
+                );
+            }
+            if normalized.contains("cancel") || normalized.contains("abort") {
+                return (
+                    "cancellation",
+                    TerminalSessionReason::ProviderCancelled,
+                    true,
+                    "error_kind=provider_cancelled",
+                );
+            }
+            if matches!(error, BrainError::Protocol(_))
+                || normalized.contains("protocol")
+                || normalized.contains("invalid")
+                || normalized.contains("malformed")
+                || normalized.contains("parse")
+                || normalized.contains("schema")
+            {
+                return (
+                    "malformed_stream",
+                    TerminalSessionReason::ProviderMalformedStream,
+                    true,
+                    "error_kind=malformed_stream",
+                );
+            }
+            (
+                "network_disconnect",
+                TerminalSessionReason::ProviderNetworkDisconnect,
+                true,
+                "error_kind=network_disconnect",
+            )
+        }
+        BrainError::StageFailure(_) => (
+            "stage_failure",
+            TerminalSessionReason::ProviderMalformedStream,
+            true,
+            "error_kind=stage_failure",
+        ),
+    }
+}
+
+fn tool_execution_error_kind(error: &ToolExecutionError) -> &'static str {
+    match error {
+        ToolExecutionError::InvalidArguments(_) => "invalid_arguments",
+        ToolExecutionError::Unavailable(_) => "unavailable",
+        ToolExecutionError::Store(_) => "store",
+    }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn fake_interrupt_gemini_stream(
@@ -1346,8 +1546,18 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
         _response_id: &str,
         frame: &AudioFrame,
     ) -> Result<RunnerTranscript, BrainError> {
-        let transcript =
-            transcribe_ink_websocket(&config.ink, &config.cartesia_api_key, frame).await?;
+        let started = Instant::now();
+        let transcript = transcribe_ink_websocket(&config.ink, &config.cartesia_api_key, frame)
+            .await
+            .map_err(|error| {
+                provider_stage_error_from_brain_error(
+                    error,
+                    "ink_stt",
+                    "cartesia",
+                    &config.ink.model,
+                    started.elapsed(),
+                )
+            })?;
         Ok(RunnerTranscript {
             interim_text: transcript.interim_text,
             final_text: transcript.final_text,
@@ -1360,7 +1570,18 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
         config: &CartesiaGeminiConfig,
         request: Value,
     ) -> Result<Vec<GeminiStreamEvent>, BrainError> {
-        stream_gemini_http(&config.gemini, request).await
+        let started = Instant::now();
+        stream_gemini_http(&config.gemini, request)
+            .await
+            .map_err(|error| {
+                provider_stage_error_from_brain_error(
+                    error,
+                    "gemini",
+                    "gemini",
+                    &config.gemini.model_id,
+                    started.elapsed(),
+                )
+            })
     }
 
     async fn synthesize_sonic(
@@ -1370,6 +1591,7 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
         transcript: &str,
         _interrupt: FakeRuntimeInterrupt,
     ) -> Result<Vec<AudioFrame>, BrainError> {
+        let started = Instant::now();
         synthesize_sonic_websocket(
             &config.sonic,
             &config.cartesia_api_key,
@@ -1377,5 +1599,14 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
             transcript,
         )
         .await
+        .map_err(|error| {
+            provider_stage_error_from_brain_error(
+                error,
+                "sonic_tts",
+                "cartesia",
+                &config.sonic.model_id,
+                started.elapsed(),
+            )
+        })
     }
 }

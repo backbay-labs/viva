@@ -3773,6 +3773,7 @@ async fn websocket_provider_error_event_emits_terminal_phase_without_raw_message
             events: vec![BrainEvent::Error(BrainProviderError {
                 source: "cartesia_gemini".to_owned(),
                 message: "raw answer transcript with CARTESIA_API_KEY must not surface".to_owned(),
+                failure: None,
             })],
         }),
         "event_probe",

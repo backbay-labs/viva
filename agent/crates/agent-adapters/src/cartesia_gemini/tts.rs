@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
@@ -31,6 +33,7 @@ pub struct SonicConfig {
     pub sample_rate: u32,
     pub cartesia_version: String,
     pub max_buffer_delay_ms: u32,
+    pub stage_timeout: Duration,
 }
 
 impl Default for SonicConfig {
@@ -43,6 +46,7 @@ impl Default for SonicConfig {
             sample_rate: CARTESIA_SAMPLE_RATE,
             cartesia_version: DEFAULT_CARTESIA_VERSION.to_owned(),
             max_buffer_delay_ms: 0,
+            stage_timeout: Duration::from_secs(8),
         }
     }
 }
@@ -164,8 +168,12 @@ where
     C: SonicConnector,
 {
     let request = config.websocket_request(api_key)?;
-    let mut socket = connector.connect(request).await?;
-    synthesize_sonic_context(&mut socket, config, context_id, transcript).await
+    timeout(config.stage_timeout, async {
+        let mut socket = connector.connect(request).await?;
+        synthesize_sonic_context(&mut socket, config, context_id, transcript).await
+    })
+    .await
+    .map_err(|_| BrainError::Connection("Cartesia Sonic stage timeout".to_owned()))?
 }
 
 pub(crate) async fn synthesize_sonic_context<S>(
@@ -410,6 +418,7 @@ fn context_id(value: &Value) -> Option<&str> {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -532,6 +541,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn synthesizer_times_out_without_leaking_transcript_or_credentials() {
+        let connector = DelayedSonicConnector;
+        let config = SonicConfig {
+            stage_timeout: Duration::from_millis(5),
+            ..SonicConfig::default()
+        };
+        let transcript = "assistant text must not appear in timeout evidence";
+
+        let error = synthesize_sonic_with_connector(
+            &connector,
+            &config,
+            "sk_car_timeout_secret",
+            "response-1",
+            transcript,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Cartesia Sonic stage timeout"));
+        assert!(!error.contains("sk_car_timeout_secret"));
+        assert!(!error.contains(transcript));
+    }
+
+    #[tokio::test]
     async fn synthesizer_sends_cancel_command_without_leaking_context_payloads() {
         let mut socket = FakeSonicSocket::new(vec![]);
 
@@ -622,6 +656,8 @@ mod tests {
         incoming: VecDeque<&'static str>,
     }
 
+    struct DelayedSonicConnector;
+
     #[async_trait]
     impl SonicConnector for RecordingSonicConnector {
         type Socket = RecordingSonicSocket;
@@ -642,6 +678,22 @@ mod tests {
                 record: self.record.clone(),
                 incoming: self.incoming.clone(),
             })
+        }
+    }
+
+    #[async_trait]
+    impl SonicConnector for DelayedSonicConnector {
+        type Socket = FakeSonicSocket;
+
+        async fn connect(
+            &self,
+            _request: tokio_tungstenite::tungstenite::http::Request<()>,
+        ) -> Result<Self::Socket, agent_domain::BrainError> {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(FakeSonicSocket::new(vec![
+                r#"{"type":"chunk","context_id":"response-1","data":"AQI="}"#,
+                r#"{"type":"done","context_id":"response-1"}"#,
+            ]))
         }
     }
 

@@ -54,6 +54,7 @@ export const VIVA_AGENT_TERMINAL_SESSION_REASONS = [
   "provider_cancelled",
   "partial_stage_success",
   "durability_degraded",
+  "tool_executor_failure",
   "rollback",
 ] as const;
 

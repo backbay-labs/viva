@@ -518,6 +518,42 @@
       ]
     },
     {
+      "id": "tool_executor_failure",
+      "label": "Tool executor failure",
+      "stage": "tools",
+      "resolution_kind": "terminal",
+      "submitted_answer_resolution": true,
+      "max_resolution_ms": 45000,
+      "learner_safe": true,
+      "authority": "agent_event",
+      "failure_class": "tool_executor_failure",
+      "terminal_reason": "tool_executor_failure",
+      "evidence_code": "tool_executor_failure",
+      "readiness_failure_kind": "dependency_unavailable",
+      "sanitized_evidence": true,
+      "failure_matrix": true,
+      "smoke_terminal_reasons": ["tool_executor_failure"],
+      "runtime_copy_causes": ["tool_executor_failure"],
+      "copy": {
+        "capsule_label": "Tool stage failed",
+        "marginalia_title": "Viva could not finish the tool stage.",
+        "marginalia_text": "The server-side source, status, or recap tool failed after the live answer was submitted, so Viva closed the turn without retaining provider contents.",
+        "next_action_label": "Retry agent",
+        "primary_action_label": "Retry agent",
+        "primary_action_intent": "retry_agent",
+        "status_label": "tool stage failed"
+      },
+      "operator_diagnostics": [
+        "terminal_reason",
+        "failure_class",
+        "stage",
+        "provider",
+        "model",
+        "deploy_sha",
+        "latency_ms"
+      ]
+    },
+    {
       "id": "network_disconnect",
       "label": "Network disconnect",
       "stage": "transport",

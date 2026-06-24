@@ -9,7 +9,9 @@ use agent_adapters::{
     cartesia_gemini::{CartesiaGeminiBrain, CartesiaGeminiConfig, FakeCartesiaGeminiRuntime},
     SyntheticBrain,
 };
-use agent_domain::{RealtimeBrain, StudyMemoryStore, StudyStoreCapabilities};
+use agent_domain::{
+    viva_max_submitted_answer_resolution, RealtimeBrain, StudyMemoryStore, StudyStoreCapabilities,
+};
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hmac::{Hmac, Mac};
@@ -17,8 +19,6 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
-const BAC_510_LEARNER_LOOP_CONTRACT_JSON: &str =
-    include_str!("../../../../packages/core/src/learner-loop-contract.json");
 
 #[derive(Clone, Debug)]
 pub struct ServiceConfig {
@@ -174,17 +174,7 @@ impl ServiceConfig {
 }
 
 pub(crate) fn bac_510_max_turn_duration() -> Duration {
-    let contract: serde_json::Value = serde_json::from_str(BAC_510_LEARNER_LOOP_CONTRACT_JSON)
-        .expect("BAC-510 learner loop contract JSON must parse");
-    let max_resolution_ms = contract
-        .get("max_submitted_answer_resolution_ms")
-        .and_then(serde_json::Value::as_u64)
-        .expect("BAC-510 learner loop contract must define max_submitted_answer_resolution_ms");
-    assert!(
-        max_resolution_ms <= 45_000,
-        "BAC-510 learner loop contract max turn bound must be <= 45 seconds"
-    );
-    Duration::from_millis(max_resolution_ms)
+    viva_max_submitted_answer_resolution()
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
