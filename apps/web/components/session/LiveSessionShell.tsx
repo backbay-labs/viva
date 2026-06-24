@@ -32,6 +32,7 @@ export function LiveSessionShell({
   transcript,
   contextLabel,
   clockLabel,
+  generationId,
   elapsed,
   hintShown,
   textAnswer,
@@ -66,6 +67,7 @@ export function LiveSessionShell({
   transcript?: string;
   contextLabel: string;
   clockLabel?: string;
+  generationId?: string;
   elapsed: number;
   hintShown: boolean;
   textAnswer?: TextAnswerState;
@@ -84,7 +86,7 @@ export function LiveSessionShell({
   onNextQuestion: () => void;
 }) {
   return (
-    <section className="live-session">
+    <section className="live-session" data-generation-id={generationId}>
       <MuseBackdrop />
       <MuseGlyphCanvas highlightedTokens={highlightedTokens} state={glyphState} />
       <div className="live-session__veil" />

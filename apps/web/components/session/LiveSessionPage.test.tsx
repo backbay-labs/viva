@@ -5,16 +5,19 @@ import type { VivaAgentAudioOutput } from "../../lib/viva-agent-client";
 import { VivaAudioWorkletUnavailableError } from "../../lib/viva-audio-capture";
 import { projectTrace } from "../../lib/viva-session-projection";
 import {
+  browserSessionReconnectReason,
   canStartMicrophoneCapture,
   captureLevelForBloom,
   derivedStateWithProjectedRecap,
   drainAgentAudio,
   enterTextAnswerMode,
+  isCurrentBrowserLifecycleAttempt,
   isSessionOver,
   micStateForAudioCaptureError,
   micStateForCaptureEndReason,
   pcm16ChunksToBase64,
   refreshBrowserSessionToken,
+  sameBrowserSessionRouteIdentity,
   sessionRouteWsAccessToken,
   shouldRefreshBrowserSessionToken,
   shouldStopReadinessPolling,
@@ -22,6 +25,7 @@ import {
   spokenTurnFallbackAction,
   stopCaptureForRecap,
   textAnswerPayload,
+  textAnswerStateForSession,
 } from "./LiveSessionPage";
 
 describe("drainAgentAudio", () => {
@@ -102,6 +106,56 @@ describe("shouldStopReadinessPolling", () => {
     expect(shouldStopReadinessPolling({ recap: undefined, status: "closed", ready: false })).toBe(
       true,
     );
+  });
+});
+
+describe("browserSessionReconnectReason", () => {
+  test("classifies bfcache and Back/Forward restores without treating normal page show as stale", () => {
+    expect(browserSessionReconnectReason({ type: "pageshow", persisted: true })).toBe(
+      "bfcache_restore",
+    );
+    expect(browserSessionReconnectReason({ type: "pageshow", persisted: false })).toBe(null);
+    expect(browserSessionReconnectReason({ type: "popstate" })).toBe("back_forward_restore");
+  });
+
+  test("compares stable route identity without requiring stripped token material to reappear", () => {
+    expect(
+      sameBrowserSessionRouteIdentity(
+        {
+          sessionId: "session-1",
+          sessionToken: "placeholder-initial-material",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        {
+          sessionId: "session-1",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+      ),
+    ).toBe(true);
+    expect(
+      sameBrowserSessionRouteIdentity(
+        {
+          sessionId: "session-1",
+          sessionToken: "placeholder-initial-material",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        {
+          sessionId: "session-2",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+      ),
+    ).toBe(false);
+  });
+
+  test("ignores stale async lifecycle completions after a newer browser action starts", () => {
+    expect(isCurrentBrowserLifecycleAttempt({ activeAttempt: 3, attempt: 3 })).toBe(true);
+    expect(isCurrentBrowserLifecycleAttempt({ activeAttempt: 4, attempt: 3 })).toBe(false);
   });
 });
 
@@ -261,6 +315,27 @@ describe("LiveSessionPage recap cleanup", () => {
       "NADH donates electrons to the ETC.",
     );
     expect(textAnswerPayload("   \n\t   ")).toBe(null);
+  });
+
+  test("disables written answer submission while a generation has a pending provider turn", () => {
+    expect(
+      textAnswerStateForSession({
+        canSubmitAnswer: false,
+        finalTranscript: undefined,
+        submittedTextAnswer: "first typed response",
+        textAnswerActive: true,
+        textAnswerAvailable: true,
+        textAnswerRequired: false,
+        textRetryOpen: false,
+        transcriptConfidence: undefined,
+      }),
+    ).toEqual({
+      active: true,
+      disabled: true,
+      lastAnswer: "first typed response",
+      lastAnswerUncertain: false,
+      required: false,
+    });
   });
 
   test("only streams buffered mic PCM to selectable live runtimes", () => {
