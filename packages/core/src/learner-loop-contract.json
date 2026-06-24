@@ -372,13 +372,13 @@
       ],
       "runtime_copy_causes": ["provider_rate_limited"],
       "copy": {
-        "capsule_label": "Provider rate limited",
-        "marginalia_title": "Live provider quota stopped this turn.",
-        "marginalia_text": "The provider quota or rate limit closed the manuscript before a complete live response.",
-        "next_action_label": "Retry after quota resets",
-        "primary_action_label": "Retry after quota resets",
+        "capsule_label": "Retry window active",
+        "marginalia_title": "This turn needs a short wait.",
+        "marginalia_text": "The live response paused before completion. Retry after the wait window clears.",
+        "next_action_label": "Retry when available",
+        "primary_action_label": "Retry when available",
         "primary_action_intent": "retry_agent",
-        "status_label": "provider rate limited"
+        "status_label": "waiting to retry"
       },
       "operator_diagnostics": [
         "terminal_reason",

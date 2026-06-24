@@ -193,6 +193,18 @@ describe("BAC-510 learner loop contract", () => {
     }
   });
 
+  test("keeps provider rate limit learner copy retry-timed without provider internals", () => {
+    const providerRateLimit = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+      (state) => state.id === "provider_rate_limit",
+    );
+    expect(providerRateLimit?.terminal_reason).toBe("provider_rate_limited");
+
+    const copyText = Object.values(providerRateLimit?.copy ?? {}).join(" ");
+    expect(/retry/i.test(copyText)).toBe(true);
+    expect(/wait window/i.test(copyText)).toBe(true);
+    expect(/\b(provider|quota|429|gemini|cartesia)\b/i.test(copyText)).toBe(false);
+  });
+
   test("reconciles every runtime copy cause with a learner-loop state", () => {
     const contractCauses = new Set(
       VIVA_LEARNER_LOOP_CONTRACT.states.flatMap((state) => state.runtime_copy_causes),

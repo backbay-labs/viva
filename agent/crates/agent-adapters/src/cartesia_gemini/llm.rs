@@ -1,17 +1,23 @@
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    time::{Duration, Instant, SystemTime},
+};
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderValue, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, RETRY_AFTER};
 use serde_json::{json, Value};
 use tokio::time::timeout;
 
-use agent_domain::{BrainError, ToolResult};
+use agent_domain::{
+    BrainError, BrainProviderFailure, BrainProviderFailureParts, TerminalSessionReason, ToolResult,
+};
 
 use super::constants::{
     DEFAULT_GEMINI_BASE_URL, DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_THINKING_LEVEL,
 };
 
 const TRUSTED_SOURCE_CONTEXT_FUNCTION: &str = "trusted_source_context";
+const DEFAULT_GEMINI_RETRY_AFTER_MS: u64 = 1_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ThinkingLevel {
@@ -205,9 +211,29 @@ impl GeminiStreamRequest {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GeminiSseResponse {
+    pub(crate) status: u16,
+    pub(crate) body: String,
+    pub(crate) retry_after: Option<String>,
+    pub(crate) reset_after: Option<String>,
+}
+
+impl GeminiSseResponse {
+    #[cfg(test)]
+    pub(crate) fn ok(body: String) -> Self {
+        Self {
+            status: 200,
+            body,
+            retry_after: None,
+            reset_after: None,
+        }
+    }
+}
+
 #[async_trait]
 pub(crate) trait GeminiSseClient: Send + Sync {
-    async fn stream(&self, request: GeminiStreamRequest) -> Result<String, BrainError>;
+    async fn stream(&self, request: GeminiStreamRequest) -> Result<GeminiSseResponse, BrainError>;
 }
 
 pub(crate) async fn stream_gemini_with_client<C>(
@@ -219,16 +245,27 @@ where
     C: GeminiSseClient,
 {
     let stream_request = GeminiStreamRequest::new(config, request)?;
+    let started = Instant::now();
     let response = timeout(config.stage_timeout, client.stream(stream_request))
         .await
         .map_err(|_| BrainError::Connection("Gemini generation stage timeout".to_owned()))?
         .map_err(sanitize_gemini_stream_error)?;
-    if response.trim().is_empty() {
+    if response.status == 429 {
+        return Err(gemini_rate_limit_stage_failure(
+            config,
+            &response,
+            started.elapsed(),
+        ));
+    }
+    if !(200..300).contains(&response.status) {
+        return Err(sanitized_gemini_http_status_error(response.status));
+    }
+    if response.body.trim().is_empty() {
         return Err(BrainError::Protocol(
             "Gemini stream returned no events".to_owned(),
         ));
     }
-    Ok(parse_gemini_sse_stream(&response))
+    Ok(parse_gemini_sse_stream(&response.body))
 }
 
 fn sanitize_gemini_stream_error(error: BrainError) -> BrainError {
@@ -256,6 +293,16 @@ fn sanitized_gemini_http_status(message: &str) -> Option<u16> {
     })
 }
 
+fn sanitized_gemini_http_status_error(status: u16) -> BrainError {
+    if matches!(status, 401 | 403) {
+        BrainError::Protocol(format!(
+            "Gemini stream request failed with status {status}"
+        ))
+    } else {
+        BrainError::Connection("Gemini stream request failed".to_owned())
+    }
+}
+
 pub(crate) async fn stream_gemini_http(
     config: &GeminiConfig,
     request: Value,
@@ -270,7 +317,7 @@ struct ReqwestGeminiSseClient {
 
 #[async_trait]
 impl GeminiSseClient for ReqwestGeminiSseClient {
-    async fn stream(&self, request: GeminiStreamRequest) -> Result<String, BrainError> {
+    async fn stream(&self, request: GeminiStreamRequest) -> Result<GeminiSseResponse, BrainError> {
         let api_key = HeaderValue::from_str(&request.api_key)
             .map_err(|_| BrainError::Protocol("invalid Gemini API key header value".to_owned()))?;
         let response = self
@@ -282,17 +329,143 @@ impl GeminiSseClient for ReqwestGeminiSseClient {
             .send()
             .await
             .map_err(|_| BrainError::Connection("Gemini stream request failed".to_owned()))?;
-        if !response.status().is_success() {
-            return Err(BrainError::Protocol(format!(
-                "Gemini stream request failed with status {}",
-                response.status().as_u16()
-            )));
-        }
-        response
+        let status = response.status().as_u16();
+        let retry_after = header_value(response.headers(), RETRY_AFTER.as_str());
+        let reset_after = reset_header_value(response.headers());
+        let body = response
             .text()
             .await
-            .map_err(|_| BrainError::Connection("Gemini stream response read failed".to_owned()))
+            .map_err(|_| BrainError::Connection("Gemini stream response read failed".to_owned()))?;
+        Ok(GeminiSseResponse {
+            status,
+            body,
+            retry_after,
+            reset_after,
+        })
     }
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn reset_header_value(headers: &HeaderMap) -> Option<String> {
+    [
+        "x-ratelimit-reset",
+        "x-rate-limit-reset",
+        "ratelimit-reset",
+        "x-goog-quota-reset",
+    ]
+    .into_iter()
+    .find_map(|name| header_value(headers, name))
+}
+
+fn gemini_rate_limit_stage_failure(
+    config: &GeminiConfig,
+    response: &GeminiSseResponse,
+    latency: Duration,
+) -> BrainError {
+    BrainError::StageFailure(Box::new(BrainProviderFailure::new(
+        BrainProviderFailureParts {
+            failure_class: "quota_rate_failure".to_owned(),
+            stage: "gemini".to_owned(),
+            terminal_reason: TerminalSessionReason::ProviderRateLimited,
+            retry_eligible: true,
+            latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
+            provider: "gemini".to_owned(),
+            model: config.model_id.clone(),
+            metadata: gemini_rate_limit_metadata(response),
+        },
+    )))
+}
+
+fn gemini_rate_limit_metadata(response: &GeminiSseResponse) -> String {
+    let retry_hint = retry_after_hint(response.retry_after.as_deref());
+    let reset_hint = response
+        .reset_after
+        .as_deref()
+        .and_then(sanitized_reset_hint)
+        .unwrap_or_else(|| "none".to_owned());
+    format!(
+        "http_status=429 retry_after_ms={} retry_after_source={} reset_hint={} body_status={} budget_state=unknown deploy_sha=unknown",
+        retry_hint.retry_after_ms,
+        retry_hint.source,
+        reset_hint,
+        sanitized_body_status(&response.body),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetryAfterHint {
+    retry_after_ms: u64,
+    source: &'static str,
+}
+
+fn retry_after_hint(value: Option<&str>) -> RetryAfterHint {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return default_retry_after_hint();
+    };
+    if let Ok(seconds) = value.parse::<u64>() {
+        return RetryAfterHint {
+            retry_after_ms: seconds.saturating_mul(1_000),
+            source: "retry_after_delta",
+        };
+    }
+    if let Ok(date) = httpdate::parse_http_date(value) {
+        let delta = date.duration_since(SystemTime::now()).unwrap_or_default();
+        return RetryAfterHint {
+            retry_after_ms: delta.as_millis().try_into().unwrap_or(u64::MAX),
+            source: "retry_after_http_date",
+        };
+    }
+    default_retry_after_hint()
+}
+
+fn default_retry_after_hint() -> RetryAfterHint {
+    RetryAfterHint {
+        retry_after_ms: DEFAULT_GEMINI_RETRY_AFTER_MS,
+        source: "default",
+    }
+}
+
+fn sanitized_reset_hint(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let sanitized = value
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ':' | '.')
+        })
+        .take(96)
+        .collect::<String>();
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn sanitized_body_status(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/status")
+                .and_then(Value::as_str)
+                .map(|status| {
+                    status
+                        .to_ascii_lowercase()
+                        .chars()
+                        .filter(|character| character.is_ascii_alphanumeric() || *character == '_')
+                        .take(64)
+                        .collect::<String>()
+                })
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 pub fn gemini_request(config: &GeminiConfig, contents: Vec<Value>, tools: &[Value]) -> Value {
@@ -940,6 +1113,126 @@ data: [DONE]
         assert!(!error.contains("gemini-timeout-secret"));
     }
 
+    #[tokio::test]
+    async fn streaming_transport_maps_429_retry_after_to_sanitized_stage_failure() {
+        let raw_body = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"raw prompt and source excerpt"}}"#;
+        let client = RecordingGeminiSseClient {
+            capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
+            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+                status: 429,
+                body: raw_body.to_owned(),
+                retry_after: Some("7".to_owned()),
+                reset_after: Some("2030-01-01T00:00:00Z".to_owned()),
+            }),
+        };
+
+        let error = stream_gemini_with_client(
+            &client,
+            &GeminiConfig {
+                api_key: "gemini-test-key".to_owned(),
+                model_id: "gemini-3.5-flash".to_owned(),
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [{ "parts": [{ "text": "raw prompt" }] }] }),
+        )
+        .await
+        .unwrap_err();
+
+        let BrainError::StageFailure(failure) = error else {
+            panic!("expected Gemini 429 stage failure");
+        };
+        assert_eq!(failure.failure_class, "quota_rate_failure");
+        assert_eq!(
+            failure.terminal_reason,
+            agent_domain::TerminalSessionReason::ProviderRateLimited
+        );
+        assert_eq!(failure.provider, "gemini");
+        assert_eq!(failure.model, "gemini-35-flash");
+        assert!(failure.metadata.contains("http_status=429"));
+        assert!(failure.metadata.contains("retry_after_ms=7000"));
+        assert!(failure
+            .metadata
+            .contains("retry_after_source=retry_after_delta"));
+        assert!(failure.metadata.contains("reset_hint=2030-01-01T00:00:00Z"));
+        assert!(failure.metadata.contains("body_status=resource_exhausted"));
+        assert!(failure.metadata.contains("budget_state=unknown"));
+        assert!(!failure.metadata.contains("raw prompt"));
+        assert!(!failure.metadata.contains("source excerpt"));
+        assert!(!failure.to_string().contains("raw prompt"));
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_429_without_valid_retry_after_uses_sanitized_default() {
+        let client = RecordingGeminiSseClient {
+            capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
+            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+                status: 429,
+                body:
+                    r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"raw body"}}"#
+                        .to_owned(),
+                retry_after: Some("not a retry hint".to_owned()),
+                reset_after: None,
+            }),
+        };
+
+        let error = stream_gemini_with_client(
+            &client,
+            &GeminiConfig {
+                api_key: "gemini-test-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [{ "parts": [{ "text": "prompt" }] }] }),
+        )
+        .await
+        .unwrap_err();
+
+        let BrainError::StageFailure(failure) = error else {
+            panic!("expected Gemini 429 stage failure");
+        };
+        assert_eq!(failure.failure_class, "quota_rate_failure");
+        assert!(failure.metadata.contains("retry_after_ms=1000"));
+        assert!(failure.metadata.contains("retry_after_source=default"));
+        assert!(!failure.metadata.contains("raw body"));
+        assert!(!failure.metadata.contains("not a retry hint"));
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_503_keeps_status_error_sanitized() {
+        let client = RecordingGeminiSseClient {
+            capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
+            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+                status: 503,
+                body: r#"{"error":{"message":"raw provider outage details"}}"#.to_owned(),
+                retry_after: Some("5".to_owned()),
+                reset_after: None,
+            }),
+        };
+
+        let error = stream_gemini_with_client(
+            &client,
+            &GeminiConfig {
+                api_key: "gemini-test-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [{ "parts": [{ "text": "prompt" }] }] }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("status 503"));
+        assert!(!error.contains("raw provider outage details"));
+        assert!(!error.contains("gemini-test-key"));
+    }
+
+    #[test]
+    fn retry_after_http_date_is_parsed_as_sanitized_backoff_hint() {
+        let hint = retry_after_hint(Some("Mon, 21 Oct 2030 07:28:00 GMT"));
+
+        assert_eq!(hint.source, "retry_after_http_date");
+        assert!(hint.retry_after_ms > 0);
+    }
+
     #[derive(Default)]
     struct GeminiRequestCapture {
         url: Option<String>,
@@ -957,19 +1250,24 @@ data: [DONE]
     #[derive(Clone)]
     enum RecordingGeminiResponse {
         Body(String),
+        Response(GeminiSseResponse),
         Error(String),
     }
 
     #[async_trait]
     impl GeminiSseClient for RecordingGeminiSseClient {
-        async fn stream(&self, request: GeminiStreamRequest) -> Result<String, BrainError> {
+        async fn stream(
+            &self,
+            request: GeminiStreamRequest,
+        ) -> Result<GeminiSseResponse, BrainError> {
             let mut capture = self.capture.lock().expect("capture lock poisoned");
             capture.url = Some(request.url);
             capture.api_key = Some(request.api_key);
             capture.body = Some(request.body);
             drop(capture);
             match &self.response {
-                RecordingGeminiResponse::Body(body) => Ok(body.clone()),
+                RecordingGeminiResponse::Body(body) => Ok(GeminiSseResponse::ok(body.clone())),
+                RecordingGeminiResponse::Response(response) => Ok(response.clone()),
                 RecordingGeminiResponse::Error(message) => {
                     Err(BrainError::Connection(message.clone()))
                 }
@@ -979,9 +1277,14 @@ data: [DONE]
 
     #[async_trait]
     impl GeminiSseClient for DelayedGeminiSseClient {
-        async fn stream(&self, _request: GeminiStreamRequest) -> Result<String, BrainError> {
+        async fn stream(
+            &self,
+            _request: GeminiStreamRequest,
+        ) -> Result<GeminiSseResponse, BrainError> {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            Ok(r#"data: {"candidates":[{"content":{"parts":[{"text":"too late"}]}}]}"#.to_owned())
+            Ok(GeminiSseResponse::ok(
+                r#"data: {"candidates":[{"content":{"parts":[{"text":"too late"}]}}]}"#.to_owned(),
+            ))
         }
     }
 }
