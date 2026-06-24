@@ -53,6 +53,7 @@ const FORBIDDEN_EVIDENCE_DETAIL_FIELDS: &[&str] = &[
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VoiceEvidenceEventKind {
+    AuthFailure,
     PreflightAccepted,
     PreflightRejected,
     ConfigAccepted,

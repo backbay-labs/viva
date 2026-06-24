@@ -756,6 +756,8 @@ function pendingSubmissionForSessionPhase(
 
 function sanitizeAgentError(message: string): string {
   if (!message) return "agent error";
+  const normalized = message.replace(/\s+/g, " ").trim().toLowerCase();
+  if (legacyAgentAuthReasons.has(normalized)) return "session auth failed";
   const redacted = redactForVivaLog({ message });
   if (isRecord(redacted) && isRedactedVivaLogValue(redacted.message)) {
     return "sanitized provider error";
@@ -994,19 +996,23 @@ const safeAgentCloseReasons = new Set([
   "first frame timeout",
   "idle timeout",
   "invalid client frame",
-  "invalid session identity",
-  "invalid session token",
   "provider source authority rejected",
   "session config required",
-  "study set access denied",
+  "session auth failed",
   "text frame too large",
   "untrusted tool_result",
+]);
+const legacyAgentAuthReasons = new Set([
+  "invalid session identity",
+  "invalid session token",
+  "study set access denied",
 ]);
 
 function safeCloseReasonForDisplay(reason: string): string {
   const normalized = reason.replace(/\s+/g, " ").trim();
   if (!normalized) return "";
   const lower = normalized.toLowerCase();
+  if (legacyAgentAuthReasons.has(lower)) return "session auth failed";
   return safeAgentCloseReasons.has(lower) ? lower : "[redacted close reason]";
 }
 

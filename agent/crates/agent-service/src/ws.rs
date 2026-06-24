@@ -29,8 +29,8 @@ use tokio::{
 use crate::{
     app::{AppState, VoiceLimitLease},
     config::{
-        bac_510_max_turn_duration, FailureControlScenario, SessionTokenClaims, VoiceLimitConfig,
-        VoiceWsAccessError,
+        bac_510_max_turn_duration, FailureControlScenario, SessionAuthFailureCode,
+        SessionTokenClaims, VoiceLimitConfig, VoiceWsAccessError,
     },
     protocol::{
         ClientFrame, ServerFrame, VIVA_VOICE_MAX_BINARY_FRAME_BYTES,
@@ -233,6 +233,7 @@ async fn handle_socket(
                 }) {
                     Ok(config) => config,
                     Err(error) => {
+                        record_session_auth_failure(&state, None, error.auth_failure_code).await;
                         let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
                         let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
                         record_terminal(&state, None, error.terminal_reason).await;
@@ -252,6 +253,8 @@ async fn handle_socket(
     let study_context = match validate_study_set_access(&state, &initial.config).await {
         Ok(study_context) => study_context,
         Err(error) => {
+            record_session_auth_failure(&state, voice_session_id.clone(), error.auth_failure_code)
+                .await;
             let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
             let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
             record_terminal(&state, voice_session_id, error.terminal_reason).await;
@@ -296,7 +299,9 @@ async fn handle_socket(
             .await
             .is_err()
         {
-            let error = ClientFrameError::invalid_session_token();
+            let error = ClientFrameError::session_auth_failed(SessionAuthFailureCode::Replayed);
+            record_session_auth_failure(&state, voice_session_id.clone(), error.auth_failure_code)
+                .await;
             let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
             let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
             record_terminal(&state, voice_session_id, error.terminal_reason).await;
@@ -447,6 +452,8 @@ async fn handle_socket(
                         break;
                     }
                     Err(ClientMessageError::Frame(error)) => {
+                        record_session_auth_failure(&state, voice_session_id.clone(), error.auth_failure_code)
+                            .await;
                         let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
                         let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
                         terminal_reason = error.terminal_reason;
@@ -1511,55 +1518,63 @@ fn authorize_initial_session_config(
 ) -> Result<AuthorizedInitialSessionConfig, ClientFrameError> {
     let mut rotate_trusted_session = false;
     let mut failure_control = None;
-    let (binding, token_nonce_claim) =
-        if let Some(secret) = state.ws_access.session_token_secret.as_deref() {
-            let token = initial
-                .session_token
-                .as_deref()
-                .ok_or_else(ClientFrameError::invalid_session_token)?;
-            let claims = SessionTokenClaims::verify(token, secret)
-                .map_err(|_| ClientFrameError::invalid_session_token())?;
-            if let Some(claim) = claims.failure_control.as_ref() {
-                failure_control = Some(
-                    state
-                        .failure_control
-                        .validate_claim(
-                            claim,
-                            &claims.user_id,
-                            &claims.study_set_id,
-                            &claims.session_id,
-                            request_origin,
-                            unix_timestamp_now()
-                                .map_err(|_| ClientFrameError::invalid_session_token())?,
+    let (binding, token_nonce_claim) = if let Some(secret) =
+        state.ws_access.session_token_secret.as_deref()
+    {
+        let token = initial.session_token.as_deref().ok_or_else(|| {
+            ClientFrameError::session_auth_failed(SessionAuthFailureCode::Malformed)
+        })?;
+        let claims = SessionTokenClaims::verify(token, secret).map_err(|error| {
+            ClientFrameError::session_auth_failed(SessionAuthFailureCode::from_token_error(&error))
+        })?;
+        if let Some(claim) = claims.failure_control.as_ref() {
+            failure_control = Some(
+                state
+                    .failure_control
+                    .validate_claim(
+                        claim,
+                        &claims.user_id,
+                        &claims.study_set_id,
+                        &claims.session_id,
+                        request_origin,
+                        unix_timestamp_now().map_err(|_| {
+                            ClientFrameError::session_auth_failed(
+                                SessionAuthFailureCode::InvalidSignature,
+                            )
+                        })?,
+                    )
+                    .map_err(|error| {
+                        ClientFrameError::session_auth_failed(
+                            SessionAuthFailureCode::from_token_error(&error),
                         )
-                        .map_err(|_| ClientFrameError::invalid_session_token())?,
-                );
-            }
-            (
-                AuthorizedClientSession {
-                    user_id: claims.user_id.clone(),
-                    study_set_id: claims.study_set_id.clone(),
-                    session_id: claims.session_id.clone(),
-                },
-                Some(SessionTokenNonceClaim {
-                    user_id: claims.user_id,
-                    study_set_id: claims.study_set_id,
-                    voice_session_id: claims.session_id,
-                    nonce: claims.nonce,
-                    expires_at: claims.expires_at,
-                }),
-            )
-        } else {
-            rotate_trusted_session = true;
-            (
-                AuthorizedClientSession {
-                    user_id: state.trusted_user_id.clone(),
-                    study_set_id: state.trusted_study_set_id.clone(),
-                    session_id: state.trusted_session_id.clone(),
-                },
-                None,
-            )
-        };
+                    })?,
+            );
+        }
+        (
+            AuthorizedClientSession {
+                user_id: claims.user_id.clone(),
+                study_set_id: claims.study_set_id.clone(),
+                session_id: claims.session_id.clone(),
+            },
+            Some(SessionTokenNonceClaim {
+                user_id: claims.user_id,
+                study_set_id: claims.study_set_id,
+                voice_session_id: claims.session_id,
+                nonce: claims.nonce,
+                expires_at: claims.expires_at,
+            }),
+        )
+    } else {
+        rotate_trusted_session = true;
+        (
+            AuthorizedClientSession {
+                user_id: state.trusted_user_id.clone(),
+                study_set_id: state.trusted_study_set_id.clone(),
+                session_id: state.trusted_session_id.clone(),
+            },
+            None,
+        )
+    };
     let mut config = sanitize_client_session_config(initial.session, &binding)?;
     config.client_generation_id = initial.client_generation_id;
     if rotate_trusted_session {
@@ -1673,6 +1688,7 @@ enum ClientMessageError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ClientFrameError {
+    auth_failure_code: Option<SessionAuthFailureCode>,
     message: &'static str,
     close_code: u16,
     close_reason: &'static str,
@@ -1682,6 +1698,7 @@ struct ClientFrameError {
 impl ClientFrameError {
     fn invalid_first_frame() -> Self {
         Self {
+            auth_failure_code: None,
             message: "first client frame must be session_config",
             close_code: close_code::PROTOCOL,
             close_reason: "session config required",
@@ -1691,6 +1708,7 @@ impl ClientFrameError {
 
     fn invalid() -> Self {
         Self {
+            auth_failure_code: None,
             message: "invalid client frame",
             close_code: close_code::PROTOCOL,
             close_reason: "invalid client frame",
@@ -1699,34 +1717,30 @@ impl ClientFrameError {
     }
 
     fn invalid_session_identity() -> Self {
-        Self {
-            message: "invalid session identity",
-            close_code: close_code::POLICY,
-            close_reason: "invalid session identity",
-            terminal_reason: "invalid_session_identity",
-        }
+        Self::session_auth_failed(SessionAuthFailureCode::IdentityMismatch)
     }
 
-    fn invalid_session_token() -> Self {
+    fn session_auth_failed(auth_failure_code: SessionAuthFailureCode) -> Self {
         Self {
-            message: "invalid session token",
+            auth_failure_code: Some(auth_failure_code),
+            message: "session auth failed",
             close_code: close_code::POLICY,
-            close_reason: "invalid session token",
-            terminal_reason: "invalid_session_token",
+            close_reason: "session auth failed",
+            terminal_reason: match auth_failure_code {
+                SessionAuthFailureCode::IdentityMismatch => "invalid_session_identity",
+                SessionAuthFailureCode::AccessDenied => "study_set_access_denied",
+                _ => "invalid_session_token",
+            },
         }
     }
 
     fn study_set_access_denied() -> Self {
-        Self {
-            message: "study set access denied",
-            close_code: close_code::POLICY,
-            close_reason: "study set access denied",
-            terminal_reason: "study_set_access_denied",
-        }
+        Self::session_auth_failed(SessionAuthFailureCode::AccessDenied)
     }
 
     fn untrusted_tool_result() -> Self {
         Self {
+            auth_failure_code: None,
             message: "browser tool_result frames are not trusted",
             close_code: close_code::POLICY,
             close_reason: "untrusted tool_result",
@@ -1736,6 +1750,7 @@ impl ClientFrameError {
 
     fn oversized_text() -> Self {
         Self {
+            auth_failure_code: None,
             message: "text frame exceeds maximum size",
             close_code: close_code::SIZE,
             close_reason: "text frame too large",
@@ -1745,6 +1760,7 @@ impl ClientFrameError {
 
     fn oversized_binary() -> Self {
         Self {
+            auth_failure_code: None,
             message: "binary frame exceeds maximum size",
             close_code: close_code::SIZE,
             close_reason: "binary frame too large",
@@ -1754,6 +1770,7 @@ impl ClientFrameError {
 
     fn disconnected() -> Self {
         Self {
+            auth_failure_code: None,
             message: "agent input channel closed",
             close_code: close_code::ABNORMAL,
             close_reason: "agent input closed",
@@ -1784,6 +1801,28 @@ fn record_client_action(state: &AppState, voice_session_id: Option<String>, acti
     state
         .evidence
         .record(VoiceEvidenceEvent::new(kind, voice_session_id, detail));
+}
+
+async fn record_session_auth_failure(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    code: Option<SessionAuthFailureCode>,
+) {
+    let Some(code) = code else {
+        return;
+    };
+    state.evidence.record(VoiceEvidenceEvent::new(
+        VoiceEvidenceEventKind::AuthFailure,
+        voice_session_id,
+        format!(
+            "code={} client_class={} retry_eligible={} stage={} evidence_field={}",
+            code.as_str(),
+            code.client_class(),
+            code.retry_eligible(),
+            code.stage(),
+            code.evidence_field()
+        ),
+    ));
 }
 
 fn record_turn_cap_config(state: &AppState, voice_session_id: Option<String>) {

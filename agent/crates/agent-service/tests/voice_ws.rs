@@ -2382,9 +2382,17 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         send_client_frame(&mut socket, &session).await;
         assert!(matches!(
             read_server_frame(&mut socket).await,
-            ServerFrame::Error { message, .. } if message == "invalid session identity"
+            ServerFrame::Error { message, .. } if message == "session auth failed"
         ));
         assert_close_code(&mut socket, CloseCode::Policy).await;
+        let auth_events =
+            wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
+        assert!(auth_events.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::AuthFailure
+                && event.detail.contains("code=identity_mismatch")
+                && event.detail.contains("client_class=terminal")
+                && event.detail.contains("retry_eligible=false")
+        }));
         let events =
             wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
         assert!(events.iter().any(|event| {
@@ -2426,6 +2434,70 @@ async fn websocket_accepts_signed_session_token_matching_initial_config() {
         ServerFrame::Event { .. }
     ));
     socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_records_auth_failure_for_forged_config_refresh() {
+    let state = test_state(1);
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/session-config.json"
+    ))
+    .unwrap();
+    let mut forged_refresh = session.clone();
+    forged_refresh["user_id"] = serde_json::Value::String("user-2".to_owned());
+
+    assert_ready_provider(&mut socket, "synthetic").await;
+    socket
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "session_config",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "session": session,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let accepted_events =
+        wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::ConfigAccepted).await;
+    assert!(accepted_events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::ConfigAccepted
+            && event.detail == "session config accepted"
+    }));
+
+    socket
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "session_config",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "session": forged_refresh,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let frames = read_server_frames_until_close(&mut socket).await;
+    for frame in frames {
+        if let ServerFrame::Error { message, .. } = frame {
+            assert_eq!(message, "session auth failed");
+        }
+    }
+    let auth_events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
+    assert!(auth_events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::AuthFailure
+            && event.detail.contains("code=identity_mismatch")
+            && event.detail.contains("client_class=terminal")
+            && event.detail.contains("retry_eligible=false")
+            && !event.detail.contains("user-2")
+    }));
 }
 
 #[tokio::test]
@@ -2575,7 +2647,7 @@ async fn websocket_rejects_failure_control_claim_from_wrong_origin_before_brain_
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "invalid session token"
+        ServerFrame::Error { message, .. } if message == "session auth failed"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
     assert!(!opened.load(Ordering::SeqCst));
@@ -2597,6 +2669,7 @@ async fn websocket_rejects_replayed_session_token_before_brain_open() {
         },
         2,
     );
+    let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
         return;
     };
@@ -2632,32 +2705,45 @@ async fn websocket_rejects_replayed_session_token_before_brain_open() {
 
     assert!(matches!(
         read_server_frame(&mut replay_socket).await,
-        ServerFrame::Error { message, .. } if message == "invalid session token"
+        ServerFrame::Error { message, .. } if message == "session auth failed"
     ));
     assert_close_code(&mut replay_socket, CloseCode::Policy).await;
+    let auth_events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
+    assert!(auth_events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::AuthFailure
+            && event.detail.contains("code=replayed")
+            && event.detail.contains("client_class=terminal")
+            && event.detail.contains("retry_eligible=false")
+    }));
     assert!(!opened.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
 async fn websocket_rejects_invalid_session_token_before_brain_open() {
-    for token in [
-        signed_session_token(
-            "session-secret",
-            "user-1",
-            "biology-midterm",
-            "voice-session-1",
-            unix_timestamp_now().saturating_sub(1),
-            "nonce-expired",
+    for (token, expected_code) in [
+        (
+            signed_session_token(
+                "session-secret",
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                unix_timestamp_now().saturating_sub(120),
+                "nonce-expired",
+            ),
+            "expired",
         ),
-        signed_session_token(
-            "wrong-secret",
-            "user-1",
-            "biology-midterm",
-            "voice-session-1",
-            unix_timestamp_now() + 60,
-            "nonce-forged-signature",
+        (
+            signed_session_token(
+                "wrong-secret",
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                unix_timestamp_now() + 60,
+                "nonce-forged-signature",
+            ),
+            "invalid_signature",
         ),
-        "viva1.malformed.signature".to_owned(),
+        ("viva1.malformed.signature".to_owned(), "malformed"),
     ] {
         let opened = Arc::new(AtomicBool::new(false));
         let state = AppState::new(
@@ -2673,6 +2759,7 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
             },
             1,
         );
+        let evidence = state.evidence.clone();
         let Some(url) = spawn_server(state).await else {
             return;
         };
@@ -2688,9 +2775,18 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
 
         assert!(matches!(
             read_server_frame(&mut socket).await,
-            ServerFrame::Error { message, .. } if message == "invalid session token"
+            ServerFrame::Error { message, .. } if message == "session auth failed"
         ));
         assert_close_code(&mut socket, CloseCode::Policy).await;
+        let auth_events =
+            wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
+        assert!(auth_events.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::AuthFailure
+                && event.detail.contains(&format!("code={expected_code}"))
+                && event.detail.contains("client_class=")
+                && event.detail.contains("stage=session")
+                && !event.detail.contains("nonce-")
+        }));
         assert!(!opened.load(Ordering::SeqCst));
     }
 }
@@ -2737,6 +2833,7 @@ async fn websocket_rejects_token_claim_mismatch_before_brain_open() {
             },
             1,
         );
+        let evidence = state.evidence.clone();
         let Some(url) = spawn_server(state).await else {
             return;
         };
@@ -2752,9 +2849,16 @@ async fn websocket_rejects_token_claim_mismatch_before_brain_open() {
 
         assert!(matches!(
             read_server_frame(&mut socket).await,
-            ServerFrame::Error { message, .. } if message == "invalid session identity"
+            ServerFrame::Error { message, .. } if message == "session auth failed"
         ));
         assert_close_code(&mut socket, CloseCode::Policy).await;
+        let auth_events =
+            wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
+        assert!(auth_events.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::AuthFailure
+                && event.detail.contains("code=identity_mismatch")
+                && event.detail.contains("client_class=terminal")
+        }));
         assert!(!opened.load(Ordering::SeqCst));
     }
 }
@@ -2803,10 +2907,16 @@ async fn websocket_checks_study_set_access_before_brain_open() {
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "study set access denied"
+        ServerFrame::Error { message, .. } if message == "session auth failed"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
     assert!(!opened.load(Ordering::SeqCst));
+    let auth_events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
+    assert!(auth_events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::AuthFailure
+            && event.detail.contains("code=access_denied")
+            && event.detail.contains("client_class=terminal")
+    }));
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
     assert!(events
         .iter()
