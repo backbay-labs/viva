@@ -716,7 +716,7 @@
         "marginalia_text": "Viva must refresh the signed session identity before another trusted turn starts.",
         "next_action_label": "Refresh session",
         "primary_action_label": "Refresh session",
-        "primary_action_intent": "retry_agent",
+        "primary_action_intent": "refresh_session",
         "status_label": "auth failed"
       },
       "operator_diagnostics": [
@@ -745,7 +745,7 @@
         "marginalia_text": "Viva should refresh server session state instead of replaying an old browser phase.",
         "next_action_label": "Refresh session",
         "primary_action_label": "Refresh session",
-        "primary_action_intent": "retry_agent",
+        "primary_action_intent": "refresh_session",
         "status_label": "stale session"
       },
       "operator_diagnostics": ["failure_class", "stage", "deploy_sha", "token_refresh_outcome"]
@@ -768,7 +768,7 @@
         "marginalia_text": "The client must reconnect from fresh server state before showing a live loop state.",
         "next_action_label": "Refresh session",
         "primary_action_label": "Refresh session",
-        "primary_action_intent": "retry_agent",
+        "primary_action_intent": "refresh_session",
         "status_label": "refresh"
       },
       "operator_diagnostics": ["failure_class", "stage", "deploy_sha", "token_refresh_outcome"]
@@ -791,7 +791,7 @@
         "marginalia_text": "Viva must reconcile the active generation before accepting another turn.",
         "next_action_label": "Refresh session",
         "primary_action_label": "Refresh session",
-        "primary_action_intent": "retry_agent",
+        "primary_action_intent": "refresh_session",
         "status_label": "tab restored"
       },
       "operator_diagnostics": ["failure_class", "stage", "deploy_sha", "token_refresh_outcome"]

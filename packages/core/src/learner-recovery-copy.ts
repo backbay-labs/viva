@@ -1,8 +1,8 @@
-import type { AgentTerminalSessionReason } from "./agent-contract";
 import {
   type LearnerLoopCopy,
   type LearnerLoopEvidenceField,
   type LearnerLoopResolutionKind,
+  type LearnerLoopTerminalReason,
   type RuntimeCopyCause,
   VIVA_LEARNER_LOOP_CONTRACT,
 } from "./learner-loop-contract";
@@ -34,7 +34,7 @@ export type LearnerRecoveryCopyEntry = {
     failure_class?: string;
     readiness_failure_kind?: string;
     stage: string;
-    terminal_reason?: AgentTerminalSessionReason;
+    terminal_reason?: LearnerLoopTerminalReason;
   };
 };
 

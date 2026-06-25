@@ -17,6 +17,13 @@ const EVIDENCE_COPY_STATE_IDS = Object.freeze([
   "deploy_drain",
 ]);
 
+const REFRESH_SESSION_STATE_IDS = Object.freeze([
+  "invalid_expired_replayed_token",
+  "back_forward_stale_session",
+  "refresh",
+  "bfcache_restore",
+]);
+
 const FORBIDDEN_LEARNER_COPY_PATTERNS = Object.freeze([
   /\bterminal_reason\b/i,
   /\bfailure_class\b/i,
@@ -137,5 +144,15 @@ describe("BAC-523 learner recovery copy contract", () => {
         learnerCopyText("saved_pending_evaluation"),
       ),
     ).toBe(false);
+  });
+
+  test("session credential recovery states preserve refresh-session intent", () => {
+    for (const stateId of REFRESH_SESSION_STATE_IDS) {
+      const entry = learnerRecoveryCopyForState(stateId);
+      expect(entry?.learner.primary_action.label).toBe("Refresh session");
+      expect(entry?.learner.primary_action.intent).toBe("refresh_session");
+      expect(entry?.learner.secondary_action.label).toBe("Refresh session");
+      expect(entry?.learner.secondary_action.intent).toBe("refresh_session");
+    }
   });
 });
