@@ -305,7 +305,10 @@ async function collectReadiness(config, fetchImpl) {
     store: {
       backend: healthStore.backend ?? readyStore.backend ?? null,
       available: healthStore.available === true && readyStore.available === true,
-      durable: healthStore.durable === true || readyStore.durable === true,
+      durable: healthStore.durable === true && readyStore.durable === true,
+      nonce_replay_protection:
+        healthStore.nonce_replay_protection === true &&
+        readyStore.nonce_replay_protection === true,
     },
     usage_events: integerOrNull(health.body?.usage?.events),
   };
@@ -326,7 +329,9 @@ function readinessPasses(readiness) {
     readiness.brain.configured === true &&
     readiness.brain.selectable === true &&
     readiness.brain.live_runtime === true &&
-    readiness.store.available === true
+    readiness.store.available === true &&
+    readiness.store.durable === true &&
+    readiness.store.nonce_replay_protection === true
   );
 }
 

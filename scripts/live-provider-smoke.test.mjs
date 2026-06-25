@@ -413,6 +413,47 @@ test("runLiveProviderSmoke fails closed when the live provider is not selectable
   assert.equal(socketOpened, false);
 });
 
+test("runLiveProviderSmoke fails closed when readiness lacks nonce replay protection", async () => {
+  let socketOpened = false;
+
+  const evidence = await runLiveProviderSmoke({
+    env: {
+      VIVA_LIVE_PROVIDER_SMOKE: "1",
+      CARTESIA_API_KEY: "cartesia-secret-value",
+      GEMINI_API_KEY: "gemini-secret-value",
+      CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+      GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
+      VIVA_LIVE_SMOKE_AUDIO_FILE: "/tmp/not-read-before-readiness.pcm",
+      VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
+      VIVA_LIVE_SMOKE_MAX_TURNS: "1",
+      VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
+      VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
+      VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "http://127.0.0.1:4318",
+    },
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/health/brain")) {
+        return jsonResponse(200, brainHealth({ nonceReplayProtection: false }));
+      }
+      if (String(url).endsWith("/ready")) {
+        return jsonResponse(200, readyBody({ nonceReplayProtection: false }));
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    },
+    createWebSocket: () => {
+      socketOpened = true;
+      throw new Error("must not open socket before durable readiness passes");
+    },
+    now: () => new Date("2026-06-18T00:00:00.000Z"),
+  });
+
+  assert.equal(evidence.status, "failed");
+  assert.equal(evidence.failure_stage, "readiness");
+  assert.equal(evidence.readiness.store.available, true);
+  assert.equal(evidence.readiness.store.durable, true);
+  assert.equal(evidence.readiness.store.nonce_replay_protection, false);
+  assert.equal(socketOpened, false);
+});
+
 test("runLiveProviderSmoke classifies malformed-stream failures without retaining payloads", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "viva-live-smoke-"));
   const audioPath = path.join(tempDir, "answer.pcm");
@@ -617,7 +658,12 @@ function jsonResponse(status, body) {
   };
 }
 
-function readyBody({ ready = true, selectable = true, liveRuntime = true } = {}) {
+function readyBody({
+  ready = true,
+  selectable = true,
+  liveRuntime = true,
+  nonceReplayProtection = true,
+} = {}) {
   return {
     ready,
     brain: {
@@ -630,7 +676,7 @@ function readyBody({ ready = true, selectable = true, liveRuntime = true } = {})
       backend: "postgres",
       available: true,
       durable: true,
-      nonce_replay_protection: true,
+      nonce_replay_protection: nonceReplayProtection,
       raw_audio_persistence: false,
       transcript_persistence: false,
       uuid_schema_translation: true,
@@ -638,7 +684,12 @@ function readyBody({ ready = true, selectable = true, liveRuntime = true } = {})
   };
 }
 
-function brainHealth({ usageEvents = 7, selectable = true, liveRuntime = true } = {}) {
+function brainHealth({
+  usageEvents = 7,
+  selectable = true,
+  liveRuntime = true,
+  nonceReplayProtection = true,
+} = {}) {
   return {
     provider: "cartesia_gemini",
     status: selectable ? "configured" : "unavailable",
@@ -652,7 +703,7 @@ function brainHealth({ usageEvents = 7, selectable = true, liveRuntime = true } 
       backend: "postgres",
       available: true,
       durable: true,
-      nonce_replay_protection: true,
+      nonce_replay_protection: nonceReplayProtection,
       raw_audio_persistence: false,
       transcript_persistence: false,
       uuid_schema_translation: true,

@@ -27,6 +27,7 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
     post_answer_concept_status_event_seen: true,
     second_tab_session_cap_observed: true,
     local_only_actions_hidden: true,
+    durable_state_release_claimed: true,
     store: {
       available: true,
       backend: "postgres",
@@ -54,6 +55,13 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
     post_answer_concept_status_event_seen: true,
     second_tab_session_cap_observed: true,
     local_only_actions_hidden: true,
+    durable_state_release_claimed: true,
+    store: {
+      available: true,
+      backend: "postgres",
+      durable: true,
+      nonce_replay_protection: true,
+    },
     store_durability_mode: "durable",
     browser_story: {
       artifact_forbidden_hits: 0,
@@ -165,12 +173,31 @@ test("requires sanitized browser-story frames for the manuscript release artifac
   );
 });
 
+test("allows default no-secret browser evidence without a durable-state release claim", () => {
+  assert.doesNotThrow(() =>
+    assertReleaseBrowserEvidence(
+      normalizeBrowserEvidence(
+        completeBrowserResult({
+          durable_state_release_claimed: false,
+          store: {
+            available: true,
+            backend: "in_memory",
+            durable: false,
+            nonce_replay_protection: true,
+          },
+        }),
+      ),
+    ),
+  );
+});
+
 test("rejects browser evidence with an ephemeral store while durable state is claimed", () => {
   assert.throws(
     () =>
       assertReleaseBrowserEvidence(
         normalizeBrowserEvidence(
           completeBrowserResult({
+            durable_state_release_claimed: true,
             store: {
               available: true,
               backend: "in_memory",
@@ -181,6 +208,46 @@ test("rejects browser evidence with an ephemeral store while durable state is cl
         ),
       ),
     /store_durability_mode/,
+  );
+});
+
+test("rejects browser evidence with unavailable store while durable state is claimed", () => {
+  assert.throws(
+    () =>
+      assertReleaseBrowserEvidence(
+        normalizeBrowserEvidence(
+          completeBrowserResult({
+            durable_state_release_claimed: true,
+            store: {
+              available: false,
+              backend: "postgres",
+              durable: true,
+              nonce_replay_protection: true,
+            },
+          }),
+        ),
+      ),
+    /store.available/,
+  );
+});
+
+test("rejects browser evidence without nonce replay protection while durable state is claimed", () => {
+  assert.throws(
+    () =>
+      assertReleaseBrowserEvidence(
+        normalizeBrowserEvidence(
+          completeBrowserResult({
+            durable_state_release_claimed: true,
+            store: {
+              available: true,
+              backend: "postgres",
+              durable: true,
+              nonce_replay_protection: false,
+            },
+          }),
+        ),
+      ),
+    /store.nonce_replay_protection/,
   );
 });
 
@@ -439,6 +506,7 @@ function completeBrowserResult(overrides = {}) {
     post_answer_concept_status_event_seen: true,
     second_tab_session_cap_observed: true,
     local_only_actions_hidden: true,
+    durable_state_release_claimed: true,
     store: {
       available: true,
       backend: "postgres",
