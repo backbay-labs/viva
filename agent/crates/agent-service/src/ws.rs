@@ -134,6 +134,19 @@ async fn acquire_user_lease_with_reconnect_grace(
     acquire_with_reconnect_grace(|| limits.try_acquire_user(user_id, max), grace).await
 }
 
+async fn acquire_failure_control_identity_lease_with_reconnect_grace(
+    limits: &VoiceLimitState,
+    user_id: &str,
+    max: usize,
+    grace: Duration,
+) -> Option<VoiceLimitLease> {
+    acquire_with_reconnect_grace(
+        || limits.try_acquire_failure_control_identity(user_id, max),
+        grace,
+    )
+    .await
+}
+
 async fn acquire_user_study_set_with_reconnect_grace(
     limits: &VoiceLimitState,
     user_id: &str,
@@ -309,7 +322,7 @@ async fn handle_socket(
         initial.failure_control,
         state.failure_control.max_sessions_per_identity(),
     ) {
-        (Some(_), Some(max)) => match acquire_user_lease_with_reconnect_grace(
+        (Some(_), Some(max)) => match acquire_failure_control_identity_lease_with_reconnect_grace(
             &state.limit_state,
             &session_binding.user_id,
             max,
@@ -331,12 +344,11 @@ async fn handle_socket(
         },
         _ => None,
     };
-    let _user_lease = match state.voice_limits.max_user_sessions {
-        Some(_) => match acquire_user_study_set_with_reconnect_grace(
+    let _user_total_lease = match state.voice_limits.max_user_sessions {
+        Some(max) => match acquire_user_lease_with_reconnect_grace(
             &state.limit_state,
             &session_binding.user_id,
-            &session_binding.study_set_id,
-            MAX_ACTIVE_SESSIONS_PER_USER_STUDY_SET,
+            max,
             RECONNECT_LEASE_GRACE,
         )
         .await
@@ -354,6 +366,27 @@ async fn handle_socket(
             }
         },
         None => None,
+    };
+    let _user_study_set_lease = match acquire_user_study_set_with_reconnect_grace(
+        &state.limit_state,
+        &session_binding.user_id,
+        &session_binding.study_set_id,
+        MAX_ACTIVE_SESSIONS_PER_USER_STUDY_SET,
+        RECONNECT_LEASE_GRACE,
+    )
+    .await
+    {
+        Some(lease) => lease,
+        None => {
+            let terminal_reason = close_with_terminal_session_phase_only(
+                &mut sender,
+                TerminalSessionReason::SessionCap,
+                close_code::POLICY,
+            )
+            .await;
+            record_terminal(&state, None, terminal_reason).await;
+            return;
+        }
     };
     if let Some(claim) = initial.token_nonce_claim.take() {
         let claim_result = state.study_store.claim_session_token_nonce(claim).await;

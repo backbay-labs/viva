@@ -2832,6 +2832,124 @@ async fn websocket_failure_control_cap_is_identity_scoped_across_study_sets() {
 }
 
 #[tokio::test]
+async fn websocket_failure_control_still_honors_user_total_session_cap() {
+    let origin = "https://control.example";
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "chemistry-final".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Chemistry Final".to_owned(),
+        course: Some("Chemistry 201".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(store.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_user_sessions: Some(1),
+        ..VoiceLimitConfig::default()
+    })
+    .with_failure_control(
+        FailureControlConfig::enabled_for_synthetic_identities(
+            FailureControlScenario::SilentStall,
+            "control-secret",
+            vec!["user-1".to_owned()],
+            vec!["biology-midterm".to_owned(), "chemistry-final".to_owned()],
+            vec![origin.to_owned()],
+            2,
+        )
+        .unwrap(),
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let biology_token = signed_session_token_with_failure_control(FailureControlTokenFixture {
+        session_secret: "session-secret",
+        control_secret: "control-secret",
+        user_id: "user-1",
+        study_set_id: "biology-midterm",
+        session_id: "voice-session-1",
+        origin,
+        scenario: FailureControlScenario::SilentStall,
+        expires_at: unix_timestamp_now() + 60,
+        nonce: "nonce-control-user-total-biology-session",
+        run_id: "run-control-user-total-biology",
+        control_nonce: "nonce-control-user-total-biology-claim",
+    });
+    let chemistry_token = signed_session_token_with_failure_control(FailureControlTokenFixture {
+        session_secret: "session-secret",
+        control_secret: "control-secret",
+        user_id: "user-1",
+        study_set_id: "chemistry-final",
+        session_id: "voice-session-2",
+        origin,
+        scenario: FailureControlScenario::SilentStall,
+        expires_at: unix_timestamp_now() + 60,
+        nonce: "nonce-control-user-total-chemistry-session",
+        run_id: "run-control-user-total-chemistry",
+        control_nonce: "nonce-control-user-total-chemistry-claim",
+    });
+
+    let mut biology_request = url.as_str().into_client_request().unwrap();
+    biology_request
+        .headers_mut()
+        .insert("origin", HeaderValue::from_str(origin).unwrap());
+    let (mut biology_socket, _) = connect_async(biology_request).await.unwrap();
+    assert_ready_provider(&mut biology_socket, "synthetic").await;
+    biology_socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&biology_token).into(),
+        ))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+    })
+    .await;
+
+    let mut chemistry_request = url.as_str().into_client_request().unwrap();
+    chemistry_request
+        .headers_mut()
+        .insert("origin", HeaderValue::from_str(origin).unwrap());
+    let (mut chemistry_socket, _) = connect_async(chemistry_request).await.unwrap();
+    assert_ready_provider(&mut chemistry_socket, "synthetic").await;
+    chemistry_socket
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token(
+                "chemistry-final",
+                "voice-session-2",
+                &chemistry_token,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut chemistry_socket).await,
+        TerminalSessionReason::SessionCap,
+    );
+    assert_close_code(&mut chemistry_socket, CloseCode::Policy).await;
+
+    biology_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut biology_socket).await;
+}
+
+#[tokio::test]
 async fn websocket_rejects_failure_control_claim_from_wrong_origin_before_brain_open() {
     let opened = Arc::new(AtomicBool::new(false));
     let allowed_origin = "https://control.example";
@@ -3694,6 +3812,178 @@ async fn websocket_user_study_set_cap_stays_one_when_user_session_knob_is_above_
 }
 
 #[tokio::test]
+async fn websocket_user_study_set_rejection_releases_user_total_lease() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "chemistry-final".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Chemistry Final".to_owned(),
+        course: Some("Chemistry 201".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    let state = AppState::with_study_store(
+        Arc::new(BackpressuredInputBrain {
+            dropped: dropped.clone(),
+        }),
+        "backpressured_input_probe",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_user_sessions: Some(2),
+        ..VoiceLimitConfig::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let biology_token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() + 60,
+        "nonce-biology-live-session",
+    );
+    let duplicate_biology_token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "biology-midterm",
+        "voice-session-duplicate",
+        unix_timestamp_now() + 60,
+        "nonce-biology-duplicate-session",
+    );
+    let chemistry_token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "chemistry-final",
+        "voice-session-2",
+        unix_timestamp_now() + 60,
+        "nonce-chemistry-after-duplicate-session",
+    );
+    let biology_session = session_config_json_with_token(&biology_token);
+    let duplicate_biology_session = session_config_json_with_ids_and_token(
+        "biology-midterm",
+        "voice-session-duplicate",
+        &duplicate_biology_token,
+    );
+    let chemistry_session = session_config_json_with_ids_and_token(
+        "chemistry-final",
+        "voice-session-2",
+        &chemistry_token,
+    );
+
+    let (mut biology_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut biology_socket, "backpressured_input_probe").await;
+    biology_socket
+        .send(WsMessage::Text(biology_session.into()))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+    })
+    .await;
+
+    let (mut duplicate_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut duplicate_socket, "backpressured_input_probe").await;
+    duplicate_socket
+        .send(WsMessage::Text(duplicate_biology_session.into()))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut duplicate_socket).await,
+        TerminalSessionReason::SessionCap,
+    );
+    assert_close_code(&mut duplicate_socket, CloseCode::Policy).await;
+
+    let (mut chemistry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut chemistry_socket, "backpressured_input_probe").await;
+    chemistry_socket
+        .send(WsMessage::Text(chemistry_session.into()))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .filter(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+            .count()
+            >= 2
+    })
+    .await;
+
+    biology_socket.close(None).await.unwrap();
+    chemistry_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut biology_socket).await;
+    let _ = read_server_frames_until_close(&mut chemistry_socket).await;
+    wait_until(Duration::from_secs(2), || dropped.load(Ordering::SeqCst)).await;
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn websocket_user_study_set_cap_still_rejects_duplicate_when_user_total_limit_disabled() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(BackpressuredInputBrain {
+            dropped: dropped.clone(),
+        }),
+        "backpressured_input_probe",
+        VoiceWsAccess::default(),
+        4,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_user_sessions: None,
+        ..VoiceLimitConfig::default()
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut first_socket, "backpressured_input_probe").await;
+    first_socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+
+    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut second_socket, "backpressured_input_probe").await;
+    second_socket
+        .send(WsMessage::Text(
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut second_socket).await,
+        TerminalSessionReason::SessionCap,
+    );
+    assert_close_code(&mut second_socket, CloseCode::Policy).await;
+
+    first_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut first_socket).await;
+    wait_until(Duration::from_secs(2), || dropped.load(Ordering::SeqCst)).await;
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn websocket_default_user_session_cap_rejects_duplicate_study_set_tab_and_releases_after_close(
 ) {
     let dropped = Arc::new(AtomicBool::new(false));
@@ -3773,7 +4063,135 @@ async fn websocket_default_user_session_cap_rejects_duplicate_study_set_tab_and_
 }
 
 #[tokio::test]
-async fn websocket_user_session_cap_is_scoped_to_learner_and_study_set() {
+async fn websocket_user_session_cap_allows_different_study_sets_until_user_total_limit() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "chemistry-final".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Chemistry Final".to_owned(),
+        course: Some("Chemistry 201".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "physics-quiz".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Physics Quiz".to_owned(),
+        course: Some("Physics 101".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    let state = AppState::with_study_store(
+        Arc::new(BackpressuredInputBrain {
+            dropped: dropped.clone(),
+        }),
+        "backpressured_input_probe",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_user_sessions: Some(2),
+        ..VoiceLimitConfig::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let biology_token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() + 60,
+        "nonce-biology-live-session",
+    );
+    let chemistry_token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "chemistry-final",
+        "voice-session-2",
+        unix_timestamp_now() + 60,
+        "nonce-chemistry-live-session",
+    );
+    let physics_token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "physics-quiz",
+        "voice-session-3",
+        unix_timestamp_now() + 60,
+        "nonce-physics-live-session",
+    );
+    let biology_session = session_config_json_with_token(&biology_token);
+    let chemistry_session = session_config_json_with_ids_and_token(
+        "chemistry-final",
+        "voice-session-2",
+        &chemistry_token,
+    );
+    let physics_session =
+        session_config_json_with_ids_and_token("physics-quiz", "voice-session-3", &physics_token);
+
+    let (mut biology_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut biology_socket, "backpressured_input_probe").await;
+    biology_socket
+        .send(WsMessage::Text(biology_session.into()))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+    })
+    .await;
+
+    let (mut chemistry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut chemistry_socket, "backpressured_input_probe").await;
+    chemistry_socket
+        .send(WsMessage::Text(chemistry_session.into()))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .filter(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+            .count()
+            >= 2
+    })
+    .await;
+
+    let (mut physics_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut physics_socket, "backpressured_input_probe").await;
+    physics_socket
+        .send(WsMessage::Text(physics_session.into()))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut physics_socket).await,
+        TerminalSessionReason::SessionCap,
+    );
+    assert_close_code(&mut physics_socket, CloseCode::Policy).await;
+
+    biology_socket.close(None).await.unwrap();
+    chemistry_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut biology_socket).await;
+    let _ = read_server_frames_until_close(&mut chemistry_socket).await;
+    wait_until(Duration::from_secs(2), || dropped.load(Ordering::SeqCst)).await;
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn websocket_user_session_cap_rejects_different_study_set_above_user_total_limit() {
     let dropped = Arc::new(AtomicBool::new(false));
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     store.upsert_study_set(data::StudySetRecord {
@@ -3813,7 +4231,7 @@ async fn websocket_user_session_cap_is_scoped_to_learner_and_study_set() {
         "biology-midterm",
         "voice-session-1",
         unix_timestamp_now() + 60,
-        "nonce-biology-live-session",
+        "nonce-biology-user-total-live-session",
     );
     let chemistry_token = signed_session_token(
         "session-secret",
@@ -3821,7 +4239,7 @@ async fn websocket_user_session_cap_is_scoped_to_learner_and_study_set() {
         "chemistry-final",
         "voice-session-2",
         unix_timestamp_now() + 60,
-        "nonce-chemistry-live-session",
+        "nonce-chemistry-user-total-live-session",
     );
     let biology_session = session_config_json_with_token(&biology_token);
     let chemistry_session = session_config_json_with_ids_and_token(
@@ -3850,20 +4268,14 @@ async fn websocket_user_session_cap_is_scoped_to_learner_and_study_set() {
         .send(WsMessage::Text(chemistry_session.into()))
         .await
         .unwrap();
-    wait_until(Duration::from_secs(2), || {
-        evidence
-            .snapshot()
-            .iter()
-            .filter(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
-            .count()
-            >= 2
-    })
-    .await;
+    assert_terminal_session_phase(
+        read_server_frame(&mut chemistry_socket).await,
+        TerminalSessionReason::SessionCap,
+    );
+    assert_close_code(&mut chemistry_socket, CloseCode::Policy).await;
 
     biology_socket.close(None).await.unwrap();
-    chemistry_socket.close(None).await.unwrap();
     let _ = read_server_frames_until_close(&mut biology_socket).await;
-    let _ = read_server_frames_until_close(&mut chemistry_socket).await;
     wait_until(Duration::from_secs(2), || dropped.load(Ordering::SeqCst)).await;
     assert!(dropped.load(Ordering::SeqCst));
 }

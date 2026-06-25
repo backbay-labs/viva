@@ -164,6 +164,7 @@ pub struct VoiceLimitState {
 #[derive(Clone, Debug, Default)]
 struct ActiveVoiceLimits {
     users: HashMap<String, usize>,
+    failure_control_identities: HashMap<String, usize>,
     user_study_sets: HashMap<String, usize>,
     ips: HashMap<String, usize>,
 }
@@ -178,6 +179,7 @@ pub struct VoiceLimitLease {
 #[derive(Clone, Copy, Debug)]
 enum VoiceLimitKind {
     User,
+    FailureControlIdentity,
     UserStudySet,
     Ip,
 }
@@ -185,6 +187,14 @@ enum VoiceLimitKind {
 impl VoiceLimitState {
     pub fn try_acquire_user(&self, user_id: &str, max: usize) -> Option<VoiceLimitLease> {
         self.try_acquire(VoiceLimitKind::User, user_id, max)
+    }
+
+    pub fn try_acquire_failure_control_identity(
+        &self,
+        user_id: &str,
+        max: usize,
+    ) -> Option<VoiceLimitLease> {
+        self.try_acquire(VoiceLimitKind::FailureControlIdentity, user_id, max)
     }
 
     pub fn try_acquire_user_study_set(
@@ -205,6 +215,7 @@ impl VoiceLimitState {
         let mut active = self.active.lock().expect("voice limit state lock poisoned");
         let counts = match kind {
             VoiceLimitKind::User => &mut active.users,
+            VoiceLimitKind::FailureControlIdentity => &mut active.failure_control_identities,
             VoiceLimitKind::UserStudySet => &mut active.user_study_sets,
             VoiceLimitKind::Ip => &mut active.ips,
         };
@@ -224,6 +235,7 @@ impl VoiceLimitState {
         let mut active = self.active.lock().expect("voice limit state lock poisoned");
         let counts = match kind {
             VoiceLimitKind::User => &mut active.users,
+            VoiceLimitKind::FailureControlIdentity => &mut active.failure_control_identities,
             VoiceLimitKind::UserStudySet => &mut active.user_study_sets,
             VoiceLimitKind::Ip => &mut active.ips,
         };
