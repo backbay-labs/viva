@@ -295,9 +295,7 @@ fn sanitized_gemini_http_status(message: &str) -> Option<u16> {
 
 fn sanitized_gemini_http_status_error(status: u16) -> BrainError {
     if matches!(status, 401 | 403) {
-        BrainError::Protocol(format!(
-            "Gemini stream request failed with status {status}"
-        ))
+        BrainError::Protocol(format!("Gemini stream request failed with status {status}"))
     } else {
         BrainError::Connection("Gemini stream request failed".to_owned())
     }
@@ -332,17 +330,32 @@ impl GeminiSseClient for ReqwestGeminiSseClient {
         let status = response.status().as_u16();
         let retry_after = header_value(response.headers(), RETRY_AFTER.as_str());
         let reset_after = reset_header_value(response.headers());
-        let body = response
-            .text()
-            .await
-            .map_err(|_| BrainError::Connection("Gemini stream response read failed".to_owned()))?;
-        Ok(GeminiSseResponse {
-            status,
-            body,
-            retry_after,
-            reset_after,
-        })
+        let body = response.text().await.map_err(|_| ());
+        gemini_sse_response_from_http_parts(status, retry_after, reset_after, body)
     }
+}
+
+fn gemini_sse_response_from_http_parts(
+    status: u16,
+    retry_after: Option<String>,
+    reset_after: Option<String>,
+    body: Result<String, ()>,
+) -> Result<GeminiSseResponse, BrainError> {
+    let body = match body {
+        Ok(body) => body,
+        Err(()) if status == 429 => String::new(),
+        Err(()) => {
+            return Err(BrainError::Connection(
+                "Gemini stream response read failed".to_owned(),
+            ));
+        }
+    };
+    Ok(GeminiSseResponse {
+        status,
+        body,
+        retry_after,
+        reset_after,
+    })
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -392,10 +405,10 @@ fn gemini_rate_limit_metadata(response: &GeminiSseResponse) -> String {
         .and_then(sanitized_reset_hint)
         .unwrap_or_else(|| "none".to_owned());
     format!(
-        "http_status=429 retry_after_ms={} retry_after_source={} reset_hint={} body_status={} budget_state=unknown deploy_sha=unknown",
+        "reset_hint={} retry_after_ms={} retry_after_source={} http_status=429 body_status={} budget_state=unknown deploy_sha=unknown",
+        reset_hint,
         retry_hint.retry_after_ms,
         retry_hint.source,
-        reset_hint,
         sanitized_body_status(&response.body),
     )
 }
@@ -438,14 +451,92 @@ fn sanitized_reset_hint(value: &str) -> Option<String> {
     if value.is_empty() {
         return None;
     }
-    let sanitized = value
-        .chars()
-        .filter(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ':' | '.')
-        })
-        .take(96)
-        .collect::<String>();
-    (!sanitized.is_empty()).then_some(sanitized)
+    if let Some(value) = rfc3339_utc_reset_hint(value) {
+        return Some(value);
+    }
+    if let Some(value) = epoch_reset_hint(value) {
+        return Some(value);
+    }
+    httpdate::parse_http_date(value)
+        .ok()
+        .filter(|value| reset_time_in_supported_range(*value))
+        .map(httpdate::fmt_http_date)
+        .map(|value| value.replace(' ', "_"))
+}
+
+fn rfc3339_utc_reset_hint(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.len() != "2030-01-01T00:00:00Z".len()
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return None;
+    }
+    let year = value[0..4].parse::<u16>().ok()?;
+    let month = value[5..7].parse::<u8>().ok()?;
+    let day = value[8..10].parse::<u8>().ok()?;
+    let hour = value[11..13].parse::<u8>().ok()?;
+    let minute = value[14..16].parse::<u8>().ok()?;
+    let second = value[17..19].parse::<u8>().ok()?;
+    if !(2020..=2100).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: u16) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+fn epoch_reset_hint(value: &str) -> Option<String> {
+    if !value.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    let timestamp = value.parse::<u64>().ok()?;
+    let millis = match value.len() {
+        10 => timestamp.checked_mul(1_000)?,
+        13 => timestamp,
+        _ => return None,
+    };
+    if reset_epoch_millis_in_supported_range(millis) {
+        Some(format!("epoch_ms={millis}"))
+    } else {
+        None
+    }
+}
+
+fn reset_time_in_supported_range(value: SystemTime) -> bool {
+    value
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .is_some_and(reset_epoch_millis_in_supported_range)
+}
+
+fn reset_epoch_millis_in_supported_range(millis: u64) -> bool {
+    const MIN_RESET_EPOCH_MS: u64 = 1_600_000_000_000;
+    const MAX_RESET_EPOCH_MS: u64 = 4_102_444_800_000;
+    (MIN_RESET_EPOCH_MS..=MAX_RESET_EPOCH_MS).contains(&millis)
 }
 
 fn sanitized_body_status(body: &str) -> String {
@@ -1197,7 +1288,70 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn streaming_transport_503_keeps_status_error_sanitized() {
+    async fn streaming_transport_429_omits_non_time_reset_hint() {
+        let client = RecordingGeminiSseClient {
+            capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
+            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+                status: 429,
+                body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
+                retry_after: Some("3".to_owned()),
+                reset_after: Some("quota-account-abc123".to_owned()),
+            }),
+        };
+
+        let error = stream_gemini_with_client(
+            &client,
+            &GeminiConfig {
+                api_key: "gemini-test-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [{ "parts": [{ "text": "prompt" }] }] }),
+        )
+        .await
+        .unwrap_err();
+
+        let BrainError::StageFailure(failure) = error else {
+            panic!("expected Gemini 429 stage failure");
+        };
+        assert!(failure.metadata.contains("reset_hint=none"));
+        assert!(!failure.metadata.contains("quota-account-abc123"));
+    }
+
+    #[test]
+    fn gemini_429_body_read_failure_preserves_rate_limit_metadata() {
+        let response = gemini_sse_response_from_http_parts(
+            429,
+            Some("5".to_owned()),
+            Some("2030-01-01T00:00:00Z".to_owned()),
+            Err(()),
+        )
+        .expect("429 body read failures should still carry status and headers");
+
+        let error = gemini_rate_limit_stage_failure(
+            &GeminiConfig {
+                model_id: "gemini-3.5-flash".to_owned(),
+                ..GeminiConfig::default()
+            },
+            &response,
+            Duration::from_millis(42),
+        );
+
+        let BrainError::StageFailure(failure) = error else {
+            panic!("expected Gemini 429 stage failure");
+        };
+        assert_eq!(failure.failure_class, "quota_rate_failure");
+        assert_eq!(
+            failure.terminal_reason,
+            agent_domain::TerminalSessionReason::ProviderRateLimited
+        );
+        assert_eq!(failure.latency_ms, 42);
+        assert!(failure.metadata.contains("retry_after_ms=5000"));
+        assert!(failure.metadata.contains("reset_hint=2030-01-01T00:00:00Z"));
+        assert!(failure.metadata.contains("body_status=unknown"));
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_503_redacts_unclassified_status_and_body() {
         let client = RecordingGeminiSseClient {
             capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
             response: RecordingGeminiResponse::Response(GeminiSseResponse {
@@ -1220,17 +1374,32 @@ data: [DONE]
         .unwrap_err()
         .to_string();
 
-        assert!(error.contains("status 503"));
+        assert_eq!(
+            error,
+            "brain connection failed: Gemini stream request failed"
+        );
+        assert!(!error.contains("503"));
         assert!(!error.contains("raw provider outage details"));
         assert!(!error.contains("gemini-test-key"));
     }
 
     #[test]
     fn retry_after_http_date_is_parsed_as_sanitized_backoff_hint() {
-        let hint = retry_after_hint(Some("Mon, 21 Oct 2030 07:28:00 GMT"));
+        let future = SystemTime::now() + Duration::from_secs(60);
+        let header = httpdate::fmt_http_date(future);
+        let hint = retry_after_hint(Some(&header));
 
         assert_eq!(hint.source, "retry_after_http_date");
         assert!(hint.retry_after_ms > 0);
+    }
+
+    #[test]
+    fn reset_hint_rejects_invalid_or_out_of_range_dates() {
+        assert_eq!(sanitized_reset_hint("2030-02-31T00:00:00Z"), None);
+
+        let out_of_range_http_date =
+            httpdate::fmt_http_date(std::time::UNIX_EPOCH + Duration::from_secs(4_102_444_801));
+        assert_eq!(sanitized_reset_hint(&out_of_range_http_date), None);
     }
 
     #[derive(Default)]

@@ -5,8 +5,8 @@ use std::{
 
 use agent_domain::{
     fixture_question, AudioFrame, BrainError, BrainEvent, BrainInput, BrainProviderError,
-    PortError, RealtimeSession, RealtimeSessionTaskGuard, SessionConfig, SessionTokenNonceClaim,
-    StudySessionPhase, TerminalSessionReason, VoiceUsageRecord,
+    BrainProviderFailure, PortError, RealtimeSession, RealtimeSessionTaskGuard, SessionConfig,
+    SessionTokenNonceClaim, StudySessionPhase, TerminalSessionReason, VoiceUsageRecord,
 };
 use axum::{
     extract::{
@@ -2297,18 +2297,34 @@ fn record_provider_stage_failure(
     state.evidence.record(VoiceEvidenceEvent::new(
         VoiceEvidenceEventKind::ProviderStageFailure,
         voice_session_id,
-        format!(
-            "failure_class={} stage={} terminal_reason={} retry_eligible={} latency_ms={} provider={} model={} metadata={}",
-            failure.failure_class,
-            failure.stage,
-            failure.terminal_reason.as_str(),
-            failure.retry_eligible,
-            failure.latency_ms,
-            failure.provider,
-            failure.model,
-            failure.metadata
-        ),
+        provider_stage_failure_detail(failure),
     ));
+}
+
+fn provider_stage_failure_detail(failure: &BrainProviderFailure) -> String {
+    let retry_after_ms = metadata_field(&failure.metadata, "retry_after_ms");
+    let reset_hint = metadata_field(&failure.metadata, "reset_hint");
+    format!(
+        "failure_class={} stage={} terminal_reason={} latency_ms={} provider={} model={} retry_after_ms={} reset_hint={} retry_eligible={} metadata={}",
+        failure.failure_class,
+        failure.stage,
+        failure.terminal_reason.as_str(),
+        failure.latency_ms,
+        failure.provider,
+        failure.model,
+        retry_after_ms.unwrap_or("unknown"),
+        reset_hint.unwrap_or("unknown"),
+        failure.retry_eligible,
+        failure.metadata
+    )
+}
+
+fn metadata_field<'a>(metadata: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    metadata
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix(&prefix))
+        .filter(|value| !value.is_empty())
 }
 
 fn record_turn_cap_config(state: &AppState, voice_session_id: Option<String>) {
@@ -2813,6 +2829,42 @@ mod tests {
             event.kind == VoiceEvidenceEventKind::StoreCounts
                 && event.detail == "durability_degraded"
         }));
+    }
+
+    #[test]
+    fn provider_stage_failure_evidence_keeps_retry_reset_metadata_before_truncation() {
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "synthetic",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+            BrainProviderFailureParts {
+                failure_class: "quota_rate_failure".to_owned(),
+                stage: "gemini".to_owned(),
+                terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                retry_eligible: true,
+                latency_ms: 123,
+                provider: "gemini".to_owned(),
+                model: "gemini-35-flash".to_owned(),
+                metadata:
+                    "http_status=429 retry_after_ms=7000 retry_after_source=retry_after_delta reset_hint=2030-01-01T00:00:00Z body_status=resource_exhausted budget_state=unknown deploy_sha=unknown"
+                        .to_owned(),
+            },
+        ));
+
+        record_provider_stage_failure(&state, Some("voice-session-1".to_owned()), &error);
+
+        let events = state.evidence.snapshot();
+        assert_eq!(events.len(), 1);
+        let detail = &events[0].detail;
+        assert!(detail.contains("failure_class=quota_rate_failure"));
+        assert!(detail.contains("stage=gemini"));
+        assert!(detail.contains("provider=gemini"));
+        assert!(detail.contains("model=gemini-35-flash"));
+        assert!(detail.contains("retry_after_ms=7000"));
+        assert!(detail.contains("reset_hint=2030-01-01T00:00:00Z"));
     }
 
     struct FailingSink;
