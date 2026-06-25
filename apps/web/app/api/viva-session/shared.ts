@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { type NextRequest, NextResponse } from "next/server";
 
 export type VivaSessionRouteFailureClass = {
@@ -20,6 +20,7 @@ export type VivaSessionRouteOutcome = {
 
 type SessionRequestPayload = {
   session_id?: unknown;
+  session_bootstrap_token?: unknown;
   session_token?: unknown;
   study_set_id?: unknown;
   user_id?: unknown;
@@ -29,6 +30,16 @@ type SessionTokenClaims = {
   expires_at: number;
   nonce: string;
   session_id: string;
+  study_set_id: string;
+  user_id: string;
+};
+
+type SessionBootstrapTokenClaims = {
+  expires_at: number;
+  nonce: string;
+  origin: string | null;
+  purpose: "viva_session_bootstrap";
+  session_id: string | null;
   study_set_id: string;
   user_id: string;
 };
@@ -67,6 +78,9 @@ type SessionTokenVerification =
   | { ok: false; reason: "invalid" | "malformed" | "missing_secret" };
 
 const RATE_LIMIT_WINDOW_MS = 60_000;
+const SESSION_BOOTSTRAP_TOKEN_TTL_SECONDS = 5 * 60;
+const SESSION_BOOTSTRAP_TOKEN_PREFIX = "viva-bootstrap1";
+const SESSION_BOOTSTRAP_TOKEN_PURPOSE = "viva_session_bootstrap";
 const mintRateLimits = new Map<string, RateLimitBucket>();
 
 export async function handleVivaSessionStart(request: NextRequest) {
@@ -82,6 +96,13 @@ export async function handleVivaSessionStart(request: NextRequest) {
   if (!userId || !studySetId) return sessionJsonError(400, "invalid_session_request", "invalid");
   const access = guardAllowedIdentity(userId, studySetId);
   if (access) return access;
+  const bootstrap = guardSessionBootstrapCapability(request, {
+    sessionId: sessionId ?? null,
+    studySetId,
+    token: requiredString(payload.value.session_bootstrap_token),
+    userId,
+  });
+  if (bootstrap) return bootstrap;
   const limit = guardMintRateLimit(request, userId, studySetId);
   if (limit) return limit;
 
@@ -172,6 +193,46 @@ export function resetVivaSessionMintRateLimitsForTests() {
   mintRateLimits.clear();
 }
 
+export function signVivaSessionBootstrapToken(input: {
+  origin?: string | null;
+  sessionId?: string | null;
+  studySetId: string;
+  userId: string;
+}): string | null {
+  const secret = sessionBootstrapSecret();
+  if (!secret) return null;
+  const claims: SessionBootstrapTokenClaims = {
+    expires_at: Math.floor(Date.now() / 1000) + SESSION_BOOTSTRAP_TOKEN_TTL_SECONDS,
+    nonce: randomUUID(),
+    origin: input.origin?.trim() || null,
+    purpose: SESSION_BOOTSTRAP_TOKEN_PURPOSE,
+    session_id: input.sessionId?.trim() || null,
+    study_set_id: input.studySetId,
+    user_id: input.userId,
+  };
+  const claimsPart = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  const payload = `${SESSION_BOOTSTRAP_TOKEN_PREFIX}.${claimsPart}`;
+  const signature = createHmac("sha256", secret).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+
+export function attachVivaSessionBootstrapTokensToLibrarySnapshot(
+  value: unknown,
+  options: {
+    allowedStudySetIds?: ReadonlySet<string> | null;
+    origin?: string | null;
+    userId: string;
+  },
+): unknown {
+  if (!isRecord(value)) return value;
+  const studySets = Array.isArray(value.study_sets)
+    ? value.study_sets.map((studySet) =>
+        attachVivaSessionBootstrapTokensToStudySet(studySet, options),
+      )
+    : value.study_sets;
+  return { ...value, study_sets: studySets };
+}
+
 function guardSameOrigin(request: NextRequest): NextResponse | null {
   const expectedOrigin = requestOrigin(request);
   const origin = request.headers.get("origin")?.trim();
@@ -202,6 +263,41 @@ function guardAllowedIdentity(userId: string, studySetId: string): NextResponse 
   }
   if (!allowedStudySetIds.has(studySetId)) {
     return sessionJsonError(403, "session_identity_not_allowed", "blocked", {
+      failure_class: "access_denied",
+    });
+  }
+  return null;
+}
+
+function guardSessionBootstrapCapability(
+  request: NextRequest,
+  input: {
+    sessionId: string | null;
+    studySetId: string;
+    token: string | null;
+    userId: string;
+  },
+): NextResponse | null {
+  const requirement = sessionBootstrapRequirement();
+  if (!requirement.required) return null;
+  if (!requirement.secret) {
+    return sessionJsonError(503, "viva_session_bootstrap_unavailable", "failed");
+  }
+  if (!input.token) {
+    return sessionJsonError(403, "session_bootstrap_capability_required", "blocked", {
+      failure_class: "access_denied",
+    });
+  }
+  const claims = verifySessionBootstrapTokenClaims(input.token, requirement.secret);
+  if (
+    !claims ||
+    claims.purpose !== SESSION_BOOTSTRAP_TOKEN_PURPOSE ||
+    claims.user_id !== input.userId ||
+    claims.study_set_id !== input.studySetId ||
+    claims.session_id !== input.sessionId ||
+    (claims.origin && claims.origin !== requestOrigin(request))
+  ) {
+    return sessionJsonError(403, "session_bootstrap_capability_required", "blocked", {
       failure_class: "access_denied",
     });
   }
@@ -446,13 +542,171 @@ function requestOrigin(request: NextRequest): string {
 }
 
 function clientIp(request: NextRequest): string {
-  const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  return forwarded || request.headers.get("x-real-ip")?.trim() || "unknown";
+  const metadataIp = (request as { ip?: unknown }).ip;
+  if (typeof metadataIp === "string" && metadataIp.trim()) return metadataIp.trim();
+  const trustedPlatformIp =
+    request.headers.get("x-vercel-forwarded-for")?.split(",").at(-1)?.trim() ||
+    request.headers.get("cf-connecting-ip")?.trim() ||
+    request.headers.get("true-client-ip")?.trim() ||
+    request.headers.get("x-real-ip")?.trim();
+  if (trustedPlatformIp) return trustedPlatformIp;
+  const forwarded = request.headers
+    .get("x-forwarded-for")
+    ?.split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .at(-1);
+  return forwarded || "unknown";
 }
 
 function serverAgentBaseUrl(): string | null {
   const value = process.env.VIVA_AGENT_HTTP_URL?.trim();
   return value || null;
+}
+
+function sessionBootstrapRequirement(): { required: boolean; secret: string | null } {
+  const agentBaseUrl = serverAgentBaseUrl();
+  const bearerToken = process.env.VIVA_AGENT_REST_BEARER_TOKEN?.trim();
+  if (!agentBaseUrl || !bearerToken || isLoopbackAgentUrl(agentBaseUrl)) {
+    return { required: false, secret: null };
+  }
+  return { required: true, secret: sessionBootstrapSecret() };
+}
+
+function sessionBootstrapSecret(): string | null {
+  return (
+    process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET?.trim() ||
+    process.env.VIVA_VOICE_SESSION_TOKEN_SECRET?.trim() ||
+    null
+  );
+}
+
+function verifySessionBootstrapTokenClaims(
+  token: string,
+  secret: string,
+): SessionBootstrapTokenClaims | null {
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts[0] !== SESSION_BOOTSTRAP_TOKEN_PREFIX) return null;
+  const claimsPart = parts[1] ?? "";
+  const signaturePart = parts[2] ?? "";
+  const signedPayload = `${SESSION_BOOTSTRAP_TOKEN_PREFIX}.${claimsPart}`;
+  let providedSignature: Buffer;
+  try {
+    providedSignature = Buffer.from(signaturePart, "base64url");
+  } catch {
+    return null;
+  }
+  const expectedSignature = createHmac("sha256", secret).update(signedPayload).digest();
+  if (
+    providedSignature.length !== expectedSignature.length ||
+    !timingSafeEqual(providedSignature, expectedSignature)
+  ) {
+    return null;
+  }
+  try {
+    const record = JSON.parse(Buffer.from(claimsPart, "base64url").toString("utf8")) as unknown;
+    if (!isRecord(record)) return null;
+    const expiresAt = numberClaim(record.expires_at);
+    const nonce = requiredString(record.nonce);
+    const purpose = record.purpose === SESSION_BOOTSTRAP_TOKEN_PURPOSE ? record.purpose : null;
+    const studySetId = requiredString(record.study_set_id);
+    const userId = requiredString(record.user_id);
+    const sessionId =
+      record.session_id === null || record.session_id === undefined
+        ? null
+        : requiredString(record.session_id);
+    const origin =
+      record.origin === null || record.origin === undefined ? null : requiredString(record.origin);
+    if (
+      expiresAt === null ||
+      expiresAt <= Math.floor(Date.now() / 1000) ||
+      !nonce ||
+      !purpose ||
+      !studySetId ||
+      !userId ||
+      (record.session_id !== null && record.session_id !== undefined && !sessionId) ||
+      (record.origin !== null && record.origin !== undefined && !origin)
+    ) {
+      return null;
+    }
+    return {
+      expires_at: expiresAt,
+      nonce,
+      origin,
+      purpose,
+      session_id: sessionId,
+      study_set_id: studySetId,
+      user_id: userId,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function attachVivaSessionBootstrapTokensToStudySet(
+  value: unknown,
+  options: {
+    allowedStudySetIds?: ReadonlySet<string> | null;
+    origin?: string | null;
+    userId: string;
+  },
+): unknown {
+  if (!isRecord(value)) return value;
+  const id = requiredString(value.id);
+  const userId = requiredString(value.user_id);
+  if (
+    !id ||
+    userId !== options.userId ||
+    (options.allowedStudySetIds && !options.allowedStudySetIds.has(id)) ||
+    !isRecord(value.actions)
+  ) {
+    return value;
+  }
+  return {
+    ...value,
+    actions: {
+      ...value.actions,
+      resume: attachVivaSessionBootstrapTokenToAction(value.actions.resume, {
+        origin: options.origin,
+        sessionId: sessionIdFromAction(value.actions.resume),
+        studySetId: id,
+        userId: options.userId,
+      }),
+      start: attachVivaSessionBootstrapTokenToAction(value.actions.start, {
+        origin: options.origin,
+        sessionId: null,
+        studySetId: id,
+        userId: options.userId,
+      }),
+    },
+  };
+}
+
+function attachVivaSessionBootstrapTokenToAction(
+  value: unknown,
+  input: {
+    origin?: string | null;
+    sessionId: string | null;
+    studySetId: string;
+    userId: string;
+  },
+): unknown {
+  if (!isRecord(value) || value.available !== true) return value;
+  const token = signVivaSessionBootstrapToken(input);
+  return token ? { ...value, session_bootstrap_token: token } : value;
+}
+
+function sessionIdFromAction(value: unknown): string | null {
+  return isRecord(value) ? requiredString(value.session_id) : null;
+}
+
+function isLoopbackAgentUrl(value: string): boolean {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  } catch {
+    return false;
+  }
 }
 
 function agentLibraryUrl(agentBaseUrl: string, userId: string): URL | null {
@@ -477,6 +731,10 @@ function configuredAllowlist(envName: string): Set<string> | null {
 
 function requiredString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function numberClaim(value: unknown): number | null {

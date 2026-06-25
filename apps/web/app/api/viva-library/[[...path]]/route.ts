@@ -1,4 +1,5 @@
 import { type NextRequest, NextResponse } from "next/server";
+import { attachVivaSessionBootstrapTokensToLibrarySnapshot } from "../../viva-session/shared";
 
 export const dynamic = "force-dynamic";
 
@@ -47,7 +48,10 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   const responseHeaders = new Headers();
   const contentType = response.headers.get("content-type");
   if (contentType) responseHeaders.set("content-type", contentType);
-  const responseBody = await browserSafeLibraryResponseBody(response, path, contentType);
+  const responseBody = await browserSafeLibraryResponseBody(response, path, contentType, {
+    origin: vivaLibraryProxyOrigin(request),
+    snapshotFilter: serverBearer.snapshotFilter,
+  });
   return new NextResponse(responseBody, {
     headers: responseHeaders,
     status: response.status,
@@ -92,7 +96,13 @@ function vivaLibraryProxyOrigin(request: NextRequest): string | null {
 function serverBearerForBrowserLibrarySnapshot(
   request: NextRequest,
   path: string[],
-): { ok: true; token?: string } | { ok: false; response: NextResponse<{ error: string }> } {
+):
+  | {
+      ok: true;
+      snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
+      token?: string;
+    }
+  | { ok: false; response: NextResponse<{ error: string }> } {
   if (
     request.method !== "GET" ||
     path.join("/") !== "study-sets/library" ||
@@ -116,7 +126,8 @@ function serverBearerForBrowserLibrarySnapshot(
     };
   }
   const allowedUserIds = configuredAllowlist("VIVA_SESSION_ALLOWED_USER_IDS");
-  if (!allowedUserIds) {
+  const allowedStudySetIds = configuredAllowlist("VIVA_SESSION_ALLOWED_STUDY_SET_IDS");
+  if (!allowedUserIds || !allowedStudySetIds) {
     return {
       ok: false,
       response: NextResponse.json(
@@ -131,7 +142,7 @@ function serverBearerForBrowserLibrarySnapshot(
       response: NextResponse.json({ error: "viva_library_identity_not_allowed" }, { status: 403 }),
     };
   }
-  return { ok: true, token };
+  return { ok: true, snapshotFilter: { allowedStudySetIds, userId }, token };
 }
 
 function configuredAllowlist(envName: string): Set<string> | null {
@@ -152,6 +163,10 @@ async function browserSafeLibraryResponseBody(
   response: Response,
   path: string[],
   contentType: string | null,
+  options: {
+    origin: string | null;
+    snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
+  },
 ): Promise<ArrayBuffer | string> {
   if (
     response.ok &&
@@ -160,7 +175,17 @@ async function browserSafeLibraryResponseBody(
   ) {
     try {
       const value = await response.json();
-      return JSON.stringify(stripLibrarySessionTokens(value));
+      const filtered = options.snapshotFilter
+        ? filterBearerBackedLibrarySnapshot(value, options.snapshotFilter)
+        : value;
+      const withBootstrapTokens = options.snapshotFilter
+        ? attachVivaSessionBootstrapTokensToLibrarySnapshot(filtered, {
+            allowedStudySetIds: options.snapshotFilter.allowedStudySetIds,
+            origin: options.origin,
+            userId: options.snapshotFilter.userId,
+          })
+        : filtered;
+      return JSON.stringify(stripLibraryTokenFields(withBootstrapTokens));
     } catch {
       return "{}";
     }
@@ -168,35 +193,57 @@ async function browserSafeLibraryResponseBody(
   return response.arrayBuffer();
 }
 
-function stripLibrarySessionTokens(value: unknown): unknown {
+function filterBearerBackedLibrarySnapshot(
+  value: unknown,
+  filter: { allowedStudySetIds: Set<string>; userId: string },
+): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
   const snapshot = value as Record<string, unknown>;
-  const studySets = Array.isArray(snapshot.study_sets)
-    ? snapshot.study_sets.map(stripStudySetSessionTokens)
-    : snapshot.study_sets;
-  return { ...snapshot, study_sets: studySets };
-}
-
-function stripStudySetSessionTokens(value: unknown): unknown {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
-  const studySet = value as Record<string, unknown>;
-  const actions =
-    studySet.actions && typeof studySet.actions === "object" && !Array.isArray(studySet.actions)
-      ? stripSessionActionTokens(studySet.actions as Record<string, unknown>)
-      : studySet.actions;
-  return { ...studySet, actions };
-}
-
-function stripSessionActionTokens(actions: Record<string, unknown>): Record<string, unknown> {
   return {
-    ...actions,
-    resume: stripSessionActionToken(actions.resume),
-    start: stripSessionActionToken(actions.start),
+    ...snapshot,
+    sessions: Array.isArray(snapshot.sessions)
+      ? snapshot.sessions.filter((session) => librarySessionAllowed(session, filter))
+      : snapshot.sessions,
+    study_sets: Array.isArray(snapshot.study_sets)
+      ? snapshot.study_sets.filter((studySet) => libraryStudySetAllowed(studySet, filter))
+      : snapshot.study_sets,
+    user_id: filter.userId,
   };
 }
 
-function stripSessionActionToken(action: unknown): unknown {
-  if (!action || typeof action !== "object" || Array.isArray(action)) return action;
-  const { session_token: _sessionToken, ...rest } = action as Record<string, unknown>;
-  return rest;
+function libraryStudySetAllowed(
+  value: unknown,
+  filter: { allowedStudySetIds: Set<string>; userId: string },
+): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const studySet = value as Record<string, unknown>;
+  return (
+    studySet.user_id === filter.userId &&
+    typeof studySet.id === "string" &&
+    filter.allowedStudySetIds.has(studySet.id)
+  );
+}
+
+function librarySessionAllowed(
+  value: unknown,
+  filter: { allowedStudySetIds: Set<string>; userId: string },
+): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const session = value as Record<string, unknown>;
+  return (
+    session.user_id === filter.userId &&
+    typeof session.study_set_id === "string" &&
+    filter.allowedStudySetIds.has(session.study_set_id)
+  );
+}
+
+function stripLibraryTokenFields(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripLibraryTokenFields);
+  if (!value || typeof value !== "object") return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "session_token" || key === "control_token") continue;
+    output[key] = stripLibraryTokenFields(child);
+  }
+  return output;
 }

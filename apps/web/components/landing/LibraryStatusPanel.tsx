@@ -272,6 +272,7 @@ async function startServerSession(
   const response = await fetch("/api/viva-session/start", {
     body: JSON.stringify({
       session_id: actionName === "resume" ? action.sessionId : undefined,
+      session_bootstrap_token: action.sessionBootstrapToken,
       study_set_id: row.id,
       user_id: row.userId,
     }),

@@ -200,17 +200,22 @@ curl -fsS \
 The same bearer also gates `/ws` preflight. Do not combine it with the direct
 browser signed-session path unless the browser/proxy sends the WebSocket
 `bearer.` subprotocol, for example through `connectVivaAgent({ token })`, or a
-trusted WSS proxy injects the token. The current `/session` page does not do
-that, so the direct browser signed-session path omits it.
+trusted WSS proxy injects the token. The same-origin session bootstrap path does
+not expose this REST bearer; `/session` reuses the signed session token as the
+WebSocket protocol credential.
 
 ### Same-origin session bootstrap
 
 Production web must use server-only same-origin session bootstrap. Browser
 library snapshots served through `/api/viva-library/study-sets/library` keep
 start/resume availability and session ids, but strip start/resume session token
-fields before the snapshot reaches the client. The browser obtains the minimum
-signed material for `/ws` only by POSTing to `/api/viva-session/start` or
-`/api/viva-session/refresh`.
+fields before the snapshot reaches the client. Server-bearer-backed snapshots
+are filtered to `VIVA_SESSION_ALLOWED_USER_IDS` and
+`VIVA_SESSION_ALLOWED_STUDY_SET_IDS`, remove server-only token fields, and carry
+only short-lived `session_bootstrap_token` capabilities for allowed start/resume
+actions. The browser obtains the minimum signed material for `/ws` only by
+POSTing that capability to `/api/viva-session/start` or by presenting an
+existing signed token to `/api/viva-session/refresh`.
 
 Client-side library refresh, export, and delete controls must also use the
 same-origin `/api/viva-library` proxy, even when `NEXT_PUBLIC_VIVA_API_URL` or
@@ -242,6 +247,10 @@ replay authority with `/ws`. Refresh outcomes such as `expired_refreshed`,
 `invalid_rejected`, `malformed_rejected`, `identity_mismatch`, and `blocked` are
 evidence fields; logs and artifacts must not include the token value, server
 bearer, agent URL secret, raw request body, or upstream error payload.
+The `/session` page sends the signed session token as both the first
+`session_config` credential and the WebSocket protocol credential; the agent
+accepts that signed token at preflight when session-token signing is configured,
+so the browser never needs the REST bearer.
 
 ## Health Checks
 

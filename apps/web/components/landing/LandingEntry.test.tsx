@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Children, type ReactElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import Page from "../../app/page";
 import type { VivaLibrarySnapshot } from "../../lib/viva-library";
 import { LandingEntry, landingEntryTarget } from "./LandingEntry";
 import { LandingHero } from "./LandingHero";
@@ -77,6 +78,12 @@ const librarySnapshot: VivaLibrarySnapshot = {
   ],
 };
 
+const originalFetch = globalThis.fetch;
+const originalAgentUrl = process.env.VIVA_AGENT_HTTP_URL;
+const originalRestBearer = process.env.VIVA_AGENT_REST_BEARER_TOKEN;
+const originalAllowedUsers = process.env.VIVA_SESSION_ALLOWED_USER_IDS;
+const originalAllowedStudySets = process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS;
+
 describe("LandingEntry", () => {
   test("renders the hero without mounting the legacy study app", () => {
     const markup = renderToStaticMarkup(<LandingEntry onEnter={() => {}} />);
@@ -149,6 +156,40 @@ describe("LandingEntry", () => {
     );
   });
 
+  test("server-side initial library fetch uses server credentials and redacts the browser snapshot", async () => {
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
+      process.env.VIVA_AGENT_REST_BEARER_TOKEN = "server-rest-bearer";
+      process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ input: String(input), init });
+        return new Response(JSON.stringify(librarySnapshot), {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        });
+      }) as typeof fetch;
+
+      const page = (await Page()) as ReactElement<{ initialLibrarySnapshot: VivaLibrarySnapshot }>;
+
+      expect(page.type).toBe(LandingEntry);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.input).toBe("https://agent.example/study-sets/library?user_id=user-1");
+      expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBe(
+        "Bearer server-rest-bearer",
+      );
+      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("session_token");
+      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("viva1.server-token");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+    }
+  });
+
   test("session cards surface a mastery ring, emphasise the next drill, and quiet the delete", () => {
     const markup = renderToStaticMarkup(
       <LandingEntry initialLibrarySnapshot={librarySnapshot} onEnter={() => {}} />,
@@ -167,3 +208,11 @@ describe("LandingEntry", () => {
     expect(markup).toContain("viva-library__action--primary");
   });
 });
+
+function restoreEnv(name: string, value: string | undefined) {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+}

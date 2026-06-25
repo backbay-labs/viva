@@ -14,6 +14,7 @@ import {
   micStateForAudioCaptureError,
   micStateForCaptureEndReason,
   pcm16ChunksToBase64,
+  sessionRouteWsAccessToken,
   shouldStopReadinessPolling,
   shouldUseLiveMicAudioTransport,
   spokenTurnFallbackAction,
@@ -114,6 +115,15 @@ describe("isSessionOver", () => {
   test("an active, connected session keeps the clock running", () => {
     expect(isSessionOver({ recap: undefined, status: "open" })).toBe(false);
     expect(isSessionOver({ recap: undefined, status: "connecting" })).toBe(false);
+  });
+});
+
+describe("sessionRouteWsAccessToken", () => {
+  test("uses the signed route session token as the direct WebSocket access credential", () => {
+    expect(sessionRouteWsAccessToken({ sessionToken: " viva1.signed-session-token " })).toBe(
+      "viva1.signed-session-token",
+    );
+    expect(sessionRouteWsAccessToken({ sessionToken: null })).toBeUndefined();
   });
 });
 

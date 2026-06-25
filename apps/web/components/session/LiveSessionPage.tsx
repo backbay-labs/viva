@@ -100,6 +100,7 @@ export function LiveSessionPage() {
     sessionId: routeIdentity.sessionId ?? process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID,
     sessionToken: routeIdentity.sessionToken,
     studySet: activeStudySet,
+    token: sessionRouteWsAccessToken(routeIdentity),
     trustedStudySetId: process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID,
     userId: routeIdentity.userId ?? process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID,
   });
@@ -844,6 +845,10 @@ function readBrowserSessionRouteIdentity() {
     ...routeIdentity,
     sessionToken: envToken,
   };
+}
+
+export function sessionRouteWsAccessToken(routeIdentity: { sessionToken?: string | null }) {
+  return routeIdentity.sessionToken?.trim() || undefined;
 }
 
 function initialReadinessProbe(): VivaAgentReadinessProbe {

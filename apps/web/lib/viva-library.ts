@@ -4,6 +4,7 @@ export type VivaLibraryAction =
   | {
       available: true;
       session_id?: string | null;
+      session_bootstrap_token?: string | null;
       session_token?: string | null;
       control_token?: string | null;
     }
@@ -96,6 +97,7 @@ export type VivaLibraryExport = {
 export type ProjectedLibraryAction = {
   available: boolean;
   sessionId?: string;
+  sessionBootstrapToken?: string | null;
   sessionToken?: string | null;
   controlToken?: string | null;
   unavailableReason?: string;
@@ -264,6 +266,7 @@ function projectSessionAction(action: VivaLibraryAction): ProjectedLibraryAction
   return {
     available: true,
     sessionId: action.session_id ?? undefined,
+    sessionBootstrapToken: action.session_bootstrap_token ?? undefined,
     sessionToken: action.session_token ?? undefined,
   };
 }

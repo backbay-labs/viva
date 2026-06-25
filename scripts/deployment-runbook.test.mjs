@@ -90,7 +90,9 @@ test("deployment runbook covers the beta operating path and stop rules", async (
     "Authorization: Bearer",
     "connectVivaAgent({ token })",
     "bearer.",
-    "direct browser signed-session path omits it",
+    "session_bootstrap_token",
+    "WebSocket protocol credential",
+    "browser never needs the REST bearer",
     "nonce",
   ]);
 

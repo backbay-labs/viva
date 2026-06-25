@@ -8,6 +8,7 @@ const originalPublicAgentUrl = process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL;
 const originalBearer = process.env.VIVA_VOICE_WS_BEARER_TOKEN;
 const originalRestBearer = process.env.VIVA_AGENT_REST_BEARER_TOKEN;
 const originalAllowedUsers = process.env.VIVA_SESSION_ALLOWED_USER_IDS;
+const originalAllowedStudySets = process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS;
 
 describe("Viva library proxy", () => {
   test("forwards caller control tokens without injecting the private server bearer", async () => {
@@ -52,6 +53,7 @@ describe("Viva library proxy", () => {
       process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
       process.env.VIVA_AGENT_REST_BEARER_TOKEN = "server-rest-bearer";
       process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
       globalThis.fetch = (async () =>
         new Response(
           JSON.stringify({
@@ -59,6 +61,7 @@ describe("Viva library proxy", () => {
             study_sets: [
               {
                 id: "biology-midterm",
+                user_id: "user-1",
                 actions: {
                   start: {
                     available: true,
@@ -106,6 +109,113 @@ describe("Viva library proxy", () => {
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
       restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+    }
+  });
+
+  test("filters bearer-backed browser library snapshots to the requested user and allowed study sets", async () => {
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_AGENT_REST_BEARER_TOKEN = "server-rest-bearer";
+      process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({
+            user_id: "user-1",
+            privacy: {
+              export: { available: true, control_token: "viva1.export-control" },
+            },
+            study_sets: [
+              {
+                id: "biology-midterm",
+                user_id: "user-1",
+                actions: {
+                  delete: { available: true, control_token: "viva1.delete-control" },
+                  start: {
+                    available: true,
+                    session_id: "allowed-session",
+                    session_token: "viva1.allowed-session-token",
+                  },
+                },
+              },
+              {
+                id: "history-final",
+                user_id: "user-1",
+                actions: {
+                  delete: { available: true, control_token: "viva1.disallowed-control" },
+                  start: {
+                    available: true,
+                    session_id: "disallowed-session",
+                    session_token: "viva1.disallowed-session-token",
+                  },
+                },
+              },
+              {
+                id: "biology-midterm",
+                user_id: "user-2",
+                actions: {
+                  start: {
+                    available: true,
+                    session_id: "other-user-session",
+                    session_token: "viva1.other-user-session-token",
+                  },
+                },
+              },
+            ],
+            sessions: [
+              {
+                voice_session_id: "allowed-recap",
+                user_id: "user-1",
+                study_set_id: "biology-midterm",
+              },
+              {
+                voice_session_id: "disallowed-recap",
+                user_id: "user-1",
+                study_set_id: "history-final",
+              },
+              {
+                voice_session_id: "other-user-recap",
+                user_id: "user-2",
+                study_set_id: "biology-midterm",
+              },
+            ],
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        )) as typeof fetch;
+
+      const request = {
+        headers: new Headers(),
+        method: "GET",
+        nextUrl: new URL(
+          "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-1",
+        ),
+      } as unknown as NextRequest;
+
+      const response = await GET(request, {
+        params: Promise.resolve({ path: ["study-sets", "library"] }),
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.study_sets.map((studySet: { id: string }) => studySet.id)).toEqual([
+        "biology-midterm",
+      ]);
+      expect(
+        body.sessions.map((session: { voice_session_id: string }) => session.voice_session_id),
+      ).toEqual(["allowed-recap"]);
+      expect(JSON.stringify(body)).not.toContain("user-2");
+      expect(JSON.stringify(body)).not.toContain("history-final");
+      expect(JSON.stringify(body)).not.toContain("session_token");
+      expect(JSON.stringify(body)).not.toContain("control_token");
+      expect(JSON.stringify(body)).not.toContain("viva1.");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
     }
   });
 
@@ -115,6 +225,7 @@ describe("Viva library proxy", () => {
       process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
       process.env.VIVA_AGENT_REST_BEARER_TOKEN = "server-rest-bearer";
       process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
       globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
         calls.push({ input: String(input), init });
         return new Response(JSON.stringify({ study_sets: [], user_id: "user-1" }), {
@@ -145,6 +256,7 @@ describe("Viva library proxy", () => {
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
       restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
     }
   });
 
@@ -154,6 +266,7 @@ describe("Viva library proxy", () => {
       process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
       delete process.env.VIVA_AGENT_REST_BEARER_TOKEN;
       process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
       globalThis.fetch = (async (input: RequestInfo | URL) => {
         calls.push(String(input));
         return new Response(JSON.stringify({ study_sets: [], user_id: "user-1" }), {
@@ -183,6 +296,7 @@ describe("Viva library proxy", () => {
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
       restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
     }
   });
 
@@ -193,6 +307,7 @@ describe("Viva library proxy", () => {
       process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://public-agent.example";
       process.env.VIVA_AGENT_REST_BEARER_TOKEN = "server-rest-bearer";
       process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
       globalThis.fetch = (async (input: RequestInfo | URL) => {
         calls.push(String(input));
         return new Response(JSON.stringify({ study_sets: [], user_id: "user-1" }), {
@@ -223,6 +338,7 @@ describe("Viva library proxy", () => {
       restoreEnv("NEXT_PUBLIC_VIVA_AGENT_HTTP_URL", originalPublicAgentUrl);
       restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
     }
   });
 

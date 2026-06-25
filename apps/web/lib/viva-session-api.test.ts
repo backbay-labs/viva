@@ -19,6 +19,7 @@ const originalEnv = {
   NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL,
   VIVA_AGENT_HTTP_URL: process.env.VIVA_AGENT_HTTP_URL,
   VIVA_AGENT_REST_BEARER_TOKEN: process.env.VIVA_AGENT_REST_BEARER_TOKEN,
+  VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET: process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET,
   VIVA_SESSION_ALLOWED_STUDY_SET_IDS: process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS,
   VIVA_SESSION_ALLOWED_USER_IDS: process.env.VIVA_SESSION_ALLOWED_USER_IDS,
   VIVA_SESSION_MINT_MAX_PER_MINUTE: process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE,
@@ -32,6 +33,7 @@ describe("Viva same-origin session API", () => {
     process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
     process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
     process.env.VIVA_AGENT_REST_BEARER_TOKEN = "redacted-rest-bearer";
+    process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = "redacted-bootstrap-signing-secret";
     process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user";
     process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
     process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "20";
@@ -52,10 +54,7 @@ describe("Viva same-origin session API", () => {
     }) as typeof fetch;
 
     const response = await startSession(
-      sessionRequest("/api/viva-session/start", {
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
     );
     const body = (await response.json()) as VivaSessionRouteOutcome;
 
@@ -90,10 +89,7 @@ describe("Viva same-origin session API", () => {
     }) as typeof fetch;
 
     const response = await startSession(
-      sessionRequest("/api/viva-session/start", {
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
     );
     const body = (await response.json()) as VivaSessionRouteFailureClass;
 
@@ -115,10 +111,7 @@ describe("Viva same-origin session API", () => {
     }) as typeof fetch;
 
     const response = await startSession(
-      sessionRequest("/api/viva-session/start", {
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
     );
     const body = (await response.json()) as VivaSessionRouteFailureClass;
 
@@ -140,14 +133,10 @@ describe("Viva same-origin session API", () => {
     }) as typeof fetch;
 
     const response = await startSession(
-      sessionRequest(
-        "/api/viva-session/start",
-        {
-          study_set_id: "biology-midterm",
-          user_id: "synthetic-user",
-        },
-        { origin: "https://evil.example", "sec-fetch-site": "cross-site" },
-      ),
+      sessionRequest("/api/viva-session/start", sessionStartPayload(), {
+        origin: "https://evil.example",
+        "sec-fetch-site": "cross-site",
+      }),
     );
     const body = (await response.json()) as VivaSessionRouteFailureClass;
 
@@ -166,10 +155,7 @@ describe("Viva same-origin session API", () => {
       calls.push(String(input));
       return jsonResponse(500, { error: "should_not_call_agent" });
     }) as typeof fetch;
-    const request = sessionRequest("/api/viva-session/start", {
-      study_set_id: "biology-midterm",
-      user_id: "synthetic-user",
-    });
+    const request = sessionRequest("/api/viva-session/start", sessionStartPayload());
     request.headers.delete("origin");
 
     const response = await startSession(request);
@@ -194,10 +180,7 @@ describe("Viva same-origin session API", () => {
     }) as typeof fetch;
 
     const response = await startSession(
-      sessionRequest("/api/viva-session/start", {
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
     );
     const body = (await response.json()) as VivaSessionRouteFailureClass;
 
@@ -210,6 +193,30 @@ describe("Viva same-origin session API", () => {
     expect(calls).toEqual([]);
   });
 
+  test("start requires a signed bootstrap capability even when same-origin headers are forged", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(500, { error: "should_not_call_agent" });
+    }) as typeof fetch;
+
+    const response = await startSession(
+      sessionRequest("/api/viva-session/start", {
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      }),
+    );
+    const body = (await response.json()) as VivaSessionRouteFailureClass;
+
+    expect(response.status).toBe(403);
+    expect(body).toEqual({
+      error: "session_bootstrap_capability_required",
+      failure_class: "access_denied",
+      token_refresh_outcome: "blocked",
+    });
+    expect(calls).toEqual([]);
+  });
+
   test("start applies independent mint limits to client IP and session identity", async () => {
     process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "1";
     process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user,alternate-user";
@@ -218,17 +225,11 @@ describe("Viva same-origin session API", () => {
         200,
         librarySnapshot({ startToken: "viva1.redacted-start-token" }),
       )) as typeof fetch;
-    const requestBody = {
-      study_set_id: "biology-midterm",
-      user_id: "synthetic-user",
-    };
+    const requestBody = sessionStartPayload();
 
     const first = await startSession(sessionRequest("/api/viva-session/start", requestBody));
     const sameIpDifferentIdentity = await startSession(
-      sessionRequest("/api/viva-session/start", {
-        study_set_id: "biology-midterm",
-        user_id: "alternate-user",
-      }),
+      sessionRequest("/api/viva-session/start", sessionStartPayload({ userId: "alternate-user" })),
     );
     const sameIpBody = (await sameIpDifferentIdentity.json()) as VivaSessionRouteFailureClass;
 
@@ -251,6 +252,36 @@ describe("Viva same-origin session API", () => {
     expect(third.status).toBe(200);
     expect(sameIdentityDifferentIp.status).toBe(429);
     expect(sameIdentityBody).toEqual({
+      error: "session_mint_rate_limited",
+      failure_class: "rate_limit",
+      token_refresh_outcome: "blocked",
+    });
+  });
+
+  test("start rate limiting uses the trusted appended proxy address instead of the caller-controlled first XFF value", async () => {
+    process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "1";
+    process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user,alternate-user";
+    globalThis.fetch = (async () =>
+      jsonResponse(
+        200,
+        librarySnapshot({ startToken: "viva1.redacted-start-token" }),
+      )) as typeof fetch;
+
+    const first = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload(), {
+        "x-forwarded-for": "198.51.100.1, 203.0.113.10",
+      }),
+    );
+    const sameProxyClient = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload({ userId: "alternate-user" }), {
+        "x-forwarded-for": "198.51.100.2, 203.0.113.10",
+      }),
+    );
+    const body = (await sameProxyClient.json()) as VivaSessionRouteFailureClass;
+
+    expect(first.status).toBe(200);
+    expect(sameProxyClient.status).toBe(429);
+    expect(body).toEqual({
       error: "session_mint_rate_limited",
       failure_class: "rate_limit",
       token_refresh_outcome: "blocked",
@@ -422,6 +453,44 @@ function sessionRequest(
     value: new URL(`https://web.example${path}`),
   });
   return request;
+}
+
+function sessionStartPayload({
+  sessionId,
+  studySetId = "biology-midterm",
+  userId = "synthetic-user",
+}: {
+  sessionId?: string;
+  studySetId?: string;
+  userId?: string;
+} = {}): Record<string, unknown> {
+  return {
+    ...(sessionId ? { session_id: sessionId } : {}),
+    session_bootstrap_token: signedSessionBootstrapToken({
+      session_id: sessionId ?? null,
+      study_set_id: studySetId,
+      user_id: userId,
+    }),
+    study_set_id: studySetId,
+    user_id: userId,
+  };
+}
+
+function signedSessionBootstrapToken(
+  claims: { session_id: string | null; study_set_id: string; user_id: string },
+  secret = "redacted-bootstrap-signing-secret",
+): string {
+  const body = {
+    ...claims,
+    expires_at: futureUnixSeconds(),
+    nonce: "bootstrap-nonce",
+    origin: "https://web.example",
+    purpose: "viva_session_bootstrap",
+  };
+  const claimsPart = Buffer.from(JSON.stringify(body)).toString("base64url");
+  const payload = `viva-bootstrap1.${claimsPart}`;
+  const signature = createHmac("sha256", secret).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
 }
 
 function jsonResponse(status: number, body: unknown): Response {
