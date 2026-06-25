@@ -13,9 +13,9 @@ use agent_domain::{
     AnswerEvaluation, AudioFrame, BrainError, BrainEvent, BrainInput, BrainProviderError,
     BrainUsage, ConceptStatus, PortError, RealtimeBrain, RealtimeBrainCapabilities,
     RealtimeSession, RealtimeSessionTaskGuard, RecapSourceMoment, SessionConfig, SessionId,
-    StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap, StudySetIngestionStatus,
-    StudySourceReference, StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts,
-    TerminalSessionReason, VoiceUsageRecord,
+    SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap,
+    StudySetIngestionStatus, StudySourceReference, StudyStoreBackend, StudyStoreCapabilities,
+    StudyStoreWriteCounts, TerminalSessionReason, VoiceUsageRecord,
 };
 use agent_service::{
     build_router, AppState, ClientFrame, FailureControlConfig, FailureControlScenario, ServerFrame,
@@ -3140,6 +3140,199 @@ async fn websocket_records_nonce_store_errors_without_replay_auth_evidence() {
 }
 
 #[tokio::test]
+async fn websocket_durable_store_replay_still_reports_session_auth_failure() {
+    let opened = Arc::new(AtomicBool::new(false));
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(DurableStoreDegradingStore {
+        inner: inner.clone(),
+        failure: DurableStoreFailureMode::NoFailure,
+    });
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(OpenProbeBrain {
+            opened: opened.clone(),
+            captured_config: None,
+        }),
+        "open_probe",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        2,
+        state_store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() + 60,
+        "nonce-durable-replay",
+    );
+
+    let (mut first_socket, _) = connect_async(url.clone()).await.unwrap();
+    let ServerFrame::Ready { store, .. } = read_server_frame(&mut first_socket).await else {
+        panic!("expected ready frame");
+    };
+    assert!(store.durable);
+    first_socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&token).into(),
+        ))
+        .await
+        .unwrap();
+    wait_for_socket_close(&mut first_socket).await;
+    assert!(opened.load(Ordering::SeqCst));
+
+    opened.store(false, Ordering::SeqCst);
+    let (mut replay_socket, _) = connect_async(url).await.unwrap();
+    let ServerFrame::Ready { store, .. } = read_server_frame(&mut replay_socket).await else {
+        panic!("expected ready frame");
+    };
+    assert!(store.durable);
+    replay_socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&token).into(),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        read_server_frame(&mut replay_socket).await,
+        ServerFrame::Error { message, .. } if message == "session auth failed"
+    ));
+    assert_close_code(&mut replay_socket, CloseCode::Policy).await;
+    let auth_events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
+    assert!(auth_events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::AuthFailure
+            && event.detail.contains("code=replayed")
+            && event.detail.contains("client_class=terminal")
+            && event.detail.contains("retry_eligible=false")
+    }));
+    let terminal_events =
+        wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(terminal_events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "invalid_session_token"
+    }));
+    assert!(!opened.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn websocket_nonce_store_failure_emits_durability_degraded_before_brain_open() {
+    let opened = Arc::new(AtomicBool::new(false));
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(DurableStoreDegradingStore {
+        inner: inner.clone(),
+        failure: DurableStoreFailureMode::NonceClaim,
+    });
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(OpenProbeBrain {
+            opened: opened.clone(),
+            captured_config: None,
+        }),
+        "open_probe",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        2,
+        state_store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() + 60,
+        "nonce-store-failure",
+    );
+
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
+        panic!("expected ready frame");
+    };
+    assert!(store.durable);
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&token).into(),
+        ))
+        .await
+        .unwrap();
+
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::DurabilityDegraded,
+    );
+    assert_close_code(&mut socket, CloseCode::Error).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "durability_degraded"
+    }));
+    assert!(!opened.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn websocket_study_context_store_failure_emits_durability_degraded_before_brain_open() {
+    let opened = Arc::new(AtomicBool::new(false));
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(DurableStoreDegradingStore {
+        inner: inner.clone(),
+        failure: DurableStoreFailureMode::StudyContext,
+    });
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(OpenProbeBrain {
+            opened: opened.clone(),
+            captured_config: None,
+        }),
+        "open_probe",
+        VoiceWsAccess::default(),
+        2,
+        state_store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/synthetic-study-session.json"
+    ))
+    .unwrap();
+
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
+        panic!("expected ready frame");
+    };
+    assert!(store.durable);
+    send_client_frame(&mut socket, &fixture.client[0]).await;
+
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::DurabilityDegraded,
+    );
+    assert_close_code(&mut socket, CloseCode::Error).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "durability_degraded"
+    }));
+    assert!(!opened.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn websocket_rejects_invalid_session_token_before_brain_open() {
     for (token, expected_code) in [
         (
@@ -3437,6 +3630,50 @@ async fn websocket_brain_open_auth_failure_emits_terminal_phase_without_raw_erro
 }
 
 #[tokio::test]
+async fn websocket_brain_open_store_failure_emits_durability_degraded_terminal_phase() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(DurableStoreDegradingStore {
+        inner: inner.clone(),
+        failure: DurableStoreFailureMode::ActiveQuestion,
+    });
+    let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(brain_store)),
+        "synthetic",
+        VoiceWsAccess::default(),
+        4,
+        state_store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/synthetic-study-session.json"
+    ))
+    .unwrap();
+
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
+        panic!("expected ready frame");
+    };
+    assert!(store.durable);
+    send_client_frame(&mut socket, &fixture.client[0]).await;
+
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::DurabilityDegraded,
+    );
+    assert_close_code(&mut socket, CloseCode::Error).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "durability_degraded"
+    }));
+}
+
+#[tokio::test]
 async fn websocket_provider_error_event_emits_terminal_phase_without_raw_message() {
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let state = AppState::with_study_store(
@@ -3469,6 +3706,62 @@ async fn websocket_provider_error_event_emits_terminal_phase_without_raw_message
         TerminalSessionReason::ProviderAuthFailed,
     );
     assert_close_code(&mut socket, CloseCode::Error).await;
+}
+
+#[tokio::test]
+async fn websocket_runtime_store_error_event_emits_durability_degraded_terminal_phase() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(DurableStoreDegradingStore {
+        inner: inner.clone(),
+        failure: DurableStoreFailureMode::NoFailure,
+    });
+    let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(EventProbeBrain {
+            study_store: Some(brain_store),
+            events: vec![BrainEvent::Error(BrainProviderError {
+                source: "synthetic-memory".to_owned(),
+                message: "postgres adapter error: durable store write failed".to_owned(),
+            })],
+        }),
+        "event_probe",
+        VoiceWsAccess::default(),
+        4,
+        state_store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/synthetic-study-session.json"
+    ))
+    .unwrap();
+
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
+        panic!("expected ready frame");
+    };
+    assert_eq!(brain.provider, "event_probe");
+    assert!(store.durable);
+    send_client_frame(&mut socket, &fixture.client[0]).await;
+
+    let frames = read_server_frames_until_terminal_reason(
+        &mut socket,
+        TerminalSessionReason::DurabilityDegraded,
+    )
+    .await;
+
+    assert!(frames.iter().any(|frame| {
+        terminal_session_reason(frame) == Some(TerminalSessionReason::DurabilityDegraded)
+    }));
+    assert_close_code(&mut socket, CloseCode::Error).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "durability_degraded"
+    }));
 }
 
 #[tokio::test]
@@ -3577,6 +3870,67 @@ async fn websocket_durable_semantic_authority_miss_remains_provider_source_rejec
     )));
     assert!(frames.iter().all(|frame| {
         terminal_session_reason(frame) != Some(TerminalSessionReason::DurabilityDegraded)
+    }));
+}
+
+#[tokio::test]
+async fn websocket_durable_terminal_close_failure_emits_durability_degraded_terminal_phase() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(DurableStoreDegradingStore {
+        inner: inner.clone(),
+        failure: DurableStoreFailureMode::SessionClose,
+    });
+    let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(IdleProbeBrain {
+            study_store: Some(brain_store),
+        }),
+        "idle_probe",
+        VoiceWsAccess::default(),
+        4,
+        state_store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(5),
+        session: Duration::from_secs(5),
+    });
+    let drain = state.drain_signal.clone();
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/synthetic-study-session.json"
+    ))
+    .unwrap();
+
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
+        panic!("expected ready frame");
+    };
+    assert_eq!(brain.provider, "idle_probe");
+    assert!(store.durable);
+    send_client_frame(&mut socket, &fixture.client[0]).await;
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Event {
+            event,
+            ..
+        } if matches!(event.as_ref(), VivaServerEvent::SessionPhase { .. })
+    ));
+
+    drain.begin_drain();
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::DurabilityDegraded,
+    );
+    assert_close_code(&mut socket, CloseCode::Error).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "durability_degraded"
     }));
 }
 
@@ -6855,8 +7209,13 @@ impl RealtimeBrain for OpenProbeBrain {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DurableStoreFailureMode {
+    ActiveQuestion,
+    NoFailure,
+    NonceClaim,
     QuestionAuthorizationSemanticMiss,
     QuestionAuthorizationWriteFailure,
+    SessionClose,
+    StudyContext,
     UsageRecording,
 }
 
@@ -6883,6 +7242,16 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         self.inner.write_counts()
     }
 
+    async fn claim_session_token_nonce(
+        &self,
+        claim: SessionTokenNonceClaim,
+    ) -> Result<(), PortError> {
+        if self.failure == DurableStoreFailureMode::NonceClaim {
+            return Err(PortError::adapter("postgres", "durable store write failed"));
+        }
+        self.inner.claim_session_token_nonce(claim).await
+    }
+
     async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
         self.inner.record_voice_session(config).await
     }
@@ -6892,6 +7261,9 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         voice_session_id: &str,
         terminal_reason: &str,
     ) -> Result<serde_json::Value, PortError> {
+        if self.failure == DurableStoreFailureMode::SessionClose {
+            return Err(PortError::adapter("postgres", "durable store write failed"));
+        }
         self.inner
             .close_voice_session(voice_session_id, terminal_reason)
             .await
@@ -6902,7 +7274,21 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         user_id: &str,
         study_set_id: &str,
     ) -> Result<Option<serde_json::Value>, PortError> {
+        if self.failure == DurableStoreFailureMode::StudyContext {
+            return Err(PortError::adapter("postgres", "durable store read failed"));
+        }
         self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn active_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<StudyQuestion>, PortError> {
+        if self.failure == DurableStoreFailureMode::ActiveQuestion {
+            return Err(PortError::adapter("postgres", "durable store read failed"));
+        }
+        self.inner.active_question(user_id, study_set_id).await
     }
 
     async fn authorize_question_started(
@@ -6921,17 +7307,22 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
                 .await;
         }
         match self.failure {
-            DurableStoreFailureMode::QuestionAuthorizationSemanticMiss => {
-                Err(PortError::unavailable(
-                    "postgres",
-                    &question.question_id,
-                    "question is not active for this study set",
-                ))
-            }
+            DurableStoreFailureMode::QuestionAuthorizationSemanticMiss => Err(PortError::adapter(
+                "postgres",
+                format!(
+                    "question tuple does not match deterministic retrieval for {}",
+                    question.question_id
+                ),
+            )),
             DurableStoreFailureMode::QuestionAuthorizationWriteFailure => {
                 Err(PortError::adapter("postgres", "durable store read failed"))
             }
-            DurableStoreFailureMode::UsageRecording => unreachable!(),
+            DurableStoreFailureMode::ActiveQuestion
+            | DurableStoreFailureMode::NoFailure
+            | DurableStoreFailureMode::NonceClaim
+            | DurableStoreFailureMode::SessionClose
+            | DurableStoreFailureMode::StudyContext
+            | DurableStoreFailureMode::UsageRecording => unreachable!(),
         }
     }
 
@@ -7191,6 +7582,10 @@ struct EventProbeBrain {
     events: Vec<BrainEvent>,
 }
 
+struct IdleProbeBrain {
+    study_store: Option<Arc<dyn StudyMemoryStore>>,
+}
+
 struct ResponseReplayProbeBrain {
     study_store: Arc<dyn StudyMemoryStore>,
 }
@@ -7294,6 +7689,50 @@ impl RealtimeBrain for EventProbeBrain {
         let task = tokio::spawn(async move {
             for event in events_to_send {
                 let _ = event_tx.send(event).await;
+            }
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for IdleProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "idle_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        if let Some(store) = &self.study_store {
+            store
+                .record_voice_session(&config)
+                .await
+                .map_err(|error| BrainError::Connection(error.to_string()))?;
+        }
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = event_tx
+                .send(BrainEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                })
+                .await;
+            while let Some(input) = input_rx.recv().await {
+                if matches!(input, BrainInput::Stop) {
+                    break;
+                }
             }
         });
 

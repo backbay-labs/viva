@@ -7,6 +7,7 @@ import {
   assertBrowserStoryArtifactFiles,
   assertReleaseBrowserEvidence,
   normalizeBrowserEvidence,
+  releaseDurableStateClaim,
   shouldSkipMissingBrowserResult,
 } from "./browser-evidence.mjs";
 
@@ -485,8 +486,15 @@ test("only missing browser result files are skippable in release-check skip mode
   const validation = new Error("Browser E2E release evidence is incomplete");
 
   assert.equal(shouldSkipMissingBrowserResult(missing, "1"), true);
+  assert.equal(shouldSkipMissingBrowserResult(missing, "1", true), false);
   assert.equal(shouldSkipMissingBrowserResult(validation, "1"), false);
   assert.equal(shouldSkipMissingBrowserResult(missing, undefined), false);
+});
+
+test("release durable-state claim reflects reused durable browser evidence", () => {
+  assert.equal(releaseDurableStateClaim({ durable_state_release_claimed: true }, false), true);
+  assert.equal(releaseDurableStateClaim({ durable_state_release_claimed: false }, true), true);
+  assert.equal(releaseDurableStateClaim({ durable_state_release_claimed: false }, false), false);
 });
 
 function completeBrowserResult(overrides = {}) {

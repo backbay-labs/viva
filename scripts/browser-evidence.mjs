@@ -117,8 +117,23 @@ export function assertReleaseBrowserEvidence(evidence) {
   }
 }
 
-export function shouldSkipMissingBrowserResult(error, skipBrowserValue) {
-  return skipBrowserValue === "1" && error instanceof Error && error.code === "ENOENT";
+export function shouldSkipMissingBrowserResult(
+  error,
+  skipBrowserValue,
+  durableStateReleaseClaimed = false,
+) {
+  return (
+    !durableStateReleaseClaimed &&
+    skipBrowserValue === "1" &&
+    error instanceof Error &&
+    error.code === "ENOENT"
+  );
+}
+
+export function releaseDurableStateClaim(browserEvidence, durableStateReleaseClaimed = false) {
+  return (
+    durableStateReleaseClaimed === true || browserEvidence?.durable_state_release_claimed === true
+  );
 }
 
 export async function assertBrowserStoryArtifactFiles(result, rootDir) {

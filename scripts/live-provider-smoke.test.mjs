@@ -448,6 +448,16 @@ test("runLiveProviderSmoke fails closed when readiness lacks nonce replay protec
 
   assert.equal(evidence.status, "failed");
   assert.equal(evidence.failure_stage, "readiness");
+  assert.equal(evidence.failure.failure_class, "durability_degraded");
+  assert.equal(evidence.failure.terminal_reason, "durability_degraded");
+  assert.deepEqual(evidence.failure.terminal_session_phase, {
+    type: "session_phase",
+    phase: "recap",
+    terminal_reason: "durability_degraded",
+  });
+  assert.equal(evidence.failure.sanitized_evidence, true);
+  assert.equal(evidence.failure.user_copy.next_action_label, "Start a fresh turn");
+  assert.equal(evidence.terminal_reason, "durability_degraded");
   assert.equal(evidence.readiness.store.available, true);
   assert.equal(evidence.readiness.store.durable, true);
   assert.equal(evidence.readiness.store.nonce_replay_protection, false);

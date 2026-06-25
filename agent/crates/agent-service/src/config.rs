@@ -565,7 +565,7 @@ pub fn validate_runtime_store_preflight(
     config: &ServiceConfig,
     store: &StudyStoreCapabilities,
 ) -> Result<(), ServiceConfigError> {
-    if config.bind_addr.ip().is_loopback() || config.ws_access.session_token_secret.is_none() {
+    if config.ws_access.session_token_secret.is_none() {
         return Ok(());
     }
     if !store.available {
@@ -1558,6 +1558,28 @@ mod tests {
 
         let error = validate_runtime_store_preflight(&config, &store.capabilities())
             .expect_err("public signed sessions must not run on ephemeral store");
+
+        assert_eq!(
+            error,
+            ServiceConfigError::DurableStoreRequiredForSignedSessions("in_memory")
+        );
+    }
+
+    #[test]
+    fn loopback_signed_session_preflight_rejects_ephemeral_store() {
+        let config = ServiceConfig {
+            bind_addr: "127.0.0.1:4318".parse().expect("bind parses"),
+            ws_access: VoiceWsAccess {
+                required_bearer: None,
+                session_token_secret: Some("session-secret".to_owned()),
+                allowed_origins: vec!["http://localhost:3000".to_owned()],
+            },
+            ..ServiceConfig::default()
+        };
+        let store = data::InMemoryStudyStore::seeded_fixture();
+
+        let error = validate_runtime_store_preflight(&config, &store.capabilities())
+            .expect_err("signed sessions must not run on ephemeral loopback store");
 
         assert_eq!(
             error,

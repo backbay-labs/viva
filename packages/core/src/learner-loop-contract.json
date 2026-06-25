@@ -261,7 +261,11 @@
       "authority": "durable_store_event",
       "failure_class": "durability_degraded",
       "terminal_reason": "durability_degraded",
+      "evidence_code": "durability_degraded",
+      "readiness_failure_kind": "store_unavailable",
       "sanitized_evidence": true,
+      "failure_matrix": true,
+      "smoke_terminal_reasons": ["durability_degraded", "readiness_store_unavailable"],
       "runtime_copy_causes": ["store_unavailable"],
       "copy": {
         "capsule_label": "Progress not saved",

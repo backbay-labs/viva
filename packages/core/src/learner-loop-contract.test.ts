@@ -65,6 +65,8 @@ describe("BAC-510 learner loop contract", () => {
     expect(durabilityDegraded?.authority).toBe("durable_store_event");
     expect(durabilityDegraded?.failure_class).toBe("durability_degraded");
     expect(durabilityDegraded?.terminal_reason).toBe("durability_degraded");
+    expect(durabilityDegraded?.failure_matrix).toBe(true);
+    expect(durabilityDegraded?.smoke_terminal_reasons).toContain("readiness_store_unavailable");
     expect(durabilityDegraded?.learner_safe).toBe(true);
 
     for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {

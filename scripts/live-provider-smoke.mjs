@@ -136,13 +136,14 @@ export async function runLiveProviderSmoke({
   }
 
   if (!readinessPasses(readiness)) {
+    const readinessReason = readinessFailureSmokeReason(readiness);
     const evidence = {
       ...base,
       status: "failed",
       failure_stage: "readiness",
-      failure: liveProviderFailureForSmokeReason("readiness_not_live_selectable"),
+      failure: liveProviderFailureForSmokeReason(readinessReason),
       readiness,
-      terminal_reason: "readiness_not_live_selectable",
+      terminal_reason: readinessReason,
     };
     auditLiveSmokeEvidence(evidence, env);
     return evidence;
@@ -333,6 +334,17 @@ function readinessPasses(readiness) {
     readiness.store.durable === true &&
     readiness.store.nonce_replay_protection === true
   );
+}
+
+function readinessFailureSmokeReason(readiness) {
+  if (
+    readiness.store.available !== true ||
+    readiness.store.durable !== true ||
+    readiness.store.nonce_replay_protection !== true
+  ) {
+    return "durability_degraded";
+  }
+  return "readiness_not_live_selectable";
 }
 
 async function bootstrapSession(config, fetchImpl) {

@@ -10,6 +10,7 @@ import {
   assertBrowserStoryArtifactFiles,
   assertReleaseBrowserEvidence,
   normalizeBrowserEvidence,
+  releaseDurableStateClaim,
   shouldSkipMissingBrowserResult,
 } from "./browser-evidence.mjs";
 import {
@@ -98,6 +99,10 @@ try {
     process.env.VIVA_RELEASE_CHECK_SKIP_BROWSER === "1"
       ? await readExistingBrowserResult()
       : await runBrowserE2E();
+  const releaseDurableStateClaimed = releaseDurableStateClaim(
+    browserResult,
+    durableStateReleaseClaimed,
+  );
   const providerReadiness = await collectProviderReadiness();
   const rollbackDrain = buildRollbackReleaseEvidence();
   assertRollbackReleaseGate(rollbackDrain);
@@ -113,7 +118,7 @@ try {
     schema: "viva.release_evidence.v1",
     commands,
     release_claims: {
-      durable_state: durableStateReleaseClaimed,
+      durable_state: releaseDurableStateClaimed,
     },
     fixture_hashes: fixtureHashes,
     provider_readiness: providerReadiness,
@@ -221,7 +226,13 @@ async function readExistingBrowserResult() {
     assertReleaseBrowserEvidence(evidence);
     return evidence;
   } catch (error) {
-    if (shouldSkipMissingBrowserResult(error, process.env.VIVA_RELEASE_CHECK_SKIP_BROWSER)) {
+    if (
+      shouldSkipMissingBrowserResult(
+        error,
+        process.env.VIVA_RELEASE_CHECK_SKIP_BROWSER,
+        durableStateReleaseClaimed,
+      )
+    ) {
       return {
         skipped: true,
         reason: "VIVA_RELEASE_CHECK_SKIP_BROWSER=1 and no existing browser result was found",

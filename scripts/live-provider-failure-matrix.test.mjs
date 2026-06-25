@@ -16,6 +16,7 @@ const REQUIRED_FAILURE_CLASSES = Object.freeze([
   "timeout",
   "malformed_stream",
   "network_disconnect",
+  "durability_degraded",
   "slow_client",
   "cancellation",
   "partial_stage_success",
@@ -84,6 +85,14 @@ test("live smoke local terminal reasons map to matrix degradations", () => {
   assert.equal(
     liveProviderFailureForSmokeReason("readiness_not_live_selectable").failure_class,
     "provider_auth_failure",
+  );
+  assert.equal(
+    liveProviderFailureForSmokeReason("readiness_store_unavailable").failure_class,
+    "durability_degraded",
+  );
+  assert.equal(
+    liveProviderFailureForSmokeReason("durability_degraded").failure_class,
+    "durability_degraded",
   );
   assert.equal(liveProviderFailureForSmokeReason("recap_timeout").failure_class, "timeout");
   assert.equal(liveProviderFailureForSmokeReason("rate_limit").failure_class, "quota_rate_failure");
