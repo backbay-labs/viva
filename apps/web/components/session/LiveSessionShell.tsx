@@ -1,6 +1,11 @@
 import type { ReviewScheduleItem, SessionRecap } from "@viva/core";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
-import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
+import {
+  projectTurnTakingState,
+  type RuntimeCopy,
+  type SourceFolioProjection,
+  type VoiceTurnTakingState,
+} from "../../lib/viva-session-projection";
 import { MuseBackdrop } from "../landing/MuseBackdrop";
 import { MuseGlyphCanvas, type MuseGlyphState } from "../landing/MuseGlyphCanvas";
 import type { CheckingControl, TextAnswerState } from "./MarginaliaPanel";
@@ -29,6 +34,7 @@ export function LiveSessionShell({
   sourceFolio,
   recap,
   reviewPlan,
+  turnTaking,
   transcript,
   contextLabel,
   clockLabel,
@@ -64,6 +70,7 @@ export function LiveSessionShell({
   sourceFolio?: SourceFolioProjection;
   recap?: SessionRecap;
   reviewPlan?: ReviewScheduleItem[];
+  turnTaking?: VoiceTurnTakingState;
   transcript?: string;
   contextLabel: string;
   clockLabel?: string;
@@ -85,6 +92,14 @@ export function LiveSessionShell({
   onTryAgain: () => void;
   onNextQuestion: () => void;
 }) {
+  const voiceTurn =
+    turnTaking ??
+    projectTurnTakingState({
+      question,
+      runtime,
+      state,
+    });
+
   return (
     <section className="live-session" data-generation-id={generationId}>
       <MuseBackdrop />
@@ -131,6 +146,7 @@ export function LiveSessionShell({
               state={state}
               textMode={Boolean(textAnswer?.active)}
             />
+            <TurnTakingPanel turnTaking={voiceTurn} />
             <SessionBottomControls
               onEndSession={onEndSession}
               onShowSources={onShowSource}
@@ -162,6 +178,37 @@ export function LiveSessionShell({
           />
         </div>
       </div>
+    </section>
+  );
+}
+
+function TurnTakingPanel({ turnTaking }: { turnTaking: VoiceTurnTakingState }) {
+  return (
+    <section aria-label="Voice turn state" className="turn-taking" data-phase={turnTaking.phase}>
+      <div aria-atomic="true" aria-live="polite" className="turn-taking__status" role="status">
+        <span className="turn-taking__label">{turnTaking.label}</span>
+        <strong className="turn-taking__headline">{turnTaking.headline}</strong>
+        <span className="turn-taking__detail">{turnTaking.detail}</span>
+      </div>
+      {turnTaking.nudge ? (
+        <p className="turn-taking__nudge">
+          <span>{turnTaking.nudge.label}</span>
+          {turnTaking.nudge.text}
+        </p>
+      ) : null}
+      {turnTaking.captions.length > 0 ? (
+        <section aria-label="Spoken captions" className="turn-captions">
+          {turnTaking.captions.map((caption) => (
+            <p className="turn-captions__line" data-kind={caption.kind} key={caption.label}>
+              <span>{caption.label}</span>
+              {caption.text}
+            </p>
+          ))}
+        </section>
+      ) : null}
+      <p aria-atomic="true" aria-live="polite" className="sr-only">
+        {turnTaking.ariaStatus}
+      </p>
     </section>
   );
 }

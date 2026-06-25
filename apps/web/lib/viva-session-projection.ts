@@ -50,6 +50,38 @@ export type TraceProjection = {
   hasAgentQuestion: boolean;
 };
 
+export type VoiceTurnPhase =
+  | "preparing"
+  | "listening"
+  | "thinking"
+  | "speaking"
+  | "feedback"
+  | "source"
+  | "recap"
+  | "recovery";
+
+export type VoiceTurnCaption = {
+  kind: "feedback" | "question" | "reprompt";
+  label: string;
+  text: string;
+};
+
+export type VoiceTurnNudge = {
+  label: string;
+  text: string;
+};
+
+export type VoiceTurnTakingState = {
+  phase: VoiceTurnPhase;
+  label: string;
+  headline: string;
+  detail: string;
+  captions: VoiceTurnCaption[];
+  nudge?: VoiceTurnNudge;
+  interruptAcknowledged: boolean;
+  ariaStatus: string;
+};
+
 export type SourceFolioState = "present" | "low_confidence" | "conflicting" | "unavailable";
 
 export type SourceFolioProjection = {
@@ -1051,4 +1083,183 @@ export function projectTrace(
 
 function terminalReasonWithoutRecap(derived: VivaAgentDerivedState): boolean {
   return Boolean(derived.terminalReason) && !derived.recap;
+}
+
+export function projectTurnTakingState(input: {
+  hasPendingAudio?: boolean;
+  interruptAcknowledged?: boolean;
+  playbackSpeaking?: boolean;
+  question: Question;
+  runtime?: RuntimeCopy;
+  state: SessionState;
+  textAnswerFallbackActive?: boolean;
+}): VoiceTurnTakingState {
+  const interruptAcknowledged = Boolean(input.interruptAcknowledged);
+  const captions = turnCaptions(input.question);
+  const nudge = turnNudge({
+    interruptAcknowledged,
+    textAnswerFallbackActive: input.textAnswerFallbackActive,
+  });
+  const speaking = Boolean(input.hasPendingAudio || input.playbackSpeaking);
+  const base = turnBaseState({
+    pending: Boolean(input.question.pending),
+    recovery: Boolean(input.question.terminal) || runtimeNeedsRecovery(input.runtime),
+    runtime: input.runtime,
+    speaking,
+    state: input.state,
+  });
+  const ariaStatus = compactSentences([
+    base.label,
+    base.headline,
+    base.detail,
+    nudge ? `${nudge.label}: ${nudge.text}` : undefined,
+    captions.length > 0
+      ? `Captions available: ${captions.map((caption) => caption.label).join(", ")}`
+      : undefined,
+  ]);
+
+  return {
+    ...base,
+    ariaStatus,
+    captions,
+    interruptAcknowledged,
+    nudge,
+  };
+}
+
+function turnBaseState(input: {
+  pending: boolean;
+  recovery: boolean;
+  runtime?: RuntimeCopy;
+  speaking: boolean;
+  state: SessionState;
+}): Pick<VoiceTurnTakingState, "detail" | "headline" | "label" | "phase"> {
+  if (input.pending) {
+    return {
+      detail: "Waiting for the examiner to open the first turn.",
+      headline: "Preparing the question.",
+      label: "Preparing",
+      phase: "preparing",
+    };
+  }
+
+  if (input.recovery) {
+    return {
+      detail: input.runtime?.nextActionLabel ?? "Recover the session before answering again.",
+      headline: input.runtime?.marginaliaTitle ?? "The voice turn is paused.",
+      label: input.runtime?.capsuleLabel ?? "Recovery",
+      phase: "recovery",
+    };
+  }
+
+  if (input.speaking) {
+    return {
+      detail: "Feedback audio is playing while the captions stay visible.",
+      headline: "Viva is speaking.",
+      label: "Speaking",
+      phase: "speaking",
+    };
+  }
+
+  switch (input.state) {
+    case "thinking":
+      return {
+        detail: "Your answer is saved while Viva checks the bounded source.",
+        headline: "Checking your answer.",
+        label: "Checking",
+        phase: "thinking",
+      };
+    case "correction":
+      return {
+        detail: "Feedback is ready in the captions and margin.",
+        headline: "Review the feedback.",
+        label: "Feedback",
+        phase: "feedback",
+      };
+    case "source":
+      return {
+        detail: "The cited source is open for the next answer.",
+        headline: "Use the source reference.",
+        label: "Source",
+        phase: "source",
+      };
+    case "recap":
+      return {
+        detail: "The session recap and review plan are ready.",
+        headline: "Session recap ready.",
+        label: "Recap",
+        phase: "recap",
+      };
+    case "listening":
+      return {
+        detail: "Speak now; if nothing is captured, Viva will offer the text answer path.",
+        headline: "Listening for your answer.",
+        label: "Your turn",
+        phase: "listening",
+      };
+  }
+}
+
+function runtimeNeedsRecovery(runtime?: RuntimeCopy): boolean {
+  if (!runtime) return false;
+  if (runtime.primaryActionDisabled) return true;
+  if (
+    runtime.primaryActionIntent === "retry_agent" ||
+    runtime.primaryActionIntent === "refresh_session"
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function turnCaptions(question: Question): VoiceTurnCaption[] {
+  if (question.pending || question.terminal) return [];
+  const captions: VoiceTurnCaption[] = [
+    {
+      kind: "question",
+      label: "Question",
+      text: question.prompt,
+    },
+  ];
+  if (question.correctionBody.trim()) {
+    captions.push({
+      kind: "feedback",
+      label: "Feedback",
+      text: question.correctionBody,
+    });
+  }
+  if (question.retryPrompt?.trim()) {
+    captions.push({
+      kind: "reprompt",
+      label: "Try again",
+      text: question.retryPrompt,
+    });
+  }
+  return captions;
+}
+
+function turnNudge(input: {
+  interruptAcknowledged: boolean;
+  textAnswerFallbackActive?: boolean;
+}): VoiceTurnNudge | undefined {
+  if (input.interruptAcknowledged) {
+    return {
+      label: "Interruption acknowledged",
+      text: "Viva stopped speaking and is listening again.",
+    };
+  }
+  if (input.textAnswerFallbackActive) {
+    return {
+      label: "No speech captured",
+      text: "Write the answer here or try speaking again.",
+    };
+  }
+  return undefined;
+}
+
+function compactSentences(parts: Array<string | undefined>): string {
+  return parts
+    .filter((part): part is string => Boolean(part?.trim()))
+    .map((part) => part.replace(/\s+/g, " ").trim())
+    .join(" ");
 }

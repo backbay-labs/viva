@@ -12,6 +12,7 @@ import {
   projectRuntimeCopy,
   type RuntimeCopy,
   type SourceFolioProjection,
+  type VoiceTurnTakingState,
 } from "../../lib/viva-session-projection";
 import { LiveSessionShell } from "./LiveSessionShell";
 import { MarginaliaPanel } from "./MarginaliaPanel";
@@ -481,6 +482,111 @@ describe("LiveSessionShell scene intent wiring", () => {
     );
 
     expect(markup).toContain('data-generation-id="session_bootstrap-1"');
+  });
+
+  test("renders voice turn state, captions, and the screen-reader live status in the plate", () => {
+    const turnTaking: VoiceTurnTakingState = {
+      ariaStatus: "Speaking. Viva is speaking. Feedback audio is playing.",
+      captions: [
+        { kind: "question", label: "Question", text: "Explain the role of NADH." },
+        { kind: "feedback", label: "Feedback", text: "Connect NADH to the proton gradient." },
+      ],
+      detail: "Feedback audio is playing while the captions stay visible.",
+      headline: "Viva is speaking.",
+      interruptAcknowledged: false,
+      label: "Speaking",
+      phase: "speaking",
+    };
+
+    const markup = renderToStaticMarkup(
+      <LiveSessionShell
+        clockLabel="Fixture clock"
+        conceptNodes={[]}
+        contextLabel="Trusted server set: Biology Midterm"
+        elapsed={5}
+        glyphState="listening"
+        highlightedTokens={[]}
+        hintShown={false}
+        levelRef={{ current: { agent: 0.6, user: 0 } }}
+        onBackToQuestion={noop}
+        onEndSession={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        runtime={runtime}
+        state="correction"
+        turnTaking={turnTaking}
+      />,
+    );
+
+    expect(markup).toContain('aria-label="Voice turn state"');
+    expect(markup).toContain('data-phase="speaking"');
+    expect(markup).toContain('role="status"');
+    expect(markup).toContain('aria-live="polite"');
+    expect(markup).toContain("Viva is speaking.");
+    expect(markup).toContain('aria-label="Spoken captions"');
+    expect(markup).toContain("Question");
+    expect(markup).toContain("Feedback");
+    expect(markup).toContain("Connect NADH to the proton gradient.");
+  });
+
+  test("renders no-speech and barge-in nudges as learner-safe visible states", () => {
+    const noSpeech: VoiceTurnTakingState = {
+      ariaStatus: "Your turn. Listening for your answer. No speech captured.",
+      captions: [{ kind: "question", label: "Question", text: "Explain the role of NADH." }],
+      detail: "Speak now; if nothing is captured, Viva will offer the text answer path.",
+      headline: "Listening for your answer.",
+      interruptAcknowledged: false,
+      label: "Your turn",
+      nudge: { label: "No speech captured", text: "Write the answer here or try speaking again." },
+      phase: "listening",
+    };
+    const interrupted: VoiceTurnTakingState = {
+      ...noSpeech,
+      ariaStatus: "Your turn. Listening for your answer. Interruption acknowledged.",
+      interruptAcknowledged: true,
+      nudge: {
+        label: "Interruption acknowledged",
+        text: "Viva stopped speaking and is listening again.",
+      },
+    };
+
+    const renderTurn = (turnTaking: VoiceTurnTakingState) =>
+      renderToStaticMarkup(
+        <LiveSessionShell
+          clockLabel="Fixture clock"
+          conceptNodes={[]}
+          contextLabel="Trusted server set: Biology Midterm"
+          elapsed={5}
+          glyphState="listening"
+          highlightedTokens={[]}
+          hintShown={false}
+          onBackToQuestion={noop}
+          onEndSession={noop}
+          onHint={noop}
+          onNextQuestion={noop}
+          onShowSource={noop}
+          onSubmitAnswer={noop}
+          onTryAgain={noop}
+          question={question}
+          runtime={runtime}
+          state="listening"
+          turnTaking={turnTaking}
+        />,
+      );
+
+    const noSpeechMarkup = renderTurn(noSpeech);
+    const interruptedMarkup = renderTurn(interrupted);
+
+    expect(noSpeechMarkup).toContain("No speech captured");
+    expect(noSpeechMarkup).toContain("Write the answer here");
+    expect(interruptedMarkup).toContain("Interruption acknowledged");
+    expect(interruptedMarkup).toContain("stopped speaking");
+    expect(/raw audio|pcm16|session_token|source excerpt/i.test(noSpeechMarkup)).toBe(false);
+    expect(/raw audio|pcm16|session_token|source excerpt/i.test(interruptedMarkup)).toBe(false);
   });
 
   test("renders fake provider readiness as a non-live test path", () => {
