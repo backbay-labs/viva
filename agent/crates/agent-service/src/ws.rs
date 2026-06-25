@@ -1296,7 +1296,7 @@ async fn authorize_browser_event(
 }
 
 fn store_error_is_durability_degraded(state: &AppState, error: &PortError) -> bool {
-    state.study_store.capabilities().durable && matches!(error, PortError::Unavailable { .. })
+    state.study_store.capabilities().durable && matches!(error, PortError::Adapter { .. })
 }
 
 fn store_write_error_is_durability_degraded(state: &AppState, error: &PortError) -> bool {

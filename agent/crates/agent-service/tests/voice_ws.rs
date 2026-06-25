@@ -3476,7 +3476,7 @@ async fn websocket_durable_store_failure_mid_turn_emits_durability_degraded_term
     let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let store = Arc::new(DurableStoreDegradingStore {
         inner: inner.clone(),
-        failure: DurableStoreFailureMode::QuestionAuthorization,
+        failure: DurableStoreFailureMode::QuestionAuthorizationWriteFailure,
     });
     let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
     let state_store: Arc<dyn StudyMemoryStore> = store.clone();
@@ -3524,6 +3524,54 @@ async fn websocket_durable_store_failure_mid_turn_emits_durability_degraded_term
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::TerminalReason
             && event.detail == "durability_degraded"
+    }));
+}
+
+#[tokio::test]
+async fn websocket_durable_semantic_authority_miss_remains_provider_source_rejected() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(DurableStoreDegradingStore {
+        inner: inner.clone(),
+        failure: DurableStoreFailureMode::QuestionAuthorizationSemanticMiss,
+    });
+    let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(EventProbeBrain {
+            study_store: Some(brain_store),
+            events: vec![BrainEvent::QuestionStarted {
+                response_id: "response-1".to_owned(),
+                question: agent_domain::fixture_question(),
+            }],
+        }),
+        "event_probe",
+        VoiceWsAccess::default(),
+        4,
+        state_store,
+    );
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/synthetic-study-session.json"
+    ))
+    .unwrap();
+
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
+        panic!("expected ready frame");
+    };
+    assert!(store.durable);
+    send_client_frame(&mut socket, &fixture.client[0]).await;
+
+    let frames = read_server_frames_until_close(&mut socket).await;
+
+    assert!(frames.iter().any(|frame| matches!(
+        frame,
+        ServerFrame::Error { message, .. } if message == "provider source authority rejected"
+    )));
+    assert!(frames.iter().all(|frame| {
+        terminal_session_reason(frame) != Some(TerminalSessionReason::DurabilityDegraded)
     }));
 }
 
@@ -6782,7 +6830,8 @@ impl RealtimeBrain for OpenProbeBrain {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DurableStoreFailureMode {
-    QuestionAuthorization,
+    QuestionAuthorizationSemanticMiss,
+    QuestionAuthorizationWriteFailure,
     UsageRecording,
 }
 
@@ -6838,17 +6887,27 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         voice_session_id: &str,
         question: &StudyQuestion,
     ) -> Result<(), PortError> {
-        if self.failure != DurableStoreFailureMode::QuestionAuthorization {
+        if self.failure != DurableStoreFailureMode::QuestionAuthorizationSemanticMiss
+            && self.failure != DurableStoreFailureMode::QuestionAuthorizationWriteFailure
+        {
             return self
                 .inner
                 .authorize_question_started(user_id, study_set_id, voice_session_id, question)
                 .await;
         }
-        Err(PortError::unavailable(
-            "postgres",
-            &question.question_id,
-            "durable store unavailable",
-        ))
+        match self.failure {
+            DurableStoreFailureMode::QuestionAuthorizationSemanticMiss => {
+                Err(PortError::unavailable(
+                    "postgres",
+                    &question.question_id,
+                    "question is not active for this study set",
+                ))
+            }
+            DurableStoreFailureMode::QuestionAuthorizationWriteFailure => {
+                Err(PortError::adapter("postgres", "durable store read failed"))
+            }
+            DurableStoreFailureMode::UsageRecording => unreachable!(),
+        }
     }
 
     async fn record_answer_evaluation(
