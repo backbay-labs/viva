@@ -3615,7 +3615,7 @@ async fn websocket_session_cap_emits_terminal_phase_before_close() {
 }
 
 #[tokio::test]
-async fn websocket_user_session_cap_emits_terminal_phase_and_releases_after_close() {
+async fn websocket_user_study_set_cap_stays_one_when_user_session_knob_is_above_one() {
     let dropped = Arc::new(AtomicBool::new(false));
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let state = AppState::with_study_store(
@@ -3628,7 +3628,7 @@ async fn websocket_user_session_cap_emits_terminal_phase_and_releases_after_clos
         store,
     )
     .with_voice_limits(VoiceLimitConfig {
-        max_user_sessions: Some(1),
+        max_user_sessions: Some(2),
         ..VoiceLimitConfig::default()
     });
     let evidence = state.evidence.clone();

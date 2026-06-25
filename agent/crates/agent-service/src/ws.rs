@@ -41,6 +41,7 @@ use crate::{
 const TERMINAL_EVENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const RECONNECT_LEASE_GRACE: Duration = Duration::from_millis(250);
 const RECONNECT_LEASE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_ACTIVE_SESSIONS_PER_USER_STUDY_SET: usize = 1;
 
 pub async fn voice_ws(
     State(state): State<AppState>,
@@ -331,11 +332,11 @@ async fn handle_socket(
         _ => None,
     };
     let _user_lease = match state.voice_limits.max_user_sessions {
-        Some(max) => match acquire_user_study_set_with_reconnect_grace(
+        Some(_) => match acquire_user_study_set_with_reconnect_grace(
             &state.limit_state,
             &session_binding.user_id,
             &session_binding.study_set_id,
-            max,
+            MAX_ACTIVE_SESSIONS_PER_USER_STUDY_SET,
             RECONNECT_LEASE_GRACE,
         )
         .await
