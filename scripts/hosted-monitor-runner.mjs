@@ -7,6 +7,12 @@ import path from "node:path";
 import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { auditTextArtifacts } from "./redaction-control.mjs";
+import {
+  buildHostedE2eMatrixContract,
+  defaultMatrixProfile,
+  failureControlScenarioIdsForProfile,
+  summarizeHostedE2eResult,
+} from "./hosted-e2e-matrix.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const hostedArtifactRoot = path.join(root, "artifacts/hosted-monitor");
@@ -36,6 +42,12 @@ export function buildHostedMonitorPlan(env = process.env) {
   const runId = sanitizeRunId(
     env.VIVA_HOSTED_RUN_ID || new Date().toISOString().replaceAll(/[:.]/g, "-"),
   );
+  const matrixProfile = (env.VIVA_HOSTED_MATRIX_PROFILE || defaultMatrixProfile(mode)).trim();
+  const matrix = buildHostedE2eMatrixContract({
+    mode,
+    profile: matrixProfile,
+    runId,
+  });
   const artifactPrefix = `viva-hosted-monitor/${mode}/${runId}`;
   const baseTarget = hostedTargetFromEnv(env, {
     agentHttpName: "VIVA_HOSTED_AGENT_HTTP_URL",
@@ -74,12 +86,21 @@ export function buildHostedMonitorPlan(env = process.env) {
           webName: "VIVA_HOSTED_FAILURE_CONTROL_WEB_URL",
         })
       : null;
+  const failureControlScenarioIds =
+    mode === "pr"
+      ? failureControlScenarioIdsForProfile({
+          configuredValue: env.VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS ?? "",
+          profile: matrixProfile,
+        })
+      : [];
   const runs =
     mode === "scheduled"
       ? [
           {
             name: "scheduled_hosted_synthetic_monitor",
+            scenario_id: "happy_path",
             env: runEnv(baseEnv, syntheticTarget, {
+              VIVA_E2E_HOSTED_SCENARIO_ID: "happy_path",
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
             }),
             timeoutMs: runTimeoutMs,
@@ -88,23 +109,28 @@ export function buildHostedMonitorPlan(env = process.env) {
       : [
           {
             name: "pr_hosted_synthetic_matrix",
+            scenario_id: "happy_path",
             env: runEnv(baseEnv, syntheticTarget, {
+              VIVA_E2E_HOSTED_SCENARIO_ID: "happy_path",
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "1",
             }),
             timeoutMs: runTimeoutMs,
           },
           {
             name: "pr_hosted_fake_provider_matrix",
+            scenario_id: "fake_provider_happy_path",
             env: runEnv(baseEnv, fakeTarget, {
+              VIVA_E2E_HOSTED_SCENARIO_ID: "fake_provider_happy_path",
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
             }),
             timeoutMs: runTimeoutMs,
           },
-          {
-            name: "pr_hosted_failure_control_provider_rate_limited",
+          ...failureControlScenarioIds.map((scenarioId) => ({
+            name: `pr_hosted_failure_control_${scenarioId}`,
+            scenario_id: scenarioId,
             env: runEnv(baseEnv, failureControlTarget, {
-              VIVA_E2E_FAILURE_CONTROL_SCENARIO:
-                env.VIVA_E2E_FAILURE_CONTROL_SCENARIO || "provider_rate_limited",
+              VIVA_E2E_FAILURE_CONTROL_SCENARIO: scenarioId,
+              VIVA_E2E_HOSTED_SCENARIO_ID: scenarioId,
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
               VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS: failureControlTarget.webUrl,
               VIVA_FAILURE_CONTROL_ENABLED: "1",
@@ -115,7 +141,7 @@ export function buildHostedMonitorPlan(env = process.env) {
               VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS: syntheticUserId,
             }),
             timeoutMs: runTimeoutMs,
-          },
+          })),
         ];
 
   return {
@@ -130,6 +156,8 @@ export function buildHostedMonitorPlan(env = process.env) {
     hostedAgentHttpUrl: baseTarget.agentHttpUrl,
     hostedAgentWsUrl: baseTarget.agentWsUrl,
     hostedWebUrl: baseTarget.webUrl,
+    matrix,
+    matrixProfile,
     mode,
     publishTimeoutMs,
     runId,
@@ -194,6 +222,7 @@ async function main() {
     mode: plan.mode,
     run_id: plan.runId,
     artifact_prefix: plan.artifactPrefix,
+    hosted_e2e_matrix: plan.matrix,
     hosted_web_origin: plan.hostedWebUrl,
     hosted_agent_origin: plan.hostedAgentHttpUrl,
     runner_identity: {
@@ -292,6 +321,7 @@ export function summarizeHostedRun(run, runDir, resultDir, outcome, result, root
       : (result?.browser_story_artifact ?? null);
   return {
     name: run.name,
+    scenario_id: run.scenario_id ?? result?.hosted_e2e?.scenario_id ?? null,
     artifact_dir: path.relative(rootDir, runDir),
     status: outcome.status,
     failure_class: outcome.failure_class ?? null,
@@ -309,6 +339,7 @@ export function summarizeHostedRun(run, runDir, resultDir, outcome, result, root
           sanitized: result.failure_control_terminal.sanitized === true,
         }
       : null,
+    hosted_e2e: summarizeHostedE2eResult(result),
     manuscript_ready: result?.manuscript_ready === true,
     page_error_count: Array.isArray(result?.page_errors) ? result.page_errors.length : 0,
     sanitized: true,

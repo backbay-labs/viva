@@ -404,7 +404,10 @@ VIVA_HOSTED_RUNNER_MODE=scheduled
 It runs one hosted Playwright browser-story proof against hosted web + hosted
 agent, using a synthetic monitor identity, then publishes sanitized evidence to
 the object prefix `viva-hosted-monitor/scheduled/<run_id>/` in the durable
-artifact store.
+artifact store. The scheduled manifest includes the BAC-524 hosted matrix
+contract and the BAC-510 evidence-field contract, but only the high-cadence
+synthetic happy-path leg runs on the cron cadence. The cron cadence remains 30
+minutes, so the synthetic monitor is bounded to at most 48 runs per day.
 
 The PR-equivalent trigger uses the same service image with:
 
@@ -414,9 +417,39 @@ VIVA_HOSTED_RUNNER_MODE=pr
 
 Run that mode from a Railway deployment or manual service run for the branch
 under review. It executes the hosted synthetic provider leg, hosted
-`fake_cartesia_gemini` provider leg, and the BAC-528 failure-control browser
-slice, including a deterministic provider-rate-limited terminal path. It
-publishes under `viva-hosted-monitor/pr/<run_id>/`.
+`fake_cartesia_gemini` provider leg, and the BAC-528 deterministic
+failure-control browser matrix for provider 429, provider timeout, silent stall,
+provider auth failure, malformed stream, network disconnect, Sonic/TTS timeout,
+recap timeout, invalid/expired/replayed/malformed auth material, stale socket,
+double submit, mic denied, and typed fallback. The default PR profile is
+`VIVA_HOSTED_MATRIX_PROFILE=full`; to run a smaller operational subset during
+manual triage, set `VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS` to a comma
+separated list such as:
+
+```sh
+VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS="provider_rate_limited,provider_timeout"
+```
+
+The full PR manifest publishes under `viva-hosted-monitor/pr/<run_id>/` and
+records one sanitized `hosted_e2e` result summary per scenario. The matrix
+contract also names future product slices for ingestion/pre-loop failure
+(`BAC-532`) and second-tab reconciliation (`BAC-535`) without treating them as
+passing default PR legs before their owning product issues land.
+
+The optional live monitor is low cadence and opt-in only:
+
+```sh
+VIVA_HOSTED_LIVE_MONITOR_ENABLED=1
+```
+
+Do not enable it until live provider zero-retention confirmations and Gemini
+quota evidence are current. The BAC-524 policy caps it to one turn, 90 seconds,
+262144 audio bytes, 0.25 USD per run, 0.50 USD per day, 4096 tokens per run,
+8192 tokens per day, at most two runs per day, and a minimum six-hour cadence.
+The live monitor must charge the separate `viva-monitor-live-smoke` budget
+bucket, never learner traffic. If the monitor itself observes two consecutive
+provider-rate-limit terminal results inside one hour, self-quarantine live runs
+for six hours and dedupe alerts for 30 minutes.
 
 Required monitor variables:
 
@@ -425,6 +458,7 @@ VIVA_HOSTED_WEB_URL="https://viva-web.example.com"
 VIVA_HOSTED_AGENT_HTTP_URL="https://viva-agent.example.com"
 VIVA_HOSTED_AGENT_WS_URL="wss://viva-agent.example.com/ws"
 VIVA_E2E_AGENT_PROVIDER="synthetic"
+VIVA_HOSTED_MATRIX_PROFILE="full"
 VIVA_HOSTED_REST_BEARER_TOKEN="<from the hosted agent REST auth secret store>"
 VIVA_HOSTED_FAKE_PROVIDER_WEB_URL="https://viva-fake-web.example.com"
 VIVA_HOSTED_FAKE_PROVIDER_AGENT_HTTP_URL="https://viva-fake-agent.example.com"
@@ -456,11 +490,15 @@ by key name and service configuration only.
 
 The hosted monitor evidence is safe to attach only after `manifest.json` reports
 `learner_identity_used: false`, each run reports `sanitized: true`, and the
-artifact upload summary reports the expected durable object prefix. The durable
-bundle intentionally publishes only text, JSON, and log artifacts; screenshots,
-traces, archives, HAR files, and other binary browser captures are local-only and
-must not be uploaded as hosted evidence. BAC-526 reads that object prefix as the
-hosted-browser evidence bundle; `/ready` alone, a local-only run, or
+artifact upload summary reports the expected durable object prefix. Each
+scenario result must include web URL, agent URL, web/agent deploy IDs when
+available, provider/model, control mode, Postgres durability, terminal reason,
+failure class, stage, latency, usage/cost, token-refresh outcome, recap success,
+log correlation, and a redaction audit. The durable bundle intentionally
+publishes only text, JSON, and log artifacts; screenshots, traces, archives, HAR
+files, and other binary browser captures are local-only and must not be uploaded
+as hosted evidence. BAC-526 reads that object prefix as the hosted-browser
+evidence bundle; `/ready` alone, a local-only run, or
 `VIVA_RELEASE_CHECK_SKIP_BROWSER=1` is not production-ready evidence.
 
 ## Rollback And Drain

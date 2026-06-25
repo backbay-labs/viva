@@ -17,6 +17,7 @@ import {
   parseFailureControlSessionTarget,
 } from "./failure-control-harness.mjs";
 import { auditTextArtifacts } from "./redaction-control.mjs";
+import { buildHostedBrowserEvidence, withHostedEvidenceAudit } from "./hosted-e2e-matrix.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactDir = path.resolve(
@@ -65,6 +66,8 @@ if (!allowedBrowserStoryProviders.has(agentProvider)) {
   );
 }
 const stopToRecap = process.env.VIVA_E2E_STOP_TO_RECAP === "1";
+const hostedScenarioId =
+  process.env.VIVA_E2E_HOSTED_SCENARIO_ID?.trim() || defaultHostedScenarioId();
 const traceRequested = process.env.VIVA_E2E_TRACE === "1";
 if (hostedMode && traceRequested) {
   throw new Error("Hosted browser E2E cannot retain Playwright traces.");
@@ -485,6 +488,22 @@ try {
   const browserStory = await buildBrowserStoryManifest({
     traceRetained: Boolean(traceArtifact),
   });
+  const screenshots = [
+    "pending-local-preview.png",
+    "server-ready-study-set.png",
+    ...(!sessionTokenFailureScenario ? ["session-ready.png", "source-folio.png"] : []),
+    ...(correctionMarginaliaVisible ? ["correction-marginalia.png"] : []),
+    ...(!failureControlPlan.enabled && !stopToRecap && requirePostAnswerSourceFolio
+      ? ["post-answer-source-folio.png"]
+      : []),
+    ...(failureControlPlan.enabled
+      ? ["failure-control-terminal.png"]
+      : ["connected-terminal-fold.png"]),
+  ];
+  const terminalReason =
+    failureControlTerminalProof?.terminal_reason ?? (recapPayloadVisible ? "completed" : null);
+  const hostedEvidenceStage =
+    failureControlTerminalProof?.stage ?? (recapPayloadVisible ? "feedback" : null);
   let result = {
     artifact_dir: path.relative(root, artifactDir),
     agent_provider: agentProvider,
@@ -522,23 +541,30 @@ try {
     written_answer_fallback_used: writtenAnswerFallbackUsed,
     local_only_actions_hidden: !shareVisible && !localScheduleVisible,
     session_url_lifecycle: sessionUrlLifecycle,
+    hosted_e2e: buildHostedBrowserEvidence({
+      agentUrl,
+      controlMode: failureControlPlan.enabled ? "failure_control" : "none",
+      deployIds: hostedDeployIds(),
+      failureClass: failureControlTerminalProof?.failure_class ?? null,
+      hostedMode,
+      postgresDurability: hostedPostgresDurability(),
+      provider: agentProvider,
+      recapSuccess: recapPayloadVisible,
+      runId: process.env.VIVA_HOSTED_RUN_ID?.trim() || null,
+      scenarioId: hostedScenarioId,
+      screenshots,
+      stage: hostedEvidenceStage,
+      terminalReason,
+      tokenRefreshOutcome:
+        sessionUrlLifecycle?.passed === true ? "canonicalized_visible_url" : "not_observed",
+      trace: traceArtifact,
+      webUrl,
+    }),
     browser_story: browserStory,
     browser_story_artifact: "browser-story.json",
     console_errors: consoleErrors,
     page_errors: pageErrors,
-    screenshots: [
-      "pending-local-preview.png",
-      "server-ready-study-set.png",
-      ...(!sessionTokenFailureScenario ? ["session-ready.png", "source-folio.png"] : []),
-      ...(secondTabSessionCap ? ["second-tab-session-cap.png"] : []),
-      ...(correctionMarginaliaVisible ? ["correction-marginalia.png"] : []),
-      ...(!failureControlPlan.enabled && !stopToRecap && requirePostAnswerSourceFolio
-        ? ["post-answer-source-folio.png"]
-        : []),
-      ...(failureControlPlan.enabled
-        ? ["failure-control-terminal.png"]
-        : ["connected-terminal-fold.png"]),
-    ],
+    screenshots,
     trace: traceArtifact,
   };
   result = await writeAuditedBrowserStoryResult(result);
@@ -772,6 +798,31 @@ function hostedSyntheticIdentity() {
       process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID?.trim() ||
       "user-1",
   };
+}
+
+function defaultHostedScenarioId() {
+  if (failureControlPlan.enabled) return failureControlPlan.scenario.id;
+  if (stopToRecap) return "deterministic_partial_recap";
+  if (agentProvider === "fake_cartesia_gemini") return "fake_provider_happy_path";
+  return "happy_path";
+}
+
+function hostedDeployIds() {
+  return {
+    agent:
+      process.env.VIVA_E2E_AGENT_DEPLOY_ID?.trim() ||
+      process.env.VIVA_HOSTED_AGENT_DEPLOY_ID?.trim() ||
+      null,
+    web:
+      process.env.VIVA_E2E_WEB_DEPLOY_ID?.trim() ||
+      process.env.VIVA_HOSTED_WEB_DEPLOY_ID?.trim() ||
+      null,
+  };
+}
+
+function hostedPostgresDurability() {
+  if (process.env.VIVA_E2E_POSTGRES_DURABLE === "1") return "durable";
+  return hostedMode ? "hosted_not_asserted" : "loopback_not_asserted";
 }
 
 function assertHostedSyntheticIdentity(identity) {
@@ -1358,13 +1409,16 @@ async function writeAuditedBrowserStoryResult(baseResult) {
       result.browser_story.trace_retained && !hostedMode
         ? skippedLocalTraceArtifactAudit()
         : await auditBrowserStoryArtifacts(artifactDir);
-    result = {
-      ...result,
-      browser_story: {
-        ...result.browser_story,
-        artifact_audit: artifactAudit,
+    result = withHostedEvidenceAudit(
+      {
+        ...result,
+        browser_story: {
+          ...result.browser_story,
+          artifact_audit: artifactAudit,
+        },
       },
-    };
+      artifactAudit,
+    );
   }
   await writeFile(storyPath, `${JSON.stringify(result.browser_story, null, 2)}\n`);
   await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`);

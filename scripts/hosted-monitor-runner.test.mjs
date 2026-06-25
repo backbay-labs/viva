@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { FAILURE_CONTROL_SCENARIOS } from "./failure-control-harness.mjs";
 import {
   buildHostedMonitorPlan,
   buildObjectKey,
@@ -54,12 +55,17 @@ test("hosted monitor plan runs scheduled synthetic browser proof against hosted 
   assert.equal(plan.runs[0].env.VIVA_E2E_SYNTHETIC_USER_ID, "synthetic-monitor-user");
   assert.equal(plan.runs[0].env.VIVA_E2E_SYNTHETIC_STUDY_SET_ID, "biology-midterm");
   assert.equal(plan.runs[0].env.VIVA_E2E_STOP_TO_RECAP, undefined);
+  assert.equal(plan.runs[0].env.VIVA_E2E_HOSTED_SCENARIO_ID, "happy_path");
   assert.equal(plan.runs[0].env.VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO, "0");
+  assert.equal(plan.matrix.schema, "viva.hosted_e2e_matrix.v1");
+  assert.equal(plan.matrix.profile, "scheduled");
+  assert.equal(plan.matrix.scenario_count, 2);
+  assert.equal(plan.matrix.monitor_policy.live_monitor.max_cost_usd_per_run, 0.25);
   assert.equal(plan.runTimeoutMs, 600000);
   assert.equal(plan.publishTimeoutMs, 120000);
 });
 
-test("hosted monitor PR mode includes the failure-control browser slice", () => {
+test("hosted monitor PR mode expands the deterministic failure-control matrix", () => {
   const plan = buildHostedMonitorPlan({
     ...baseEnv,
     VIVA_FAILURE_CONTROL_SECRET: "redacted-control-secret",
@@ -67,17 +73,22 @@ test("hosted monitor PR mode includes the failure-control browser slice", () => 
   });
 
   assert.equal(plan.mode, "pr");
+  assert.equal(plan.matrixProfile, "full");
+  assert.equal(plan.matrix.scenario_count, 4 + FAILURE_CONTROL_SCENARIOS.length);
   assert.deepEqual(
     plan.runs.map((run) => run.name),
     [
       "pr_hosted_synthetic_matrix",
       "pr_hosted_fake_provider_matrix",
-      "pr_hosted_failure_control_provider_rate_limited",
+      ...FAILURE_CONTROL_SCENARIOS.map((scenario) => `pr_hosted_failure_control_${scenario.id}`),
     ],
   );
   assert.equal(plan.runs[1].env.VIVA_E2E_AGENT_PROVIDER, "fake_cartesia_gemini");
   assert.equal(plan.runs[1].env.VIVA_E2E_HOSTED_WEB_URL, "https://fake-web.example.com");
+  assert.equal(plan.runs[1].env.VIVA_E2E_HOSTED_SCENARIO_ID, "fake_provider_happy_path");
+  assert.equal(plan.runs[2].scenario_id, FAILURE_CONTROL_SCENARIOS[0].id);
   assert.equal(plan.runs[2].env.VIVA_E2E_FAILURE_CONTROL_SCENARIO, "provider_rate_limited");
+  assert.equal(plan.runs[2].env.VIVA_E2E_HOSTED_SCENARIO_ID, "provider_rate_limited");
   assert.equal(plan.runs[2].env.VIVA_E2E_HOSTED_WEB_URL, "https://failure-web.example.com");
   assert.equal(
     plan.runs[2].env.VIVA_E2E_HOSTED_AGENT_HTTP_URL,
@@ -90,6 +101,20 @@ test("hosted monitor PR mode includes the failure-control browser slice", () => 
   assert.equal(plan.runs[2].env.VIVA_FAILURE_CONTROL_ENABLED, "1");
   assert.equal(plan.runs[2].env.VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS, "synthetic-monitor-user");
   assert.equal(plan.runs[2].env.VIVA_FAILURE_CONTROL_STUDY_SET_IDS, "biology-midterm");
+});
+
+test("hosted monitor PR mode allows a smaller explicit failure-control scenario subset", () => {
+  const plan = buildHostedMonitorPlan({
+    ...baseEnv,
+    VIVA_FAILURE_CONTROL_SECRET: "redacted-control-secret",
+    VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS: "provider_rate_limited,provider_timeout",
+    VIVA_HOSTED_RUNNER_MODE: "pr",
+  });
+
+  assert.deepEqual(
+    plan.runs.map((run) => run.scenario_id),
+    ["happy_path", "fake_provider_happy_path", "provider_rate_limited", "provider_timeout"],
+  );
 });
 
 test("hosted monitor rejects learner-like runner identities", () => {
