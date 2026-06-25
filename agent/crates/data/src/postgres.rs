@@ -2138,39 +2138,12 @@ impl StudyMemoryStore for PostgresStudyStore {
         let concept_uuid = self.concept_uuid_for(study_set_uuid, concept_id).await?;
         self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
             .await?;
-        let duplicate = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM review_items
-                WHERE user_id = $1
-                  AND study_set_id = $2
-                  AND concept_id = $3
-                  AND due_at = $4::timestamptz
-                  AND voice_session_id = $5
-                  AND status = 'scheduled'
-             )",
-        )
-        .bind(user_id)
-        .bind(study_set_uuid)
-        .bind(concept_uuid)
-        .bind(due_at)
-        .bind(voice_session_uuid)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(pg_error)?;
-        if duplicate {
-            return Ok(
-                json!({ "concept_id": concept_id, "due_at": due_at, "status": "scheduled" }),
-            );
-        }
         let result = sqlx::query(
             "INSERT INTO review_items (id, user_id, study_set_id, concept_id, due_at, reason, status, voice_session_id)
-             SELECT $1, $2, $3, $4, $5::timestamptz, 'voice_session', 'scheduled', $6
-             WHERE EXISTS (
-                 SELECT 1 FROM concepts c
-                 JOIN study_sets s ON s.id = c.study_set_id
-                 WHERE c.id = $4 AND c.study_set_id = $3 AND s.user_id = $2
-             )",
+             VALUES ($1, $2, $3, $4, $5::timestamptz, 'voice_session', 'scheduled', $6)
+             ON CONFLICT (user_id, study_set_id, voice_session_id, concept_id, due_at)
+             WHERE status = 'scheduled' AND voice_session_id IS NOT NULL
+             DO NOTHING",
         )
         .bind(Uuid::new_v4())
         .bind(user_id)
@@ -2182,11 +2155,9 @@ impl StudyMemoryStore for PostgresStudyStore {
         .await
         .map_err(pg_error)?;
         if result.rows_affected() == 0 {
-            return Err(PortError::unavailable(
-                "postgres",
-                concept_id,
-                "concept is not available for this study set",
-            ));
+            return Ok(
+                json!({ "concept_id": concept_id, "due_at": due_at, "status": "scheduled" }),
+            );
         }
         self.increment_count(WriteCountKind::ReviewItem)?;
         Ok(json!({ "concept_id": concept_id, "due_at": due_at, "status": "scheduled" }))

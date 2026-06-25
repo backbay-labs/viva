@@ -50,6 +50,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0011_answer_attempt_envelopes.sql",
         include_str!("../../../migrations/0011_answer_attempt_envelopes.sql"),
     ),
+    (
+        "0012_review_items_atomic_replay_guard.sql",
+        include_str!("../../../migrations/0012_review_items_atomic_replay_guard.sql"),
+    ),
 ];
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
@@ -303,6 +307,18 @@ mod tests {
         assert!(sql.contains("source_spans_excerpt_bounded"));
         assert!(!sql.contains("summary TEXT"));
         assert!(!sql.contains("headline TEXT"));
+    }
+
+    #[test]
+    fn migrations_define_atomic_review_item_replay_guard() {
+        let sql = migration_sql();
+        assert!(sql.contains("DELETE FROM review_items duplicate"));
+        assert!(sql.contains("AND duplicate.id > kept.id"));
+        assert!(sql.contains("review_items_voice_session_concept_due_scheduled_idx"));
+        assert!(sql.contains(
+            "ON review_items (user_id, study_set_id, voice_session_id, concept_id, due_at)"
+        ));
+        assert!(sql.contains("WHERE status = 'scheduled' AND voice_session_id IS NOT NULL"));
     }
 
     #[test]
@@ -811,6 +827,61 @@ mod tests {
                 .map(|review| review.concept_id.as_str()),
             Some("atp-synthase")
         );
+    }
+
+    #[tokio::test]
+    async fn optional_postgres_schedule_review_item_concurrent_replay_is_atomic_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        record_fixture_session(&store).await;
+
+        let before = store.write_counts();
+        let first = store.schedule_review_item(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "atp-synthase",
+            "2026-06-22T09:00:00Z",
+        );
+        let second = store.schedule_review_item(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "atp-synthase",
+            "2026-06-22T09:00:00Z",
+        );
+        let (first, second) = tokio::join!(first, second);
+        first.expect("first replay schedules review item");
+        second.expect("second replay observes atomic duplicate guard");
+
+        let after = store.write_counts();
+        assert_eq!(after.review_items - before.review_items, 1);
+        let row_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM review_items
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND voice_session_id = $3
+               AND concept_id = $4
+               AND due_at = $5::timestamptz
+               AND status = 'scheduled'",
+        )
+        .bind("user-1")
+        .bind(fixture_uuid("biology-midterm").expect("study set fixture UUID"))
+        .bind(fixture_uuid("voice-session-1").expect("voice session fixture UUID"))
+        .bind(parse_uuid("77777777-7777-4777-8777-777777777777").expect("concept fixture UUID"))
+        .bind("2026-06-22T09:00:00Z")
+        .fetch_one(&pool)
+        .await
+        .expect("review item row count query succeeds");
+        assert_eq!(row_count, 1);
     }
 
     #[tokio::test]
