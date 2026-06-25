@@ -127,10 +127,20 @@ pub enum ManuscriptIntent {
 #[non_exhaustive]
 pub enum BrainInput {
     Audio(AudioFrame),
+    AudioWithMetadata {
+        frame: AudioFrame,
+        client_generation_id: Option<String>,
+    },
     Text(String),
+    TextWithMetadata {
+        text: String,
+        client_generation_id: Option<String>,
+    },
     ToolResult(ToolResult),
     SessionContextRefresh(serde_json::Value),
-    ProactiveTurn { prompt: String },
+    ProactiveTurn {
+        prompt: String,
+    },
     CancelResponse,
     Stop,
 }

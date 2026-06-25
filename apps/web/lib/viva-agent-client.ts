@@ -190,6 +190,7 @@ export type VivaAgentSessionController = {
   connect: (reason?: VivaAgentGenerationReason) => WebSocket;
   close: () => void;
   refreshSession: (input?: {
+    reason?: VivaAgentGenerationReason;
     session?: AgentSessionConfig;
     sessionToken?: string | null;
   }) => WebSocket;
@@ -627,7 +628,10 @@ export function vivaAgentReducer(
 
   switch (event.type) {
     case "session_phase": {
-      const pendingSubmission = event.phase === "thinking" ? state.pendingSubmission : undefined;
+      const pendingSubmission = pendingSubmissionForSessionPhase(
+        event.phase,
+        state.pendingSubmission,
+      );
       if (state.recap && event.phase !== "recap") return state;
       if (event.terminal_reason && event.phase === "recap" && !state.recap) {
         return {
@@ -739,6 +743,15 @@ export function vivaAgentReducer(
     default:
       return state;
   }
+}
+
+function pendingSubmissionForSessionPhase(
+  phase: AgentStudySessionPhase,
+  pendingSubmission: VivaAgentPendingSubmission | undefined,
+): VivaAgentPendingSubmission | undefined {
+  return phase === "ready" || phase === "listening" || phase === "thinking"
+    ? pendingSubmission
+    : undefined;
 }
 
 function sanitizeAgentError(message: string): string {
@@ -876,7 +889,7 @@ export function createVivaAgentSessionController(
       if ("sessionToken" in input) {
         currentSessionToken = input.sessionToken ?? null;
       }
-      return openSocket("token_refresh");
+      return openSocket(input.reason ?? "token_refresh");
     },
     reset() {
       setState(initialVivaAgentSessionState());

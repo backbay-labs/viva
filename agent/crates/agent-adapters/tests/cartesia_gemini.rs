@@ -400,6 +400,51 @@ async fn fake_runtime_is_selectable_realtime_brain_without_live_keys() {
 }
 
 #[tokio::test]
+async fn fake_runtime_persists_client_generation_id_on_answer_attempts() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let runtime = FakeCartesiaGeminiRuntime::new(store.clone());
+    let mut session = runtime.open(fixture_session_config()).await.unwrap();
+
+    assert!(matches!(
+        next_event(&mut session).await,
+        BrainEvent::SessionPhase {
+            phase: agent_domain::StudySessionPhase::Ready
+        }
+    ));
+    assert!(matches!(
+        next_event(&mut session).await,
+        BrainEvent::QuestionStarted { response_id, .. } if response_id == "response-1"
+    ));
+    session
+        .input
+        .send(BrainInput::TextWithMetadata {
+            text: "NADH donates electrons.".to_owned(),
+            client_generation_id: Some("back_forward_restore-2".to_owned()),
+        })
+        .await
+        .unwrap();
+
+    for _ in 0..16 {
+        if matches!(
+            next_event(&mut session).await,
+            BrainEvent::RecapReady { .. }
+        ) {
+            break;
+        }
+    }
+
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.answer_attempts.len(), 1);
+    assert_eq!(
+        snapshot.answer_attempts[0]
+            .envelope
+            .client_generation_id
+            .as_deref(),
+        Some("back_forward_restore-2"),
+    );
+}
+
+#[tokio::test]
 async fn fake_runtime_open_cancel_aborts_active_tool_write_before_commit() {
     let inner_store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let (store, answer_started, release_answer) = BlockingAnswerStore::new(inner_store.clone());

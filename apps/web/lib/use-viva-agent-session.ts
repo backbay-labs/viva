@@ -118,8 +118,10 @@ export function useVivaAgentSession(options: UseVivaAgentSessionOptions) {
     connect: (reason?: VivaAgentGenerationReason) => controllerRef.current?.connect(reason),
     derived,
     readiness,
-    refreshSession: (input?: { sessionToken?: string | null }) =>
-      controllerRef.current?.refreshSession(input),
+    refreshSession: (input?: {
+      reason?: VivaAgentGenerationReason;
+      sessionToken?: string | null;
+    }) => controllerRef.current?.refreshSession(input),
     reset: () => controllerRef.current?.reset(),
     sendAudio: (pcm16Base64: string) => controllerRef.current?.sendAudio(pcm16Base64) ?? false,
     sendText: (text: string) => controllerRef.current?.sendText(text) ?? false,

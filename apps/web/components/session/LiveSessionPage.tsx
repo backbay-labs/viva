@@ -30,6 +30,7 @@ import { recapPlanFromSessionEvents } from "../../lib/viva-display";
 import { vivaSceneReducer } from "../../lib/viva-scene-reducer";
 import {
   canonicalizeSessionBrowserUrl,
+  type SessionRouteIdentity,
   sessionRouteIdentityFromLocationParts,
   sessionRouteIdentityFromSearch,
 } from "../../lib/viva-session-entry";
@@ -177,21 +178,67 @@ export function LiveSessionPage() {
     return () => window.clearTimeout(id);
   }, [routeSessionTokenRefreshReady]);
 
-  const reconnectForBrowserLifecycle = useCallback((reason: VivaAgentGenerationReason) => {
-    browserLifecycleAttemptRef.current += 1;
-    const nextRouteIdentity = readBrowserSessionRouteIdentity();
-    if (!sameBrowserSessionRouteIdentity(routeIdentityRef.current, nextRouteIdentity)) {
-      window.location.reload();
-      return;
-    }
-    setSourceOpen(false);
-    setHintShown(false);
-    setTextRetryOpen(false);
-    setSubmittedTextAnswer(undefined);
-    stopCaptureForRecap(captureRef, captureStartedRef, levelRef, capturedTurnPcm16Ref);
-    agentRef.current.reset();
-    agentRef.current.connect(reason);
-  }, []);
+  const reconnectForBrowserLifecycle = useCallback(
+    (reason: VivaAgentGenerationReason) => {
+      const nextRouteIdentity = readBrowserSessionRouteIdentity();
+      const plan = browserLifecycleReconnectPlan({
+        currentRouteIdentity: routeIdentityRef.current,
+        nextRouteIdentity,
+        recap: agentRef.current.derived.recap,
+        sessionId: activeStudySet.sessionId,
+        sessionToken: sessionTokenRef.current,
+        status: agentRef.current.status,
+        userId: activeStudySet.userId,
+      });
+      const attempt = browserLifecycleAttemptRef.current + 1;
+      browserLifecycleAttemptRef.current = attempt;
+      if (plan.action === "skip_session_over") return;
+      if (plan.action === "reload") {
+        window.location.reload();
+        return;
+      }
+      setSourceOpen(false);
+      setHintShown(false);
+      setTextRetryOpen(false);
+      setSubmittedTextAnswer(undefined);
+      stopCaptureForRecap(captureRef, captureStartedRef, levelRef, capturedTurnPcm16Ref);
+      if (plan.action === "refresh_session_token") {
+        void refreshVivaSessionToken({
+          sessionId: plan.sessionId,
+          sessionToken: plan.sessionToken,
+          studySetId: activeStudySet.id,
+          userId: plan.userId,
+        })
+          .then((result) => {
+            if (
+              !isCurrentBrowserLifecycleAttempt({
+                activeAttempt: browserLifecycleAttemptRef.current,
+                attempt,
+              })
+            ) {
+              return;
+            }
+            sessionTokenRef.current = result.session_token;
+            agentRef.current.refreshSession({ reason, sessionToken: result.session_token });
+          })
+          .catch(() => {
+            if (
+              isCurrentBrowserLifecycleAttempt({
+                activeAttempt: browserLifecycleAttemptRef.current,
+                attempt,
+              })
+            ) {
+              agentRef.current.reset();
+              agentRef.current.connect(reason);
+            }
+          });
+        return;
+      }
+      agentRef.current.reset();
+      agentRef.current.connect(reason);
+    },
+    [activeStudySet.id, activeStudySet.sessionId, activeStudySet.userId],
+  );
 
   useEffect(() => {
     const handlePageShow = (event: PageTransitionEvent) => {
@@ -775,6 +822,46 @@ export function browserSessionReconnectReason(
 ): VivaAgentGenerationReason | null {
   if (event.type === "popstate") return "back_forward_restore";
   return event.persisted ? "bfcache_restore" : null;
+}
+
+export type BrowserLifecycleReconnectPlan =
+  | { action: "skip_session_over" }
+  | { action: "reload" }
+  | { action: "socket_retry" }
+  | {
+      action: "refresh_session_token";
+      sessionId: string;
+      sessionToken: string;
+      userId: string;
+    };
+
+export function browserLifecycleReconnectPlan(input: {
+  currentRouteIdentity: SessionRouteIdentity;
+  nextRouteIdentity: SessionRouteIdentity;
+  recap: unknown;
+  sessionId?: string | null;
+  sessionToken?: string | null;
+  status: string;
+  userId?: string | null;
+}): BrowserLifecycleReconnectPlan {
+  if (!sameBrowserSessionRouteIdentity(input.currentRouteIdentity, input.nextRouteIdentity)) {
+    return { action: "reload" };
+  }
+  if (input.recap) {
+    return { action: "skip_session_over" };
+  }
+  const sessionToken = input.sessionToken?.trim();
+  const userId = input.userId?.trim();
+  const sessionId = input.sessionId?.trim();
+  if (sessionToken && userId && sessionId) {
+    return {
+      action: "refresh_session_token",
+      sessionId,
+      sessionToken,
+      userId,
+    };
+  }
+  return { action: "socket_retry" };
 }
 
 /**

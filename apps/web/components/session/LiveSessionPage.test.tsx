@@ -5,6 +5,7 @@ import type { VivaAgentAudioOutput } from "../../lib/viva-agent-client";
 import { VivaAudioWorkletUnavailableError } from "../../lib/viva-audio-capture";
 import { projectTrace } from "../../lib/viva-session-projection";
 import {
+  browserLifecycleReconnectPlan,
   browserSessionReconnectReason,
   canStartMicrophoneCapture,
   captureLevelForBloom,
@@ -156,6 +157,112 @@ describe("browserSessionReconnectReason", () => {
   test("ignores stale async lifecycle completions after a newer browser action starts", () => {
     expect(isCurrentBrowserLifecycleAttempt({ activeAttempt: 3, attempt: 3 })).toBe(true);
     expect(isCurrentBrowserLifecycleAttempt({ activeAttempt: 4, attempt: 3 })).toBe(false);
+  });
+
+  test("does not reconnect browser restores after a terminal recap", () => {
+    expect(
+      browserLifecycleReconnectPlan({
+        currentRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: "spent-token",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        nextRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        recap: { headline: "done" },
+        sessionId: "session-1",
+        sessionToken: "spent-token",
+        status: "open",
+        userId: "user-1",
+      }),
+    ).toEqual({ action: "skip_session_over" });
+  });
+
+  test("reloads changed route identity even when the previous session has a recap", () => {
+    expect(
+      browserLifecycleReconnectPlan({
+        currentRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: "spent-token",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        nextRouteIdentity: {
+          sessionId: "session-2",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        recap: { headline: "done" },
+        sessionId: "session-1",
+        sessionToken: "spent-token",
+        status: "closed",
+        userId: "user-1",
+      }),
+    ).toEqual({ action: "reload" });
+  });
+
+  test("refreshes spent session tokens before same-identity lifecycle reconnects", () => {
+    expect(
+      browserLifecycleReconnectPlan({
+        currentRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: "spent-token",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        nextRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        recap: undefined,
+        sessionId: "session-1",
+        sessionToken: "spent-token",
+        status: "open",
+        userId: "user-1",
+      }),
+    ).toEqual({
+      action: "refresh_session_token",
+      sessionId: "session-1",
+      sessionToken: "spent-token",
+      userId: "user-1",
+    });
+  });
+
+  test("refreshes spent session tokens after a non-recap socket close", () => {
+    expect(
+      browserLifecycleReconnectPlan({
+        currentRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: "spent-token",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        nextRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        recap: undefined,
+        sessionId: "session-1",
+        sessionToken: "spent-token",
+        status: "closed",
+        userId: "user-1",
+      }),
+    ).toEqual({
+      action: "refresh_session_token",
+      sessionId: "session-1",
+      sessionToken: "spent-token",
+      userId: "user-1",
+    });
   });
 });
 

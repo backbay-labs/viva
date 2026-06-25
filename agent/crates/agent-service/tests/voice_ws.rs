@@ -2495,6 +2495,7 @@ async fn websocket_failure_control_claim_forces_sanitized_provider_terminal_path
         &ClientFrame::Text {
             version: VIVA_VOICE_PROTOCOL_VERSION,
             text: "synthetic answer".to_owned(),
+            client_generation_id: None,
         },
     )
     .await;
@@ -5382,7 +5383,10 @@ impl RealtimeBrain for StopWritesAnswerProbeBrain {
             let mut accepted_answer = false;
             while let Some(input) = input_rx.recv().await {
                 match input {
-                    BrainInput::Audio(_) | BrainInput::Text(_) => {
+                    BrainInput::Audio(_)
+                    | BrainInput::AudioWithMetadata { .. }
+                    | BrainInput::Text(_)
+                    | BrainInput::TextWithMetadata { .. } => {
                         accepted_answer = true;
                     }
                     BrainInput::Stop if accepted_answer => {
@@ -5832,7 +5836,13 @@ impl RealtimeBrain for AnswerResolutionProbeBrain {
                 if sent {
                     continue;
                 }
-                if matches!(input, BrainInput::Audio(_) | BrainInput::Text(_)) {
+                if matches!(
+                    input,
+                    BrainInput::Audio(_)
+                        | BrainInput::AudioWithMetadata { .. }
+                        | BrainInput::Text(_)
+                        | BrainInput::TextWithMetadata { .. }
+                ) {
                     let _ = event_tx
                         .send(BrainEvent::ResponseCompleted {
                             response_id: "response-1".to_owned(),
@@ -5876,7 +5886,13 @@ impl RealtimeBrain for DelayedSingleResolutionProbeBrain {
                 if sent {
                     continue;
                 }
-                if matches!(input, BrainInput::Audio(_) | BrainInput::Text(_)) {
+                if matches!(
+                    input,
+                    BrainInput::Audio(_)
+                        | BrainInput::AudioWithMetadata { .. }
+                        | BrainInput::Text(_)
+                        | BrainInput::TextWithMetadata { .. }
+                ) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     let _ = event_tx
                         .send(BrainEvent::ResponseCompleted {
@@ -5918,7 +5934,13 @@ impl RealtimeBrain for DuplicateResolutionProbeBrain {
         let task = tokio::spawn(async move {
             let mut answer_count = 0_u8;
             while let Some(input) = input_rx.recv().await {
-                if !matches!(input, BrainInput::Audio(_) | BrainInput::Text(_)) {
+                if !matches!(
+                    input,
+                    BrainInput::Audio(_)
+                        | BrainInput::AudioWithMetadata { .. }
+                        | BrainInput::Text(_)
+                        | BrainInput::TextWithMetadata { .. }
+                ) {
                     continue;
                 }
                 answer_count = answer_count.saturating_add(1);
@@ -5968,7 +5990,13 @@ impl RealtimeBrain for ResponseThenPhaseProbeBrain {
                 if sent {
                     continue;
                 }
-                if matches!(input, BrainInput::Audio(_) | BrainInput::Text(_)) {
+                if matches!(
+                    input,
+                    BrainInput::Audio(_)
+                        | BrainInput::AudioWithMetadata { .. }
+                        | BrainInput::Text(_)
+                        | BrainInput::TextWithMetadata { .. }
+                ) {
                     let _ = event_tx
                         .send(BrainEvent::ResponseCompleted {
                             response_id: "response-1".to_owned(),
@@ -6015,7 +6043,13 @@ impl RealtimeBrain for CancelledThenStaleResolutionProbeBrain {
         let task = tokio::spawn(async move {
             let mut answer_count = 0_u8;
             while let Some(input) = input_rx.recv().await {
-                if !matches!(input, BrainInput::Audio(_) | BrainInput::Text(_)) {
+                if !matches!(
+                    input,
+                    BrainInput::Audio(_)
+                        | BrainInput::AudioWithMetadata { .. }
+                        | BrainInput::Text(_)
+                        | BrainInput::TextWithMetadata { .. }
+                ) {
                     continue;
                 }
                 answer_count = answer_count.saturating_add(1);

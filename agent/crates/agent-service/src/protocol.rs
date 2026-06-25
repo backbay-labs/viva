@@ -18,14 +18,20 @@ pub enum ClientFrame {
     SessionConfig {
         version: u32,
         session: SessionConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_generation_id: Option<String>,
     },
     Audio {
         version: u32,
         frame: AudioFrame,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_generation_id: Option<String>,
     },
     Text {
         version: u32,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_generation_id: Option<String>,
     },
     ToolResult {
         version: u32,

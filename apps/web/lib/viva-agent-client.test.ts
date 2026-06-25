@@ -765,6 +765,19 @@ describe("Viva agent browser client", () => {
       JSON.stringify({
         type: "event",
         version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "session_phase", phase: "listening" },
+      }),
+    );
+    expect(controller.getState().pendingSubmission).toEqual({
+      generationId: "session_bootstrap-1",
+      kind: "text",
+    });
+    expect(controller.sendText("still duplicate typed response")).toBe(false);
+
+    socket.message(
+      JSON.stringify({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
         event: { type: "session_phase", phase: "feedback" },
       }),
     );

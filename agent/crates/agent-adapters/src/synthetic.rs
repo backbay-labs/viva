@@ -8,7 +8,8 @@ use std::time::Duration;
 use tokio::{sync::mpsc, task::AbortHandle, time::sleep};
 
 use agent_domain::{
-    fixture_question, AnswerEvaluation, BrainError, BrainEvent, BrainInput, BrainProviderError,
+    fixture_question, AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus,
+    AnswerContentPolicy, AnswerEvaluation, BrainError, BrainEvent, BrainInput, BrainProviderError,
     BrainUsage, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent,
     ManuscriptRegister, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession,
     RealtimeSessionTaskGuard, RecapSourceMoment, SessionConfig, StudyMemoryStore, StudyQuestion,
@@ -153,14 +154,30 @@ impl RealtimeBrain for SyntheticBrain {
                         let response_id = spec.response_id(turn);
                         let answer_turn = turn;
                         turn += 1;
-                        let transcript =
-                            format!("received {} PCM16 bytes", frame.pcm16_bytes().len());
                         active_response = Some(spawn_study_answer_sequence(
                             event_tx.clone(),
                             spec.clone(),
                             question.clone(),
                             &response_id,
-                            transcript,
+                            SyntheticAnswerInput::audio(frame, None),
+                            answer_turn,
+                            study_store.clone(),
+                        ));
+                    }
+                    BrainInput::AudioWithMetadata {
+                        frame,
+                        client_generation_id,
+                    } => {
+                        cancel_active_response(&mut active_response);
+                        let response_id = spec.response_id(turn);
+                        let answer_turn = turn;
+                        turn += 1;
+                        active_response = Some(spawn_study_answer_sequence(
+                            event_tx.clone(),
+                            spec.clone(),
+                            question.clone(),
+                            &response_id,
+                            SyntheticAnswerInput::audio(frame, client_generation_id),
                             answer_turn,
                             study_store.clone(),
                         ));
@@ -175,7 +192,25 @@ impl RealtimeBrain for SyntheticBrain {
                             spec.clone(),
                             question.clone(),
                             &response_id,
-                            text,
+                            SyntheticAnswerInput::text(text, None),
+                            answer_turn,
+                            study_store.clone(),
+                        ));
+                    }
+                    BrainInput::TextWithMetadata {
+                        text,
+                        client_generation_id,
+                    } => {
+                        cancel_active_response(&mut active_response);
+                        let response_id = spec.response_id(turn);
+                        let answer_turn = turn;
+                        turn += 1;
+                        active_response = Some(spawn_study_answer_sequence(
+                            event_tx.clone(),
+                            spec.clone(),
+                            question.clone(),
+                            &response_id,
+                            SyntheticAnswerInput::text(text, client_generation_id),
                             answer_turn,
                             study_store.clone(),
                         ));
@@ -295,7 +330,7 @@ fn spawn_study_answer_sequence(
     spec: SyntheticStudySessionSpec,
     question: StudyQuestion,
     response_id: &str,
-    answer_text: String,
+    answer_input: SyntheticAnswerInput,
     turn: usize,
     study_store: Option<Arc<dyn StudyMemoryStore>>,
 ) -> ActiveResponse {
@@ -312,7 +347,7 @@ fn spawn_study_answer_sequence(
                 spec,
                 question,
                 response_id: task_response_id,
-                answer_text,
+                answer_input,
                 turn,
                 study_store,
                 cancelled: task_cancelled,
@@ -334,11 +369,66 @@ struct StudyAnswerJob {
     spec: SyntheticStudySessionSpec,
     question: StudyQuestion,
     response_id: String,
-    answer_text: String,
+    answer_input: SyntheticAnswerInput,
     turn: usize,
     study_store: Option<Arc<dyn StudyMemoryStore>>,
     cancelled: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
+}
+
+struct SyntheticAnswerInput {
+    text: String,
+    capture_mode: AnswerCaptureMode,
+    byte_count: Option<u64>,
+    char_count: Option<u64>,
+    client_generation_id: Option<String>,
+}
+
+impl SyntheticAnswerInput {
+    fn audio(frame: agent_domain::AudioFrame, client_generation_id: Option<String>) -> Self {
+        let byte_count = frame.pcm16_bytes().len().try_into().unwrap_or(u64::MAX);
+        Self {
+            text: format!("received {byte_count} PCM16 bytes"),
+            capture_mode: AnswerCaptureMode::Audio,
+            byte_count: Some(byte_count),
+            char_count: None,
+            client_generation_id,
+        }
+    }
+
+    fn text(text: String, client_generation_id: Option<String>) -> Self {
+        Self {
+            byte_count: Some(text.len().try_into().unwrap_or(u64::MAX)),
+            char_count: Some(text.chars().count().try_into().unwrap_or(u64::MAX)),
+            capture_mode: AnswerCaptureMode::Typed,
+            text,
+            client_generation_id,
+        }
+    }
+}
+
+fn synthetic_answer_attempt_envelope(job: &StudyAnswerJob) -> AnswerAttemptEnvelope {
+    AnswerAttemptEnvelope {
+        response_id: job.response_id.clone(),
+        question_id: job.question.question_id.clone(),
+        submission_sequence: job.turn.try_into().unwrap_or(u32::MAX),
+        idempotency_key: format!(
+            "{}:{}:{}:{}:synthetic",
+            job.spec.voice_session_id, job.question.question_id, job.turn, job.response_id
+        ),
+        capture_mode: job.answer_input.capture_mode,
+        byte_count: job.answer_input.byte_count,
+        char_count: job.answer_input.char_count,
+        duration_ms: None,
+        client_generation_id: job.answer_input.client_generation_id.clone(),
+        locale: None,
+        capture_status: AnswerCaptureStatus::Accepted,
+        content_policy: AnswerContentPolicy::None,
+        answer_digest_hmac: None,
+        transcript_status: None,
+        transcript_confidence_bucket: None,
+        pre_provider_state: "synthetic_before_evaluation".to_owned(),
+    }
 }
 
 async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: StudyAnswerJob) {
@@ -377,7 +467,7 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
         event_tx,
         BrainEvent::TranscriptDelta {
             response_id: job.response_id.clone(),
-            text: job.answer_text.clone(),
+            text: job.answer_input.text.clone(),
         },
         &job.cancelled,
     )
@@ -389,7 +479,7 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
         event_tx,
         BrainEvent::TranscriptFinal {
             response_id: job.response_id.clone(),
-            text: job.answer_text.clone(),
+            text: job.answer_input.text.clone(),
             confidence: Some(answer_spec.transcript_confidence),
         },
         &job.cancelled,
@@ -430,7 +520,7 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
     let source = job.question.source.clone();
     let evaluation = AnswerEvaluation {
         question_id: job.question.question_id.clone(),
-        answer_text: job.answer_text,
+        answer_text: job.answer_input.text.clone(),
         label: answer_spec.label.to_owned(),
         concise_feedback: answer_spec.feedback.to_owned(),
         retry_prompt: job.question.follow_up.clone(),
@@ -442,6 +532,20 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
         return;
     }
     if let Some(store) = &job.study_store {
+        if job.answer_input.client_generation_id.is_some() {
+            if let Err(error) = store
+                .record_answer_attempt_envelope(
+                    &job.spec.user_id,
+                    &job.spec.study_set_id,
+                    &job.spec.voice_session_id,
+                    synthetic_answer_attempt_envelope(&job),
+                )
+                .await
+            {
+                emit_store_error(event_tx, error.to_string()).await;
+                return;
+            }
+        }
         if let Err(error) = store
             .record_answer_evaluation(
                 &job.spec.user_id,
@@ -915,6 +1019,53 @@ mod tests {
         assert_eq!(snapshot.concept_statuses[0].concept_id, "atp-synthase");
         assert_eq!(snapshot.review_items.len(), 1);
         assert_eq!(snapshot.review_items[0].concept_id, "atp-synthase");
+    }
+
+    #[tokio::test]
+    async fn persists_client_generation_id_on_synthetic_answer_attempts() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let brain = SyntheticBrain::with_study_store(store.clone());
+        let mut session = brain
+            .open(SessionConfig {
+                session_id: Some(SessionId::new("voice-session-1")),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+
+        let _ = next_event(&mut session).await;
+        let _ = next_event(&mut session).await;
+        session
+            .input
+            .send(BrainInput::TextWithMetadata {
+                text: "NADH gives electrons to the electron transport chain.".to_owned(),
+                client_generation_id: Some("bfcache_restore-3".to_owned()),
+            })
+            .await
+            .unwrap();
+
+        loop {
+            match next_event(&mut session).await {
+                BrainEvent::SessionPhase {
+                    phase: StudySessionPhase::Correction,
+                } => break,
+                BrainEvent::Error(error) => panic!("store rejected synthetic answer: {error:?}"),
+                _ => {}
+            }
+        }
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.answer_attempts.len(), 1);
+        assert_eq!(
+            snapshot.answer_attempts[0]
+                .envelope
+                .client_generation_id
+                .as_deref(),
+            Some("bfcache_restore-3"),
+        );
     }
 
     #[tokio::test]
