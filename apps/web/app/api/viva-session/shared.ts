@@ -567,7 +567,7 @@ function serverAgentBaseUrl(): string | null {
 function sessionBootstrapRequirement(): { required: boolean; secret: string | null } {
   const agentBaseUrl = serverAgentBaseUrl();
   const bearerToken = process.env.VIVA_AGENT_REST_BEARER_TOKEN?.trim();
-  if (!agentBaseUrl || !bearerToken || isLoopbackAgentUrl(agentBaseUrl)) {
+  if (!agentBaseUrl || !bearerToken) {
     return { required: false, secret: null };
   }
   return { required: true, secret: sessionBootstrapSecret() };
@@ -698,15 +698,6 @@ function attachVivaSessionBootstrapTokenToAction(
 
 function sessionIdFromAction(value: unknown): string | null {
   return isRecord(value) ? requiredString(value.session_id) : null;
-}
-
-function isLoopbackAgentUrl(value: string): boolean {
-  try {
-    const hostname = new URL(value).hostname.toLowerCase();
-    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
-  } catch {
-    return false;
-  }
 }
 
 function agentLibraryUrl(agentBaseUrl: string, userId: string): URL | null {

@@ -68,9 +68,10 @@ function vivaLibraryProxyHeaders(
 ): Headers {
   const headers = new Headers();
   const authorization = request.headers.get("authorization");
-  if (authorization) headers.set("authorization", authorization);
-  if (!authorization && options.serverBearerToken) {
+  if (options.serverBearerToken) {
     headers.set("authorization", `Bearer ${options.serverBearerToken}`);
+  } else if (authorization) {
+    headers.set("authorization", authorization);
   }
   const controlToken = request.headers.get("x-viva-library-control-token");
   if (controlToken) headers.set("x-viva-library-control-token", controlToken);
@@ -103,11 +104,7 @@ function serverBearerForBrowserLibrarySnapshot(
       token?: string;
     }
   | { ok: false; response: NextResponse<{ error: string }> } {
-  if (
-    request.method !== "GET" ||
-    path.join("/") !== "study-sets/library" ||
-    request.headers.get("authorization")
-  ) {
+  if (request.method !== "GET" || path.join("/") !== "study-sets/library") {
     return { ok: true };
   }
   const token = process.env.VIVA_AGENT_REST_BEARER_TOKEN?.trim();

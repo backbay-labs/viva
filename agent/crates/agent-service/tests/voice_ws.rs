@@ -1177,6 +1177,54 @@ async fn library_export_returns_sanitized_user_visible_state_and_privacy_facts()
 }
 
 #[tokio::test]
+async fn library_export_and_delete_reject_browser_session_token_authorization() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    seed_completed_library_session(&store).await;
+    let app = build_router(test_state_with_rest_auth(4, store));
+    let session_token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() + 60,
+        "nonce-rest-control",
+    );
+    let authorization = format!("Bearer {session_token}");
+
+    let export = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/export?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .header("authorization", &authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(export.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    let session_delete = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/study-sets/biology-midterm/sessions/voice-session-1?user_id=user-1")
+                .header("origin", "http://localhost:3000")
+                .header("authorization", &authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session_delete.status(),
+        axum::http::StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
 async fn library_export_and_delete_reject_public_trusted_user_without_rest_auth() {
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     seed_completed_library_session(&store).await;

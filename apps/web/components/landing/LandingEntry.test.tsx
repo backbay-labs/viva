@@ -180,7 +180,11 @@ describe("LandingEntry", () => {
         "Bearer server-rest-bearer",
       );
       expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("session_token");
+      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("control_token");
       expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("viva1.server-token");
+      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain(
+        "viva1.control-token",
+      );
     } finally {
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);

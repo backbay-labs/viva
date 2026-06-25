@@ -239,7 +239,7 @@ describe("Viva library projection", () => {
     });
   });
 
-  test("redacts start and resume session tokens from browser-bound snapshots", () => {
+  test("redacts session and control tokens from browser-bound snapshots", () => {
     const redacted = redactVivaLibrarySessionTokens(snapshot);
 
     expect(redacted.study_sets[0]?.actions.start).toEqual({
@@ -251,7 +251,9 @@ describe("Viva library projection", () => {
       unavailable_reason: "no_open_session",
     });
     expect(JSON.stringify(redacted)).not.toContain("session_token");
+    expect(JSON.stringify(redacted)).not.toContain("control_token");
     expect(JSON.stringify(redacted)).not.toContain("viva1.start-token");
+    expect(JSON.stringify(redacted)).not.toContain("viva1.control-token");
     expect(snapshot.study_sets[0]?.actions.start).toEqual({
       available: true,
       session_id: "start-session-1",
@@ -264,12 +266,16 @@ describe("Viva library projection", () => {
     const staticExport = browserInitialLibrarySnapshot(snapshot, { staticExport: true });
 
     expect(JSON.stringify(serverful)).not.toContain("session_token");
+    expect(JSON.stringify(serverful)).not.toContain("control_token");
     expect(JSON.stringify(serverful)).not.toContain("viva1.start-token");
+    expect(JSON.stringify(serverful)).not.toContain("viva1.control-token");
     expect(staticExport.study_sets[0]?.actions.start).toEqual({
       available: true,
       session_id: "start-session-1",
       session_token: "viva1.start-token",
     });
+    expect(JSON.stringify(staticExport)).not.toContain("control_token");
+    expect(JSON.stringify(staticExport)).not.toContain("viva1.control-token");
   });
 
   test("formats completed-session next review from the persisted server schedule only", () => {

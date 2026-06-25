@@ -217,6 +217,32 @@ describe("Viva same-origin session API", () => {
     expect(calls).toEqual([]);
   });
 
+  test("start requires bootstrap capability for loopback agents when server REST bearer minting is enabled", async () => {
+    const calls: string[] = [];
+    process.env.VIVA_AGENT_HTTP_URL = "http://127.0.0.1:4318";
+    process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "http://127.0.0.1:4318";
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+    }) as typeof fetch;
+
+    const response = await startSession(
+      sessionRequest("/api/viva-session/start", {
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      }),
+    );
+    const body = (await response.json()) as VivaSessionRouteFailureClass;
+
+    expect(response.status).toBe(403);
+    expect(body).toEqual({
+      error: "session_bootstrap_capability_required",
+      failure_class: "access_denied",
+      token_refresh_outcome: "blocked",
+    });
+    expect(calls).toEqual([]);
+  });
+
   test("start applies independent mint limits to client IP and session identity", async () => {
     process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "1";
     process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user,alternate-user";

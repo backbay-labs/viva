@@ -766,7 +766,7 @@ async fn library_snapshot(
                 })),
             );
         }
-        if let Err(error) = state.ws_access.validate_headers(&headers) {
+        if let Err(error) = state.ws_access.validate_bearer_headers(&headers) {
             return (
                 StatusCode::UNAUTHORIZED,
                 response_headers,
@@ -1032,7 +1032,7 @@ async fn create_paste_study_set(
                 })),
             );
         }
-        if let Err(error) = state.ws_access.validate_headers(&headers) {
+        if let Err(error) = state.ws_access.validate_bearer_headers(&headers) {
             return (
                 StatusCode::UNAUTHORIZED,
                 response_headers,
@@ -1123,7 +1123,7 @@ async fn create_file_study_set(
                 })),
             );
         }
-        if let Err(error) = state.ws_access.validate_headers(&headers) {
+        if let Err(error) = state.ws_access.validate_bearer_headers(&headers) {
             return (
                 StatusCode::UNAUTHORIZED,
                 response_headers,
@@ -1482,7 +1482,7 @@ fn require_library_control_access(
         ));
     }
     if state.ws_access.required_bearer.is_some()
-        && state.ws_access.validate_headers(headers).is_ok()
+        && state.ws_access.validate_bearer_headers(headers).is_ok()
     {
         return None;
     }
@@ -1533,7 +1533,7 @@ fn library_mutation_access_unavailable_reason(
     user_id: &str,
 ) -> Option<&'static str> {
     if state.ws_access.required_bearer.is_some()
-        && state.ws_access.validate_headers(headers).is_ok()
+        && state.ws_access.validate_bearer_headers(headers).is_ok()
     {
         return None;
     }

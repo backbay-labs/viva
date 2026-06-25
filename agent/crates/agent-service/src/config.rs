@@ -646,10 +646,23 @@ impl VoiceWsAccess {
             }
         }
 
-        self.validate_bearer_headers(headers)
+        self.validate_ws_bearer_headers(headers)
     }
 
     pub fn validate_bearer_headers(&self, headers: &HeaderMap) -> Result<(), VoiceWsAccessError> {
+        let Some(required) = &self.required_bearer else {
+            return Ok(());
+        };
+        let Some(provided) = authorization_bearer_from_headers(headers) else {
+            return Err(VoiceWsAccessError::MissingBearer);
+        };
+        if constant_time_eq(required.as_bytes(), provided.as_bytes()) {
+            return Ok(());
+        }
+        Err(VoiceWsAccessError::InvalidBearer)
+    }
+
+    fn validate_ws_bearer_headers(&self, headers: &HeaderMap) -> Result<(), VoiceWsAccessError> {
         let Some(required) = &self.required_bearer else {
             return Ok(());
         };
@@ -778,17 +791,20 @@ pub enum VoiceWsAccessError {
 }
 
 fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
+    authorization_bearer_from_headers(headers).or_else(|| {
+        headers
+            .get("sec-websocket-protocol")
+            .and_then(|value| value.to_str().ok())
+            .and_then(protocol_bearer)
+    })
+}
+
+fn authorization_bearer_from_headers(headers: &HeaderMap) -> Option<String> {
     headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(ToOwned::to_owned)
-        .or_else(|| {
-            headers
-                .get("sec-websocket-protocol")
-                .and_then(|value| value.to_str().ok())
-                .and_then(protocol_bearer)
-        })
 }
 
 fn protocol_bearer(value: &str) -> Option<String> {
@@ -877,7 +893,7 @@ mod tests {
         }
         .sign("session-secret")
         .expect("token should sign");
-        let protocol = format!("viva-voice, bearer.{}", URL_SAFE_NO_PAD.encode(token));
+        let protocol = format!("viva-voice, bearer.{}", URL_SAFE_NO_PAD.encode(&token));
         let mut headers = HeaderMap::new();
         headers.insert("origin", HeaderValue::from_static("https://web.example"));
         headers.insert(
@@ -886,6 +902,18 @@ mod tests {
         );
 
         assert_eq!(access.validate_headers(&headers), Ok(()));
+        assert_eq!(
+            access.validate_bearer_headers(&headers),
+            Err(VoiceWsAccessError::MissingBearer)
+        );
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("header should be valid"),
+        );
+        assert_eq!(
+            access.validate_bearer_headers(&headers),
+            Err(VoiceWsAccessError::InvalidBearer)
+        );
     }
 
     #[test]

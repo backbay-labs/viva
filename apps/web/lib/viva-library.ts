@@ -178,30 +178,40 @@ export function projectLibrarySnapshot(
 }
 
 export function redactVivaLibrarySessionTokens(snapshot: VivaLibrarySnapshot): VivaLibrarySnapshot {
-  return {
-    ...snapshot,
-    study_sets: snapshot.study_sets.map((studySet) => ({
-      ...studySet,
-      actions: {
-        ...studySet.actions,
-        resume: redactSessionToken(studySet.actions.resume),
-        start: redactSessionToken(studySet.actions.start),
-      },
-    })),
-  };
+  return stripBrowserOnlyTokenFields(snapshot, {
+    controlToken: true,
+    sessionToken: true,
+  }) as VivaLibrarySnapshot;
 }
 
 export function browserInitialLibrarySnapshot(
   snapshot: VivaLibrarySnapshot,
   options: { staticExport?: boolean } = {},
 ): VivaLibrarySnapshot {
-  return options.staticExport ? snapshot : redactVivaLibrarySessionTokens(snapshot);
+  return stripBrowserOnlyTokenFields(snapshot, {
+    controlToken: true,
+    sessionToken: !options.staticExport,
+  }) as VivaLibrarySnapshot;
 }
 
-function redactSessionToken(action: VivaLibraryAction): VivaLibraryAction {
-  if (!action.available) return { ...action };
-  const { session_token: _sessionToken, ...rest } = action;
-  return rest;
+function stripBrowserOnlyTokenFields(
+  value: unknown,
+  options: { controlToken: boolean; sessionToken: boolean },
+): unknown {
+  if (Array.isArray(value))
+    return value.map((child) => stripBrowserOnlyTokenFields(child, options));
+  if (!value || typeof value !== "object") return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (
+      (options.sessionToken && key === "session_token") ||
+      (options.controlToken && key === "control_token")
+    ) {
+      continue;
+    }
+    output[key] = stripBrowserOnlyTokenFields(child, options);
+  }
+  return output;
 }
 
 function projectStudySetRow(studySet: VivaLibraryStudySet): ProjectedLibraryRow {

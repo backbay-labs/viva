@@ -219,6 +219,111 @@ describe("Viva library proxy", () => {
     }
   });
 
+  test("does not let caller Authorization bypass bearer-backed browser snapshot filtering", async () => {
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_AGENT_REST_BEARER_TOKEN = "server-rest-bearer";
+      process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ input: String(input), init });
+        return new Response(
+          JSON.stringify({
+            user_id: "user-1",
+            privacy: {
+              export: { available: true, control_token: "viva1.export-control" },
+            },
+            study_sets: [
+              {
+                id: "biology-midterm",
+                user_id: "user-1",
+                actions: {
+                  delete: { available: true, control_token: "viva1.delete-control" },
+                  start: {
+                    available: true,
+                    session_id: "allowed-session",
+                    session_token: "viva1.allowed-session-token",
+                  },
+                },
+              },
+              {
+                id: "history-final",
+                user_id: "user-1",
+                actions: {
+                  start: {
+                    available: true,
+                    session_id: "disallowed-session",
+                    session_token: "viva1.disallowed-session-token",
+                  },
+                },
+              },
+              {
+                id: "biology-midterm",
+                user_id: "user-2",
+                actions: {
+                  start: {
+                    available: true,
+                    session_id: "other-user-session",
+                    session_token: "viva1.other-user-session-token",
+                  },
+                },
+              },
+            ],
+            sessions: [
+              {
+                voice_session_id: "allowed-recap",
+                user_id: "user-1",
+                study_set_id: "biology-midterm",
+              },
+              {
+                voice_session_id: "other-user-recap",
+                user_id: "user-2",
+                study_set_id: "biology-midterm",
+              },
+            ],
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        );
+      }) as typeof fetch;
+
+      const request = {
+        headers: new Headers({ authorization: "Bearer viva1.browser-session-token" }),
+        method: "GET",
+        nextUrl: new URL(
+          "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-1",
+        ),
+      } as unknown as NextRequest;
+
+      const response = await GET(request, {
+        params: Promise.resolve({ path: ["study-sets", "library"] }),
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(calls).toHaveLength(1);
+      const headers = new Headers(calls[0]?.init?.headers);
+      expect(headers.get("authorization")).toBe("Bearer server-rest-bearer");
+      expect(body.study_sets.map((studySet: { id: string }) => studySet.id)).toEqual([
+        "biology-midterm",
+      ]);
+      expect(
+        body.sessions.map((session: { voice_session_id: string }) => session.voice_session_id),
+      ).toEqual(["allowed-recap"]);
+      expect(JSON.stringify(body)).not.toContain("user-2");
+      expect(JSON.stringify(body)).not.toContain("history-final");
+      expect(JSON.stringify(body)).not.toContain("session_token");
+      expect(JSON.stringify(body)).not.toContain("control_token");
+      expect(JSON.stringify(body)).not.toContain("viva1.");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+    }
+  });
+
   test("injects the server REST bearer for allowed browser library snapshots", async () => {
     const calls: Array<{ input: string; init?: RequestInit }> = [];
     try {
