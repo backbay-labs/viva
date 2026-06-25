@@ -2718,6 +2718,120 @@ async fn websocket_failure_control_claim_forces_sanitized_provider_terminal_path
 }
 
 #[tokio::test]
+async fn websocket_failure_control_cap_is_identity_scoped_across_study_sets() {
+    let origin = "https://control.example";
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "chemistry-final".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Chemistry Final".to_owned(),
+        course: Some("Chemistry 201".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(store.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    )
+    .with_failure_control(
+        FailureControlConfig::enabled_for_synthetic_identities(
+            FailureControlScenario::SilentStall,
+            "control-secret",
+            vec!["user-1".to_owned()],
+            vec!["biology-midterm".to_owned(), "chemistry-final".to_owned()],
+            vec![origin.to_owned()],
+            1,
+        )
+        .unwrap(),
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let biology_token = signed_session_token_with_failure_control(FailureControlTokenFixture {
+        session_secret: "session-secret",
+        control_secret: "control-secret",
+        user_id: "user-1",
+        study_set_id: "biology-midterm",
+        session_id: "voice-session-1",
+        origin,
+        scenario: FailureControlScenario::SilentStall,
+        expires_at: unix_timestamp_now() + 60,
+        nonce: "nonce-control-biology-session",
+        run_id: "run-control-biology",
+        control_nonce: "nonce-control-biology-claim",
+    });
+    let chemistry_token = signed_session_token_with_failure_control(FailureControlTokenFixture {
+        session_secret: "session-secret",
+        control_secret: "control-secret",
+        user_id: "user-1",
+        study_set_id: "chemistry-final",
+        session_id: "voice-session-2",
+        origin,
+        scenario: FailureControlScenario::SilentStall,
+        expires_at: unix_timestamp_now() + 60,
+        nonce: "nonce-control-chemistry-session",
+        run_id: "run-control-chemistry",
+        control_nonce: "nonce-control-chemistry-claim",
+    });
+
+    let mut biology_request = url.as_str().into_client_request().unwrap();
+    biology_request
+        .headers_mut()
+        .insert("origin", HeaderValue::from_str(origin).unwrap());
+    let (mut biology_socket, _) = connect_async(biology_request).await.unwrap();
+    assert_ready_provider(&mut biology_socket, "synthetic").await;
+    biology_socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&biology_token).into(),
+        ))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+    })
+    .await;
+
+    let mut chemistry_request = url.as_str().into_client_request().unwrap();
+    chemistry_request
+        .headers_mut()
+        .insert("origin", HeaderValue::from_str(origin).unwrap());
+    let (mut chemistry_socket, _) = connect_async(chemistry_request).await.unwrap();
+    assert_ready_provider(&mut chemistry_socket, "synthetic").await;
+    chemistry_socket
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token(
+                "chemistry-final",
+                "voice-session-2",
+                &chemistry_token,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    assert_terminal_session_phase(
+        read_server_frame(&mut chemistry_socket).await,
+        TerminalSessionReason::SessionCap,
+    );
+    assert_close_code(&mut chemistry_socket, CloseCode::Policy).await;
+    biology_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut biology_socket).await;
+}
+
+#[tokio::test]
 async fn websocket_rejects_failure_control_claim_from_wrong_origin_before_brain_open() {
     let opened = Arc::new(AtomicBool::new(false));
     let allowed_origin = "https://control.example";

@@ -27,7 +27,7 @@ use tokio::{
 };
 
 use crate::{
-    app::{AppState, VoiceLimitLease},
+    app::{AppState, VoiceLimitLease, VoiceLimitState},
     config::{
         bac_510_max_turn_duration, FailureControlScenario, SessionAuthFailureCode,
         SessionTokenClaims, VoiceLimitConfig, VoiceWsAccessError,
@@ -39,6 +39,8 @@ use crate::{
 };
 
 const TERMINAL_EVENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const RECONNECT_LEASE_GRACE: Duration = Duration::from_millis(250);
+const RECONNECT_LEASE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 pub async fn voice_ws(
     State(state): State<AppState>,
@@ -120,6 +122,47 @@ fn validate_ws_preflight(
         _permit: permit,
         _ip_lease: ip_lease,
     })
+}
+
+async fn acquire_user_lease_with_reconnect_grace(
+    limits: &VoiceLimitState,
+    user_id: &str,
+    max: usize,
+    grace: Duration,
+) -> Option<VoiceLimitLease> {
+    acquire_with_reconnect_grace(|| limits.try_acquire_user(user_id, max), grace).await
+}
+
+async fn acquire_user_study_set_with_reconnect_grace(
+    limits: &VoiceLimitState,
+    user_id: &str,
+    study_set_id: &str,
+    max: usize,
+    grace: Duration,
+) -> Option<VoiceLimitLease> {
+    acquire_with_reconnect_grace(
+        || limits.try_acquire_user_study_set(user_id, study_set_id, max),
+        grace,
+    )
+    .await
+}
+
+async fn acquire_with_reconnect_grace(
+    mut acquire: impl FnMut() -> Option<VoiceLimitLease>,
+    grace: Duration,
+) -> Option<VoiceLimitLease> {
+    if let Some(lease) = acquire() {
+        return Some(lease);
+    }
+
+    let started_at = Instant::now();
+    while started_at.elapsed() < grace {
+        tokio::time::sleep(RECONNECT_LEASE_RETRY_INTERVAL).await;
+        if let Some(lease) = acquire() {
+            return Some(lease);
+        }
+    }
+    None
 }
 
 fn session_ip_key(headers: &HeaderMap) -> String {
@@ -261,24 +304,42 @@ async fn handle_socket(
             return;
         }
     };
-    let max_user_sessions = match initial.failure_control {
-        Some(_) => match (
-            state.voice_limits.max_user_sessions,
-            state.failure_control.max_sessions_per_identity(),
-        ) {
-            (Some(global), Some(control)) => Some(global.min(control)),
-            (Some(global), None) => Some(global),
-            (None, Some(control)) => Some(control),
-            (None, None) => None,
+    let _failure_control_identity_lease = match (
+        initial.failure_control,
+        state.failure_control.max_sessions_per_identity(),
+    ) {
+        (Some(_), Some(max)) => match acquire_user_lease_with_reconnect_grace(
+            &state.limit_state,
+            &session_binding.user_id,
+            max,
+            RECONNECT_LEASE_GRACE,
+        )
+        .await
+        {
+            Some(lease) => Some(lease),
+            None => {
+                let terminal_reason = close_with_terminal_session_phase_only(
+                    &mut sender,
+                    TerminalSessionReason::SessionCap,
+                    close_code::POLICY,
+                )
+                .await;
+                record_terminal(&state, None, terminal_reason).await;
+                return;
+            }
         },
-        None => state.voice_limits.max_user_sessions,
+        _ => None,
     };
-    let _user_lease = match max_user_sessions {
-        Some(max) => match state.limit_state.try_acquire_user_study_set(
+    let _user_lease = match state.voice_limits.max_user_sessions {
+        Some(max) => match acquire_user_study_set_with_reconnect_grace(
+            &state.limit_state,
             &session_binding.user_id,
             &session_binding.study_set_id,
             max,
-        ) {
+            RECONNECT_LEASE_GRACE,
+        )
+        .await
+        {
             Some(lease) => Some(lease),
             None => {
                 let terminal_reason = close_with_terminal_session_phase_only(
@@ -2057,6 +2118,49 @@ mod tests {
             terminal_reason_for_provider_message(&message),
             TerminalSessionReason::ProviderTimeout
         );
+    }
+
+    #[tokio::test]
+    async fn user_study_set_acquire_waits_for_reconnect_lease_release() {
+        let limits = crate::app::VoiceLimitState::default();
+        let held = limits
+            .try_acquire_user_study_set("user-1", "biology-midterm", 1)
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            drop(held);
+        });
+
+        let lease = acquire_user_study_set_with_reconnect_grace(
+            &limits,
+            "user-1",
+            "biology-midterm",
+            1,
+            Duration::from_millis(250),
+        )
+        .await;
+
+        release.await.unwrap();
+        assert!(lease.is_some());
+    }
+
+    #[tokio::test]
+    async fn user_study_set_acquire_still_rejects_live_duplicate_after_reconnect_grace() {
+        let limits = crate::app::VoiceLimitState::default();
+        let _held = limits
+            .try_acquire_user_study_set("user-1", "biology-midterm", 1)
+            .unwrap();
+
+        let lease = acquire_user_study_set_with_reconnect_grace(
+            &limits,
+            "user-1",
+            "biology-midterm",
+            1,
+            Duration::from_millis(25),
+        )
+        .await;
+
+        assert!(lease.is_none());
     }
 
     struct FailingSink;
