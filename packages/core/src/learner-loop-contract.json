@@ -228,9 +228,9 @@
       "copy": {
         "capsule_label": "Saved for checking",
         "marginalia_title": "Your attempt is saved.",
-        "marginalia_text": "Viva saved the attempt envelope and will not invent feedback while evaluation is unavailable.",
-        "next_action_label": "Check later",
-        "primary_action_label": "Check later",
+        "marginalia_text": "Viva saved the attempt envelope and will not invent feedback while evaluation is unavailable. Start a fresh question now; the saved attempt can be evaluated when service recovers.",
+        "next_action_label": "Start a fresh question",
+        "primary_action_label": "Start a fresh question",
         "primary_action_intent": "start_session",
         "status_label": "pending evaluation"
       },
