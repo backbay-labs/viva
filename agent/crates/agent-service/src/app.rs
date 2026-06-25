@@ -305,6 +305,21 @@ impl VoiceLimitState {
                         },
                     });
                 }
+                if let ProviderQueueBehavior::Deny {
+                    reason,
+                    terminal_reason,
+                } = queue_behavior
+                {
+                    return ProviderAdmission::denied(ProviderAdmissionDenial {
+                        reason,
+                        terminal_reason,
+                        retry_after_ms: 0,
+                        reset_hint: "none".to_owned(),
+                        budget_state: "within_limit".to_owned(),
+                        queue_depth: active.provider_inflight + active.provider_waiting,
+                        queue_delay_ms: 0,
+                    });
+                }
                 if let Some(max) = limits.max_provider_concurrent_turns {
                     let queued_ahead = reservation.is_none() && active.provider_waiting > 0;
                     if active.provider_inflight >= max || queued_ahead {
@@ -765,6 +780,37 @@ mod tests {
         };
         assert_eq!(denial.reason, "provider_queue_saturated");
         assert_eq!(denial.queue_depth, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_deny_behavior_rejects_before_spare_global_capacity() {
+        let state = VoiceLimitState::default();
+        let limits = VoiceLimitConfig::default();
+        let first = state
+            .try_admit_provider_turn(&limits, ProviderQueueBehavior::Wait)
+            .await;
+        assert!(matches!(
+            first.decision,
+            ProviderAdmissionDecision::Admitted
+        ));
+
+        let second = state
+            .try_admit_provider_turn(
+                &limits,
+                ProviderQueueBehavior::Deny {
+                    reason: "overlapping_provider_turn",
+                    terminal_reason: TerminalSessionReason::SlowClient,
+                },
+            )
+            .await;
+
+        let ProviderAdmissionDecision::Denied(denial) = second.decision else {
+            panic!("same-socket deny behavior must reject even when global capacity is spare");
+        };
+        assert_eq!(denial.reason, "overlapping_provider_turn");
+        assert_eq!(denial.terminal_reason, TerminalSessionReason::SlowClient);
+        assert_eq!(denial.queue_depth, 1);
+        assert_eq!(denial.retry_after_ms, 0);
     }
 
     #[tokio::test]
