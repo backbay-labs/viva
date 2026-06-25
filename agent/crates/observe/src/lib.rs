@@ -9,16 +9,43 @@ const REDACTED_EVIDENCE_DETAIL: &str = "redacted_evidence_detail";
 const FORBIDDEN_EVIDENCE_DETAIL_MARKERS: &[&str] = &[
     "pcm16_base64",
     "answer_text",
+    "answertext",
     "transcript_final",
+    "transcriptfinal",
     "source_context",
+    "sourcecontext",
     "pasted_text",
+    "pastedtext",
     "session_token",
     "viva1.",
     "bearer ",
+    "bearer.",
     "cartesia_api_key",
     "gemini_api_key",
     "raw answer",
+    "raw_answer_text",
+    "rawanswertext",
+    "raw_audio",
+    "rawaudio",
+    "raw_transcript",
+    "rawtranscript",
+    "prompt_content",
+    "promptcontent",
     "source excerpt",
+    "source_excerpt_text",
+    "sourceexcerpttext",
+];
+
+const FORBIDDEN_EVIDENCE_DETAIL_FIELDS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer",
+    "control_token",
+    "controltoken",
+    "password",
+    "secret",
+    "token",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -104,9 +131,32 @@ pub fn sanitize_evidence_detail(detail: String) -> String {
 
 fn contains_forbidden_evidence_detail_marker(detail: &str) -> bool {
     let normalized = detail.to_ascii_lowercase();
-    FORBIDDEN_EVIDENCE_DETAIL_MARKERS
+    let marker_hit = FORBIDDEN_EVIDENCE_DETAIL_MARKERS
         .iter()
-        .any(|marker| normalized.contains(marker))
+        .any(|marker| normalized.contains(marker));
+    if marker_hit {
+        return true;
+    }
+    let field_scan = normalized
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '-' | '.' | '=' | ':' | '"')
+        })
+        .collect::<String>();
+    FORBIDDEN_EVIDENCE_DETAIL_FIELDS
+        .iter()
+        .any(|field| detail_field_assignment_present(&field_scan, field))
+}
+
+fn detail_field_assignment_present(detail: &str, field: &str) -> bool {
+    [
+        format!("{field}="),
+        format!("{field}:"),
+        format!("\"{field}\""),
+    ]
+    .iter()
+    .any(|marker| detail.contains(marker))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -252,5 +302,23 @@ mod tests {
         );
 
         assert_eq!(event.detail, "redacted_evidence_detail");
+    }
+
+    #[test]
+    fn evidence_detail_redacts_token_key_and_compound_payload_markers() {
+        for detail in [
+            "token=opaque-control-value",
+            "controlToken=opaque-control-value",
+            "APIKey=opaque-provider-value",
+            "bearer.opaque-session-value",
+            "rawAnswerText=plain learner content",
+            "promptContent=question stem",
+            "sourceExcerptText=chapter quote",
+        ] {
+            let event =
+                VoiceEvidenceEvent::new(VoiceEvidenceEventKind::AnswerReceived, None, detail);
+
+            assert_eq!(event.detail, "redacted_evidence_detail", "{detail}");
+        }
     }
 }

@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
   addedLineViolatesRedactionAudit,
   assertNoForbiddenEvidenceMarkers,
+  auditTextArtifacts,
   changedFileNeedsRedactionAudit,
   forbiddenStructuralFieldInText,
   redactForVivaLog,
@@ -29,11 +33,18 @@ test("redacts structurally forbidden log fields instead of serializing raw value
     answer_text: "NADH donates electrons to the electron transport chain.",
     answerText: "learner response",
     apiKey: "provider-key",
+    APIKey: "provider-key-acronym",
+    cartesiaAPIKey: "cartesia-provider-key",
+    controlToken: "opaque-control-token",
     duration_ms: 318,
     pastedText: "source text",
+    promptContent: "question stem",
+    rawAnswerText: "learner response compound",
     session_token: "viva1.signed.payload",
     sessionToken: "client token",
+    sourceExcerptText: "chapter quote",
     stage: "gemini",
+    token: "opaque-bearer-token",
     transcript_final: "learner said the raw answer aloud",
   });
 
@@ -41,11 +52,18 @@ test("redacts structurally forbidden log fields instead of serializing raw value
     answer_text: "[redacted]",
     answerText: "[redacted]",
     apiKey: "[redacted]",
+    APIKey: "[redacted]",
+    cartesiaAPIKey: "[redacted]",
+    controlToken: "[redacted]",
     duration_ms: 318,
     pastedText: "[redacted]",
+    promptContent: "[redacted]",
+    rawAnswerText: "[redacted]",
     session_token: "[redacted]",
     sessionToken: "[redacted]",
+    sourceExcerptText: "[redacted]",
     stage: "gemini",
+    token: "[redacted]",
     transcript_final: "[redacted]",
   });
   assert.doesNotMatch(JSON.stringify(redacted), /NADH|viva1|raw answer/i);
@@ -82,7 +100,62 @@ test("per-PR redaction check catches structural raw-payload fields", () => {
   assert.equal(forbiddenStructuralFieldInText("Self { api_key }"), "api_key");
   assert.equal(forbiddenStructuralFieldInText("record({ answerText })"), "answer_text");
   assert.equal(forbiddenStructuralFieldInText("record({ sessionToken })"), "session_token");
+  assert.equal(forbiddenStructuralFieldInText("const detail = authorization;"), "authorization");
+  assert.equal(forbiddenStructuralFieldInText("const detail = authorization"), "authorization");
+  assert.equal(forbiddenStructuralFieldInText("return authorization"), "authorization");
+  assert.equal(forbiddenStructuralFieldInText('headers["authorization"]'), "authorization");
+  assert.equal(forbiddenStructuralFieldInText("record({ controlToken })"), "control_token");
+  assert.equal(forbiddenStructuralFieldInText("Self { cartesiaAPIKey }"), "cartesia_api_key");
+  assert.equal(forbiddenStructuralFieldInText("record({ promptContent })"), "prompt_content");
+  assert.equal(forbiddenStructuralFieldInText("record({ rawAnswerText })"), "raw_answer_text");
+  assert.equal(forbiddenStructuralFieldInText("record({ sourceExcerptText })"), "source_excerpt_text");
+  assert.equal(forbiddenStructuralFieldInText('{"message":"invalid session token"}'), undefined);
+  assert.equal(forbiddenStructuralFieldInText("invalid session token"), undefined);
   assert.equal(addedLineViolatesRedactionAudit("  prompt_content_retained: true"), false);
+});
+
+test("artifact audit catches structural sensitive fields even without denylist marker values", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "viva-redaction-artifacts-"));
+  try {
+    const file = path.join(dir, "evidence.json");
+    await writeFile(
+      file,
+      JSON.stringify({
+        schema: "viva.generated_evidence.v1",
+        controlToken: "opaque-control-value",
+        APIKey: "opaque-provider-value",
+        rawAnswerText: "plain learner content",
+      }),
+    );
+
+    await assert.rejects(
+      () => auditTextArtifacts([dir], { rootDir: dir, context: "artifact", env: {} }),
+      /artifact .* includes forbidden evidence field:/,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact audit permits sanitized auth failure copy that mentions token", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "viva-redaction-safe-artifacts-"));
+  try {
+    const file = path.join(dir, "browser-story.json");
+    await writeFile(
+      file,
+      JSON.stringify({
+        schema: "viva.browser_story.v1",
+        message: "invalid session token",
+        terminalReason: "session_auth_rejected",
+      }),
+    );
+
+    await assert.doesNotReject(() =>
+      auditTextArtifacts([dir], { rootDir: dir, context: "artifact", env: {} }),
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("per-PR redaction check fails when the configured base cannot be diffed", () => {

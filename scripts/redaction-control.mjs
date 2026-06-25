@@ -46,6 +46,7 @@ export const FORBIDDEN_STRUCTURAL_FIELDS = Object.freeze([
   "session_token",
   "source_context",
   "source_excerpt",
+  "token",
   "transcript_final",
   "transcript_text",
 ]);
@@ -53,6 +54,30 @@ export const FORBIDDEN_STRUCTURAL_FIELDS = Object.freeze([
 const forbiddenStructuralFieldSet = new Set(
   FORBIDDEN_STRUCTURAL_FIELDS.map((field) => normalizeStructuralFieldName(field)),
 );
+
+const forbiddenCompoundStructuralFieldStems = [
+  "answer",
+  "answer_transcript",
+  "raw_answer",
+  "raw_audio",
+  "raw_transcript",
+  "prompt",
+  "source_context",
+  "source_excerpt",
+  "transcript",
+].map((field) => normalizeStructuralFieldName(field));
+
+const forbiddenCompoundStructuralFieldTails = new Set([
+  "base64",
+  "blob",
+  "body",
+  "bytes",
+  "content",
+  "final",
+  "payload",
+  "text",
+  "value",
+]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([
   ".js",
@@ -112,6 +137,9 @@ export async function auditTextArtifacts(
       if (!isTextArtifact(file)) continue;
       scanned_files += 1;
       const text = await readFile(file, "utf8");
+      assertNoForbiddenStructuralTextFields(text, {
+        context: `${context} ${relative}`,
+      });
       assertNoForbiddenTextMarkers(text, {
         context: `${context} ${relative}`,
         env,
@@ -158,14 +186,31 @@ export function forbiddenEvidenceMarkerInText(text) {
 }
 
 export function forbiddenStructuralFieldInText(text) {
-  const candidatePattern = /(^|[^A-Za-z0-9_$])["']?([A-Za-z_][A-Za-z0-9_-]*)["']?\s*(?=[:=,})])/g;
-  let match = candidatePattern.exec(text);
-  while (match) {
-    const normalized = normalizeStructuralFieldName(match[2]);
-    if (isForbiddenStructuralField(normalized)) return normalized;
-    match = candidatePattern.exec(text);
+  const candidatePatterns = [
+    { pattern: /(^|[{\s,])["']([A-Za-z_][A-Za-z0-9_-]*)["']\s*:/g, group: 2 },
+    { pattern: /(^|[^A-Za-z0-9_$])([A-Za-z_][A-Za-z0-9_-]*)\s*[:=]/g, group: 2 },
+    { pattern: /[{,]\s*([A-Za-z_][A-Za-z0-9_-]*)\s*(?=[,}])/g, group: 1 },
+    { pattern: /\[\s*["']([A-Za-z_][A-Za-z0-9_-]*)["']\s*\]/g, group: 1 },
+    { pattern: /=\s*([A-Za-z_][A-Za-z0-9_-]*)\s*(?=[;,\]\)}]|$)/g, group: 1 },
+    { pattern: /\breturn\s+([A-Za-z_][A-Za-z0-9_-]*)\s*(?=[;,\]\)}]|$)/g, group: 1 },
+    { pattern: /\.([A-Za-z_][A-Za-z0-9_-]*)\s*(?=[;,\]\)}]|$)/g, group: 1 },
+  ];
+  for (const { pattern, group } of candidatePatterns) {
+    let match = pattern.exec(text);
+    while (match) {
+      const normalized = normalizeStructuralFieldName(match[group]);
+      if (isForbiddenStructuralField(normalized)) return normalized;
+      match = pattern.exec(text);
+    }
   }
   return undefined;
+}
+
+function assertNoForbiddenStructuralTextFields(text, { context = "artifact" } = {}) {
+  const field = forbiddenStructuralFieldInText(text);
+  if (field) {
+    throw new Error(`${context} includes forbidden evidence field: ${field}`);
+  }
 }
 
 function redactValue(value, key) {
@@ -212,8 +257,18 @@ function isForbiddenStructuralField(key) {
     forbiddenStructuralFieldSet.has(normalized) ||
     normalized.endsWith("_api_key") ||
     normalized.endsWith("_password") ||
-    normalized.endsWith("_secret")
+    normalized.endsWith("_secret") ||
+    normalized.endsWith("_token") ||
+    isForbiddenCompoundStructuralField(normalized)
   );
+}
+
+function isForbiddenCompoundStructuralField(normalized) {
+  return forbiddenCompoundStructuralFieldStems.some((stem) => {
+    if (!normalized.startsWith(`${stem}_`)) return false;
+    const tail = normalized.slice(stem.length + 1).split("_").at(-1);
+    return Boolean(tail && forbiddenCompoundStructuralFieldTails.has(tail));
+  });
 }
 
 function serializedForAudit(value) {
@@ -244,6 +299,7 @@ function isRecord(value) {
 
 function normalizeStructuralFieldName(key) {
   return key
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
     .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
     .replace(/[-.\s]+/g, "_")
     .toLowerCase();

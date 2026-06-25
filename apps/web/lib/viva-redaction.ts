@@ -40,10 +40,35 @@ const FORBIDDEN_LOG_FIELDS = new Set(
     "session_token",
     "source_context",
     "source_excerpt",
+    "token",
     "transcript_final",
     "transcript_text",
   ].map((field) => normalizeLogFieldName(field)),
 );
+
+const FORBIDDEN_COMPOUND_LOG_FIELD_STEMS = [
+  "answer",
+  "answer_transcript",
+  "raw_answer",
+  "raw_audio",
+  "raw_transcript",
+  "prompt",
+  "source_context",
+  "source_excerpt",
+  "transcript",
+].map((field) => normalizeLogFieldName(field));
+
+const FORBIDDEN_COMPOUND_LOG_FIELD_TAILS = new Set([
+  "base64",
+  "blob",
+  "body",
+  "bytes",
+  "content",
+  "final",
+  "payload",
+  "text",
+  "value",
+]);
 
 export function redactForVivaLog(value: unknown): unknown {
   return redactValue(value, null);
@@ -83,8 +108,21 @@ function isForbiddenLogField(key: string): boolean {
     FORBIDDEN_LOG_FIELDS.has(normalized) ||
     normalized.endsWith("_api_key") ||
     normalized.endsWith("_password") ||
-    normalized.endsWith("_secret")
+    normalized.endsWith("_secret") ||
+    normalized.endsWith("_token") ||
+    isForbiddenCompoundLogField(normalized)
   );
+}
+
+function isForbiddenCompoundLogField(normalized: string): boolean {
+  return FORBIDDEN_COMPOUND_LOG_FIELD_STEMS.some((stem) => {
+    if (!normalized.startsWith(`${stem}_`)) return false;
+    const tail = normalized
+      .slice(stem.length + 1)
+      .split("_")
+      .at(-1);
+    return Boolean(tail && FORBIDDEN_COMPOUND_LOG_FIELD_TAILS.has(tail));
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -93,6 +131,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function normalizeLogFieldName(key: string): string {
   return key
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
     .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
     .replace(/[-.\s]+/g, "_")
     .toLowerCase();
