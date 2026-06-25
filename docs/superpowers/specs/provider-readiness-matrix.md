@@ -3,10 +3,15 @@
 BAC-305 is proved by the sanitized release evidence gate:
 
 ```sh
-VIVA_RELEASE_CHECK_SKIP_BROWSER=1 bun run release:check
+VIVA_E2E_AGENT_PROVIDER=synthetic \
+VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO=1 \
+  bun run e2e:browser
+bun run release:check
 ```
 
-The command writes `artifacts/release-check/evidence.json`. The artifact directory is ignored by git and is meant to be attached to release evidence, not committed.
+The command writes `artifacts/release-check/evidence.json`. The artifact
+directory is ignored by git and is meant to be attached to release evidence, not
+committed. `VIVA_RELEASE_CHECK_SKIP_BROWSER=1` is never production-ready proof.
 
 ## Expected Matrix
 

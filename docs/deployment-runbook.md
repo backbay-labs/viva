@@ -309,7 +309,6 @@ VIVA_E2E_AGENT_PROVIDER=synthetic \
 VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO=1 \
   bun run e2e:browser
 VIVA_AGENT_PROVIDER=fake_cartesia_gemini \
-VIVA_RELEASE_CHECK_SKIP_BROWSER=1 \
   bun run release:check
 ```
 
@@ -323,10 +322,13 @@ VIVA_E2E_FAILURE_CONTROL_SCENARIO=provider_rate_limited \
 The release evidence bundle is sanitized output only: command summaries,
 fixture hashes, browser story filenames/screenshots, provider readiness matrix,
 failure_control_harness disabled state, rollback_drain criteria,
-provider_failure_observability dashboard criteria, and artifact audit summary.
-It must show forbidden hits equal to zero. `bun run release:check` must fail if
-`VIVA_FAILURE_CONTROL_ENABLED=1`; deterministic provider failure coverage must
-come from the signed harness, not flaky real outages.
+provider_failure_observability dashboard criteria, hosted_e2e_matrix contract,
+production_release_gate summary, release_bundle integrity hash/signature, and
+artifact audit summary. It must show forbidden hits equal to zero.
+`bun run release:check` must fail if `VIVA_FAILURE_CONTROL_ENABLED=1`;
+deterministic provider failure coverage must come from the signed harness, not
+flaky real outages. Do not set `VIVA_RELEASE_CHECK_SKIP_BROWSER=1` for release
+evidence; a browser-skipped result cannot certify production readiness.
 
 Opt-in live smoke is separate. Only run it after Act 3 makes `/ready` selectable
 for `cartesia_gemini` and after budget/time caps are set. The minimum proof is:
@@ -646,18 +648,36 @@ Before any production release, the sanitized release evidence must include:
 
 - `VIVA_RELEASE_WEB_DEPLOY_ID`
 - `VIVA_RELEASE_AGENT_DEPLOY_ID`
+- `VIVA_LIVE_WEB_DEPLOY_ID`
+- `VIVA_LIVE_AGENT_DEPLOY_ID`
+- `VIVA_RELEASE_WEB_ORIGIN`
+- `VIVA_RELEASE_AGENT_ORIGIN`
 - `VIVA_RELEASE_CONFIG_DIFF_SHA256`
+- `VIVA_RELEASE_SECRETS_SNAPSHOT_SHA256`
 - `VIVA_RELEASE_PROVIDER_MODE`
 - `VIVA_RELEASE_POSTGRES_STATE`
 - `VIVA_RELEASE_RECOVERY_VALIDATION`
+- `VIVA_RELEASE_LIVE_SMOKE_EVIDENCE_PATH`
+- `VIVA_PROVIDER_LIMITER_STATE`
+- `VIVA_GEMINI_QUOTA_CONFIRMED=1`
+- `VIVA_GEMINI_QUOTA_RPM_LIMIT`
+- `VIVA_GEMINI_QUOTA_TPM_LIMIT`
+- `VIVA_RELEASE_BUNDLE_SIGNING_SECRET`
 - `VIVA_RELEASE_OWNER`
 - `VIVA_RELEASE_OWNER_DECISION=proceed`
 - `VIVA_RELEASE_OWNER_DECIDED_AT_UTC`
 
 Set `VIVA_PRODUCTION_RELEASE=1` only for the production release gate. With that
 flag present, `bun run release:check` fails unless rollback thresholds, deploy
-ids, redacted config diff hash, provider mode, Postgres state, recovery
-validation, and the owner proceed decision are present.
+ids, currently-live deploy ids, hosted browser deploy ids, redacted config and
+secret snapshot hashes, provider mode/model, durable Postgres state,
+budget-capped live smoke evidence, submitted-answer recovery matrix,
+provider-failure recovery proof, BAC-528 harness-disabled state, BAC-531
+consent/deletion proof, BAC-529 Gemini quota sufficiency, release bundle
+signature, and the owner proceed decision are present. The gate rejects stale
+evidence over 24 hours old, deploy-id mismatches, missing hosted browser
+evidence, browser-skipped evidence, and any ephemeral durability mode while
+BAC-520/BAC-521/BAC-522 durable-state proof is claimed.
 
 ## Logs And Evidence Redaction
 
@@ -681,7 +701,6 @@ Validate redaction before attaching release evidence:
 
 ```sh
 VIVA_AGENT_PROVIDER=fake_cartesia_gemini \
-VIVA_RELEASE_CHECK_SKIP_BROWSER=1 \
   bun run release:check
 node -e 'const e=require("./artifacts/release-check/evidence.json"); if (e.artifact_audit.forbidden_hits !== 0) process.exit(1); console.log(e.artifact_audit)'
 ```

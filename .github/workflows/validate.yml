@@ -57,7 +57,6 @@ jobs:
       - name: Sanitized release evidence gate
         env:
           VIVA_AGENT_PROVIDER: fake_cartesia_gemini
-          VIVA_RELEASE_CHECK_SKIP_BROWSER: "1"
         run: bun run release:check
 
       - name: Upload sanitized release evidence bundle
