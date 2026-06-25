@@ -187,23 +187,12 @@ pub(crate) fn bac_510_max_turn_duration() -> Duration {
     Duration::from_millis(max_resolution_ms)
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct VoiceLimitConfig {
     pub max_user_sessions: Option<usize>,
     pub max_ip_sessions: Option<usize>,
     pub max_audio_bytes_per_minute: Option<u64>,
     pub max_session_cost_usd: Option<f64>,
-}
-
-impl Default for VoiceLimitConfig {
-    fn default() -> Self {
-        Self {
-            max_user_sessions: Some(1),
-            max_ip_sessions: None,
-            max_audio_bytes_per_minute: None,
-            max_session_cost_usd: None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1102,8 +1091,8 @@ mod tests {
     }
 
     #[test]
-    fn voice_limits_default_to_one_active_session_per_learner_study_set() {
-        assert_eq!(VoiceLimitConfig::default().max_user_sessions, Some(1));
+    fn voice_limits_default_user_total_cap_to_opt_in() {
+        assert_eq!(VoiceLimitConfig::default().max_user_sessions, None);
     }
 
     #[test]

@@ -3984,8 +3984,7 @@ async fn websocket_user_study_set_cap_still_rejects_duplicate_when_user_total_li
 }
 
 #[tokio::test]
-async fn websocket_default_user_session_cap_rejects_duplicate_study_set_tab_and_releases_after_close(
-) {
+async fn websocket_default_study_set_cap_rejects_duplicate_tab_and_releases() {
     let dropped = Arc::new(AtomicBool::new(false));
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let state = AppState::with_study_store(
@@ -4058,6 +4057,123 @@ async fn websocket_default_user_session_cap_rejects_duplicate_study_set_tab_and_
     .await;
     third_socket.close(None).await.unwrap();
     let _ = read_server_frames_until_close(&mut third_socket).await;
+    wait_until(Duration::from_secs(2), || dropped.load(Ordering::SeqCst)).await;
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn websocket_default_limits_allow_different_study_sets_but_reject_duplicate_tabs() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "chemistry-final".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Chemistry Final".to_owned(),
+        course: Some("Chemistry 201".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    let state = AppState::with_study_store(
+        Arc::new(BackpressuredInputBrain {
+            dropped: dropped.clone(),
+        }),
+        "backpressured_input_probe",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let biology_token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() + 60,
+        "nonce-biology-default-limit-session",
+    );
+    let duplicate_biology_token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "biology-midterm",
+        "voice-session-duplicate",
+        unix_timestamp_now() + 60,
+        "nonce-biology-default-limit-duplicate",
+    );
+    let chemistry_token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "chemistry-final",
+        "voice-session-2",
+        unix_timestamp_now() + 60,
+        "nonce-chemistry-default-limit-session",
+    );
+    let biology_session = session_config_json_with_token(&biology_token);
+    let duplicate_biology_session = session_config_json_with_ids_and_token(
+        "biology-midterm",
+        "voice-session-duplicate",
+        &duplicate_biology_token,
+    );
+    let chemistry_session = session_config_json_with_ids_and_token(
+        "chemistry-final",
+        "voice-session-2",
+        &chemistry_token,
+    );
+
+    let (mut biology_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut biology_socket, "backpressured_input_probe").await;
+    biology_socket
+        .send(WsMessage::Text(biology_session.into()))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+    })
+    .await;
+
+    let (mut chemistry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut chemistry_socket, "backpressured_input_probe").await;
+    chemistry_socket
+        .send(WsMessage::Text(chemistry_session.into()))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .filter(|event| event.kind == VoiceEvidenceEventKind::SessionOpened)
+            .count()
+            >= 2
+    })
+    .await;
+
+    let (mut duplicate_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut duplicate_socket, "backpressured_input_probe").await;
+    duplicate_socket
+        .send(WsMessage::Text(duplicate_biology_session.into()))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut duplicate_socket).await,
+        TerminalSessionReason::SessionCap,
+    );
+    assert_close_code(&mut duplicate_socket, CloseCode::Policy).await;
+
+    biology_socket.close(None).await.unwrap();
+    chemistry_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut biology_socket).await;
+    let _ = read_server_frames_until_close(&mut chemistry_socket).await;
     wait_until(Duration::from_secs(2), || dropped.load(Ordering::SeqCst)).await;
     assert!(dropped.load(Ordering::SeqCst));
 }
