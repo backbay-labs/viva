@@ -1189,14 +1189,19 @@ fn provider_error_is_durability_degraded(state: &AppState, error: &BrainProvider
     if !state.study_store.capabilities().durable {
         return false;
     }
-    let source = error.source.to_ascii_lowercase();
+    provider_store_error_is_durability_degraded(&error.source, &error.message)
+}
+
+fn provider_store_error_is_durability_degraded(source: &str, message: &str) -> bool {
+    let source = source.to_ascii_lowercase();
     if !matches!(
         source.as_str(),
         "synthetic-memory" | "fake-provider-store" | "cartesia-gemini-store"
     ) {
         return false;
     }
-    provider_store_error_message_is_durability_degraded(&error.message)
+    message.trim().eq_ignore_ascii_case("store adapter error")
+        || provider_store_error_message_is_durability_degraded(message)
 }
 
 fn provider_store_error_message_is_durability_degraded(message: &str) -> bool {
@@ -2530,6 +2535,26 @@ mod tests {
             "postgres connection pool timed out"
         ));
         assert!(!provider_store_error_message_is_durability_degraded(
+            "postgres adapter error: closed voice session cannot be reopened"
+        ));
+    }
+
+    #[test]
+    fn durability_classifier_preserves_sanitized_store_adapter_marker_for_store_sources() {
+        assert!(provider_store_error_is_durability_degraded(
+            "fake-provider-store",
+            "store adapter error"
+        ));
+        assert!(provider_store_error_is_durability_degraded(
+            "cartesia-gemini-store",
+            "store adapter error"
+        ));
+        assert!(!provider_store_error_is_durability_degraded(
+            "agent-service",
+            "store adapter error"
+        ));
+        assert!(!provider_store_error_is_durability_degraded(
+            "fake-provider-store",
             "postgres adapter error: closed voice session cannot be reopened"
         ));
     }
