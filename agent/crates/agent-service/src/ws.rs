@@ -609,6 +609,16 @@ async fn handle_socket(
                                         .await;
                                         break;
                                     }
+                                    Ok(ForwardBrainEvent::DurabilityDegraded) => {
+                                        terminal_reason = close_with_terminal_session_phase(
+                                            &mut sender,
+                                            &session.input,
+                                            TerminalSessionReason::DurabilityDegraded,
+                                            close_code::ERROR,
+                                        )
+                                        .await;
+                                        break;
+                                    }
                                     Ok(ForwardBrainEvent::CostBudgetExceeded) => {
                                         terminal_reason = close_with_terminal_session_phase(
                                             &mut sender,
@@ -737,6 +747,16 @@ async fn handle_socket(
                             &mut sender,
                             close_code::POLICY,
                             "provider source authority rejected",
+                        )
+                        .await;
+                        break;
+                    }
+                    Ok(ForwardBrainEvent::DurabilityDegraded) => {
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            TerminalSessionReason::DurabilityDegraded,
+                            close_code::ERROR,
                         )
                         .await;
                         break;
@@ -907,6 +927,7 @@ enum ForwardBrainEvent {
     Continue,
     Suppressed,
     Rejected,
+    DurabilityDegraded,
     CostBudgetExceeded,
     ProviderFailure(TerminalSessionReason),
 }
@@ -929,15 +950,26 @@ where
             terminal_reason_for_provider_error(error),
         ));
     }
-    if !authorize_browser_event(context.state, context.session_binding, &event).await {
-        send_json(
-            sender,
-            &ServerFrame::error("provider source authority rejected"),
-        )
-        .await?;
-        return Ok(ForwardBrainEvent::Rejected);
+    match authorize_browser_event(context.state, context.session_binding, &event).await {
+        BrowserEventAuthorization::Authorized => {}
+        BrowserEventAuthorization::Rejected => {
+            send_json(
+                sender,
+                &ServerFrame::error("provider source authority rejected"),
+            )
+            .await?;
+            return Ok(ForwardBrainEvent::Rejected);
+        }
+        BrowserEventAuthorization::DurabilityDegraded => {
+            context.state.evidence.record(VoiceEvidenceEvent::new(
+                VoiceEvidenceEventKind::StoreCounts,
+                context.voice_session_id.clone(),
+                "durability_degraded",
+            ));
+            return Ok(ForwardBrainEvent::DurabilityDegraded);
+        }
     }
-    if let Some(usage_record) = record_brain_event(
+    match record_brain_event(
         context.state,
         context.voice_session_id.clone(),
         &event,
@@ -945,11 +977,17 @@ where
     )
     .await
     {
-        if !context
-            .session_limits
-            .record_session_cost(context.limits, usage_record.cost_estimate_usd)
-        {
-            return Ok(ForwardBrainEvent::CostBudgetExceeded);
+        BrainEventRecordResult::None => {}
+        BrainEventRecordResult::DurabilityDegraded => {
+            return Ok(ForwardBrainEvent::DurabilityDegraded);
+        }
+        BrainEventRecordResult::Usage(usage_record) => {
+            if !context
+                .session_limits
+                .record_session_cost(context.limits, usage_record.cost_estimate_usd)
+            {
+                return Ok(ForwardBrainEvent::CostBudgetExceeded);
+            }
         }
     }
     let Some(frame) = ServerFrame::browser_event(event) else {
@@ -1155,11 +1193,18 @@ fn unix_timestamp_now() -> Result<u64, std::time::SystemTimeError> {
         .map(|duration| duration.as_secs())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrowserEventAuthorization {
+    Authorized,
+    Rejected,
+    DurabilityDegraded,
+}
+
 async fn authorize_browser_event(
     state: &AppState,
     session_binding: &AuthorizedClientSession,
     event: &agent_domain::BrainEvent,
-) -> bool {
+) -> BrowserEventAuthorization {
     let result = match event {
         agent_domain::BrainEvent::QuestionStarted { question, .. } => {
             state
@@ -1239,9 +1284,27 @@ async fn authorize_browser_event(
                 )
                 .await
         }
-        _ => return true,
+        _ => return BrowserEventAuthorization::Authorized,
     };
-    result.is_ok()
+    match result {
+        Ok(()) => BrowserEventAuthorization::Authorized,
+        Err(error) if store_error_is_durability_degraded(state, &error) => {
+            BrowserEventAuthorization::DurabilityDegraded
+        }
+        Err(_) => BrowserEventAuthorization::Rejected,
+    }
+}
+
+fn store_error_is_durability_degraded(state: &AppState, error: &PortError) -> bool {
+    state.study_store.capabilities().durable && matches!(error, PortError::Unavailable { .. })
+}
+
+fn store_write_error_is_durability_degraded(state: &AppState, error: &PortError) -> bool {
+    state.study_store.capabilities().durable
+        && matches!(
+            error,
+            PortError::Unavailable { .. } | PortError::Adapter { .. }
+        )
 }
 
 #[derive(Default)]
@@ -1967,12 +2030,19 @@ fn record_turn_cap_config(state: &AppState, voice_session_id: Option<String>) {
     ));
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum BrainEventRecordResult {
+    None,
+    Usage(VoiceUsageRecord),
+    DurabilityDegraded,
+}
+
 async fn record_brain_event(
     state: &AppState,
     voice_session_id: Option<String>,
     event: &agent_domain::BrainEvent,
     session_elapsed: Duration,
-) -> Option<VoiceUsageRecord> {
+) -> BrainEventRecordResult {
     if let agent_domain::BrainEvent::Usage(usage) = event {
         let elapsed_ms = session_elapsed.as_millis().try_into().unwrap_or(u64::MAX);
         let usage_record = state.usage.record(
@@ -1988,15 +2058,24 @@ async fn record_brain_event(
             .record_voice_usage(usage_record.clone())
             .await
         {
-            state.evidence.record(VoiceEvidenceEvent::new(
-                VoiceEvidenceEventKind::StoreCounts,
-                voice_session_id,
-                format!("usage_persist_failed: {error}"),
-            ));
+            if store_write_error_is_durability_degraded(state, &error) {
+                state.evidence.record(VoiceEvidenceEvent::new(
+                    VoiceEvidenceEventKind::StoreCounts,
+                    voice_session_id,
+                    "durability_degraded",
+                ));
+                return BrainEventRecordResult::DurabilityDegraded;
+            } else {
+                state.evidence.record(VoiceEvidenceEvent::new(
+                    VoiceEvidenceEventKind::StoreCounts,
+                    voice_session_id,
+                    format!("usage_persist_failed: {error}"),
+                ));
+            }
         }
-        return Some(usage_record);
+        return BrainEventRecordResult::Usage(usage_record);
     }
-    let (kind, detail) = (match event {
+    let Some((kind, detail)) = (match event {
         agent_domain::BrainEvent::QuestionStarted { response_id, .. } => Some((
             VoiceEvidenceEventKind::QuestionEmitted,
             response_id.as_str(),
@@ -2015,11 +2094,13 @@ async fn record_brain_event(
             Some((VoiceEvidenceEventKind::CancelReceived, "response cancelled"))
         }
         _ => None,
-    })?;
+    }) else {
+        return BrainEventRecordResult::None;
+    };
     state
         .evidence
         .record(VoiceEvidenceEvent::new(kind, voice_session_id, detail));
-    None
+    BrainEventRecordResult::None
 }
 
 async fn record_terminal(state: &AppState, voice_session_id: Option<String>, reason: &str) {
@@ -2790,8 +2871,10 @@ mod tests {
             }),
             Duration::from_secs(2),
         )
-        .await
-        .expect("usage events should return a usage record");
+        .await;
+        let BrainEventRecordResult::Usage(record) = record else {
+            panic!("usage events should return a usage record");
+        };
 
         let usage = state.usage.snapshot();
         assert_eq!(usage.len(), 1);
