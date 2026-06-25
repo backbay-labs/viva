@@ -3935,6 +3935,122 @@ async fn websocket_durable_terminal_close_failure_emits_durability_degraded_term
 }
 
 #[tokio::test]
+async fn websocket_client_stop_close_failure_emits_durability_degraded_terminal_phase() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(DurableStoreDegradingStore {
+        inner: inner.clone(),
+        failure: DurableStoreFailureMode::SessionClose,
+    });
+    let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(IdleProbeBrain {
+            study_store: Some(brain_store),
+        }),
+        "idle_probe",
+        VoiceWsAccess::default(),
+        4,
+        state_store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(5),
+        session: Duration::from_secs(5),
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/synthetic-study-session.json"
+    ))
+    .unwrap();
+
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
+        panic!("expected ready frame");
+    };
+    assert_eq!(brain.provider, "idle_probe");
+    assert!(store.durable);
+    send_client_frame(&mut socket, &fixture.client[0]).await;
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Event {
+            event,
+            ..
+        } if matches!(event.as_ref(), VivaServerEvent::SessionPhase { .. })
+    ));
+    send_client_frame(&mut socket, &fixture.client[3]).await;
+
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::DurabilityDegraded,
+    );
+    assert_close_code(&mut socket, CloseCode::Error).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "durability_degraded"
+    }));
+}
+
+#[tokio::test]
+async fn websocket_peer_close_failure_records_durability_degraded_terminal_reason() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(DurableStoreDegradingStore {
+        inner: inner.clone(),
+        failure: DurableStoreFailureMode::SessionClose,
+    });
+    let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(IdleProbeBrain {
+            study_store: Some(brain_store),
+        }),
+        "idle_probe",
+        VoiceWsAccess::default(),
+        4,
+        state_store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(5),
+        session: Duration::from_secs(5),
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/synthetic-study-session.json"
+    ))
+    .unwrap();
+
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
+        panic!("expected ready frame");
+    };
+    assert_eq!(brain.provider, "idle_probe");
+    assert!(store.durable);
+    send_client_frame(&mut socket, &fixture.client[0]).await;
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Event {
+            event,
+            ..
+        } if matches!(event.as_ref(), VivaServerEvent::SessionPhase { .. })
+    ));
+    socket.send(WsMessage::Close(None)).await.unwrap();
+
+    let _ = read_server_frames_until_close(&mut socket).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "durability_degraded"
+    }));
+}
+
+#[tokio::test]
 async fn websocket_durable_store_write_failure_mid_turn_emits_durability_degraded_terminal_phase() {
     let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let store = Arc::new(DurableStoreDegradingStore {

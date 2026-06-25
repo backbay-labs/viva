@@ -649,7 +649,6 @@ async fn handle_socket(
                         record_client_action(&state, voice_session_id.clone(), action);
                         match action {
                             ClientAction::Stop => {
-                                terminal_reason = "client_stop";
                                 let mut forward_context = BrainForwardContext {
                                     state: &state,
                                     voice_session_id: voice_session_id.clone(),
@@ -718,16 +717,32 @@ async fn handle_socket(
                                     }
                                     Err(_) => {
                                         terminal_reason = "send_failed";
+                                        let _ = close_with(
+                                            &mut sender,
+                                            close_code::NORMAL,
+                                            "client stop",
+                                        )
+                                        .await;
+                                        break;
                                     }
                                 }
-                                let _ =
-                                    close_with(&mut sender, close_code::NORMAL, "client stop").await;
+                                terminal_reason = close_with_client_stop(
+                                    &mut sender,
+                                    &state,
+                                    voice_session_id.clone(),
+                                    &mut terminal_persisted,
+                                )
+                                .await;
                                 break;
                             }
                             ClientAction::Close => {
-                                terminal_reason = "client_stop";
-                                let _ =
-                                    close_with(&mut sender, close_code::NORMAL, "client stop").await;
+                                terminal_reason = close_with_client_stop(
+                                    &mut sender,
+                                    &state,
+                                    voice_session_id.clone(),
+                                    &mut terminal_persisted,
+                                )
+                                .await;
                                 break;
                             }
                             _ => {}
@@ -968,6 +983,33 @@ where
     terminal_reason.as_str()
 }
 
+async fn close_with_client_stop<S>(
+    sender: &mut S,
+    state: &AppState,
+    voice_session_id: Option<String>,
+    terminal_persisted: &mut bool,
+) -> &'static str
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    let terminal_label =
+        persist_terminal_label_or_durability_degraded(state, voice_session_id, "client_stop").await;
+    *terminal_persisted = true;
+    if terminal_label == TerminalSessionReason::DurabilityDegraded.as_str() {
+        let _ =
+            send_terminal_session_phase(sender, TerminalSessionReason::DurabilityDegraded).await;
+        let _ = close_with(
+            sender,
+            close_code::ERROR,
+            TerminalSessionReason::DurabilityDegraded.close_reason(),
+        )
+        .await;
+        return TerminalSessionReason::DurabilityDegraded.as_str();
+    }
+    let _ = close_with(sender, close_code::NORMAL, "client stop").await;
+    terminal_label
+}
+
 async fn send_terminal_session_phase<S>(
     sender: &mut S,
     terminal_reason: TerminalSessionReason,
@@ -1159,14 +1201,14 @@ fn provider_error_is_durability_degraded(state: &AppState, error: &BrainProvider
 
 fn provider_store_error_message_is_durability_degraded(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
-    normalized.contains("adapter error")
-        || normalized.contains("store unavailable")
-        || normalized.contains("unavailable for")
+    normalized.contains("store unavailable")
+        || normalized.contains("database unavailable")
+        || normalized.contains("postgres unavailable")
         || normalized.contains("durable store")
-        || normalized.contains("database")
-        || normalized.contains("postgres")
         || normalized.contains("connection")
         || normalized.contains("pool")
+        || normalized.contains("timed out")
+        || normalized.contains("timeout")
 }
 
 fn terminal_reason_for_provider_message(message: &str) -> TerminalSessionReason {
@@ -1464,12 +1506,13 @@ fn store_adapter_error_is_durability_degraded(error: &PortError) -> bool {
         PortError::Adapter { reason, .. } => {
             let normalized = reason.to_ascii_lowercase();
             normalized.contains("durable store")
-                || normalized.contains("database")
-                || normalized.contains("postgres")
-                || normalized.contains("sql")
+                || normalized.contains("store unavailable")
+                || normalized.contains("database unavailable")
+                || normalized.contains("postgres unavailable")
                 || normalized.contains("connection")
                 || normalized.contains("pool")
-                || normalized.contains("closed")
+                || normalized.contains("timed out")
+                || normalized.contains("timeout")
         }
         PortError::Unavailable { .. } => false,
     }
@@ -2332,6 +2375,36 @@ async fn persist_terminal_session_reason(
     reason
 }
 
+async fn persist_terminal_label_or_durability_degraded(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    reason: &'static str,
+) -> &'static str {
+    let Some(session_id) = voice_session_id.as_deref() else {
+        return reason;
+    };
+    if let Err(error) = state
+        .study_store
+        .close_voice_session(session_id, reason)
+        .await
+    {
+        if store_write_error_is_durability_degraded(state, &error) {
+            state.evidence.record(VoiceEvidenceEvent::new(
+                VoiceEvidenceEventKind::StoreCounts,
+                voice_session_id,
+                "session_close_failed: durability_degraded",
+            ));
+            return TerminalSessionReason::DurabilityDegraded.as_str();
+        }
+        state.evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::StoreCounts,
+            voice_session_id,
+            format!("session_close_failed: {error}"),
+        ));
+    }
+    reason
+}
+
 fn terminal_close_code(reason: TerminalSessionReason, close_code: u16) -> u16 {
     if reason == TerminalSessionReason::DurabilityDegraded {
         close_code::ERROR
@@ -2446,6 +2519,19 @@ mod tests {
             terminal_reason_for_provider_message("synthetic partial stage success typed fallback"),
             TerminalSessionReason::PartialStageSuccess
         );
+    }
+
+    #[test]
+    fn durability_classifier_ignores_semantic_adapter_errors() {
+        assert!(provider_store_error_message_is_durability_degraded(
+            "postgres adapter error: durable store write failed"
+        ));
+        assert!(provider_store_error_message_is_durability_degraded(
+            "postgres connection pool timed out"
+        ));
+        assert!(!provider_store_error_message_is_durability_degraded(
+            "postgres adapter error: closed voice session cannot be reopened"
+        ));
     }
 
     #[test]
