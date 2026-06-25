@@ -59,6 +59,8 @@ export type LearnerLoopAuthority =
   | "server_control_event"
   | "session_event";
 
+export type LearnerLoopTerminalReason = AgentTerminalSessionReason | "durability_degraded";
+
 export type LearnerLoopCopy = {
   capsule_label: string;
   marginalia_title: string;
@@ -79,7 +81,7 @@ export type LearnerLoopState = {
   learner_safe: true;
   authority: LearnerLoopAuthority;
   failure_class?: string;
-  terminal_reason?: AgentTerminalSessionReason;
+  terminal_reason?: LearnerLoopTerminalReason;
   evidence_code?: string;
   readiness_failure_kind?: string;
   sanitized_evidence: true;

@@ -15,6 +15,7 @@ const REQUIRED_STATE_IDS = Object.freeze([
   "retry_prompt",
   "saved_pending_evaluation",
   "deterministic_partial_recap",
+  "durability_degraded",
   "provider_auth_failure",
   "provider_rate_limit",
   "provider_timeout",
@@ -57,6 +58,14 @@ describe("BAC-510 learner loop contract", () => {
     for (const stateId of REQUIRED_STATE_IDS) {
       expect(statesById.has(stateId)).toBe(true);
     }
+
+    const durabilityDegraded = statesById.get("durability_degraded");
+    expect(durabilityDegraded?.submitted_answer_resolution).toBe(true);
+    expect(durabilityDegraded?.resolution_kind).toBe("terminal");
+    expect(durabilityDegraded?.authority).toBe("durable_store_event");
+    expect(durabilityDegraded?.failure_class).toBe("durability_degraded");
+    expect(durabilityDegraded?.terminal_reason).toBe("durability_degraded");
+    expect(durabilityDegraded?.learner_safe).toBe(true);
 
     for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {
       expect(state.learner_safe).toBe(true);

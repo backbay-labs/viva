@@ -251,6 +251,37 @@
       ]
     },
     {
+      "id": "durability_degraded",
+      "label": "Durability degraded",
+      "stage": "store",
+      "resolution_kind": "terminal",
+      "submitted_answer_resolution": true,
+      "max_resolution_ms": 45000,
+      "learner_safe": true,
+      "authority": "durable_store_event",
+      "failure_class": "durability_degraded",
+      "terminal_reason": "durability_degraded",
+      "sanitized_evidence": true,
+      "runtime_copy_causes": ["store_unavailable"],
+      "copy": {
+        "capsule_label": "Progress not saved",
+        "marginalia_title": "Viva could not save this turn.",
+        "marginalia_text": "Viva could not save durable progress, so it closed the turn without inventing a result.",
+        "next_action_label": "Start a fresh turn",
+        "primary_action_label": "Start a fresh turn",
+        "primary_action_intent": "start_session",
+        "status_label": "durability degraded"
+      },
+      "operator_diagnostics": [
+        "terminal_reason",
+        "failure_class",
+        "stage",
+        "deploy_sha",
+        "latency_ms",
+        "recap_success"
+      ]
+    },
+    {
       "id": "provider_auth_failure",
       "label": "Provider auth failure",
       "stage": "readiness",
