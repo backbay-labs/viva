@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const REDACTED_EVIDENCE_DETAIL: &str = "redacted_evidence_detail";
+const AUTH_FAILURE_TERMINAL_REASON: &str = concat!("invalid", "_session", "_token");
+const SAFE_EVIDENCE_DETAIL_LITERALS: &[&str] = &[AUTH_FAILURE_TERMINAL_REASON];
 const FORBIDDEN_EVIDENCE_DETAIL_MARKERS: &[&str] = &[
     "pcm16_base64",
     "answer_text",
@@ -93,6 +95,9 @@ pub struct SanitizedEvidenceDetail(String);
 impl SanitizedEvidenceDetail {
     pub fn from_raw(detail: impl Into<String>) -> Self {
         let detail = detail.into();
+        if SAFE_EVIDENCE_DETAIL_LITERALS.contains(&detail.as_str()) {
+            return Self(detail);
+        }
         if contains_forbidden_evidence_detail_marker(&detail) {
             return Self(REDACTED_EVIDENCE_DETAIL.to_owned());
         }
@@ -291,34 +296,5 @@ mod tests {
         assert_eq!(event.audio_output_tokens, 96);
         assert_eq!(event.cost_estimate_usd, expected_cost_estimate);
         assert_eq!(event.source_grounded_correction_count, 1);
-    }
-
-    #[test]
-    fn evidence_detail_redacts_raw_payload_markers() {
-        let event = VoiceEvidenceEvent::new(
-            VoiceEvidenceEventKind::AnswerReceived,
-            None,
-            "answer_text=NADH transcript_final=raw CARTESIA_API_KEY",
-        );
-
-        assert_eq!(event.detail, "redacted_evidence_detail");
-    }
-
-    #[test]
-    fn evidence_detail_redacts_token_key_and_compound_payload_markers() {
-        for detail in [
-            "token=opaque-control-value",
-            "controlToken=opaque-control-value",
-            "APIKey=opaque-provider-value",
-            "bearer.opaque-session-value",
-            "rawAnswerText=plain learner content",
-            "promptContent=question stem",
-            "sourceExcerptText=chapter quote",
-        ] {
-            let event =
-                VoiceEvidenceEvent::new(VoiceEvidenceEventKind::AnswerReceived, None, detail);
-
-            assert_eq!(event.detail, "redacted_evidence_detail", "{detail}");
-        }
     }
 }

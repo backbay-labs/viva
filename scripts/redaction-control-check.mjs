@@ -24,7 +24,7 @@ for (const line of diff.split("\n")) {
   if (!currentFile || !changedFileNeedsRedactionAudit(currentFile)) continue;
   if (!line.startsWith("+") || line.startsWith("+++")) continue;
   const added = line.slice(1);
-  if (addedLineViolatesRedactionAudit(added)) {
+  if (addedLineViolatesRedactionAudit(added, { file: currentFile })) {
     const marker = forbiddenEvidenceMarkerInText(added) ?? forbiddenStructuralFieldInText(added);
     violations.push(`${currentFile}: added forbidden redaction marker ${marker}`);
   }

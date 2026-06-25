@@ -79,6 +79,16 @@ const forbiddenCompoundStructuralFieldTails = new Set([
   "value",
 ]);
 
+const ALLOWED_SANITIZED_BOOLEAN_PROOF_FIELDS = new Set([
+  "back_forward_replayed_token",
+  "bfcache_restore_replayed_token",
+  "refresh_replayed_token",
+]);
+
+const SAFE_FORBIDDEN_MARKER_LITERALS = new Map([
+  ["session_token", ["invalid_session_token"]],
+]);
+
 const AUDITED_FILE_EXTENSIONS = new Set([
   ".js",
   ".mjs",
@@ -87,6 +97,90 @@ const AUDITED_FILE_EXTENSIONS = new Set([
   ".rs",
   ".yml",
   ".yaml",
+]);
+
+const RUNTIME_REDACTION_BOUNDARY_FILES = new Set([
+  "apps/web/lib/viva-redaction.ts",
+  "agent/crates/observe/src/lib.rs",
+]);
+
+const RUNTIME_REDACTION_BOUNDARY_MARKER_CONSTANTS = new Map([
+  [
+    "apps/web/lib/viva-redaction.ts",
+    new Set([
+      "answer",
+      "answer_text",
+      "answer_transcript",
+      "api_key",
+      "audio_blob",
+      "audio_bytes",
+      "authorization",
+      "bearer",
+      "bearer.",
+      "Bearer ",
+      "CARTESIA_API_KEY",
+      "GEMINI_API_KEY",
+      "password",
+      "pasted_text",
+      "pcm16_base64",
+      "prompt",
+      "raw answer",
+      "raw_answer",
+      "raw_audio",
+      "raw_transcript",
+      "secret",
+      "session_token",
+      "source excerpt",
+      "source_context",
+      "source_excerpt",
+      "token",
+      "transcript",
+      "transcript_final",
+      "transcript_text",
+      "viva1.",
+    ]),
+  ],
+  [
+    "agent/crates/observe/src/lib.rs",
+    new Set([
+      "answer_text",
+      "answertext",
+      "api_key",
+      "apikey",
+      "authorization",
+      "bearer",
+      "bearer ",
+      "bearer.",
+      "cartesia_api_key",
+      "control_token",
+      "controltoken",
+      "gemini_api_key",
+      "password",
+      "pasted_text",
+      "pastedtext",
+      "pcm16_base64",
+      "prompt_content",
+      "promptcontent",
+      "raw answer",
+      "raw_answer_text",
+      "rawanswertext",
+      "raw_audio",
+      "rawaudio",
+      "raw_transcript",
+      "rawtranscript",
+      "secret",
+      "session_token",
+      "source excerpt",
+      "source_context",
+      "sourcecontext",
+      "source_excerpt_text",
+      "sourceexcerpttext",
+      "token",
+      "transcript_final",
+      "transcriptfinal",
+      "viva1.",
+    ]),
+  ],
 ]);
 
 export function redactForVivaLog(value) {
@@ -165,9 +259,7 @@ export function changedFileNeedsRedactionAudit(file) {
   }
   if (
     file === "scripts/redaction-control.mjs" ||
-    file === "scripts/redaction-control-check.mjs" ||
-    file === "apps/web/lib/viva-redaction.ts" ||
-    file === "agent/crates/observe/src/lib.rs"
+    file === "scripts/redaction-control-check.mjs"
   ) {
     return false;
   }
@@ -176,13 +268,22 @@ export function changedFileNeedsRedactionAudit(file) {
   return /(^scripts\/|^apps\/web\/|^agent\/crates\/|^packages\/|^\.github\/workflows\/)/.test(file);
 }
 
-export function addedLineViolatesRedactionAudit(line) {
+export function addedLineViolatesRedactionAudit(line, { file } = {}) {
+  if (markerConstantAllowedInRuntimeRedactionBoundary(line, file)) return false;
   return Boolean(forbiddenEvidenceMarkerInText(line) ?? forbiddenStructuralFieldInText(line));
 }
 
 export function forbiddenEvidenceMarkerInText(text) {
   const normalized = text.toLowerCase();
-  return FORBIDDEN_EVIDENCE_MARKERS.find((marker) => normalized.includes(marker.toLowerCase()));
+  return FORBIDDEN_EVIDENCE_MARKERS.find((marker) => {
+    const normalizedMarker = marker.toLowerCase();
+    let index = normalized.indexOf(normalizedMarker);
+    while (index >= 0) {
+      if (!safeForbiddenMarkerOccurrence(normalized, index, normalizedMarker)) return true;
+      index = normalized.indexOf(normalizedMarker, index + normalizedMarker.length);
+    }
+    return false;
+  });
 }
 
 export function forbiddenStructuralFieldInText(text) {
@@ -199,6 +300,10 @@ export function forbiddenStructuralFieldInText(text) {
     let match = pattern.exec(text);
     while (match) {
       const normalized = normalizeStructuralFieldName(match[group]);
+      if (allowedSanitizedBooleanProofFieldOccurrence(text, match, group, normalized)) {
+        match = pattern.exec(text);
+        continue;
+      }
       if (isForbiddenStructuralField(normalized)) return normalized;
       match = pattern.exec(text);
     }
@@ -268,6 +373,41 @@ function isForbiddenCompoundStructuralField(normalized) {
     if (!normalized.startsWith(`${stem}_`)) return false;
     const tail = normalized.slice(stem.length + 1).split("_").at(-1);
     return Boolean(tail && forbiddenCompoundStructuralFieldTails.has(tail));
+  });
+}
+
+function allowedSanitizedBooleanProofFieldOccurrence(text, match, group, normalized) {
+  if (!ALLOWED_SANITIZED_BOOLEAN_PROOF_FIELDS.has(normalized)) return false;
+  const matchedText = match[0];
+  const field = match[group];
+  const fieldOffset = matchedText.indexOf(field);
+  if (fieldOffset < 0) return false;
+  const fieldStart = match.index + fieldOffset;
+  const preceding = text[fieldStart - 1] ?? "";
+  if (preceding && !/[{"'\s,]/.test(preceding)) return false;
+  const afterField = text.slice(fieldStart + field.length);
+  return /^["']?\s*[:=]\s*(?:true|false)\s*(?=[,}\]\n\r]|$)/.test(afterField);
+}
+
+function markerConstantAllowedInRuntimeRedactionBoundary(line, file) {
+  if (!RUNTIME_REDACTION_BOUNDARY_FILES.has(file)) return false;
+  const literal = /^\s*["']([^"']+)["']\s*,?\s*$/.exec(line)?.[1];
+  if (!literal) return false;
+  return RUNTIME_REDACTION_BOUNDARY_MARKER_CONSTANTS.get(file)?.has(literal) === true;
+}
+
+function safeForbiddenMarkerOccurrence(text, index, marker) {
+  const safeLiterals = SAFE_FORBIDDEN_MARKER_LITERALS.get(marker);
+  if (!safeLiterals) return false;
+  return safeLiterals.some((literal) => {
+    const markerOffset = literal.indexOf(marker);
+    if (markerOffset < 0) return false;
+    const literalStart = index - markerOffset;
+    if (literalStart < 0) return false;
+    if (text.slice(literalStart, literalStart + literal.length) !== literal) return false;
+    const before = text[literalStart - 1] ?? "";
+    const after = text[literalStart + literal.length] ?? "";
+    return (!before || /["'\s:[,]/.test(before)) && (!after || /["'\s,}\]]/.test(after));
   });
 }
 
