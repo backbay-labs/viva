@@ -568,6 +568,12 @@ pub fn validate_runtime_store_preflight(
     if config.ws_access.session_token_secret.is_none() {
         return Ok(());
     }
+    if config.bind_addr.ip().is_loopback()
+        && config.failure_control.enabled()
+        && store.nonce_replay_protection
+    {
+        return Ok(());
+    }
     if !store.available {
         return Err(ServiceConfigError::SignedSessionStoreUnavailable(
             store.backend.as_str(),
@@ -1585,5 +1591,31 @@ mod tests {
             error,
             ServiceConfigError::DurableStoreRequiredForSignedSessions("in_memory")
         );
+    }
+
+    #[test]
+    fn loopback_failure_control_allows_ephemeral_signed_session_store() {
+        let config = ServiceConfig {
+            bind_addr: "127.0.0.1:4318".parse().expect("bind parses"),
+            ws_access: VoiceWsAccess {
+                required_bearer: None,
+                session_token_secret: Some("session-secret".to_owned()),
+                allowed_origins: vec!["http://localhost:3000".to_owned()],
+            },
+            failure_control: FailureControlConfig::enabled_for_synthetic_identities(
+                FailureControlScenario::ProviderRateLimited,
+                "control-secret",
+                vec!["user-1".to_owned()],
+                vec!["biology-midterm".to_owned()],
+                vec!["http://localhost:3000".to_owned()],
+                1,
+            )
+            .expect("synthetic failure-control config should parse"),
+            ..ServiceConfig::default()
+        };
+        let store = data::InMemoryStudyStore::seeded_fixture();
+
+        validate_runtime_store_preflight(&config, &store.capabilities())
+            .expect("loopback failure-control browser evidence may use the local fixture store");
     }
 }

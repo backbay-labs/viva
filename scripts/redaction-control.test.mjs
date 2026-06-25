@@ -223,6 +223,36 @@ test("per-PR redaction check permits required auth source identifiers only in so
     }),
     true,
   );
+  assert.equal(
+    addedLineViolatesRedactionAudit("BrainError::MissingApiKey => false,", {
+      file: "agent/crates/agent-service/src/ws.rs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("BrainError::MissingApiKey => false,", {
+      file: "agent/crates/agent-service/src/config.rs",
+    }),
+    true,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("if config.ws_access.session_token_secret.is_none() {", {
+      file: "agent/crates/agent-service/src/config.rs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('session_token_secret: Some("session-secret".to_owned()),', {
+      file: "agent/crates/agent-service/src/config.rs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("let leaked = config.ws_access.session_token_secret;", {
+      file: "agent/crates/agent-service/src/config.rs",
+    }),
+    true,
+  );
   assert.throws(
     () =>
       assertNoForbiddenEvidenceMarkers({

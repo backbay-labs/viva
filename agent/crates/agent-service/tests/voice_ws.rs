@@ -3630,6 +3630,53 @@ async fn websocket_brain_open_auth_failure_emits_terminal_phase_without_raw_erro
 }
 
 #[tokio::test]
+async fn websocket_brain_open_failure_with_missing_session_close_keeps_provider_terminal_reason() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(DurableStoreDegradingStore {
+        inner: inner.clone(),
+        failure: DurableStoreFailureMode::SessionCloseMissing,
+    });
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(OpenAuthFailureBrain),
+        "cartesia_gemini",
+        VoiceWsAccess::default(),
+        4,
+        state_store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/synthetic-study-session.json"
+    ))
+    .unwrap();
+
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
+        panic!("expected ready frame");
+    };
+    assert!(store.durable);
+    send_client_frame(&mut socket, &fixture.client[0]).await;
+
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::ProviderAuthFailed,
+    );
+    assert_close_code(&mut socket, CloseCode::Error).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "provider_auth_failed"
+    }));
+    assert!(events.iter().all(|event| {
+        event.kind != VoiceEvidenceEventKind::TerminalReason
+            || event.detail != "durability_degraded"
+    }));
+}
+
+#[tokio::test]
 async fn websocket_brain_open_store_failure_emits_durability_degraded_terminal_phase() {
     let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let store = Arc::new(DurableStoreDegradingStore {
@@ -3658,6 +3705,50 @@ async fn websocket_brain_open_store_failure_emits_durability_degraded_terminal_p
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
+    assert!(store.durable);
+    send_client_frame(&mut socket, &fixture.client[0]).await;
+
+    assert_terminal_session_phase(
+        read_server_frame(&mut socket).await,
+        TerminalSessionReason::DurabilityDegraded,
+    );
+    assert_close_code(&mut socket, CloseCode::Error).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "durability_degraded"
+    }));
+}
+
+#[tokio::test]
+async fn websocket_protocol_wrapped_open_store_failure_emits_durability_degraded_terminal_phase() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(DurableStoreDegradingStore {
+        inner: inner.clone(),
+        failure: DurableStoreFailureMode::NoFailure,
+    });
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(OpenProtocolStoreFailureBrain),
+        "open_protocol_store_failure",
+        VoiceWsAccess::default(),
+        4,
+        state_store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/synthetic-study-session.json"
+    ))
+    .unwrap();
+
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
+        panic!("expected ready frame");
+    };
+    assert_eq!(brain.provider, "open_protocol_store_failure");
     assert!(store.durable);
     send_client_frame(&mut socket, &fixture.client[0]).await;
 
@@ -3931,6 +4022,9 @@ async fn websocket_durable_terminal_close_failure_emits_durability_degraded_term
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::TerminalReason
             && event.detail == "durability_degraded"
+    }));
+    assert!(events.iter().all(|event| {
+        event.kind != VoiceEvidenceEventKind::TerminalReason || event.detail != "client_disconnect"
     }));
 }
 
@@ -7106,6 +7200,29 @@ impl RealtimeBrain for OpenAuthFailureBrain {
     }
 }
 
+struct OpenProtocolStoreFailureBrain;
+
+#[async_trait::async_trait]
+impl RealtimeBrain for OpenProtocolStoreFailureBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "open_protocol_store_failure".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        _config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        Err(BrainError::Protocol(
+            "postgres durable store read failed".to_owned(),
+        ))
+    }
+}
+
 struct AbortProbeBrain {
     dropped: Arc<AtomicBool>,
 }
@@ -7331,6 +7448,7 @@ enum DurableStoreFailureMode {
     QuestionAuthorizationSemanticMiss,
     QuestionAuthorizationWriteFailure,
     SessionClose,
+    SessionCloseMissing,
     StudyContext,
     UsageRecording,
 }
@@ -7379,6 +7497,13 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
     ) -> Result<serde_json::Value, PortError> {
         if self.failure == DurableStoreFailureMode::SessionClose {
             return Err(PortError::adapter("postgres", "durable store write failed"));
+        }
+        if self.failure == DurableStoreFailureMode::SessionCloseMissing {
+            return Err(PortError::unavailable(
+                "postgres",
+                voice_session_id,
+                "voice session does not exist",
+            ));
         }
         self.inner
             .close_voice_session(voice_session_id, terminal_reason)
@@ -7437,6 +7562,7 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
             | DurableStoreFailureMode::NoFailure
             | DurableStoreFailureMode::NonceClaim
             | DurableStoreFailureMode::SessionClose
+            | DurableStoreFailureMode::SessionCloseMissing
             | DurableStoreFailureMode::StudyContext
             | DurableStoreFailureMode::UsageRecording => unreachable!(),
         }

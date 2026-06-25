@@ -1173,10 +1173,10 @@ fn brain_error_is_durability_degraded(state: &AppState, error: &BrainError) -> b
         return false;
     }
     match error {
-        BrainError::Connection(message) => {
+        BrainError::Connection(message) | BrainError::Protocol(message) => {
             provider_store_error_message_is_durability_degraded(message)
         }
-        BrainError::MissingApiKey | BrainError::Protocol(_) => false,
+        BrainError::MissingApiKey => false,
     }
 }
 
@@ -1208,12 +1208,14 @@ fn provider_store_error_message_is_durability_degraded(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     normalized.contains("store unavailable")
         || normalized.contains("database unavailable")
-        || normalized.contains("postgres unavailable")
         || normalized.contains("durable store")
-        || normalized.contains("connection")
-        || normalized.contains("pool")
-        || normalized.contains("timed out")
-        || normalized.contains("timeout")
+        || ((normalized.contains("postgres")
+            || normalized.contains("database")
+            || normalized.contains("store"))
+            && (normalized.contains("connection")
+                || normalized.contains("pool")
+                || normalized.contains("timed out")
+                || normalized.contains("timeout")))
 }
 
 fn terminal_reason_for_provider_message(message: &str) -> TerminalSessionReason {
@@ -1499,11 +1501,7 @@ fn store_error_is_durability_degraded(state: &AppState, error: &PortError) -> bo
 }
 
 fn store_write_error_is_durability_degraded(state: &AppState, error: &PortError) -> bool {
-    state.study_store.capabilities().durable
-        && matches!(
-            error,
-            PortError::Unavailable { .. } | PortError::Adapter { .. }
-        )
+    state.study_store.capabilities().durable && store_adapter_error_is_durability_degraded(error)
 }
 
 fn store_adapter_error_is_durability_degraded(error: &PortError) -> bool {
@@ -1582,7 +1580,7 @@ async fn validate_study_set_access(
         Err(error) if store_error_is_durability_degraded(state, &error) => {
             StudySetAccessResult::DurabilityDegraded
         }
-        Err(_) => StudySetAccessResult::Denied(ClientFrameError::study_set_access_denied()),
+        Err(_) => StudySetAccessResult::Denied(ClientFrameError::study_store_unavailable()),
     }
 }
 
@@ -2329,6 +2327,7 @@ async fn record_brain_event(
 }
 
 async fn record_terminal(state: &AppState, voice_session_id: Option<String>, reason: &str) {
+    let mut terminal_reason = reason;
     if let Some(session_id) = voice_session_id.as_deref() {
         if let Err(error) = state
             .study_store
@@ -2336,6 +2335,7 @@ async fn record_terminal(state: &AppState, voice_session_id: Option<String>, rea
             .await
         {
             let detail = if store_write_error_is_durability_degraded(state, &error) {
+                terminal_reason = TerminalSessionReason::DurabilityDegraded.as_str();
                 "session_close_failed: durability_degraded".to_owned()
             } else {
                 format!("session_close_failed: {error}")
@@ -2347,7 +2347,7 @@ async fn record_terminal(state: &AppState, voice_session_id: Option<String>, rea
             ));
         }
     }
-    record_terminal_evidence(state, voice_session_id, reason);
+    record_terminal_evidence(state, voice_session_id, terminal_reason);
 }
 
 async fn persist_terminal_session_reason(
@@ -2536,6 +2536,15 @@ mod tests {
         ));
         assert!(!provider_store_error_message_is_durability_degraded(
             "postgres adapter error: closed voice session cannot be reopened"
+        ));
+        assert!(!provider_store_error_message_is_durability_degraded(
+            "postgres unavailable for missing-study-set: study set does not exist"
+        ));
+        assert!(!provider_store_error_message_is_durability_degraded(
+            "postgres unavailable for concept-1: concept is not available for this study set"
+        ));
+        assert!(!provider_store_error_message_is_durability_degraded(
+            "shared Cartesia/Gemini runner is wired but live transports remain gated; no network connection was attempted"
         ));
     }
 

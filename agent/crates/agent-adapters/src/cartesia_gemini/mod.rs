@@ -573,13 +573,17 @@ async fn emit_fake_provider_error(event_tx: &mpsc::Sender<BrainEvent>, message: 
 
 fn fake_provider_error_source_and_message(message: &str) -> (String, String) {
     let normalized = message.to_ascii_lowercase();
-    if normalized.contains("adapter error") {
+    if normalized.contains("adapter error")
+        && fake_provider_store_error_is_durability_degraded(&normalized)
+    {
         return (
             "fake-provider-store".to_owned(),
             "store adapter error".to_owned(),
         );
     }
-    if normalized.contains("unavailable for") {
+    if normalized.contains("unavailable for")
+        && fake_provider_store_error_is_durability_degraded(&normalized)
+    {
         return (
             "fake-provider-store".to_owned(),
             "store unavailable".to_owned(),
@@ -589,6 +593,19 @@ fn fake_provider_error_source_and_message(message: &str) -> (String, String) {
         "agent-service".to_owned(),
         "fake provider turn failed".to_owned(),
     )
+}
+
+fn fake_provider_store_error_is_durability_degraded(normalized: &str) -> bool {
+    normalized.contains("store unavailable")
+        || normalized.contains("database unavailable")
+        || normalized.contains("durable store")
+        || ((normalized.contains("postgres")
+            || normalized.contains("database")
+            || normalized.contains("store"))
+            && (normalized.contains("connection")
+                || normalized.contains("pool")
+                || normalized.contains("timed out")
+                || normalized.contains("timeout")))
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -694,18 +711,39 @@ mod tests {
 
     #[test]
     fn fake_provider_store_errors_keep_only_sanitized_store_markers() {
-        let (source, message) =
-            fake_provider_error_source_and_message("postgres adapter error: raw payload details");
+        let (source, message) = fake_provider_error_source_and_message(
+            "postgres adapter error: durable store write failed",
+        );
         assert_eq!(source, "fake-provider-store");
         assert_eq!(message, "store adapter error");
 
         let (source, message) =
-            fake_provider_error_source_and_message("postgres unavailable for voice-session-1");
+            fake_provider_error_source_and_message("postgres unavailable for durable store");
         assert_eq!(source, "fake-provider-store");
         assert_eq!(message, "store unavailable");
 
         let (source, message) =
             fake_provider_error_source_and_message("provider-specific raw turn failure");
+        assert_eq!(source, "agent-service");
+        assert_eq!(message, "fake provider turn failed");
+    }
+
+    #[test]
+    fn fake_provider_store_errors_do_not_promote_semantic_store_failures() {
+        let (source, message) = fake_provider_error_source_and_message(
+            "postgres adapter error: answer attempt envelope cannot be changed",
+        );
+        assert_eq!(source, "agent-service");
+        assert_eq!(message, "fake provider turn failed");
+
+        let (source, message) =
+            fake_provider_error_source_and_message("memory unavailable for missing-study-set");
+        assert_eq!(source, "agent-service");
+        assert_eq!(message, "fake provider turn failed");
+
+        let (source, message) = fake_provider_error_source_and_message(
+            "postgres unavailable for concept-1: concept is not available for this study set",
+        );
         assert_eq!(source, "agent-service");
         assert_eq!(message, "fake provider turn failed");
     }
