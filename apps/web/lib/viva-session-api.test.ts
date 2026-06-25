@@ -160,6 +160,56 @@ describe("Viva same-origin session API", () => {
     expect(calls).toEqual([]);
   });
 
+  test("start rejects requests without a positive same-origin header before contacting the agent", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(500, { error: "should_not_call_agent" });
+    }) as typeof fetch;
+    const request = sessionRequest("/api/viva-session/start", {
+      study_set_id: "biology-midterm",
+      user_id: "synthetic-user",
+    });
+    request.headers.delete("origin");
+
+    const response = await startSession(request);
+    const body = (await response.json()) as VivaSessionRouteFailureClass;
+
+    expect(response.status).toBe(403);
+    expect(body).toEqual({
+      error: "cross_origin_session_request",
+      failure_class: "access_denied",
+      token_refresh_outcome: "blocked",
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("start fails closed when session identity allowlists are not configured", async () => {
+    const calls: string[] = [];
+    delete process.env.VIVA_SESSION_ALLOWED_USER_IDS;
+    delete process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(500, { error: "should_not_call_agent" });
+    }) as typeof fetch;
+
+    const response = await startSession(
+      sessionRequest("/api/viva-session/start", {
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      }),
+    );
+    const body = (await response.json()) as VivaSessionRouteFailureClass;
+
+    expect(response.status).toBe(503);
+    expect(body).toEqual({
+      error: "viva_session_identity_allowlist_unavailable",
+      failure_class: "session_bootstrap_failed",
+      token_refresh_outcome: "failed",
+    });
+    expect(calls).toEqual([]);
+  });
+
   test("start applies independent mint limits to client IP and session identity", async () => {
     process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "1";
     process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user,alternate-user";

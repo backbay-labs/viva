@@ -1,6 +1,6 @@
 import { LandingEntry } from "../components/landing/LandingEntry";
-import { fetchVivaLibrarySnapshot } from "../lib/viva-agent-client";
-import { redactVivaLibrarySessionTokens, type VivaLibrarySnapshot } from "../lib/viva-library";
+import { fetchVivaLibrarySnapshot, vivaStaticExportEnabled } from "../lib/viva-agent-client";
+import { browserInitialLibrarySnapshot, type VivaLibrarySnapshot } from "../lib/viva-library";
 
 export default async function Page() {
   const initialLibrarySnapshot = await initialSnapshot();
@@ -9,7 +9,9 @@ export default async function Page() {
 
 async function initialSnapshot(): Promise<VivaLibrarySnapshot | null> {
   try {
-    return redactVivaLibrarySessionTokens(await fetchVivaLibrarySnapshot());
+    return browserInitialLibrarySnapshot(await fetchVivaLibrarySnapshot(), {
+      staticExport: vivaStaticExportEnabled(),
+    });
   } catch {
     return null;
   }

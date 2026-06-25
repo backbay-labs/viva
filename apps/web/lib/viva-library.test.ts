@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  browserInitialLibrarySnapshot,
   projectLibrarySnapshot,
   redactVivaLibrarySessionTokens,
   type VivaLibrarySnapshot,
@@ -252,6 +253,19 @@ describe("Viva library projection", () => {
     expect(JSON.stringify(redacted)).not.toContain("session_token");
     expect(JSON.stringify(redacted)).not.toContain("viva1.start-token");
     expect(snapshot.study_sets[0]?.actions.start).toEqual({
+      available: true,
+      session_id: "start-session-1",
+      session_token: "viva1.start-token",
+    });
+  });
+
+  test("preserves direct session tokens only for static-export initial snapshots", () => {
+    const serverful = browserInitialLibrarySnapshot(snapshot, { staticExport: false });
+    const staticExport = browserInitialLibrarySnapshot(snapshot, { staticExport: true });
+
+    expect(JSON.stringify(serverful)).not.toContain("session_token");
+    expect(JSON.stringify(serverful)).not.toContain("viva1.start-token");
+    expect(staticExport.study_sets[0]?.actions.start).toEqual({
       available: true,
       session_id: "start-session-1",
       session_token: "viva1.start-token",

@@ -33,7 +33,11 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   );
   upstream.search = request.nextUrl.search;
 
-  const headers = vivaLibraryProxyHeaders(request);
+  const serverBearer = serverBearerForBrowserLibrarySnapshot(request, path);
+  if (!serverBearer.ok) return serverBearer.response;
+  const headers = vivaLibraryProxyHeaders(request, {
+    serverBearerToken: serverBearer.token,
+  });
   const response = await fetch(upstream, {
     body: request.method === "POST" ? await request.text() : undefined,
     cache: "no-store",
@@ -51,17 +55,19 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
 }
 
 function vivaAgentServerHttpBaseUrl(): string | null {
-  return (
-    process.env.VIVA_AGENT_HTTP_URL?.trim() ||
-    process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL?.trim() ||
-    "http://127.0.0.1:4318"
-  );
+  return process.env.VIVA_AGENT_HTTP_URL?.trim() || null;
 }
 
-function vivaLibraryProxyHeaders(request: NextRequest): Headers {
+function vivaLibraryProxyHeaders(
+  request: NextRequest,
+  options: { serverBearerToken?: string } = {},
+): Headers {
   const headers = new Headers();
   const authorization = request.headers.get("authorization");
   if (authorization) headers.set("authorization", authorization);
+  if (!authorization && options.serverBearerToken) {
+    headers.set("authorization", `Bearer ${options.serverBearerToken}`);
+  }
   const controlToken = request.headers.get("x-viva-library-control-token");
   if (controlToken) headers.set("x-viva-library-control-token", controlToken);
   const contentType = request.headers.get("content-type");
@@ -81,6 +87,61 @@ function vivaLibraryProxyOrigin(request: NextRequest): string | null {
     return `${protocol}://${host}`;
   }
   return request.nextUrl.origin;
+}
+
+function serverBearerForBrowserLibrarySnapshot(
+  request: NextRequest,
+  path: string[],
+): { ok: true; token?: string } | { ok: false; response: NextResponse<{ error: string }> } {
+  if (
+    request.method !== "GET" ||
+    path.join("/") !== "study-sets/library" ||
+    request.headers.get("authorization")
+  ) {
+    return { ok: true };
+  }
+  const token = process.env.VIVA_AGENT_REST_BEARER_TOKEN?.trim();
+  if (!token) {
+    return {
+      ok: false,
+      response: NextResponse.json({ error: "viva_library_auth_unavailable" }, { status: 503 }),
+    };
+  }
+
+  const userId = request.nextUrl.searchParams.get("user_id")?.trim();
+  if (!userId) {
+    return {
+      ok: false,
+      response: NextResponse.json({ error: "viva_library_user_required" }, { status: 400 }),
+    };
+  }
+  const allowedUserIds = configuredAllowlist("VIVA_SESSION_ALLOWED_USER_IDS");
+  if (!allowedUserIds) {
+    return {
+      ok: false,
+      response: NextResponse.json(
+        { error: "viva_library_identity_allowlist_unavailable" },
+        { status: 503 },
+      ),
+    };
+  }
+  if (!allowedUserIds.has(userId)) {
+    return {
+      ok: false,
+      response: NextResponse.json({ error: "viva_library_identity_not_allowed" }, { status: 403 }),
+    };
+  }
+  return { ok: true, token };
+}
+
+function configuredAllowlist(envName: string): Set<string> | null {
+  const raw = process.env[envName]?.trim();
+  if (!raw) return null;
+  const entries = raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return entries.length > 0 ? new Set(entries) : null;
 }
 
 function trimTrailingSlash(value: string): string {

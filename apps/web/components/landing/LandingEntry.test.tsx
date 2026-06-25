@@ -4,6 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { VivaLibrarySnapshot } from "../../lib/viva-library";
 import { LandingEntry, landingEntryTarget } from "./LandingEntry";
 import { LandingHero } from "./LandingHero";
+import { libraryActionSessionTarget } from "./LibraryStatusPanel";
 
 type LandingHeroProps = Parameters<typeof LandingHero>[0];
 
@@ -130,6 +131,22 @@ describe("LandingEntry", () => {
     );
     expect(markup).not.toContain("session_token=");
     expect(markup).not.toContain("viva1.server-token");
+  });
+
+  test("keeps a direct signed-token session target available for static-export actions", () => {
+    const target = libraryActionSessionTarget(
+      { id: "biology-midterm", userId: "user-1" },
+      {
+        available: true,
+        sessionId: "server-session",
+        sessionToken: "viva1.static-export-token",
+      },
+      { includeSessionToken: true },
+    );
+
+    expect(target).toBe(
+      "/session?user_id=user-1&study_set_id=biology-midterm&session_id=server-session#session_token=viva1.static-export-token",
+    );
   });
 
   test("session cards surface a mastery ring, emphasise the next drill, and quiet the delete", () => {

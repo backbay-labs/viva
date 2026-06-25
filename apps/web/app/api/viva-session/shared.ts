@@ -176,12 +176,12 @@ function guardSameOrigin(request: NextRequest): NextResponse | null {
   const expectedOrigin = requestOrigin(request);
   const origin = request.headers.get("origin")?.trim();
   const fetchSite = request.headers.get("sec-fetch-site")?.trim().toLowerCase();
-  if (origin && origin !== expectedOrigin) {
+  if (!origin || origin !== expectedOrigin) {
     return sessionJsonError(403, "cross_origin_session_request", "blocked", {
       failure_class: "access_denied",
     });
   }
-  if (fetchSite && !["same-origin", "same-site", "none"].includes(fetchSite)) {
+  if (fetchSite && fetchSite !== "same-origin") {
     return sessionJsonError(403, "cross_origin_session_request", "blocked", {
       failure_class: "access_denied",
     });
@@ -190,12 +190,17 @@ function guardSameOrigin(request: NextRequest): NextResponse | null {
 }
 
 function guardAllowedIdentity(userId: string, studySetId: string): NextResponse | null {
-  if (!isAllowed("VIVA_SESSION_ALLOWED_USER_IDS", userId)) {
+  const allowedUserIds = configuredAllowlist("VIVA_SESSION_ALLOWED_USER_IDS");
+  const allowedStudySetIds = configuredAllowlist("VIVA_SESSION_ALLOWED_STUDY_SET_IDS");
+  if (!allowedUserIds || !allowedStudySetIds) {
+    return sessionJsonError(503, "viva_session_identity_allowlist_unavailable", "failed");
+  }
+  if (!allowedUserIds.has(userId)) {
     return sessionJsonError(403, "session_identity_not_allowed", "blocked", {
       failure_class: "access_denied",
     });
   }
-  if (!isAllowed("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", studySetId)) {
+  if (!allowedStudySetIds.has(studySetId)) {
     return sessionJsonError(403, "session_identity_not_allowed", "blocked", {
       failure_class: "access_denied",
     });
@@ -460,14 +465,14 @@ function agentLibraryUrl(agentBaseUrl: string, userId: string): URL | null {
   }
 }
 
-function isAllowed(envName: string, value: string): boolean {
+function configuredAllowlist(envName: string): Set<string> | null {
   const raw = process.env[envName]?.trim();
-  if (!raw) return true;
-  return raw
+  if (!raw) return null;
+  const entries = raw
     .split(",")
     .map((entry) => entry.trim())
-    .filter(Boolean)
-    .includes(value);
+    .filter(Boolean);
+  return entries.length > 0 ? new Set(entries) : null;
 }
 
 function requiredString(value: unknown): string | null {

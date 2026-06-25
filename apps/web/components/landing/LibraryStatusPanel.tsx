@@ -15,6 +15,17 @@ type LibraryProjection = ReturnType<typeof projectLibrarySnapshot>;
 type LibraryRow = LibraryProjection["libraryRows"][number];
 type SessionRow = LibraryProjection["sessionRows"][number];
 
+export type LibraryActionSessionTargetRow = {
+  id: string;
+  userId: string;
+};
+
+export type LibraryActionSessionTargetAction = {
+  available: boolean;
+  sessionId?: string | null;
+  sessionToken?: string | null;
+};
+
 export function LibraryStatusPanel({
   snapshot,
   now,
@@ -182,8 +193,8 @@ function LibraryStudySetRow({
   onDelete: (row: LibraryRow) => void;
   row: LibraryRow;
 }) {
-  const startTarget = libraryActionTarget(row, row.start);
-  const resumeTarget = libraryActionTarget(row, row.resume);
+  const startTarget = libraryActionSessionTarget(row, row.start);
+  const resumeTarget = libraryActionSessionTarget(row, row.resume);
   return (
     <article className="viva-library__row">
       <div>
@@ -230,10 +241,15 @@ function LibraryStudySetRow({
   );
 }
 
-function libraryActionTarget(row: LibraryRow, action: LibraryRow["start"]) {
+export function libraryActionSessionTarget(
+  row: LibraryActionSessionTargetRow,
+  action: LibraryActionSessionTargetAction,
+  options: { includeSessionToken?: boolean } = {},
+) {
   if (!action.available) return "/session";
   return librarySessionTarget({
     sessionId: action.sessionId,
+    sessionToken: options.includeSessionToken ? action.sessionToken : undefined,
     studySetId: row.id,
     userId: row.userId,
   });
@@ -245,6 +261,14 @@ async function startServerSession(
   action: LibraryRow["start"],
 ) {
   if (!action.available) return;
+  if (action.sessionToken?.trim()) {
+    navigateToSession(
+      libraryActionSessionTarget(row, action, {
+        includeSessionToken: true,
+      }),
+    );
+    return;
+  }
   const response = await fetch("/api/viva-session/start", {
     body: JSON.stringify({
       session_id: actionName === "resume" ? action.sessionId : undefined,

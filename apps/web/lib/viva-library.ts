@@ -189,6 +189,13 @@ export function redactVivaLibrarySessionTokens(snapshot: VivaLibrarySnapshot): V
   };
 }
 
+export function browserInitialLibrarySnapshot(
+  snapshot: VivaLibrarySnapshot,
+  options: { staticExport?: boolean } = {},
+): VivaLibrarySnapshot {
+  return options.staticExport ? snapshot : redactVivaLibrarySessionTokens(snapshot);
+}
+
 function redactSessionToken(action: VivaLibraryAction): VivaLibraryAction {
   if (!action.available) return { ...action };
   const { session_token: _sessionToken, ...rest } = action;
