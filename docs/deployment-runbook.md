@@ -322,8 +322,9 @@ VIVA_E2E_FAILURE_CONTROL_SCENARIO=provider_rate_limited \
 
 The release evidence bundle is sanitized output only: command summaries,
 fixture hashes, browser story filenames/screenshots, provider readiness matrix,
-failure_control_harness disabled state, rollback_drain criteria, and artifact
-audit summary. It must show forbidden hits equal to zero. `bun run release:check` must fail if
+failure_control_harness disabled state, rollback_drain criteria,
+provider_failure_observability dashboard criteria, and artifact audit summary.
+It must show forbidden hits equal to zero. `bun run release:check` must fail if
 `VIVA_FAILURE_CONTROL_ENABLED=1`; deterministic provider failure coverage must
 come from the signed harness, not flaky real outages.
 

@@ -22,6 +22,13 @@ import {
   LIVE_PROVIDER_GATE_COMMAND_NAME,
   PROVIDER_READINESS_TARGETS,
 } from "./provider-readiness-matrix.mjs";
+import fixtureProviderFailureDashboard from "./fixtures/provider-failure-dashboard-samples.json" with {
+  type: "json",
+};
+import {
+  assertProviderFailureObservabilityEvidence,
+  providerFailureObservabilityEvidence,
+} from "./provider-failure-observability.mjs";
 import { assertNoForbiddenEvidenceMarkers, auditTextArtifacts } from "./redaction-control.mjs";
 import {
   assertRollbackReleaseGate,
@@ -67,6 +74,10 @@ try {
     "scripts/rollback-drain-criteria.test.mjs",
   ]);
   await runRollbackDrainProofCommands();
+  await run("provider_failure_observability_unit_tests", "node", [
+    "--test",
+    "scripts/provider-failure-observability.test.mjs",
+  ]);
   await run("provider_gate_tests", "cargo", [
     "test",
     "--manifest-path",
@@ -106,6 +117,10 @@ try {
   const providerReadiness = await collectProviderReadiness();
   const rollbackDrain = buildRollbackReleaseEvidence();
   assertRollbackReleaseGate(rollbackDrain);
+  const providerFailureObservability = providerFailureObservabilityEvidence({
+    fixture: fixtureProviderFailureDashboard,
+  });
+  assertProviderFailureObservabilityEvidence(providerFailureObservability);
   const fixtureHashes = await hashFixtureFiles(path.join(root, "agent/fixtures/voice-protocol"));
   const artifactAudit = await auditGeneratedArtifacts([
     artifactDir,
@@ -124,6 +139,7 @@ try {
     provider_readiness: providerReadiness,
     failure_control_harness: failureControlEvidence,
     rollback_drain: rollbackDrain,
+    provider_failure_observability: providerFailureObservability,
     browser_e2e: browserResult,
     artifact_audit: artifactAudit,
     release_bundle: buildReleaseBundleManifest(outputPath, commands, browserResult),

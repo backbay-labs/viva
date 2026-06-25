@@ -1,0 +1,506 @@
+import learnerLoopContract from "../packages/core/src/learner-loop-contract.json" with {
+  type: "json",
+};
+import {
+  REQUIRED_ROLLBACK_TRIGGER_IDS,
+  ROLLBACK_TRIGGER_THRESHOLDS,
+} from "./rollback-drain-criteria.mjs";
+
+const OBSERVABILITY_SCHEMA = "viva.provider_failure_observability.v1";
+
+export const PROVIDER_FAILURE_DASHBOARD_GROUPS = Object.freeze([
+  "failure_class",
+  "stage",
+  "provider",
+  "model",
+  "deploy_sha",
+  "latency_bucket",
+  "usage_bucket",
+  "cost_bucket",
+  "terminal_reason",
+]);
+
+const query = ({
+  id,
+  title,
+  failure_class,
+  stage,
+  terminal_reason = null,
+  railway_query,
+  evidence_fields,
+}) =>
+  Object.freeze({
+    id,
+    title,
+    failure_class,
+    stage,
+    terminal_reason,
+    railway_query,
+    evidence_fields: Object.freeze(evidence_fields),
+    sanitized_query_only: true,
+  });
+
+export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
+  query({
+    id: "provider_429",
+    title: "Gemini quota/rate-limit terminal turns",
+    failure_class: "quota_rate_failure",
+    stage: "provider",
+    terminal_reason: "provider_rate_limited",
+    railway_query:
+      'service:"agent-service" (signal:"gemini_http_429" OR terminal_reason:"provider_rate_limited" OR failure_class:"quota_rate_failure")',
+    evidence_fields: [
+      "failure_class",
+      "stage",
+      "provider",
+      "model",
+      "deploy_sha",
+      "latency_ms",
+      "usage",
+      "cost_usd",
+      "terminal_reason",
+    ],
+  }),
+  query({
+    id: "provider_auth_failure",
+    title: "Live provider auth/configuration failures",
+    failure_class: "provider_auth_failure",
+    stage: "provider_auth",
+    terminal_reason: "provider_auth_failed",
+    railway_query:
+      'service:"agent-service" (terminal_reason:"provider_auth_failed" OR failure_class:"provider_auth_failure")',
+    evidence_fields: ["failure_class", "stage", "provider", "model", "deploy_sha", "latency_ms"],
+  }),
+  query({
+    id: "provider_timeout",
+    title: "Provider and recap timeout terminal turns",
+    failure_class: "timeout",
+    stage: "websocket",
+    terminal_reason: "provider_timeout",
+    railway_query:
+      'service:"agent-service" (terminal_reason:"provider_timeout" OR failure_class:"timeout")',
+    evidence_fields: ["terminal_reason", "failure_class", "stage", "provider", "model", "deploy_sha", "latency_ms"],
+  }),
+  query({
+    id: "malformed_stream",
+    title: "Malformed or structured provider stream failures",
+    failure_class: "malformed_stream",
+    stage: "websocket",
+    terminal_reason: "provider_malformed_stream",
+    railway_query:
+      'service:"agent-service" (terminal_reason:"provider_malformed_stream" OR failure_class:"malformed_stream")',
+    evidence_fields: ["terminal_reason", "failure_class", "stage", "provider", "model", "deploy_sha", "latency_ms"],
+  }),
+  query({
+    id: "network_disconnect",
+    title: "Provider transport disconnects",
+    failure_class: "network_disconnect",
+    stage: "transport",
+    terminal_reason: "provider_network_disconnect",
+    railway_query:
+      'service:"agent-service" (terminal_reason:"provider_network_disconnect" OR failure_class:"network_disconnect")',
+    evidence_fields: ["terminal_reason", "failure_class", "stage", "provider", "model", "deploy_sha", "latency_ms"],
+  }),
+  query({
+    id: "token_refresh_failure",
+    title: "Signed-session token refresh failures",
+    failure_class: "session_auth_failure",
+    stage: "session_auth",
+    railway_query:
+      'service:"agent-service" (failure_class:"session_auth_failure" OR token_refresh_outcome:"failed")',
+    evidence_fields: ["failure_class", "stage", "deploy_sha", "token_refresh_outcome", "latency_ms"],
+  }),
+  query({
+    id: "recap_failure",
+    title: "Partial recap or recap failure terminal turns",
+    failure_class: "partial_stage_success",
+    stage: "recap",
+    terminal_reason: "partial_stage_success",
+    railway_query:
+      'service:"agent-service" (terminal_reason:"partial_stage_success" OR recap_success:false)',
+    evidence_fields: ["terminal_reason", "failure_class", "stage", "deploy_sha", "latency_ms", "recap_success"],
+  }),
+  query({
+    id: "deploy_drain",
+    title: "Deploy drain terminal sessions",
+    failure_class: "deploy_drain",
+    stage: "deployment",
+    terminal_reason: "drained",
+    railway_query:
+      'service:"agent-service" (terminal_reason:"drained" OR failure_class:"deploy_drain")',
+    evidence_fields: ["terminal_reason", "failure_class", "stage", "deploy_sha", "latency_ms"],
+  }),
+  query({
+    id: "watchdog_expiry",
+    title: "Watchdog and turn-cap terminal sessions",
+    failure_class: "turn_cap",
+    stage: "session",
+    terminal_reason: "turn_cap",
+    railway_query:
+      'service:"agent-service" (terminal_reason:"turn_cap" OR terminal_reason:"slow_client" OR failure_class:"turn_cap")',
+    evidence_fields: ["terminal_reason", "failure_class", "stage", "deploy_sha", "latency_ms"],
+  }),
+  query({
+    id: "stuck_checking",
+    title: "Submitted-answer sessions still checking beyond BAC-510 bound",
+    failure_class: "stuck_checking",
+    stage: "session",
+    railway_query:
+      'service:"web" ui_state:"checking" elapsed_ms:">45000" submitted_answer:true',
+    evidence_fields: ["failure_class", "stage", "deploy_sha", "latency_ms"],
+  }),
+  query({
+    id: "release_gate_stale_evidence",
+    title: "Production release evidence is stale or browser-skipped",
+    failure_class: "release_gate_stale_evidence",
+    stage: "release_gate",
+    railway_query:
+      'artifact:"viva.release_evidence.v1" (browser_e2e.skipped:true OR evidence_age_seconds:">86400")',
+    evidence_fields: ["stage", "deploy_sha", "latency_ms"],
+  }),
+]);
+
+const alertFromRollbackThreshold = (threshold) =>
+  Object.freeze({
+    id: threshold.shared_alert_id,
+    source_threshold_id: threshold.id,
+    failure_class: threshold.failure_class,
+    stage: threshold.stage,
+    metric: threshold.metric,
+    operator: threshold.operator,
+    value: threshold.value,
+    unit: threshold.unit,
+    window_seconds: threshold.window_seconds,
+    sustained_seconds: threshold.sustained_seconds,
+    minimum_sample_metric: threshold.minimum_sample_metric,
+    minimum_sample_value: threshold.minimum_sample_value,
+    minimum_failure_metric: threshold.minimum_failure_metric,
+    minimum_failure_value: threshold.minimum_failure_value,
+    severity: "rollback_candidate",
+    rollback_threshold_source: "scripts/rollback-drain-criteria.mjs",
+  });
+
+const alert = ({
+  id,
+  failure_class,
+  stage,
+  metric,
+  operator = ">=",
+  value,
+  unit,
+  window_seconds,
+  sustained_seconds,
+  severity,
+  query_id,
+}) =>
+  Object.freeze({
+    id,
+    failure_class,
+    stage,
+    metric,
+    operator,
+    value,
+    unit,
+    window_seconds,
+    sustained_seconds,
+    severity,
+    query_id,
+    rollback_threshold_source: null,
+  });
+
+export const PROVIDER_FAILURE_ALERTS = Object.freeze([
+  ...ROLLBACK_TRIGGER_THRESHOLDS.map(alertFromRollbackThreshold),
+  alert({
+    id: "bac525_release_gate_stale_evidence",
+    failure_class: "release_gate_stale_evidence",
+    stage: "release_gate",
+    metric: "release_evidence_age_seconds",
+    operator: ">",
+    value: 86_400,
+    unit: "seconds",
+    window_seconds: 86_400,
+    sustained_seconds: 3_600,
+    severity: "release_blocking",
+    query_id: "release_gate_stale_evidence",
+  }),
+  alert({
+    id: "bac525_malformed_stream_count",
+    failure_class: "malformed_stream",
+    stage: "websocket",
+    metric: "malformed_stream_count",
+    value: 1,
+    unit: "count",
+    window_seconds: 600,
+    sustained_seconds: 60,
+    severity: "operator_page",
+    query_id: "malformed_stream",
+  }),
+  alert({
+    id: "bac525_network_disconnect_count",
+    failure_class: "network_disconnect",
+    stage: "transport",
+    metric: "network_disconnect_count",
+    value: 3,
+    unit: "count",
+    window_seconds: 600,
+    sustained_seconds: 300,
+    severity: "operator_page",
+    query_id: "network_disconnect",
+  }),
+  alert({
+    id: "bac525_watchdog_expiry_count",
+    failure_class: "turn_cap",
+    stage: "session",
+    metric: "watchdog_expiry_count",
+    value: 1,
+    unit: "count",
+    window_seconds: 300,
+    sustained_seconds: 60,
+    severity: "operator_page",
+    query_id: "watchdog_expiry",
+  }),
+  alert({
+    id: "bac525_deploy_drain_observed",
+    failure_class: "deploy_drain",
+    stage: "deployment",
+    metric: "deploy_drain_count",
+    value: 1,
+    unit: "count",
+    window_seconds: 600,
+    sustained_seconds: 60,
+    severity: "release_audit",
+    query_id: "deploy_drain",
+  }),
+  alert({
+    id: "bac525_pending_evaluation_count",
+    failure_class: "pending_evaluation",
+    stage: "store",
+    metric: "pending_evaluation_count",
+    value: 1,
+    unit: "count",
+    window_seconds: 600,
+    sustained_seconds: 60,
+    severity: "operator_page",
+    query_id: "recap_failure",
+  }),
+  alert({
+    id: "bac525_rollback_observed",
+    failure_class: "rollback",
+    stage: "rollback",
+    metric: "rollback_count",
+    value: 1,
+    unit: "count",
+    window_seconds: 600,
+    sustained_seconds: 60,
+    severity: "release_blocking",
+    query_id: "deploy_drain",
+  }),
+]);
+
+export const FAILURE_CLASS_COVERAGE = Object.freeze([
+  coverage("pre_loop_unavailable", null, {
+    no_operator_alert_reason:
+      "Pre-loop ingestion is recoverable before a live turn; dashboard query is sufficient unless release evidence marks it stale.",
+  }),
+  coverage("session_bootstrap_unavailable", null, {
+    no_operator_alert_reason:
+      "Bootstrap unavailability is dashboard-only because hosted monitor/release-gate stale evidence blocks live traffic before admission.",
+  }),
+  coverage("pending_evaluation", "bac525_pending_evaluation_count"),
+  coverage("partial_stage_success", "bac525_recap_failure_rate_percent"),
+  coverage("provider_auth_failure", "bac525_provider_auth_failure_count"),
+  coverage("quota_rate_failure", "bac525_provider_429_rate_percent"),
+  coverage("cost_budget", "bac525_provider_429_rate_percent", {
+    note: "Cost-budget exhaustion shares the provider quota/cost dashboard row and rollback candidate path.",
+  }),
+  coverage("local_rate_limit", "bac525_watchdog_expiry_count", {
+    note: "Local rate limits are grouped with watchdog/turn-cap pressure.",
+  }),
+  coverage("timeout", "bac525_provider_timeout_rate_percent"),
+  coverage("malformed_stream", "bac525_malformed_stream_count"),
+  coverage("network_disconnect", "bac525_network_disconnect_count"),
+  coverage("slow_client", "bac525_watchdog_expiry_count"),
+  coverage("cancellation", null, {
+    no_operator_alert_reason:
+      "Provider cancellation is normally learner or control initiated; it remains dashboard-only unless it escalates into timeout, recap failure, or network disconnect.",
+  }),
+  coverage("session_auth_failure", "bac525_token_refresh_failure_rate_percent"),
+  coverage("stale_client_session", null, {
+    no_operator_alert_reason:
+      "Back/Forward stale sessions are client-recoverable generation reconciliation events.",
+  }),
+  coverage("client_refresh", null, {
+    no_operator_alert_reason: "Browser refresh is client-recoverable and not an operator incident.",
+  }),
+  coverage("tab_restored_from_frozen_state", null, {
+    no_operator_alert_reason:
+      "BFCache/tab restore is client-recoverable generation reconciliation, not provider failure.",
+  }),
+  coverage("duplicate_submission", null, {
+    no_operator_alert_reason:
+      "Double-submit is recoverable because idempotency joins or ignores the duplicate and should not page operators.",
+  }),
+  coverage("audio_input_unavailable", null, {
+    no_operator_alert_reason:
+      "Mic unavailable has a typed fallback path and is client-recoverable unless live monitor failures rise.",
+  }),
+  coverage("deploy_drain", "bac525_deploy_drain_observed"),
+  coverage("turn_cap", "bac525_watchdog_expiry_count"),
+  coverage("session_cap", "bac525_watchdog_expiry_count"),
+  coverage("rollback", "bac525_rollback_observed"),
+]);
+
+export function providerFailureObservabilityEvidence({ fixture = null } = {}) {
+  const evidence = {
+    schema: OBSERVABILITY_SCHEMA,
+    dashboard: {
+      title: "Provider Failure Operations",
+      group_by: PROVIDER_FAILURE_DASHBOARD_GROUPS,
+      required_artifact_links: [
+        {
+          id: "hosted_release_evidence",
+          path: "artifacts/release-check/evidence.json",
+          sanitized: true,
+        },
+        {
+          id: "browser_story",
+          path: "artifacts/e2e-browser/browser-story.json",
+          sanitized: true,
+        },
+        {
+          id: "rollback_criteria",
+          path: "release_evidence.rollback_drain.criteria",
+          source: "scripts/rollback-drain-criteria.mjs",
+          sanitized: true,
+        },
+      ],
+    },
+    log_queries: PROVIDER_FAILURE_LOG_QUERIES.map((entry) => cloneJson(entry)),
+    alerts: PROVIDER_FAILURE_ALERTS.map((entry) => cloneJson(entry)),
+    coverage: FAILURE_CLASS_COVERAGE.map((entry) => cloneJson(entry)),
+    fixture: fixture ? cloneJson(fixture) : null,
+    redaction: {
+      raw_audio_indexed: false,
+      transcript_text_indexed: false,
+      learner_answer_payloads_indexed: false,
+      prompts_indexed: false,
+      unrestricted_source_material_indexed: false,
+      secrets_indexed: false,
+    },
+    sanitized: true,
+  };
+  assertProviderFailureObservabilityEvidence(evidence);
+  return evidence;
+}
+
+export function assertProviderFailureObservabilityEvidence(evidence) {
+  if (evidence.schema !== OBSERVABILITY_SCHEMA) {
+    throw new Error("Invalid provider failure observability schema");
+  }
+  const queryIds = new Set(evidence.log_queries.map((entry) => entry.id));
+  for (const id of [
+    "provider_429",
+    "provider_auth_failure",
+    "provider_timeout",
+    "malformed_stream",
+    "network_disconnect",
+    "token_refresh_failure",
+    "recap_failure",
+    "deploy_drain",
+    "watchdog_expiry",
+    "stuck_checking",
+    "release_gate_stale_evidence",
+  ]) {
+    if (!queryIds.has(id)) {
+      throw new Error(`missing provider failure log query ${id}`);
+    }
+  }
+  for (const group of PROVIDER_FAILURE_DASHBOARD_GROUPS) {
+    if (!evidence.dashboard.group_by.includes(group)) {
+      throw new Error(`dashboard missing group ${group}`);
+    }
+  }
+
+  const alertIds = new Set(evidence.alerts.map((entry) => entry.id));
+  for (const thresholdId of REQUIRED_ROLLBACK_TRIGGER_IDS) {
+    const threshold = ROLLBACK_TRIGGER_THRESHOLDS.find((entry) => entry.id === thresholdId);
+    if (!threshold || !alertIds.has(threshold.shared_alert_id)) {
+      throw new Error(`missing shared BAC-527 alert threshold ${thresholdId}`);
+    }
+  }
+  if (!alertIds.has("bac525_release_gate_stale_evidence")) {
+    throw new Error("missing release-gate stale evidence alert");
+  }
+
+  const coverageByFailureClass = new Map(
+    evidence.coverage.map((entry) => [entry.failure_class, entry]),
+  );
+  for (const failureClass of learnerLoopFailureClasses()) {
+    const coverage = coverageByFailureClass.get(failureClass);
+    if (!coverage) {
+      throw new Error(`missing BAC-510 failure-class coverage for ${failureClass}`);
+    }
+    if (!coverage.alert_id && !coverage.no_operator_alert_reason) {
+      throw new Error(`coverage for ${failureClass} has neither alert nor no-alert rationale`);
+    }
+    if (coverage.alert_id && !alertIds.has(coverage.alert_id)) {
+      throw new Error(`coverage for ${failureClass} references unknown alert ${coverage.alert_id}`);
+    }
+  }
+
+  assertNoForbiddenEvidenceMarkers(evidence);
+  return evidence;
+}
+
+export function learnerLoopFailureClasses() {
+  return Array.from(
+    new Set(
+      learnerLoopContract.states
+        .map((state) => (typeof state.failure_class === "string" ? state.failure_class : null))
+        .filter(Boolean),
+    ),
+  ).sort();
+}
+
+function coverage(failure_class, alert_id, extra = {}) {
+  return Object.freeze({
+    failure_class,
+    alert_id,
+    ...extra,
+  });
+}
+
+function assertNoForbiddenEvidenceMarkers(value) {
+  const serialized = JSON.stringify(value);
+  const forbidden = [
+    "pcm16_base64",
+    "answer_text",
+    "transcript_final",
+    "source_context",
+    "pasted_text",
+    "session_token",
+    "viva1.",
+    "session-secret",
+    "raw_prompt",
+    "provider_prompt",
+    "source_excerpt",
+    "CARTESIA_API_KEY",
+    "GEMINI_API_KEY",
+    "Bearer ",
+  ];
+  for (const needle of forbidden) {
+    if (serialized.includes(needle)) {
+      throw new Error(`provider failure observability includes forbidden marker: ${needle}`);
+    }
+  }
+  for (const [name, envValue] of Object.entries(process.env)) {
+    if (!/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) continue;
+    if (envValue && envValue.length >= 8 && serialized.includes(envValue)) {
+      throw new Error(`provider failure observability includes secret value from ${name}`);
+    }
+  }
+}
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}

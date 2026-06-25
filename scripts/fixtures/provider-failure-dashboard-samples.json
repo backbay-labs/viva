@@ -1,0 +1,39 @@
+{
+  "schema": "viva.provider_failure_dashboard_fixture.v1",
+  "events": [
+    {
+      "id": "railway_gemini_http_429",
+      "query_id": "provider_429",
+      "platform": "railway",
+      "observed_at_utc": "2026-06-22T02:36:00Z",
+      "failure_class": "quota_rate_failure",
+      "stage": "provider",
+      "provider": "cartesia_gemini",
+      "model": "gemini-live",
+      "deploy_sha": "hosted-snapshot",
+      "latency_bucket": "unknown",
+      "usage_bucket": "unknown",
+      "cost_bucket": "unknown",
+      "terminal_reason": "provider_rate_limited",
+      "signal": "gemini_http_429",
+      "sanitized": true
+    },
+    {
+      "id": "hosted_recap_timeout",
+      "query_id": "provider_timeout",
+      "platform": "hosted-monitor",
+      "observed_at_utc": "2026-06-22T02:37:00Z",
+      "failure_class": "timeout",
+      "stage": "recap",
+      "provider": "cartesia_gemini",
+      "model": "gemini-live",
+      "deploy_sha": "hosted-snapshot",
+      "latency_bucket": "45s_plus",
+      "usage_bucket": "none",
+      "cost_bucket": "none",
+      "terminal_reason": "provider_timeout",
+      "signal": "recap_timeout",
+      "sanitized": true
+    }
+  ]
+}
