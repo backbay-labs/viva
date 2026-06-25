@@ -188,6 +188,7 @@ function ready(provider: string, overrides: Partial<VivaReadyFrame["brain"]> = {
       backend: "in_memory",
       available: true,
       durable: false,
+      nonce_replay_protection: true,
       raw_audio_persistence: false,
       transcript_persistence: false,
       uuid_schema_translation: true,

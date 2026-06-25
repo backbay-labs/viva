@@ -135,6 +135,15 @@ describe("BAC-510 learner loop contract", () => {
         ),
       }),
     ).toThrow("Terminal learner loop state rollback is missing terminal_reason");
+
+    expect(() =>
+      validateLearnerLoopContract({
+        ...VIVA_LEARNER_LOOP_CONTRACT,
+        states: VIVA_LEARNER_LOOP_CONTRACT.states.map((state) =>
+          state.id === "rollback" ? { ...state, terminal_reason: "roll_back" as never } : state,
+        ),
+      }),
+    ).toThrow("Unknown learner loop terminal reason roll_back");
   });
 
   test("names required evidence fields without forbidden raw payload fields", () => {

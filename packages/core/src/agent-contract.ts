@@ -39,22 +39,25 @@ export type AgentStudySessionPhase =
   | "correction"
   | "recap";
 
-export type AgentTerminalSessionReason =
-  | "drained"
-  | "session_cap"
-  | "turn_cap"
-  | "rate_limit"
-  | "cost_budget"
-  | "provider_auth_failed"
-  | "provider_rate_limited"
-  | "provider_timeout"
-  | "provider_malformed_stream"
-  | "provider_network_disconnect"
-  | "slow_client"
-  | "provider_cancelled"
-  | "partial_stage_success"
-  | "durability_degraded"
-  | "rollback";
+export const VIVA_AGENT_TERMINAL_SESSION_REASONS = [
+  "drained",
+  "session_cap",
+  "turn_cap",
+  "rate_limit",
+  "cost_budget",
+  "provider_auth_failed",
+  "provider_rate_limited",
+  "provider_timeout",
+  "provider_malformed_stream",
+  "provider_network_disconnect",
+  "slow_client",
+  "provider_cancelled",
+  "partial_stage_success",
+  "durability_degraded",
+  "rollback",
+] as const;
+
+export type AgentTerminalSessionReason = (typeof VIVA_AGENT_TERMINAL_SESSION_REASONS)[number];
 
 export type AgentStudySourceReference = {
   source_id: string;
@@ -637,26 +640,10 @@ function requireStudyPhase(value: unknown): AgentStudySessionPhase {
 }
 
 function requireTerminalSessionReason(value: unknown): AgentTerminalSessionReason {
-  if (
-    value !== "drained" &&
-    value !== "session_cap" &&
-    value !== "turn_cap" &&
-    value !== "rate_limit" &&
-    value !== "cost_budget" &&
-    value !== "provider_auth_failed" &&
-    value !== "provider_rate_limited" &&
-    value !== "provider_timeout" &&
-    value !== "provider_malformed_stream" &&
-    value !== "provider_network_disconnect" &&
-    value !== "slow_client" &&
-    value !== "provider_cancelled" &&
-    value !== "partial_stage_success" &&
-    value !== "durability_degraded" &&
-    value !== "rollback"
-  ) {
+  if (!VIVA_AGENT_TERMINAL_SESSION_REASONS.includes(value as AgentTerminalSessionReason)) {
     throw new Error("Invalid terminal session reason");
   }
-  return value;
+  return value as AgentTerminalSessionReason;
 }
 
 function requireSourceConfidence(value: unknown): AgentSourceConfidence {
