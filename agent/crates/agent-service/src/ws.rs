@@ -2305,15 +2305,15 @@ fn provider_stage_failure_detail(failure: &BrainProviderFailure) -> String {
     let retry_after_ms = metadata_field(&failure.metadata, "retry_after_ms");
     let reset_hint = metadata_field(&failure.metadata, "reset_hint");
     format!(
-        "failure_class={} stage={} terminal_reason={} latency_ms={} provider={} model={} retry_after_ms={} reset_hint={} retry_eligible={} metadata={}",
+        "failure_class={} stage={} terminal_reason={} latency_ms={} retry_after_ms={} reset_hint={} provider={} model={} retry_eligible={} metadata={}",
         failure.failure_class,
         failure.stage,
         failure.terminal_reason.as_str(),
         failure.latency_ms,
-        failure.provider,
-        failure.model,
         retry_after_ms.unwrap_or("unknown"),
         reset_hint.unwrap_or("unknown"),
+        failure.provider,
+        failure.model,
         failure.retry_eligible,
         failure.metadata
     )
@@ -2863,6 +2863,44 @@ mod tests {
         assert!(detail.contains("stage=gemini"));
         assert!(detail.contains("provider=gemini"));
         assert!(detail.contains("model=gemini-35-flash"));
+        assert!(detail.contains("retry_after_ms=7000"));
+        assert!(detail.contains("reset_hint=2030-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn provider_stage_failure_evidence_keeps_retry_reset_with_long_model() {
+        use std::sync::Arc;
+
+        use agent_adapters::SyntheticBrain;
+
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "synthetic",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+            BrainProviderFailureParts {
+                failure_class: "quota_rate_failure".to_owned(),
+                stage: "gemini".to_owned(),
+                terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                retry_eligible: true,
+                latency_ms: 123,
+                provider: "gemini".to_owned(),
+                model: "gemini-35-flash-preview-long-sanitized-model-identifier-long-sanitized-model-identifier-long-tail"
+                    .to_owned(),
+                metadata:
+                    "http_status=429 retry_after_ms=7000 retry_after_source=retry_after_delta reset_hint=2030-01-01T00:00:00Z body_status=resource_exhausted budget_state=unknown deploy_sha=unknown"
+                        .to_owned(),
+            },
+        ));
+
+        record_provider_stage_failure(&state, Some("voice-session-1".to_owned()), &error);
+
+        let events = state.evidence.snapshot();
+        assert_eq!(events.len(), 1);
+        let detail = &events[0].detail;
+        assert!(detail.len() <= 240);
         assert!(detail.contains("retry_after_ms=7000"));
         assert!(detail.contains("reset_hint=2030-01-01T00:00:00Z"));
     }
