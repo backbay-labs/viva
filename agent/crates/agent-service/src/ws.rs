@@ -29,7 +29,7 @@ use tokio::{
 use crate::{
     app::{
         AppState, ProviderAdmission, ProviderAdmissionDecision, ProviderAdmissionDenial,
-        VoiceLimitLease, VoiceLimitState,
+        ProviderQueueBehavior, VoiceLimitLease, VoiceLimitState,
     },
     config::{
         bac_510_max_turn_duration, FailureControlScenario, SessionAuthFailureCode,
@@ -476,6 +476,23 @@ async fn handle_socket(
     record_turn_cap_config(&state, voice_session_id.clone());
     let session_started_at = Instant::now();
 
+    if let Some(admission) = state
+        .limit_state
+        .provider_backoff_admission(&state.voice_limits)
+    {
+        record_provider_admission(&state, voice_session_id.clone(), &admission);
+        if let ProviderAdmissionDecision::Denied(denial) = admission.decision {
+            let terminal_reason = close_with_terminal_session_phase_only(
+                &mut sender,
+                denial.terminal_reason,
+                close_code::POLICY,
+            )
+            .await;
+            record_terminal(&state, voice_session_id, terminal_reason).await;
+            return;
+        }
+    }
+
     let session_result = match failure_control {
         Some(scenario) => open_failure_control_session(&state, initial_config, scenario).await,
         None => state.brain.open(initial_config).await,
@@ -491,6 +508,7 @@ async fn handle_socket(
                 ));
                 TerminalSessionReason::DurabilityDegraded
             } else {
+                record_brain_open_provider_failure(&state, voice_session_id.clone(), &error);
                 terminal_reason_for_brain_error(&error)
             };
             let close_terminal_reason = close_with_terminal_session_phase_only(
@@ -667,9 +685,18 @@ async fn handle_socket(
                             queue_delay_ms: 0,
                         })
                     } else {
+                        let queue_behavior = if pending_provider_admissions.is_empty() {
+                            ProviderQueueBehavior::Wait
+                        } else {
+                            ProviderQueueBehavior::Deny {
+                                reason: "overlapping_provider_turn",
+                                terminal_reason: TerminalSessionReason::SlowClient,
+                            }
+                        };
                         state
                             .limit_state
-                            .try_admit_provider_turn(&state.voice_limits)
+                            .try_admit_provider_turn(&state.voice_limits, queue_behavior)
+                            .await
                     };
                     record_provider_admission(&state, voice_session_id.clone(), &admission);
                     if let ProviderAdmissionDecision::Denied(denial) = &admission.decision {
@@ -1203,15 +1230,19 @@ where
             ));
             return Ok(ForwardBrainEvent::DurabilityDegraded);
         }
+        let terminal_reason = terminal_reason_for_provider_error(error);
         if let Some(failure) = &error.failure {
             context
                 .state
                 .limit_state
                 .record_provider_failure(context.limits, failure);
+        } else {
+            context
+                .state
+                .limit_state
+                .record_provider_terminal_failure(context.limits, terminal_reason);
         }
-        return Ok(ForwardBrainEvent::ProviderFailure(
-            terminal_reason_for_provider_error(error),
-        ));
+        return Ok(ForwardBrainEvent::ProviderFailure(terminal_reason));
     }
     match authorize_browser_event(context.state, context.session_binding, &event).await {
         BrowserEventAuthorization::Authorized => {}
@@ -1288,6 +1319,28 @@ fn brain_error_is_durability_degraded(state: &AppState, error: &BrainError) -> b
             failure.terminal_reason == TerminalSessionReason::DurabilityDegraded
         }
         BrainError::MissingApiKey => false,
+    }
+}
+
+fn record_brain_open_provider_failure(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    error: &BrainError,
+) {
+    match error {
+        BrainError::StageFailure(failure) => {
+            let provider_error = BrainProviderError::from_stage_failure((**failure).clone());
+            record_provider_stage_failure(state, voice_session_id, &provider_error);
+            state
+                .limit_state
+                .record_provider_failure(&state.voice_limits, failure);
+        }
+        _ => {
+            state.limit_state.record_provider_terminal_failure(
+                &state.voice_limits,
+                terminal_reason_for_brain_error(error),
+            );
+        }
     }
 }
 
