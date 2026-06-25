@@ -3515,11 +3515,16 @@ async fn websocket_durable_store_failure_mid_turn_emits_durability_degraded_term
     assert!(store.durable);
     send_client_frame(&mut socket, &fixture.client[0]).await;
 
-    let frames = read_server_frames_until_close(&mut socket).await;
+    let frames = read_server_frames_until_terminal_reason(
+        &mut socket,
+        TerminalSessionReason::DurabilityDegraded,
+    )
+    .await;
 
     assert!(frames.iter().any(|frame| {
         terminal_session_reason(frame) == Some(TerminalSessionReason::DurabilityDegraded)
     }));
+    assert_close_code(&mut socket, CloseCode::Error).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::TerminalReason
@@ -3614,11 +3619,16 @@ async fn websocket_durable_store_write_failure_mid_turn_emits_durability_degrade
     assert!(store.durable);
     send_client_frame(&mut socket, &fixture.client[0]).await;
 
-    let frames = read_server_frames_until_close(&mut socket).await;
+    let frames = read_server_frames_until_terminal_reason(
+        &mut socket,
+        TerminalSessionReason::DurabilityDegraded,
+    )
+    .await;
 
     assert!(frames.iter().any(|frame| {
         terminal_session_reason(frame) == Some(TerminalSessionReason::DurabilityDegraded)
     }));
+    assert_close_code(&mut socket, CloseCode::Error).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::TerminalReason
@@ -6506,6 +6516,21 @@ async fn read_server_frames_until_close(socket: &mut TestWebSocket) -> Vec<Serve
             Some(Ok(WsMessage::Text(text))) => frames.push(serde_json::from_str(&text).unwrap()),
             Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => return frames,
             Some(Ok(_)) => {}
+        }
+    }
+}
+
+async fn read_server_frames_until_terminal_reason(
+    socket: &mut TestWebSocket,
+    expected: TerminalSessionReason,
+) -> Vec<ServerFrame> {
+    let mut frames = Vec::new();
+    loop {
+        let frame = read_server_frame(socket).await;
+        let terminal = terminal_session_reason(&frame);
+        frames.push(frame);
+        if terminal == Some(expected) {
+            return frames;
         }
     }
 }
