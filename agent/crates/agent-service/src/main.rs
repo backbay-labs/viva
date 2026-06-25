@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_service::{
-    build_brain, build_router, build_study_store, AppState, ServiceConfig, VoiceDrainSignal,
-    WsTimeouts,
+    build_brain, build_router, build_study_store, validate_runtime_store_preflight, AppState,
+    ServiceConfig, VoiceDrainSignal, WsTimeouts,
 };
 
 const VOICE_DRAIN_GRACE_PERIOD: Duration = Duration::from_secs(2);
@@ -21,6 +21,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = ServiceConfig::from_env()?;
     let study_store = build_study_store(&config).await?;
+    validate_runtime_store_preflight(&config, &study_store.capabilities())?;
     let brain = build_brain(&config, Arc::clone(&study_store));
     let state = AppState::with_study_store(
         brain,

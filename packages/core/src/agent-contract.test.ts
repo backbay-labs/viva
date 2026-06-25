@@ -51,6 +51,7 @@ describe("Viva voice agent contract", () => {
       backend: "in_memory",
       available: true,
       durable: false,
+      nonce_replay_protection: true,
       raw_audio_persistence: false,
       transcript_persistence: false,
       uuid_schema_translation: true,
@@ -94,6 +95,7 @@ describe("Viva voice agent contract", () => {
       "slow_client",
       "provider_cancelled",
       "partial_stage_success",
+      "durability_degraded",
       "rollback",
     ] as const) {
       const parsed = parseVivaServerFrame({

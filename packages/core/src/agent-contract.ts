@@ -53,6 +53,7 @@ export type AgentTerminalSessionReason =
   | "slow_client"
   | "provider_cancelled"
   | "partial_stage_success"
+  | "durability_degraded"
   | "rollback";
 
 export type AgentStudySourceReference = {
@@ -195,6 +196,7 @@ export type AgentStoreReadiness = {
   backend: string;
   available: boolean;
   durable: boolean;
+  nonce_replay_protection: boolean;
   raw_audio_persistence: boolean;
   transcript_persistence: boolean;
   uuid_schema_translation: boolean;
@@ -512,6 +514,7 @@ function parseStoreReadiness(value: unknown): AgentStoreReadiness {
   requireNonEmptyString(store.backend, "store backend");
   requireBoolean(store.available, "store available");
   requireBoolean(store.durable, "store durable");
+  requireBoolean(store.nonce_replay_protection, "store nonce replay protection");
   requireBoolean(store.raw_audio_persistence, "raw audio persistence");
   requireBoolean(store.transcript_persistence, "transcript persistence");
   requireBoolean(store.uuid_schema_translation, "uuid schema translation");
@@ -648,6 +651,7 @@ function requireTerminalSessionReason(value: unknown): AgentTerminalSessionReaso
     value !== "slow_client" &&
     value !== "provider_cancelled" &&
     value !== "partial_stage_success" &&
+    value !== "durability_degraded" &&
     value !== "rollback"
   ) {
     throw new Error("Invalid terminal session reason");
