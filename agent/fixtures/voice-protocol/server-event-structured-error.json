@@ -1,6 +1,6 @@
 {
   "type": "event",
-  "version": 2,
+  "version": 3,
   "event": {
     "type": "structured_error",
     "source": "agent-service",

@@ -6,7 +6,7 @@ use agent_domain::{
 };
 use serde::{Deserialize, Serialize};
 
-pub const VIVA_VOICE_PROTOCOL_VERSION: u32 = 2;
+pub const VIVA_VOICE_PROTOCOL_VERSION: u32 = 3;
 pub const VIVA_VOICE_SAMPLE_RATE_HZ: u32 = 24_000;
 pub const VIVA_VOICE_INPUT_ENCODING: &str = "pcm_s16le";
 pub const VIVA_VOICE_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;

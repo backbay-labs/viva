@@ -1,4 +1,4 @@
-export const VIVA_VOICE_PROTOCOL_VERSION = 2;
+export const VIVA_VOICE_PROTOCOL_VERSION = 3;
 export const VIVA_VOICE_SAMPLE_RATE_HZ = 24_000;
 export const VIVA_VOICE_INPUT_ENCODING = "pcm_s16le";
 export const VIVA_VOICE_MAX_TEXT_FRAME_BYTES = 64 * 1024;

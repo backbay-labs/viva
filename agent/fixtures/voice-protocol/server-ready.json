@@ -1,6 +1,6 @@
 {
   "type": "ready",
-  "version": 2,
+  "version": 3,
   "sample_rate_hz": 24000,
   "input_encoding": "pcm_s16le",
   "brain": {

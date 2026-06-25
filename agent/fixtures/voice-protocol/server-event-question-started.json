@@ -1,6 +1,6 @@
 {
   "type": "event",
-  "version": 2,
+  "version": 3,
   "event": {
     "type": "question_started",
     "response_id": "response-1",

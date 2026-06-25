@@ -22,12 +22,12 @@ import {
 import { seedStudySets } from "./index";
 
 describe("Viva voice agent contract", () => {
-  test("uses protocol v2 because ready frames carry required provider/store readiness", () => {
-    expect(VIVA_VOICE_PROTOCOL_VERSION).toBe(2);
+  test("uses protocol v3 because ready frames carry required provider/store nonce readiness", () => {
+    expect(VIVA_VOICE_PROTOCOL_VERSION).toBe(3);
     expect(() =>
       parseVivaServerFrame({
         type: "ready",
-        version: 1,
+        version: 2,
         sample_rate_hz: VIVA_VOICE_SAMPLE_RATE_HZ,
         input_encoding: VIVA_VOICE_INPUT_ENCODING,
       }),

@@ -147,6 +147,46 @@ describe("Viva agent browser client", () => {
     expect(probe.error).toContain("invalid /health/brain readiness payload");
   });
 
+  test("reports /ready as offline when store nonce replay capability is missing", async () => {
+    const { nonce_replay_protection: _nonce, ...storeWithoutNonce } = readyFixture.store;
+    const probe = await fetchVivaAgentReadinessProbe({
+      apiBaseUrl: "http://localhost:4318",
+      fetchImpl: async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/health/brain")) {
+          return jsonResponse(200, {
+            provider: "cartesia_gemini",
+            brain: {
+              provider: "cartesia_gemini",
+              configured: true,
+              selectable: true,
+              live_runtime: false,
+            },
+            store: readyFixture.store,
+            status: "ok",
+          });
+        }
+        if (url.endsWith("/ready")) {
+          return jsonResponse(200, {
+            ready: true,
+            brain: {
+              provider: "cartesia_gemini",
+              configured: true,
+              selectable: true,
+              live_runtime: false,
+            },
+            store: storeWithoutNonce,
+          });
+        }
+        throw new Error(`unexpected URL ${url}`);
+      },
+    });
+
+    expect(probe.status).toBe("offline");
+    if (probe.status !== "offline") throw new Error("Expected offline probe");
+    expect(probe.error).toContain("invalid /ready readiness payload");
+  });
+
   test("encodes optional bearer token as websocket subprotocol", () => {
     expect(vivaAgentProtocols()).toEqual(["viva-voice"]);
     expect(vivaAgentProtocols("secret")).toEqual(["viva-voice", "bearer.c2VjcmV0"]);
