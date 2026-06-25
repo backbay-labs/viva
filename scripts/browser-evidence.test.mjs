@@ -27,6 +27,12 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
     post_answer_concept_status_event_seen: true,
     second_tab_session_cap_observed: true,
     local_only_actions_hidden: true,
+    store: {
+      available: true,
+      backend: "postgres",
+      durable: true,
+      nonce_replay_protection: true,
+    },
     browser_story: completeBrowserStory(),
     console_errors: ["console failure"],
     page_errors: [],
@@ -48,6 +54,7 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
     post_answer_concept_status_event_seen: true,
     second_tab_session_cap_observed: true,
     local_only_actions_hidden: true,
+    store_durability_mode: "durable",
     browser_story: {
       artifact_forbidden_hits: 0,
       artifact_files: [
@@ -155,6 +162,25 @@ test("rejects browser evidence without next-session review recommendations", () 
 test("requires sanitized browser-story frames for the manuscript release artifact", () => {
   assert.doesNotThrow(() =>
     assertReleaseBrowserEvidence(normalizeBrowserEvidence(completeBrowserResult())),
+  );
+});
+
+test("rejects browser evidence with an ephemeral store while durable state is claimed", () => {
+  assert.throws(
+    () =>
+      assertReleaseBrowserEvidence(
+        normalizeBrowserEvidence(
+          completeBrowserResult({
+            store: {
+              available: true,
+              backend: "in_memory",
+              durable: false,
+              nonce_replay_protection: true,
+            },
+          }),
+        ),
+      ),
+    /store_durability_mode/,
   );
 });
 
@@ -413,6 +439,12 @@ function completeBrowserResult(overrides = {}) {
     post_answer_concept_status_event_seen: true,
     second_tab_session_cap_observed: true,
     local_only_actions_hidden: true,
+    store: {
+      available: true,
+      backend: "postgres",
+      durable: true,
+      nonce_replay_protection: true,
+    },
     browser_story: completeBrowserStory(),
     console_errors: [],
     page_errors: [],

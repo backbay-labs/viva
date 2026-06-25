@@ -10,7 +10,7 @@ import {
 import { assertNoForbiddenEvidenceMarkers } from "./redaction-control.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 const LIVE_PROVIDER = "cartesia_gemini";
 const DEFAULT_AGENT_HTTP_URL = "http://127.0.0.1:4318";
 const DEFAULT_BOOTSTRAP_TEXT =
@@ -704,6 +704,7 @@ function readinessUnavailable() {
       available: false,
       backend: null,
       durable: false,
+      nonce_replay_protection: false,
     },
     usage_events: null,
   };
@@ -723,6 +724,7 @@ function summarizeStore(store) {
     available: store?.available === true,
     backend: typeof store?.backend === "string" ? store.backend : null,
     durable: store?.durable === true,
+    nonce_replay_protection: store?.nonce_replay_protection === true,
   };
 }
 

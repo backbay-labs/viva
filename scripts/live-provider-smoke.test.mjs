@@ -69,7 +69,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
   const frames = [
     {
       type: "ready",
-      version: 2,
+      version: 3,
       sample_rate_hz: 24000,
       input_encoding: "pcm_s16le",
       brain: {
@@ -82,6 +82,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
         backend: "postgres",
         available: true,
         durable: true,
+        nonce_replay_protection: true,
         raw_audio_persistence: false,
         transcript_persistence: false,
         uuid_schema_translation: true,
@@ -89,7 +90,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 2,
+      version: 3,
       event: {
         type: "transcript_final",
         response_id: "response-1",
@@ -99,7 +100,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 2,
+      version: 3,
       event: {
         type: "answer_evaluated",
         response_id: "response-1",
@@ -110,7 +111,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 2,
+      version: 3,
       event: {
         type: "source_reference",
         response_id: "response-1",
@@ -122,7 +123,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 2,
+      version: 3,
       event: {
         type: "audio_delta",
         response_id: "response-1",
@@ -133,7 +134,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 2,
+      version: 3,
       event: {
         type: "recap_ready",
         response_id: "response-1",
@@ -629,6 +630,7 @@ function readyBody({ ready = true, selectable = true, liveRuntime = true } = {})
       backend: "postgres",
       available: true,
       durable: true,
+      nonce_replay_protection: true,
       raw_audio_persistence: false,
       transcript_persistence: false,
       uuid_schema_translation: true,
@@ -650,6 +652,7 @@ function brainHealth({ usageEvents = 7, selectable = true, liveRuntime = true } 
       backend: "postgres",
       available: true,
       durable: true,
+      nonce_replay_protection: true,
       raw_audio_persistence: false,
       transcript_persistence: false,
       uuid_schema_translation: true,
@@ -663,7 +666,7 @@ function brainHealth({ usageEvents = 7, selectable = true, liveRuntime = true } 
 function readyFrame() {
   return {
     type: "ready",
-    version: 2,
+    version: 3,
     sample_rate_hz: 24000,
     input_encoding: "pcm_s16le",
     brain: {
@@ -676,6 +679,7 @@ function readyFrame() {
       backend: "postgres",
       available: true,
       durable: true,
+      nonce_replay_protection: true,
       raw_audio_persistence: false,
       transcript_persistence: false,
       uuid_schema_translation: true,
@@ -799,7 +803,7 @@ class MalformedStreamSocket extends FakeSocket {
       queueMicrotask(() => {
         this.message({
           type: "error",
-          version: 2,
+          version: 3,
           message: "provider raw payload with prompt text must not be retained",
         });
         this.close(1011, "provider stream failed");
@@ -821,7 +825,7 @@ class InvalidJsonSocket extends FakeSocket {
       }
     } else if (Buffer.isBuffer(data)) {
       queueMicrotask(() => {
-        this.rawMessage('{"type":"event","version":2,"event":');
+        this.rawMessage('{"type":"event","version":3,"event":');
         this.close(1011, "provider stream failed");
       });
     }
@@ -861,7 +865,7 @@ class TerminalReasonSocket extends FakeSocket {
 function eventFrame(type, event) {
   return {
     type: "event",
-    version: 2,
+    version: 3,
     event: {
       type,
       ...event,

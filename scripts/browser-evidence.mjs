@@ -28,6 +28,7 @@ export function normalizeBrowserEvidence(result) {
     post_answer_concept_status_event_seen: result.post_answer_concept_status_event_seen === true,
     second_tab_session_cap_observed: result.second_tab_session_cap_observed === true,
     local_only_actions_hidden: result.local_only_actions_hidden === true,
+    store_durability_mode: normalizeStoreDurabilityMode(result.store),
     browser_story: normalizeBrowserStory(result.browser_story),
     console_error_count: Array.isArray(result.console_errors) ? result.console_errors.length : 0,
     page_error_count: Array.isArray(result.page_errors) ? result.page_errors.length : 0,
@@ -64,6 +65,8 @@ export function assertReleaseBrowserEvidence(evidence) {
     failures.push("second_tab_session_cap_observed must be true");
   if (evidence.local_only_actions_hidden !== true)
     failures.push("local_only_actions_hidden must be true");
+  if (evidence.store_durability_mode !== "durable")
+    failures.push("store_durability_mode must be durable for durable-state release claims");
   if (browserStory.schema !== "viva.browser_story.v1")
     failures.push("browser_story.schema must be viva.browser_story.v1");
   if (browserStory.agent_provider !== "synthetic")
@@ -210,6 +213,11 @@ function normalizeBrowserStory(story) {
         ? commandSummary.validation_run_id
         : null,
   };
+}
+
+function normalizeStoreDurabilityMode(store) {
+  if (!isRecord(store) || typeof store.durable !== "boolean") return "unknown";
+  return store.durable ? "durable" : "ephemeral";
 }
 
 function hasCommandSummary(commandSummary) {
