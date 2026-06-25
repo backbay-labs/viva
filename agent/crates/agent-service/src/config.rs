@@ -153,10 +153,10 @@ impl ServiceConfig {
         }
         config.voice_limits.max_provider_concurrent_turns =
             env_value("VIVA_PROVIDER_MAX_CONCURRENT_TURNS")
-                .and_then(|value| parse_positive_usize(&value))
+                .and_then(|value| parse_nonnegative_usize(&value))
                 .or(config.voice_limits.max_provider_concurrent_turns);
         config.voice_limits.max_provider_queue_depth = env_value("VIVA_PROVIDER_MAX_QUEUE_DEPTH")
-            .and_then(|value| parse_positive_usize(&value))
+            .and_then(|value| parse_nonnegative_usize(&value))
             .or(config.voice_limits.max_provider_queue_depth);
         config.voice_limits.provider_backoff_default_ms =
             env_value("VIVA_PROVIDER_BACKOFF_DEFAULT_MS")
@@ -646,6 +646,10 @@ fn parse_positive_u64(value: &str) -> Option<u64> {
 
 fn parse_positive_usize(value: &str) -> Option<usize> {
     value.parse::<usize>().ok().filter(|parsed| *parsed > 0)
+}
+
+fn parse_nonnegative_usize(value: &str) -> Option<usize> {
+    value.parse::<usize>().ok()
 }
 
 fn parse_positive_f64(value: &str) -> Option<f64> {
@@ -1196,6 +1200,17 @@ mod tests {
         assert_eq!(config.voice_limits.max_provider_queue_depth, Some(3));
         assert_eq!(config.voice_limits.provider_backoff_default_ms, 250);
         assert_eq!(config.voice_limits.provider_backoff_max_ms, 5_000);
+    }
+
+    #[test]
+    fn from_env_allows_zero_provider_concurrent_turns() {
+        let config = ServiceConfig::from_env_with(|name| match name {
+            "VIVA_PROVIDER_MAX_CONCURRENT_TURNS" => Some("0".to_owned()),
+            _ => None,
+        })
+        .expect("zero provider concurrency should validate as immediate admission denial");
+
+        assert_eq!(config.voice_limits.max_provider_concurrent_turns, Some(0));
     }
 
     #[test]

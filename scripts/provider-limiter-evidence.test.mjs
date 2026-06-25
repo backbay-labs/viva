@@ -12,15 +12,19 @@ test("provider limiter release evidence is enabled and names admission proofs", 
   assert.equal(evidence.schema, "viva.provider_limiter.v1");
   assert.equal(evidence.enabled_for_release, true);
   assert.equal(evidence.required_event_kind, "provider_admission");
-  assert.deepEqual(evidence.required_detail_fields, [
-    "admission_decision",
-    "queue_depth",
-    "queue_delay_ms",
-    "budget_state",
-    "retry_after_ms",
-    "reset_hint",
-    "terminal_reason",
-  ]);
+  assert.deepEqual(evidence.required_detail_fields, {
+    admitted: ["admission_decision", "queue_depth", "queue_delay_ms", "budget_state"],
+    denied: [
+      "admission_decision",
+      "reason",
+      "terminal_reason",
+      "queue_depth",
+      "queue_delay_ms",
+      "retry_after_ms",
+      "reset_hint",
+      "budget_state",
+    ],
+  });
   assert.equal(
     evidence.proved_by.agent_service_test,
     "websocket_provider_backoff_denies_next_answer_before_brain_input",
@@ -40,7 +44,7 @@ test("provider limiter release evidence fails closed when disabled or incomplete
         schema: "viva.provider_limiter.v1",
         enabled_for_release: true,
         required_event_kind: "provider_admission",
-        required_detail_fields: [],
+        required_detail_fields: { admitted: [], denied: [] },
         proved_by: {},
       }),
     /missing provider limiter evidence fields/,
