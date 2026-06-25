@@ -29,7 +29,8 @@ use super::{
     audio_frame_bytes, gemini_request, parse_gemini_sse_line, parse_ink_event, parse_sonic_event,
     select_next_question, send_fake_unless_cancelled, sonic_generation_request,
     CartesiaGeminiConfig, FakeRuntimeInterrupt, FakeRuntimeReport, GeminiStreamEvent, InkEvent,
-    SonicEvent, FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT,
+    SonicEvent, FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT, MAX_GEMINI_EXECUTED_TOOL_STAGES,
+    MAX_GEMINI_TOOL_LOOP_PASSES,
 };
 use super::{emit_fake_provider_error, parse_result_field};
 
@@ -499,8 +500,9 @@ where
         let mut conversation = GeminiConversation::default();
         conversation.push_user_text(answer_text);
         let mut response_prompt = String::new();
+        let mut executed_gemini_tool_stages = 0_u32;
 
-        for _ in 0..4 {
+        for _ in 0..MAX_GEMINI_TOOL_LOOP_PASSES {
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
                 return Ok(response_prompt);
             }
@@ -509,6 +511,7 @@ where
                 conversation.snapshot(),
                 &self.config.tools,
             );
+            let gemini_started = Instant::now();
             let stream = fake_interrupt_gemini_stream(
                 self.transports.stream_gemini(&self.config, request).await?,
                 interrupt,
@@ -559,6 +562,14 @@ where
                         } else {
                             ToolProposal::new(name, args).with_call_id(id)
                         };
+                        if executed_gemini_tool_stages >= MAX_GEMINI_EXECUTED_TOOL_STAGES {
+                            return Err(gemini_tool_loop_budget_error(
+                                proposal.name(),
+                                &self.config.gemini.model_id,
+                                gemini_started.elapsed(),
+                            ));
+                        }
+                        executed_gemini_tool_stages = executed_gemini_tool_stages.saturating_add(1);
                         let result = execute_tool_stage(
                             executor,
                             response_id,
@@ -566,6 +577,7 @@ where
                             self.config.tool_stage_timeout,
                             "tools",
                             "tool_executor_failure",
+                            Some(&self.config.gemini.model_id),
                         )
                         .await?;
                         if result.proposal.name() == "evaluate_spoken_answer" {
@@ -603,12 +615,10 @@ where
                         ..BrainUsage::default()
                     }),
                     GeminiStreamEvent::Error(message) => {
-                        return Err(provider_stage_error_from_brain_error(
-                            BrainError::Protocol(message),
-                            "gemini",
-                            "gemini",
+                        return Err(gemini_stream_event_error(
+                            message,
                             &self.config.gemini.model_id,
-                            Duration::ZERO,
+                            gemini_started.elapsed(),
                         ))
                     }
                     GeminiStreamEvent::ModelPart { text: None, .. } => {}
@@ -670,6 +680,7 @@ where
             self.config.tool_stage_timeout,
             "tools",
             "tool_executor_failure",
+            None,
         )
         .await
         .and_then(|result| parse_result_field::<StudySourceReference>(&result.result, "source"))?;
@@ -711,6 +722,7 @@ where
             self.config.tool_stage_timeout,
             "tools",
             "tool_executor_failure",
+            None,
         )
         .await?;
         let concept_id = parse_result_field::<String>(&status_result.result, "concept_id")?;
@@ -741,6 +753,7 @@ where
             self.config.tool_stage_timeout,
             "tools",
             "tool_executor_failure",
+            None,
         )
         .await?;
 
@@ -789,6 +802,7 @@ where
             self.config.recap_stage_timeout,
             "recap",
             "recap_projection_failure",
+            None,
         )
         .await
         .and_then(|result| parse_result_field::<StudySessionRecap>(&result.result, "recap"))?;
@@ -944,19 +958,19 @@ async fn execute_tool_stage(
     deadline: Duration,
     stage: &'static str,
     failure_class: &'static str,
+    gemini_model: Option<&str>,
 ) -> Result<ToolResult, BrainError> {
     let tool_name = proposal.name().to_owned();
     let started = Instant::now();
     match timeout(deadline, executor.execute(response_id, proposal)).await {
         Ok(Ok(result)) => Ok(result),
-        Ok(Err(error)) => Err(tool_stage_error(
+        Ok(Err(error)) => Err(tool_execution_stage_error(
             &tool_name,
             failure_class,
             stage,
-            TerminalSessionReason::ToolExecutorFailure,
-            !matches!(error, ToolExecutionError::InvalidArguments(_)),
             started.elapsed(),
-            tool_execution_error_kind(&error),
+            &error,
+            gemini_model,
         )),
         Err(_) => Err(tool_stage_error(
             &tool_name,
@@ -991,6 +1005,67 @@ fn tool_stage_error(
             metadata: format!("tool={tool_name} error_kind={error_kind}"),
         },
     )))
+}
+
+fn tool_execution_stage_error(
+    tool_name: &str,
+    failure_class: &'static str,
+    stage: &'static str,
+    latency: Duration,
+    error: &ToolExecutionError,
+    gemini_model: Option<&str>,
+) -> BrainError {
+    if let (ToolExecutionError::InvalidArguments(_), Some(model)) = (error, gemini_model) {
+        return gemini_tool_stage_error(
+            tool_name,
+            model,
+            latency,
+            tool_execution_error_kind(error),
+        );
+    }
+    tool_stage_error(
+        tool_name,
+        failure_class,
+        stage,
+        TerminalSessionReason::ToolExecutorFailure,
+        true,
+        latency,
+        tool_execution_error_kind(error),
+    )
+}
+
+fn gemini_tool_stage_error(
+    tool_name: &str,
+    model: &str,
+    latency: Duration,
+    error_kind: &'static str,
+) -> BrainError {
+    BrainError::StageFailure(Box::new(BrainProviderFailure::new(
+        BrainProviderFailureParts {
+            failure_class: "malformed_stream".to_owned(),
+            stage: "gemini".to_owned(),
+            terminal_reason: TerminalSessionReason::ProviderMalformedStream,
+            retry_eligible: true,
+            latency_ms: duration_ms(latency),
+            provider: "gemini".to_owned(),
+            model: model.to_owned(),
+            metadata: format!("tool={tool_name} error_kind={error_kind}"),
+        },
+    )))
+}
+
+fn gemini_tool_loop_budget_error(tool_name: &str, model: &str, latency: Duration) -> BrainError {
+    gemini_tool_stage_error(tool_name, model, latency, "tool_loop_budget_exceeded")
+}
+
+fn gemini_stream_event_error(message: String, model: &str, latency: Duration) -> BrainError {
+    provider_stage_error_from_brain_error(
+        BrainError::Protocol(message),
+        "gemini",
+        "gemini",
+        model,
+        latency,
+    )
 }
 
 fn provider_stage_error_from_brain_error(
@@ -1036,6 +1111,12 @@ fn provider_failure_classification(
                 || normalized.contains("_api_key")
                 || normalized.contains("unauthorized")
                 || normalized.contains("forbidden")
+                || normalized.contains("status 401")
+                || normalized.contains("status: 401")
+                || normalized.contains("status=401")
+                || normalized.contains("status 403")
+                || normalized.contains("status: 403")
+                || normalized.contains("status=403")
                 || normalized.contains("permission")
             {
                 return (
@@ -1113,6 +1194,107 @@ fn tool_execution_error_kind(error: &ToolExecutionError) -> &'static str {
 
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_classifier_maps_http_auth_statuses_to_auth_failure() {
+        for message in [
+            "Gemini stream request failed with status 401",
+            "Gemini stream request failed with status 403",
+            "Gemini stream request failed with status: 401",
+            "Gemini stream request failed with status=403",
+        ] {
+            let (failure_class, terminal_reason, retry_eligible, metadata) =
+                provider_failure_classification(&BrainError::Protocol(message.to_owned()));
+
+            assert_eq!(failure_class, "provider_auth_failure");
+            assert_eq!(terminal_reason, TerminalSessionReason::ProviderAuthFailed);
+            assert!(!retry_eligible);
+            assert_eq!(metadata, "error_kind=provider_auth");
+        }
+    }
+
+    #[test]
+    fn invalid_tool_arguments_classify_as_malformed_provider_stream() {
+        let error = tool_execution_stage_error(
+            "unknown_tool",
+            "tool_executor_failure",
+            "tools",
+            Duration::from_millis(42),
+            &ToolExecutionError::InvalidArguments("unknown tool".to_owned()),
+            Some("gemini-test-model"),
+        );
+        let BrainError::StageFailure(failure) = error else {
+            panic!("invalid tool arguments should produce a stage failure");
+        };
+
+        assert_eq!(failure.failure_class, "malformed_stream");
+        assert_eq!(failure.stage, "gemini");
+        assert_eq!(failure.provider, "gemini");
+        assert_eq!(failure.model, "gemini-test-model");
+        assert_eq!(
+            failure.terminal_reason,
+            TerminalSessionReason::ProviderMalformedStream
+        );
+        assert!(failure.retry_eligible);
+        assert_eq!(failure.latency_ms, 42);
+        assert!(failure.metadata.contains("tool=unknown_tool"));
+        assert!(failure.metadata.contains("error_kind=invalid_arguments"));
+    }
+
+    #[test]
+    fn server_tool_invalid_arguments_remain_tool_executor_failures() {
+        let error = tool_execution_stage_error(
+            "record_status",
+            "tool_executor_failure",
+            "tools",
+            Duration::from_millis(11),
+            &ToolExecutionError::InvalidArguments("bad server proposal".to_owned()),
+            None,
+        );
+        let BrainError::StageFailure(failure) = error else {
+            panic!("server tool argument errors should produce a stage failure");
+        };
+
+        assert_eq!(failure.failure_class, "tool_executor_failure");
+        assert_eq!(failure.stage, "tools");
+        assert_eq!(failure.provider, "server");
+        assert_eq!(failure.model, "viva-tools");
+        assert_eq!(
+            failure.terminal_reason,
+            TerminalSessionReason::ToolExecutorFailure
+        );
+        assert!(failure.retry_eligible);
+        assert_eq!(failure.latency_ms, 11);
+        assert!(failure.metadata.contains("tool=record_status"));
+        assert!(failure.metadata.contains("error_kind=invalid_arguments"));
+    }
+
+    #[test]
+    fn gemini_sse_error_events_preserve_elapsed_latency() {
+        let error = gemini_stream_event_error(
+            "Gemini stream provider error".to_owned(),
+            "gemini-test-model",
+            Duration::from_millis(73),
+        );
+        let BrainError::StageFailure(failure) = error else {
+            panic!("Gemini SSE error event should produce a stage failure");
+        };
+
+        assert_eq!(failure.failure_class, "malformed_stream");
+        assert_eq!(failure.stage, "gemini");
+        assert_eq!(failure.provider, "gemini");
+        assert_eq!(failure.model, "gemini-test-model");
+        assert_eq!(failure.latency_ms, 73);
+        assert_eq!(
+            failure.terminal_reason,
+            TerminalSessionReason::ProviderMalformedStream
+        );
+    }
 }
 
 fn fake_interrupt_gemini_stream(

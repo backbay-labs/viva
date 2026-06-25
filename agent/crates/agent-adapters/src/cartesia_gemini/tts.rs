@@ -46,7 +46,7 @@ impl Default for SonicConfig {
             sample_rate: CARTESIA_SAMPLE_RATE,
             cartesia_version: DEFAULT_CARTESIA_VERSION.to_owned(),
             max_buffer_delay_ms: 0,
-            stage_timeout: Duration::from_secs(8),
+            stage_timeout: Duration::from_secs(4),
         }
     }
 }

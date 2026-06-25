@@ -40,6 +40,9 @@ use runner::{
 
 pub(crate) const FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT: &str =
     "NADH donates electrons to the electron transport chain.";
+pub(crate) const MAX_GEMINI_TOOL_LOOP_PASSES: u32 = 2;
+pub(crate) const MAX_GEMINI_EXECUTED_TOOL_STAGES: u32 = 1;
+pub(crate) const DETERMINISTIC_STUDY_TOOL_STAGES: u32 = 3;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct CartesiaGeminiConfig {
@@ -86,8 +89,8 @@ impl Default for CartesiaGeminiConfig {
             gemini: GeminiConfig::default(),
             ink: InkConfig::default(),
             sonic: SonicConfig::default(),
-            tool_stage_timeout: Duration::from_secs(5),
-            recap_stage_timeout: Duration::from_secs(5),
+            tool_stage_timeout: Duration::from_secs(3),
+            recap_stage_timeout: Duration::from_secs(3),
             live_runtime_enabled: false,
             cartesia_zero_data_retention_enabled: false,
             gemini_zero_data_retention_approved: false,
@@ -218,8 +221,12 @@ impl CartesiaGeminiConfig {
     pub fn total_live_stage_deadline(&self) -> Duration {
         [
             self.ink.stage_timeout,
-            self.gemini.stage_timeout,
-            self.tool_stage_timeout,
+            self.gemini
+                .stage_timeout
+                .saturating_mul(MAX_GEMINI_TOOL_LOOP_PASSES),
+            self.tool_stage_timeout.saturating_mul(
+                MAX_GEMINI_EXECUTED_TOOL_STAGES.saturating_add(DETERMINISTIC_STUDY_TOOL_STAGES),
+            ),
             self.sonic.stage_timeout,
             self.recap_stage_timeout,
         ]

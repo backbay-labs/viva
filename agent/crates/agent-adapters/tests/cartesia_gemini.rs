@@ -42,6 +42,21 @@ fn adapter_defaults_define_stage_deadlines_under_bac_510_turn_cap() {
     assert!(config.sonic.stage_timeout > Duration::ZERO);
     assert!(config.tool_stage_timeout > Duration::ZERO);
     assert!(config.recap_stage_timeout > Duration::ZERO);
+    let expected_live_path_budget = [
+        config.ink.stage_timeout,
+        config.gemini.stage_timeout.saturating_mul(2),
+        config.tool_stage_timeout.saturating_mul(4),
+        config.sonic.stage_timeout,
+        config.recap_stage_timeout,
+    ]
+    .into_iter()
+    .fold(Duration::ZERO, |total, duration| {
+        total.saturating_add(duration)
+    });
+    assert_eq!(
+        config.total_live_stage_deadline(),
+        expected_live_path_budget
+    );
     assert!(
         config.total_live_stage_deadline() <= viva_max_submitted_answer_resolution(),
         "live provider stage deadlines must stay inside the BAC-510 submitted-answer cap"

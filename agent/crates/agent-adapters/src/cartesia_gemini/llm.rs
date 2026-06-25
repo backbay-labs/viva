@@ -74,7 +74,7 @@ impl Default for GeminiConfig {
             base_url: DEFAULT_GEMINI_BASE_URL.to_owned(),
             thinking_level: ThinkingLevel::parse(DEFAULT_GEMINI_THINKING_LEVEL),
             system_instruction: viva_system_instruction(),
-            stage_timeout: Duration::from_secs(18),
+            stage_timeout: Duration::from_secs(9),
         }
     }
 }
@@ -222,13 +222,38 @@ where
     let response = timeout(config.stage_timeout, client.stream(stream_request))
         .await
         .map_err(|_| BrainError::Connection("Gemini generation stage timeout".to_owned()))?
-        .map_err(|_| BrainError::Connection("Gemini stream request failed".to_owned()))?;
+        .map_err(sanitize_gemini_stream_error)?;
     if response.trim().is_empty() {
         return Err(BrainError::Protocol(
             "Gemini stream returned no events".to_owned(),
         ));
     }
     Ok(parse_gemini_sse_stream(&response))
+}
+
+fn sanitize_gemini_stream_error(error: BrainError) -> BrainError {
+    match error {
+        BrainError::Connection(message) | BrainError::Protocol(message) => {
+            if let Some(status) = sanitized_gemini_http_status(&message) {
+                return BrainError::Protocol(format!(
+                    "Gemini stream request failed with status {status}"
+                ));
+            }
+            BrainError::Connection("Gemini stream request failed".to_owned())
+        }
+        BrainError::MissingApiKey => BrainError::MissingApiKey,
+        BrainError::StageFailure(failure) => BrainError::StageFailure(failure),
+    }
+}
+
+fn sanitized_gemini_http_status(message: &str) -> Option<u16> {
+    let normalized = message.to_ascii_lowercase();
+    [401_u16, 403_u16, 429_u16].into_iter().find(|status| {
+        let status = status.to_string();
+        normalized.contains(&format!("status {status}"))
+            || normalized.contains(&format!("status: {status}"))
+            || normalized.contains(&format!("status={status}"))
+    })
 }
 
 pub(crate) async fn stream_gemini_http(
@@ -829,6 +854,64 @@ data: [DONE]
         .to_string();
 
         assert!(error.contains("Gemini stream request failed"));
+        assert!(!error.contains(prompt_text));
+        assert!(!error.contains("gemini-test-key"));
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_preserves_safe_http_status_failures() {
+        let prompt_text = "do not leak this prompt or source excerpt";
+        let client = RecordingGeminiSseClient {
+            capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
+            response: RecordingGeminiResponse::Error(format!(
+                "Gemini stream request failed with status 401 after {prompt_text}"
+            )),
+        };
+
+        let error = stream_gemini_with_client(
+            &client,
+            &GeminiConfig {
+                api_key: "gemini-test-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [{ "parts": [{ "text": prompt_text }] }] }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Gemini stream request failed with status 401"));
+        assert!(!error.contains(prompt_text));
+        assert!(!error.contains("gemini-test-key"));
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_redacts_unclassified_http_status_failures() {
+        let prompt_text = "do not leak this prompt or source excerpt";
+        let client = RecordingGeminiSseClient {
+            capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
+            response: RecordingGeminiResponse::Error(format!(
+                "Gemini stream request failed with status 503 after {prompt_text}"
+            )),
+        };
+
+        let error = stream_gemini_with_client(
+            &client,
+            &GeminiConfig {
+                api_key: "gemini-test-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [{ "parts": [{ "text": prompt_text }] }] }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(
+            error,
+            "brain connection failed: Gemini stream request failed"
+        );
+        assert!(!error.contains("503"));
         assert!(!error.contains(prompt_text));
         assert!(!error.contains("gemini-test-key"));
     }

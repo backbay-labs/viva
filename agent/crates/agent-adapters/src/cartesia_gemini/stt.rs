@@ -49,7 +49,7 @@ impl Default for InkConfig {
             min_volume: "0.05".to_owned(),
             max_silence_duration_secs: "0.7".to_owned(),
             cartesia_version: DEFAULT_CARTESIA_VERSION.to_owned(),
-            stage_timeout: Duration::from_secs(8),
+            stage_timeout: Duration::from_secs(4),
         }
     }
 }
