@@ -8,8 +8,9 @@ use agent_domain::{
     CreatePasteStudySet, LibraryNextReviewSummary, LibrarySessionRecapSummary,
     LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
     SessionConfig, SessionTokenNonceClaim, StudyLibrarySnapshot, StudyMemoryStore, StudyQuestion,
-    StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus, StudySourceReference,
-    StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts, VoiceUsageRecord,
+    StudySessionDurableCounts, StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus,
+    StudySourceReference, StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts,
+    VoiceUsageRecord,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -539,6 +540,39 @@ impl StudyMemoryStore for PostgresStudyStore {
         .map_err(pg_error)?;
         usize::try_from(count).map_err(|_| {
             PortError::adapter("postgres", "pending answer attempt count overflowed usize")
+        })
+    }
+
+    async fn study_session_durable_counts(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<StudySessionDurableCounts, PortError> {
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        let row = sqlx::query(
+            "SELECT
+                (SELECT COUNT(*) FROM answer_attempts
+                 WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3) AS answer_attempts,
+                (SELECT COUNT(*) FROM concept_statuses
+                 WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3) AS concept_statuses,
+                (SELECT COUNT(*) FROM review_items
+                 WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3) AS review_items,
+                (SELECT COUNT(*) FROM session_recaps
+                 WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3) AS prior_recaps",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(pg_error)?;
+        Ok(StudySessionDurableCounts {
+            answer_attempts: count_to_usize(row.try_get("answer_attempts").map_err(pg_error)?)?,
+            concept_statuses: count_to_usize(row.try_get("concept_statuses").map_err(pg_error)?)?,
+            review_items: count_to_usize(row.try_get("review_items").map_err(pg_error)?)?,
+            prior_recaps: count_to_usize(row.try_get("prior_recaps").map_err(pg_error)?)?,
         })
     }
 
@@ -2438,6 +2472,11 @@ fn source_confidence_str(confidence: &agent_domain::SourceConfidence) -> &'stati
 fn to_i64(value: u64, label: &str) -> Result<i64, PortError> {
     i64::try_from(value)
         .map_err(|_| PortError::adapter("postgres", format!("{label} exceeds BIGINT range")))
+}
+
+fn count_to_usize(count: i64) -> Result<usize, PortError> {
+    usize::try_from(count)
+        .map_err(|_| PortError::adapter("postgres", "durable count exceeds platform usize"))
 }
 
 fn optional_u64_to_i64(value: Option<u64>, label: &str) -> Result<Option<i64>, PortError> {

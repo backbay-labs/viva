@@ -10,9 +10,10 @@ use agent_domain::{
     LibraryNextReviewSummary, LibrarySessionRecapSummary, LibrarySessionSummary,
     LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError, SessionConfig, SessionStore,
     SessionTokenNonceClaim, SourceConfidence, StudyConceptSummary, StudyDocumentSummary,
-    StudyLibrarySnapshot, StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap,
-    StudySetIngestionRecord, StudySetIngestionStatus, StudySetSummary, StudySourceReference,
-    StudySourceSpanSummary, StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts,
+    StudyLibrarySnapshot, StudyMemoryStore, StudyMode, StudyQuestion, StudySessionDurableCounts,
+    StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus, StudySetSummary,
+    StudySourceReference, StudySourceSpanSummary, StudyStoreBackend, StudyStoreCapabilities,
+    StudyStoreWriteCounts,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -1929,6 +1930,56 @@ impl StudyMemoryStore for InMemoryStudyStore {
             .count())
     }
 
+    async fn study_session_durable_counts(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<StudySessionDurableCounts, PortError> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        Ok(StudySessionDurableCounts {
+            answer_attempts: state
+                .answer_attempts
+                .iter()
+                .filter(|attempt| {
+                    attempt.user_id == user_id
+                        && attempt.study_set_id == study_set_id
+                        && attempt.voice_session_id == voice_session_id
+                })
+                .count(),
+            concept_statuses: state
+                .concept_statuses
+                .iter()
+                .filter(|status| {
+                    status.user_id == user_id
+                        && status.study_set_id == study_set_id
+                        && status.voice_session_id == voice_session_id
+                })
+                .count(),
+            review_items: state
+                .review_items
+                .iter()
+                .filter(|review| {
+                    review.user_id == user_id
+                        && review.study_set_id == study_set_id
+                        && review.voice_session_id == voice_session_id
+                })
+                .count(),
+            prior_recaps: state
+                .recaps
+                .iter()
+                .filter(|recap| {
+                    recap.user_id == user_id
+                        && recap.study_set_id == study_set_id
+                        && recap.voice_session_id == voice_session_id
+                })
+                .count(),
+        })
+    }
+
     async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
         let user_id = required_user_id(config)?;
         let study_set_id = required_study_set_id(config)?;
@@ -3206,6 +3257,77 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn study_session_durable_counts_are_scoped_to_authorized_session() {
+        let store = seeded_store();
+        record_fixture_session(&store).await;
+        store
+            .record_voice_session(&SessionConfig {
+                session_id: Some(SessionId::new("voice-session-2")),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+
+        for session_id in ["voice-session-1", "voice-session-2"] {
+            record_fixture_answer(&store, session_id).await;
+            store
+                .record_concept_status(
+                    "user-1",
+                    "biology-midterm",
+                    session_id,
+                    "response-1",
+                    "oxidative-phosphorylation",
+                    ConceptStatus::Strong,
+                )
+                .await
+                .unwrap();
+            store
+                .schedule_review_item(
+                    "user-1",
+                    "biology-midterm",
+                    session_id,
+                    "atp-synthase",
+                    "2026-06-16T09:00:00Z",
+                )
+                .await
+                .unwrap();
+            store
+                .record_recap(
+                    "user-1",
+                    "biology-midterm",
+                    session_id,
+                    "response-1",
+                    StudySessionRecap {
+                        voice_session_id: session_id.to_owned(),
+                        headline: "Durable recap".to_owned(),
+                        summary: "Recorded from durable state.".to_owned(),
+                        strong_concepts: vec!["oxidative-phosphorylation".to_owned()],
+                        shaky_concepts: vec![],
+                        missed_concepts: vec![],
+                        review_later: vec!["atp-synthase".to_owned()],
+                        next_action: "Continue".to_owned(),
+                        source_moments: vec![],
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let counts = store
+            .study_session_durable_counts("user-1", "biology-midterm", "voice-session-1")
+            .await
+            .unwrap();
+        assert_eq!(counts.answer_attempts, 1);
+        assert_eq!(counts.concept_statuses, 1);
+        assert_eq!(counts.review_items, 1);
+        assert_eq!(counts.prior_recaps, 1);
+        assert_eq!(store.write_counts().answer_attempts, 2);
     }
 
     #[tokio::test]
