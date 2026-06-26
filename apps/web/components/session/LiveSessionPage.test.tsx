@@ -18,6 +18,7 @@ import {
   micStateForCaptureEndReason,
   pcm16ChunksToBase64,
   refreshBrowserSessionToken,
+  resetPlaybackCancellationStateForGeneration,
   sameBrowserSessionRouteIdentity,
   sessionRouteWsAccessToken,
   shouldRefreshBrowserSessionToken,
@@ -80,6 +81,32 @@ describe("drainAgentAudio", () => {
     expect(cancelled).toEqual(["rB"]);
     expect(ackCalls).toBe(0);
     expect(next).toBe(2);
+  });
+
+  test("generation reset clears handled cancellation count with playback state", () => {
+    let resets = 0;
+    const handledCancelRef = { current: 2 };
+
+    resetPlaybackCancellationStateForGeneration({
+      handledCancelRef,
+      playback: {
+        resetForGeneration: () => {
+          resets += 1;
+          return {
+            cancelledResponseIds: [],
+            nextSequence: 0,
+            queue: [],
+            responding: false,
+            scheduledFrameCount: 0,
+            speaking: false,
+            userGestureUnlocked: true,
+          };
+        },
+      },
+    });
+
+    expect(resets).toBe(1);
+    expect(handledCancelRef.current).toBe(0);
   });
 });
 
@@ -236,7 +263,7 @@ describe("browserSessionReconnectReason", () => {
     });
   });
 
-  test("refreshes spent session tokens after a non-recap socket close", () => {
+  test("reloads instead of refreshing a same-identity closed voice session", () => {
     expect(
       browserLifecycleReconnectPlan({
         currentRouteIdentity: {
@@ -257,12 +284,7 @@ describe("browserSessionReconnectReason", () => {
         status: "closed",
         userId: "user-1",
       }),
-    ).toEqual({
-      action: "refresh_session_token",
-      sessionId: "session-1",
-      sessionToken: "spent-token",
-      userId: "user-1",
-    });
+    ).toEqual({ action: "reload" });
   });
 });
 

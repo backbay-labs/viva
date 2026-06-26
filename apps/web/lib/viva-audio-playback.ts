@@ -245,12 +245,15 @@ export class VivaAudioPlaybackSink {
   }
 
   resetForGeneration(): VivaAudioPlaybackState {
+    const nextSequence = this.#state.nextSequence;
     for (const frame of this.#scheduled.values()) {
+      frame.node.onended = null;
       stopPlaybackNode(frame.node);
     }
     this.#scheduled.clear();
     this.#state = {
       ...initialVivaAudioPlaybackState(),
+      nextSequence,
       userGestureUnlocked: this.#state.userGestureUnlocked,
     };
     this.#resetNextStartTime();

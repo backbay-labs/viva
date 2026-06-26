@@ -150,7 +150,10 @@ export function LiveSessionPage() {
     return sink;
   }, []);
   const resetPlaybackForGeneration = useCallback(() => {
-    playbackRef.current?.resetForGeneration();
+    resetPlaybackCancellationStateForGeneration({
+      handledCancelRef,
+      playback: playbackRef.current,
+    });
   }, []);
 
   useEffect(() => {
@@ -867,6 +870,9 @@ export function browserLifecycleReconnectPlan(input: {
   if (input.recap) {
     return { action: "skip_session_over" };
   }
+  if (input.status === "closed") {
+    return { action: "reload" };
+  }
   const sessionToken = input.sessionToken?.trim();
   const userId = input.userId?.trim();
   const sessionId = input.sessionId?.trim();
@@ -918,6 +924,14 @@ export function drainAgentAudio(input: {
   for (const output of input.audio) input.sink.enqueue(output);
   if (input.audio.length > 0) input.acknowledgeAudio(input.audio);
   return input.cancellations.length;
+}
+
+export function resetPlaybackCancellationStateForGeneration(input: {
+  handledCancelRef: { current: number };
+  playback: Pick<VivaAudioPlaybackSink, "resetForGeneration"> | null;
+}) {
+  input.playback?.resetForGeneration();
+  input.handledCancelRef.current = 0;
 }
 
 /**

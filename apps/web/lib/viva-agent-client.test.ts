@@ -807,6 +807,33 @@ describe("Viva agent browser client", () => {
     ).toEqual(["text", "text"]);
   });
 
+  test("reducer keeps pending submissions when stale cancellations arrive", () => {
+    const pendingSubmission = {
+      generationId: "session_bootstrap-1",
+      kind: "text" as const,
+    };
+    const state = {
+      ...initialVivaAgentSessionState(),
+      activeResponseId: "response-2",
+      pendingSubmission,
+      phase: "thinking" as const,
+    };
+
+    const next = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "cancellation", response_id: "response-1" },
+      }),
+    );
+
+    expect(next.activeResponseId).toBe("response-2");
+    expect(next.phase).toBe("thinking");
+    expect(next.pendingSubmission).toEqual(pendingSubmission);
+    expect(next.cancelledResponseIds).toContain("response-1");
+  });
+
   test("reducer maps product session fixture and suppresses stale response events", () => {
     let state = initialVivaAgentSessionState();
     for (const frame of fullSessionFixture.server.map(parseVivaServerFrame)) {

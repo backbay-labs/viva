@@ -148,8 +148,10 @@ describe("Viva audio playback queue", () => {
       frame: { pcm16_base64: pcm16LeBytesToBase64(new Uint8Array([1, 0])) },
       responseId: "response-1",
     });
+    context.sources[0]?.finish();
 
     expect(sink.getState().cancelledResponseIds).toEqual([]);
+    expect(sink.getState().scheduledFrameCount).toBe(1);
     expect(sink.getState().userGestureUnlocked).toBe(true);
     expect(context.sources.at(-1)?.stopped).toBe(false);
   });

@@ -169,7 +169,8 @@ impl RealtimeBrain for SyntheticBrain {
                         client_generation_id,
                     } => {
                         cancel_active_response(&mut active_response);
-                        let response_id = spec.response_id(turn);
+                        let response_id =
+                            spec.response_id_for_generation(turn, client_generation_id.as_deref());
                         let answer_turn = turn;
                         turn += 1;
                         active_response = Some(spawn_study_answer_sequence(
@@ -202,7 +203,8 @@ impl RealtimeBrain for SyntheticBrain {
                         client_generation_id,
                     } => {
                         cancel_active_response(&mut active_response);
-                        let response_id = spec.response_id(turn);
+                        let response_id =
+                            spec.response_id_for_generation(turn, client_generation_id.as_deref());
                         let answer_turn = turn;
                         turn += 1;
                         active_response = Some(spawn_study_answer_sequence(
@@ -255,6 +257,7 @@ impl RealtimeBrain for SyntheticBrain {
 
 #[derive(Clone, Debug)]
 struct SyntheticStudySessionSpec {
+    client_generation_id: Option<String>,
     user_id: String,
     voice_session_id: String,
     study_set_id: String,
@@ -267,6 +270,7 @@ impl SyntheticStudySessionSpec {
         let voice_session_id = required(config.session_id.as_deref(), "session_id")?;
         let study_set_id = required(config.study_set_id.as_deref(), "study_set_id")?;
         Ok(Self {
+            client_generation_id: config.client_generation_id.clone(),
             user_id: user_id.to_owned(),
             voice_session_id: voice_session_id.to_owned(),
             study_set_id: study_set_id.to_owned(),
@@ -275,7 +279,25 @@ impl SyntheticStudySessionSpec {
     }
 
     fn response_id(&self, turn: usize) -> String {
-        format!("response-{turn}")
+        self.response_id_for_generation(turn, self.client_generation_id.as_deref())
+    }
+
+    fn response_id_for_generation(
+        &self,
+        turn: usize,
+        client_generation_id: Option<&str>,
+    ) -> String {
+        let base = format!("response-{turn}");
+        let generation_id = client_generation_id.or(self.client_generation_id.as_deref());
+        let Some(generation_id) = generation_id else {
+            return base;
+        };
+        let generation_id = sanitized_response_generation_id(generation_id);
+        if generation_id.is_empty() {
+            base
+        } else {
+            format!("{base}-generation-{generation_id}")
+        }
     }
 
     fn concept_id_for_turn<'a>(&'a self, turn: usize, fixture_concept_id: &'a str) -> &'a str {
@@ -291,6 +313,17 @@ impl SyntheticStudySessionSpec {
         }
         self.active_concepts[turn.saturating_sub(1) % self.active_concepts.len()].as_str()
     }
+}
+
+fn sanitized_response_generation_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => character,
+            _ => '-',
+        })
+        .take(96)
+        .collect()
 }
 
 fn required<'a>(value: Option<&'a str>, label: &str) -> Result<&'a str, BrainError> {
@@ -1025,19 +1058,25 @@ mod tests {
     async fn persists_client_generation_id_on_synthetic_answer_attempts() {
         let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
         let brain = SyntheticBrain::with_study_store(store.clone());
-        let mut session = brain
-            .open(SessionConfig {
-                session_id: Some(SessionId::new("voice-session-1")),
-                user_id: Some("user-1".to_owned()),
-                study_set_id: Some("biology-midterm".to_owned()),
-                mode: Some(StudyMode::Quiz),
-                ..SessionConfig::default()
-            })
-            .await
-            .unwrap();
+        let mut config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        config.client_generation_id = Some("bfcache_restore-3".to_owned());
+        let mut session = brain.open(config).await.unwrap();
 
+        let response_id = "response-1-generation-bfcache_restore-3";
         let _ = next_event(&mut session).await;
-        let _ = next_event(&mut session).await;
+        match next_event(&mut session).await {
+            BrainEvent::QuestionStarted {
+                response_id: question_response_id,
+                ..
+            } => assert_eq!(question_response_id, response_id),
+            event => panic!("expected generated question response id, got {event:?}"),
+        }
         session
             .input
             .send(BrainInput::TextWithMetadata {
@@ -1059,6 +1098,11 @@ mod tests {
 
         let snapshot = store.snapshot();
         assert_eq!(snapshot.answer_attempts.len(), 1);
+        assert_eq!(snapshot.answer_attempts[0].response_id, response_id);
+        assert_eq!(
+            snapshot.answer_attempts[0].envelope.response_id,
+            response_id
+        );
         assert_eq!(
             snapshot.answer_attempts[0]
                 .envelope

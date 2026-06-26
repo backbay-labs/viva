@@ -711,7 +711,7 @@ export function vivaAgentReducer(
         ...state,
         activeResponseId: cancellingActive ? undefined : state.activeResponseId,
         phase: cancellingActive ? "listening" : state.phase,
-        pendingSubmission: undefined,
+        pendingSubmission: cancellingActive ? undefined : state.pendingSubmission,
         manuscriptIntents: cancelledResponseId
           ? state.manuscriptIntents.filter((intent) => intent.responseId !== cancelledResponseId)
           : state.manuscriptIntents,
