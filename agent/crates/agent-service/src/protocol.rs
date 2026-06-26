@@ -346,9 +346,9 @@ impl ServerFrame {
             | BrainEvent::ResponseCancelled
             | BrainEvent::ResponseCancelledFor { .. }
             | BrainEvent::ResponseStarted { .. }
-            | BrainEvent::ResponseTextStarted { .. }
-            | BrainEvent::ResponseCompleted { .. } => Some(Self::event(event)),
+            | BrainEvent::ResponseTextStarted { .. } => Some(Self::event(event)),
             BrainEvent::Usage(_)
+            | BrainEvent::ResponseCompleted { .. }
             | BrainEvent::ResponseToolProposal { .. }
             | BrainEvent::Transcript(_)
             | BrainEvent::SpeechIntent(_) => None,
@@ -489,6 +489,10 @@ mod tests {
             })
             .is_none()
         );
+        assert!(ServerFrame::browser_event(BrainEvent::ResponseCompleted {
+            response_id: "response-1".to_owned()
+        })
+        .is_none());
     }
 
     #[test]

@@ -737,6 +737,14 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
     )
     .await;
     job.completed.store(true, Ordering::SeqCst);
+    let _ = send_unless_cancelled(
+        event_tx,
+        BrainEvent::ResponseCompleted {
+            response_id: job.response_id.clone(),
+        },
+        &job.cancelled,
+    )
+    .await;
 }
 
 async fn emit_session_recap(
@@ -938,6 +946,12 @@ mod tests {
         assert!(saw_source);
         assert!(saw_manuscript_intent);
         assert!(saw_usage);
+        assert_eq!(
+            next_event(&mut session).await,
+            BrainEvent::ResponseCompleted {
+                response_id: "response-1".to_owned()
+            }
+        );
 
         session
             .input
