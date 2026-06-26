@@ -556,6 +556,27 @@ impl StudyMemoryStore for PostgresStudyStore {
             .clone()
     }
 
+    async fn pending_answer_attempts_for_session(
+        &self,
+        voice_session_id: &str,
+    ) -> Result<usize, PortError> {
+        let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM answer_attempts
+             WHERE voice_session_id = $1
+               AND evaluation_label IS NULL
+               AND concept_status IS NULL",
+        )
+        .bind(voice_session_uuid)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(pg_error)?;
+        usize::try_from(count).map_err(|_| {
+            PortError::adapter("postgres", "pending answer attempt count overflowed usize")
+        })
+    }
+
     async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
         let session_id = required(config.session_id.as_deref(), "session_id")?;
         let user_id = required(config.user_id.as_deref(), "user_id")?;

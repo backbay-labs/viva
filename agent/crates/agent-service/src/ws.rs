@@ -527,7 +527,7 @@ async fn handle_socket(
             close_code::NORMAL,
         )
         .await;
-        record_terminal_evidence(&state, voice_session_id, terminal_reason);
+        record_terminal_evidence(&state, voice_session_id, terminal_reason).await;
         return;
     }
 
@@ -918,7 +918,7 @@ async fn handle_socket(
         }
     }
     if terminal_persisted {
-        record_terminal_evidence(&state, voice_session_id, terminal_reason);
+        record_terminal_evidence(&state, voice_session_id, terminal_reason).await;
     } else {
         record_terminal(&state, voice_session_id, terminal_reason).await;
     }
@@ -1479,10 +1479,6 @@ fn emit_pending_evaluation_observability_log(
 
 fn observability_model(provider: &str) -> String {
     format!("{provider}-viva")
-}
-
-fn pending_evaluation_attempts(counts: &StudyStoreWriteCounts) -> usize {
-    counts.answer_attempts.saturating_sub(counts.recaps)
 }
 
 async fn open_failure_control_session(
@@ -2595,7 +2591,7 @@ async fn record_terminal(state: &AppState, voice_session_id: Option<String>, rea
             ));
         }
     }
-    record_terminal_evidence(state, voice_session_id, terminal_reason);
+    record_terminal_evidence(state, voice_session_id, terminal_reason).await;
 }
 
 async fn persist_terminal_session_reason(
@@ -2666,9 +2662,28 @@ fn terminal_close_code(reason: TerminalSessionReason, close_code: u16) -> u16 {
     }
 }
 
-fn record_terminal_evidence(state: &AppState, voice_session_id: Option<String>, reason: &str) {
+async fn record_terminal_evidence(state: &AppState, voice_session_id: Option<String>, reason: &str) {
+    let pending_answer_attempts = if let Some(session_id) = voice_session_id.as_deref() {
+        match state
+            .study_store
+            .pending_answer_attempts_for_session(session_id)
+            .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                state.evidence.record(VoiceEvidenceEvent::new(
+                    VoiceEvidenceEventKind::StoreCounts,
+                    voice_session_id.clone(),
+                    format!("pending_answer_attempts_failed: {error}"),
+                ));
+                0
+            }
+        }
+    } else {
+        0
+    };
     let counts = state.study_store.write_counts();
-    emit_pending_evaluation_observability_log(state, reason, pending_evaluation_attempts(&counts));
+    emit_pending_evaluation_observability_log(state, reason, pending_answer_attempts);
     state.evidence.record(VoiceEvidenceEvent::new(
         VoiceEvidenceEventKind::StoreCounts,
         voice_session_id.clone(),
@@ -2861,30 +2876,6 @@ mod tests {
         assert_eq!(
             observability_model("cartesia_gemini"),
             "cartesia_gemini-viva"
-        );
-    }
-
-    #[test]
-    fn pending_evaluation_attempts_tracks_unrecapped_answer_writes() {
-        assert_eq!(
-            pending_evaluation_attempts(&StudyStoreWriteCounts {
-                sessions: 1,
-                answer_attempts: 3,
-                concept_statuses: 0,
-                review_items: 0,
-                recaps: 1,
-            }),
-            2
-        );
-        assert_eq!(
-            pending_evaluation_attempts(&StudyStoreWriteCounts {
-                sessions: 1,
-                answer_attempts: 1,
-                concept_statuses: 0,
-                review_items: 0,
-                recaps: 3,
-            }),
-            0
         );
     }
 

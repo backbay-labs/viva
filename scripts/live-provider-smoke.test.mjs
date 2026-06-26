@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   auditLiveSmokeEvidence,
   buildLiveSmokeConfig,
+  liveMonitorEvidence,
   runLiveProviderSmoke,
   summarizeServerFrame,
 } from "./live-provider-smoke.mjs";
@@ -268,6 +269,22 @@ test("live smoke evidence audit rejects secret values and raw payload markers", 
     () => auditLiveSmokeEvidence({ ...safe, leaked: "pcm16_base64" }, {}),
     /forbidden payload marker/,
   );
+});
+
+test("live monitor stuck-checking evidence is reserved for recap timeouts", () => {
+  const recapTimeout = liveMonitorEvidence({
+    consecutiveFailures: 1,
+    status: "failed",
+    terminalReason: "recap_timeout",
+  });
+  const turnCapExceeded = liveMonitorEvidence({
+    consecutiveFailures: 1,
+    status: "failed",
+    terminalReason: "turn_cap_exceeded",
+  });
+
+  assert.equal(recapTimeout.stuck_checking_sessions, 1);
+  assert.equal(turnCapExceeded.stuck_checking_sessions, 0);
 });
 
 test("runLiveProviderSmoke proves readiness, bootstrap, websocket events, and usage counts", async () => {

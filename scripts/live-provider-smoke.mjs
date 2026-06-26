@@ -745,10 +745,9 @@ function privacyEvidence() {
   };
 }
 
-function liveMonitorEvidence({ consecutiveFailures, status, terminalReason }) {
+export function liveMonitorEvidence({ consecutiveFailures, status, terminalReason }) {
   const failed = status === "failed";
-  const stuckChecking =
-    terminalReason === "recap_timeout" || terminalReason === "turn_cap_exceeded";
+  const stuckChecking = terminalReason === "recap_timeout";
   return {
     failure_class: failed ? "live_monitor_failure" : null,
     live_monitor_attempt_count: 1,

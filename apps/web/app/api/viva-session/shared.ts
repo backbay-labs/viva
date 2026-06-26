@@ -9,9 +9,18 @@ export type VivaSessionRouteFailureClass = {
   token_refresh_outcome: string;
 };
 
+type VivaSessionRouteName = "refresh" | "start";
+type VivaSessionRouteAction = "refresh" | "resume" | "start";
+type VivaSessionRouteLogContext = {
+  action?: VivaSessionRouteAction | null;
+  route: VivaSessionRouteName;
+};
+
 export type VivaSessionRouteFailureLog = VivaSessionRouteFailureClass & {
+  action: VivaSessionRouteAction | null;
   deploy_sha: string | null;
   event: "viva_session_route_failure";
+  route: VivaSessionRouteName | null;
   service: "web";
   stage: string;
   status: number;
@@ -146,31 +155,38 @@ export const VIVA_SESSION_AUTH_FAILURE_PROFILES = {
 const mintRateLimits = new Map<string, RateLimitBucket>();
 
 export async function handleVivaSessionStart(request: NextRequest) {
-  const guard = guardSameOrigin(request);
+  const routeContext = { route: "start" } as const;
+  const guard = guardSameOrigin(request, routeContext);
   if (guard) return guard;
 
-  const payload = await readSessionPayload(request);
+  const payload = await readSessionPayload(request, routeContext);
   if (!payload.ok) return payload.response;
 
   const userId = requiredString(payload.value.user_id);
   const studySetId = requiredString(payload.value.study_set_id);
   const sessionId = requiredString(payload.value.session_id);
-  if (!userId || !studySetId) return sessionJsonError(400, "invalid_session_request", "invalid");
-  const access = guardAllowedIdentity(userId, studySetId);
+  const actionName = sessionId ? "resume" : "start";
+  const logContext = { action: actionName, route: "start" } as const;
+  if (!userId || !studySetId) {
+    return sessionJsonError(400, "invalid_session_request", "invalid", logContext);
+  }
+  const access = guardAllowedIdentity(userId, studySetId, logContext);
   if (access) return access;
   const bootstrap = guardSessionBootstrapCapability(request, {
+    ...logContext,
     sessionId: sessionId ?? null,
     studySetId,
     token: requiredString(payload.value.session_bootstrap_token),
     userId,
   });
   if (bootstrap) return bootstrap;
-  const limit = guardMintRateLimit(request, userId, studySetId);
+  const limit = guardMintRateLimit(request, userId, studySetId, logContext);
   if (limit) return limit;
 
   const minted = await mintSessionFromLibrary({
-    actionName: sessionId ? "resume" : "start",
+    actionName,
     origin: requestOrigin(request),
+    route: "start",
     sessionId: sessionId ?? undefined,
     studySetId,
     userId,
@@ -188,10 +204,11 @@ export async function handleVivaSessionStart(request: NextRequest) {
 }
 
 export async function handleVivaSessionRefresh(request: NextRequest) {
-  const guard = guardSameOrigin(request);
+  const logContext = { action: "refresh", route: "refresh" } as const;
+  const guard = guardSameOrigin(request, logContext);
   if (guard) return guard;
 
-  const payload = await readSessionPayload(request);
+  const payload = await readSessionPayload(request, logContext);
   if (!payload.ok) return payload.response;
 
   const userId = requiredString(payload.value.user_id);
@@ -199,33 +216,34 @@ export async function handleVivaSessionRefresh(request: NextRequest) {
   const sessionId = requiredString(payload.value.session_id);
   const sessionToken = requiredString(payload.value.session_token);
   if (!userId || !studySetId || !sessionId || !sessionToken) {
-    return sessionJsonError(400, "invalid_session_request", "invalid");
+    return sessionJsonError(400, "invalid_session_request", "invalid", logContext);
   }
 
-  const access = guardAllowedIdentity(userId, studySetId);
+  const access = guardAllowedIdentity(userId, studySetId, logContext);
   if (access) return access;
 
   const claims = verifySessionTokenClaims(sessionToken);
   if (!claims.ok) {
     if (claims.reason === "missing_secret") {
-      return sessionJsonError(503, "viva_session_refresh_unavailable", "failed");
+      return sessionJsonError(503, "viva_session_refresh_unavailable", "failed", logContext);
     }
-    return sessionAuthTerminalJsonError(authFailureCodeForTokenReason(claims.reason));
+    return sessionAuthTerminalJsonError(authFailureCodeForTokenReason(claims.reason), logContext);
   }
   if (
     claims.value.user_id !== userId ||
     claims.value.study_set_id !== studySetId ||
     claims.value.session_id !== sessionId
   ) {
-    return sessionAuthTerminalJsonError("identity_mismatch");
+    return sessionAuthTerminalJsonError("identity_mismatch", logContext);
   }
 
-  const limit = guardMintRateLimit(request, userId, studySetId);
+  const limit = guardMintRateLimit(request, userId, studySetId, logContext);
   if (limit) return limit;
 
   const minted = await mintSessionFromLibrary({
     actionName: "resume",
     origin: requestOrigin(request),
+    route: "refresh",
     sessionId,
     studySetId,
     userId,
@@ -363,34 +381,48 @@ export function attachVivaLibraryControlTokensToLibrarySnapshot(
   return { ...value, sessions, study_sets: studySets };
 }
 
-function guardSameOrigin(request: NextRequest): NextResponse | null {
+function guardSameOrigin(
+  request: NextRequest,
+  logContext: VivaSessionRouteLogContext,
+): NextResponse | null {
   const expectedOrigin = requestOrigin(request);
   const origin = request.headers.get("origin")?.trim();
   const fetchSite = request.headers.get("sec-fetch-site")?.trim().toLowerCase();
   if (!origin || origin !== expectedOrigin) {
     return sessionJsonError(403, "cross_origin_session_request", "blocked", {
+      ...logContext,
       failure_class: "access_denied",
     });
   }
   if (fetchSite && fetchSite !== "same-origin") {
     return sessionJsonError(403, "cross_origin_session_request", "blocked", {
+      ...logContext,
       failure_class: "access_denied",
     });
   }
   return null;
 }
 
-function guardAllowedIdentity(userId: string, studySetId: string): NextResponse | null {
+function guardAllowedIdentity(
+  userId: string,
+  studySetId: string,
+  logContext: VivaSessionRouteLogContext,
+): NextResponse | null {
   const allowedUserIds = configuredAllowlist("VIVA_SESSION_ALLOWED_USER_IDS");
   const allowedStudySetIds = configuredAllowlist("VIVA_SESSION_ALLOWED_STUDY_SET_IDS");
   if (!allowedUserIds || !allowedStudySetIds) {
-    return sessionJsonError(503, "viva_session_identity_allowlist_unavailable", "failed");
+    return sessionJsonError(
+      503,
+      "viva_session_identity_allowlist_unavailable",
+      "failed",
+      logContext,
+    );
   }
   if (!allowedUserIds.has(userId)) {
-    return sessionAuthTerminalJsonError("access_denied");
+    return sessionAuthTerminalJsonError("access_denied", logContext);
   }
   if (!allowedStudySetIds.has(studySetId)) {
-    return sessionAuthTerminalJsonError("access_denied");
+    return sessionAuthTerminalJsonError("access_denied", logContext);
   }
   return null;
 }
@@ -398,6 +430,8 @@ function guardAllowedIdentity(userId: string, studySetId: string): NextResponse 
 function guardSessionBootstrapCapability(
   request: NextRequest,
   input: {
+    action?: VivaSessionRouteAction | null;
+    route: VivaSessionRouteName;
     sessionId: string | null;
     studySetId: string;
     token: string | null;
@@ -407,11 +441,13 @@ function guardSessionBootstrapCapability(
   const requirement = sessionBootstrapRequirement();
   if (!requirement.required) return null;
   if (!requirement.secret) {
-    return sessionJsonError(503, "viva_session_bootstrap_unavailable", "failed");
+    return sessionJsonError(503, "viva_session_bootstrap_unavailable", "failed", input);
   }
   if (!input.token) {
     return sessionJsonError(403, "session_bootstrap_capability_required", "blocked", {
+      action: input.action,
       failure_class: "access_denied",
+      route: input.route,
     });
   }
   const claims = verifySessionBootstrapTokenClaims(input.token, requirement.secret);
@@ -424,7 +460,9 @@ function guardSessionBootstrapCapability(
     (claims.origin && claims.origin !== requestOrigin(request))
   ) {
     return sessionJsonError(403, "session_bootstrap_capability_required", "blocked", {
+      action: input.action,
       failure_class: "access_denied",
+      route: input.route,
     });
   }
   return null;
@@ -434,6 +472,7 @@ function guardMintRateLimit(
   request: NextRequest,
   userId: string,
   studySetId: string,
+  logContext: VivaSessionRouteLogContext,
 ): NextResponse | null {
   const max = positiveInteger(process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE, 12);
   const now = Date.now();
@@ -443,6 +482,7 @@ function guardMintRateLimit(
   const identityBucket = currentRateLimitBucket(identityKey, now);
   if (ipBucket.count >= max || identityBucket.count >= max) {
     return sessionJsonError(429, "session_mint_rate_limited", "blocked", {
+      ...logContext,
       failure_class: "rate_limit",
     });
   }
@@ -462,6 +502,7 @@ function currentRateLimitBucket(key: string, now: number): RateLimitBucket {
 
 async function readSessionPayload(
   request: NextRequest,
+  logContext: VivaSessionRouteLogContext,
 ): Promise<
   | { ok: true; value: SessionRequestPayload }
   | { ok: false; response: NextResponse<VivaSessionRouteFailureClass> }
@@ -469,17 +510,24 @@ async function readSessionPayload(
   try {
     const value = (await request.json()) as unknown;
     if (!value || typeof value !== "object" || Array.isArray(value)) {
-      return { ok: false, response: sessionJsonError(400, "invalid_session_request", "invalid") };
+      return {
+        ok: false,
+        response: sessionJsonError(400, "invalid_session_request", "invalid", logContext),
+      };
     }
     return { ok: true, value: value as SessionRequestPayload };
   } catch {
-    return { ok: false, response: sessionJsonError(400, "invalid_session_request", "invalid") };
+    return {
+      ok: false,
+      response: sessionJsonError(400, "invalid_session_request", "invalid", logContext),
+    };
   }
 }
 
 async function mintSessionFromLibrary(input: {
   actionName: "resume" | "start";
   origin: string;
+  route: VivaSessionRouteName;
   sessionId?: string;
   studySetId: string;
   userId: string;
@@ -495,6 +543,7 @@ async function mintSessionFromLibrary(input: {
 > {
   const agentBaseUrl = serverAgentBaseUrl();
   const bearerToken = process.env.VIVA_AGENT_REST_BEARER_TOKEN?.trim();
+  const logContext = { action: input.actionName, route: input.route } as const;
   if (!agentBaseUrl || !bearerToken) {
     return {
       ok: false,
@@ -504,6 +553,7 @@ async function mintSessionFromLibrary(input: {
         "failed",
         "session_bootstrap_unavailable",
         PRE_LOOP_SESSION_TERMINAL_REASON,
+        logContext,
       ),
     };
   }
@@ -518,6 +568,7 @@ async function mintSessionFromLibrary(input: {
         "failed",
         "session_bootstrap_unavailable",
         PRE_LOOP_SESSION_TERMINAL_REASON,
+        logContext,
       ),
     };
   }
@@ -548,6 +599,7 @@ async function mintSessionFromLibrary(input: {
           "failed",
           "session_bootstrap_unavailable",
           PRE_LOOP_SESSION_TERMINAL_REASON,
+          logContext,
         ),
       };
     }
@@ -561,6 +613,7 @@ async function mintSessionFromLibrary(input: {
           "failed",
           "session_bootstrap_unavailable",
           PRE_LOOP_SESSION_TERMINAL_REASON,
+          logContext,
         ),
       };
     }
@@ -573,6 +626,7 @@ async function mintSessionFromLibrary(input: {
         "failed",
         "session_bootstrap_unavailable",
         PRE_LOOP_SESSION_TERMINAL_REASON,
+        logContext,
       ),
     };
   } finally {
@@ -582,7 +636,9 @@ async function mintSessionFromLibrary(input: {
   const studySet = snapshot.study_sets?.find(
     (entry) => entry.id === input.studySetId && entry.user_id === input.userId,
   );
-  const preLoopStudySetError = studySet ? preLoopStudySetUnavailableResponse(studySet) : null;
+  const preLoopStudySetError = studySet
+    ? preLoopStudySetUnavailableResponse(studySet, logContext)
+    : null;
   if (preLoopStudySetError) {
     return {
       ok: false,
@@ -605,6 +661,7 @@ async function mintSessionFromLibrary(input: {
         "unavailable",
         "session_bootstrap_unavailable",
         PRE_LOOP_SESSION_TERMINAL_REASON,
+        logContext,
       ),
     };
   }
@@ -623,6 +680,7 @@ async function mintSessionFromLibrary(input: {
 
 function preLoopStudySetUnavailableResponse(
   studySet: VivaLibraryStudySet,
+  logContext: VivaSessionRouteLogContext,
 ): NextResponse<VivaSessionRouteFailureClass> | null {
   if (studySet.ingestion_status === "failed") {
     return sessionPreLoopJsonError(
@@ -631,6 +689,7 @@ function preLoopStudySetUnavailableResponse(
       "blocked",
       "pre_loop_unavailable",
       PRE_LOOP_INGESTION_TERMINAL_REASON,
+      logContext,
     );
   }
   if (
@@ -644,6 +703,7 @@ function preLoopStudySetUnavailableResponse(
       "blocked",
       "pre_loop_unavailable",
       PRE_LOOP_INGESTION_TERMINAL_REASON,
+      logContext,
     );
   }
   if (
@@ -656,6 +716,7 @@ function preLoopStudySetUnavailableResponse(
       "blocked",
       "pre_loop_unavailable",
       PRE_LOOP_INGESTION_TERMINAL_REASON,
+      logContext,
     );
   }
   return null;
@@ -764,12 +825,14 @@ function authFailureCodeForTokenReason(
 
 function sessionAuthTerminalJsonError(
   operatorCode: Exclude<VivaSessionAuthFailureCode, "expired">,
+  logContext?: VivaSessionRouteLogContext,
 ): NextResponse<VivaSessionRouteFailureClass> {
   const profile = VIVA_SESSION_AUTH_FAILURE_PROFILES[operatorCode];
   if (profile.clientClass !== "terminal") {
-    return sessionJsonError(503, "viva_session_refresh_unavailable", "failed");
+    return sessionJsonError(503, "viva_session_refresh_unavailable", "failed", logContext);
   }
   return sessionJsonError(401, "session_auth_terminal", "terminal", {
+    ...logContext,
     failure_class: "session_auth_terminal",
   });
 }
@@ -780,8 +843,10 @@ function sessionPreLoopJsonError(
   tokenRefreshOutcome: string,
   failureClass: string,
   terminalReason: string,
+  logContext: VivaSessionRouteLogContext | null = null,
 ): NextResponse<VivaSessionRouteFailureClass> {
   return sessionJsonError(status, error, tokenRefreshOutcome, {
+    ...(logContext ?? {}),
     failure_class: failureClass,
     stage: "pre_loop",
     terminal_reason: terminalReason,
@@ -803,7 +868,9 @@ function sessionJsonError(
   error: string,
   tokenRefreshOutcome: string,
   options: {
+    action?: VivaSessionRouteAction | null;
     failure_class?: string;
+    route?: VivaSessionRouteName;
     stage?: "pre_loop" | "session";
     terminal_reason?: string;
   } = {},
@@ -815,7 +882,7 @@ function sessionJsonError(
     ...(options.terminal_reason ? { terminal_reason: options.terminal_reason } : {}),
     token_refresh_outcome: tokenRefreshOutcome,
   };
-  emitVivaSessionRouteFailureLog(body, status);
+  emitVivaSessionRouteFailureLog(body, status, options);
   return NextResponse.json(body, {
     headers: { "cache-control": "no-store" },
     status,
@@ -825,24 +892,32 @@ function sessionJsonError(
 export function vivaSessionRouteFailureLogPayload(
   body: VivaSessionRouteFailureClass,
   status: number,
+  context: { action?: VivaSessionRouteAction | null; route?: VivaSessionRouteName } = {},
 ): VivaSessionRouteFailureLog {
   return {
     ...body,
+    action: context.action ?? null,
     deploy_sha: deploymentSha(),
     event: "viva_session_route_failure",
+    route: context.route ?? null,
     service: "web",
     stage: body.stage ?? sessionFailureStage(body.failure_class),
     status,
   };
 }
 
-function emitVivaSessionRouteFailureLog(body: VivaSessionRouteFailureClass, status: number) {
-  const payload = vivaSessionRouteFailureLogPayload(body, status);
+function emitVivaSessionRouteFailureLog(
+  body: VivaSessionRouteFailureClass,
+  status: number,
+  context: { action?: VivaSessionRouteAction | null; route?: VivaSessionRouteName },
+) {
+  const payload = vivaSessionRouteFailureLogPayload(body, status, context);
   console.warn(JSON.stringify(payload));
 }
 
 function sessionFailureStage(failureClass: string): string {
   if (
+    failureClass === "session_auth_terminal" ||
     failureClass === "auth_material_failure" ||
     failureClass === "identity_mismatch" ||
     failureClass === "malformed_token"

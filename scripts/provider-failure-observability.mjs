@@ -151,12 +151,14 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "session_auth_failure",
     stage: "session_auth",
     railway_query:
-      'service:"web" event:"viva_session_route_failure" (failure_class:"session_auth_failure" OR failure_class:"auth_material_failure" OR error:"viva_session_refresh_unavailable" OR token_refresh_outcome:"invalid_rejected" OR token_refresh_outcome:"malformed_rejected" OR token_refresh_outcome:"identity_mismatch")',
+      'service:"web" event:"viva_session_route_failure" route:"refresh" (token_refresh_outcome:"failed" OR failure_class:"session_auth_failure" OR failure_class:"auth_material_failure" OR error:"viva_session_refresh_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable" OR token_refresh_outcome:"invalid_rejected" OR token_refresh_outcome:"malformed_rejected" OR token_refresh_outcome:"identity_mismatch")',
     evidence_fields: [
+      "action",
       "failure_class",
       "stage",
       "deploy_sha",
       "error",
+      "route",
       "token_refresh_outcome",
       "latency_ms",
     ],

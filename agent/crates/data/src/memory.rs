@@ -1912,6 +1912,23 @@ impl StudyMemoryStore for InMemoryStudyStore {
         }
     }
 
+    async fn pending_answer_attempts_for_session(
+        &self,
+        voice_session_id: &str,
+    ) -> Result<usize, PortError> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        Ok(state
+            .answer_attempts
+            .iter()
+            .filter(|record| {
+                record.voice_session_id == voice_session_id && record.evaluation.is_none()
+            })
+            .count())
+    }
+
     async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
         let user_id = required_user_id(config)?;
         let study_set_id = required_study_set_id(config)?;
@@ -3071,6 +3088,48 @@ mod tests {
         InMemoryStudyStore::seeded_fixture()
     }
 
+    fn pending_attempt_record(voice_session_id: &str, response_id: &str) -> AnswerAttemptRecord {
+        AnswerAttemptRecord {
+            user_id: "user-1".to_owned(),
+            study_set_id: "biology-midterm".to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            response_id: response_id.to_owned(),
+            envelope: PersistedAnswerAttemptEnvelope {
+                response_id: response_id.to_owned(),
+                question_id: "q-1".to_owned(),
+                submission_sequence: 1,
+                idempotency_key: format!("{voice_session_id}:{response_id}"),
+                capture_mode: AnswerCaptureMode::Typed,
+                byte_count: None,
+                char_count: Some(12),
+                duration_ms: None,
+                client_generation_id: None,
+                locale: None,
+                capture_status: AnswerCaptureStatus::Accepted,
+                content_policy: AnswerContentPolicy::DigestOnly,
+                answer_digest_hmac: Some("digest".to_owned()),
+                transcript_status: None,
+                transcript_confidence_bucket: None,
+                pre_provider_state: "submitted".to_owned(),
+            },
+            evaluation: None,
+        }
+    }
+
+    fn evaluated_attempt_record(voice_session_id: &str, response_id: &str) -> AnswerAttemptRecord {
+        let question = fixture_question();
+        AnswerAttemptRecord {
+            evaluation: Some(PersistedAnswerEvaluation {
+                question_id: question.question_id,
+                label: "mostly correct".to_owned(),
+                concept_status: ConceptStatus::Strong,
+                confidence_score: 0.84,
+                source: PersistedSourceReference::from(&fixture_source_reference()),
+            }),
+            ..pending_attempt_record(voice_session_id, response_id)
+        }
+    }
+
     async fn record_fixture_session(store: &InMemoryStudyStore) {
         store
             .record_voice_session(&SessionConfig {
@@ -3082,6 +3141,45 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_answer_attempts_are_scoped_to_voice_session() {
+        let store = InMemoryStudyStore::new();
+        {
+            let mut state = store.inner.write().expect("memory store lock poisoned");
+            state
+                .answer_attempts
+                .push(pending_attempt_record("voice-session-1", "response-1"));
+            state
+                .answer_attempts
+                .push(pending_attempt_record("voice-session-2", "response-2"));
+            state
+                .answer_attempts
+                .push(evaluated_attempt_record("voice-session-2", "response-3"));
+        }
+
+        assert_eq!(
+            store
+                .pending_answer_attempts_for_session("voice-session-1")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .pending_answer_attempts_for_session("voice-session-2")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .pending_answer_attempts_for_session("voice-session-3")
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     fn fixture_session_config() -> SessionConfig {

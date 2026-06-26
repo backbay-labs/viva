@@ -64,7 +64,8 @@ test("provider failure observability defines reusable sanitized log queries", ()
     queriesById.get("token_refresh_failure").railway_query,
     /service:"web" event:"viva_session_route_failure"/,
   );
-  assert.doesNotMatch(
+  assert.match(queriesById.get("token_refresh_failure").railway_query, /route:"refresh"/);
+  assert.match(
     queriesById.get("token_refresh_failure").railway_query,
     /token_refresh_outcome:"failed"/,
   );
@@ -111,6 +112,14 @@ test("reviewed BAC-525 queries name emitted log and evidence surfaces", () => {
   assert.match(
     queriesById.get("token_refresh_failure").railway_query,
     /event:"viva_session_route_failure"/,
+  );
+  assert(
+    queriesById.get("token_refresh_failure").evidence_fields.includes("route"),
+    "token refresh failure query must expose the route discriminator",
+  );
+  assert(
+    queriesById.get("token_refresh_failure").evidence_fields.includes("action"),
+    "token refresh failure query must expose the action discriminator",
   );
   assert.match(
     queriesById.get("stuck_checking").railway_query,
@@ -172,6 +181,15 @@ test("release check exposes stale-evidence inputs without storing write-time age
   const releaseCheck = await readFile("scripts/release-check.mjs", "utf8");
 
   assert.match(releaseCheck, /release_gate: buildReleaseGateEvidence/);
+  assert.match(releaseCheck, /deploy_sha: releaseDeploySha\(\)/);
+  for (const name of [
+    "RAILWAY_GIT_COMMIT_SHA",
+    "VERCEL_GIT_COMMIT_SHA",
+    "GITHUB_SHA",
+    "SOURCE_VERSION",
+  ]) {
+    assert.match(releaseCheck, new RegExp(name));
+  }
   assert.match(releaseCheck, /max_age_seconds/);
   assert.doesNotMatch(releaseCheck, /evidence_age_seconds/);
   assert.match(releaseCheck, /browser_skip_shortcut/);

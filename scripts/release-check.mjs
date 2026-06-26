@@ -448,13 +448,26 @@ function buildReleaseGateEvidence({ browserResult, generatedAt }) {
   const browserSkipShortcut = browserResult?.skipped === true;
   return {
     browser_skip_shortcut: browserSkipShortcut,
-    deploy_sha: process.env.VERCEL_GIT_COMMIT_SHA?.trim() || null,
+    deploy_sha: releaseDeploySha(),
     failure_class: browserSkipShortcut ? "release_gate_stale_evidence" : null,
     generated_at: generatedAt.toISOString(),
     max_age_seconds: 86_400,
     sanitized: true,
     stage: "release_gate",
   };
+}
+
+function releaseDeploySha() {
+  for (const name of [
+    "RAILWAY_GIT_COMMIT_SHA",
+    "VERCEL_GIT_COMMIT_SHA",
+    "GITHUB_SHA",
+    "SOURCE_VERSION",
+  ]) {
+    const value = process.env[name]?.trim();
+    if (value) return value.slice(0, 64);
+  }
+  return null;
 }
 
 async function auditGeneratedArtifacts(dirs) {
