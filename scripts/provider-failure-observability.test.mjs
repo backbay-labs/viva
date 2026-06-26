@@ -26,6 +26,7 @@ test("provider failure observability defines reusable sanitized log queries", ()
     "malformed_stream",
     "network_disconnect",
     "token_refresh_failure",
+    "startup_unavailable",
     "recap_failure",
     "pending_evaluation",
     "deploy_drain",
@@ -45,6 +46,14 @@ test("provider failure observability defines reusable sanitized log queries", ()
     /failure_class:"local_rate_limit"/,
   );
   assert.match(queriesById.get("watchdog_expiry").railway_query, /failure_class:"session_cap"/);
+  assert.match(
+    queriesById.get("startup_unavailable").railway_query,
+    /failure_class:"pre_loop_unavailable"/,
+  );
+  assert.match(
+    queriesById.get("startup_unavailable").railway_query,
+    /failure_class:"session_bootstrap_unavailable"/,
+  );
   assert.match(
     queriesById.get("live_monitor_failure").railway_query,
     /live_monitor_consecutive_failures/,
@@ -77,7 +86,24 @@ test("provider failure dashboard groups by every required operator dimension", (
   assert(
     evidence.dashboard.required_artifact_links.some((link) => link.id === "rollback_criteria"),
   );
+  assert.equal(
+    evidence.dashboard.required_artifact_links.find((link) => link.id === "rollback_criteria").path,
+    "rollback_drain.criteria",
+  );
   assert(evidence.dashboard.required_artifact_links.every((link) => link.sanitized === true));
+});
+
+test("provider failure dashboard links the actual release evidence artifact path", () => {
+  const evidence = providerFailureObservabilityEvidence({
+    fixture,
+    releaseEvidencePath: "artifacts/custom-release/evidence.json",
+  });
+
+  assert.equal(
+    evidence.dashboard.required_artifact_links.find((link) => link.id === "hosted_release_evidence")
+      .path,
+    "artifacts/custom-release/evidence.json",
+  );
 });
 
 test("provider alerts reuse BAC-527 rollback thresholds without copying numbers", () => {
@@ -142,6 +168,14 @@ test("coverage matrix accounts for every BAC-510 failure class with query-backed
             query.railway_query.includes('terminal_reason:"session_cap"')),
         `query ${query.id} does not cover ${failureClass}`,
       );
+    } else if (coverage.query_id) {
+      const query = queriesById.get(coverage.query_id);
+      assert(query, `unknown no-alert query for ${failureClass}`);
+      assert(
+        query.failure_class === failureClass ||
+          query.railway_query.includes(`failure_class:"${failureClass}"`),
+        `no-alert query ${query.id} does not cover ${failureClass}`,
+      );
     } else {
       assert.match(
         coverage.no_operator_alert_reason,
@@ -168,6 +202,23 @@ test("coverage validation rejects alerts whose query text cannot observe the fai
   assert.throws(
     () => assertProviderFailureObservabilityEvidence(unsafe),
     /query cost_budget does not cover cost_budget/,
+  );
+});
+
+test("dashboard-only coverage must be backed by a concrete log query", () => {
+  const evidence = providerFailureObservabilityEvidence({ fixture });
+  const unsafe = {
+    ...evidence,
+    coverage: evidence.coverage.map((entry) => {
+      if (entry.failure_class !== "pre_loop_unavailable") return entry;
+      const { query_id: _queryId, ...withoutQuery } = entry;
+      return withoutQuery;
+    }),
+  };
+
+  assert.throws(
+    () => assertProviderFailureObservabilityEvidence(unsafe),
+    /coverage for pre_loop_unavailable claims dashboard coverage without a query/,
   );
 });
 

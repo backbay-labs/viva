@@ -1,11 +1,11 @@
 import learnerLoopContract from "../packages/core/src/learner-loop-contract.json" with {
   type: "json",
 };
+import { assertNoForbiddenEvidenceMarkers } from "./redaction-control.mjs";
 import {
   REQUIRED_ROLLBACK_TRIGGER_IDS,
   ROLLBACK_TRIGGER_THRESHOLDS,
 } from "./rollback-drain-criteria.mjs";
-import { assertNoForbiddenEvidenceMarkers } from "./redaction-control.mjs";
 
 const OBSERVABILITY_SCHEMA = "viva.provider_failure_observability.v1";
 
@@ -159,6 +159,15 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
       "token_refresh_outcome",
       "latency_ms",
     ],
+  }),
+  query({
+    id: "startup_unavailable",
+    title: "Pre-loop and session-bootstrap unavailable gates",
+    failure_class: "pre_loop_unavailable",
+    stage: "startup",
+    railway_query:
+      'service:"agent-service" (failure_class:"pre_loop_unavailable" OR failure_class:"session_bootstrap_unavailable" OR terminal_reason:"pre_loop_unavailable" OR terminal_reason:"session_bootstrap_unavailable")',
+    evidence_fields: ["failure_class", "stage", "deploy_sha", "latency_ms", "terminal_reason"],
   }),
   query({
     id: "recap_failure",
@@ -415,10 +424,14 @@ export const PROVIDER_FAILURE_ALERTS = Object.freeze([
 
 export const FAILURE_CLASS_COVERAGE = Object.freeze([
   coverage("pre_loop_unavailable", null, {
+    query_id: "startup_unavailable",
+    requires_query: true,
     no_operator_alert_reason:
       "Pre-loop ingestion is recoverable before a live turn; dashboard query is sufficient unless release evidence marks it stale.",
   }),
   coverage("session_bootstrap_unavailable", null, {
+    query_id: "startup_unavailable",
+    requires_query: true,
     no_operator_alert_reason:
       "Bootstrap unavailability is dashboard-only because hosted monitor/release-gate stale evidence blocks live traffic before admission.",
   }),
@@ -464,7 +477,10 @@ export const FAILURE_CLASS_COVERAGE = Object.freeze([
   coverage("rollback", "bac525_rollback_observed"),
 ]);
 
-export function providerFailureObservabilityEvidence({ fixture = null } = {}) {
+export function providerFailureObservabilityEvidence({
+  fixture = null,
+  releaseEvidencePath = "artifacts/release-check/evidence.json",
+} = {}) {
   const evidence = {
     schema: OBSERVABILITY_SCHEMA,
     dashboard: {
@@ -473,7 +489,7 @@ export function providerFailureObservabilityEvidence({ fixture = null } = {}) {
       required_artifact_links: [
         {
           id: "hosted_release_evidence",
-          path: "artifacts/release-check/evidence.json",
+          path: releaseEvidencePath,
           sanitized: true,
         },
         {
@@ -483,7 +499,7 @@ export function providerFailureObservabilityEvidence({ fixture = null } = {}) {
         },
         {
           id: "rollback_criteria",
-          path: "release_evidence.rollback_drain.criteria",
+          path: "rollback_drain.criteria",
           source: "scripts/rollback-drain-criteria.mjs",
           sanitized: true,
         },
@@ -521,6 +537,7 @@ export function assertProviderFailureObservabilityEvidence(evidence) {
     "malformed_stream",
     "network_disconnect",
     "token_refresh_failure",
+    "startup_unavailable",
     "recap_failure",
     "pending_evaluation",
     "deploy_drain",
@@ -590,6 +607,19 @@ export function assertProviderFailureObservabilityEvidence(evidence) {
         throw new Error(
           `coverage for ${failureClass} uses query ${queryEntry.id} that does not cover the failure class or terminal reason`,
         );
+      }
+    } else {
+      if (coverage.requires_query === true && !coverage.query_id) {
+        throw new Error(`coverage for ${failureClass} claims dashboard coverage without a query`);
+      }
+      if (coverage.query_id) {
+        const queryEntry = queriesById.get(coverage.query_id);
+        if (!queryEntry) {
+          throw new Error(`coverage for ${failureClass} references unknown query`);
+        }
+        if (!queryCoversFailureClass(queryEntry, failureClass)) {
+          throw new Error(`coverage for ${failureClass} uses query that does not cover it`);
+        }
       }
     }
   }

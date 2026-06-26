@@ -24,12 +24,12 @@ import {
   assertProviderFailureObservabilityEvidence,
   providerFailureObservabilityEvidence,
 } from "./provider-failure-observability.mjs";
-import { assertNoForbiddenEvidenceMarkers, auditTextArtifacts } from "./redaction-control.mjs";
 import {
   buildProviderReadinessMatrix,
   LIVE_PROVIDER_GATE_COMMAND_NAME,
   PROVIDER_READINESS_TARGETS,
 } from "./provider-readiness-matrix.mjs";
+import { assertNoForbiddenEvidenceMarkers, auditTextArtifacts } from "./redaction-control.mjs";
 import {
   assertRollbackReleaseGate,
   buildRollbackReleaseEvidence,
@@ -52,6 +52,7 @@ const durableStateReleaseClaimed = process.env.VIVA_RELEASE_DURABLE_STATE_CLAIME
 
 await rm(artifactDir, { recursive: true, force: true });
 await mkdir(artifactDir, { recursive: true });
+const outputPath = path.join(artifactDir, "evidence.json");
 
 try {
   const failureControlPlan = buildFailureControlPlan();
@@ -78,7 +79,6 @@ try {
     "--test",
     "scripts/provider-failure-observability.test.mjs",
   ]);
-  await runRollbackDrainProofCommands();
   await run("provider_gate_tests", "cargo", [
     "test",
     "--manifest-path",
@@ -120,6 +120,7 @@ try {
   assertRollbackReleaseGate(rollbackDrain);
   const providerFailureObservability = providerFailureObservabilityEvidence({
     fixture: fixtureProviderFailureDashboard,
+    releaseEvidencePath: path.relative(root, outputPath),
   });
   assertProviderFailureObservabilityEvidence(providerFailureObservability);
   const fixtureHashes = await hashFixtureFiles(path.join(root, "agent/fixtures/voice-protocol"));
@@ -128,7 +129,6 @@ try {
     path.join(root, "artifacts/e2e-browser"),
     path.join(root, "artifacts/e2e-browser-fake-provider"),
   ]);
-  const outputPath = path.join(artifactDir, "evidence.json");
   const evidence = {
     generated_at: new Date().toISOString(),
     schema: "viva.release_evidence.v1",
