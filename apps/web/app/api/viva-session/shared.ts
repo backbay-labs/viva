@@ -18,6 +18,25 @@ export type VivaSessionRouteOutcome = {
   token_refresh_outcome: string;
 };
 
+export type VivaSessionAuthFailureCode =
+  | "expired"
+  | "replayed"
+  | "malformed"
+  | "invalid_signature"
+  | "identity_mismatch"
+  | "access_denied";
+
+export type VivaSessionAuthClientClass = "recoverable" | "terminal";
+
+type VivaSessionAuthFailureProfile = {
+  clientClass: VivaSessionAuthClientClass;
+  evidenceFields: readonly ["failure_class", "stage", "token_refresh_outcome"];
+  learnerCopyCause: "auth_failed";
+  operatorCode: VivaSessionAuthFailureCode;
+  retryEligible: boolean;
+  stage: "session";
+};
+
 type SessionRequestPayload = {
   session_id?: unknown;
   session_bootstrap_token?: unknown;
@@ -92,7 +111,7 @@ type RateLimitBucket = {
 
 type SessionTokenVerification =
   | { ok: true; expired: boolean; value: SessionTokenClaims }
-  | { ok: false; reason: "invalid" | "malformed" | "missing_secret" };
+  | { ok: false; reason: "invalid_signature" | "malformed" | "missing_secret" };
 
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const SESSION_BOOTSTRAP_TOKEN_TTL_SECONDS = 5 * 60;
@@ -100,6 +119,14 @@ const SESSION_BOOTSTRAP_TOKEN_PREFIX = "viva-bootstrap1";
 const SESSION_BOOTSTRAP_TOKEN_PURPOSE = "viva_session_bootstrap";
 const LIBRARY_CONTROL_TOKEN_PREFIX = "viva-control1";
 const LIBRARY_CONTROL_TOKEN_PURPOSE = "viva_library_control";
+export const VIVA_SESSION_AUTH_FAILURE_PROFILES = {
+  access_denied: sessionAuthFailureProfile("access_denied", "terminal", false),
+  expired: sessionAuthFailureProfile("expired", "recoverable", true),
+  identity_mismatch: sessionAuthFailureProfile("identity_mismatch", "terminal", false),
+  invalid_signature: sessionAuthFailureProfile("invalid_signature", "terminal", false),
+  malformed: sessionAuthFailureProfile("malformed", "terminal", false),
+  replayed: sessionAuthFailureProfile("replayed", "terminal", false),
+} as const satisfies Record<VivaSessionAuthFailureCode, VivaSessionAuthFailureProfile>;
 const mintRateLimits = new Map<string, RateLimitBucket>();
 
 export async function handleVivaSessionStart(request: NextRequest) {
@@ -167,23 +194,14 @@ export async function handleVivaSessionRefresh(request: NextRequest) {
     if (claims.reason === "missing_secret") {
       return sessionJsonError(503, "viva_session_refresh_unavailable", "failed");
     }
-    if (claims.reason === "invalid") {
-      return sessionJsonError(401, "invalid_session_token", "invalid_rejected", {
-        failure_class: "auth_material_failure",
-      });
-    }
-    return sessionJsonError(400, "malformed_session_token", "malformed_rejected", {
-      failure_class: "malformed_token",
-    });
+    return sessionAuthTerminalJsonError(authFailureCodeForTokenReason(claims.reason));
   }
   if (
     claims.value.user_id !== userId ||
     claims.value.study_set_id !== studySetId ||
     claims.value.session_id !== sessionId
   ) {
-    return sessionJsonError(409, "session_identity_mismatch", "identity_mismatch", {
-      failure_class: "identity_mismatch",
-    });
+    return sessionAuthTerminalJsonError("identity_mismatch");
   }
 
   const limit = guardMintRateLimit(request, userId, studySetId);
@@ -197,12 +215,13 @@ export async function handleVivaSessionRefresh(request: NextRequest) {
     userId,
   });
   if (!minted.ok) return minted.response;
+  const tokenRefreshOutcome = claims.expired ? "expired_refreshed" : "refreshed";
   return sessionJson(
     {
       failure_class: null,
       session: minted.value.session,
       session_token: minted.value.session_token,
-      token_refresh_outcome: claims.expired ? "expired_refreshed" : "refreshed",
+      token_refresh_outcome: tokenRefreshOutcome,
     },
     200,
   );
@@ -352,14 +371,10 @@ function guardAllowedIdentity(userId: string, studySetId: string): NextResponse 
     return sessionJsonError(503, "viva_session_identity_allowlist_unavailable", "failed");
   }
   if (!allowedUserIds.has(userId)) {
-    return sessionJsonError(403, "session_identity_not_allowed", "blocked", {
-      failure_class: "access_denied",
-    });
+    return sessionAuthTerminalJsonError("access_denied");
   }
   if (!allowedStudySetIds.has(studySetId)) {
-    return sessionJsonError(403, "session_identity_not_allowed", "blocked", {
-      failure_class: "access_denied",
-    });
+    return sessionAuthTerminalJsonError("access_denied");
   }
   return null;
 }
@@ -562,7 +577,7 @@ function verifySessionTokenClaims(token: string): SessionTokenVerification {
     providedSignature.length !== expectedSignature.length ||
     !timingSafeEqual(providedSignature, expectedSignature)
   ) {
-    return { ok: false, reason: "invalid" };
+    return { ok: false, reason: "invalid_signature" };
   }
   try {
     const raw = Buffer.from(claimsPart, "base64url").toString("utf8");
@@ -601,6 +616,45 @@ function verifySessionTokenClaims(token: string): SessionTokenVerification {
   } catch {
     return { ok: false, reason: "malformed" };
   }
+}
+
+function sessionAuthFailureProfile(
+  operatorCode: VivaSessionAuthFailureCode,
+  clientClass: VivaSessionAuthClientClass,
+  retryEligible: boolean,
+): VivaSessionAuthFailureProfile {
+  return {
+    clientClass,
+    evidenceFields: ["failure_class", "stage", "token_refresh_outcome"],
+    learnerCopyCause: "auth_failed",
+    operatorCode,
+    retryEligible,
+    stage: "session",
+  };
+}
+
+function authFailureCodeForTokenReason(
+  reason: Exclude<SessionTokenVerification, { ok: true }>["reason"],
+): Exclude<VivaSessionAuthFailureCode, "expired"> {
+  if (reason === "missing_secret") return "access_denied";
+  switch (reason) {
+    case "invalid_signature":
+      return "invalid_signature";
+    case "malformed":
+      return "malformed";
+  }
+}
+
+function sessionAuthTerminalJsonError(
+  operatorCode: Exclude<VivaSessionAuthFailureCode, "expired">,
+): NextResponse<VivaSessionRouteFailureClass> {
+  const profile = VIVA_SESSION_AUTH_FAILURE_PROFILES[operatorCode];
+  if (profile.clientClass !== "terminal") {
+    return sessionJsonError(503, "viva_session_refresh_unavailable", "failed");
+  }
+  return sessionJsonError(401, "session_auth_terminal", "terminal", {
+    failure_class: "session_auth_terminal",
+  });
 }
 
 function sessionJson(

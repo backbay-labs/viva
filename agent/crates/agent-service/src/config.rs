@@ -696,6 +696,8 @@ pub struct SessionTokenClaims {
     pub failure_control: Option<FailureControlClaim>,
 }
 
+pub const EXPIRY_CLOCK_SKEW_SECONDS: u64 = 60;
+
 impl SessionTokenClaims {
     pub fn sign(&self, secret: &str) -> Result<String, SessionTokenError> {
         if secret.is_empty() || !self.has_required_claims() {
@@ -745,9 +747,9 @@ impl SessionTokenClaims {
         let claims: Self =
             serde_json::from_slice(&claims_bytes).map_err(|_| SessionTokenError::Malformed)?;
         if !claims.has_required_claims() {
-            return Err(SessionTokenError::Invalid);
+            return Err(SessionTokenError::Malformed);
         }
-        if claims.expires_at <= now {
+        if claims.expires_at.saturating_add(EXPIRY_CLOCK_SKEW_SECONDS) < now {
             return Err(SessionTokenError::Expired);
         }
         Ok(claims)
@@ -778,6 +780,60 @@ pub enum SessionTokenError {
     Invalid,
     #[error("expired session token")]
     Expired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionAuthFailureCode {
+    Expired,
+    Replayed,
+    Malformed,
+    InvalidSignature,
+    IdentityMismatch,
+    AccessDenied,
+}
+
+impl SessionAuthFailureCode {
+    pub fn from_token_error(error: &SessionTokenError) -> Self {
+        match error {
+            SessionTokenError::Expired => Self::Expired,
+            SessionTokenError::Malformed => Self::Malformed,
+            SessionTokenError::Invalid => Self::InvalidSignature,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Replayed => "replayed",
+            Self::Malformed => "malformed",
+            Self::InvalidSignature => "invalid_signature",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::AccessDenied => "access_denied",
+        }
+    }
+
+    pub fn client_class(self) -> &'static str {
+        match self {
+            Self::Expired => "recoverable",
+            Self::Replayed
+            | Self::Malformed
+            | Self::InvalidSignature
+            | Self::IdentityMismatch
+            | Self::AccessDenied => "terminal",
+        }
+    }
+
+    pub fn retry_eligible(self) -> bool {
+        matches!(self, Self::Expired)
+    }
+
+    pub fn stage(self) -> &'static str {
+        "session"
+    }
+
+    pub fn evidence_field(self) -> &'static str {
+        "session_auth_failure_code"
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -1289,6 +1345,14 @@ mod tests {
         );
         assert_eq!(
             SessionTokenClaims::verify_at(&token, "secret", 100),
+            Ok(claims.clone())
+        );
+        assert_eq!(
+            SessionTokenClaims::verify_at(&token, "secret", 160),
+            Ok(claims.clone())
+        );
+        assert_eq!(
+            SessionTokenClaims::verify_at(&token, "secret", 161),
             Err(SessionTokenError::Expired)
         );
         assert_eq!(
@@ -1299,6 +1363,61 @@ mod tests {
             SessionTokenClaims::verify_at("not-a-viva-token", "secret", 99),
             Err(SessionTokenError::Malformed)
         );
+        let malformed_claims = serde_json::json!({
+            "user_id": "",
+            "study_set_id": "biology-midterm",
+            "session_id": "voice-session-1",
+            "expires_at": 100,
+            "nonce": "nonce-1",
+        });
+        let malformed_claims =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&malformed_claims).unwrap());
+        let malformed_payload = ["viva1", malformed_claims.as_str()].join(".");
+        let malformed_signature =
+            URL_SAFE_NO_PAD.encode(sign_payload("secret", malformed_payload.as_bytes()).unwrap());
+        let signed_malformed_claims = format!("{malformed_payload}.{malformed_signature}");
+        assert_eq!(
+            SessionTokenClaims::verify_at(&signed_malformed_claims, "secret", 99),
+            Err(SessionTokenError::Malformed)
+        );
+    }
+
+    #[test]
+    fn session_auth_failure_codes_map_to_coarse_client_classes() {
+        assert_eq!(
+            SessionAuthFailureCode::from_token_error(&SessionTokenError::Expired),
+            SessionAuthFailureCode::Expired
+        );
+        assert_eq!(
+            SessionAuthFailureCode::from_token_error(&SessionTokenError::Malformed),
+            SessionAuthFailureCode::Malformed
+        );
+        assert_eq!(
+            SessionAuthFailureCode::from_token_error(&SessionTokenError::Invalid),
+            SessionAuthFailureCode::InvalidSignature
+        );
+        for code in [
+            SessionAuthFailureCode::Expired,
+            SessionAuthFailureCode::Replayed,
+            SessionAuthFailureCode::Malformed,
+            SessionAuthFailureCode::InvalidSignature,
+            SessionAuthFailureCode::IdentityMismatch,
+            SessionAuthFailureCode::AccessDenied,
+        ] {
+            assert!(!code.as_str().contains("secret"));
+            assert!(matches!(code.stage(), "session"));
+            assert!(matches!(code.evidence_field(), "session_auth_failure_code"));
+            match code {
+                SessionAuthFailureCode::Expired => {
+                    assert_eq!(code.client_class(), "recoverable");
+                    assert!(code.retry_eligible());
+                }
+                _ => {
+                    assert_eq!(code.client_class(), "terminal");
+                    assert!(!code.retry_eligible());
+                }
+            }
+        }
     }
 
     #[test]

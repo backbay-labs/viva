@@ -183,7 +183,7 @@ test("failure-control token scenarios mutate the browser target to prove token r
   );
   assert.equal(expired.token_mode, "expired_token");
   assert.equal(expired.preconsume_replay, false);
-  assert.equal(decodedTokenClaims(parseFailureControlSessionTarget(expired.target).sessionToken).expires_at, 90);
+  assert.equal(decodedTokenClaims(parseFailureControlSessionTarget(expired.target).sessionToken).expires_at, 89);
   assert(validSignature(parseFailureControlSessionTarget(expired.target).sessionToken, secret));
 
   const replayed = failureControlSessionTargetForScenario(

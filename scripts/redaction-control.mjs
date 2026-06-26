@@ -87,6 +87,23 @@ const ALLOWED_SANITIZED_BOOLEAN_PROOF_FIELDS = new Set([
 
 const SAFE_FORBIDDEN_MARKER_LITERALS = new Map([["session_token", ["invalid_session_token"]]]);
 
+const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
+  {
+    file: "agent/crates/agent-service/src/ws.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /\.claim_session_token_nonce\(/,
+      /\.session_token_secret\.as_deref\(\)/,
+      /initial\.session_token\.as_deref\(\)/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws.rs",
+    marker: "token",
+    patterns: Object.freeze([/let token = initial\.session_token\.as_deref\(\)/]),
+  },
+]);
+
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);
 
 const RUNTIME_REDACTION_BOUNDARY_FILES = new Set([
@@ -258,7 +275,12 @@ export function changedFileNeedsRedactionAudit(file) {
 
 export function addedLineViolatesRedactionAudit(line, { file } = {}) {
   if (markerConstantAllowedInRuntimeRedactionBoundary(line, file)) return false;
-  return Boolean(forbiddenEvidenceMarkerInText(line) ?? forbiddenStructuralFieldInText(line));
+  const evidenceMarker = forbiddenEvidenceMarkerInText(line);
+  if (evidenceMarker && !sourceAuditEvidenceMarkerAllowed(line, file, evidenceMarker)) return true;
+  const structuralField = forbiddenStructuralFieldInText(line);
+  return Boolean(
+    structuralField && !sourceAuditStructuralFieldAllowed(line, file, structuralField),
+  );
 }
 
 export function forbiddenEvidenceMarkerInText(text) {
@@ -380,6 +402,20 @@ function allowedSanitizedBooleanProofFieldOccurrence(text, match, group, normali
   if (preceding && !/[{"'\s,]/.test(preceding)) return false;
   const afterField = text.slice(fieldStart + field.length);
   return /^["']?\s*[:=]\s*(?:true|false)\s*(?=[,}\]\n\r]|$)/.test(afterField);
+}
+
+function sourceAuditEvidenceMarkerAllowed(line, file, marker) {
+  return SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES.some((entry) => {
+    return (
+      entry.file === file &&
+      entry.marker === marker &&
+      entry.patterns.some((pattern) => pattern.test(line))
+    );
+  });
+}
+
+function sourceAuditStructuralFieldAllowed(line, file, field) {
+  return sourceAuditEvidenceMarkerAllowed(line, file, field);
 }
 
 function markerConstantAllowedInRuntimeRedactionBoundary(line, file) {

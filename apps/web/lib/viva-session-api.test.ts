@@ -4,6 +4,7 @@ import type { NextRequest } from "next/server";
 import { POST as refreshSession } from "../app/api/viva-session/refresh/route";
 import {
   resetVivaSessionMintRateLimitsForTests,
+  VIVA_SESSION_AUTH_FAILURE_PROFILES,
   type VivaSessionRouteFailureClass,
   type VivaSessionRouteOutcome,
 } from "../app/api/viva-session/shared";
@@ -44,6 +45,30 @@ describe("Viva same-origin session API", () => {
     globalThis.fetch = originalFetch;
     resetVivaSessionMintRateLimitsForTests();
     for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
+  });
+
+  test("auth failure profiles cover operator codes while exposing coarse client classes", () => {
+    expect(Object.keys(VIVA_SESSION_AUTH_FAILURE_PROFILES).sort()).toEqual([
+      "access_denied",
+      "expired",
+      "identity_mismatch",
+      "invalid_signature",
+      "malformed",
+      "replayed",
+    ]);
+    for (const [code, profile] of Object.entries(VIVA_SESSION_AUTH_FAILURE_PROFILES)) {
+      expect(profile.operatorCode).toBe(code);
+      expect(profile.stage).toBe("session");
+      expect(profile.evidenceFields).toEqual(["failure_class", "stage", "token_refresh_outcome"]);
+      expect(profile.learnerCopyCause).toBe("auth_failed");
+      if (code === "expired") {
+        expect(profile.clientClass).toBe("recoverable");
+        expect(profile.retryEligible).toBe(true);
+      } else {
+        expect(profile.clientClass).toBe("terminal");
+        expect(profile.retryEligible).toBe(false);
+      }
+    }
   });
 
   test("start mints through the server REST bearer without reflecting secrets", async () => {
@@ -243,6 +268,31 @@ describe("Viva same-origin session API", () => {
     expect(calls).toEqual([]);
   });
 
+  test("start hides same-origin access-denied detail behind terminal auth class", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(500, { error: "should_not_call_agent" });
+    }) as typeof fetch;
+
+    const response = await startSession(
+      sessionRequest("/api/viva-session/start", {
+        study_set_id: "biology-midterm",
+        user_id: "other-user",
+      }),
+    );
+    const body = (await response.json()) as VivaSessionRouteFailureClass;
+
+    expect(response.status).toBe(401);
+    expect(body).toEqual({
+      error: "session_auth_terminal",
+      failure_class: "session_auth_terminal",
+      token_refresh_outcome: "terminal",
+    });
+    expect(/access_denied|other-user|biology-midterm/.test(JSON.stringify(body))).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
   test("start applies independent mint limits to client IP and session identity", async () => {
     process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "1";
     process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user,alternate-user";
@@ -351,6 +401,43 @@ describe("Viva same-origin session API", () => {
     });
   });
 
+  test("refresh records a normal same-identity token refresh separately from expiry recovery", async () => {
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input: String(input), init });
+      return jsonResponse(200, librarySnapshot({ resumeToken: "viva1.redacted-refresh-token" }));
+    }) as typeof fetch;
+
+    const response = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", {
+        session_id: "server-session",
+        session_token: signedSessionToken({
+          expires_at: futureUnixSeconds(),
+          nonce: "valid-refresh-nonce",
+          session_id: "server-session",
+          study_set_id: "biology-midterm",
+          user_id: "synthetic-user",
+        }),
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      }),
+    );
+    const body = (await response.json()) as VivaSessionRouteOutcome;
+
+    expect(response.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(body).toEqual({
+      failure_class: null,
+      session: {
+        session_id: "server-session",
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      },
+      session_token: "viva1.redacted-refresh-token",
+      token_refresh_outcome: "refreshed",
+    });
+  });
+
   test("refresh requires the server-only session signing secret before contacting the agent", async () => {
     const calls: string[] = [];
     delete process.env.VIVA_VOICE_SESSION_TOKEN_SECRET;
@@ -384,31 +471,27 @@ describe("Viva same-origin session API", () => {
     expect(calls).toEqual([]);
   });
 
-  test("refresh rejects identity-mismatched and malformed tokens without reflecting token material", async () => {
+  test("refresh exposes only coarse terminal auth class for invalid token categories", async () => {
     const calls: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       calls.push(String(input));
       return jsonResponse(500, { error: "should_not_call_agent" });
     }) as typeof fetch;
 
-    const mismatch = await refreshSession(
-      sessionRequest("/api/viva-session/refresh", {
-        session_id: "server-session",
-        session_token: signedSessionToken({
+    const cases = [
+      {
+        forbiddenFragments: ["mismatch-nonce", "identity_mismatch", "other-user"],
+        token: signedSessionToken({
           expires_at: futureUnixSeconds(),
           nonce: "mismatch-nonce",
           session_id: "server-session",
           study_set_id: "biology-midterm",
           user_id: "other-user",
         }),
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
-    );
-    const invalid = await refreshSession(
-      sessionRequest("/api/viva-session/refresh", {
-        session_id: "server-session",
-        session_token: signedSessionToken(
+      },
+      {
+        forbiddenFragments: ["invalid-signature-nonce", "invalid_signature", "invalid_rejected"],
+        token: signedSessionToken(
           {
             expires_at: futureUnixSeconds(),
             nonce: "invalid-signature-nonce",
@@ -418,43 +501,56 @@ describe("Viva same-origin session API", () => {
           },
           "wrong-session-signing-secret",
         ),
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
-    );
-    const malformed = await refreshSession(
-      sessionRequest("/api/viva-session/refresh", {
-        session_id: "server-session",
-        session_token: "not-a-viva-token",
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
-    );
-    const mismatchBody = (await mismatch.json()) as VivaSessionRouteFailureClass;
-    const invalidBody = (await invalid.json()) as VivaSessionRouteFailureClass;
-    const malformedBody = (await malformed.json()) as VivaSessionRouteFailureClass;
+      },
+      {
+        forbiddenFragments: ["not-a-viva-token", "malformed", "malformed_rejected"],
+        token: "not-a-viva-token",
+      },
+    ];
+    const observed = [];
+    for (const input of cases) {
+      const response = await refreshSession(
+        sessionRequest("/api/viva-session/refresh", {
+          session_id: "server-session",
+          session_token: input.token,
+          study_set_id: "biology-midterm",
+          user_id: "synthetic-user",
+        }),
+      );
+      const body = (await response.json()) as VivaSessionRouteFailureClass;
+      observed.push({ body, status: response.status });
+      const serialized = JSON.stringify(body);
+      for (const fragment of input.forbiddenFragments) {
+        expect(serialized).not.toContain(fragment);
+      }
+    }
 
-    expect(mismatch.status).toBe(409);
-    expect(mismatchBody).toEqual({
-      error: "session_identity_mismatch",
-      failure_class: "identity_mismatch",
-      token_refresh_outcome: "identity_mismatch",
-    });
-    expect(JSON.stringify(mismatchBody)).not.toContain("mismatch-nonce");
-    expect(invalid.status).toBe(401);
-    expect(invalidBody).toEqual({
-      error: "invalid_session_token",
-      failure_class: "auth_material_failure",
-      token_refresh_outcome: "invalid_rejected",
-    });
-    expect(JSON.stringify(invalidBody)).not.toContain("invalid-signature-nonce");
-    expect(malformed.status).toBe(400);
-    expect(malformedBody).toEqual({
-      error: "malformed_session_token",
-      failure_class: "malformed_token",
-      token_refresh_outcome: "malformed_rejected",
-    });
-    expect(JSON.stringify(malformedBody)).not.toContain("not-a-viva-token");
+    expect(observed).toEqual([
+      {
+        status: 401,
+        body: {
+          error: "session_auth_terminal",
+          failure_class: "session_auth_terminal",
+          token_refresh_outcome: "terminal",
+        },
+      },
+      {
+        status: 401,
+        body: {
+          error: "session_auth_terminal",
+          failure_class: "session_auth_terminal",
+          token_refresh_outcome: "terminal",
+        },
+      },
+      {
+        status: 401,
+        body: {
+          error: "session_auth_terminal",
+          failure_class: "session_auth_terminal",
+          token_refresh_outcome: "terminal",
+        },
+      },
+    ]);
     expect(calls).toEqual([]);
   });
 });

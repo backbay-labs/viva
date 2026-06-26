@@ -10,10 +10,11 @@ use std::{
 
 use agent_adapters::{cartesia_gemini::FakeCartesiaGeminiRuntime, SyntheticBrain};
 use agent_domain::{
-    AudioFrame, BrainError, BrainEvent, BrainInput, BrainProviderError, BrainUsage, ConceptStatus,
-    RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard,
-    RecapSourceMoment, SessionConfig, SessionId, StudyMemoryStore, StudyMode, StudySessionRecap,
-    StudySetIngestionStatus, TerminalSessionReason,
+    AnswerEvaluation, AudioFrame, BrainError, BrainEvent, BrainInput, BrainProviderError,
+    BrainUsage, ConceptStatus, PortError, RealtimeBrain, RealtimeBrainCapabilities,
+    RealtimeSession, RealtimeSessionTaskGuard, RecapSourceMoment, SessionConfig, SessionId,
+    StudyMemoryStore, StudyMode, StudySessionRecap, StudySetIngestionStatus, StudySourceReference,
+    StudyStoreCapabilities, StudyStoreWriteCounts, TerminalSessionReason,
 };
 use agent_service::{
     build_router, AppState, ClientFrame, FailureControlConfig, FailureControlScenario, ServerFrame,
@@ -105,6 +106,135 @@ fn test_state_with_session_token_and_store(
         1,
         store,
     )
+}
+
+#[derive(Clone, Copy)]
+enum FailingStudyStoreMode {
+    ClaimNonce,
+    StudyContext,
+}
+
+struct FailingStudyStore {
+    inner: data::InMemoryStudyStore,
+    mode: FailingStudyStoreMode,
+}
+
+impl FailingStudyStore {
+    fn new(mode: FailingStudyStoreMode) -> Self {
+        Self {
+            inner: data::InMemoryStudyStore::seeded_fixture(),
+            mode,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for FailingStudyStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    async fn claim_session_token_nonce(
+        &self,
+        claim: agent_domain::SessionTokenNonceClaim,
+    ) -> Result<(), PortError> {
+        if matches!(self.mode, FailingStudyStoreMode::ClaimNonce) {
+            return Err(PortError::adapter("test_store", "nonce write failed"));
+        }
+        self.inner.claim_session_token_nonce(claim).await
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        if matches!(self.mode, FailingStudyStoreMode::StudyContext) {
+            return Err(PortError::adapter("test_store", "study context failed"));
+        }
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
 }
 
 async fn seed_completed_library_session(store: &Arc<data::InMemoryStudyStore>) {
@@ -2382,9 +2512,17 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         send_client_frame(&mut socket, &session).await;
         assert!(matches!(
             read_server_frame(&mut socket).await,
-            ServerFrame::Error { message, .. } if message == "invalid session identity"
+            ServerFrame::Error { message, .. } if message == "session auth failed"
         ));
         assert_close_code(&mut socket, CloseCode::Policy).await;
+        let auth_events =
+            wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
+        assert!(auth_events.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::AuthFailure
+                && event.detail.contains("code=identity_mismatch")
+                && event.detail.contains("client_class=terminal")
+                && event.detail.contains("retry_eligible=false")
+        }));
         let events =
             wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
         assert!(events.iter().any(|event| {
@@ -2426,6 +2564,70 @@ async fn websocket_accepts_signed_session_token_matching_initial_config() {
         ServerFrame::Event { .. }
     ));
     socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_records_auth_failure_for_forged_config_refresh() {
+    let state = test_state(1);
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/session-config.json"
+    ))
+    .unwrap();
+    let mut forged_refresh = session.clone();
+    forged_refresh["user_id"] = serde_json::Value::String("user-2".to_owned());
+
+    assert_ready_provider(&mut socket, "synthetic").await;
+    socket
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "session_config",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "session": session,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let accepted_events =
+        wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::ConfigAccepted).await;
+    assert!(accepted_events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::ConfigAccepted
+            && event.detail == "session config accepted"
+    }));
+
+    socket
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "session_config",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "session": forged_refresh,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let frames = read_server_frames_until_close(&mut socket).await;
+    for frame in frames {
+        if let ServerFrame::Error { message, .. } = frame {
+            assert_eq!(message, "session auth failed");
+        }
+    }
+    let auth_events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
+    assert!(auth_events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::AuthFailure
+            && event.detail.contains("code=identity_mismatch")
+            && event.detail.contains("client_class=terminal")
+            && event.detail.contains("retry_eligible=false")
+            && !event.detail.contains("user-2")
+    }));
 }
 
 #[tokio::test]
@@ -2575,7 +2777,7 @@ async fn websocket_rejects_failure_control_claim_from_wrong_origin_before_brain_
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "invalid session token"
+        ServerFrame::Error { message, .. } if message == "session auth failed"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
     assert!(!opened.load(Ordering::SeqCst));
@@ -2597,6 +2799,7 @@ async fn websocket_rejects_replayed_session_token_before_brain_open() {
         },
         2,
     );
+    let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
         return;
     };
@@ -2632,32 +2835,103 @@ async fn websocket_rejects_replayed_session_token_before_brain_open() {
 
     assert!(matches!(
         read_server_frame(&mut replay_socket).await,
-        ServerFrame::Error { message, .. } if message == "invalid session token"
+        ServerFrame::Error { message, .. } if message == "session auth failed"
     ));
     assert_close_code(&mut replay_socket, CloseCode::Policy).await;
+    let auth_events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
+    assert!(auth_events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::AuthFailure
+            && event.detail.contains("code=replayed")
+            && event.detail.contains("client_class=terminal")
+            && event.detail.contains("retry_eligible=false")
+    }));
+    assert!(!opened.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn websocket_records_nonce_store_errors_without_replay_auth_evidence() {
+    let opened = Arc::new(AtomicBool::new(false));
+    let store: Arc<dyn StudyMemoryStore> =
+        Arc::new(FailingStudyStore::new(FailingStudyStoreMode::ClaimNonce));
+    let state = AppState::with_study_store(
+        Arc::new(OpenProbeBrain {
+            opened: opened.clone(),
+            captured_config: None,
+        }),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        1,
+        store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let token = signed_session_token(
+        "session-secret",
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() + 60,
+        "nonce-store-outage",
+    );
+    let (mut socket, _) = connect_async(url).await.unwrap();
+
+    assert_ready_provider(&mut socket, "open_probe").await;
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&token).into(),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Error { message, .. } if message == "session token nonce store unavailable"
+    ));
+    assert_close_code(&mut socket, CloseCode::Policy).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "session_token_nonce_store_unavailable"
+    }));
+    assert!(!evidence
+        .snapshot()
+        .iter()
+        .any(|event| event.kind == VoiceEvidenceEventKind::AuthFailure));
     assert!(!opened.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
 async fn websocket_rejects_invalid_session_token_before_brain_open() {
-    for token in [
-        signed_session_token(
-            "session-secret",
-            "user-1",
-            "biology-midterm",
-            "voice-session-1",
-            unix_timestamp_now().saturating_sub(1),
-            "nonce-expired",
+    for (token, expected_code) in [
+        (
+            signed_session_token(
+                "session-secret",
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                unix_timestamp_now().saturating_sub(120),
+                "nonce-expired",
+            ),
+            "expired",
         ),
-        signed_session_token(
-            "wrong-secret",
-            "user-1",
-            "biology-midterm",
-            "voice-session-1",
-            unix_timestamp_now() + 60,
-            "nonce-forged-signature",
+        (
+            signed_session_token(
+                "wrong-secret",
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                unix_timestamp_now() + 60,
+                "nonce-forged-signature",
+            ),
+            "invalid_signature",
         ),
-        "viva1.malformed.signature".to_owned(),
+        ("viva1.malformed.signature".to_owned(), "malformed"),
     ] {
         let opened = Arc::new(AtomicBool::new(false));
         let state = AppState::new(
@@ -2673,6 +2947,7 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
             },
             1,
         );
+        let evidence = state.evidence.clone();
         let Some(url) = spawn_server(state).await else {
             return;
         };
@@ -2688,9 +2963,18 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
 
         assert!(matches!(
             read_server_frame(&mut socket).await,
-            ServerFrame::Error { message, .. } if message == "invalid session token"
+            ServerFrame::Error { message, .. } if message == "session auth failed"
         ));
         assert_close_code(&mut socket, CloseCode::Policy).await;
+        let auth_events =
+            wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
+        assert!(auth_events.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::AuthFailure
+                && event.detail.contains(&format!("code={expected_code}"))
+                && event.detail.contains("client_class=")
+                && event.detail.contains("stage=session")
+                && !event.detail.contains("nonce-")
+        }));
         assert!(!opened.load(Ordering::SeqCst));
     }
 }
@@ -2737,6 +3021,7 @@ async fn websocket_rejects_token_claim_mismatch_before_brain_open() {
             },
             1,
         );
+        let evidence = state.evidence.clone();
         let Some(url) = spawn_server(state).await else {
             return;
         };
@@ -2752,9 +3037,16 @@ async fn websocket_rejects_token_claim_mismatch_before_brain_open() {
 
         assert!(matches!(
             read_server_frame(&mut socket).await,
-            ServerFrame::Error { message, .. } if message == "invalid session identity"
+            ServerFrame::Error { message, .. } if message == "session auth failed"
         ));
         assert_close_code(&mut socket, CloseCode::Policy).await;
+        let auth_events =
+            wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
+        assert!(auth_events.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::AuthFailure
+                && event.detail.contains("code=identity_mismatch")
+                && event.detail.contains("client_class=terminal")
+        }));
         assert!(!opened.load(Ordering::SeqCst));
     }
 }
@@ -2803,15 +3095,77 @@ async fn websocket_checks_study_set_access_before_brain_open() {
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "study set access denied"
+        ServerFrame::Error { message, .. } if message == "session auth failed"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
     assert!(!opened.load(Ordering::SeqCst));
+    let auth_events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
+    assert!(auth_events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::AuthFailure
+            && event.detail.contains("code=access_denied")
+            && event.detail.contains("client_class=terminal")
+    }));
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
     assert!(events
         .iter()
         .any(|event| event.kind == VoiceEvidenceEventKind::TerminalReason
             && event.detail == "study_set_access_denied"));
+}
+
+#[tokio::test]
+async fn websocket_records_study_context_store_errors_without_access_denied_auth_evidence() {
+    let opened = Arc::new(AtomicBool::new(false));
+    let store: Arc<dyn StudyMemoryStore> =
+        Arc::new(FailingStudyStore::new(FailingStudyStoreMode::StudyContext));
+    let state = AppState::with_study_store(
+        Arc::new(OpenProbeBrain {
+            opened: opened.clone(),
+            captured_config: None,
+        }),
+        "synthetic",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/session-config.json"
+    ))
+    .unwrap();
+
+    assert_ready_provider(&mut socket, "open_probe").await;
+    socket
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "session_config",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "session": session,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Error { message, .. } if message == "study store unavailable"
+    ));
+    assert_close_code(&mut socket, CloseCode::Policy).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason
+            && event.detail == "study_store_unavailable"
+    }));
+    assert!(!evidence
+        .snapshot()
+        .iter()
+        .any(|event| event.kind == VoiceEvidenceEventKind::AuthFailure));
+    assert!(!opened.load(Ordering::SeqCst));
 }
 
 #[tokio::test]

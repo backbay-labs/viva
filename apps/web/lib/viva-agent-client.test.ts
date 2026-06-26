@@ -522,6 +522,22 @@ describe("Viva agent browser client", () => {
     expect(JSON.stringify(state)).not.toContain("raw answer text");
   });
 
+  test("reducer normalizes legacy auth errors to the coarse recovery reason", () => {
+    for (const message of [
+      "invalid session token",
+      "invalid session identity",
+      "study set access denied",
+    ]) {
+      const state = vivaAgentReducer(initialVivaAgentSessionState(), {
+        type: "error",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        message,
+      });
+
+      expect(state.errors).toEqual(["session auth failed"]);
+    }
+  });
+
   test("reducer sanitizes structured provider errors before projection can render them", () => {
     const rawProviderMessage =
       "structured_error prompt transcript with CARTESIA_API_KEY and source excerpt";
@@ -600,15 +616,44 @@ describe("Viva agent browser client", () => {
     socket.open();
     socket.close({
       code: 1008,
-      reason: "invalid session token",
+      reason: "session auth failed",
       wasClean: false,
     });
 
     expect(controller.getState().close).toEqual({
       code: 1008,
-      reason: "invalid session token",
+      reason: "session auth failed",
       wasClean: false,
     });
+  });
+
+  test("controller normalizes legacy auth close reasons before projection", () => {
+    for (const reason of [
+      "invalid session token",
+      "invalid session identity",
+      "study set access denied",
+    ]) {
+      FakeWebSocket.instances = [];
+      const controller = createVivaAgentSessionController({
+        WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+        session: sessionFixture as AgentSessionConfig,
+        url: "ws://localhost:4318/ws",
+      });
+
+      const socket = controller.connect() as unknown as FakeWebSocket;
+      socket.open();
+      socket.close({
+        code: 1008,
+        reason,
+        wasClean: false,
+      });
+
+      expect(controller.getState().close).toEqual({
+        code: 1008,
+        reason: "session auth failed",
+        wasClean: false,
+      });
+    }
   });
 
   test("controller reconnect closes the previous socket before opening a replacement", () => {

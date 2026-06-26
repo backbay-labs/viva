@@ -680,7 +680,7 @@ describe("projectRuntimeCopy", () => {
     const copy = projectRuntimeCopy({
       close: {
         code: 1008,
-        reason: "invalid session token",
+        reason: "session auth failed",
         wasClean: false,
       },
       readiness: trustedReadiness,

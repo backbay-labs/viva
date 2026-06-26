@@ -198,6 +198,41 @@ test("per-PR redaction check catches structural raw-payload fields", () => {
   assert.equal(addedLineViolatesRedactionAudit("  prompt_content_retained: true"), false);
 });
 
+test("per-PR redaction check permits required auth source identifiers only in source audit", () => {
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      "let claim_result = state.study_store.claim_session_token_nonce(claim).await;",
+      {
+        file: "agent/crates/agent-service/src/ws.rs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      "let token = initial.session_token.as_deref().ok_or_else(|| {",
+      {
+        file: "agent/crates/agent-service/src/ws.rs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("let leaked = evidence.session_token;", {
+      file: "agent/crates/agent-service/src/ws.rs",
+    }),
+    true,
+  );
+  assert.throws(
+    () =>
+      assertNoForbiddenEvidenceMarkers({
+        schema: "viva.generated_evidence.v1",
+        session_token: "placeholder-session-material",
+      }),
+    /forbidden evidence field: session_token/,
+  );
+});
+
 test("artifact audit catches structural sensitive fields even without denylist marker values", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "viva-redaction-artifacts-"));
   try {
