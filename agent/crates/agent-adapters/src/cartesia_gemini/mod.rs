@@ -90,7 +90,7 @@ impl Default for CartesiaGeminiConfig {
             ink: InkConfig::default(),
             sonic: SonicConfig::default(),
             tool_stage_timeout: Duration::from_secs(2),
-            recap_stage_timeout: Duration::from_secs(3),
+            recap_stage_timeout: Duration::from_secs(2),
             live_runtime_enabled: false,
             cartesia_zero_data_retention_enabled: false,
             gemini_zero_data_retention_approved: false,
@@ -303,6 +303,7 @@ pub enum FakeRuntimeInterrupt {
     MalformedGeminiManuscriptIntent,
     UnauthorizedGeminiManuscriptIntent,
     NoGeminiManuscriptIntent,
+    GeminiToolCallOnFinalPass,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -731,7 +732,13 @@ mod tests {
 
         assert_eq!(MAX_GEMINI_EXECUTED_TOOL_STAGES, 5);
         assert_eq!(config.tool_stage_timeout, Duration::from_secs(2));
-        assert!(config.total_live_stage_deadline() <= viva_max_submitted_answer_resolution());
+        assert_eq!(config.recap_stage_timeout, Duration::from_secs(2));
+        assert!(
+            config
+                .total_live_stage_deadline()
+                .saturating_add(Duration::from_secs(1))
+                <= viva_max_submitted_answer_resolution()
+        );
     }
 
     #[test]

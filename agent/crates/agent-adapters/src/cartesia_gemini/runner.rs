@@ -503,7 +503,7 @@ where
         let mut response_prompt = String::new();
         let mut executed_gemini_tool_stages = 0_u32;
 
-        for _ in 0..MAX_GEMINI_TOOL_LOOP_PASSES {
+        for pass_index in 0..MAX_GEMINI_TOOL_LOOP_PASSES {
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
                 return Ok(response_prompt);
             }
@@ -518,6 +518,7 @@ where
                 interrupt,
             );
             let mut saw_tool_call = false;
+            let mut last_tool_call: Option<(String, Duration)> = None;
             for event in stream {
                 match event {
                     GeminiStreamEvent::FunctionCall { id, name, args, .. } => {
@@ -545,6 +546,8 @@ where
                             &self.config.gemini.model_id,
                             gemini_started.elapsed(),
                         )?;
+                        last_tool_call =
+                            Some((proposal.name().to_owned(), gemini_started.elapsed()));
                         if proposal.name() == "emit_manuscript_intent" {
                             let accepted = if let Some(intent) =
                                 parse_gemini_manuscript_intent(proposal.arguments())
@@ -628,6 +631,15 @@ where
             }
             if !saw_tool_call {
                 break;
+            }
+            if pass_index + 1 >= MAX_GEMINI_TOOL_LOOP_PASSES {
+                let (tool_name, latency) = last_tool_call
+                    .unwrap_or_else(|| ("unrecognized_tool".to_owned(), gemini_started.elapsed()));
+                return Err(gemini_tool_loop_budget_error(
+                    &tool_name,
+                    &self.config.gemini.model_id,
+                    latency,
+                ));
             }
         }
 
@@ -803,7 +815,7 @@ where
             ToolProposal::build_session_recap(&session.study_set_id, &session.voice_session_id),
             self.config.recap_stage_timeout,
             "recap",
-            "recap_projection_failure",
+            "tool_executor_failure",
             None,
         )
         .await
@@ -1505,6 +1517,31 @@ fn fake_interrupt_gemini_stream(
                 event => event,
             })
             .collect(),
+        FakeRuntimeInterrupt::GeminiToolCallOnFinalPass
+            if stream
+                .iter()
+                .all(|event| !matches!(event, GeminiStreamEvent::FunctionCall { .. })) =>
+        {
+            let args = json!({
+                "type": "entity_intent",
+                "entity_id": "nadh",
+                "entity_kind": "concept",
+                "register": "correcting",
+                "emphasis": "marked",
+            });
+            vec![GeminiStreamEvent::FunctionCall {
+                id: "call-manuscript-final-pass".to_owned(),
+                name: "emit_manuscript_intent".to_owned(),
+                args: args.clone(),
+                part: json!({
+                    "functionCall": {
+                        "id": "call-manuscript-final-pass",
+                        "name": "emit_manuscript_intent",
+                        "args": args,
+                    }
+                }),
+            }]
+        }
         _ => stream,
     }
 }

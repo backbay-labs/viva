@@ -5,7 +5,7 @@ use agent_adapters::cartesia_gemini::{
 };
 use agent_domain::{
     viva_max_submitted_answer_resolution, AnswerAttemptEnvelope, AnswerEvaluation, AudioFrame,
-    AuthorizedStudySession, BrainEvent, BrainInput, ConceptStatus, ManuscriptEmphasis,
+    AuthorizedStudySession, BrainError, BrainEvent, BrainInput, ConceptStatus, ManuscriptEmphasis,
     ManuscriptEntityKind, ManuscriptIntent, ManuscriptRegister, PortError, RealtimeBrain,
     RealtimeSession, SessionConfig, SessionId, StudyMemoryStore, StudyMode, StudyQuestion,
     StudySessionRecap, StudySourceReference, StudyStoreCapabilities, StudyStoreWriteCounts,
@@ -58,8 +58,11 @@ fn adapter_defaults_define_stage_deadlines_under_bac_510_turn_cap() {
         expected_live_path_budget
     );
     assert!(
-        config.total_live_stage_deadline() <= viva_max_submitted_answer_resolution(),
-        "live provider stage deadlines must stay inside the BAC-510 submitted-answer cap"
+        config
+            .total_live_stage_deadline()
+            .saturating_add(Duration::from_secs(1))
+            <= viva_max_submitted_answer_resolution(),
+        "live provider stage deadlines must leave terminal-emission slack inside the BAC-510 submitted-answer cap"
     );
 }
 
@@ -893,7 +896,7 @@ async fn fake_runtime_reports_tool_source_failure_as_stage_failure() {
     let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let session = fixture_session_config();
     inner.record_voice_session(&session).await.unwrap();
-    let store = Arc::new(FailSourceAfterQuestionStore::new(inner));
+    let store = Arc::new(FailStudyToolStore::source_after_question(inner));
     let runtime = FakeCartesiaGeminiRuntime::new(store);
 
     let mut realtime = runtime.open(session).await.unwrap();
@@ -939,6 +942,90 @@ async fn fake_runtime_reports_tool_source_failure_as_stage_failure() {
     assert!(failure.metadata.contains("tool=retrieve_source_reference"));
     assert!(!error_text.contains("raw source excerpt"));
     assert!(!failure.metadata.contains("raw source excerpt"));
+}
+
+#[tokio::test]
+async fn fake_runtime_reports_recap_failure_with_tool_executor_failure_class() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let session = fixture_session_config();
+    inner.record_voice_session(&session).await.unwrap();
+    let store = Arc::new(FailStudyToolStore::recap(inner));
+    let runtime = FakeCartesiaGeminiRuntime::new(store);
+
+    let mut realtime = runtime.open(session).await.unwrap();
+    assert!(matches!(
+        next_event(&mut realtime).await,
+        BrainEvent::SessionPhase { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut realtime).await,
+        BrainEvent::QuestionStarted { .. }
+    ));
+    realtime
+        .input
+        .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+            1_u8, 2, 3, 4,
+        ])))
+        .await
+        .unwrap();
+
+    let error = loop {
+        match next_event(&mut realtime).await {
+            BrainEvent::Error(error) => break error,
+            BrainEvent::RecapReady { .. } => {
+                panic!("recap tool failure unexpectedly emitted recap")
+            }
+            _ => {}
+        }
+    };
+    let error_text = error.message.clone();
+    let failure = error
+        .failure
+        .expect("provider error includes stage failure");
+
+    assert_eq!(failure.failure_class, "tool_executor_failure");
+    assert_eq!(failure.stage, "recap");
+    assert_eq!(
+        failure.terminal_reason,
+        TerminalSessionReason::ToolExecutorFailure
+    );
+    assert!(failure.retry_eligible);
+    assert_eq!(failure.provider, "server");
+    assert_eq!(failure.model, "viva-tools");
+    assert!(failure.metadata.contains("tool=build_session_recap"));
+    assert!(!error_text.contains("raw recap excerpt"));
+    assert!(!failure.metadata.contains("raw recap excerpt"));
+}
+
+#[tokio::test]
+async fn fake_runtime_fails_when_gemini_requests_tool_on_final_loop_pass() {
+    let (store, session) = fixture_store_and_session().await;
+    let runtime = FakeCartesiaGeminiRuntime::new(store);
+
+    let error = runtime
+        .replay_audio_turn_with_interrupt(
+            session,
+            AudioFrame::from_pcm16_bytes(vec![1_u8, 2, 3, 4]),
+            FakeRuntimeInterrupt::GeminiToolCallOnFinalPass,
+        )
+        .await
+        .unwrap_err();
+    let BrainError::StageFailure(failure) = error else {
+        panic!("final-pass Gemini tool call should produce a stage failure");
+    };
+
+    assert_eq!(failure.failure_class, "malformed_stream");
+    assert_eq!(failure.stage, "gemini");
+    assert_eq!(
+        failure.terminal_reason,
+        TerminalSessionReason::ProviderMalformedStream
+    );
+    assert!(failure.retry_eligible);
+    assert_eq!(failure.provider, "gemini");
+    assert!(failure.metadata.contains("tool=emit_manuscript_intent"));
+    assert!(failure
+        .metadata
+        .contains("error_kind=tool_loop_budget_exceeded"));
 }
 
 #[tokio::test]
@@ -1298,22 +1385,35 @@ struct BlockingAnswerStore {
     release_answer: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
-struct FailSourceAfterQuestionStore {
+struct FailStudyToolStore {
     inner: Arc<data::InMemoryStudyStore>,
     source_reference_calls: Mutex<usize>,
+    fail_source_after_question: bool,
+    fail_recap: bool,
 }
 
-impl FailSourceAfterQuestionStore {
-    fn new(inner: Arc<data::InMemoryStudyStore>) -> Self {
+impl FailStudyToolStore {
+    fn source_after_question(inner: Arc<data::InMemoryStudyStore>) -> Self {
         Self {
             inner,
             source_reference_calls: Mutex::new(0),
+            fail_source_after_question: true,
+            fail_recap: false,
+        }
+    }
+
+    fn recap(inner: Arc<data::InMemoryStudyStore>) -> Self {
+        Self {
+            inner,
+            source_reference_calls: Mutex::new(0),
+            fail_source_after_question: false,
+            fail_recap: true,
         }
     }
 }
 
 #[async_trait::async_trait]
-impl StudyMemoryStore for FailSourceAfterQuestionStore {
+impl StudyMemoryStore for FailStudyToolStore {
     fn capabilities(&self) -> StudyStoreCapabilities {
         self.inner.capabilities()
     }
@@ -1379,7 +1479,7 @@ impl StudyMemoryStore for FailSourceAfterQuestionStore {
         study_set_id: &str,
         source_id: &str,
     ) -> Result<Option<StudySourceReference>, PortError> {
-        let should_fail = {
+        let should_fail = self.fail_source_after_question && {
             let mut calls = self
                 .source_reference_calls
                 .lock()
@@ -1440,6 +1540,12 @@ impl StudyMemoryStore for FailSourceAfterQuestionStore {
         response_id: &str,
         recap: StudySessionRecap,
     ) -> Result<serde_json::Value, PortError> {
+        if self.fail_recap {
+            return Err(PortError::adapter(
+                "study_store",
+                "raw recap excerpt from adapter must not leak",
+            ));
+        }
         self.inner
             .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
             .await
