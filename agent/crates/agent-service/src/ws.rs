@@ -3381,7 +3381,9 @@ async fn record_brain_event(
         state.evidence.record(VoiceEvidenceEvent::new(
             VoiceEvidenceEventKind::ProviderFallback,
             voice_session_id,
-            format!("provider={provider} from_model={from_model} to_model={to_model} reason={reason}"),
+            format!(
+                "provider={provider} from_model={from_model} to_model={to_model} reason={reason}"
+            ),
         ));
         return BrainEventRecordResult::None;
     }
