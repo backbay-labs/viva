@@ -71,17 +71,21 @@ type WindowWithWebkitAudioContext = Window &
 export function LiveSessionPage() {
   const reducedMotion = usePrefersReducedMotion();
   const [routeIdentity] = useState(readBrowserSessionRouteIdentity);
+  const [sessionToken, setSessionToken] = useState(routeIdentity.sessionToken ?? null);
+  const [routeSessionTokenRefreshReady, setRouteSessionTokenRefreshReady] = useState(
+    () => !shouldRefreshBrowserSessionToken(routeIdentity),
+  );
   const activeStudySet = useMemo(
     () => ({
       ...STUDY_SET,
       id: routeIdentity.studySetId ?? STUDY_SET.id,
       userId: routeIdentity.userId ?? STUDY_SET.userId,
       sessionId: routeIdentity.sessionId ?? STUDY_SET.sessionId,
-      sessionToken: routeIdentity.sessionToken ?? STUDY_SET.sessionToken,
+      sessionToken: sessionToken ?? STUDY_SET.sessionToken,
       serverOwned: routeIdentity.studySetId ? true : STUDY_SET.serverOwned,
       ingestionStatus: routeIdentity.studySetId ? ("ready" as const) : STUDY_SET.ingestionStatus,
     }),
-    [routeIdentity],
+    [routeIdentity, sessionToken],
   );
   const [elapsed, setElapsed] = useState(0);
   const [hintShown, setHintShown] = useState(false);
@@ -98,8 +102,9 @@ export function LiveSessionPage() {
   const agent = useVivaAgentSession({
     mode: "quiz",
     sessionId: routeIdentity.sessionId ?? process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID,
-    sessionToken: routeIdentity.sessionToken,
+    sessionToken,
     studySet: activeStudySet,
+    token: sessionRouteWsAccessToken({ sessionToken }),
     trustedStudySetId: process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID,
     userId: routeIdentity.userId ?? process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID,
   });
@@ -138,15 +143,33 @@ export function LiveSessionPage() {
     return sink;
   }, []);
 
+  useEffect(() => {
+    if (!shouldRefreshBrowserSessionToken(routeIdentity)) {
+      setRouteSessionTokenRefreshReady(true);
+      return;
+    }
+    let cancelled = false;
+    setRouteSessionTokenRefreshReady(false);
+    void refreshBrowserSessionToken(routeIdentity).then((refreshedToken) => {
+      if (cancelled) return;
+      if (refreshedToken) setSessionToken(refreshedToken);
+      setRouteSessionTokenRefreshReady(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [routeIdentity]);
+
   // Connect once, deferred to the next tick so the dev StrictMode
   // mount→unmount→mount cycle settles first. The throwaway first mount schedules
   // a timer that its own cleanup clears; only the final, stable mount's connect
   // actually runs — so we open exactly one socket on the live controller instead
   // of opening then immediately closing a throwaway one.
   useEffect(() => {
+    if (!routeSessionTokenRefreshReady) return;
     const id = window.setTimeout(() => agentRef.current.connect(), 0);
     return () => window.clearTimeout(id);
-  }, []);
+  }, [routeSessionTokenRefreshReady]);
 
   // Session duration clock — counts up while the session is live, then freezes
   // on its final duration once a recap arrives or the socket terminally closes.
@@ -844,6 +867,52 @@ function readBrowserSessionRouteIdentity() {
     ...routeIdentity,
     sessionToken: envToken,
   };
+}
+
+export function sessionRouteWsAccessToken(routeIdentity: { sessionToken?: string | null }) {
+  return routeIdentity.sessionToken?.trim() || undefined;
+}
+
+type BrowserSessionRouteIdentity = {
+  sessionId?: string | null;
+  sessionToken?: string | null;
+  studySetId?: string | null;
+  userId?: string | null;
+};
+
+export function shouldRefreshBrowserSessionToken(identity: BrowserSessionRouteIdentity): boolean {
+  return Boolean(
+    identity.sessionId?.trim() &&
+      identity.sessionToken?.trim() &&
+      identity.studySetId?.trim() &&
+      identity.userId?.trim(),
+  );
+}
+
+export async function refreshBrowserSessionToken(
+  identity: BrowserSessionRouteIdentity,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | null> {
+  const fallbackToken = identity.sessionToken?.trim() || null;
+  if (!shouldRefreshBrowserSessionToken(identity)) return fallbackToken;
+  try {
+    const response = await fetchImpl("/api/viva-session/refresh", {
+      body: JSON.stringify({
+        session_id: identity.sessionId?.trim(),
+        session_token: fallbackToken,
+        study_set_id: identity.studySetId?.trim(),
+        user_id: identity.userId?.trim(),
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    if (!response.ok) return fallbackToken;
+    const body = (await response.json()) as { session_token?: unknown };
+    const refreshedToken = typeof body.session_token === "string" ? body.session_token.trim() : "";
+    return refreshedToken || fallbackToken;
+  } catch {
+    return fallbackToken;
+  }
 }
 
 function initialReadinessProbe(): VivaAgentReadinessProbe {

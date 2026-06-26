@@ -49,6 +49,7 @@ export type VivaPasteStudySetOptions = {
 export type VivaLibrarySnapshotOptions = {
   apiBaseUrl?: string;
   bearerToken?: string;
+  cache?: RequestCache;
   controlToken?: string;
   fetchImpl?: typeof fetch;
   userId?: string;
@@ -158,6 +159,7 @@ const bundledVivaAgentWsUrl = process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL;
 const bundledVivaAgentHttpUrl = process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL;
 const bundledVivaApiUrl = process.env.NEXT_PUBLIC_VIVA_API_URL;
 const bundledVivaStaticExport = process.env.VIVA_STATIC_EXPORT;
+const bundledNextPublicVivaStaticExport = process.env.NEXT_PUBLIC_VIVA_STATIC_EXPORT;
 const defaultVivaAgentWsUrl = "ws://127.0.0.1:4318/ws";
 
 export function vivaAgentWsUrl(env?: Record<string, string | undefined>): string {
@@ -364,6 +366,7 @@ export async function fetchVivaLibrarySnapshot(
     url.searchParams.set("user_id", options.userId.trim());
   }
   const response = await fetchImpl(url.toString(), {
+    cache: options.cache,
     headers: vivaLibraryAuthHeaders(options),
     method: "GET",
   });
@@ -442,9 +445,9 @@ export async function deleteVivaSessionHistory(
 function vivaLibraryApiBaseUrl(options: VivaLibrarySnapshotOptions): string {
   const apiBaseUrl =
     options.apiBaseUrl ??
+    browserVivaLibraryProxyBaseUrl() ??
     vivaApiBaseUrl() ??
     configuredVivaAgentHttpBaseUrl() ??
-    browserVivaLibraryProxyBaseUrl() ??
     vivaAgentHttpBaseUrl();
   if (!apiBaseUrl) {
     throw new Error("Viva API URL is unavailable");
@@ -457,8 +460,19 @@ function configuredVivaAgentHttpBaseUrl(): string | undefined {
   return explicitAgentHttp?.trim() ? trimTrailingSlash(explicitAgentHttp.trim()) : undefined;
 }
 
+export function vivaStaticExportEnabled(env?: Record<string, string | undefined>): boolean {
+  const explicitEnv = env !== undefined;
+  const resolvedEnv = env ?? envRecord();
+  const publicFlag =
+    resolvedEnv.NEXT_PUBLIC_VIVA_STATIC_EXPORT ??
+    (explicitEnv ? undefined : bundledNextPublicVivaStaticExport);
+  const serverFlag =
+    resolvedEnv.VIVA_STATIC_EXPORT ?? (explicitEnv ? undefined : bundledVivaStaticExport);
+  return publicFlag === "1" || serverFlag === "1";
+}
+
 function browserVivaLibraryProxyBaseUrl(): string | undefined {
-  if (bundledVivaStaticExport === "1" || typeof window === "undefined") return undefined;
+  if (vivaStaticExportEnabled() || typeof window === "undefined") return undefined;
   return `${window.location.origin}/api/viva-library`;
 }
 

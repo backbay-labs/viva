@@ -4,7 +4,9 @@ export type VivaLibraryAction =
   | {
       available: true;
       session_id?: string | null;
+      session_bootstrap_token?: string | null;
       session_token?: string | null;
+      same_origin_control_token?: string | null;
       control_token?: string | null;
     }
   | {
@@ -56,6 +58,9 @@ export type VivaLibraryNextReview = {
 };
 
 export type VivaLibrarySession = {
+  actions?: {
+    delete?: VivaLibraryAction;
+  };
   voice_session_id: string;
   user_id?: string;
   study_set_id: string;
@@ -96,7 +101,9 @@ export type VivaLibraryExport = {
 export type ProjectedLibraryAction = {
   available: boolean;
   sessionId?: string;
+  sessionBootstrapToken?: string | null;
   sessionToken?: string | null;
+  sameOriginControlToken?: string | null;
   controlToken?: string | null;
   unavailableReason?: string;
 };
@@ -131,6 +138,7 @@ export type ProjectedSessionRow = {
   recapLabel: string;
   mastery: ProjectedSessionMastery | null;
   nextReview: ProjectedNextReview | null;
+  delete: ProjectedLibraryAction;
 };
 
 export type ProjectedNextReview = {
@@ -175,6 +183,46 @@ export function projectLibrarySnapshot(
   };
 }
 
+export function redactVivaLibrarySessionTokens(snapshot: VivaLibrarySnapshot): VivaLibrarySnapshot {
+  return stripBrowserOnlyTokenFields(snapshot, {
+    controlToken: false,
+    sessionToken: true,
+  }) as VivaLibrarySnapshot;
+}
+
+export function browserInitialLibrarySnapshot(
+  snapshot: VivaLibrarySnapshot,
+  options: {
+    directSessionTokens?: boolean;
+    staticExport?: boolean;
+  } = {},
+): VivaLibrarySnapshot {
+  return stripBrowserOnlyTokenFields(snapshot, {
+    controlToken: !options.staticExport,
+    sessionToken: !(options.staticExport || options.directSessionTokens),
+  }) as VivaLibrarySnapshot;
+}
+
+function stripBrowserOnlyTokenFields(
+  value: unknown,
+  options: { controlToken: boolean; sessionToken: boolean },
+): unknown {
+  if (Array.isArray(value))
+    return value.map((child) => stripBrowserOnlyTokenFields(child, options));
+  if (!value || typeof value !== "object") return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (
+      (options.sessionToken && key === "session_token") ||
+      (options.controlToken && key === "control_token")
+    ) {
+      continue;
+    }
+    output[key] = stripBrowserOnlyTokenFields(child, options);
+  }
+  return output;
+}
+
 function projectStudySetRow(studySet: VivaLibraryStudySet): ProjectedLibraryRow {
   return {
     id: studySet.id,
@@ -200,6 +248,12 @@ function projectSessionRow(session: VivaLibrarySession): ProjectedSessionRow {
     recapLabel: recapLabel(session.recap),
     mastery: projectSessionMastery(session.recap),
     nextReview: projectNextReview(session.next_review),
+    delete: projectMutationAction(
+      session.actions?.delete ?? {
+        available: false,
+        unavailable_reason: "server_mutation_unavailable",
+      },
+    ),
   };
 }
 
@@ -228,15 +282,22 @@ function projectSessionAction(action: VivaLibraryAction): ProjectedLibraryAction
       unavailableReason: action.unavailable_reason,
     };
   }
-  if (!action.session_token) {
+  if (!action.session_id) {
     return {
       available: false,
-      unavailableReason: "session_token_unavailable",
+      unavailableReason: "session_id_unavailable",
+    };
+  }
+  if (!action.session_token && !action.session_bootstrap_token) {
+    return {
+      available: false,
+      unavailableReason: "session_capability_unavailable",
     };
   }
   return {
     available: true,
     sessionId: action.session_id ?? undefined,
+    sessionBootstrapToken: action.session_bootstrap_token ?? undefined,
     sessionToken: action.session_token ?? undefined,
   };
 }
@@ -248,13 +309,17 @@ function projectMutationAction(action: VivaLibraryAction): ProjectedLibraryActio
       unavailableReason: action.unavailable_reason,
     };
   }
-  if (!action.control_token) {
+  if (!action.control_token && !action.same_origin_control_token) {
     return {
       available: false,
       unavailableReason: "control_token_unavailable",
     };
   }
-  return { available: true, controlToken: action.control_token };
+  return {
+    available: true,
+    controlToken: action.control_token,
+    sameOriginControlToken: action.same_origin_control_token,
+  };
 }
 
 function projectPrivacy(privacy: VivaLibraryPrivacy): ProjectedLibraryPrivacy {

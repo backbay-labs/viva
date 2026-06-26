@@ -953,6 +953,9 @@ describe("Viva agent browser client", () => {
 
   test("uses an absolute same-origin proxy URL for browser library calls", async () => {
     const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const originalEnv = process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL;
+    const originalApiEnv = process.env.NEXT_PUBLIC_VIVA_API_URL;
+    const originalStaticExport = process.env.NEXT_PUBLIC_VIVA_STATIC_EXPORT;
     const calls: Array<{ input: string; init?: RequestInit }> = [];
     const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ input: String(input), init });
@@ -977,15 +980,65 @@ describe("Viva agent browser client", () => {
         configurable: true,
         value: { location: { origin: "http://localhost:3000" } },
       });
+      process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
+      process.env.NEXT_PUBLIC_VIVA_API_URL = "https://agent.example";
+      delete process.env.NEXT_PUBLIC_VIVA_STATIC_EXPORT;
 
       await fetchVivaLibrarySnapshot({ fetchImpl, userId: "user-1" });
     } finally {
       restoreGlobalProperty("window", originalWindow);
+      restoreEnv("NEXT_PUBLIC_VIVA_AGENT_HTTP_URL", originalEnv);
+      restoreEnv("NEXT_PUBLIC_VIVA_API_URL", originalApiEnv);
+      restoreEnv("NEXT_PUBLIC_VIVA_STATIC_EXPORT", originalStaticExport);
     }
 
     expect(calls[0]?.input).toBe(
       "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-1",
     );
+  });
+
+  test("skips the same-origin proxy for browser library calls in static export builds", async () => {
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const originalAgentEnv = process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL;
+    const originalApiEnv = process.env.NEXT_PUBLIC_VIVA_API_URL;
+    const originalStaticExport = process.env.NEXT_PUBLIC_VIVA_STATIC_EXPORT;
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input: String(input), init });
+      return jsonResponse(200, {
+        privacy: {
+          copy: "Voice recordings and transcripts are not saved.",
+          export: { available: false, unavailable_reason: "mutation_auth_required" },
+          export_contains_raw_provider_payloads: false,
+          raw_audio_persistence: false,
+          transcript_persistence: false,
+          transcripts_saved: false,
+          voice_recordings_saved: false,
+        },
+        sessions: [],
+        study_sets: [],
+        user_id: "user-1",
+      });
+    }) as typeof fetch;
+
+    try {
+      Object.defineProperty(globalThis, "window", {
+        configurable: true,
+        value: { location: { origin: "http://localhost:3000" } },
+      });
+      process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
+      delete process.env.NEXT_PUBLIC_VIVA_API_URL;
+      process.env.NEXT_PUBLIC_VIVA_STATIC_EXPORT = "1";
+
+      await fetchVivaLibrarySnapshot({ fetchImpl, userId: "user-1" });
+    } finally {
+      restoreGlobalProperty("window", originalWindow);
+      restoreEnv("NEXT_PUBLIC_VIVA_AGENT_HTTP_URL", originalAgentEnv);
+      restoreEnv("NEXT_PUBLIC_VIVA_API_URL", originalApiEnv);
+      restoreEnv("NEXT_PUBLIC_VIVA_STATIC_EXPORT", originalStaticExport);
+    }
+
+    expect(calls[0]?.input).toBe("https://agent.example/study-sets/library?user_id=user-1");
   });
 
   test("calls privacy export and delete endpoints without client-side source payloads", async () => {
@@ -1034,6 +1087,14 @@ function restoreGlobalProperty(name: string, descriptor: PropertyDescriptor | un
     Object.defineProperty(globalThis, name, descriptor);
   } else {
     delete (globalThis as Record<string, unknown>)[name];
+  }
+}
+
+function restoreEnv(name: string, value: string | undefined) {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
   }
 }
 

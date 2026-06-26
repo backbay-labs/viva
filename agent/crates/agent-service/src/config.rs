@@ -646,20 +646,41 @@ impl VoiceWsAccess {
             }
         }
 
-        self.validate_bearer_headers(headers)
+        self.validate_ws_bearer_headers(headers)
     }
 
     pub fn validate_bearer_headers(&self, headers: &HeaderMap) -> Result<(), VoiceWsAccessError> {
         let Some(required) = &self.required_bearer else {
             return Ok(());
         };
+        let Some(provided) = authorization_bearer_from_headers(headers) else {
+            return Err(VoiceWsAccessError::MissingBearer);
+        };
+        if constant_time_eq(required.as_bytes(), provided.as_bytes()) {
+            return Ok(());
+        }
+        Err(VoiceWsAccessError::InvalidBearer)
+    }
+
+    fn validate_ws_bearer_headers(&self, headers: &HeaderMap) -> Result<(), VoiceWsAccessError> {
+        let Some(required) = &self.required_bearer else {
+            return Ok(());
+        };
         let Some(provided) = bearer_from_headers(headers) else {
             return Err(VoiceWsAccessError::MissingBearer);
         };
-        if !constant_time_eq(required.as_bytes(), provided.as_bytes()) {
-            return Err(VoiceWsAccessError::InvalidBearer);
+        if constant_time_eq(required.as_bytes(), provided.as_bytes()) {
+            return Ok(());
         }
-        Ok(())
+        if self
+            .session_token_secret
+            .as_deref()
+            .and_then(|secret| SessionTokenClaims::verify(&provided, secret).ok())
+            .is_some()
+        {
+            return Ok(());
+        }
+        Err(VoiceWsAccessError::InvalidBearer)
     }
 }
 
@@ -770,17 +791,20 @@ pub enum VoiceWsAccessError {
 }
 
 fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
+    authorization_bearer_from_headers(headers).or_else(|| {
+        headers
+            .get("sec-websocket-protocol")
+            .and_then(|value| value.to_str().ok())
+            .and_then(protocol_bearer)
+    })
+}
+
+fn authorization_bearer_from_headers(headers: &HeaderMap) -> Option<String> {
     headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(ToOwned::to_owned)
-        .or_else(|| {
-            headers
-                .get("sec-websocket-protocol")
-                .and_then(|value| value.to_str().ok())
-                .and_then(protocol_bearer)
-        })
 }
 
 fn protocol_bearer(value: &str) -> Option<String> {
@@ -850,6 +874,46 @@ mod tests {
             HeaderValue::from_static("viva-voice, bearer.c2VjcmV0"),
         );
         assert_eq!(access.validate_headers(&headers), Ok(()));
+    }
+
+    #[test]
+    fn validates_signed_session_token_protocol_when_rest_bearer_is_configured() {
+        let access = VoiceWsAccess {
+            required_bearer: Some("rest-secret".to_owned()),
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec!["https://web.example".to_owned()],
+        };
+        let token = SessionTokenClaims {
+            user_id: "user-1".to_owned(),
+            study_set_id: "biology-midterm".to_owned(),
+            session_id: "voice-session-1".to_owned(),
+            expires_at: unix_timestamp_now().expect("time should be available") + 60,
+            nonce: "nonce-1".to_owned(),
+            failure_control: None,
+        }
+        .sign("session-secret")
+        .expect("token should sign");
+        let protocol = format!("viva-voice, bearer.{}", URL_SAFE_NO_PAD.encode(&token));
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://web.example"));
+        headers.insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_str(&protocol).expect("protocol should be valid"),
+        );
+
+        assert_eq!(access.validate_headers(&headers), Ok(()));
+        assert_eq!(
+            access.validate_bearer_headers(&headers),
+            Err(VoiceWsAccessError::MissingBearer)
+        );
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("header should be valid"),
+        );
+        assert_eq!(
+            access.validate_bearer_headers(&headers),
+            Err(VoiceWsAccessError::InvalidBearer)
+        );
     }
 
     #[test]
