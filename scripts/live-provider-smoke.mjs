@@ -126,27 +126,34 @@ export async function runLiveProviderSmoke({
   try {
     readiness = await collectReadiness(config, fetchImpl);
   } catch {
+    const terminalReason = "readiness_unavailable";
+    const failure = liveProviderFailureForSmokeReason(terminalReason);
     const evidence = {
       ...base,
       status: "failed",
       failure_stage: "readiness",
-      failure: liveProviderFailureForSmokeReason("readiness_unavailable"),
+      failure,
+      failure_class: failure.failure_class,
+      monitor: failedMonitorEvidence(config, terminalReason),
       readiness: readinessUnavailable(),
-      terminal_reason: "readiness_unavailable",
+      terminal_reason: terminalReason,
     };
     auditLiveSmokeEvidence(evidence, env);
     return evidence;
   }
 
   if (!readinessPasses(readiness)) {
-    const readinessReason = readinessFailureSmokeReason(readiness);
+    const terminalReason = readinessFailureSmokeReason(readiness);
+    const failure = liveProviderFailureForSmokeReason(terminalReason);
     const evidence = {
       ...base,
       status: "failed",
       failure_stage: "readiness",
-      failure: liveProviderFailureForSmokeReason(readinessReason),
+      failure,
+      failure_class: failure.failure_class,
+      monitor: failedMonitorEvidence(config, terminalReason),
       readiness,
-      terminal_reason: readinessReason,
+      terminal_reason: terminalReason,
     };
     auditLiveSmokeEvidence(evidence, env);
     return evidence;
@@ -159,13 +166,17 @@ export async function runLiveProviderSmoke({
       throw new Error("audio size outside configured cap");
     }
   } catch {
+    const terminalReason = "audio_input_unavailable";
+    const failure = liveProviderFailureForSmokeReason(terminalReason);
     const evidence = {
       ...base,
       status: "failed",
       failure_stage: "audio_input",
-      failure: liveProviderFailureForSmokeReason("audio_input_unavailable"),
+      failure,
+      failure_class: failure.failure_class,
+      monitor: failedMonitorEvidence(config, terminalReason),
       readiness,
-      terminal_reason: "audio_input_unavailable",
+      terminal_reason: terminalReason,
     };
     auditLiveSmokeEvidence(evidence, env);
     return evidence;
@@ -175,13 +186,17 @@ export async function runLiveProviderSmoke({
   try {
     bootstrap = await bootstrapSession(config, fetchImpl);
   } catch {
+    const terminalReason = "bootstrap_failed";
+    const failure = liveProviderFailureForSmokeReason(terminalReason);
     const evidence = {
       ...base,
       status: "failed",
       failure_stage: "bootstrap",
-      failure: liveProviderFailureForSmokeReason("bootstrap_failed"),
+      failure,
+      failure_class: failure.failure_class,
+      monitor: failedMonitorEvidence(config, terminalReason),
       readiness,
-      terminal_reason: "bootstrap_failed",
+      terminal_reason: terminalReason,
     };
     auditLiveSmokeEvidence(evidence, env);
     return evidence;
@@ -203,17 +218,15 @@ export async function runLiveProviderSmoke({
     websocket.terminal_reason === "recap_observed"
       ? "passed"
       : "failed";
+  const failure =
+    status === "failed"
+      ? liveProviderFailureForSmokeReason(websocket.terminal_reason ?? "websocket_failed")
+      : null;
   const evidence = {
     ...base,
     status,
     ...(status === "failed" ? { failure_stage: "websocket" } : {}),
-    ...(status === "failed"
-      ? {
-          failure: liveProviderFailureForSmokeReason(
-            websocket.terminal_reason ?? "websocket_failed",
-          ),
-        }
-      : {}),
+    ...(failure ? { failure, failure_class: failure.failure_class } : {}),
     readiness,
     bootstrap: {
       server_study_created: bootstrap.serverStudyCreated,
@@ -746,6 +759,14 @@ function liveMonitorEvidence({ consecutiveFailures, status, terminalReason }) {
     stuck_checking_sessions: stuckChecking ? 1 : 0,
     terminal_reason: terminalReason,
   };
+}
+
+function failedMonitorEvidence(config, terminalReason) {
+  return liveMonitorEvidence({
+    consecutiveFailures: config.liveMonitorConsecutiveFailures,
+    status: "failed",
+    terminalReason,
+  });
 }
 
 function readinessUnavailable() {

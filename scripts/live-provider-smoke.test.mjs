@@ -412,8 +412,14 @@ test("runLiveProviderSmoke fails closed when the live provider is not selectable
 
   assert.equal(evidence.status, "failed");
   assert.equal(evidence.failure_stage, "readiness");
+  assert.equal(evidence.failure_class, "provider_auth_failure");
   assert.equal(evidence.failure.failure_class, "provider_auth_failure");
   assert.equal(evidence.failure.terminal_reason, "provider_auth_failed");
+  assert.equal(evidence.monitor.failure_class, "live_monitor_failure");
+  assert.equal(evidence.monitor.live_monitor_attempt_count, 1);
+  assert.equal(evidence.monitor.live_monitor_consecutive_failures, 1);
+  assert.equal(evidence.monitor.signal, "live_monitor_failure");
+  assert.equal(evidence.monitor.terminal_reason, "readiness_not_live_selectable");
   assert.deepEqual(evidence.failure.terminal_session_phase, {
     type: "session_phase",
     phase: "recap",
@@ -706,6 +712,7 @@ test("runLiveProviderSmoke maps runtime rate terminal phases to quota-rate failu
 
     assert.equal(evidence.status, "failed");
     assert.equal(evidence.failure_stage, "websocket");
+    assert.equal(evidence.failure_class, "quota_rate_failure");
     assert.equal(evidence.websocket.terminal_reason, "rate_limit");
     assert.equal(evidence.failure.failure_class, "quota_rate_failure");
     assert.equal(evidence.failure.terminal_reason, "provider_rate_limited");

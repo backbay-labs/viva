@@ -6,7 +6,7 @@ use std::{
 use agent_domain::{
     fixture_question, AudioFrame, BrainError, BrainEvent, BrainInput, BrainProviderError,
     PortError, RealtimeSession, RealtimeSessionTaskGuard, SessionConfig, SessionTokenNonceClaim,
-    StudySessionPhase, TerminalSessionReason, VoiceUsageRecord,
+    StudySessionPhase, StudyStoreWriteCounts, TerminalSessionReason, VoiceUsageRecord,
 };
 use axum::{
     extract::{
@@ -1349,6 +1349,11 @@ fn terminal_observability_classification(
             stage: "transport",
             signal: "provider_network_disconnect",
         },
+        "provider_cancelled" => TerminalObservabilityClassification {
+            failure_class: "cancellation",
+            stage: "provider",
+            signal: "provider_cancelled",
+        },
         "partial_stage_success" => TerminalObservabilityClassification {
             failure_class: "partial_stage_success",
             stage: "recap",
@@ -1421,17 +1426,63 @@ fn emit_terminal_observability_log(state: &AppState, reason: &str) {
         return;
     };
     let deploy_sha = deployment_sha();
+    let model = observability_model(&state.provider);
     tracing::warn!(
         event = "provider_failure_observed",
         failure_class = classification.failure_class,
         stage = classification.stage,
         provider = %state.provider,
-        model = "unknown",
+        model = %model,
         deploy_sha = %deploy_sha,
         terminal_reason = reason,
         signal = classification.signal,
+        latency_ms = "unknown",
+        latency_bucket = "unknown",
+        usage = "unknown",
+        usage_bucket = "unknown",
+        cost_usd = "unknown",
+        cost_bucket = "unknown",
         "viva provider failure observed"
     );
+}
+
+fn emit_pending_evaluation_observability_log(
+    state: &AppState,
+    terminal_reason: &str,
+    pending_answer_attempts: usize,
+) {
+    if pending_answer_attempts == 0 {
+        return;
+    }
+    let deploy_sha = deployment_sha();
+    let model = observability_model(&state.provider);
+    tracing::warn!(
+        event = "provider_failure_observed",
+        failure_class = "pending_evaluation",
+        stage = "store",
+        provider = %state.provider,
+        model = %model,
+        deploy_sha = %deploy_sha,
+        terminal_reason = terminal_reason,
+        signal = "pending_evaluation",
+        evaluation_state = "pending",
+        pending_answer_attempts,
+        latency_ms = "unknown",
+        latency_bucket = "unknown",
+        usage = "unknown",
+        usage_bucket = "unknown",
+        cost_usd = "unknown",
+        cost_bucket = "unknown",
+        "viva pending evaluation observed"
+    );
+}
+
+fn observability_model(provider: &str) -> String {
+    format!("{provider}-viva")
+}
+
+fn pending_evaluation_attempts(counts: &StudyStoreWriteCounts) -> usize {
+    counts.answer_attempts.saturating_sub(counts.recaps)
 }
 
 async fn open_failure_control_session(
@@ -2617,6 +2668,7 @@ fn terminal_close_code(reason: TerminalSessionReason, close_code: u16) -> u16 {
 
 fn record_terminal_evidence(state: &AppState, voice_session_id: Option<String>, reason: &str) {
     let counts = state.study_store.write_counts();
+    emit_pending_evaluation_observability_log(state, reason, pending_evaluation_attempts(&counts));
     state.evidence.record(VoiceEvidenceEvent::new(
         VoiceEvidenceEventKind::StoreCounts,
         voice_session_id.clone(),
@@ -2786,6 +2838,14 @@ mod tests {
             })
         );
         assert_eq!(
+            terminal_observability_classification("provider_cancelled"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "cancellation",
+                stage: "provider",
+                signal: "provider_cancelled",
+            })
+        );
+        assert_eq!(
             terminal_observability_classification("turn_cap"),
             Some(TerminalObservabilityClassification {
                 failure_class: "turn_cap",
@@ -2794,6 +2854,38 @@ mod tests {
             })
         );
         assert_eq!(terminal_observability_classification("completed"), None);
+    }
+
+    #[test]
+    fn terminal_observability_model_uses_provider_suffix() {
+        assert_eq!(
+            observability_model("cartesia_gemini"),
+            "cartesia_gemini-viva"
+        );
+    }
+
+    #[test]
+    fn pending_evaluation_attempts_tracks_unrecapped_answer_writes() {
+        assert_eq!(
+            pending_evaluation_attempts(&StudyStoreWriteCounts {
+                sessions: 1,
+                answer_attempts: 3,
+                concept_statuses: 0,
+                review_items: 0,
+                recaps: 1,
+            }),
+            2
+        );
+        assert_eq!(
+            pending_evaluation_attempts(&StudyStoreWriteCounts {
+                sessions: 1,
+                answer_attempts: 1,
+                concept_statuses: 0,
+                review_items: 0,
+                recaps: 3,
+            }),
+            0
+        );
     }
 
     #[test]

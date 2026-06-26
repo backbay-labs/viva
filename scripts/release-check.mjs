@@ -449,9 +449,9 @@ function buildReleaseGateEvidence({ browserResult, generatedAt }) {
   return {
     browser_skip_shortcut: browserSkipShortcut,
     deploy_sha: process.env.VERCEL_GIT_COMMIT_SHA?.trim() || null,
-    evidence_age_seconds: Math.max(0, Math.floor((Date.now() - generatedAt.getTime()) / 1000)),
     failure_class: browserSkipShortcut ? "release_gate_stale_evidence" : null,
     generated_at: generatedAt.toISOString(),
+    max_age_seconds: 86_400,
     sanitized: true,
     stage: "release_gate",
   };

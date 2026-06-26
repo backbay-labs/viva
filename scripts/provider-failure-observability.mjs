@@ -151,11 +151,12 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "session_auth_failure",
     stage: "session_auth",
     railway_query:
-      'service:"web" event:"viva_session_route_failure" (failure_class:"session_auth_failure" OR failure_class:"auth_material_failure" OR failure_class:"malformed_token" OR failure_class:"identity_mismatch" OR token_refresh_outcome:"failed" OR token_refresh_outcome:"invalid_rejected" OR token_refresh_outcome:"malformed_rejected" OR token_refresh_outcome:"identity_mismatch")',
+      'service:"web" event:"viva_session_route_failure" (failure_class:"session_auth_failure" OR failure_class:"auth_material_failure" OR error:"viva_session_refresh_unavailable" OR token_refresh_outcome:"invalid_rejected" OR token_refresh_outcome:"malformed_rejected" OR token_refresh_outcome:"identity_mismatch")',
     evidence_fields: [
       "failure_class",
       "stage",
       "deploy_sha",
+      "error",
       "token_refresh_outcome",
       "latency_ms",
     ],
@@ -166,8 +167,15 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "pre_loop_unavailable",
     stage: "startup",
     railway_query:
-      'service:"agent-service" (failure_class:"pre_loop_unavailable" OR failure_class:"session_bootstrap_unavailable" OR terminal_reason:"pre_loop_unavailable" OR terminal_reason:"session_bootstrap_unavailable")',
-    evidence_fields: ["failure_class", "stage", "deploy_sha", "latency_ms", "terminal_reason"],
+      '(service:"agent-service" (failure_class:"pre_loop_unavailable" OR failure_class:"session_bootstrap_unavailable" OR terminal_reason:"pre_loop_unavailable" OR terminal_reason:"session_bootstrap_unavailable")) OR (service:"web" event:"viva_session_route_failure" (error:"viva_session_bootstrap_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable"))',
+    evidence_fields: [
+      "failure_class",
+      "stage",
+      "deploy_sha",
+      "error",
+      "latency_ms",
+      "terminal_reason",
+    ],
   }),
   query({
     id: "recap_failure",
@@ -194,6 +202,16 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     railway_query:
       'service:"agent-service" event:"provider_failure_observed" (failure_class:"pending_evaluation" OR terminal_reason:"pending_evaluation")',
     evidence_fields: ["failure_class", "stage", "deploy_sha", "latency_ms", "evaluation_state"],
+  }),
+  query({
+    id: "provider_cancellation",
+    title: "Provider cancellation terminal sessions",
+    failure_class: "cancellation",
+    stage: "provider",
+    terminal_reason: "provider_cancelled",
+    railway_query:
+      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"provider_cancelled" OR failure_class:"cancellation" OR signal:"provider_cancelled")',
+    evidence_fields: ["terminal_reason", "failure_class", "stage", "deploy_sha", "latency_ms"],
   }),
   query({
     id: "deploy_drain",
@@ -265,12 +283,13 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "release_gate_stale_evidence",
     stage: "release_gate",
     railway_query:
-      'artifact:"viva.release_evidence.v1" (failure_class:"release_gate_stale_evidence" OR release_gate.browser_skip_shortcut:true OR release_gate.evidence_age_seconds:">86400")',
+      'artifact:"viva.release_evidence.v1" (failure_class:"release_gate_stale_evidence" OR release_gate.browser_skip_shortcut:true OR generated_at:"<now-24h")',
     evidence_fields: [
       "stage",
       "deploy_sha",
+      "generated_at",
       "release_gate.browser_skip_shortcut",
-      "release_gate.evidence_age_seconds",
+      "release_gate.max_age_seconds",
     ],
   }),
 ]);
@@ -461,6 +480,8 @@ export const FAILURE_CLASS_COVERAGE = Object.freeze([
   coverage("network_disconnect", "bac525_network_disconnect_count"),
   coverage("slow_client", "bac525_watchdog_expiry_count"),
   coverage("cancellation", null, {
+    query_id: "provider_cancellation",
+    requires_query: true,
     no_operator_alert_reason:
       "Provider cancellation is normally learner or control initiated; it remains dashboard-only unless it escalates into timeout, recap failure, or network disconnect.",
   }),
@@ -553,6 +574,7 @@ export function assertProviderFailureObservabilityEvidence(evidence) {
     "startup_unavailable",
     "recap_failure",
     "pending_evaluation",
+    "provider_cancellation",
     "deploy_drain",
     "watchdog_expiry",
     "stuck_checking",

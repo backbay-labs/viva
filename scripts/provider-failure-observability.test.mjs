@@ -30,6 +30,7 @@ test("provider failure observability defines reusable sanitized log queries", ()
     "startup_unavailable",
     "recap_failure",
     "pending_evaluation",
+    "provider_cancellation",
     "deploy_drain",
     "watchdog_expiry",
     "stuck_checking",
@@ -63,10 +64,18 @@ test("provider failure observability defines reusable sanitized log queries", ()
     queriesById.get("token_refresh_failure").railway_query,
     /service:"web" event:"viva_session_route_failure"/,
   );
+  assert.doesNotMatch(
+    queriesById.get("token_refresh_failure").railway_query,
+    /token_refresh_outcome:"failed"/,
+  );
+  assert.match(
+    queriesById.get("startup_unavailable").railway_query,
+    /service:"web" event:"viva_session_route_failure"/,
+  );
   assert.match(queriesById.get("stuck_checking").railway_query, /monitor\.stuck_checking_sessions/);
   assert.match(
     queriesById.get("release_gate_stale_evidence").railway_query,
-    /release_gate\.evidence_age_seconds/,
+    /generated_at:"<now-24h"/,
   );
   for (const query of PROVIDER_FAILURE_LOG_QUERIES) {
     assert.equal(query.sanitized_query_only, true);
@@ -87,6 +96,7 @@ test("reviewed BAC-525 queries name emitted log and evidence surfaces", () => {
     "network_disconnect",
     "recap_failure",
     "pending_evaluation",
+    "provider_cancellation",
     "deploy_drain",
     "watchdog_expiry",
     "rollback_observed",
@@ -113,7 +123,7 @@ test("reviewed BAC-525 queries name emitted log and evidence surfaces", () => {
   assert(
     queriesById
       .get("release_gate_stale_evidence")
-      .evidence_fields.includes("release_gate.evidence_age_seconds"),
+      .evidence_fields.includes("release_gate.max_age_seconds"),
   );
 });
 
@@ -158,11 +168,12 @@ test("provider failure dashboard links the actual release evidence artifact path
   );
 });
 
-test("release check indexes stale-evidence fields before the dashboard queries them", async () => {
+test("release check exposes stale-evidence inputs without storing write-time age", async () => {
   const releaseCheck = await readFile("scripts/release-check.mjs", "utf8");
 
   assert.match(releaseCheck, /release_gate: buildReleaseGateEvidence/);
-  assert.match(releaseCheck, /evidence_age_seconds/);
+  assert.match(releaseCheck, /max_age_seconds/);
+  assert.doesNotMatch(releaseCheck, /evidence_age_seconds/);
   assert.match(releaseCheck, /browser_skip_shortcut/);
 });
 
