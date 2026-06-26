@@ -31,8 +31,8 @@ use super::tts::synthesize_sonic_websocket;
 use super::{
     audio_frame_bytes, gemini_request, parse_gemini_sse_line, parse_ink_event, parse_sonic_event,
     select_next_question, send_fake_unless_cancelled, sonic_generation_request,
-    CartesiaGeminiConfig, FakeRuntimeInterrupt, FakeRuntimeReport, GeminiStreamEvent, InkEvent,
-    SonicEvent, FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT, MAX_GEMINI_EXECUTED_TOOL_STAGES,
+    CartesiaGeminiConfig, FakeRuntimeInterrupt, FakeRuntimeReport, GeminiConfig, GeminiStreamEvent,
+    InkEvent, SonicEvent, FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT, MAX_GEMINI_EXECUTED_TOOL_STAGES,
     MAX_GEMINI_TOOL_LOOP_PASSES,
 };
 use super::{emit_fake_provider_error, parse_result_field};
@@ -540,17 +540,18 @@ where
                             from_model,
                             to_model,
                             reason,
+                            failure,
                         } = event
                         {
+                            promote_active_gemini_fallback(&mut active_gemini, &to_model);
                             events.push(BrainEvent::ProviderFallbackActivated {
                                 response_id: response_id.to_owned(),
                                 provider: "gemini".to_owned(),
                                 from_model,
-                                to_model: to_model.clone(),
+                                to_model,
                                 reason,
+                                failure,
                             });
-                            active_gemini.model_id = to_model;
-                            active_gemini.fallback_model_ids.clear();
                         }
                     }
                     return Err(failure.error);
@@ -685,15 +686,16 @@ where
                         from_model,
                         to_model,
                         reason,
+                        failure,
                     } => {
-                        active_gemini.model_id = to_model.clone();
-                        active_gemini.fallback_model_ids.clear();
+                        promote_active_gemini_fallback(&mut active_gemini, &to_model);
                         events.push(BrainEvent::ProviderFallbackActivated {
                             response_id: response_id.to_owned(),
                             provider: "gemini".to_owned(),
                             from_model,
                             to_model,
                             reason,
+                            failure,
                         });
                     }
                     GeminiStreamEvent::Error(message) => {
@@ -1257,6 +1259,17 @@ fn gemini_stream_event_error(message: String, model: &str, latency: Duration) ->
         model,
         latency,
     )
+}
+
+fn promote_active_gemini_fallback(active_gemini: &mut GeminiConfig, to_model: &str) {
+    let remaining_fallbacks = active_gemini
+        .fallback_model_ids
+        .iter()
+        .position(|model_id| model_id == to_model)
+        .map(|index| active_gemini.fallback_model_ids[index + 1..].to_vec())
+        .unwrap_or_default();
+    active_gemini.model_id = to_model.to_owned();
+    active_gemini.fallback_model_ids = remaining_fallbacks;
 }
 
 fn provider_stage_error_from_brain_error(
@@ -2382,6 +2395,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gemini_tool_loop_preserves_unused_fallbacks_after_model_switch() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        store.record_voice_session(&session_config).await.unwrap();
+        let session = AuthorizedStudySession::from_config(&session_config).unwrap();
+        let executor = VivaToolExecutor::new(store.clone(), session.clone());
+        let question = select_next_question(&executor, &session).await.unwrap();
+        let transports = FallbackContinuationCaptureTransports::default();
+        let runner = CartesiaGeminiRunner {
+            config: CartesiaGeminiConfig {
+                gemini: super::super::GeminiConfig {
+                    api_key: "gemini-test-key".to_owned(),
+                    model_id: "gemini-3.5-pro".to_owned(),
+                    fallback_model_ids: vec![
+                        "gemini-3.5-flash".to_owned(),
+                        "gemini-3.5-lite".to_owned(),
+                    ],
+                    ..super::super::GeminiConfig::default()
+                },
+                ..CartesiaGeminiConfig::default()
+            },
+            transports: transports.clone(),
+            store: Some(store),
+        };
+        let mut events = Vec::new();
+        let mut usage = BrainUsage::default();
+
+        runner
+            .run_gemini_tool_loop(GeminiToolLoopJob {
+                answer_text: "omitted",
+                cancelled: None,
+                emit_text_delta: false,
+                events: &mut events,
+                executor: &executor,
+                interrupt: FakeRuntimeInterrupt::None,
+                question: &question,
+                response_id: "response-1",
+                session: &session,
+                usage: &mut usage,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transports
+                .models
+                .lock()
+                .expect("models lock poisoned")
+                .as_slice(),
+            ["gemini-3.5-pro", "gemini-3.5-flash"]
+        );
+        assert_eq!(
+            transports
+                .fallback_lists
+                .lock()
+                .expect("fallback lists lock poisoned")
+                .as_slice(),
+            [
+                vec!["gemini-3.5-flash".to_owned(), "gemini-3.5-lite".to_owned()],
+                vec!["gemini-3.5-lite".to_owned()]
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn gemini_tool_loop_emits_fallback_activation_before_returning_failure() {
         let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
         let session_config = SessionConfig {
@@ -2493,11 +2577,8 @@ mod tests {
             .await;
 
         let mut events = Vec::new();
-        loop {
-            match timeout(Duration::from_millis(50), event_rx.recv()).await {
-                Ok(Some(event)) => events.push(event),
-                Ok(None) | Err(_) => break,
-            }
+        while let Ok(Some(event)) = timeout(Duration::from_millis(50), event_rx.recv()).await {
+            events.push(event);
         }
 
         let fallback_index = events
@@ -2529,6 +2610,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct FallbackContinuationCaptureTransports {
         models: Arc<Mutex<Vec<String>>>,
+        fallback_lists: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
     #[derive(Clone)]
@@ -2558,6 +2640,10 @@ mod tests {
             models.push(config.gemini.model_id.clone());
             let call_index = models.len();
             drop(models);
+            self.fallback_lists
+                .lock()
+                .expect("fallback lists lock poisoned")
+                .push(config.gemini.fallback_model_ids.clone());
 
             if call_index == 1 {
                 let args = json!({
@@ -2571,6 +2657,7 @@ mod tests {
                         from_model: "gemini-3.5-pro".to_owned(),
                         to_model: "gemini-3.5-flash".to_owned(),
                         reason: "primary_429".to_owned(),
+                        failure: None,
                     },
                     GeminiStreamEvent::FunctionCall {
                         id: "call-eval-1".to_owned(),
@@ -2640,6 +2727,7 @@ mod tests {
                     from_model: "gemini-3.5-pro".to_owned(),
                     to_model: "gemini-3.5-flash".to_owned(),
                     reason: "primary_429".to_owned(),
+                    failure: None,
                 }],
                 error: BrainError::StageFailure(Box::new(BrainProviderFailure::new(
                     BrainProviderFailureParts {

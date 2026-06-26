@@ -237,6 +237,7 @@ pub enum BrainEvent {
         from_model: String,
         to_model: String,
         reason: String,
+        failure: Option<BrainProviderFailure>,
     },
     Error(BrainProviderError),
     SpeechIntent(SpeechIntent),

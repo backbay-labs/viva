@@ -3375,9 +3375,15 @@ async fn record_brain_event(
         from_model,
         to_model,
         reason,
+        failure,
         ..
     } = event
     {
+        if let Some(failure) = failure {
+            state
+                .limit_state
+                .record_provider_failure(&state.voice_limits, failure);
+        }
         state.evidence.record(VoiceEvidenceEvent::new(
             VoiceEvidenceEventKind::ProviderFallback,
             voice_session_id,
@@ -5033,6 +5039,7 @@ mod tests {
             from_model: "gemini-3.5-pro".to_owned(),
             to_model: "gemini-3.5-flash".to_owned(),
             reason: "primary_429".to_owned(),
+            failure: None,
         };
 
         assert!(record_brain_event(
@@ -5055,5 +5062,70 @@ mod tests {
         assert!(evidence[0].detail.contains("from_model=gemini-3.5-pro"));
         assert!(evidence[0].detail.contains("to_model=gemini-3.5-flash"));
         assert!(evidence[0].detail.contains("reason=primary_429"));
+    }
+
+    #[tokio::test]
+    async fn provider_fallback_activation_rate_limit_feeds_provider_backoff() {
+        use std::sync::Arc;
+
+        use agent_adapters::SyntheticBrain;
+
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "cartesia_gemini",
+            crate::VoiceWsAccess::default(),
+            1,
+        )
+        .with_voice_limits(VoiceLimitConfig {
+            provider_backoff_default_ms: 1_000,
+            provider_backoff_max_ms: 5_000,
+            ..VoiceLimitConfig::default()
+        });
+        let event = agent_domain::BrainEvent::ProviderFallbackActivated {
+            response_id: "response-1".to_owned(),
+            provider: "gemini".to_owned(),
+            from_model: "gemini-3.5-pro".to_owned(),
+            to_model: "gemini-3.5-flash".to_owned(),
+            reason: "primary_429".to_owned(),
+            failure: Some(BrainProviderFailure::new(BrainProviderFailureParts {
+                failure_class: "quota_rate_failure".to_owned(),
+                stage: "gemini".to_owned(),
+                terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                retry_eligible: true,
+                latency_ms: 17,
+                provider: "gemini".to_owned(),
+                model: "gemini-3.5-pro".to_owned(),
+                metadata: "http_status=429 retry_after_ms=750 retry_after_source=retry_after_delta reset_hint=2030-01-01T00:00:00Z body_status=resource_exhausted budget_state=within_limit deploy_sha=test-sha".to_owned(),
+            })),
+        };
+
+        assert!(record_brain_event(
+            &state,
+            Some("voice-session-1".to_owned()),
+            &event,
+            Duration::from_secs(1),
+        )
+        .await
+        .is_none());
+
+        let admission = state
+            .limit_state
+            .try_admit_provider_turn(&state.voice_limits, ProviderQueueBehavior::Wait)
+            .await;
+        let ProviderAdmissionDecision::Denied(denial) = admission.decision else {
+            panic!("fallback 429 should install provider backoff");
+        };
+        assert_eq!(denial.reason, "provider_backoff");
+        assert_eq!(
+            denial.terminal_reason,
+            TerminalSessionReason::ProviderRateLimited
+        );
+        assert_eq!(denial.retry_after_ms, 750);
+        assert_eq!(denial.reset_hint, "2030-01-01T00:00:00Z");
+        assert_eq!(denial.budget_state, "within_limit");
+        assert!(state.evidence.snapshot().iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::ProviderFallback
+                && event.detail.contains("reason=primary_429")
+        }));
     }
 }

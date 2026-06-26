@@ -197,6 +197,7 @@ pub enum GeminiStreamEvent {
         from_model: String,
         to_model: String,
         reason: String,
+        failure: Option<BrainProviderFailure>,
     },
 }
 
@@ -340,6 +341,7 @@ where
                     } else {
                         "fallback_429".to_owned()
                     },
+                    failure: brain_provider_failure(&error),
                 });
                 last_rate_limit = Some(error);
                 continue;
@@ -395,17 +397,47 @@ fn gemini_attempt_failure(
     }
 }
 
+fn brain_provider_failure(error: &BrainError) -> Option<BrainProviderFailure> {
+    match error {
+        BrainError::StageFailure(failure) => Some((**failure).clone()),
+        _ => None,
+    }
+}
+
 fn gemini_generation_stage_timeout() -> BrainError {
     BrainError::Connection("Gemini generation stage timeout".to_owned())
 }
 
 fn gemini_attempt_request(config: &GeminiConfig, request: &Value) -> Value {
     let mut request = request.clone();
-    if config.thinking_level.is_some() && config.supports_thinking_config() {
-        return request;
+    if let Some(thinking_level) = &config.thinking_level {
+        if config.supports_thinking_config() {
+            upsert_gemini_thinking_config(&mut request, thinking_level);
+            return request;
+        }
     }
     remove_gemini_thinking_config(&mut request);
     request
+}
+
+fn upsert_gemini_thinking_config(request: &mut Value, thinking_level: &ThinkingLevel) {
+    let Some(request_object) = request.as_object_mut() else {
+        return;
+    };
+    let generation_config = request_object
+        .entry("generationConfig".to_owned())
+        .or_insert_with(|| json!({}));
+    if !generation_config.is_object() {
+        *generation_config = json!({});
+    }
+    if let Some(generation_config) = generation_config.as_object_mut() {
+        generation_config.insert(
+            "thinkingConfig".to_owned(),
+            json!({
+                "thinkingLevel": thinking_level.as_api_str(),
+            }),
+        );
+    }
 }
 
 fn remove_gemini_thinking_config(request: &mut Value) {
@@ -1416,6 +1448,40 @@ mod tests {
 
     use super::*;
 
+    fn assert_fallback_activation(
+        event: &GeminiStreamEvent,
+        from_model: &str,
+        to_model: &str,
+        reason: &str,
+        retry_after_ms: u64,
+    ) {
+        let GeminiStreamEvent::FallbackActivated {
+            from_model: actual_from,
+            to_model: actual_to,
+            reason: actual_reason,
+            failure,
+        } = event
+        else {
+            panic!("expected fallback activation, got {event:?}");
+        };
+        assert_eq!(actual_from, from_model);
+        assert_eq!(actual_to, to_model);
+        assert_eq!(actual_reason, reason);
+        let failure = failure
+            .as_ref()
+            .expect("fallback activation carries originating provider failure");
+        assert_eq!(failure.failure_class, "quota_rate_failure");
+        assert_eq!(
+            failure.terminal_reason,
+            TerminalSessionReason::ProviderRateLimited
+        );
+        assert_eq!(failure.provider, "gemini");
+        assert_eq!(failure.model, from_model.replace('.', ""));
+        assert!(failure
+            .metadata
+            .contains(&format!("retry_after_ms={retry_after_ms}")));
+    }
+
     #[test]
     fn normalizes_thinking_level_and_omits_for_older_models() {
         let config = GeminiConfig {
@@ -1541,13 +1607,19 @@ data: [DONE]
             ),
         };
         let config = GeminiConfig {
-            api_key: "local-fixture".to_owned(),
+            api_key: "gemini-test-key".to_owned(),
             base_url: "https://generativelanguage.googleapis.com/v1beta/models".to_owned(),
             model_id: "gemini-3.5-flash".to_owned(),
             ..GeminiConfig::default()
         };
         let body = json!({
-            "contents": [],
+            "contents": [{ "role": "user", "parts": [{ "text": "do not log this answer" }] }],
+        });
+        let mut expected_body = body.clone();
+        expected_body["generationConfig"] = json!({
+            "thinkingConfig": {
+                "thinkingLevel": "LOW",
+            },
         });
 
         let events = stream_gemini_with_client(&client, &config, body.clone())
@@ -1566,9 +1638,9 @@ data: [DONE]
             capture.url.as_deref(),
             Some("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse")
         );
-        assert_eq!(capture.api_key.as_deref(), Some("local-fixture"));
-        assert_eq!(capture.body.as_ref(), Some(&body));
-        assert!(!capture.url.as_ref().unwrap().contains("local-fixture"));
+        assert_eq!(capture.api_key.as_deref(), Some("gemini-test-key"));
+        assert_eq!(capture.body.as_ref(), Some(&expected_body));
+        assert!(!capture.url.as_ref().unwrap().contains("gemini-test-key"));
     }
 
     #[tokio::test]
@@ -2166,13 +2238,12 @@ data: [DONE]
         .await
         .expect("fallback model succeeds");
 
-        assert_eq!(
-            events[0],
-            GeminiStreamEvent::FallbackActivated {
-                from_model: "gemini-3.5-pro".to_owned(),
-                to_model: "gemini-3.5-flash".to_owned(),
-                reason: "primary_429".to_owned(),
-            }
+        assert_fallback_activation(
+            &events[0],
+            "gemini-3.5-pro",
+            "gemini-3.5-flash",
+            "primary_429",
+            3_000,
         );
         assert!(events.iter().any(|event| matches!(
             event,
@@ -2248,6 +2319,61 @@ data: [DONE]
             .expect("fallback body")
             .pointer("/generationConfig/thinkingConfig")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_reapplies_thinking_config_for_upgraded_fallback() {
+        let primary_config = GeminiConfig {
+            api_key: "gemini-test-key".to_owned(),
+            model_id: "gemini-2.5-flash".to_owned(),
+            fallback_model_ids: vec!["gemini-3.5-flash".to_owned()],
+            thinking_level: ThinkingLevel::parse("low"),
+            ..GeminiConfig::default()
+        };
+        let request = gemini_request(
+            &primary_config,
+            vec![json!({ "role": "user", "parts": [{ "text": "fixture-redacted-input" }] })],
+            &[],
+        );
+        assert!(request
+            .pointer("/generationConfig/thinkingConfig")
+            .is_none());
+        let client = SequencedGeminiSseClient {
+            captures: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(vec![
+                GeminiSseResponse {
+                    status: 429,
+                    body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
+                    retry_after: Some("2".to_owned()),
+                    reset_after: None,
+                },
+                GeminiSseResponse::ok(
+                    r#"data: {"candidates":[{"content":{"parts":[{"text":"fixture-fallback-ok"}]}}]}"#
+                        .to_owned(),
+                ),
+            ])),
+        };
+
+        stream_gemini_with_client(&client, &primary_config, request)
+            .await
+            .expect("upgraded fallback model succeeds");
+
+        let captures = client.captures.lock().expect("capture lock poisoned");
+        assert_eq!(captures.len(), 2);
+        assert!(captures[0]
+            .body
+            .as_ref()
+            .expect("primary body")
+            .pointer("/generationConfig/thinkingConfig")
+            .is_none());
+        assert_eq!(
+            captures[1]
+                .body
+                .as_ref()
+                .expect("fallback body")
+                .pointer("/generationConfig/thinkingConfig/thinkingLevel"),
+            Some(&json!("LOW"))
+        );
     }
 
     #[tokio::test]
@@ -2383,13 +2509,13 @@ data: [DONE]
         .await
         .unwrap_err();
 
-        assert_eq!(
-            failure.events,
-            vec![GeminiStreamEvent::FallbackActivated {
-                from_model: "gemini-3.5-pro".to_owned(),
-                to_model: "gemini-2.5-flash".to_owned(),
-                reason: "primary_429".to_owned(),
-            }]
+        assert_eq!(failure.events.len(), 1);
+        assert_fallback_activation(
+            &failure.events[0],
+            "gemini-3.5-pro",
+            "gemini-2.5-flash",
+            "primary_429",
+            1_000,
         );
         let BrainError::StageFailure(stage_failure) = failure.error else {
             panic!("expected Gemini fallback stage failure");
@@ -2426,13 +2552,13 @@ data: [DONE]
         .await
         .unwrap_err();
 
-        assert_eq!(
-            failure.events,
-            vec![GeminiStreamEvent::FallbackActivated {
-                from_model: "gemini-3.5-pro".to_owned(),
-                to_model: "gemini-2.5-flash".to_owned(),
-                reason: "primary_429".to_owned(),
-            }]
+        assert_eq!(failure.events.len(), 1);
+        assert_fallback_activation(
+            &failure.events[0],
+            "gemini-3.5-pro",
+            "gemini-2.5-flash",
+            "primary_429",
+            1_000,
         );
         let BrainError::StageFailure(stage_failure) = failure.error else {
             panic!("expected Gemini fallback empty response stage failure");
@@ -2517,13 +2643,13 @@ data: [DONE]
         .await
         .unwrap_err();
 
-        assert_eq!(
-            failure.events,
-            vec![GeminiStreamEvent::FallbackActivated {
-                from_model: "gemini-3.5-pro".to_owned(),
-                to_model: "gemini-3.5-flash".to_owned(),
-                reason: "primary_429".to_owned(),
-            }]
+        assert_eq!(failure.events.len(), 1);
+        assert_fallback_activation(
+            &failure.events[0],
+            "gemini-3.5-pro",
+            "gemini-3.5-flash",
+            "primary_429",
+            1_000,
         );
         assert_eq!(
             client.captures.lock().expect("capture lock poisoned").len(),
