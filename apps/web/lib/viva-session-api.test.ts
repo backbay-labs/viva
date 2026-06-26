@@ -7,6 +7,7 @@ import {
   VIVA_SESSION_AUTH_FAILURE_PROFILES,
   type VivaSessionRouteFailureClass,
   type VivaSessionRouteOutcome,
+  vivaSessionRouteFailureLogPayload,
 } from "../app/api/viva-session/shared";
 import { POST as startSession } from "../app/api/viva-session/start/route";
 
@@ -16,8 +17,10 @@ const { afterEach, beforeEach, describe, expect, test } = bunTest as typeof bunT
 };
 
 const originalFetch = globalThis.fetch;
+const originalConsoleWarn = console.warn;
 const originalEnv = {
   NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL,
+  VERCEL_GIT_COMMIT_SHA: process.env.VERCEL_GIT_COMMIT_SHA,
   VIVA_AGENT_HTTP_URL: process.env.VIVA_AGENT_HTTP_URL,
   VIVA_AGENT_REST_BEARER_TOKEN: process.env.VIVA_AGENT_REST_BEARER_TOKEN,
   VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET: process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET,
@@ -31,6 +34,7 @@ const originalEnv = {
 
 describe("Viva same-origin session API", () => {
   beforeEach(() => {
+    console.warn = () => {};
     resetVivaSessionMintRateLimitsForTests();
     process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
     process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
@@ -44,6 +48,7 @@ describe("Viva same-origin session API", () => {
   });
 
   afterEach(() => {
+    console.warn = originalConsoleWarn;
     globalThis.fetch = originalFetch;
     resetVivaSessionMintRateLimitsForTests();
     for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
@@ -711,6 +716,30 @@ describe("Viva same-origin session API", () => {
       },
     ]);
     expect(calls).toEqual([]);
+  });
+
+  test("session route failures expose sanitized log fields for provider dashboards", () => {
+    process.env.VERCEL_GIT_COMMIT_SHA = "abc123";
+
+    expect(
+      vivaSessionRouteFailureLogPayload(
+        {
+          error: "invalid_session_token",
+          failure_class: "auth_material_failure",
+          token_refresh_outcome: "invalid_rejected",
+        },
+        401,
+      ),
+    ).toEqual({
+      deploy_sha: "abc123",
+      error: "invalid_session_token",
+      event: "viva_session_route_failure",
+      failure_class: "auth_material_failure",
+      service: "web",
+      stage: "session_auth",
+      status: 401,
+      token_refresh_outcome: "invalid_rejected",
+    });
   });
 });
 

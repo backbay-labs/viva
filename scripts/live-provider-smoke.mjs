@@ -96,6 +96,9 @@ export function buildLiveSmokeConfig({ env = process.env, rootDir = root } = {})
     caps,
     enabled,
     httpBaseUrl,
+    liveMonitorConsecutiveFailures: optionalNonNegativeInteger(
+      env.VIVA_LIVE_MONITOR_CONSECUTIVE_FAILURES,
+    ),
     origin: env.VIVA_LIVE_SMOKE_ORIGIN?.trim() || null,
     outputPath,
     provider,
@@ -220,6 +223,11 @@ export async function runLiveProviderSmoke({
       ...websocket,
       required_events: requiredEvents,
     },
+    monitor: liveMonitorEvidence({
+      consecutiveFailures: config.liveMonitorConsecutiveFailures,
+      status,
+      terminalReason: websocket.terminal_reason,
+    }),
     usage: {
       events_before: readiness.usage_events,
       events_after: usageAfter,
@@ -724,6 +732,22 @@ function privacyEvidence() {
   };
 }
 
+function liveMonitorEvidence({ consecutiveFailures, status, terminalReason }) {
+  const failed = status === "failed";
+  const stuckChecking =
+    terminalReason === "recap_timeout" || terminalReason === "turn_cap_exceeded";
+  return {
+    failure_class: failed ? "live_monitor_failure" : null,
+    live_monitor_attempt_count: 1,
+    live_monitor_consecutive_failures: failed ? Math.max(1, consecutiveFailures) : 0,
+    sanitized: true,
+    signal: failed ? "live_monitor_failure" : null,
+    stage: "monitor",
+    stuck_checking_sessions: stuckChecking ? 1 : 0,
+    terminal_reason: terminalReason,
+  };
+}
+
 function readinessUnavailable() {
   return {
     access: {
@@ -810,6 +834,18 @@ function requiredPositiveNumber(env, name) {
   const parsed = Number.parseFloat(value);
   if (!Number.isFinite(parsed) || parsed <= 0) {
     throw new Error(`invalid live smoke cap ${name}`);
+  }
+  return parsed;
+}
+
+function optionalNonNegativeInteger(value) {
+  if (!hasValue(value)) return 0;
+  if (!/^\d+$/.test(value)) {
+    throw new Error("invalid live monitor consecutive failure count");
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error("invalid live monitor consecutive failure count");
   }
   return parsed;
 }

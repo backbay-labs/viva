@@ -129,8 +129,9 @@ try {
     path.join(root, "artifacts/e2e-browser"),
     path.join(root, "artifacts/e2e-browser-fake-provider"),
   ]);
+  const generatedAt = new Date();
   const evidence = {
-    generated_at: new Date().toISOString(),
+    generated_at: generatedAt.toISOString(),
     schema: "viva.release_evidence.v1",
     commands,
     release_claims: {
@@ -142,6 +143,7 @@ try {
     rollback_drain: rollbackDrain,
     provider_failure_observability: providerFailureObservability,
     browser_e2e: browserResult,
+    release_gate: buildReleaseGateEvidence({ browserResult, generatedAt }),
     artifact_audit: artifactAudit,
     release_bundle: buildReleaseBundleManifest(outputPath, commands, browserResult),
     privacy: {
@@ -439,6 +441,19 @@ function buildReleaseBundleManifest(outputPath, commandRecords, browserResult) {
         : browserFiles.map((file) => path.posix.join(browserArtifactDir, file)),
     // biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions expands this literal.
     workflow_artifact_name: "viva-release-evidence-${{ github.sha }}",
+  };
+}
+
+function buildReleaseGateEvidence({ browserResult, generatedAt }) {
+  const browserSkipShortcut = browserResult?.skipped === true;
+  return {
+    browser_skip_shortcut: browserSkipShortcut,
+    deploy_sha: process.env.VERCEL_GIT_COMMIT_SHA?.trim() || null,
+    evidence_age_seconds: Math.max(0, Math.floor((Date.now() - generatedAt.getTime()) / 1000)),
+    failure_class: browserSkipShortcut ? "release_gate_stale_evidence" : null,
+    generated_at: generatedAt.toISOString(),
+    sanitized: true,
+    stage: "release_gate",
   };
 }
 

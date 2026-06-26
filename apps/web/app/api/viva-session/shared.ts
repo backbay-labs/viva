@@ -9,6 +9,14 @@ export type VivaSessionRouteFailureClass = {
   token_refresh_outcome: string;
 };
 
+export type VivaSessionRouteFailureLog = VivaSessionRouteFailureClass & {
+  deploy_sha: string | null;
+  event: "viva_session_route_failure";
+  service: "web";
+  stage: string;
+  status: number;
+};
+
 export type VivaSessionRouteOutcome = {
   failure_class: null;
   session: {
@@ -800,19 +808,63 @@ function sessionJsonError(
     terminal_reason?: string;
   } = {},
 ): NextResponse<VivaSessionRouteFailureClass> {
-  return NextResponse.json(
-    {
-      error,
-      failure_class: options.failure_class ?? "session_bootstrap_failed",
-      ...(options.stage ? { stage: options.stage } : {}),
-      ...(options.terminal_reason ? { terminal_reason: options.terminal_reason } : {}),
-      token_refresh_outcome: tokenRefreshOutcome,
-    },
-    {
-      headers: { "cache-control": "no-store" },
-      status,
-    },
-  );
+  const body = {
+    error,
+    failure_class: options.failure_class ?? "session_bootstrap_failed",
+    ...(options.stage ? { stage: options.stage } : {}),
+    ...(options.terminal_reason ? { terminal_reason: options.terminal_reason } : {}),
+    token_refresh_outcome: tokenRefreshOutcome,
+  };
+  emitVivaSessionRouteFailureLog(body, status);
+  return NextResponse.json(body, {
+    headers: { "cache-control": "no-store" },
+    status,
+  });
+}
+
+export function vivaSessionRouteFailureLogPayload(
+  body: VivaSessionRouteFailureClass,
+  status: number,
+): VivaSessionRouteFailureLog {
+  return {
+    ...body,
+    deploy_sha: deploymentSha(),
+    event: "viva_session_route_failure",
+    service: "web",
+    stage: body.stage ?? sessionFailureStage(body.failure_class),
+    status,
+  };
+}
+
+function emitVivaSessionRouteFailureLog(body: VivaSessionRouteFailureClass, status: number) {
+  const payload = vivaSessionRouteFailureLogPayload(body, status);
+  console.warn(JSON.stringify(payload));
+}
+
+function sessionFailureStage(failureClass: string): string {
+  if (
+    failureClass === "auth_material_failure" ||
+    failureClass === "identity_mismatch" ||
+    failureClass === "malformed_token"
+  ) {
+    return "session_auth";
+  }
+  if (failureClass === "access_denied") return "access";
+  if (failureClass === "rate_limit") return "admission";
+  return "session_bootstrap";
+}
+
+function deploymentSha(): string | null {
+  for (const name of [
+    "VERCEL_GIT_COMMIT_SHA",
+    "RAILWAY_GIT_COMMIT_SHA",
+    "GITHUB_SHA",
+    "SOURCE_VERSION",
+  ]) {
+    const value = process.env[name]?.trim();
+    if (value) return value.slice(0, 64);
+  }
+  return null;
 }
 
 function requestOrigin(request: NextRequest): string {

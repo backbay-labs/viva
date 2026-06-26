@@ -1313,6 +1313,127 @@ fn terminal_reason_for_provider_message(message: &str) -> TerminalSessionReason 
     TerminalSessionReason::ProviderNetworkDisconnect
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TerminalObservabilityClassification {
+    failure_class: &'static str,
+    stage: &'static str,
+    signal: &'static str,
+}
+
+fn terminal_observability_classification(
+    reason: &str,
+) -> Option<TerminalObservabilityClassification> {
+    let classification = match reason {
+        "provider_rate_limited" => TerminalObservabilityClassification {
+            failure_class: "quota_rate_failure",
+            stage: "provider",
+            signal: "gemini_http_429",
+        },
+        "provider_auth_failed" => TerminalObservabilityClassification {
+            failure_class: "provider_auth_failure",
+            stage: "provider_auth",
+            signal: "provider_auth_failed",
+        },
+        "provider_timeout" => TerminalObservabilityClassification {
+            failure_class: "timeout",
+            stage: "websocket",
+            signal: "provider_timeout",
+        },
+        "provider_malformed_stream" => TerminalObservabilityClassification {
+            failure_class: "malformed_stream",
+            stage: "websocket",
+            signal: "provider_malformed_stream",
+        },
+        "provider_network_disconnect" => TerminalObservabilityClassification {
+            failure_class: "network_disconnect",
+            stage: "transport",
+            signal: "provider_network_disconnect",
+        },
+        "partial_stage_success" => TerminalObservabilityClassification {
+            failure_class: "partial_stage_success",
+            stage: "recap",
+            signal: "recap_failure",
+        },
+        "pending_evaluation" => TerminalObservabilityClassification {
+            failure_class: "pending_evaluation",
+            stage: "store",
+            signal: "pending_evaluation",
+        },
+        "cost_budget" => TerminalObservabilityClassification {
+            failure_class: "cost_budget",
+            stage: "provider",
+            signal: "cost_budget_exhausted",
+        },
+        "rate_limit" => TerminalObservabilityClassification {
+            failure_class: "local_rate_limit",
+            stage: "session",
+            signal: "local_rate_limit",
+        },
+        "turn_cap" => TerminalObservabilityClassification {
+            failure_class: "turn_cap",
+            stage: "session",
+            signal: "turn_cap",
+        },
+        "session_cap" => TerminalObservabilityClassification {
+            failure_class: "session_cap",
+            stage: "session",
+            signal: "session_cap",
+        },
+        "slow_client" => TerminalObservabilityClassification {
+            failure_class: "slow_client",
+            stage: "session",
+            signal: "slow_client",
+        },
+        "drained" => TerminalObservabilityClassification {
+            failure_class: "deploy_drain",
+            stage: "deployment",
+            signal: "deploy_drain",
+        },
+        "rollback" => TerminalObservabilityClassification {
+            failure_class: "rollback",
+            stage: "rollback",
+            signal: "rollback_required",
+        },
+        _ => return None,
+    };
+    Some(classification)
+}
+
+fn deployment_sha() -> String {
+    for name in [
+        "RAILWAY_GIT_COMMIT_SHA",
+        "VERCEL_GIT_COMMIT_SHA",
+        "GITHUB_SHA",
+        "SOURCE_VERSION",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.chars().take(64).collect();
+            }
+        }
+    }
+    "unknown".to_owned()
+}
+
+fn emit_terminal_observability_log(state: &AppState, reason: &str) {
+    let Some(classification) = terminal_observability_classification(reason) else {
+        return;
+    };
+    let deploy_sha = deployment_sha();
+    tracing::warn!(
+        event = "provider_failure_observed",
+        failure_class = classification.failure_class,
+        stage = classification.stage,
+        provider = %state.provider,
+        model = "unknown",
+        deploy_sha = %deploy_sha,
+        terminal_reason = reason,
+        signal = classification.signal,
+        "viva provider failure observed"
+    );
+}
+
 async fn open_failure_control_session(
     state: &AppState,
     config: SessionConfig,
@@ -2513,6 +2634,7 @@ fn record_terminal_evidence(state: &AppState, voice_session_id: Option<String>, 
         voice_session_id.clone(),
         reason,
     ));
+    emit_terminal_observability_log(state, reason);
     state.evidence.record(VoiceEvidenceEvent::new(
         VoiceEvidenceEventKind::Close,
         voice_session_id,
@@ -2643,6 +2765,35 @@ mod tests {
             "fake-provider-store",
             "postgres adapter error: closed voice session cannot be reopened"
         ));
+    }
+
+    #[test]
+    fn terminal_observability_classifier_emits_query_backing_fields() {
+        assert_eq!(
+            terminal_observability_classification("provider_rate_limited"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "quota_rate_failure",
+                stage: "provider",
+                signal: "gemini_http_429",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("provider_auth_failed"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "provider_auth_failure",
+                stage: "provider_auth",
+                signal: "provider_auth_failed",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("turn_cap"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "turn_cap",
+                stage: "session",
+                signal: "turn_cap",
+            })
+        );
+        assert_eq!(terminal_observability_classification("completed"), None);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import fixture from "./fixtures/provider-failure-dashboard-samples.json" with { type: "json" };
@@ -56,13 +57,64 @@ test("provider failure observability defines reusable sanitized log queries", ()
   );
   assert.match(
     queriesById.get("live_monitor_failure").railway_query,
-    /live_monitor_consecutive_failures/,
+    /monitor\.live_monitor_consecutive_failures/,
+  );
+  assert.match(
+    queriesById.get("token_refresh_failure").railway_query,
+    /service:"web" event:"viva_session_route_failure"/,
+  );
+  assert.match(queriesById.get("stuck_checking").railway_query, /monitor\.stuck_checking_sessions/);
+  assert.match(
+    queriesById.get("release_gate_stale_evidence").railway_query,
+    /release_gate\.evidence_age_seconds/,
   );
   for (const query of PROVIDER_FAILURE_LOG_QUERIES) {
     assert.equal(query.sanitized_query_only, true);
     assert.match(query.id, /^[a-z0-9_]+$/);
     assert(query.evidence_fields.length > 0);
   }
+});
+
+test("reviewed BAC-525 queries name emitted log and evidence surfaces", () => {
+  const queriesById = new Map(PROVIDER_FAILURE_LOG_QUERIES.map((entry) => [entry.id, entry]));
+
+  for (const id of [
+    "provider_429",
+    "provider_auth_failure",
+    "provider_timeout",
+    "cost_budget",
+    "malformed_stream",
+    "network_disconnect",
+    "recap_failure",
+    "pending_evaluation",
+    "deploy_drain",
+    "watchdog_expiry",
+    "rollback_observed",
+  ]) {
+    assert.match(
+      queriesById.get(id).railway_query,
+      /event:"provider_failure_observed"/,
+      `${id} must query the agent structured terminal emitter`,
+    );
+  }
+
+  assert.match(
+    queriesById.get("token_refresh_failure").railway_query,
+    /event:"viva_session_route_failure"/,
+  );
+  assert.match(
+    queriesById.get("stuck_checking").railway_query,
+    /artifact:"viva.live_provider_smoke.v1"/,
+  );
+  assert.match(
+    queriesById.get("live_monitor_failure").railway_query,
+    /artifact:"viva.live_provider_smoke.v1"/,
+  );
+  assert(
+    queriesById
+      .get("release_gate_stale_evidence")
+      .evidence_fields.includes("release_gate.evidence_age_seconds"),
+  );
 });
 
 test("provider failure dashboard groups by every required operator dimension", () => {
@@ -104,6 +156,14 @@ test("provider failure dashboard links the actual release evidence artifact path
       .path,
     "artifacts/custom-release/evidence.json",
   );
+});
+
+test("release check indexes stale-evidence fields before the dashboard queries them", async () => {
+  const releaseCheck = await readFile("scripts/release-check.mjs", "utf8");
+
+  assert.match(releaseCheck, /release_gate: buildReleaseGateEvidence/);
+  assert.match(releaseCheck, /evidence_age_seconds/);
+  assert.match(releaseCheck, /browser_skip_shortcut/);
 });
 
 test("provider alerts reuse BAC-527 rollback thresholds without copying numbers", () => {

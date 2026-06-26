@@ -672,6 +672,7 @@ test("runLiveProviderSmoke maps runtime rate terminal phases to quota-rate failu
         VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
         VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
         VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "https://agent.viva.test",
+        VIVA_LIVE_MONITOR_CONSECUTIVE_FAILURES: "2",
       },
       fetchImpl: async (url) => {
         if (String(url).endsWith("/health/brain")) {
@@ -708,6 +709,10 @@ test("runLiveProviderSmoke maps runtime rate terminal phases to quota-rate failu
     assert.equal(evidence.websocket.terminal_reason, "rate_limit");
     assert.equal(evidence.failure.failure_class, "quota_rate_failure");
     assert.equal(evidence.failure.terminal_reason, "provider_rate_limited");
+    assert.equal(evidence.monitor.failure_class, "live_monitor_failure");
+    assert.equal(evidence.monitor.live_monitor_attempt_count, 1);
+    assert.equal(evidence.monitor.live_monitor_consecutive_failures, 2);
+    assert.equal(evidence.monitor.signal, "live_monitor_failure");
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

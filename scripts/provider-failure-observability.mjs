@@ -49,7 +49,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "provider",
     terminal_reason: "provider_rate_limited",
     railway_query:
-      'service:"agent-service" (signal:"gemini_http_429" OR terminal_reason:"provider_rate_limited" OR failure_class:"quota_rate_failure")',
+      'service:"agent-service" event:"provider_failure_observed" (signal:"gemini_http_429" OR terminal_reason:"provider_rate_limited" OR failure_class:"quota_rate_failure")',
     evidence_fields: [
       "failure_class",
       "stage",
@@ -69,7 +69,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "provider_auth",
     terminal_reason: "provider_auth_failed",
     railway_query:
-      'service:"agent-service" (terminal_reason:"provider_auth_failed" OR failure_class:"provider_auth_failure")',
+      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"provider_auth_failed" OR failure_class:"provider_auth_failure")',
     evidence_fields: ["failure_class", "stage", "provider", "model", "deploy_sha", "latency_ms"],
   }),
   query({
@@ -79,7 +79,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "websocket",
     terminal_reason: "provider_timeout",
     railway_query:
-      'service:"agent-service" (terminal_reason:"provider_timeout" OR failure_class:"timeout")',
+      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"provider_timeout" OR failure_class:"timeout")',
     evidence_fields: [
       "terminal_reason",
       "failure_class",
@@ -97,7 +97,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "provider",
     terminal_reason: "cost_budget",
     railway_query:
-      'service:"agent-service" (terminal_reason:"cost_budget" OR failure_class:"cost_budget" OR cost_budget_exhausted:true)',
+      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"cost_budget" OR failure_class:"cost_budget" OR signal:"cost_budget_exhausted")',
     evidence_fields: [
       "terminal_reason",
       "failure_class",
@@ -116,7 +116,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "websocket",
     terminal_reason: "provider_malformed_stream",
     railway_query:
-      'service:"agent-service" (terminal_reason:"provider_malformed_stream" OR failure_class:"malformed_stream")',
+      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"provider_malformed_stream" OR failure_class:"malformed_stream")',
     evidence_fields: [
       "terminal_reason",
       "failure_class",
@@ -134,7 +134,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "transport",
     terminal_reason: "provider_network_disconnect",
     railway_query:
-      'service:"agent-service" (terminal_reason:"provider_network_disconnect" OR failure_class:"network_disconnect")',
+      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"provider_network_disconnect" OR failure_class:"network_disconnect")',
     evidence_fields: [
       "terminal_reason",
       "failure_class",
@@ -151,7 +151,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "session_auth_failure",
     stage: "session_auth",
     railway_query:
-      'service:"agent-service" (failure_class:"session_auth_failure" OR failure_class:"auth_material_failure" OR token_refresh_outcome:"failed")',
+      'service:"web" event:"viva_session_route_failure" (failure_class:"session_auth_failure" OR failure_class:"auth_material_failure" OR failure_class:"malformed_token" OR failure_class:"identity_mismatch" OR token_refresh_outcome:"failed" OR token_refresh_outcome:"invalid_rejected" OR token_refresh_outcome:"malformed_rejected" OR token_refresh_outcome:"identity_mismatch")',
     evidence_fields: [
       "failure_class",
       "stage",
@@ -176,7 +176,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "recap",
     terminal_reason: "partial_stage_success",
     railway_query:
-      'service:"agent-service" (terminal_reason:"partial_stage_success" OR failure_class:"recap_failure" OR recap_success:false)',
+      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"partial_stage_success" OR failure_class:"recap_failure" OR signal:"recap_failure")',
     evidence_fields: [
       "terminal_reason",
       "failure_class",
@@ -192,7 +192,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "pending_evaluation",
     stage: "store",
     railway_query:
-      'service:"agent-service" (failure_class:"pending_evaluation" OR terminal_reason:"pending_evaluation" OR evaluation_state:"pending")',
+      'service:"agent-service" event:"provider_failure_observed" (failure_class:"pending_evaluation" OR terminal_reason:"pending_evaluation")',
     evidence_fields: ["failure_class", "stage", "deploy_sha", "latency_ms", "evaluation_state"],
   }),
   query({
@@ -202,7 +202,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "deployment",
     terminal_reason: "drained",
     railway_query:
-      'service:"agent-service" (terminal_reason:"drained" OR failure_class:"deploy_drain")',
+      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"drained" OR failure_class:"deploy_drain")',
     evidence_fields: ["terminal_reason", "failure_class", "stage", "deploy_sha", "latency_ms"],
   }),
   query({
@@ -212,7 +212,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "session",
     terminal_reason: "turn_cap",
     railway_query:
-      'service:"agent-service" (terminal_reason:"turn_cap" OR terminal_reason:"slow_client" OR terminal_reason:"rate_limit" OR terminal_reason:"session_cap" OR failure_class:"turn_cap" OR failure_class:"local_rate_limit" OR failure_class:"session_cap")',
+      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"turn_cap" OR terminal_reason:"slow_client" OR terminal_reason:"rate_limit" OR terminal_reason:"session_cap" OR failure_class:"turn_cap" OR failure_class:"local_rate_limit" OR failure_class:"session_cap")',
     evidence_fields: ["terminal_reason", "failure_class", "stage", "deploy_sha", "latency_ms"],
   }),
   query({
@@ -221,8 +221,15 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "stuck_checking",
     stage: "session",
     railway_query:
-      'service:"web" (failure_class:"stuck_checking" OR ui_state:"checking" elapsed_ms:">45000" submitted_answer:true)',
-    evidence_fields: ["failure_class", "stage", "deploy_sha", "latency_ms"],
+      'artifact:"viva.live_provider_smoke.v1" (failure_class:"stuck_checking" OR monitor.stuck_checking_sessions:">=1" OR terminal_reason:"recap_timeout")',
+    evidence_fields: [
+      "failure_class",
+      "stage",
+      "deploy_sha",
+      "latency_ms",
+      "monitor.stuck_checking_sessions",
+      "terminal_reason",
+    ],
   }),
   query({
     id: "live_monitor_failure",
@@ -230,7 +237,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "live_monitor_failure",
     stage: "monitor",
     railway_query:
-      'service:"monitor" (failure_class:"live_monitor_failure" OR live_monitor_consecutive_failures:">=2" OR signal:"live_monitor_failure")',
+      'artifact:"viva.live_provider_smoke.v1" (failure_class:"live_monitor_failure" OR monitor.live_monitor_consecutive_failures:">=2" OR monitor.signal:"live_monitor_failure")',
     evidence_fields: [
       "failure_class",
       "stage",
@@ -238,7 +245,8 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
       "model",
       "deploy_sha",
       "latency_ms",
-      "live_monitor_consecutive_failures",
+      "monitor.live_monitor_attempt_count",
+      "monitor.live_monitor_consecutive_failures",
     ],
   }),
   query({
@@ -248,7 +256,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "rollback",
     terminal_reason: "rollback",
     railway_query:
-      'service:"agent-service" (terminal_reason:"rollback" OR failure_class:"rollback" OR rollback_required:true)',
+      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"rollback" OR failure_class:"rollback" OR signal:"rollback_required")',
     evidence_fields: ["terminal_reason", "failure_class", "stage", "deploy_sha", "latency_ms"],
   }),
   query({
@@ -257,8 +265,13 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "release_gate_stale_evidence",
     stage: "release_gate",
     railway_query:
-      'artifact:"viva.release_evidence.v1" (failure_class:"release_gate_stale_evidence" OR browser_e2e.skipped:true OR evidence_age_seconds:">86400")',
-    evidence_fields: ["stage", "deploy_sha", "latency_ms"],
+      'artifact:"viva.release_evidence.v1" (failure_class:"release_gate_stale_evidence" OR release_gate.browser_skip_shortcut:true OR release_gate.evidence_age_seconds:">86400")',
+    evidence_fields: [
+      "stage",
+      "deploy_sha",
+      "release_gate.browser_skip_shortcut",
+      "release_gate.evidence_age_seconds",
+    ],
   }),
 ]);
 
