@@ -2251,13 +2251,68 @@ impl StudyMemoryStore for PostgresStudyStore {
             }
             source_span_ids.push(Self::uuid_for(&moment.source.source_id)?);
         }
-        let result = sqlx::query(
-            "INSERT INTO session_recaps (id, user_id, study_set_id, voice_session_id, strong_concepts, shaky_concepts, missed_concepts, review_later, source_span_ids)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             ON CONFLICT (user_id, study_set_id, voice_session_id, strong_concepts, shaky_concepts, missed_concepts, review_later, source_span_ids)
-             DO NOTHING",
+        let recap_insert_id = Uuid::new_v4();
+        let inserted = sqlx::query_scalar::<_, bool>(
+            "WITH input (
+                 id,
+                 user_id,
+                 study_set_id,
+                 voice_session_id,
+                 strong_concepts,
+                 shaky_concepts,
+                 missed_concepts,
+                 review_later,
+                 source_span_ids
+             ) AS (
+                 VALUES ($1::uuid, $2::text, $3::uuid, $4::uuid, $5::text[], $6::text[], $7::text[], $8::text[], $9::uuid[])
+             ),
+             inserted AS (
+                 INSERT INTO session_recaps (
+                     id,
+                     user_id,
+                     study_set_id,
+                     voice_session_id,
+                     strong_concepts,
+                     shaky_concepts,
+                     missed_concepts,
+                     review_later,
+                     source_span_ids
+                 )
+                 SELECT
+                     id,
+                     user_id,
+                     study_set_id,
+                     voice_session_id,
+                     strong_concepts,
+                     shaky_concepts,
+                     missed_concepts,
+                     review_later,
+                     source_span_ids
+                 FROM input
+                 ON CONFLICT (user_id, study_set_id, voice_session_id) DO NOTHING
+                 RETURNING TRUE AS inserted
+             ),
+             updated AS (
+                 UPDATE session_recaps existing
+                 SET strong_concepts = input.strong_concepts,
+                     shaky_concepts = input.shaky_concepts,
+                     missed_concepts = input.missed_concepts,
+                     review_later = input.review_later,
+                     source_span_ids = input.source_span_ids
+                 FROM input
+                 WHERE existing.user_id = input.user_id
+                   AND existing.study_set_id = input.study_set_id
+                   AND existing.voice_session_id = input.voice_session_id
+                   AND NOT EXISTS (SELECT 1 FROM inserted)
+                 RETURNING FALSE AS inserted
+             )
+             SELECT COALESCE(
+                 (SELECT inserted FROM inserted),
+                 (SELECT inserted FROM updated),
+                 FALSE
+             )",
         )
-        .bind(Uuid::new_v4())
+        .bind(recap_insert_id)
         .bind(user_id)
         .bind(study_set_uuid)
         .bind(voice_session_uuid)
@@ -2266,10 +2321,10 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(&recap.missed_concepts)
         .bind(&recap.review_later)
         .bind(&source_span_ids)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(pg_error)?;
-        if result.rows_affected() > 0 {
+        if inserted {
             self.increment_count(WriteCountKind::Recap)?;
         }
         self.record_event_authorization(

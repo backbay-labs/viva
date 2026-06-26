@@ -1298,11 +1298,11 @@ fn brain_event_submitted_answer_resolution(
     event: &agent_domain::BrainEvent,
 ) -> Option<SubmittedAnswerResolution> {
     match event {
-        agent_domain::BrainEvent::RecapReady { .. }
-        | agent_domain::BrainEvent::TerminalSessionPhase { .. } => {
+        agent_domain::BrainEvent::TerminalSessionPhase { .. } => {
             Some(SubmittedAnswerResolution::All)
         }
-        agent_domain::BrainEvent::AnswerEvaluated { .. }
+        agent_domain::BrainEvent::RecapReady { .. }
+        | agent_domain::BrainEvent::AnswerEvaluated { .. }
         | agent_domain::BrainEvent::ResponseCompleted { .. }
         | agent_domain::BrainEvent::ResponseCancelledFor { .. } => {
             Some(SubmittedAnswerResolution::One {
@@ -1320,11 +1320,11 @@ fn brain_event_provider_turn_completion(
     event: &agent_domain::BrainEvent,
 ) -> Option<SubmittedAnswerResolution> {
     match event {
-        agent_domain::BrainEvent::RecapReady { .. }
-        | agent_domain::BrainEvent::TerminalSessionPhase { .. } => {
+        agent_domain::BrainEvent::TerminalSessionPhase { .. } => {
             Some(SubmittedAnswerResolution::All)
         }
         agent_domain::BrainEvent::AnswerEvaluated { .. }
+        | agent_domain::BrainEvent::RecapReady { .. }
         | agent_domain::BrainEvent::ResponseCompleted { .. }
         | agent_domain::BrainEvent::ResponseCancelledFor { .. } => {
             Some(SubmittedAnswerResolution::One {

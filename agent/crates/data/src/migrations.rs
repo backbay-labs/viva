@@ -58,6 +58,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0013_recap_and_concept_status_atomic_replay_guard.sql",
         include_str!("../../../migrations/0013_recap_and_concept_status_atomic_replay_guard.sql"),
     ),
+    (
+        "0014_session_recaps_one_row_per_session.sql",
+        include_str!("../../../migrations/0014_session_recaps_one_row_per_session.sql"),
+    ),
 ];
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
@@ -332,6 +336,8 @@ mod tests {
         assert!(sql.contains(
             "ON session_recaps (user_id, study_set_id, voice_session_id, strong_concepts, shaky_concepts, missed_concepts, review_later, source_span_ids)"
         ));
+        assert!(sql.contains("session_recaps_voice_session_unique_idx"));
+        assert!(sql.contains("ON session_recaps (user_id, study_set_id, voice_session_id)"));
         assert!(sql.contains("concept_status_events"));
         assert!(sql.contains(
             "PRIMARY KEY (user_id, study_set_id, voice_session_id, response_id, concept_id, payload_sha256)"
@@ -954,6 +960,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optional_postgres_record_recap_replaces_session_payload_without_incrementing_count_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&store, &session_id).await;
+        let mut first = fixture_recap();
+        first.voice_session_id.clone_from(&session_id);
+        let mut replacement = first.clone();
+        replacement.strong_concepts.push("ATP synthase".to_owned());
+        replacement.shaky_concepts.clear();
+
+        store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                "response-recap-a",
+                first,
+            )
+            .await
+            .expect("first recap records");
+        store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                "response-recap-b",
+                replacement,
+            )
+            .await
+            .expect("second recap replaces session row");
+
+        assert_eq!(store.write_counts().recaps, 1);
+        let row_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM session_recaps
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND voice_session_id = $3",
+        )
+        .bind("user-1")
+        .bind(fixture_uuid("biology-midterm").expect("study set fixture UUID"))
+        .bind(parse_uuid(&session_id).expect("voice session UUID"))
+        .fetch_one(&pool)
+        .await
+        .expect("recap row count query succeeds");
+        assert_eq!(row_count, 1);
+        let strong_concepts = sqlx::query_scalar::<_, Vec<String>>(
+            "SELECT strong_concepts
+             FROM session_recaps
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND voice_session_id = $3",
+        )
+        .bind("user-1")
+        .bind(fixture_uuid("biology-midterm").expect("study set fixture UUID"))
+        .bind(parse_uuid(&session_id).expect("voice session UUID"))
+        .fetch_one(&pool)
+        .await
+        .expect("recap strong concepts query succeeds");
+        assert_eq!(
+            strong_concepts,
+            vec!["NADH".to_owned(), "ATP synthase".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_postgres_session_recap_backfill_dedupes_existing_session_rows_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations_until(&pool, "0014_session_recaps_one_row_per_session.sql")
+            .await
+            .expect("pre-0014 migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&store, &session_id).await;
+        let study_set_uuid = fixture_uuid("biology-midterm").expect("study set fixture UUID");
+        let voice_session_uuid = parse_uuid(&session_id).expect("voice session UUID");
+        let source_uuid = fixture_uuid("src-lecture-5-slide-18").expect("source span fixture UUID");
+
+        for (strong, shaky, offset_seconds) in [
+            (
+                vec!["NADH".to_owned()],
+                vec!["ATP synthase".to_owned()],
+                0_i64,
+            ),
+            (
+                vec!["NADH".to_owned(), "ATP synthase".to_owned()],
+                Vec::new(),
+                1_i64,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO session_recaps (
+                    id,
+                    user_id,
+                    study_set_id,
+                    voice_session_id,
+                    strong_concepts,
+                    shaky_concepts,
+                    missed_concepts,
+                    review_later,
+                    source_span_ids,
+                    created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, '{}', $7, $8, NOW() + ($9 || ' seconds')::interval)",
+            )
+            .bind(Uuid::new_v4())
+            .bind("user-1")
+            .bind(study_set_uuid)
+            .bind(voice_session_uuid)
+            .bind(strong)
+            .bind(shaky)
+            .bind(vec!["ATP synthase".to_owned()])
+            .bind(vec![source_uuid])
+            .bind(offset_seconds.to_string())
+            .execute(&pool)
+            .await
+            .expect("pre-0014 duplicate session recap row inserts");
+        }
+        assert_eq!(session_recap_rows_for_session(&pool, &session_id).await, 2);
+
+        apply_migration_sql(&pool, "0014_session_recaps_one_row_per_session.sql")
+            .await
+            .expect("0014 migration applies");
+
+        assert_eq!(session_recap_rows_for_session(&pool, &session_id).await, 1);
+        let unique_index_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM pg_indexes
+                WHERE schemaname = 'public'
+                  AND tablename = 'session_recaps'
+                  AND indexname = 'session_recaps_voice_session_unique_idx'
+            )",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("unique recap index existence query succeeds");
+        assert!(unique_index_exists);
+        let duplicate_insert = sqlx::query(
+            "INSERT INTO session_recaps (
+                id,
+                user_id,
+                study_set_id,
+                voice_session_id,
+                strong_concepts,
+                shaky_concepts,
+                missed_concepts,
+                review_later,
+                source_span_ids
+            )
+            VALUES ($1, $2, $3, $4, $5, '{}', '{}', '{}', $6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind("user-1")
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .bind(vec!["replacement".to_owned()])
+        .bind(vec![source_uuid])
+        .execute(&pool)
+        .await;
+        assert!(
+            duplicate_insert.is_err(),
+            "0014 unique index must block a second recap row for the same session"
+        );
+    }
+
+    #[tokio::test]
     async fn optional_postgres_record_concept_status_concurrent_replay_is_atomic_when_database_url_is_set(
     ) {
         let Some(pool) = optional_postgres_pool().await else {
@@ -1235,6 +1422,28 @@ mod tests {
                 .await
                 .expect("DATABASE_URL should connect for optional postgres test"),
         )
+    }
+
+    async fn run_migrations_until(
+        pool: &sqlx::PgPool,
+        stop_before_name: &str,
+    ) -> Result<(), sqlx::Error> {
+        for (name, _) in MIGRATIONS {
+            if *name == stop_before_name {
+                break;
+            }
+            apply_migration_sql(pool, name).await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_migration_sql(pool: &sqlx::PgPool, name: &str) -> Result<(), sqlx::Error> {
+        let sql = MIGRATIONS
+            .iter()
+            .find_map(|(migration_name, sql)| (*migration_name == name).then_some(*sql))
+            .unwrap_or_else(|| panic!("missing migration {name}"));
+        sqlx::raw_sql(sql).execute(pool).await?;
+        Ok(())
     }
 
     async fn record_fixture_session(store: &dyn StudyMemoryStore) {
@@ -1544,6 +1753,18 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("concept status event row count query succeeds")
+    }
+
+    async fn session_recap_rows_for_session(pool: &sqlx::PgPool, voice_session_id: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM session_recaps
+             WHERE voice_session_id = $1",
+        )
+        .bind(parse_uuid(voice_session_id).expect("session id is a UUID"))
+        .fetch_one(pool)
+        .await
+        .expect("session recap row count query succeeds")
     }
 
     async fn count_rows(pool: &sqlx::PgPool, table: &str) -> i64 {

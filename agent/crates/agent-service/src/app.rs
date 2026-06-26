@@ -260,6 +260,21 @@ impl VoiceLimitState {
         queue_behavior: ProviderQueueBehavior,
     ) -> ProviderAdmission {
         if !limits.provider_limiter_enabled {
+            if let ProviderQueueBehavior::Deny {
+                reason,
+                terminal_reason,
+            } = queue_behavior
+            {
+                return ProviderAdmission::denied(ProviderAdmissionDenial {
+                    reason,
+                    terminal_reason,
+                    retry_after_ms: 0,
+                    reset_hint: "none".to_owned(),
+                    budget_state: "within_limit".to_owned(),
+                    queue_depth: 0,
+                    queue_delay_ms: 0,
+                });
+            }
             return ProviderAdmission::admitted(None, 0, "disabled");
         }
         let mut reservation: Option<ProviderQueueReservation> = None;
