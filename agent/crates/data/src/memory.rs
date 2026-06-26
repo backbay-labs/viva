@@ -2715,18 +2715,6 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 ));
             }
         }
-        let persisted = PersistedSessionRecap::from(recap);
-        if !state.recaps.iter().any(|record| {
-            record.user_id == user_id
-                && record.study_set_id == study_set_id
-                && record.voice_session_id == voice_session_id
-                && record.recap == persisted
-        }) {
-            return Err(PortError::adapter(
-                "memory",
-                "recap event does not match persisted session recap",
-            ));
-        }
         let authorization = event_authorization_record(
             user_id,
             study_set_id,
@@ -4484,6 +4472,95 @@ mod tests {
         assert!(!persisted.contains("Connect this to the proton gradient"));
         assert!(!persisted.contains("NADH source"));
         assert!(!persisted.contains("Forged browser-only"));
+    }
+
+    #[tokio::test]
+    async fn authorizes_recap_event_from_recorded_write_after_later_recap_replacement() {
+        let store = seeded_store();
+        record_fixture_session(&store).await;
+
+        let first_recap = StudySessionRecap {
+            voice_session_id: "voice-session-1".to_owned(),
+            headline: "First recap".to_owned(),
+            summary: "Initial recap.".to_owned(),
+            strong_concepts: vec!["NADH".to_owned()],
+            shaky_concepts: vec![],
+            missed_concepts: vec![],
+            review_later: vec!["ATP synthase".to_owned()],
+            next_action: "Review oxidative phosphorylation.".to_owned(),
+            source_moments: vec![RecapSourceMoment {
+                text: "NADH source".to_owned(),
+                source: fixture_source_reference(),
+                status: ConceptStatus::Strong,
+            }],
+        };
+        let second_recap = StudySessionRecap {
+            voice_session_id: "voice-session-1".to_owned(),
+            headline: "Second recap".to_owned(),
+            summary: "Replacement recap.".to_owned(),
+            strong_concepts: vec!["ATP synthase".to_owned()],
+            shaky_concepts: vec!["NADH".to_owned()],
+            missed_concepts: vec![],
+            review_later: vec![],
+            next_action: "Compare electron transport steps.".to_owned(),
+            source_moments: vec![RecapSourceMoment {
+                text: "ATP synthase source".to_owned(),
+                source: fixture_source_reference(),
+                status: ConceptStatus::Shaky,
+            }],
+        };
+
+        store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-a",
+                first_recap.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-b",
+                second_recap.clone(),
+            )
+            .await
+            .unwrap();
+
+        store
+            .authorize_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-a",
+                &first_recap,
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .authorize_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-b",
+                &first_recap,
+            )
+            .await
+            .is_err());
+        store
+            .authorize_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-b",
+                &second_recap,
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

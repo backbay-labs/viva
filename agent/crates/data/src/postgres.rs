@@ -458,41 +458,6 @@ impl PostgresStudyStore {
         .map_err(pg_error)
     }
 
-    async fn recap_was_recorded(
-        &self,
-        user_id: &str,
-        study_set_uuid: Uuid,
-        voice_session_uuid: Uuid,
-        recap: &StudySessionRecap,
-        source_span_ids: &[Uuid],
-    ) -> Result<bool, PortError> {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM session_recaps
-                WHERE user_id = $1
-                  AND study_set_id = $2
-                  AND voice_session_id = $3
-                  AND strong_concepts = $4
-                  AND shaky_concepts = $5
-                  AND missed_concepts = $6
-                  AND review_later = $7
-                  AND source_span_ids = $8
-             )",
-        )
-        .bind(user_id)
-        .bind(study_set_uuid)
-        .bind(voice_session_uuid)
-        .bind(&recap.strong_concepts)
-        .bind(&recap.shaky_concepts)
-        .bind(&recap.missed_concepts)
-        .bind(&recap.review_later)
-        .bind(source_span_ids)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(pg_error)
-    }
-
     async fn concept_uuid_for(
         &self,
         study_set_uuid: Uuid,
@@ -1727,7 +1692,6 @@ impl StudyMemoryStore for PostgresStudyStore {
         let voice_session_uuid = Self::uuid_for(voice_session_id)?;
         self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
             .await?;
-        let mut source_span_ids = Vec::new();
         for moment in &recap.source_moments {
             let canonical = self
                 .source_reference(user_id, study_set_id, &moment.source.source_id)
@@ -1745,22 +1709,6 @@ impl StudyMemoryStore for PostgresStudyStore {
                     "recap source tuple does not match deterministic retrieval",
                 ));
             }
-            source_span_ids.push(Self::uuid_for(&moment.source.source_id)?);
-        }
-        if !self
-            .recap_was_recorded(
-                user_id,
-                study_set_uuid,
-                voice_session_uuid,
-                recap,
-                &source_span_ids,
-            )
-            .await?
-        {
-            return Err(PortError::adapter(
-                "postgres",
-                "recap event does not match persisted session recap",
-            ));
         }
         if !self.has_event_authorization(
             user_id,
