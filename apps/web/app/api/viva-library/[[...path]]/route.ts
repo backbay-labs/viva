@@ -20,13 +20,13 @@ export async function DELETE(request: NextRequest, context: VivaLibraryRouteCont
 }
 
 export function OPTIONS() {
-  return new NextResponse(null, { status: 204 });
+  return new NextResponse(null, { headers: noStoreHeaders(), status: 204 });
 }
 
 async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibraryRouteContext) {
   const agentBaseUrl = vivaAgentServerHttpBaseUrl();
   if (!agentBaseUrl) {
-    return NextResponse.json({ error: "viva_agent_unavailable" }, { status: 503 });
+    return vivaLibraryProxyJsonError(503, "viva_agent_unavailable");
   }
   const { path = [] } = await context.params;
   const upstream = new URL(
@@ -39,15 +39,24 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   const headers = vivaLibraryProxyHeaders(request, {
     serverBearerToken: serverBearer.token,
   });
-  const response = await fetch(upstream, {
-    body: request.method === "POST" ? await request.text() : undefined,
-    cache: "no-store",
-    headers,
-    method: request.method,
-  });
+  let response: Response;
+  try {
+    response = await fetch(upstream, {
+      body: request.method === "POST" ? await request.text() : undefined,
+      cache: "no-store",
+      headers,
+      method: request.method,
+    });
+  } catch {
+    return vivaLibraryProxyJsonError(502, "viva_library_proxy_unavailable");
+  }
+  if (serverBearer.snapshotFilter && !response.ok) {
+    return vivaLibraryProxyJsonError(response.status, "viva_library_proxy_unavailable");
+  }
   const responseHeaders = new Headers();
   const contentType = response.headers.get("content-type");
   if (contentType) responseHeaders.set("content-type", contentType);
+  responseHeaders.set("cache-control", "no-store");
   const responseBody = await browserSafeLibraryResponseBody(response, path, contentType, {
     origin: vivaLibraryProxyOrigin(request),
     snapshotFilter: serverBearer.snapshotFilter,
@@ -60,6 +69,16 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
 
 function vivaAgentServerHttpBaseUrl(): string | null {
   return process.env.VIVA_AGENT_HTTP_URL?.trim() || null;
+}
+
+function noStoreHeaders(headers: HeadersInit = {}): Headers {
+  const output = new Headers(headers);
+  output.set("cache-control", "no-store");
+  return output;
+}
+
+function vivaLibraryProxyJsonError(status: number, error: string): NextResponse<{ error: string }> {
+  return NextResponse.json({ error }, { headers: noStoreHeaders(), status });
 }
 
 function vivaLibraryProxyHeaders(
@@ -111,7 +130,7 @@ function serverBearerForBrowserLibrarySnapshot(
   if (!token) {
     return {
       ok: false,
-      response: NextResponse.json({ error: "viva_library_auth_unavailable" }, { status: 503 }),
+      response: vivaLibraryProxyJsonError(503, "viva_library_auth_unavailable"),
     };
   }
 
@@ -119,7 +138,7 @@ function serverBearerForBrowserLibrarySnapshot(
   if (!userId) {
     return {
       ok: false,
-      response: NextResponse.json({ error: "viva_library_user_required" }, { status: 400 }),
+      response: vivaLibraryProxyJsonError(400, "viva_library_user_required"),
     };
   }
   const allowedUserIds = configuredAllowlist("VIVA_SESSION_ALLOWED_USER_IDS");
@@ -127,16 +146,13 @@ function serverBearerForBrowserLibrarySnapshot(
   if (!allowedUserIds || !allowedStudySetIds) {
     return {
       ok: false,
-      response: NextResponse.json(
-        { error: "viva_library_identity_allowlist_unavailable" },
-        { status: 503 },
-      ),
+      response: vivaLibraryProxyJsonError(503, "viva_library_identity_allowlist_unavailable"),
     };
   }
   if (!allowedUserIds.has(userId)) {
     return {
       ok: false,
-      response: NextResponse.json({ error: "viva_library_identity_not_allowed" }, { status: 403 }),
+      response: vivaLibraryProxyJsonError(403, "viva_library_identity_not_allowed"),
     };
   }
   return { ok: true, snapshotFilter: { allowedStudySetIds, userId }, token };
@@ -182,7 +198,7 @@ async function browserSafeLibraryResponseBody(
             userId: options.snapshotFilter.userId,
           })
         : filtered;
-      return JSON.stringify(stripLibraryTokenFields(withBootstrapTokens));
+      return JSON.stringify(stripLibrarySessionTokens(withBootstrapTokens));
     } catch {
       return "{}";
     }
@@ -234,13 +250,13 @@ function librarySessionAllowed(
   );
 }
 
-function stripLibraryTokenFields(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripLibraryTokenFields);
+function stripLibrarySessionTokens(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripLibrarySessionTokens);
   if (!value || typeof value !== "object") return value;
   const output: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
-    if (key === "session_token" || key === "control_token") continue;
-    output[key] = stripLibraryTokenFields(child);
+    if (key === "session_token") continue;
+    output[key] = stripLibrarySessionTokens(child);
   }
   return output;
 }

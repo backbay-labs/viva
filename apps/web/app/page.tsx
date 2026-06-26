@@ -7,7 +7,7 @@ import {
 import { browserInitialLibrarySnapshot, type VivaLibrarySnapshot } from "../lib/viva-library";
 import { attachVivaSessionBootstrapTokensToLibrarySnapshot } from "./api/viva-session/shared";
 
-export const dynamic = "force-dynamic";
+export const dynamic = "auto";
 
 export default async function Page() {
   const initialLibrarySnapshot = await initialSnapshot();

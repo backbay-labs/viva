@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { Children, type ReactElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import Page from "../../app/page";
-import type { VivaLibrarySnapshot } from "../../lib/viva-library";
+import Page, { dynamic } from "../../app/page";
+import { projectLibrarySnapshot, type VivaLibrarySnapshot } from "../../lib/viva-library";
 import { LandingEntry, landingEntryTarget } from "./LandingEntry";
 import { LandingHero } from "./LandingHero";
-import { libraryActionSessionTarget } from "./LibraryStatusPanel";
+import { libraryActionSessionTarget, startServerSession } from "./LibraryStatusPanel";
 
 type LandingHeroProps = Parameters<typeof LandingHero>[0];
 
@@ -180,17 +180,70 @@ describe("LandingEntry", () => {
         "Bearer server-rest-bearer",
       );
       expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("session_token");
-      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("control_token");
       expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("viva1.server-token");
-      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain(
-        "viva1.control-token",
-      );
+      expect(page.props.initialLibrarySnapshot.privacy.export).toEqual({
+        available: true,
+        control_token: "viva1.control-token",
+      });
     } finally {
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
       restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
       restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+    }
+  });
+
+  test("the landing page stays compatible with static export builds", () => {
+    expect(dynamic).toBe("auto");
+  });
+
+  test("refreshes expired bootstrap capabilities before retrying session start", async () => {
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    const navigations: string[] = [];
+    const staleSnapshot = librarySnapshotWithBootstrap("stale-bootstrap-capability");
+    const freshSnapshot = librarySnapshotWithBootstrap("fresh-bootstrap-capability");
+    const row = projectLibrarySnapshot(staleSnapshot).libraryRows[0];
+    if (!row) throw new Error("fixture must include a library row");
+    try {
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ input: String(input), init });
+        if (calls.length === 1) {
+          return new Response(JSON.stringify({ error: "session_bootstrap_capability_required" }), {
+            headers: { "content-type": "application/json" },
+            status: 403,
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            session: {
+              session_id: "server-session",
+              study_set_id: "biology-midterm",
+              user_id: "user-1",
+            },
+            session_token: "redacted-session-token",
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        );
+      }) as typeof fetch;
+
+      await startServerSession(row, "start", row.start, {
+        navigate: (target) => navigations.push(target),
+        refreshLibrary: async () => freshSnapshot,
+      });
+
+      expect(calls).toHaveLength(2);
+      expect(JSON.parse(String(calls[0]?.init?.body)).session_bootstrap_token).toBe(
+        "stale-bootstrap-capability",
+      );
+      expect(JSON.parse(String(calls[1]?.init?.body)).session_bootstrap_token).toBe(
+        "fresh-bootstrap-capability",
+      );
+      expect(navigations).toEqual([
+        "/session?user_id=user-1&study_set_id=biology-midterm&session_id=server-session#session_token=redacted-session-token",
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
     }
   });
 
@@ -212,6 +265,27 @@ describe("LandingEntry", () => {
     expect(markup).toContain("viva-library__action--primary");
   });
 });
+
+function librarySnapshotWithBootstrap(sessionBootstrapToken: string): VivaLibrarySnapshot {
+  const readyStudySet = librarySnapshot.study_sets[0];
+  if (!readyStudySet) throw new Error("fixture must include a ready study set");
+  return {
+    ...librarySnapshot,
+    study_sets: [
+      {
+        ...readyStudySet,
+        actions: {
+          ...readyStudySet.actions,
+          start: {
+            available: true,
+            session_bootstrap_token: sessionBootstrapToken,
+            session_id: "server-session",
+          },
+        },
+      },
+    ],
+  };
+}
 
 function restoreEnv(name: string, value: string | undefined) {
   if (value === undefined) {

@@ -179,7 +179,7 @@ export function projectLibrarySnapshot(
 
 export function redactVivaLibrarySessionTokens(snapshot: VivaLibrarySnapshot): VivaLibrarySnapshot {
   return stripBrowserOnlyTokenFields(snapshot, {
-    controlToken: true,
+    controlToken: false,
     sessionToken: true,
   }) as VivaLibrarySnapshot;
 }
@@ -189,7 +189,7 @@ export function browserInitialLibrarySnapshot(
   options: { staticExport?: boolean } = {},
 ): VivaLibrarySnapshot {
   return stripBrowserOnlyTokenFields(snapshot, {
-    controlToken: true,
+    controlToken: false,
     sessionToken: !options.staticExport,
   }) as VivaLibrarySnapshot;
 }

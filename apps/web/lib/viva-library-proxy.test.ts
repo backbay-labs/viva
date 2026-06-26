@@ -41,6 +41,7 @@ describe("Viva library proxy", () => {
       expect(headers.get("x-viva-library-control-token")).toBe("viva1.control-token");
       expect(headers.get("origin")).toBe("http://localhost:3000");
       expect(headers.get("authorization")).toBe(null);
+      expect(response.headers.get("cache-control")).toBe("no-store");
     } finally {
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
@@ -118,7 +119,6 @@ describe("Viva library proxy", () => {
       process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
       process.env.VIVA_AGENT_REST_BEARER_TOKEN = "server-rest-bearer";
       process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
-      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
       process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
       globalThis.fetch = (async () =>
         new Response(
@@ -208,8 +208,12 @@ describe("Viva library proxy", () => {
       expect(JSON.stringify(body)).not.toContain("user-2");
       expect(JSON.stringify(body)).not.toContain("history-final");
       expect(JSON.stringify(body)).not.toContain("session_token");
-      expect(JSON.stringify(body)).not.toContain("control_token");
-      expect(JSON.stringify(body)).not.toContain("viva1.");
+      expect(body.privacy.export.control_token).toBe("viva1.export-control");
+      expect(body.study_sets[0].actions.delete.control_token).toBe("viva1.delete-control");
+      expect(JSON.stringify(body)).not.toContain("session_token");
+      expect(JSON.stringify(body)).not.toContain("viva1.disallowed");
+      expect(JSON.stringify(body)).not.toContain("viva1.allowed-session-token");
+      expect(response.headers.get("cache-control")).toBe("no-store");
     } finally {
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
@@ -313,8 +317,11 @@ describe("Viva library proxy", () => {
       expect(JSON.stringify(body)).not.toContain("user-2");
       expect(JSON.stringify(body)).not.toContain("history-final");
       expect(JSON.stringify(body)).not.toContain("session_token");
-      expect(JSON.stringify(body)).not.toContain("control_token");
-      expect(JSON.stringify(body)).not.toContain("viva1.");
+      expect(body.privacy.export.control_token).toBe("viva1.export-control");
+      expect(body.study_sets[0].actions.delete.control_token).toBe("viva1.delete-control");
+      expect(JSON.stringify(body)).not.toContain("session_token");
+      expect(JSON.stringify(body)).not.toContain("viva1.disallowed");
+      expect(JSON.stringify(body)).not.toContain("viva1.allowed-session-token");
     } finally {
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
@@ -365,6 +372,51 @@ describe("Viva library proxy", () => {
     }
   });
 
+  test("sanitizes upstream browser library snapshot errors after private bearer injection", async () => {
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_AGENT_REST_BEARER_TOKEN = "server-rest-bearer";
+      process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({
+            authorization: "Bearer server-rest-bearer",
+            detail: "agent failure at http://agent.test/study-sets/library",
+            session_token: "viva1.raw-upstream-token",
+          }),
+          { headers: { "content-type": "application/json" }, status: 503 },
+        )) as typeof fetch;
+
+      const request = {
+        headers: new Headers(),
+        method: "GET",
+        nextUrl: new URL(
+          "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-1",
+        ),
+      } as unknown as NextRequest;
+
+      const response = await GET(request, {
+        params: Promise.resolve({ path: ["study-sets", "library"] }),
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(503);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(body).toEqual({ error: "viva_library_proxy_unavailable" });
+      expect(JSON.stringify(body)).not.toContain("server-rest-bearer");
+      expect(JSON.stringify(body)).not.toContain("agent.test");
+      expect(JSON.stringify(body)).not.toContain("session_token");
+      expect(JSON.stringify(body)).not.toContain("viva1.");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+    }
+  });
+
   test("fails browser library snapshots closed when the server REST bearer is missing", async () => {
     const calls: string[] = [];
     try {
@@ -395,6 +447,7 @@ describe("Viva library proxy", () => {
 
       expect(response.status).toBe(503);
       expect(body).toEqual({ error: "viva_library_auth_unavailable" });
+      expect(response.headers.get("cache-control")).toBe("no-store");
       expect(calls).toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;
@@ -436,6 +489,7 @@ describe("Viva library proxy", () => {
 
       expect(response.status).toBe(503);
       expect(body).toEqual({ error: "viva_agent_unavailable" });
+      expect(response.headers.get("cache-control")).toBe("no-store");
       expect(calls).toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;
@@ -495,6 +549,35 @@ describe("Viva library proxy", () => {
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
       restoreEnv("VIVA_VOICE_WS_BEARER_TOKEN", originalBearer);
+    }
+  });
+
+  test("converts agent fetch failures to sanitized uncached proxy errors", async () => {
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      globalThis.fetch = (async () => {
+        throw new Error("connection refused for server-rest-bearer at http://agent.test");
+      }) as typeof fetch;
+
+      const request = {
+        headers: new Headers({ "x-viva-library-control-token": "viva1.control-token" }),
+        method: "GET",
+        nextUrl: new URL("http://localhost:3000/api/viva-library/study-sets/export?user_id=user-1"),
+      } as unknown as NextRequest;
+
+      const response = await GET(request, {
+        params: Promise.resolve({ path: ["study-sets", "export"] }),
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(502);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(body).toEqual({ error: "viva_library_proxy_unavailable" });
+      expect(JSON.stringify(body)).not.toContain("server-rest-bearer");
+      expect(JSON.stringify(body)).not.toContain("agent.test");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
     }
   });
 });
