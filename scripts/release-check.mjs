@@ -17,11 +17,6 @@ import {
   buildFailureControlPlan,
   failureControlHarnessEvidence,
 } from "./failure-control-harness.mjs";
-import {
-  buildProviderReadinessMatrix,
-  LIVE_PROVIDER_GATE_COMMAND_NAME,
-  PROVIDER_READINESS_TARGETS,
-} from "./provider-readiness-matrix.mjs";
 import fixtureProviderFailureDashboard from "./fixtures/provider-failure-dashboard-samples.json" with {
   type: "json",
 };
@@ -30,6 +25,11 @@ import {
   providerFailureObservabilityEvidence,
 } from "./provider-failure-observability.mjs";
 import { assertNoForbiddenEvidenceMarkers, auditTextArtifacts } from "./redaction-control.mjs";
+import {
+  buildProviderReadinessMatrix,
+  LIVE_PROVIDER_GATE_COMMAND_NAME,
+  PROVIDER_READINESS_TARGETS,
+} from "./provider-readiness-matrix.mjs";
 import {
   assertRollbackReleaseGate,
   buildRollbackReleaseEvidence,
@@ -78,6 +78,7 @@ try {
     "--test",
     "scripts/provider-failure-observability.test.mjs",
   ]);
+  await runRollbackDrainProofCommands();
   await run("provider_gate_tests", "cargo", [
     "test",
     "--manifest-path",

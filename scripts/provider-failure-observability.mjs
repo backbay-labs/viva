@@ -5,6 +5,7 @@ import {
   REQUIRED_ROLLBACK_TRIGGER_IDS,
   ROLLBACK_TRIGGER_THRESHOLDS,
 } from "./rollback-drain-criteria.mjs";
+import { assertNoForbiddenEvidenceMarkers } from "./redaction-control.mjs";
 
 const OBSERVABILITY_SCHEMA = "viva.provider_failure_observability.v1";
 
@@ -79,7 +80,34 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     terminal_reason: "provider_timeout",
     railway_query:
       'service:"agent-service" (terminal_reason:"provider_timeout" OR failure_class:"timeout")',
-    evidence_fields: ["terminal_reason", "failure_class", "stage", "provider", "model", "deploy_sha", "latency_ms"],
+    evidence_fields: [
+      "terminal_reason",
+      "failure_class",
+      "stage",
+      "provider",
+      "model",
+      "deploy_sha",
+      "latency_ms",
+    ],
+  }),
+  query({
+    id: "cost_budget",
+    title: "Provider cost-budget terminal turns",
+    failure_class: "cost_budget",
+    stage: "provider",
+    terminal_reason: "cost_budget",
+    railway_query:
+      'service:"agent-service" (terminal_reason:"cost_budget" OR failure_class:"cost_budget" OR cost_budget_exhausted:true)',
+    evidence_fields: [
+      "terminal_reason",
+      "failure_class",
+      "stage",
+      "provider",
+      "model",
+      "deploy_sha",
+      "latency_ms",
+      "cost_usd",
+    ],
   }),
   query({
     id: "malformed_stream",
@@ -89,7 +117,15 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     terminal_reason: "provider_malformed_stream",
     railway_query:
       'service:"agent-service" (terminal_reason:"provider_malformed_stream" OR failure_class:"malformed_stream")',
-    evidence_fields: ["terminal_reason", "failure_class", "stage", "provider", "model", "deploy_sha", "latency_ms"],
+    evidence_fields: [
+      "terminal_reason",
+      "failure_class",
+      "stage",
+      "provider",
+      "model",
+      "deploy_sha",
+      "latency_ms",
+    ],
   }),
   query({
     id: "network_disconnect",
@@ -99,7 +135,15 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     terminal_reason: "provider_network_disconnect",
     railway_query:
       'service:"agent-service" (terminal_reason:"provider_network_disconnect" OR failure_class:"network_disconnect")',
-    evidence_fields: ["terminal_reason", "failure_class", "stage", "provider", "model", "deploy_sha", "latency_ms"],
+    evidence_fields: [
+      "terminal_reason",
+      "failure_class",
+      "stage",
+      "provider",
+      "model",
+      "deploy_sha",
+      "latency_ms",
+    ],
   }),
   query({
     id: "token_refresh_failure",
@@ -107,8 +151,14 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "session_auth_failure",
     stage: "session_auth",
     railway_query:
-      'service:"agent-service" (failure_class:"session_auth_failure" OR token_refresh_outcome:"failed")',
-    evidence_fields: ["failure_class", "stage", "deploy_sha", "token_refresh_outcome", "latency_ms"],
+      'service:"agent-service" (failure_class:"session_auth_failure" OR failure_class:"auth_material_failure" OR token_refresh_outcome:"failed")',
+    evidence_fields: [
+      "failure_class",
+      "stage",
+      "deploy_sha",
+      "token_refresh_outcome",
+      "latency_ms",
+    ],
   }),
   query({
     id: "recap_failure",
@@ -117,8 +167,24 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "recap",
     terminal_reason: "partial_stage_success",
     railway_query:
-      'service:"agent-service" (terminal_reason:"partial_stage_success" OR recap_success:false)',
-    evidence_fields: ["terminal_reason", "failure_class", "stage", "deploy_sha", "latency_ms", "recap_success"],
+      'service:"agent-service" (terminal_reason:"partial_stage_success" OR failure_class:"recap_failure" OR recap_success:false)',
+    evidence_fields: [
+      "terminal_reason",
+      "failure_class",
+      "stage",
+      "deploy_sha",
+      "latency_ms",
+      "recap_success",
+    ],
+  }),
+  query({
+    id: "pending_evaluation",
+    title: "Saved pending-evaluation durable states",
+    failure_class: "pending_evaluation",
+    stage: "store",
+    railway_query:
+      'service:"agent-service" (failure_class:"pending_evaluation" OR terminal_reason:"pending_evaluation" OR evaluation_state:"pending")',
+    evidence_fields: ["failure_class", "stage", "deploy_sha", "latency_ms", "evaluation_state"],
   }),
   query({
     id: "deploy_drain",
@@ -137,7 +203,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "session",
     terminal_reason: "turn_cap",
     railway_query:
-      'service:"agent-service" (terminal_reason:"turn_cap" OR terminal_reason:"slow_client" OR failure_class:"turn_cap")',
+      'service:"agent-service" (terminal_reason:"turn_cap" OR terminal_reason:"slow_client" OR terminal_reason:"rate_limit" OR terminal_reason:"session_cap" OR failure_class:"turn_cap" OR failure_class:"local_rate_limit" OR failure_class:"session_cap")',
     evidence_fields: ["terminal_reason", "failure_class", "stage", "deploy_sha", "latency_ms"],
   }),
   query({
@@ -146,8 +212,35 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "stuck_checking",
     stage: "session",
     railway_query:
-      'service:"web" ui_state:"checking" elapsed_ms:">45000" submitted_answer:true',
+      'service:"web" (failure_class:"stuck_checking" OR ui_state:"checking" elapsed_ms:">45000" submitted_answer:true)',
     evidence_fields: ["failure_class", "stage", "deploy_sha", "latency_ms"],
+  }),
+  query({
+    id: "live_monitor_failure",
+    title: "Consecutive hosted live monitor failures",
+    failure_class: "live_monitor_failure",
+    stage: "monitor",
+    railway_query:
+      'service:"monitor" (failure_class:"live_monitor_failure" OR live_monitor_consecutive_failures:">=2" OR signal:"live_monitor_failure")',
+    evidence_fields: [
+      "failure_class",
+      "stage",
+      "provider",
+      "model",
+      "deploy_sha",
+      "latency_ms",
+      "live_monitor_consecutive_failures",
+    ],
+  }),
+  query({
+    id: "rollback_observed",
+    title: "Rollback decisions and executions",
+    failure_class: "rollback",
+    stage: "rollback",
+    terminal_reason: "rollback",
+    railway_query:
+      'service:"agent-service" (terminal_reason:"rollback" OR failure_class:"rollback" OR rollback_required:true)',
+    evidence_fields: ["terminal_reason", "failure_class", "stage", "deploy_sha", "latency_ms"],
   }),
   query({
     id: "release_gate_stale_evidence",
@@ -155,10 +248,20 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "release_gate_stale_evidence",
     stage: "release_gate",
     railway_query:
-      'artifact:"viva.release_evidence.v1" (browser_e2e.skipped:true OR evidence_age_seconds:">86400")',
+      'artifact:"viva.release_evidence.v1" (failure_class:"release_gate_stale_evidence" OR browser_e2e.skipped:true OR evidence_age_seconds:">86400")',
     evidence_fields: ["stage", "deploy_sha", "latency_ms"],
   }),
 ]);
+
+const ROLLBACK_THRESHOLD_QUERY_IDS = Object.freeze({
+  provider_429_rate_percent: "provider_429",
+  provider_timeout_rate_percent: "provider_timeout",
+  provider_auth_failure_count: "provider_auth_failure",
+  stuck_checking_sessions: "stuck_checking",
+  recap_failure_rate_percent: "recap_failure",
+  token_refresh_failure_rate_percent: "token_refresh_failure",
+  live_monitor_consecutive_failures: "live_monitor_failure",
+});
 
 const alertFromRollbackThreshold = (threshold) =>
   Object.freeze({
@@ -177,6 +280,7 @@ const alertFromRollbackThreshold = (threshold) =>
     minimum_failure_metric: threshold.minimum_failure_metric,
     minimum_failure_value: threshold.minimum_failure_value,
     severity: "rollback_candidate",
+    query_id: ROLLBACK_THRESHOLD_QUERY_IDS[threshold.id],
     rollback_threshold_source: "scripts/rollback-drain-criteria.mjs",
   });
 
@@ -222,6 +326,18 @@ export const PROVIDER_FAILURE_ALERTS = Object.freeze([
     sustained_seconds: 3_600,
     severity: "release_blocking",
     query_id: "release_gate_stale_evidence",
+  }),
+  alert({
+    id: "bac525_cost_budget_exhausted",
+    failure_class: "cost_budget",
+    stage: "provider",
+    metric: "cost_budget_terminal_count",
+    value: 1,
+    unit: "count",
+    window_seconds: 600,
+    sustained_seconds: 60,
+    severity: "operator_page",
+    query_id: "cost_budget",
   }),
   alert({
     id: "bac525_malformed_stream_count",
@@ -281,7 +397,7 @@ export const PROVIDER_FAILURE_ALERTS = Object.freeze([
     window_seconds: 600,
     sustained_seconds: 60,
     severity: "operator_page",
-    query_id: "recap_failure",
+    query_id: "pending_evaluation",
   }),
   alert({
     id: "bac525_rollback_observed",
@@ -293,7 +409,7 @@ export const PROVIDER_FAILURE_ALERTS = Object.freeze([
     window_seconds: 600,
     sustained_seconds: 60,
     severity: "release_blocking",
-    query_id: "deploy_drain",
+    query_id: "rollback_observed",
   }),
 ]);
 
@@ -310,9 +426,7 @@ export const FAILURE_CLASS_COVERAGE = Object.freeze([
   coverage("partial_stage_success", "bac525_recap_failure_rate_percent"),
   coverage("provider_auth_failure", "bac525_provider_auth_failure_count"),
   coverage("quota_rate_failure", "bac525_provider_429_rate_percent"),
-  coverage("cost_budget", "bac525_provider_429_rate_percent", {
-    note: "Cost-budget exhaustion shares the provider quota/cost dashboard row and rollback candidate path.",
-  }),
+  coverage("cost_budget", "bac525_cost_budget_exhausted"),
   coverage("local_rate_limit", "bac525_watchdog_expiry_count", {
     note: "Local rate limits are grouped with watchdog/turn-cap pressure.",
   }),
@@ -397,18 +511,23 @@ export function assertProviderFailureObservabilityEvidence(evidence) {
   if (evidence.schema !== OBSERVABILITY_SCHEMA) {
     throw new Error("Invalid provider failure observability schema");
   }
-  const queryIds = new Set(evidence.log_queries.map((entry) => entry.id));
+  const queriesById = new Map(evidence.log_queries.map((entry) => [entry.id, entry]));
+  const queryIds = new Set(queriesById.keys());
   for (const id of [
     "provider_429",
     "provider_auth_failure",
     "provider_timeout",
+    "cost_budget",
     "malformed_stream",
     "network_disconnect",
     "token_refresh_failure",
     "recap_failure",
+    "pending_evaluation",
     "deploy_drain",
     "watchdog_expiry",
     "stuck_checking",
+    "live_monitor_failure",
+    "rollback_observed",
     "release_gate_stale_evidence",
   ]) {
     if (!queryIds.has(id)) {
@@ -421,7 +540,22 @@ export function assertProviderFailureObservabilityEvidence(evidence) {
     }
   }
 
-  const alertIds = new Set(evidence.alerts.map((entry) => entry.id));
+  const alertsById = new Map(evidence.alerts.map((entry) => [entry.id, entry]));
+  const alertIds = new Set(alertsById.keys());
+  for (const alertEntry of evidence.alerts) {
+    if (!alertEntry.query_id) {
+      throw new Error(`alert ${alertEntry.id} is missing query_id`);
+    }
+    const queryEntry = queriesById.get(alertEntry.query_id);
+    if (!queryEntry) {
+      throw new Error(`alert ${alertEntry.id} references unknown query ${alertEntry.query_id}`);
+    }
+    if (!queryCoversFailureClass(queryEntry, alertEntry.failure_class)) {
+      throw new Error(
+        `alert ${alertEntry.id} query ${alertEntry.query_id} does not cover ${alertEntry.failure_class}`,
+      );
+    }
+  }
   for (const thresholdId of REQUIRED_ROLLBACK_TRIGGER_IDS) {
     const threshold = ROLLBACK_TRIGGER_THRESHOLDS.find((entry) => entry.id === thresholdId);
     if (!threshold || !alertIds.has(threshold.shared_alert_id)) {
@@ -446,6 +580,18 @@ export function assertProviderFailureObservabilityEvidence(evidence) {
     if (coverage.alert_id && !alertIds.has(coverage.alert_id)) {
       throw new Error(`coverage for ${failureClass} references unknown alert ${coverage.alert_id}`);
     }
+    if (coverage.alert_id) {
+      const alertEntry = alertsById.get(coverage.alert_id);
+      const queryEntry = queriesById.get(alertEntry.query_id);
+      if (!alertEntry.query_id || !queryEntry) {
+        throw new Error(`coverage for ${failureClass} references alert without query`);
+      }
+      if (!queryCoversFailureClass(queryEntry, failureClass)) {
+        throw new Error(
+          `coverage for ${failureClass} uses query ${queryEntry.id} that does not cover the failure class or terminal reason`,
+        );
+      }
+    }
   }
 
   assertNoForbiddenEvidenceMarkers(evidence);
@@ -462,43 +608,27 @@ export function learnerLoopFailureClasses() {
   ).sort();
 }
 
+function queryCoversFailureClass(queryEntry, failureClass) {
+  const railwayQuery = queryEntry.railway_query;
+  if (railwayQuery.includes(`failure_class:"${failureClass}"`)) return true;
+  return learnerLoopTerminalReasonsForFailureClass(failureClass).some((reason) =>
+    railwayQuery.includes(`terminal_reason:"${reason}"`),
+  );
+}
+
+function learnerLoopTerminalReasonsForFailureClass(failureClass) {
+  return learnerLoopContract.states
+    .filter((state) => state.failure_class === failureClass)
+    .map((state) => (typeof state.terminal_reason === "string" ? state.terminal_reason : null))
+    .filter(Boolean);
+}
+
 function coverage(failure_class, alert_id, extra = {}) {
   return Object.freeze({
     failure_class,
     alert_id,
     ...extra,
   });
-}
-
-function assertNoForbiddenEvidenceMarkers(value) {
-  const serialized = JSON.stringify(value);
-  const forbidden = [
-    "pcm16_base64",
-    "answer_text",
-    "transcript_final",
-    "source_context",
-    "pasted_text",
-    "session_token",
-    "viva1.",
-    "session-secret",
-    "raw_prompt",
-    "provider_prompt",
-    "source_excerpt",
-    "CARTESIA_API_KEY",
-    "GEMINI_API_KEY",
-    "Bearer ",
-  ];
-  for (const needle of forbidden) {
-    if (serialized.includes(needle)) {
-      throw new Error(`provider failure observability includes forbidden marker: ${needle}`);
-    }
-  }
-  for (const [name, envValue] of Object.entries(process.env)) {
-    if (!/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) continue;
-    if (envValue && envValue.length >= 8 && serialized.includes(envValue)) {
-      throw new Error(`provider failure observability includes secret value from ${name}`);
-    }
-  }
 }
 
 function cloneJson(value) {
