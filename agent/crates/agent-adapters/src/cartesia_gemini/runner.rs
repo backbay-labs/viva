@@ -448,6 +448,11 @@ where
         {
             Ok(response_prompt) => response_prompt,
             Err(error) => {
+                for event in deferred_events {
+                    if !send_fake_unless_cancelled(&job.event_tx, event, &job.cancelled).await {
+                        return;
+                    }
+                }
                 emit_fake_provider_error(&job.event_tx, error).await;
                 return;
             }
@@ -2438,6 +2443,87 @@ mod tests {
         };
         assert_eq!(failure.provider, "gemini");
         assert_eq!(failure.model, "gemini-35-flash");
+    }
+
+    #[tokio::test]
+    async fn emit_turn_drains_fallback_activation_before_provider_failure() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        store.record_voice_session(&session_config).await.unwrap();
+        let session = AuthorizedStudySession::from_config(&session_config).unwrap();
+        let executor = VivaToolExecutor::new(store.clone(), session.clone());
+        let question = select_next_question(&executor, &session).await.unwrap();
+        let runner = CartesiaGeminiRunner {
+            config: CartesiaGeminiConfig {
+                gemini: super::super::GeminiConfig {
+                    api_key: "gemini-test-key".to_owned(),
+                    model_id: "gemini-3.5-pro".to_owned(),
+                    fallback_model_ids: vec!["gemini-3.5-flash".to_owned()],
+                    ..super::super::GeminiConfig::default()
+                },
+                ..CartesiaGeminiConfig::default()
+            },
+            transports: FallbackFailureTransports,
+            store: Some(store),
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+
+        runner
+            .emit_turn(RunnerTurnJob {
+                event_tx,
+                executor,
+                session,
+                question,
+                response_id: "response-1".to_owned(),
+                submission_sequence: 1,
+                input: RunnerInput::Text {
+                    text: "omitted".to_owned(),
+                    client_generation_id: None,
+                },
+                confidence: Some(1.0),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                completed: Arc::new(AtomicBool::new(false)),
+            })
+            .await;
+
+        let mut events = Vec::new();
+        loop {
+            match timeout(Duration::from_millis(50), event_rx.recv()).await {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        let fallback_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    BrainEvent::ProviderFallbackActivated {
+                        from_model,
+                        to_model,
+                        reason,
+                        ..
+                    } if from_model == "gemini-3.5-pro"
+                        && to_model == "gemini-3.5-flash"
+                        && reason == "primary_429"
+                )
+            })
+            .expect("fallback activation should be emitted before provider failure");
+        let error_index = events
+            .iter()
+            .position(|event| matches!(event, BrainEvent::Error(_)))
+            .expect("fallback failure should emit provider error");
+        assert!(
+            fallback_index < error_index,
+            "fallback activation must precede terminal provider error"
+        );
     }
 
     #[derive(Clone, Default)]

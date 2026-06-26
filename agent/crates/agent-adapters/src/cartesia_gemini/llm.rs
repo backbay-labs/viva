@@ -279,11 +279,21 @@ where
     let mut attempt_events = Vec::new();
     let stage_deadline = Instant::now() + config.stage_timeout;
     for (index, attempt_config) in attempts.iter().enumerate() {
-        let remaining = stage_deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(|| {
-                gemini_attempt_failure(&attempt_events, gemini_generation_stage_timeout())
-            })?;
+        let remaining = match stage_deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) => remaining,
+            None if index > 0 => {
+                return Err(gemini_attempt_failure(
+                    &attempt_events,
+                    gemini_timeout_stage_failure(attempt_config, config.stage_timeout),
+                ));
+            }
+            None => {
+                return Err(gemini_attempt_failure(
+                    &attempt_events,
+                    gemini_generation_stage_timeout(),
+                ));
+            }
+        };
         let stream_request = GeminiStreamRequest::new(
             attempt_config,
             gemini_attempt_request(attempt_config, &request),
@@ -2487,6 +2497,50 @@ data: [DONE]
     }
 
     #[tokio::test]
+    async fn streaming_transport_attributes_expired_fallback_deadline_to_attempt_model() {
+        let client = BlockingRateLimitGeminiSseClient {
+            captures: Arc::new(Mutex::new(Vec::new())),
+            delay: Duration::from_millis(5),
+        };
+
+        let failure = stream_gemini_with_client_attempt_events(
+            &client,
+            &GeminiConfig {
+                api_key: "gemini-test-key".to_owned(),
+                model_id: "gemini-3.5-pro".to_owned(),
+                fallback_model_ids: vec!["gemini-3.5-flash".to_owned()],
+                stage_timeout: Duration::from_millis(1),
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [{ "parts": [{ "text": "fixture-redacted-input" }] }] }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            failure.events,
+            vec![GeminiStreamEvent::FallbackActivated {
+                from_model: "gemini-3.5-pro".to_owned(),
+                to_model: "gemini-3.5-flash".to_owned(),
+                reason: "primary_429".to_owned(),
+            }]
+        );
+        assert_eq!(
+            client.captures.lock().expect("capture lock poisoned").len(),
+            1,
+            "fallback request should not be sent after the shared deadline expires"
+        );
+        let BrainError::StageFailure(failure) = failure.error else {
+            panic!("expected expired fallback deadline to remain a provider stage failure");
+        };
+        assert_eq!(failure.failure_class, "timeout");
+        assert_eq!(failure.provider, "gemini");
+        assert_eq!(failure.model, "gemini-35-flash");
+        assert!(failure.retry_eligible);
+        assert!(!failure.to_string().contains("fixture-redacted-input"));
+    }
+
+    #[tokio::test]
     async fn streaming_transport_attributes_fallback_client_error_to_attempt_model() {
         let client = FallibleSequencedGeminiSseClient {
             captures: Arc::new(Mutex::new(Vec::new())),
@@ -2632,6 +2686,11 @@ data: [DONE]
         responses: Arc<Mutex<Vec<(Duration, GeminiSseResponse)>>>,
     }
 
+    struct BlockingRateLimitGeminiSseClient {
+        captures: Arc<Mutex<Vec<GeminiRequestCapture>>>,
+        delay: Duration,
+    }
+
     struct FallibleSequencedGeminiSseClient {
         captures: Arc<Mutex<Vec<GeminiRequestCapture>>>,
         responses: Arc<Mutex<Vec<Result<GeminiSseResponse, BrainError>>>>,
@@ -2707,6 +2766,30 @@ data: [DONE]
                 .lock()
                 .expect("responses lock poisoned")
                 .remove(0)
+        }
+    }
+
+    #[async_trait]
+    impl GeminiSseClient for BlockingRateLimitGeminiSseClient {
+        async fn stream(
+            &self,
+            request: GeminiStreamRequest,
+        ) -> Result<GeminiSseResponse, BrainError> {
+            self.captures
+                .lock()
+                .expect("captures lock poisoned")
+                .push(GeminiRequestCapture {
+                    url: Some(request.url),
+                    api_key: Some(request.api_key),
+                    body: Some(request.body),
+                });
+            std::thread::sleep(self.delay);
+            Ok(GeminiSseResponse {
+                status: 429,
+                body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
+                retry_after: Some("1".to_owned()),
+                reset_after: None,
+            })
         }
     }
 
