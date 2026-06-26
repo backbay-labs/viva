@@ -21,6 +21,10 @@ import {
   buildFailureControlPlan,
   failureControlHarnessEvidence,
 } from "./failure-control-harness.mjs";
+import {
+  assertNoForbiddenEvidenceMarkers,
+  auditTextArtifacts,
+} from "./redaction-control.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactDir = path.resolve(
@@ -146,7 +150,7 @@ try {
     },
   };
 
-  auditSanitizedEvidence(evidence);
+  assertNoForbiddenEvidenceMarkers(evidence, { context: "release evidence" });
   await writeFile(outputPath, `${JSON.stringify(evidence, null, 2)}\n`);
   console.log(`Sanitized release evidence written to ${path.relative(root, outputPath)}`);
 } catch (error) {
@@ -367,34 +371,6 @@ async function hashFixtureFiles(dir) {
   return hashes;
 }
 
-function auditSanitizedEvidence(evidence) {
-  const serialized = JSON.stringify(evidence);
-  const forbidden = [
-    "pcm16_base64",
-    "answer_text",
-    "transcript_final",
-    "source_context",
-    "NADH donates high-energy electrons",
-    "received 4 PCM16 bytes",
-    "CARTESIA_API_KEY",
-    "GEMINI_API_KEY",
-    "viva-release-check-cartesia-placeholder-key",
-    "viva-release-check-gemini-placeholder-key",
-    "Bearer ",
-  ];
-  for (const needle of forbidden) {
-    if (serialized.includes(needle)) {
-      throw new Error(`release evidence includes forbidden payload marker: ${needle}`);
-    }
-  }
-  for (const [name, value] of Object.entries(process.env)) {
-    if (!/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) continue;
-    if (value && value.length >= 8 && serialized.includes(value)) {
-      throw new Error(`release evidence includes secret value from ${name}`);
-    }
-  }
-}
-
 function buildReleaseBundleManifest(outputPath, commandRecords, browserResult) {
   const browserArtifactDir =
     typeof browserResult.artifact_dir === "string" ? browserResult.artifact_dir : null;
@@ -413,70 +389,11 @@ function buildReleaseBundleManifest(outputPath, commandRecords, browserResult) {
 }
 
 async function auditGeneratedArtifacts(dirs) {
-  const forbidden = [
-    "pcm16_base64",
-    "answer_text",
-    "transcript_final",
-    "source_context",
-    "pasted_text",
-    "session_token",
-    "viva1.",
-    "session-secret",
-    "preload stroke volume cardiac output",
-    "Stroke volume rises as ventricular preload",
-    "NADH donates high-energy electrons",
-    "received 4 PCM16 bytes",
-    "CARTESIA_API_KEY",
-    "GEMINI_API_KEY",
-    "viva-release-check-cartesia-placeholder-key",
-    "viva-release-check-gemini-placeholder-key",
-    "Bearer ",
-  ];
-  let scanned_files = 0;
-  for (const dir of dirs) {
-    for (const file of await listFiles(dir)) {
-      const relative = path.relative(root, file);
-      if (file.endsWith(".zip")) {
-        throw new Error(`release artifact includes unsanitized trace archive: ${relative}`);
-      }
-      if (!isTextArtifact(file)) continue;
-      scanned_files += 1;
-      const text = await readFile(file, "utf8");
-      for (const needle of forbidden) {
-        if (text.includes(needle)) {
-          throw new Error(`artifact ${relative} includes forbidden payload marker: ${needle}`);
-        }
-      }
-      for (const [name, value] of Object.entries(process.env)) {
-        if (!/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) continue;
-        if (value && value.length >= 8 && text.includes(value)) {
-          throw new Error(`artifact ${relative} includes secret value from ${name}`);
-        }
-      }
-    }
-  }
-  return {
-    scanned_files,
-    forbidden_hits: 0,
-  };
-}
-
-async function listFiles(dir) {
-  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-  const files = [];
-  for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      files.push(...(await listFiles(fullPath)));
-    } else if (entry.isFile()) {
-      files.push(fullPath);
-    }
-  }
-  return files;
-}
-
-function isTextArtifact(file) {
-  return /\.(json|log|txt|stdout|stderr)$/i.test(file);
+  return auditTextArtifacts(dirs, {
+    context: "artifact",
+    rootDir: root,
+    zipMessage: (relative) => `release artifact includes unsanitized trace archive: ${relative}`,
+  });
 }
 
 function isSafeRelativeArtifactName(name) {
