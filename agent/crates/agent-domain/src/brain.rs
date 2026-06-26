@@ -71,6 +71,8 @@ pub struct SessionConfig {
     pub initial_goal: Option<String>,
     pub source_context: Vec<SourceContext>,
     pub active_concepts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_generation_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -127,10 +129,20 @@ pub enum ManuscriptIntent {
 #[non_exhaustive]
 pub enum BrainInput {
     Audio(AudioFrame),
+    AudioWithMetadata {
+        frame: AudioFrame,
+        client_generation_id: Option<String>,
+    },
     Text(String),
+    TextWithMetadata {
+        text: String,
+        client_generation_id: Option<String>,
+    },
     ToolResult(ToolResult),
     SessionContextRefresh(serde_json::Value),
-    ProactiveTurn { prompt: String },
+    ProactiveTurn {
+        prompt: String,
+    },
     CancelResponse,
     Stop,
 }

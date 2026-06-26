@@ -28,12 +28,14 @@ import {
   type VivaAgentAudioOutput,
   type VivaAgentClientOptions,
   type VivaAgentCloseDiagnostics,
+  type VivaAgentGenerationReason,
   type VivaAgentSessionController,
   type VivaAgentSessionState,
 } from "./viva-agent-client";
 
 export type VivaAgentDerivedState = {
   phase: VivaAgentSessionState["phase"];
+  generationId?: string;
   terminalReason?: AgentTerminalSessionReason;
   close?: VivaAgentCloseDiagnostics;
   question?: SessionQuestion;
@@ -113,12 +115,16 @@ export function useVivaAgentSession(options: UseVivaAgentSessionOptions) {
     agentState,
     cancel: () => controllerRef.current?.cancel(),
     close: () => controllerRef.current?.close(),
-    connect: () => controllerRef.current?.connect(),
+    connect: (reason?: VivaAgentGenerationReason) => controllerRef.current?.connect(reason),
     derived,
     readiness,
+    refreshSession: (input?: {
+      reason?: VivaAgentGenerationReason;
+      sessionToken?: string | null;
+    }) => controllerRef.current?.refreshSession(input),
     reset: () => controllerRef.current?.reset(),
-    sendAudio: (pcm16Base64: string) => controllerRef.current?.sendAudio(pcm16Base64),
-    sendText: (text: string) => controllerRef.current?.sendText(text),
+    sendAudio: (pcm16Base64: string) => controllerRef.current?.sendAudio(pcm16Base64) ?? false,
+    sendText: (text: string) => controllerRef.current?.sendText(text) ?? false,
     status: agentState.status,
     stop: () => controllerRef.current?.stop(),
   };
@@ -142,7 +148,7 @@ export function studySetToAgentSessionConfig(
 export function deriveVivaAgentUiState(state: VivaAgentSessionState): VivaAgentDerivedState {
   const question = state.question ? agentQuestionToSessionQuestion(state.question) : undefined;
   return {
-    canSubmitAnswer: state.status === "open",
+    canSubmitAnswer: state.status === "open" && !state.pendingSubmission,
     close: state.close,
     errors: state.errors,
     evaluation: state.evaluation
@@ -152,6 +158,7 @@ export function deriveVivaAgentUiState(state: VivaAgentSessionState): VivaAgentD
     currentConceptStatus: state.currentConceptStatus,
     conceptStatuses: state.conceptStatuses,
     finalTranscript: state.finalTranscript,
+    generationId: state.generation?.id,
     transcriptConfidence: state.transcriptConfidence,
     manuscriptIntents: state.manuscriptIntents.map((event) => event.intent),
     phase: state.question && state.phase === "ready" ? "listening" : state.phase,

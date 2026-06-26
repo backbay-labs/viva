@@ -86,6 +86,7 @@ where
             )
         })?;
         self.transports.authorize_open().await?;
+        let session_generation_id = session_config.client_generation_id.clone();
         let session = AuthorizedStudySession::from_config(&session_config)
             .map_err(|error| BrainError::Protocol(error.to_string()))?;
         store
@@ -99,6 +100,7 @@ where
         let (event_tx, events) = mpsc::channel::<BrainEvent>(32);
         let runner = self.clone();
         let task = tokio::spawn(async move {
+            let first_response_id = response_id_for_turn(1, session_generation_id.as_deref());
             let _ = event_tx
                 .send(BrainEvent::SessionPhase {
                     phase: StudySessionPhase::Ready,
@@ -106,7 +108,7 @@ where
                 .await;
             let _ = event_tx
                 .send(BrainEvent::QuestionStarted {
-                    response_id: "response-1".to_owned(),
+                    response_id: first_response_id,
                     question: question.clone(),
                 })
                 .await;
@@ -114,61 +116,41 @@ where
             let mut turn = 1_usize;
             let mut active_response: Option<ActiveRunnerResponse> = None;
             while let Some(input) = input_rx.recv().await {
-                match input {
-                    BrainInput::Audio(frame) => {
-                        if let Some(response_id) =
-                            cancel_active_runner_response(&mut active_response)
-                        {
-                            let _ = event_tx
-                                .send(BrainEvent::ResponseCancelledFor { response_id })
-                                .await;
-                        }
-                        let submission_sequence = turn as u32;
-                        let response_id = format!("response-{turn}");
-                        turn += 1;
-                        active_response = Some(runner.spawn_turn(
-                            RunnerTurnJob {
-                                event_tx: event_tx.clone(),
-                                executor: executor.clone(),
-                                session: session.clone(),
-                                question: question.clone(),
-                                response_id: response_id.clone(),
-                                submission_sequence,
-                                input: RunnerInput::Audio(frame),
-                                confidence: Some(0.91),
-                                cancelled: Arc::new(AtomicBool::new(false)),
-                                completed: Arc::new(AtomicBool::new(false)),
-                            },
-                            response_id,
-                        ));
-                    }
-                    BrainInput::Text(text) => {
-                        if let Some(response_id) =
-                            cancel_active_runner_response(&mut active_response)
-                        {
-                            let _ = event_tx
-                                .send(BrainEvent::ResponseCancelledFor { response_id })
-                                .await;
-                        }
-                        let submission_sequence = turn as u32;
-                        let response_id = format!("response-{turn}");
-                        turn += 1;
-                        active_response = Some(runner.spawn_turn(
-                            RunnerTurnJob {
-                                event_tx: event_tx.clone(),
-                                executor: executor.clone(),
-                                session: session.clone(),
-                                question: question.clone(),
-                                response_id: response_id.clone(),
-                                submission_sequence,
-                                input: RunnerInput::Text(text),
-                                confidence: Some(1.0),
-                                cancelled: Arc::new(AtomicBool::new(false)),
-                                completed: Arc::new(AtomicBool::new(false)),
-                            },
-                            response_id,
-                        ));
-                    }
+                let runner_turn = match input {
+                    BrainInput::Audio(frame) => Some((
+                        RunnerInput::Audio {
+                            frame,
+                            client_generation_id: None,
+                        },
+                        Some(0.91_f32),
+                    )),
+                    BrainInput::AudioWithMetadata {
+                        frame,
+                        client_generation_id,
+                    } => Some((
+                        RunnerInput::Audio {
+                            frame,
+                            client_generation_id,
+                        },
+                        Some(0.91_f32),
+                    )),
+                    BrainInput::Text(text) => Some((
+                        RunnerInput::Text {
+                            text,
+                            client_generation_id: None,
+                        },
+                        Some(1.0_f32),
+                    )),
+                    BrainInput::TextWithMetadata {
+                        text,
+                        client_generation_id,
+                    } => Some((
+                        RunnerInput::Text {
+                            text,
+                            client_generation_id,
+                        },
+                        Some(1.0_f32),
+                    )),
                     BrainInput::CancelResponse => {
                         let response_id = match active_response
                             .take()
@@ -180,7 +162,8 @@ where
                                 active.response_id.clone()
                             }
                             None => {
-                                let response_id = format!("response-{turn}");
+                                let response_id =
+                                    response_id_for_turn(turn, session_generation_id.as_deref());
                                 turn += 1;
                                 response_id
                             }
@@ -188,6 +171,7 @@ where
                         let _ = event_tx
                             .send(BrainEvent::ResponseCancelledFor { response_id })
                             .await;
+                        continue;
                     }
                     BrainInput::Stop => {
                         let _ = cancel_active_runner_response(&mut active_response);
@@ -195,9 +179,41 @@ where
                     }
                     BrainInput::ToolResult(_)
                     | BrainInput::SessionContextRefresh(_)
-                    | BrainInput::ProactiveTurn { .. } => {}
-                    _ => {}
+                    | BrainInput::ProactiveTurn { .. } => continue,
+                    _ => continue,
+                };
+                let Some((runner_input, confidence)) = runner_turn else {
+                    continue;
+                };
+
+                if let Some(response_id) = cancel_active_runner_response(&mut active_response) {
+                    let _ = event_tx
+                        .send(BrainEvent::ResponseCancelledFor { response_id })
+                        .await;
                 }
+                let submission_sequence = turn as u32;
+                let response_id = response_id_for_turn(
+                    turn,
+                    runner_input
+                        .client_generation_id()
+                        .or(session_generation_id.as_deref()),
+                );
+                turn += 1;
+                active_response = Some(runner.spawn_turn(
+                    RunnerTurnJob {
+                        event_tx: event_tx.clone(),
+                        executor: executor.clone(),
+                        session: session.clone(),
+                        question: question.clone(),
+                        response_id: response_id.clone(),
+                        submission_sequence,
+                        input: runner_input,
+                        confidence,
+                        cancelled: Arc::new(AtomicBool::new(false)),
+                        completed: Arc::new(AtomicBool::new(false)),
+                    },
+                    response_id,
+                ));
             }
         });
 
@@ -230,7 +246,10 @@ where
                 &question,
                 &response_id,
                 1,
-                &RunnerInput::Audio(frame.clone()),
+                &RunnerInput::Audio {
+                    frame: frame.clone(),
+                    client_generation_id: None,
+                },
             ))
             .await
             .map_err(|error| BrainError::Protocol(error.to_string()))?;
@@ -448,12 +467,12 @@ where
         input: &RunnerInput,
     ) -> Result<RunnerTranscript, BrainError> {
         match input {
-            RunnerInput::Audio(frame) => {
+            RunnerInput::Audio { frame, .. } => {
                 self.transports
                     .transcribe_audio(&self.config, response_id, frame)
                     .await
             }
-            RunnerInput::Text(text) => Ok(RunnerTranscript {
+            RunnerInput::Text { text, .. } => Ok(RunnerTranscript {
                 interim_text: text.clone(),
                 final_text: text.clone(),
                 confidence: Some(1.0),
@@ -777,8 +796,29 @@ where
 
 #[derive(Clone, Debug)]
 pub(crate) enum RunnerInput {
-    Audio(AudioFrame),
-    Text(String),
+    Audio {
+        frame: AudioFrame,
+        client_generation_id: Option<String>,
+    },
+    Text {
+        text: String,
+        client_generation_id: Option<String>,
+    },
+}
+
+impl RunnerInput {
+    fn client_generation_id(&self) -> Option<&str> {
+        match self {
+            Self::Audio {
+                client_generation_id,
+                ..
+            }
+            | Self::Text {
+                client_generation_id,
+                ..
+            } => client_generation_id.as_deref(),
+        }
+    }
 }
 
 pub(crate) struct RunnerTurnJob {
@@ -802,13 +842,13 @@ pub(crate) fn answer_attempt_envelope(
     input: &RunnerInput,
 ) -> AnswerAttemptEnvelope {
     let (capture_mode, byte_count, char_count, pre_provider_state) = match input {
-        RunnerInput::Audio(frame) => (
+        RunnerInput::Audio { frame, .. } => (
             AnswerCaptureMode::Audio,
             Some(audio_frame_bytes(frame).len() as u64),
             None,
             "before_ink_stt",
         ),
-        RunnerInput::Text(text) => (
+        RunnerInput::Text { text, .. } => (
             AnswerCaptureMode::Typed,
             Some(text.len() as u64),
             Some(text.chars().count() as u64),
@@ -827,7 +867,7 @@ pub(crate) fn answer_attempt_envelope(
         byte_count,
         char_count,
         duration_ms: None,
-        client_generation_id: None,
+        client_generation_id: input.client_generation_id().map(ToOwned::to_owned),
         locale: None,
         capture_status: AnswerCaptureStatus::Accepted,
         content_policy: AnswerContentPolicy::None,
@@ -836,6 +876,30 @@ pub(crate) fn answer_attempt_envelope(
         transcript_confidence_bucket: None,
         pre_provider_state: pre_provider_state.to_owned(),
     }
+}
+
+fn response_id_for_turn(turn: usize, client_generation_id: Option<&str>) -> String {
+    let base = format!("response-{turn}");
+    let Some(generation_id) = client_generation_id else {
+        return base;
+    };
+    let generation_id = sanitized_response_generation_id(generation_id);
+    if generation_id.is_empty() {
+        base
+    } else {
+        format!("{base}-generation-{generation_id}")
+    }
+}
+
+fn sanitized_response_generation_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => character,
+            _ => '-',
+        })
+        .take(96)
+        .collect()
 }
 
 struct GeminiToolLoopJob<'a> {

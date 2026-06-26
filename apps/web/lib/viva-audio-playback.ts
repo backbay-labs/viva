@@ -244,6 +244,23 @@ export class VivaAudioPlaybackSink {
     return this.getState();
   }
 
+  resetForGeneration(): VivaAudioPlaybackState {
+    const nextSequence = this.#state.nextSequence;
+    for (const frame of this.#scheduled.values()) {
+      frame.node.onended = null;
+      stopPlaybackNode(frame.node);
+    }
+    this.#scheduled.clear();
+    this.#state = {
+      ...initialVivaAudioPlaybackState(),
+      nextSequence,
+      userGestureUnlocked: this.#state.userGestureUnlocked,
+    };
+    this.#resetNextStartTime();
+    this.#publishState();
+    return this.getState();
+  }
+
   async close(): Promise<void> {
     this.cancel(null);
     this.#analyser?.disconnect();

@@ -5,16 +5,21 @@ import type { VivaAgentAudioOutput } from "../../lib/viva-agent-client";
 import { VivaAudioWorkletUnavailableError } from "../../lib/viva-audio-capture";
 import { projectTrace } from "../../lib/viva-session-projection";
 import {
+  browserLifecycleReconnectPlan,
+  browserSessionReconnectReason,
   canStartMicrophoneCapture,
   captureLevelForBloom,
   derivedStateWithProjectedRecap,
   drainAgentAudio,
   enterTextAnswerMode,
+  isCurrentBrowserLifecycleAttempt,
   isSessionOver,
   micStateForAudioCaptureError,
   micStateForCaptureEndReason,
   pcm16ChunksToBase64,
   refreshBrowserSessionToken,
+  resetPlaybackCancellationStateForGeneration,
+  sameBrowserSessionRouteIdentity,
   sessionRouteWsAccessToken,
   shouldRefreshBrowserSessionToken,
   shouldStopReadinessPolling,
@@ -22,6 +27,7 @@ import {
   spokenTurnFallbackAction,
   stopCaptureForRecap,
   textAnswerPayload,
+  textAnswerStateForSession,
 } from "./LiveSessionPage";
 
 describe("drainAgentAudio", () => {
@@ -76,6 +82,32 @@ describe("drainAgentAudio", () => {
     expect(ackCalls).toBe(0);
     expect(next).toBe(2);
   });
+
+  test("generation reset clears handled cancellation count with playback state", () => {
+    let resets = 0;
+    const handledCancelRef = { current: 2 };
+
+    resetPlaybackCancellationStateForGeneration({
+      handledCancelRef,
+      playback: {
+        resetForGeneration: () => {
+          resets += 1;
+          return {
+            cancelledResponseIds: [],
+            nextSequence: 0,
+            queue: [],
+            responding: false,
+            scheduledFrameCount: 0,
+            speaking: false,
+            userGestureUnlocked: true,
+          };
+        },
+      },
+    });
+
+    expect(resets).toBe(1);
+    expect(handledCancelRef.current).toBe(0);
+  });
 });
 
 describe("shouldStopReadinessPolling", () => {
@@ -102,6 +134,157 @@ describe("shouldStopReadinessPolling", () => {
     expect(shouldStopReadinessPolling({ recap: undefined, status: "closed", ready: false })).toBe(
       true,
     );
+  });
+});
+
+describe("browserSessionReconnectReason", () => {
+  test("classifies bfcache and Back/Forward restores without treating normal page show as stale", () => {
+    expect(browserSessionReconnectReason({ type: "pageshow", persisted: true })).toBe(
+      "bfcache_restore",
+    );
+    expect(browserSessionReconnectReason({ type: "pageshow", persisted: false })).toBe(null);
+    expect(browserSessionReconnectReason({ type: "popstate" })).toBe("back_forward_restore");
+  });
+
+  test("compares stable route identity without requiring stripped token material to reappear", () => {
+    expect(
+      sameBrowserSessionRouteIdentity(
+        {
+          sessionId: "session-1",
+          sessionToken: "placeholder-initial-material",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        {
+          sessionId: "session-1",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+      ),
+    ).toBe(true);
+    expect(
+      sameBrowserSessionRouteIdentity(
+        {
+          sessionId: "session-1",
+          sessionToken: "placeholder-initial-material",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        {
+          sessionId: "session-2",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+      ),
+    ).toBe(false);
+  });
+
+  test("ignores stale async lifecycle completions after a newer browser action starts", () => {
+    expect(isCurrentBrowserLifecycleAttempt({ activeAttempt: 3, attempt: 3 })).toBe(true);
+    expect(isCurrentBrowserLifecycleAttempt({ activeAttempt: 4, attempt: 3 })).toBe(false);
+  });
+
+  test("does not reconnect browser restores after a terminal recap", () => {
+    expect(
+      browserLifecycleReconnectPlan({
+        currentRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: "spent-token",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        nextRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        recap: { headline: "done" },
+        sessionId: "session-1",
+        sessionToken: "spent-token",
+        status: "open",
+        userId: "user-1",
+      }),
+    ).toEqual({ action: "skip_session_over" });
+  });
+
+  test("reloads changed route identity even when the previous session has a recap", () => {
+    expect(
+      browserLifecycleReconnectPlan({
+        currentRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: "spent-token",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        nextRouteIdentity: {
+          sessionId: "session-2",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        recap: { headline: "done" },
+        sessionId: "session-1",
+        sessionToken: "spent-token",
+        status: "closed",
+        userId: "user-1",
+      }),
+    ).toEqual({ action: "reload" });
+  });
+
+  test("refreshes spent session tokens before same-identity lifecycle reconnects", () => {
+    expect(
+      browserLifecycleReconnectPlan({
+        currentRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: "spent-token",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        nextRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        recap: undefined,
+        sessionId: "session-1",
+        sessionToken: "spent-token",
+        status: "open",
+        userId: "user-1",
+      }),
+    ).toEqual({
+      action: "refresh_session_token",
+      sessionId: "session-1",
+      sessionToken: "spent-token",
+      userId: "user-1",
+    });
+  });
+
+  test("reloads instead of refreshing a same-identity closed voice session", () => {
+    expect(
+      browserLifecycleReconnectPlan({
+        currentRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: "spent-token",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        nextRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        recap: undefined,
+        sessionId: "session-1",
+        sessionToken: "spent-token",
+        status: "closed",
+        userId: "user-1",
+      }),
+    ).toEqual({ action: "reload" });
   });
 });
 
@@ -261,6 +444,27 @@ describe("LiveSessionPage recap cleanup", () => {
       "NADH donates electrons to the ETC.",
     );
     expect(textAnswerPayload("   \n\t   ")).toBe(null);
+  });
+
+  test("disables written answer submission while a generation has a pending provider turn", () => {
+    expect(
+      textAnswerStateForSession({
+        canSubmitAnswer: false,
+        finalTranscript: undefined,
+        submittedTextAnswer: "first typed response",
+        textAnswerActive: true,
+        textAnswerAvailable: true,
+        textAnswerRequired: false,
+        textRetryOpen: false,
+        transcriptConfidence: undefined,
+      }),
+    ).toEqual({
+      active: true,
+      disabled: true,
+      lastAnswer: "first typed response",
+      lastAnswerUncertain: false,
+      required: false,
+    });
   });
 
   test("only streams buffered mic PCM to selectable live runtimes", () => {

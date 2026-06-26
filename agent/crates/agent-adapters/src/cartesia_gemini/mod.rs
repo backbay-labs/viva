@@ -333,8 +333,28 @@ impl FakeCartesiaGeminiRuntime {
         let task = tokio::spawn(async move {
             while let Some(input) = input_rx.recv().await {
                 let runner_input = match input {
-                    BrainInput::Audio(frame) => RunnerInput::Audio(frame),
-                    BrainInput::Text(text) => RunnerInput::Text(text),
+                    BrainInput::Audio(frame) => RunnerInput::Audio {
+                        frame,
+                        client_generation_id: None,
+                    },
+                    BrainInput::AudioWithMetadata {
+                        frame,
+                        client_generation_id,
+                    } => RunnerInput::Audio {
+                        frame,
+                        client_generation_id,
+                    },
+                    BrainInput::Text(text) => RunnerInput::Text {
+                        text,
+                        client_generation_id: None,
+                    },
+                    BrainInput::TextWithMetadata {
+                        text,
+                        client_generation_id,
+                    } => RunnerInput::Text {
+                        text,
+                        client_generation_id,
+                    },
                     BrainInput::Stop => break,
                     _ => continue,
                 };
@@ -361,8 +381,8 @@ impl FakeCartesiaGeminiRuntime {
                     break;
                 }
                 let final_transcript = match runner_input {
-                    RunnerInput::Audio(_) => FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT.to_owned(),
-                    RunnerInput::Text(text) => text,
+                    RunnerInput::Audio { .. } => FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT.to_owned(),
+                    RunnerInput::Text { text, .. } => text,
                 };
                 let _ = event_tx.send(BrainEvent::InputSpeechStarted).await;
                 let _ = event_tx
@@ -445,7 +465,10 @@ impl FakeCartesiaGeminiRuntime {
                             .await;
                         while let Some(input) = input_rx.recv().await {
                             match input {
-                                BrainInput::Audio(_) | BrainInput::Text(_) => {
+                                BrainInput::Audio(_)
+                                | BrainInput::AudioWithMetadata { .. }
+                                | BrainInput::Text(_)
+                                | BrainInput::TextWithMetadata { .. } => {
                                     let _ = event_tx
                                         .send(BrainEvent::ResponseCancelledFor {
                                             response_id: response_id.clone(),

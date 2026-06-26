@@ -207,6 +207,8 @@ describe("projectRuntimeCopy", () => {
     expect(auth.cause).toBe("auth_failed");
     expect(auth.marginaliaText).toContain("auth failed");
     expect(auth.nextActionLabel).toBe("Refresh session");
+    expect(auth.primaryActionDisabled).toBe(false);
+    expect(auth.primaryActionIntent).toBe("refresh_session");
   });
 
   test("treats post-ready server rejections as unavailable instead of provider copy", () => {
@@ -689,6 +691,8 @@ describe("projectRuntimeCopy", () => {
     expect(copy.cause).toBe("auth_failed");
     expect(copy.capsuleLabel).toBe("Auth failed");
     expect(copy.nextActionLabel).toBe("Refresh session");
+    expect(copy.primaryActionDisabled).toBe(false);
+    expect(copy.primaryActionIntent).toBe("refresh_session");
     expect(copy.marginaliaText).not.toContain("terminal phase");
   });
 

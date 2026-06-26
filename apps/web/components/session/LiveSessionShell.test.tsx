@@ -453,6 +453,35 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).not.toContain("live tutor");
   });
 
+  test("exposes the active generation id as non-visible browser evidence metadata", () => {
+    const markup = renderToStaticMarkup(
+      <LiveSessionShell
+        clockLabel="Fixture clock"
+        conceptNodes={[]}
+        contextLabel="Trusted server set: Biology Midterm"
+        elapsed={5}
+        generationId="session_bootstrap-1"
+        glyphState="listening"
+        highlightedTokens={[]}
+        hintShown={false}
+        levelRef={{ current: { agent: 0, user: 0 } }}
+        onBackToQuestion={noop}
+        onEndSession={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        runtime={runtime}
+        scene={scene}
+        state="listening"
+      />,
+    );
+
+    expect(markup).toContain('data-generation-id="session_bootstrap-1"');
+  });
+
   test("renders fake provider readiness as a non-live test path", () => {
     const markup = renderRuntimeSurfaces(
       projectRuntimeCopy({

@@ -151,17 +151,29 @@ export type ManuscriptIntent =
       emphasis: ManuscriptEmphasis;
     };
 
+type VivaClientGenerationMetadata = {
+  client_generation_id?: string;
+};
+
 export type VivaClientFrame =
-  | {
+  | ({
       type: "session_config";
       version: typeof VIVA_VOICE_PROTOCOL_VERSION;
       session: AgentSessionConfig;
       session_token?: string;
-    }
-  | { type: "audio"; version: typeof VIVA_VOICE_PROTOCOL_VERSION; frame: AgentAudioFrame }
-  | { type: "text"; version: typeof VIVA_VOICE_PROTOCOL_VERSION; text: string }
-  | { type: "cancel"; version: typeof VIVA_VOICE_PROTOCOL_VERSION }
-  | { type: "stop"; version: typeof VIVA_VOICE_PROTOCOL_VERSION };
+    } & VivaClientGenerationMetadata)
+  | ({
+      type: "audio";
+      version: typeof VIVA_VOICE_PROTOCOL_VERSION;
+      frame: AgentAudioFrame;
+    } & VivaClientGenerationMetadata)
+  | ({
+      type: "text";
+      version: typeof VIVA_VOICE_PROTOCOL_VERSION;
+      text: string;
+    } & VivaClientGenerationMetadata)
+  | ({ type: "cancel"; version: typeof VIVA_VOICE_PROTOCOL_VERSION } & VivaClientGenerationMetadata)
+  | ({ type: "stop"; version: typeof VIVA_VOICE_PROTOCOL_VERSION } & VivaClientGenerationMetadata);
 
 export type VivaReadyFrame = {
   type: "ready";
@@ -221,8 +233,12 @@ export type VivaServerFrame =
   | { type: "event"; version: typeof VIVA_VOICE_PROTOCOL_VERSION; event: VivaServerEvent }
   | { type: "error"; version: typeof VIVA_VOICE_PROTOCOL_VERSION; message: string };
 
-export function audioClientFrame(pcm16Base64: string): VivaClientFrame {
+export function audioClientFrame(
+  pcm16Base64: string,
+  clientGenerationId?: string,
+): VivaClientFrame {
   return {
+    ...(clientGenerationId ? { client_generation_id: clientGenerationId } : {}),
     type: "audio",
     version: VIVA_VOICE_PROTOCOL_VERSION,
     frame: { pcm16_base64: pcm16Base64 },
@@ -232,8 +248,10 @@ export function audioClientFrame(pcm16Base64: string): VivaClientFrame {
 export function sessionConfigFrame(
   session: AgentSessionConfig,
   sessionToken?: string | null,
+  clientGenerationId?: string,
 ): VivaClientFrame {
   const frame: VivaClientFrame = {
+    ...(clientGenerationId ? { client_generation_id: clientGenerationId } : {}),
     type: "session_config",
     version: VIVA_VOICE_PROTOCOL_VERSION,
     session,
@@ -355,6 +373,9 @@ export function parseVivaClientFrame(value: unknown): VivaClientFrame {
   const frame = requireRecord(value, "client frame");
   if (frame.version !== VIVA_VOICE_PROTOCOL_VERSION) {
     throw new Error("Unsupported Viva voice protocol version");
+  }
+  if ("client_generation_id" in frame && frame.client_generation_id !== undefined) {
+    requireNonEmptyString(frame.client_generation_id, "client_generation_id");
   }
   switch (frame.type) {
     case "session_config":

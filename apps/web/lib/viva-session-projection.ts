@@ -77,6 +77,7 @@ export type RuntimeCopy = {
 
 export type RuntimePrimaryActionIntent =
   | "disabled"
+  | "refresh_session"
   | "retry_agent"
   | "start_session"
   | "submit_turn";
@@ -213,7 +214,7 @@ export function projectRuntimeCopy({
         cause: "auth_failed",
       },
       context,
-      { disabled: true, nextActionLabel: "Refresh session" },
+      { disabled: false, intent: "refresh_session", nextActionLabel: "Refresh session" },
     );
   }
 

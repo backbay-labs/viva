@@ -6,7 +6,9 @@ import { usePrefersReducedMotion } from "../../lib/use-prefers-reduced-motion";
 import { useVivaAgentSession, type VivaAgentDerivedState } from "../../lib/use-viva-agent-session";
 import {
   fetchVivaAgentReadinessProbe,
+  refreshVivaSessionToken,
   type VivaAgentAudioOutput,
+  type VivaAgentGenerationReason,
   type VivaAgentReadinessProbe,
   vivaAgentHttpBaseUrl,
 } from "../../lib/viva-agent-client";
@@ -28,6 +30,7 @@ import { recapPlanFromSessionEvents } from "../../lib/viva-display";
 import { vivaSceneReducer } from "../../lib/viva-scene-reducer";
 import {
   canonicalizeSessionBrowserUrl,
+  type SessionRouteIdentity,
   sessionRouteIdentityFromLocationParts,
   sessionRouteIdentityFromSearch,
 } from "../../lib/viva-session-entry";
@@ -42,6 +45,7 @@ import {
 } from "../../lib/viva-session-projection";
 import { createVoiceLevelMeter } from "../../lib/viva-voice-level";
 import { LiveSessionShell } from "./LiveSessionShell";
+import type { TextAnswerState } from "./MarginaliaPanel";
 import { glyphStateFor, type SessionState } from "./session-data";
 import type { VoiceTraceLevel } from "./VoiceTraceCanvas";
 
@@ -98,6 +102,9 @@ export function LiveSessionPage() {
   const [textRetryOpen, setTextRetryOpen] = useState(false);
   const [submittedTextAnswer, setSubmittedTextAnswer] = useState<string>();
   const [recordingConsentAcknowledged, setRecordingConsentAcknowledged] = useState(false);
+  const routeIdentityRef = useRef(routeIdentity);
+  const sessionTokenRef = useRef(routeIdentity.sessionToken ?? STUDY_SET.sessionToken ?? null);
+  const browserLifecycleAttemptRef = useRef(0);
 
   const agent = useVivaAgentSession({
     mode: "quiz",
@@ -142,6 +149,12 @@ export function LiveSessionPage() {
     playbackRef.current = sink;
     return sink;
   }, []);
+  const resetPlaybackForGeneration = useCallback(() => {
+    resetPlaybackCancellationStateForGeneration({
+      handledCancelRef,
+      playback: playbackRef.current,
+    });
+  }, []);
 
   useEffect(() => {
     if (!shouldRefreshBrowserSessionToken(routeIdentity)) {
@@ -170,6 +183,94 @@ export function LiveSessionPage() {
     const id = window.setTimeout(() => agentRef.current.connect(), 0);
     return () => window.clearTimeout(id);
   }, [routeSessionTokenRefreshReady]);
+
+  const reconnectForBrowserLifecycle = useCallback(
+    (reason: VivaAgentGenerationReason) => {
+      const nextRouteIdentity = readBrowserSessionRouteIdentity();
+      const plan = browserLifecycleReconnectPlan({
+        currentRouteIdentity: routeIdentityRef.current,
+        nextRouteIdentity,
+        recap: agentRef.current.derived.recap,
+        sessionId: activeStudySet.sessionId,
+        sessionToken: sessionTokenRef.current,
+        status: agentRef.current.status,
+        userId: activeStudySet.userId,
+      });
+      const attempt = browserLifecycleAttemptRef.current + 1;
+      browserLifecycleAttemptRef.current = attempt;
+      if (plan.action === "skip_session_over") return;
+      if (plan.action === "reload") {
+        window.location.reload();
+        return;
+      }
+      setSourceOpen(false);
+      setHintShown(false);
+      setTextRetryOpen(false);
+      setSubmittedTextAnswer(undefined);
+      stopCaptureForRecap(captureRef, captureStartedRef, levelRef, capturedTurnPcm16Ref);
+      resetPlaybackForGeneration();
+      if (plan.action === "refresh_session_token") {
+        void refreshVivaSessionToken({
+          sessionId: plan.sessionId,
+          sessionToken: plan.sessionToken,
+          studySetId: activeStudySet.id,
+          userId: plan.userId,
+        })
+          .then((result) => {
+            if (
+              !isCurrentBrowserLifecycleAttempt({
+                activeAttempt: browserLifecycleAttemptRef.current,
+                attempt,
+              })
+            ) {
+              return;
+            }
+            sessionTokenRef.current = result.session_token;
+            agentRef.current.refreshSession({ reason, sessionToken: result.session_token });
+          })
+          .catch(() => {
+            if (
+              isCurrentBrowserLifecycleAttempt({
+                activeAttempt: browserLifecycleAttemptRef.current,
+                attempt,
+              })
+            ) {
+              agentRef.current.reset();
+              agentRef.current.connect(reason);
+            }
+          });
+        return;
+      }
+      agentRef.current.reset();
+      agentRef.current.connect(reason);
+    },
+    [
+      activeStudySet.id,
+      activeStudySet.sessionId,
+      activeStudySet.userId,
+      resetPlaybackForGeneration,
+    ],
+  );
+
+  useEffect(() => {
+    const handlePageShow = (event: PageTransitionEvent) => {
+      const reason = browserSessionReconnectReason({
+        persisted: event.persisted,
+        type: "pageshow",
+      });
+      if (reason) reconnectForBrowserLifecycle(reason);
+    };
+    const handlePopState = () => {
+      const reason = browserSessionReconnectReason({ type: "popstate" });
+      if (reason) reconnectForBrowserLifecycle(reason);
+    };
+    window.addEventListener("pageshow", handlePageShow);
+    window.addEventListener("popstate", handlePopState);
+    return () => {
+      window.removeEventListener("pageshow", handlePageShow);
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, [reconnectForBrowserLifecycle]);
 
   // Session duration clock — counts up while the session is live, then freezes
   // on its final duration once a recap arrives or the socket terminally closes.
@@ -402,8 +503,8 @@ export function LiveSessionPage() {
       setHintShown(false);
       setTextRetryOpen(false);
       setTextAnswerEnabled(true);
-      setSubmittedTextAnswer(payload);
-      agentRef.current.sendText(payload);
+      const sent = agentRef.current.sendText(payload);
+      if (sent) setSubmittedTextAnswer(payload);
     },
     [activateTextAnswerMode, unlockPlayback],
   );
@@ -415,12 +516,62 @@ export function LiveSessionPage() {
     agentRef.current.sendText("(challenge citation)");
   }, [onUserGesture]);
   const retryAgent = useCallback(() => {
+    browserLifecycleAttemptRef.current += 1;
     setSourceOpen(false);
     setHintShown(false);
     setTextRetryOpen(false);
+    resetPlaybackForGeneration();
     agentRef.current.reset();
-    agentRef.current.connect();
-  }, []);
+    agentRef.current.connect("socket_retry");
+  }, [resetPlaybackForGeneration]);
+  const refreshSession = useCallback(() => {
+    const attempt = browserLifecycleAttemptRef.current + 1;
+    browserLifecycleAttemptRef.current = attempt;
+    setSourceOpen(false);
+    setHintShown(false);
+    setTextRetryOpen(false);
+    setSubmittedTextAnswer(undefined);
+    resetPlaybackForGeneration();
+    const sessionToken = sessionTokenRef.current;
+    if (!sessionToken || !activeStudySet.userId || !activeStudySet.sessionId) {
+      retryAgent();
+      return;
+    }
+    void refreshVivaSessionToken({
+      sessionId: activeStudySet.sessionId,
+      sessionToken,
+      studySetId: activeStudySet.id,
+      userId: activeStudySet.userId,
+    })
+      .then((result) => {
+        if (
+          !isCurrentBrowserLifecycleAttempt({
+            activeAttempt: browserLifecycleAttemptRef.current,
+            attempt,
+          })
+        ) {
+          return;
+        }
+        sessionTokenRef.current = result.session_token;
+        agentRef.current.refreshSession({ sessionToken: result.session_token });
+      })
+      .catch(() => {
+        if (
+          isCurrentBrowserLifecycleAttempt({
+            activeAttempt: browserLifecycleAttemptRef.current,
+            attempt,
+          })
+        ) {
+          retryAgent();
+        }
+      });
+  }, [
+    activeStudySet.id,
+    activeStudySet.sessionId,
+    activeStudySet.userId,
+    resetPlaybackForGeneration,
+    retryAgent,
+  ]);
   const startNewSession = useCallback(() => {
     setSourceOpen(false);
     setHintShown(false);
@@ -560,21 +711,14 @@ export function LiveSessionPage() {
   const textAnswerRequired = micState === "denied" || micState === "unsupported";
   const textAnswerAvailable = websocketReady;
   const textAnswerActive = textAnswerAvailable && (textAnswerRequired || textAnswerEnabled);
-  const studentHandAnswer = textRetryOpen
-    ? undefined
-    : (agent.derived.finalTranscript ?? submittedTextAnswer);
-  // The caveat only applies when the shown answer IS the voice transcription
-  // (not a typed answer), and the agent reported low confidence in hearing it.
-  const studentHandUncertain =
-    studentHandAnswer !== undefined &&
-    studentHandAnswer === agent.derived.finalTranscript &&
-    transcriptionWasUncertain(agent.derived.transcriptConfidence);
   const submitRuntimePrimaryAction =
-    runtime.primaryActionIntent === "retry_agent"
-      ? retryAgent
-      : runtime.primaryActionIntent === "start_session"
-        ? startNewSession
-        : submitSpokenTurn;
+    runtime.primaryActionIntent === "refresh_session"
+      ? refreshSession
+      : runtime.primaryActionIntent === "retry_agent"
+        ? retryAgent
+        : runtime.primaryActionIntent === "start_session"
+          ? startNewSession
+          : submitSpokenTurn;
 
   useEffect(() => {
     if (textAnswerActive) {
@@ -609,6 +753,7 @@ export function LiveSessionPage() {
       contextLabel={sessionContextLabel}
       elapsed={elapsed}
       glyphState={glyphStateFor(effectiveState)}
+      generationId={agent.derived.generationId}
       highlightedTokens={highlightedTokens}
       hintShown={hintShown}
       checkingControl={
@@ -647,19 +792,99 @@ export function LiveSessionPage() {
       sourceFolio={sourceFolio}
       state={effectiveState}
       transcript={agent.derived.transcript}
-      textAnswer={
-        textAnswerAvailable
-          ? {
-              active: textAnswerActive,
-              disabled: false,
-              lastAnswer: studentHandAnswer,
-              lastAnswerUncertain: studentHandUncertain,
-              required: textAnswerRequired,
-            }
-          : undefined
-      }
+      textAnswer={textAnswerStateForSession({
+        canSubmitAnswer: agent.derived.canSubmitAnswer,
+        finalTranscript: agent.derived.finalTranscript,
+        submittedTextAnswer,
+        textAnswerActive,
+        textAnswerAvailable,
+        textAnswerRequired,
+        textRetryOpen,
+        transcriptConfidence: agent.derived.transcriptConfidence,
+      })}
     />
   );
+}
+
+export function textAnswerStateForSession(input: {
+  canSubmitAnswer: boolean;
+  finalTranscript?: string;
+  submittedTextAnswer?: string;
+  textAnswerActive: boolean;
+  textAnswerAvailable: boolean;
+  textAnswerRequired: boolean;
+  textRetryOpen: boolean;
+  transcriptConfidence?: number;
+}): TextAnswerState | undefined {
+  if (!input.textAnswerAvailable) return undefined;
+  const lastAnswer = input.textRetryOpen
+    ? undefined
+    : (input.finalTranscript ?? input.submittedTextAnswer);
+  return {
+    active: input.textAnswerActive,
+    disabled: !input.canSubmitAnswer,
+    lastAnswer,
+    lastAnswerUncertain: Boolean(
+      lastAnswer !== undefined &&
+        lastAnswer === input.finalTranscript &&
+        transcriptionWasUncertain(input.transcriptConfidence),
+    ),
+    required: input.textAnswerRequired,
+  };
+}
+
+export type BrowserSessionReconnectEvent =
+  | { type: "pageshow"; persisted: boolean }
+  | { type: "popstate" };
+
+export function browserSessionReconnectReason(
+  event: BrowserSessionReconnectEvent,
+): VivaAgentGenerationReason | null {
+  if (event.type === "popstate") return "back_forward_restore";
+  return event.persisted ? "bfcache_restore" : null;
+}
+
+export type BrowserLifecycleReconnectPlan =
+  | { action: "skip_session_over" }
+  | { action: "reload" }
+  | { action: "socket_retry" }
+  | {
+      action: "refresh_session_token";
+      sessionId: string;
+      sessionToken: string;
+      userId: string;
+    };
+
+export function browserLifecycleReconnectPlan(input: {
+  currentRouteIdentity: SessionRouteIdentity;
+  nextRouteIdentity: SessionRouteIdentity;
+  recap: unknown;
+  sessionId?: string | null;
+  sessionToken?: string | null;
+  status: string;
+  userId?: string | null;
+}): BrowserLifecycleReconnectPlan {
+  if (!sameBrowserSessionRouteIdentity(input.currentRouteIdentity, input.nextRouteIdentity)) {
+    return { action: "reload" };
+  }
+  if (input.recap) {
+    return { action: "skip_session_over" };
+  }
+  if (input.status === "closed") {
+    return { action: "reload" };
+  }
+  const sessionToken = input.sessionToken?.trim();
+  const userId = input.userId?.trim();
+  const sessionId = input.sessionId?.trim();
+  if (sessionToken && userId && sessionId) {
+    return {
+      action: "refresh_session_token",
+      sessionId,
+      sessionToken,
+      userId,
+    };
+  }
+  return { action: "socket_retry" };
 }
 
 /**
@@ -699,6 +924,14 @@ export function drainAgentAudio(input: {
   for (const output of input.audio) input.sink.enqueue(output);
   if (input.audio.length > 0) input.acknowledgeAudio(input.audio);
   return input.cancellations.length;
+}
+
+export function resetPlaybackCancellationStateForGeneration(input: {
+  handledCancelRef: { current: number };
+  playback: Pick<VivaAudioPlaybackSink, "resetForGeneration"> | null;
+}) {
+  input.playback?.resetForGeneration();
+  input.handledCancelRef.current = 0;
 }
 
 /**
@@ -913,6 +1146,24 @@ export async function refreshBrowserSessionToken(
   } catch {
     return fallbackToken;
   }
+}
+
+export function sameBrowserSessionRouteIdentity(
+  left: ReturnType<typeof readBrowserSessionRouteIdentity>,
+  right: ReturnType<typeof readBrowserSessionRouteIdentity>,
+): boolean {
+  return (
+    left.userId === right.userId &&
+    left.studySetId === right.studySetId &&
+    left.sessionId === right.sessionId
+  );
+}
+
+export function isCurrentBrowserLifecycleAttempt(input: {
+  activeAttempt: number;
+  attempt: number;
+}): boolean {
+  return input.activeAttempt === input.attempt;
 }
 
 function initialReadinessProbe(): VivaAgentReadinessProbe {

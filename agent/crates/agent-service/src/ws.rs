@@ -950,7 +950,10 @@ async fn open_failure_control_session(
 
         while let Some(input) = input_rx.recv().await {
             match input {
-                BrainInput::Audio(_) | BrainInput::Text(_) => {
+                BrainInput::Audio(_)
+                | BrainInput::AudioWithMetadata { .. }
+                | BrainInput::Text(_)
+                | BrainInput::TextWithMetadata { .. } => {
                     let _ = event_tx.send(BrainEvent::InputSpeechStarted).await;
                     let _ = event_tx.send(BrainEvent::InputSpeechStopped).await;
                     if scenario == FailureControlScenario::SilentStall {
@@ -1281,7 +1284,20 @@ async fn send_client_input_action_with_drain(
 fn brain_input_audio_bytes(brain_input: &BrainInput) -> Option<u64> {
     match brain_input {
         BrainInput::Audio(frame) => Some(frame.pcm16_bytes().len().try_into().unwrap_or(u64::MAX)),
+        BrainInput::AudioWithMetadata { frame, .. } => {
+            Some(frame.pcm16_bytes().len().try_into().unwrap_or(u64::MAX))
+        }
         _ => None,
+    }
+}
+
+fn validated_client_generation_id(
+    value: Option<String>,
+) -> Result<Option<String>, ClientFrameError> {
+    match value {
+        Some(value) if value.trim().is_empty() => Err(ClientFrameError::invalid()),
+        Some(value) => Ok(Some(value)),
+        None => Ok(None),
     }
 }
 
@@ -1310,14 +1326,42 @@ fn client_input_action(
                         action: ClientAction::ConfigRefresh,
                     })
                 }
-                ClientFrame::Audio { frame, .. } => Ok(ClientInputAction::Send {
-                    brain_input: BrainInput::Audio(frame),
-                    action: ClientAction::Audio,
-                }),
-                ClientFrame::Text { text, .. } => Ok(ClientInputAction::Send {
-                    brain_input: BrainInput::Text(text),
-                    action: ClientAction::AnswerText,
-                }),
+                ClientFrame::Audio {
+                    frame,
+                    client_generation_id,
+                    ..
+                } => {
+                    let client_generation_id =
+                        validated_client_generation_id(client_generation_id)?;
+                    Ok(ClientInputAction::Send {
+                        brain_input: match client_generation_id {
+                            Some(client_generation_id) => BrainInput::AudioWithMetadata {
+                                frame,
+                                client_generation_id: Some(client_generation_id),
+                            },
+                            None => BrainInput::Audio(frame),
+                        },
+                        action: ClientAction::Audio,
+                    })
+                }
+                ClientFrame::Text {
+                    text,
+                    client_generation_id,
+                    ..
+                } => {
+                    let client_generation_id =
+                        validated_client_generation_id(client_generation_id)?;
+                    Ok(ClientInputAction::Send {
+                        brain_input: match client_generation_id {
+                            Some(client_generation_id) => BrainInput::TextWithMetadata {
+                                text,
+                                client_generation_id: Some(client_generation_id),
+                            },
+                            None => BrainInput::Text(text),
+                        },
+                        action: ClientAction::AnswerText,
+                    })
+                }
                 ClientFrame::ToolResult { .. } => Err(ClientFrameError::untrusted_tool_result()),
                 ClientFrame::Cancel { .. } => Ok(ClientInputAction::Send {
                     brain_input: BrainInput::CancelResponse,
@@ -1424,7 +1468,9 @@ fn initial_session_config_from_message(
     if frame.frame_type != "session_config" {
         return Err(ClientFrameError::invalid_first_frame());
     }
+    let client_generation_id = validated_client_generation_id(frame.client_generation_id)?;
     Ok(InitialSessionConfig {
+        client_generation_id,
         session: frame.session,
         session_token: frame.session_token,
     })
@@ -1454,6 +1500,7 @@ fn sanitize_client_session_config(
     }
     config.source_context.clear();
     config.active_concepts.clear();
+    config.client_generation_id = None;
     Ok(config)
 }
 
@@ -1514,6 +1561,7 @@ fn authorize_initial_session_config(
             )
         };
     let mut config = sanitize_client_session_config(initial.session, &binding)?;
+    config.client_generation_id = initial.client_generation_id;
     if rotate_trusted_session {
         config.session_id = Some(agent_domain::SessionId::new(
             state.next_trusted_voice_session_id(),
@@ -1542,6 +1590,7 @@ struct AuthorizedClientSession {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct InitialSessionConfig {
+    client_generation_id: Option<String>,
     session: SessionConfig,
     session_token: Option<String>,
 }
@@ -1559,6 +1608,8 @@ struct InitialClientFrame {
     frame_type: String,
     version: u32,
     session: SessionConfig,
+    #[serde(default)]
+    client_generation_id: Option<String>,
     #[serde(default)]
     session_token: Option<String>,
 }
@@ -2058,6 +2109,98 @@ mod tests {
             received.recv().await.unwrap(),
             BrainInput::CancelResponse
         ));
+    }
+
+    #[test]
+    fn preserves_initial_session_config_generation_metadata() {
+        let initial = initial_session_config_from_message(Message::Text(
+            json!({
+                "type": "session_config",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "session": {
+                    "session_id": "voice-session-1",
+                    "user_id": "user-1",
+                    "study_set_id": "biology-midterm",
+                    "source_context": [],
+                    "active_concepts": [],
+                },
+                "session_token": "placeholder-session-material",
+                "client_generation_id": "token_refresh-3",
+            })
+            .to_string()
+            .into(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            initial.client_generation_id.as_deref(),
+            Some("token_refresh-3")
+        );
+        assert_eq!(
+            initial.session_token.as_deref(),
+            Some("placeholder-session-material")
+        );
+        assert_eq!(initial.session.client_generation_id, None);
+    }
+
+    #[tokio::test]
+    async fn maps_client_generation_ids_to_brain_inputs() {
+        let (input, mut received) = mpsc::channel(8);
+        let binding = fixture_binding();
+
+        handle_client_message(
+            Message::Text(
+                json!({
+                    "type": "text",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "text": "quiz me",
+                    "client_generation_id": "bfcache_restore-2",
+                })
+                .to_string()
+                .into(),
+            ),
+            &input,
+            &binding,
+        )
+        .await
+        .unwrap();
+        handle_client_message(
+            Message::Text(
+                json!({
+                    "type": "audio",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "frame": { "pcm16_base64": "AQIDBA==" },
+                    "client_generation_id": "token_refresh-3",
+                })
+                .to_string()
+                .into(),
+            ),
+            &input,
+            &binding,
+        )
+        .await
+        .unwrap();
+
+        match received.recv().await.unwrap() {
+            BrainInput::TextWithMetadata {
+                text,
+                client_generation_id,
+            } => {
+                assert_eq!(text, "quiz me");
+                assert_eq!(client_generation_id.as_deref(), Some("bfcache_restore-2"));
+            }
+            other => panic!("expected text input with metadata, got {other:?}"),
+        }
+        match received.recv().await.unwrap() {
+            BrainInput::AudioWithMetadata {
+                frame,
+                client_generation_id,
+            } => {
+                assert_eq!(frame.pcm16_bytes(), &[1, 2, 3, 4]);
+                assert_eq!(client_generation_id.as_deref(), Some("token_refresh-3"));
+            }
+            other => panic!("expected audio input with metadata, got {other:?}"),
+        }
     }
 
     #[tokio::test]

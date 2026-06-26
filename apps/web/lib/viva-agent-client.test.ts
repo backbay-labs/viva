@@ -20,6 +20,7 @@ import {
   fetchVivaLibrarySnapshot,
   initialVivaAgentSessionState,
   parseVivaAgentMessage,
+  refreshVivaSessionToken,
   vivaAgentHttpBaseUrl,
   vivaAgentProtocols,
   vivaAgentReducer,
@@ -158,10 +159,55 @@ describe("Viva agent browser client", () => {
     expect(agentProtocolVersion()).toBe(VIVA_VOICE_PROTOCOL_VERSION);
   });
 
+  test("refreshes signed session material through the same-origin browser route", async () => {
+    const calls: Array<{ body: unknown; url: string }> = [];
+    const result = await refreshVivaSessionToken(
+      {
+        sessionId: "session-1",
+        sessionToken: "placeholder-current-material",
+        studySetId: "study-set-1",
+        userId: "user-1",
+      },
+      {
+        apiBaseUrl: "http://localhost:3000",
+        fetchImpl: async (input, init) => {
+          calls.push({
+            body: JSON.parse(String(init?.body ?? "{}")),
+            url: String(input),
+          });
+          return jsonResponse(200, {
+            failure_class: null,
+            session: {
+              session_id: "session-1",
+              study_set_id: "study-set-1",
+              user_id: "user-1",
+            },
+            session_token: "placeholder-refreshed-material",
+            token_refresh_outcome: "refreshed",
+          });
+        },
+      },
+    );
+
+    expect(calls).toEqual([
+      {
+        body: {
+          session_id: "session-1",
+          session_token: "placeholder-current-material",
+          study_set_id: "study-set-1",
+          user_id: "user-1",
+        },
+        url: "http://localhost:3000/api/viva-session/refresh",
+      },
+    ]);
+    expect(result.session_token).toBe("placeholder-refreshed-material");
+  });
+
   test("controller sends initial session config and command frames", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
       session: sessionFixture as AgentSessionConfig,
       sessionToken: "signed-session-token",
       url: "ws://localhost:4318/ws",
@@ -176,6 +222,7 @@ describe("Viva agent browser client", () => {
     const sessionConfig = parseVivaClientFrame(JSON.parse(socket.sent[0] ?? "{}"));
     expect(sessionConfig.type).toBe("session_config");
     if (sessionConfig.type !== "session_config") throw new Error("Expected session config");
+    expect(sessionConfig.client_generation_id).toBe("session_bootstrap-1");
     expect(sessionConfig.session_token).toBe("signed-session-token");
     expect("session_token" in sessionConfig.session).toBe(false);
 
@@ -183,10 +230,18 @@ describe("Viva agent browser client", () => {
     expect(controller.getState().status).toBe("open");
 
     controller.sendText("quiz me");
+    socket.message(
+      JSON.stringify({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "session_phase", phase: "feedback" },
+      }),
+    );
     controller.sendAudio("AQIDBA==");
     controller.cancel();
     controller.stop();
     expect(parseVivaClientFrame(JSON.parse(socket.sent[1] ?? "{}"))).toEqual({
+      client_generation_id: "session_bootstrap-1",
       text: "quiz me",
       type: "text",
       version: VIVA_VOICE_PROTOCOL_VERSION,
@@ -560,18 +615,223 @@ describe("Viva agent browser client", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
       session: sessionFixture as AgentSessionConfig,
       url: "ws://localhost:4318/ws",
     });
 
     const first = controller.connect() as unknown as FakeWebSocket;
-    const second = controller.connect() as unknown as FakeWebSocket;
+    expect(controller.getState().generation).toEqual({
+      id: "session_bootstrap-1",
+      reason: "session_bootstrap",
+      sequence: 1,
+    });
+    const second = controller.connect("socket_retry") as unknown as FakeWebSocket;
 
     expect(FakeWebSocket.instances).toEqual([first, second]);
     expect(first.closeCount).toBe(1);
     expect(first.readyState).toBe(3);
     expect(second.closeCount).toBe(0);
     expect(controller.getState().status).toBe("connecting");
+    expect(controller.getState().generation).toEqual({
+      id: "socket_retry-2",
+      reason: "socket_retry",
+      sequence: 2,
+    });
+  });
+
+  test("controller ignores stale socket events and close frames from prior generations", () => {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
+      session: sessionFixture as AgentSessionConfig,
+      url: "ws://localhost:4318/ws",
+    });
+
+    const first = controller.connect() as unknown as FakeWebSocket;
+    const second = controller.connect("socket_retry") as unknown as FakeWebSocket;
+
+    first.open();
+    expect(first.sent).toHaveLength(0);
+
+    second.open();
+    second.message(JSON.stringify(readyFixture));
+    expect(controller.getState().status).toBe("open");
+    expect(controller.getState().generation?.id).toBe("socket_retry-2");
+    expect(parseVivaClientFrame(JSON.parse(second.sent[0] ?? "{}")).client_generation_id).toBe(
+      "socket_retry-2",
+    );
+
+    first.message(
+      JSON.stringify({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "session_phase", phase: "recap", terminal_reason: "drained" },
+      }),
+    );
+    first.close({ code: 1000, reason: "client stop", wasClean: true });
+
+    expect(controller.getState().status).toBe("open");
+    expect(controller.getState().phase).toBe("ready");
+    expect(controller.getState().close).toBeUndefined();
+    expect(controller.getState().generation?.id).toBe("socket_retry-2");
+  });
+
+  test("controller refresh gets a new generation and stale thinking events cannot overwrite it", () => {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
+      session: sessionFixture as AgentSessionConfig,
+      sessionToken: "placeholder-initial-material",
+      url: "ws://localhost:4318/ws",
+    });
+
+    const first = controller.connect() as unknown as FakeWebSocket;
+    first.open();
+    first.message(JSON.stringify(readyFixture));
+    first.message(
+      JSON.stringify({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "session_phase", phase: "thinking" },
+      }),
+    );
+    expect(controller.getState().phase).toBe("thinking");
+
+    const refreshed = controller.refreshSession({
+      sessionToken: "placeholder-refreshed-material",
+    }) as unknown as FakeWebSocket;
+    expect(refreshed.protocols).toEqual(vivaAgentProtocols("placeholder-refreshed-material"));
+    expect(controller.getState().status).toBe("connecting");
+    expect(controller.getState().phase).toBe("ready");
+    expect(controller.getState().generation?.id).toBe("token_refresh-2");
+
+    first.message(
+      JSON.stringify({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "session_phase", phase: "recap", terminal_reason: "drained" },
+      }),
+    );
+    first.close({ code: 1000, reason: "client stop", wasClean: true });
+
+    refreshed.open();
+    const refreshConfig = parseVivaClientFrame(JSON.parse(refreshed.sent[0] ?? "{}"));
+    expect(refreshConfig.type).toBe("session_config");
+    if (refreshConfig.type !== "session_config") throw new Error("Expected session config");
+    expect(refreshConfig.client_generation_id).toBe("token_refresh-2");
+    expect(refreshConfig.session_token).toBe("placeholder-refreshed-material");
+    refreshed.message(JSON.stringify(readyFixture));
+
+    expect(controller.getState().status).toBe("open");
+    expect(controller.getState().phase).toBe("ready");
+    expect(controller.getState().close).toBeUndefined();
+    expect(controller.getState().generation?.id).toBe("token_refresh-2");
+  });
+
+  test("controller marks token-backed websocket errors as refreshable preflight failures", () => {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      session: sessionFixture as AgentSessionConfig,
+      sessionToken: "placeholder-expired-material",
+      token: "placeholder-expired-material",
+      url: "ws://localhost:4318/ws",
+    });
+
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.error();
+
+    expect(controller.getState().status).toBe("error");
+    expect(controller.getState().errors.at(-1)).toBe("WebSocket session token preflight failed");
+  });
+
+  test("controller drops duplicate answer submits while a provider turn is pending", () => {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
+      session: sessionFixture as AgentSessionConfig,
+      url: "ws://localhost:4318/ws",
+    });
+
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.open();
+    socket.message(JSON.stringify(readyFixture));
+
+    expect(controller.sendText("first typed response")).toBe(true);
+    expect(controller.sendText("second typed response")).toBe(false);
+    expect(controller.sendAudio("AQIDBA==")).toBe(false);
+
+    expect(
+      socket.sent.slice(1).map((frame) => parseVivaClientFrame(JSON.parse(frame)).type),
+    ).toEqual(["text"]);
+    expect(parseVivaClientFrame(JSON.parse(socket.sent[1] ?? "{}"))).toEqual({
+      client_generation_id: "session_bootstrap-1",
+      text: "first typed response",
+      type: "text",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+    });
+    expect(controller.getState().pendingSubmission).toEqual({
+      generationId: "session_bootstrap-1",
+      kind: "text",
+    });
+
+    socket.message(
+      JSON.stringify({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "session_phase", phase: "listening" },
+      }),
+    );
+    expect(controller.getState().pendingSubmission).toEqual({
+      generationId: "session_bootstrap-1",
+      kind: "text",
+    });
+    expect(controller.sendText("still duplicate typed response")).toBe(false);
+
+    socket.message(
+      JSON.stringify({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "session_phase", phase: "feedback" },
+      }),
+    );
+    expect(controller.getState().pendingSubmission).toBeUndefined();
+
+    expect(controller.sendText("followup typed response")).toBe(true);
+    expect(
+      socket.sent.slice(1).map((frame) => parseVivaClientFrame(JSON.parse(frame)).type),
+    ).toEqual(["text", "text"]);
+  });
+
+  test("reducer keeps pending submissions when stale cancellations arrive", () => {
+    const pendingSubmission = {
+      generationId: "session_bootstrap-1",
+      kind: "text" as const,
+    };
+    const state = {
+      ...initialVivaAgentSessionState(),
+      activeResponseId: "response-2",
+      pendingSubmission,
+      phase: "thinking" as const,
+    };
+
+    const next = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: { type: "cancellation", response_id: "response-1" },
+      }),
+    );
+
+    expect(next.activeResponseId).toBe("response-2");
+    expect(next.phase).toBe("thinking");
+    expect(next.pendingSubmission).toEqual(pendingSubmission);
+    expect(next.cancelledResponseIds).toContain("response-1");
   });
 
   test("reducer maps product session fixture and suppresses stale response events", () => {
@@ -1142,6 +1402,10 @@ class FakeWebSocket {
 
   message(data: string) {
     this.emit("message", Object.assign(new Event("message"), { data }));
+  }
+
+  error() {
+    this.emit("error", new Event("error"));
   }
 
   private emit(type: string, event: Event & { data?: unknown }) {

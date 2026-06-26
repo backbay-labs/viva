@@ -131,4 +131,23 @@ describe("useVivaAgentSession adapter", () => {
       { type: "scene_intent", register: "examining", emphasis: "measured" },
     ]);
   });
+
+  test("keeps generation metadata visible while pending submits disable duplicate answers", () => {
+    const derived = deriveVivaAgentUiState({
+      ...initialVivaAgentSessionState(),
+      generation: {
+        id: "session_bootstrap-1",
+        reason: "session_bootstrap",
+        sequence: 1,
+      },
+      pendingSubmission: {
+        generationId: "session_bootstrap-1",
+        kind: "text",
+      },
+      status: "open",
+    });
+
+    expect(derived.generationId).toBe("session_bootstrap-1");
+    expect(derived.canSubmitAnswer).toBe(false);
+  });
 });

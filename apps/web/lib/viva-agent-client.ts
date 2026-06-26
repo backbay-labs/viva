@@ -46,6 +46,29 @@ export type VivaPasteStudySetOptions = {
   fetchImpl?: typeof fetch;
 };
 
+export type VivaSessionRefreshInput = {
+  sessionId: string;
+  sessionToken: string;
+  studySetId: string;
+  userId: string;
+};
+
+export type VivaSessionRefreshOptions = {
+  apiBaseUrl?: string;
+  fetchImpl?: typeof fetch;
+};
+
+export type VivaSessionRefreshResult = {
+  failure_class: null;
+  session: {
+    session_id: string;
+    study_set_id: string;
+    user_id: string;
+  };
+  session_token: string;
+  token_refresh_outcome: string;
+};
+
 export type VivaLibrarySnapshotOptions = {
   apiBaseUrl?: string;
   bearerToken?: string;
@@ -102,6 +125,24 @@ export type VivaAgentCloseDiagnostics = {
   wasClean: boolean;
 };
 
+export type VivaAgentGenerationReason =
+  | "session_bootstrap"
+  | "socket_retry"
+  | "token_refresh"
+  | "bfcache_restore"
+  | "back_forward_restore";
+
+export type VivaAgentGeneration = {
+  id: string;
+  reason: VivaAgentGenerationReason;
+  sequence: number;
+};
+
+export type VivaAgentPendingSubmission = {
+  generationId: string;
+  kind: "audio" | "text";
+};
+
 export type VivaAgentAudioOutput = {
   responseId: string;
   frame: AgentAudioFrame;
@@ -115,6 +156,8 @@ export type VivaAgentManuscriptIntent = {
 export type VivaAgentSessionState = {
   status: VivaAgentConnectionStatus;
   close?: VivaAgentCloseDiagnostics;
+  generation?: VivaAgentGeneration;
+  pendingSubmission?: VivaAgentPendingSubmission;
   ready?: VivaReadyFrame;
   phase: AgentStudySessionPhase;
   terminalReason?: AgentTerminalSessionReason;
@@ -137,17 +180,23 @@ export type VivaAgentSessionState = {
 };
 
 export type VivaAgentSessionControllerOptions = VivaAgentClientOptions & {
+  generationIdFactory?: (input: { reason: VivaAgentGenerationReason; sequence: number }) => string;
   session: AgentSessionConfig;
   sessionToken?: string | null;
   initialState?: VivaAgentSessionState;
 };
 
 export type VivaAgentSessionController = {
-  connect: () => WebSocket;
+  connect: (reason?: VivaAgentGenerationReason) => WebSocket;
   close: () => void;
+  refreshSession: (input?: {
+    reason?: VivaAgentGenerationReason;
+    session?: AgentSessionConfig;
+    sessionToken?: string | null;
+  }) => WebSocket;
   reset: () => void;
-  sendText: (text: string) => void;
-  sendAudio: (pcm16Base64: string) => void;
+  sendText: (text: string) => boolean;
+  sendAudio: (pcm16Base64: string) => boolean;
   acknowledgeAudio: (consumed: readonly VivaAgentAudioOutput[]) => void;
   cancel: () => void;
   stop: () => void;
@@ -442,6 +491,29 @@ export async function deleteVivaSessionHistory(
   return response.json();
 }
 
+export async function refreshVivaSessionToken(
+  input: VivaSessionRefreshInput,
+  options: VivaSessionRefreshOptions = {},
+): Promise<VivaSessionRefreshResult> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const base = options.apiBaseUrl ? trimTrailingSlash(options.apiBaseUrl) : "";
+  const response = await fetchImpl(`${base}/api/viva-session/refresh`, {
+    body: JSON.stringify({
+      session_id: input.sessionId,
+      session_token: input.sessionToken,
+      study_set_id: input.studySetId,
+      user_id: input.userId,
+    }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  const body = (await response.json().catch(() => null)) as unknown;
+  if (!response.ok || !isVivaSessionRefreshResult(body)) {
+    throw new Error("Viva session refresh failed");
+  }
+  return body;
+}
+
 function vivaLibraryApiBaseUrl(options: VivaLibrarySnapshotOptions): string {
   const apiBaseUrl =
     options.apiBaseUrl ??
@@ -453,6 +525,20 @@ function vivaLibraryApiBaseUrl(options: VivaLibrarySnapshotOptions): string {
     throw new Error("Viva API URL is unavailable");
   }
   return apiBaseUrl;
+}
+
+function isVivaSessionRefreshResult(value: unknown): value is VivaSessionRefreshResult {
+  return (
+    isRecord(value) &&
+    value.failure_class === null &&
+    isRecord(value.session) &&
+    typeof value.session.session_id === "string" &&
+    typeof value.session.study_set_id === "string" &&
+    typeof value.session.user_id === "string" &&
+    typeof value.session_token === "string" &&
+    value.session_token.trim().length > 0 &&
+    typeof value.token_refresh_outcome === "string"
+  );
 }
 
 function configuredVivaAgentHttpBaseUrl(): string | undefined {
@@ -519,6 +605,7 @@ export function vivaAgentReducer(
     return {
       ...state,
       status: "error",
+      pendingSubmission: undefined,
       errors: [...state.errors, sanitizeAgentError(frame.message)],
     };
   }
@@ -540,20 +627,27 @@ export function vivaAgentReducer(
   }
 
   switch (event.type) {
-    case "session_phase":
+    case "session_phase": {
+      const pendingSubmission = pendingSubmissionForSessionPhase(
+        event.phase,
+        state.pendingSubmission,
+      );
       if (state.recap && event.phase !== "recap") return state;
       if (event.terminal_reason && event.phase === "recap" && !state.recap) {
         return {
           ...state,
           phase: event.phase,
+          pendingSubmission,
           terminalReason: event.terminal_reason,
         };
       }
       return {
         ...state,
         phase: event.phase,
+        pendingSubmission,
         terminalReason: event.terminal_reason ?? state.terminalReason,
       };
+    }
     case "question_started":
       return {
         ...state,
@@ -561,6 +655,7 @@ export function vivaAgentReducer(
         question: event.question,
         transcript: "",
         terminalReason: undefined,
+        pendingSubmission: undefined,
         finalTranscript: undefined,
         transcriptConfidence: undefined,
         evaluation: undefined,
@@ -580,7 +675,7 @@ export function vivaAgentReducer(
         transcriptConfidence: event.confidence ?? undefined,
       };
     case "answer_evaluated":
-      return { ...state, evaluation: event.evaluation };
+      return { ...state, evaluation: event.evaluation, pendingSubmission: undefined };
     case "source_reference":
       return { ...state, currentSource: event.source, sources: [...state.sources, event.source] };
     case "concept_status":
@@ -598,7 +693,7 @@ export function vivaAgentReducer(
         ],
       };
     case "recap_ready":
-      return { ...state, phase: "recap", recap: event.recap };
+      return { ...state, phase: "recap", pendingSubmission: undefined, recap: event.recap };
     case "audio_delta":
       return {
         ...state,
@@ -616,6 +711,7 @@ export function vivaAgentReducer(
         ...state,
         activeResponseId: cancellingActive ? undefined : state.activeResponseId,
         phase: cancellingActive ? "listening" : state.phase,
+        pendingSubmission: cancellingActive ? undefined : state.pendingSubmission,
         manuscriptIntents: cancelledResponseId
           ? state.manuscriptIntents.filter((intent) => intent.responseId !== cancelledResponseId)
           : state.manuscriptIntents,
@@ -641,11 +737,21 @@ export function vivaAgentReducer(
       return {
         ...state,
         status: "error",
+        pendingSubmission: undefined,
         errors: [...state.errors, sanitizeAgentError(event.message)],
       };
     default:
       return state;
   }
+}
+
+function pendingSubmissionForSessionPhase(
+  phase: AgentStudySessionPhase,
+  pendingSubmission: VivaAgentPendingSubmission | undefined,
+): VivaAgentPendingSubmission | undefined {
+  return phase === "ready" || phase === "listening" || phase === "thinking"
+    ? pendingSubmission
+    : undefined;
 }
 
 function sanitizeAgentError(message: string): string {
@@ -659,10 +765,20 @@ function sanitizeAgentError(message: string): string {
     .slice(0, 160);
 }
 
+function webSocketErrorMessage(token?: string | null): string {
+  if (token) return "WebSocket session token preflight failed";
+  return "WebSocket error";
+}
+
 export function createVivaAgentSessionController(
   options: VivaAgentSessionControllerOptions,
 ): VivaAgentSessionController {
   let socket: WebSocket | undefined;
+  let activeGeneration = options.initialState?.generation;
+  let generationSequence = options.initialState?.generation?.sequence ?? 0;
+  let currentWebSocketToken = options.token ?? null;
+  let currentSession = options.session;
+  let currentSessionToken = options.sessionToken ?? null;
   let state = options.initialState ?? initialVivaAgentSessionState();
   const listeners = new Set<(next: VivaAgentSessionState) => void>();
 
@@ -671,61 +787,132 @@ export function createVivaAgentSessionController(
     for (const listener of listeners) listener(state);
   }
 
-  function sendFrame(frame: VivaClientFrame) {
-    if (socket?.readyState !== 1) {
-      setState({ ...state, status: "error", errors: [...state.errors, "WebSocket is not open"] });
-      return;
+  function createGeneration(reason: VivaAgentGenerationReason): VivaAgentGeneration {
+    const sequence = generationSequence + 1;
+    generationSequence = sequence;
+    const id =
+      options.generationIdFactory?.({ reason, sequence }) ??
+      defaultVivaAgentGenerationId({ reason, sequence });
+    return { id, reason, sequence };
+  }
+
+  function isActiveSocketGeneration(nextSocket: WebSocket, generation: VivaAgentGeneration) {
+    return socket === nextSocket && activeGeneration?.id === generation.id;
+  }
+
+  function sendFrame(frame: VivaClientFrame): boolean {
+    const generationId = activeGeneration?.id;
+    if (socket?.readyState !== 1 || !generationId) {
+      setState({
+        ...state,
+        status: "error",
+        pendingSubmission: undefined,
+        errors: [...state.errors, "WebSocket is not open"],
+      });
+      return false;
     }
-    socket.send(JSON.stringify(frame));
+    socket.send(JSON.stringify(withClientGeneration(frame, generationId)));
+    return true;
+  }
+
+  function sendSubmissionFrame(
+    kind: VivaAgentPendingSubmission["kind"],
+    frame: VivaClientFrame,
+  ): boolean {
+    const generationId = activeGeneration?.id;
+    if (!generationId || state.pendingSubmission) return false;
+    if (sendFrame(frame)) {
+      setState({ ...state, pendingSubmission: { generationId, kind } });
+      return true;
+    }
+    return false;
+  }
+
+  function openSocket(reason: VivaAgentGenerationReason): WebSocket {
+    const previousSocket = socket;
+    const generation = createGeneration(reason);
+    activeGeneration = generation;
+    previousSocket?.close();
+    const nextSocket = connectVivaAgent({
+      ...options,
+      token: currentWebSocketToken ?? undefined,
+    });
+    socket = nextSocket;
+    setState({ ...initialVivaAgentSessionState(), generation, status: "connecting" });
+    setSocketHandler(nextSocket, "open", () => {
+      if (!isActiveSocketGeneration(nextSocket, generation)) return;
+      sendFrame(sessionConfigFrame(currentSession, currentSessionToken, generation.id));
+    });
+    setSocketHandler(nextSocket, "message", (event) => {
+      if (!isActiveSocketGeneration(nextSocket, generation)) return;
+      if (typeof event.data !== "string") return;
+      try {
+        setState(vivaAgentReducer(state, parseVivaAgentMessage(event.data)));
+      } catch (error) {
+        setState({
+          ...state,
+          status: "error",
+          pendingSubmission: undefined,
+          errors: [...state.errors, error instanceof Error ? error.message : String(error)],
+        });
+      }
+    });
+    setSocketHandler(nextSocket, "close", (event) => {
+      if (!isActiveSocketGeneration(nextSocket, generation)) return;
+      setState({
+        ...state,
+        generation,
+        pendingSubmission: undefined,
+        status: "closed",
+        close: closeDiagnosticsForEvent(event),
+      });
+    });
+    setSocketHandler(nextSocket, "error", () => {
+      if (!isActiveSocketGeneration(nextSocket, generation)) return;
+      setState({
+        ...state,
+        pendingSubmission: undefined,
+        status: "error",
+        errors: [...state.errors, webSocketErrorMessage(currentSessionToken)],
+      });
+    });
+    return nextSocket;
   }
 
   return {
-    connect() {
-      socket?.close();
-      const nextSocket = connectVivaAgent(options);
-      socket = nextSocket;
-      setState({ ...initialVivaAgentSessionState(), status: "connecting" });
-      setSocketHandler(nextSocket, "open", () => {
-        if (socket !== nextSocket) return;
-        sendFrame(sessionConfigFrame(options.session, options.sessionToken));
-      });
-      setSocketHandler(nextSocket, "message", (event) => {
-        if (socket !== nextSocket) return;
-        if (typeof event.data !== "string") return;
-        try {
-          setState(vivaAgentReducer(state, parseVivaAgentMessage(event.data)));
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          setState({
-            ...state,
-            status: "error",
-            errors: [...state.errors, sanitizeAgentError(message)],
-          });
-        }
-      });
-      setSocketHandler(nextSocket, "close", (event) => {
-        if (socket !== nextSocket) return;
-        setState({ ...state, status: "closed", close: closeDiagnosticsForEvent(event) });
-      });
-      setSocketHandler(nextSocket, "error", () => {
-        if (socket !== nextSocket) return;
-        setState({ ...state, status: "error", errors: [...state.errors, "WebSocket error"] });
-      });
-      return nextSocket;
+    connect(reason = "session_bootstrap") {
+      return openSocket(reason);
     },
     close() {
-      socket?.close();
+      const closingSocket = socket;
       socket = undefined;
-      setState({ ...initialVivaAgentSessionState(), status: "closed" });
+      closingSocket?.close();
+      setState({
+        ...initialVivaAgentSessionState(),
+        generation: activeGeneration,
+        status: "closed",
+      });
+    },
+    refreshSession(input = {}) {
+      currentSession = input.session ?? currentSession;
+      if ("sessionToken" in input) {
+        currentSessionToken = input.sessionToken ?? null;
+        currentWebSocketToken = input.sessionToken ?? null;
+      }
+      return openSocket(input.reason ?? "token_refresh");
     },
     reset() {
       setState(initialVivaAgentSessionState());
     },
     sendText(text: string) {
-      sendFrame({ type: "text", version: VIVA_VOICE_PROTOCOL_VERSION, text });
+      return sendSubmissionFrame("text", {
+        type: "text",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        text,
+      });
     },
     sendAudio(pcm16Base64: string) {
-      sendFrame(audioClientFrame(pcm16Base64));
+      return sendSubmissionFrame("audio", audioClientFrame(pcm16Base64));
     },
     acknowledgeAudio(consumed: readonly VivaAgentAudioOutput[]) {
       // Drop exactly the frames the consumer enqueued to the playback sink — by
@@ -756,6 +943,21 @@ export function createVivaAgentSessionController(
       };
     },
   };
+}
+
+function withClientGeneration(frame: VivaClientFrame, generationId: string): VivaClientFrame {
+  return { ...frame, client_generation_id: generationId } as VivaClientFrame;
+}
+
+function defaultVivaAgentGenerationId(input: {
+  reason: VivaAgentGenerationReason;
+  sequence: number;
+}): string {
+  const random =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  return `viva-${input.reason}-${input.sequence}-${random}`;
 }
 
 function responseIdForEvent(event: VivaServerEvent): string | undefined {
