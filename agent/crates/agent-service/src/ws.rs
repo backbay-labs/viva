@@ -2308,17 +2308,18 @@ fn provider_stage_failure_detail(failure: &BrainProviderFailure) -> String {
     let budget_state = metadata_field(&failure.metadata, "budget_state");
     let deploy_sha = metadata_field(&failure.metadata, "deploy_sha");
     format!(
-        "failure_class={} stage={} latency_ms={} provider={} model={} retry_after_ms={} retry_after_source={} reset_hint={} budget_state={} deploy_sha={}",
+        "failure_class={} stage={} terminal_reason={} retry_after_ms={} retry_after_source={} reset_hint={} budget_state={} deploy_sha={} latency_ms={} provider={} model={}",
         failure.failure_class,
         failure.stage,
-        failure.latency_ms,
-        bounded_evidence_value(&failure.provider, 24),
-        bounded_evidence_value(&failure.model, 24),
+        failure.terminal_reason.as_str(),
         retry_after_ms.unwrap_or("unknown"),
         retry_after_source.unwrap_or("unknown"),
         reset_hint.unwrap_or("unknown"),
         budget_state.unwrap_or("unknown"),
-        deploy_sha.unwrap_or("unknown")
+        deploy_sha.unwrap_or("unknown"),
+        failure.latency_ms,
+        bounded_evidence_value(&failure.provider, 24),
+        bounded_evidence_value(&failure.model, 24)
     )
 }
 
@@ -2868,8 +2869,7 @@ mod tests {
         let detail = &events[0].detail;
         assert!(detail.contains("failure_class=quota_rate_failure"));
         assert!(detail.contains("stage=gemini"));
-        assert!(detail.contains("provider=gemini"));
-        assert!(detail.contains("model=gemini-35-flash"));
+        assert!(detail.contains("terminal_reason=provider_rate_limited"));
         assert!(detail.contains("retry_after_ms=7000"));
         assert!(detail.contains("retry_after_source=retry_after_delta"));
         assert!(detail.contains("reset_hint=2030-01-01T00:00:00Z"));
@@ -2911,6 +2911,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         let detail = &events[0].detail;
         assert!(detail.len() <= 240);
+        assert!(detail.contains("terminal_reason=provider_rate_limited"));
         assert!(detail.contains("retry_after_ms=7000"));
         assert!(detail.contains("retry_after_source=retry_after_delta"));
         assert!(detail.contains("reset_hint=2030-01-01T00:00:00Z"));
