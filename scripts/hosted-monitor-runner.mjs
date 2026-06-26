@@ -1,30 +1,17 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { createHmac, createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
-import { finished } from "node:stream/promises";
 import path from "node:path";
+import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+import { auditTextArtifacts } from "./redaction-control.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const hostedArtifactRoot = path.join(root, "artifacts/hosted-monitor");
 const defaultRunTimeoutMs = 10 * 60 * 1000;
 const defaultPublishTimeoutMs = 2 * 60 * 1000;
-const forbiddenArtifactMarkers = [
-  "pcm16_base64",
-  "answer_text",
-  "transcript_final",
-  "source_context",
-  "pasted_text",
-  "session_token",
-  "viva1.",
-  "session-secret",
-  "CARTESIA_API_KEY",
-  "GEMINI_API_KEY",
-  "Bearer ",
-  "bearer.",
-];
 
 export function buildHostedMonitorPlan(env = process.env) {
   const mode = (env.VIVA_HOSTED_RUNNER_MODE || "scheduled").trim();
@@ -522,24 +509,12 @@ async function auditHostedArtifacts(directory) {
     if (isRejectedHostedArtifact(file)) {
       throw new Error(`hosted monitor artifact ${path.relative(root, file)} is not allowed`);
     }
-    if (!isTextArtifact(file)) continue;
-    const text = await readFile(file, "utf8");
-    for (const marker of forbiddenArtifactMarkers) {
-      if (text.includes(marker)) {
-        throw new Error(
-          `hosted monitor artifact ${path.relative(root, file)} includes forbidden marker`,
-        );
-      }
-    }
-    for (const [name, value] of Object.entries(process.env)) {
-      if (!/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) continue;
-      if (value && value.length >= 8 && text.includes(value)) {
-        throw new Error(
-          `hosted monitor artifact ${path.relative(root, file)} includes secret value from ${name}`,
-        );
-      }
-    }
   }
+  await auditTextArtifacts([directory], {
+    context: "hosted monitor artifact",
+    rootDir: root,
+    zipMessage: (relative) => `hosted monitor artifact ${relative} is not allowed`,
+  });
 }
 
 export async function publishableHostedFiles(directory) {

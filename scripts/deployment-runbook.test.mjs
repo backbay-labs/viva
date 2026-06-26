@@ -254,7 +254,10 @@ test("hosted monitor substrate config is deployable off GitHub Actions", async (
 test("hosted monitor agent targets can deploy from the agent directory", async () => {
   const dockerfile = await readFile("agent/Dockerfile", "utf8");
   assert.match(dockerfile, /cargo build --manifest-path Cargo\.toml --release -p agent-service/);
-  assert.match(dockerfile, /VIVA_AGENT_BIND_ADDR=\$\{VIVA_AGENT_BIND_ADDR:-0\.0\.0\.0:\$\{PORT:-4318\}\}/);
+  assert.match(
+    dockerfile,
+    /VIVA_AGENT_BIND_ADDR=\$\{VIVA_AGENT_BIND_ADDR:-0\.0\.0\.0:\$\{PORT:-4318\}\}/,
+  );
   assert.doesNotMatch(dockerfile, /Dockerfile\.monitor|hosted:monitor/);
 });
 
