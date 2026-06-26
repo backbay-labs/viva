@@ -1246,9 +1246,10 @@ function recordServerFramePayload(payload, events) {
     return;
   }
   if (frame?.type === "error") {
+    const sessionAuthError = isSessionAuthErrorMessage(frame.message);
     events.push({
-      message: frame.message === "invalid session token" ? frame.message : "[redacted]",
-      terminalReason: frame.message === "invalid session token" ? "session_auth_rejected" : null,
+      message: sessionAuthError ? frame.message : "[redacted]",
+      terminalReason: sessionAuthError ? "session_auth_rejected" : null,
       type: "server_error",
     });
     return;
@@ -1263,6 +1264,10 @@ function recordServerFramePayload(payload, events) {
     terminalReason: frame.event.terminal_reason ?? null,
     type: frame.event.type,
   });
+}
+
+function isSessionAuthErrorMessage(message) {
+  return message === "invalid session token" || message === "session auth failed";
 }
 
 async function waitForFailureControlTerminal(events, plan, timeoutMs) {

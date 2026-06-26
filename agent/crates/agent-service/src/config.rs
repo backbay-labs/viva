@@ -696,7 +696,7 @@ pub struct SessionTokenClaims {
     pub failure_control: Option<FailureControlClaim>,
 }
 
-pub const SESSION_TOKEN_EXPIRY_CLOCK_SKEW_SECONDS: u64 = 60;
+pub const EXPIRY_CLOCK_SKEW_SECONDS: u64 = 60;
 
 impl SessionTokenClaims {
     pub fn sign(&self, secret: &str) -> Result<String, SessionTokenError> {
@@ -747,13 +747,9 @@ impl SessionTokenClaims {
         let claims: Self =
             serde_json::from_slice(&claims_bytes).map_err(|_| SessionTokenError::Malformed)?;
         if !claims.has_required_claims() {
-            return Err(SessionTokenError::Invalid);
+            return Err(SessionTokenError::Malformed);
         }
-        if claims
-            .expires_at
-            .saturating_add(SESSION_TOKEN_EXPIRY_CLOCK_SKEW_SECONDS)
-            < now
-        {
+        if claims.expires_at.saturating_add(EXPIRY_CLOCK_SKEW_SECONDS) < now {
             return Err(SessionTokenError::Expired);
         }
         Ok(claims)
@@ -1365,6 +1361,23 @@ mod tests {
         );
         assert_eq!(
             SessionTokenClaims::verify_at("not-a-viva-token", "secret", 99),
+            Err(SessionTokenError::Malformed)
+        );
+        let malformed_claims = serde_json::json!({
+            "user_id": "",
+            "study_set_id": "biology-midterm",
+            "session_id": "voice-session-1",
+            "expires_at": 100,
+            "nonce": "nonce-1",
+        });
+        let malformed_claims =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&malformed_claims).unwrap());
+        let malformed_payload = ["viva1", malformed_claims.as_str()].join(".");
+        let malformed_signature =
+            URL_SAFE_NO_PAD.encode(sign_payload("secret", malformed_payload.as_bytes()).unwrap());
+        let signed_malformed_claims = format!("{malformed_payload}.{malformed_signature}");
+        assert_eq!(
+            SessionTokenClaims::verify_at(&signed_malformed_claims, "secret", 99),
             Err(SessionTokenError::Malformed)
         );
     }

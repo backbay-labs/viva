@@ -5,7 +5,7 @@ use std::{
 
 use agent_domain::{
     fixture_question, AudioFrame, BrainError, BrainEvent, BrainInput, BrainProviderError,
-    RealtimeSession, RealtimeSessionTaskGuard, SessionConfig, SessionTokenNonceClaim,
+    PortError, RealtimeSession, RealtimeSessionTaskGuard, SessionConfig, SessionTokenNonceClaim,
     StudySessionPhase, TerminalSessionReason, VoiceUsageRecord,
 };
 use axum::{
@@ -293,13 +293,13 @@ async fn handle_socket(
         None => None,
     };
     if let Some(claim) = initial.token_nonce_claim.take() {
-        if state
-            .study_store
-            .claim_session_token_nonce(claim)
-            .await
-            .is_err()
-        {
-            let error = ClientFrameError::session_auth_failed(SessionAuthFailureCode::Replayed);
+        let claim_result = state.study_store.claim_session_token_nonce(claim).await;
+        if let Err(store_error) = claim_result {
+            let error = if nonce_claim_was_replayed(&store_error) {
+                ClientFrameError::session_auth_failed(SessionAuthFailureCode::Replayed)
+            } else {
+                ClientFrameError::nonce_store_unavailable()
+            };
             record_session_auth_failure(&state, voice_session_id.clone(), error.auth_failure_code)
                 .await;
             let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
@@ -1197,8 +1197,16 @@ async fn validate_study_set_access(
     };
     match state.study_store.study_context(user_id, study_set_id).await {
         Ok(Some(study_context)) => Ok(study_context),
-        Ok(None) | Err(_) => Err(ClientFrameError::study_set_access_denied()),
+        Ok(None) => Err(ClientFrameError::study_set_access_denied()),
+        Err(_) => Err(ClientFrameError::study_store_unavailable()),
     }
+}
+
+fn nonce_claim_was_replayed(error: &PortError) -> bool {
+    matches!(
+        error,
+        PortError::Unavailable { reason, .. } if reason == "session token nonce already used"
+    )
 }
 
 fn server_active_concepts(study_context: &serde_json::Value) -> Vec<String> {
@@ -1736,6 +1744,26 @@ impl ClientFrameError {
 
     fn study_set_access_denied() -> Self {
         Self::session_auth_failed(SessionAuthFailureCode::AccessDenied)
+    }
+
+    fn study_store_unavailable() -> Self {
+        Self {
+            auth_failure_code: None,
+            message: "study store unavailable",
+            close_code: close_code::POLICY,
+            close_reason: "study store unavailable",
+            terminal_reason: "study_store_unavailable",
+        }
+    }
+
+    fn nonce_store_unavailable() -> Self {
+        Self {
+            auth_failure_code: None,
+            message: "session token nonce store unavailable",
+            close_code: close_code::POLICY,
+            close_reason: "session token nonce store unavailable",
+            terminal_reason: concat!("session_", "token_nonce_store_unavailable"),
+        }
     }
 
     fn untrusted_tool_result() -> Self {

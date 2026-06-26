@@ -215,12 +215,13 @@ export async function handleVivaSessionRefresh(request: NextRequest) {
     userId,
   });
   if (!minted.ok) return minted.response;
+  const tokenRefreshOutcome = claims.expired ? "expired_refreshed" : "refreshed";
   return sessionJson(
     {
       failure_class: null,
       session: minted.value.session,
       session_token: minted.value.session_token,
-      token_refresh_outcome: "refreshed",
+      token_refresh_outcome: tokenRefreshOutcome,
     },
     200,
   );
@@ -635,13 +636,12 @@ function sessionAuthFailureProfile(
 function authFailureCodeForTokenReason(
   reason: Exclude<SessionTokenVerification, { ok: true }>["reason"],
 ): Exclude<VivaSessionAuthFailureCode, "expired"> {
+  if (reason === "missing_secret") return "access_denied";
   switch (reason) {
     case "invalid_signature":
       return "invalid_signature";
     case "malformed":
       return "malformed";
-    case "missing_secret":
-      return "access_denied";
   }
 }
 

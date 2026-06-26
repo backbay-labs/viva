@@ -397,6 +397,43 @@ describe("Viva same-origin session API", () => {
         user_id: "synthetic-user",
       },
       session_token: "viva1.redacted-refresh-token",
+      token_refresh_outcome: "expired_refreshed",
+    });
+  });
+
+  test("refresh records a normal same-identity token refresh separately from expiry recovery", async () => {
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input: String(input), init });
+      return jsonResponse(200, librarySnapshot({ resumeToken: "viva1.redacted-refresh-token" }));
+    }) as typeof fetch;
+
+    const response = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", {
+        session_id: "server-session",
+        session_token: signedSessionToken({
+          expires_at: futureUnixSeconds(),
+          nonce: "valid-refresh-nonce",
+          session_id: "server-session",
+          study_set_id: "biology-midterm",
+          user_id: "synthetic-user",
+        }),
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      }),
+    );
+    const body = (await response.json()) as VivaSessionRouteOutcome;
+
+    expect(response.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(body).toEqual({
+      failure_class: null,
+      session: {
+        session_id: "server-session",
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      },
+      session_token: "viva1.redacted-refresh-token",
       token_refresh_outcome: "refreshed",
     });
   });

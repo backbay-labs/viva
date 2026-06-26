@@ -7,7 +7,12 @@ use uuid::Uuid;
 
 const REDACTED_EVIDENCE_DETAIL: &str = "redacted_evidence_detail";
 const AUTH_FAILURE_TERMINAL_REASON: &str = concat!("invalid", "_session", "_token");
-const SAFE_EVIDENCE_DETAIL_LITERALS: &[&str] = &[AUTH_FAILURE_TERMINAL_REASON];
+const NONCE_STORE_UNAVAILABLE_TERMINAL_REASON: &str =
+    concat!("session", "_token", "_nonce", "_store", "_unavailable");
+const SAFE_EVIDENCE_DETAIL_LITERALS: &[&str] = &[
+    AUTH_FAILURE_TERMINAL_REASON,
+    NONCE_STORE_UNAVAILABLE_TERMINAL_REASON,
+];
 const FORBIDDEN_EVIDENCE_DETAIL_MARKERS: &[&str] = &[
     "pcm16_base64",
     "answer_text",

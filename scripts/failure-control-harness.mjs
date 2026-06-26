@@ -302,7 +302,7 @@ function expiredSessionToken(token, secret, now) {
     throw new Error("failure-control expired-token control requires a signed viva1 token");
   }
   const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
-  claims.expires_at = Math.max(0, now - 60);
+  claims.expires_at = Math.max(0, now - 61);
   const claimsPart = Buffer.from(JSON.stringify(claims)).toString("base64url");
   const payload = `viva1.${claimsPart}`;
   const signature = createHmac("sha256", trimmedSecret).update(payload).digest("base64url");
