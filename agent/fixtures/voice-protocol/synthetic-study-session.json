@@ -2,7 +2,7 @@
   "client": [
     {
       "type": "session_config",
-      "version": 2,
+      "version": 3,
       "session": {
         "session_id": "voice-session-1",
         "user_id": "user-1",
@@ -24,22 +24,22 @@
     },
     {
       "type": "text",
-      "version": 2,
+      "version": 3,
       "text": "NADH gives electrons to the electron transport chain."
     },
     {
       "type": "cancel",
-      "version": 2
+      "version": 3
     },
     {
       "type": "stop",
-      "version": 2
+      "version": 3
     }
   ],
   "server": [
     {
       "type": "ready",
-      "version": 2,
+      "version": 3,
       "sample_rate_hz": 24000,
       "input_encoding": "pcm_s16le",
       "brain": {
@@ -52,6 +52,7 @@
         "backend": "in_memory",
         "available": true,
         "durable": false,
+        "nonce_replay_protection": true,
         "raw_audio_persistence": false,
         "transcript_persistence": false,
         "uuid_schema_translation": true
@@ -59,7 +60,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "session_phase",
         "phase": "ready"
@@ -67,7 +68,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "question_started",
         "response_id": "response-1",
@@ -94,7 +95,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "session_phase",
         "phase": "listening"
@@ -102,7 +103,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "transcript_delta",
         "response_id": "response-1",
@@ -111,7 +112,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "transcript_final",
         "response_id": "response-1",
@@ -121,7 +122,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "session_phase",
         "phase": "thinking"
@@ -129,7 +130,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "manuscript_intent",
         "response_id": "response-1",
@@ -142,7 +143,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "answer_evaluated",
         "response_id": "response-1",
@@ -167,7 +168,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "source_reference",
         "response_id": "response-1",
@@ -183,7 +184,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "manuscript_intent",
         "response_id": "response-1",
@@ -198,7 +199,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "concept_status",
         "response_id": "response-1",
@@ -208,7 +209,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "manuscript_intent",
         "response_id": "response-1",
@@ -223,7 +224,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "session_phase",
         "phase": "feedback"
@@ -231,7 +232,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "session_phase",
         "phase": "correction"
@@ -239,7 +240,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "cancellation",
         "response_id": "response-2"
@@ -247,7 +248,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "recap_ready",
         "response_id": "response-0",
@@ -279,7 +280,7 @@
     },
     {
       "type": "event",
-      "version": 2,
+      "version": 3,
       "event": {
         "type": "session_phase",
         "phase": "recap"

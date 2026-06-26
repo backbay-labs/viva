@@ -1894,6 +1894,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             backend: StudyStoreBackend::InMemory,
             available: true,
             durable: false,
+            nonce_replay_protection: true,
             raw_audio_persistence: false,
             transcript_persistence: false,
             uuid_schema_translation: true,

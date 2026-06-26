@@ -10,6 +10,7 @@ import {
   assertBrowserStoryArtifactFiles,
   assertReleaseBrowserEvidence,
   normalizeBrowserEvidence,
+  releaseDurableStateClaim,
   shouldSkipMissingBrowserResult,
 } from "./browser-evidence.mjs";
 import {
@@ -40,6 +41,7 @@ const agentServiceBinary = path.join(
   process.platform === "win32" ? "agent-service.exe" : "agent-service",
 );
 const commands = [];
+const durableStateReleaseClaimed = process.env.VIVA_RELEASE_DURABLE_STATE_CLAIMED === "1";
 
 await rm(artifactDir, { recursive: true, force: true });
 await mkdir(artifactDir, { recursive: true });
@@ -97,6 +99,10 @@ try {
     process.env.VIVA_RELEASE_CHECK_SKIP_BROWSER === "1"
       ? await readExistingBrowserResult()
       : await runBrowserE2E();
+  const releaseDurableStateClaimed = releaseDurableStateClaim(
+    browserResult,
+    durableStateReleaseClaimed,
+  );
   const providerReadiness = await collectProviderReadiness();
   const rollbackDrain = buildRollbackReleaseEvidence();
   assertRollbackReleaseGate(rollbackDrain);
@@ -111,6 +117,9 @@ try {
     generated_at: new Date().toISOString(),
     schema: "viva.release_evidence.v1",
     commands,
+    release_claims: {
+      durable_state: releaseDurableStateClaimed,
+    },
     fixture_hashes: fixtureHashes,
     provider_readiness: providerReadiness,
     failure_control_harness: failureControlEvidence,
@@ -192,6 +201,7 @@ async function runBrowserE2E() {
   await run("browser_e2e_synthetic_provider", "bun", ["run", "e2e:browser"], {
     VIVA_E2E_ARTIFACT_DIR: path.join(root, "artifacts/e2e-browser"),
     VIVA_E2E_AGENT_PROVIDER: "synthetic",
+    VIVA_E2E_DURABLE_STATE_RELEASE_CLAIMED: durableStateReleaseClaimed ? "1" : "0",
     VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "1",
   });
   return readExistingBrowserResult();
@@ -208,11 +218,21 @@ async function readExistingBrowserResult() {
   try {
     const result = JSON.parse(await readFile(resultPath, "utf8"));
     await assertBrowserStoryArtifactFiles(result, root);
-    const evidence = normalizeBrowserEvidence(result);
+    const evidence = normalizeBrowserEvidence({
+      ...result,
+      durable_state_release_claimed:
+        result.durable_state_release_claimed === true || durableStateReleaseClaimed,
+    });
     assertReleaseBrowserEvidence(evidence);
     return evidence;
   } catch (error) {
-    if (shouldSkipMissingBrowserResult(error, process.env.VIVA_RELEASE_CHECK_SKIP_BROWSER)) {
+    if (
+      shouldSkipMissingBrowserResult(
+        error,
+        process.env.VIVA_RELEASE_CHECK_SKIP_BROWSER,
+        durableStateReleaseClaimed,
+      )
+    ) {
       return {
         skipped: true,
         reason: "VIVA_RELEASE_CHECK_SKIP_BROWSER=1 and no existing browser result was found",

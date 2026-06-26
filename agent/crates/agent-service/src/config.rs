@@ -9,7 +9,7 @@ use agent_adapters::{
     cartesia_gemini::{CartesiaGeminiBrain, CartesiaGeminiConfig, FakeCartesiaGeminiRuntime},
     SyntheticBrain,
 };
-use agent_domain::{RealtimeBrain, StudyMemoryStore};
+use agent_domain::{RealtimeBrain, StudyMemoryStore, StudyStoreCapabilities};
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hmac::{Hmac, Mac};
@@ -561,6 +561,39 @@ pub async fn build_study_store(
     Ok(Arc::new(data::PostgresStudyStore::new(pool)))
 }
 
+pub fn validate_runtime_store_preflight(
+    config: &ServiceConfig,
+    store: &StudyStoreCapabilities,
+) -> Result<(), ServiceConfigError> {
+    if config.ws_access.session_token_secret.is_none() {
+        return Ok(());
+    }
+    if config.bind_addr.ip().is_loopback()
+        && config.failure_control.enabled()
+        && store.nonce_replay_protection
+    {
+        return Ok(());
+    }
+    if !store.available {
+        return Err(ServiceConfigError::SignedSessionStoreUnavailable(
+            store.backend.as_str(),
+        ));
+    }
+    if !store.durable {
+        return Err(ServiceConfigError::DurableStoreRequiredForSignedSessions(
+            store.backend.as_str(),
+        ));
+    }
+    if !store.nonce_replay_protection {
+        return Err(
+            ServiceConfigError::NonceReplayProtectionRequiredForSignedSessions(
+                store.backend.as_str(),
+            ),
+        );
+    }
+    Ok(())
+}
+
 pub fn build_brain(
     config: &ServiceConfig,
     study_store: Arc<dyn StudyMemoryStore>,
@@ -633,6 +666,14 @@ pub enum ServiceConfigError {
     PublicBindMissingAllowedOrigins(SocketAddr),
     #[error("failure-control misconfigured: {0}")]
     FailureControlMisconfigured(&'static str),
+    #[error("signed-session store `{0}` is unavailable")]
+    SignedSessionStoreUnavailable(&'static str),
+    #[error("public signed-session mode requires a durable store; configured store is `{0}`")]
+    DurableStoreRequiredForSignedSessions(&'static str),
+    #[error(
+        "public signed-session mode requires nonce replay protection; configured store is `{0}`"
+    )]
+    NonceReplayProtectionRequiredForSignedSessions(&'static str),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1505,5 +1546,76 @@ mod tests {
             agent_domain::StudyStoreBackend::InMemory
         );
         assert!(!capabilities.durable);
+        assert!(capabilities.nonce_replay_protection);
+    }
+
+    #[test]
+    fn public_signed_session_preflight_rejects_ephemeral_store() {
+        let config = ServiceConfig {
+            bind_addr: "0.0.0.0:4318".parse().expect("bind parses"),
+            ws_access: VoiceWsAccess {
+                required_bearer: None,
+                session_token_secret: Some("session-secret".to_owned()),
+                allowed_origins: vec!["https://viva.example.com".to_owned()],
+            },
+            ..ServiceConfig::default()
+        };
+        let store = data::InMemoryStudyStore::seeded_fixture();
+
+        let error = validate_runtime_store_preflight(&config, &store.capabilities())
+            .expect_err("public signed sessions must not run on ephemeral store");
+
+        assert_eq!(
+            error,
+            ServiceConfigError::DurableStoreRequiredForSignedSessions("in_memory")
+        );
+    }
+
+    #[test]
+    fn loopback_signed_session_preflight_rejects_ephemeral_store() {
+        let config = ServiceConfig {
+            bind_addr: "127.0.0.1:4318".parse().expect("bind parses"),
+            ws_access: VoiceWsAccess {
+                required_bearer: None,
+                session_token_secret: Some("session-secret".to_owned()),
+                allowed_origins: vec!["http://localhost:3000".to_owned()],
+            },
+            ..ServiceConfig::default()
+        };
+        let store = data::InMemoryStudyStore::seeded_fixture();
+
+        let error = validate_runtime_store_preflight(&config, &store.capabilities())
+            .expect_err("signed sessions must not run on ephemeral loopback store");
+
+        assert_eq!(
+            error,
+            ServiceConfigError::DurableStoreRequiredForSignedSessions("in_memory")
+        );
+    }
+
+    #[test]
+    fn loopback_failure_control_allows_ephemeral_signed_session_store() {
+        let config = ServiceConfig {
+            bind_addr: "127.0.0.1:4318".parse().expect("bind parses"),
+            ws_access: VoiceWsAccess {
+                required_bearer: None,
+                session_token_secret: Some("session-secret".to_owned()),
+                allowed_origins: vec!["http://localhost:3000".to_owned()],
+            },
+            failure_control: FailureControlConfig::enabled_for_synthetic_identities(
+                FailureControlScenario::ProviderRateLimited,
+                "control-secret",
+                vec!["user-1".to_owned()],
+                vec!["biology-midterm".to_owned()],
+                vec!["http://localhost:3000".to_owned()],
+                1,
+            )
+            .expect("synthetic failure-control config should parse"),
+            ..ServiceConfig::default()
+        };
+        let store = data::InMemoryStudyStore::seeded_fixture();
+
+        validate_runtime_store_preflight(&config, &store.capabilities())
+            .expect("loopback failure-control browser evidence may use the local fixture store");
     }
 }

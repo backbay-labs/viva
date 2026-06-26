@@ -542,6 +542,7 @@ impl StudyMemoryStore for PostgresStudyStore {
             backend: StudyStoreBackend::Postgres,
             available: true,
             durable: true,
+            nonce_replay_protection: true,
             raw_audio_persistence: false,
             transcript_persistence: false,
             uuid_schema_translation: true,

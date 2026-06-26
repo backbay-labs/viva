@@ -40,6 +40,10 @@ const failureControlIdentity = failureControlPlan.enabled
 const sessionTokenFailureScenario =
   failureControlPlan.enabled && isFailureControlSessionTokenScenario(failureControlPlan.scenario);
 const allowedBrowserStoryProviders = new Set(["synthetic", "fake_cartesia_gemini"]);
+const VIVA_VOICE_PROTOCOL_VERSION = 3;
+const durableStateReleaseClaimed =
+  process.env.VIVA_E2E_DURABLE_STATE_RELEASE_CLAIMED === "1" ||
+  process.env.VIVA_RELEASE_DURABLE_STATE_CLAIMED === "1";
 if (!allowedBrowserStoryProviders.has(agentProvider)) {
   throw new Error(
     `BAC-307 browser-story capture only supports non-live providers: ${[
@@ -101,7 +105,7 @@ try {
       ...failureControlEnv,
     },
   );
-  await waitForHttpJson(
+  const agentReadiness = await waitForHttpJson(
     `${agentUrl}/ready`,
     (json) => {
       return json?.ready === true && json?.brain?.provider === agentProvider;
@@ -433,6 +437,8 @@ try {
     artifact_dir: path.relative(root, artifactDir),
     agent_provider: agentProvider,
     agent_url: agentUrl,
+    store: summarizeStore(agentReadiness?.store),
+    durable_state_release_claimed: durableStateReleaseClaimed,
     stop_to_recap: stopToRecap,
     web_url: webUrl,
     legacy_upload_visible: legacyUploadVisible,
@@ -636,7 +642,7 @@ async function fetchFailureControlStartTarget(targetPage) {
 async function consumeFailureControlReplayToken(targetPage, signedStartTarget) {
   const session = parseFailureControlSessionTarget(signedStartTarget);
   return targetPage.evaluate(
-    async ({ session, wsUrl }) =>
+    async ({ protocolVersion, session, wsUrl }) =>
       new Promise((resolve, reject) => {
         const socket = new WebSocket(wsUrl, ["viva-voice"]);
         const timeout = window.setTimeout(() => {
@@ -657,7 +663,7 @@ async function consumeFailureControlReplayToken(targetPage, signedStartTarget) {
             socket.send(
               JSON.stringify({
                 type: "session_config",
-                version: 2,
+                version: protocolVersion,
                 session: {
                   active_concepts: [],
                   session_id: session.sessionId,
@@ -690,7 +696,7 @@ async function consumeFailureControlReplayToken(targetPage, signedStartTarget) {
           reject(new Error("failure-control replay nonce preconsume websocket failed"));
         });
       }),
-    { session, wsUrl },
+    { protocolVersion: VIVA_VOICE_PROTOCOL_VERSION, session, wsUrl },
   );
 }
 
@@ -1157,6 +1163,15 @@ async function buildBrowserStoryManifest({ traceRetained }) {
     frames: storyFrames,
     sanitized: true,
     trace_retained: traceRetained,
+  };
+}
+
+function summarizeStore(store) {
+  return {
+    available: store?.available === true,
+    backend: typeof store?.backend === "string" ? store.backend : null,
+    durable: store?.durable === true,
+    nonce_replay_protection: store?.nonce_replay_protection === true,
   };
 }
 

@@ -1,4 +1,4 @@
-export const VIVA_VOICE_PROTOCOL_VERSION = 2;
+export const VIVA_VOICE_PROTOCOL_VERSION = 3;
 export const VIVA_VOICE_SAMPLE_RATE_HZ = 24_000;
 export const VIVA_VOICE_INPUT_ENCODING = "pcm_s16le";
 export const VIVA_VOICE_MAX_TEXT_FRAME_BYTES = 64 * 1024;
@@ -39,21 +39,25 @@ export type AgentStudySessionPhase =
   | "correction"
   | "recap";
 
-export type AgentTerminalSessionReason =
-  | "drained"
-  | "session_cap"
-  | "turn_cap"
-  | "rate_limit"
-  | "cost_budget"
-  | "provider_auth_failed"
-  | "provider_rate_limited"
-  | "provider_timeout"
-  | "provider_malformed_stream"
-  | "provider_network_disconnect"
-  | "slow_client"
-  | "provider_cancelled"
-  | "partial_stage_success"
-  | "rollback";
+export const VIVA_AGENT_TERMINAL_SESSION_REASONS = [
+  "drained",
+  "session_cap",
+  "turn_cap",
+  "rate_limit",
+  "cost_budget",
+  "provider_auth_failed",
+  "provider_rate_limited",
+  "provider_timeout",
+  "provider_malformed_stream",
+  "provider_network_disconnect",
+  "slow_client",
+  "provider_cancelled",
+  "partial_stage_success",
+  "durability_degraded",
+  "rollback",
+] as const;
+
+export type AgentTerminalSessionReason = (typeof VIVA_AGENT_TERMINAL_SESSION_REASONS)[number];
 
 export type AgentStudySourceReference = {
   source_id: string;
@@ -195,6 +199,7 @@ export type AgentStoreReadiness = {
   backend: string;
   available: boolean;
   durable: boolean;
+  nonce_replay_protection: boolean;
   raw_audio_persistence: boolean;
   transcript_persistence: boolean;
   uuid_schema_translation: boolean;
@@ -512,6 +517,7 @@ function parseStoreReadiness(value: unknown): AgentStoreReadiness {
   requireNonEmptyString(store.backend, "store backend");
   requireBoolean(store.available, "store available");
   requireBoolean(store.durable, "store durable");
+  requireBoolean(store.nonce_replay_protection, "store nonce replay protection");
   requireBoolean(store.raw_audio_persistence, "raw audio persistence");
   requireBoolean(store.transcript_persistence, "transcript persistence");
   requireBoolean(store.uuid_schema_translation, "uuid schema translation");
@@ -634,25 +640,10 @@ function requireStudyPhase(value: unknown): AgentStudySessionPhase {
 }
 
 function requireTerminalSessionReason(value: unknown): AgentTerminalSessionReason {
-  if (
-    value !== "drained" &&
-    value !== "session_cap" &&
-    value !== "turn_cap" &&
-    value !== "rate_limit" &&
-    value !== "cost_budget" &&
-    value !== "provider_auth_failed" &&
-    value !== "provider_rate_limited" &&
-    value !== "provider_timeout" &&
-    value !== "provider_malformed_stream" &&
-    value !== "provider_network_disconnect" &&
-    value !== "slow_client" &&
-    value !== "provider_cancelled" &&
-    value !== "partial_stage_success" &&
-    value !== "rollback"
-  ) {
+  if (!VIVA_AGENT_TERMINAL_SESSION_REASONS.includes(value as AgentTerminalSessionReason)) {
     throw new Error("Invalid terminal session reason");
   }
-  return value;
+  return value as AgentTerminalSessionReason;
 }
 
 function requireSourceConfidence(value: unknown): AgentSourceConfidence {

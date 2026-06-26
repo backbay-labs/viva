@@ -11,6 +11,7 @@ const REQUIRED_BROWSER_STORY_FRAME_IDS = [
 ];
 
 export function normalizeBrowserEvidence(result) {
+  const store = normalizeStore(result.store);
   return {
     artifact_dir: result.artifact_dir,
     agent_provider: typeof result.agent_provider === "string" ? result.agent_provider : null,
@@ -28,6 +29,9 @@ export function normalizeBrowserEvidence(result) {
     post_answer_concept_status_event_seen: result.post_answer_concept_status_event_seen === true,
     second_tab_session_cap_observed: result.second_tab_session_cap_observed === true,
     local_only_actions_hidden: result.local_only_actions_hidden === true,
+    durable_state_release_claimed: normalizeDurableStateReleaseClaim(result),
+    store,
+    store_durability_mode: normalizeStoreDurabilityMode(result.store),
     browser_story: normalizeBrowserStory(result.browser_story),
     console_error_count: Array.isArray(result.console_errors) ? result.console_errors.length : 0,
     page_error_count: Array.isArray(result.page_errors) ? result.page_errors.length : 0,
@@ -64,6 +68,14 @@ export function assertReleaseBrowserEvidence(evidence) {
     failures.push("second_tab_session_cap_observed must be true");
   if (evidence.local_only_actions_hidden !== true)
     failures.push("local_only_actions_hidden must be true");
+  if (evidence.durable_state_release_claimed === true) {
+    if (evidence.store_durability_mode !== "durable")
+      failures.push("store_durability_mode must be durable for durable-state release claims");
+    if (evidence.store?.available !== true)
+      failures.push("store.available must be true for durable-state release claims");
+    if (evidence.store?.nonce_replay_protection !== true)
+      failures.push("store.nonce_replay_protection must be true for durable-state release claims");
+  }
   if (browserStory.schema !== "viva.browser_story.v1")
     failures.push("browser_story.schema must be viva.browser_story.v1");
   if (browserStory.agent_provider !== "synthetic")
@@ -105,8 +117,23 @@ export function assertReleaseBrowserEvidence(evidence) {
   }
 }
 
-export function shouldSkipMissingBrowserResult(error, skipBrowserValue) {
-  return skipBrowserValue === "1" && error instanceof Error && error.code === "ENOENT";
+export function shouldSkipMissingBrowserResult(
+  error,
+  skipBrowserValue,
+  durableStateReleaseClaimed = false,
+) {
+  return (
+    !durableStateReleaseClaimed &&
+    skipBrowserValue === "1" &&
+    error instanceof Error &&
+    error.code === "ENOENT"
+  );
+}
+
+export function releaseDurableStateClaim(browserEvidence, durableStateReleaseClaimed = false) {
+  return (
+    durableStateReleaseClaimed === true || browserEvidence?.durable_state_release_claimed === true
+  );
 }
 
 export async function assertBrowserStoryArtifactFiles(result, rootDir) {
@@ -210,6 +237,25 @@ function normalizeBrowserStory(story) {
         ? commandSummary.validation_run_id
         : null,
   };
+}
+
+function normalizeStoreDurabilityMode(store) {
+  if (!isRecord(store) || typeof store.durable !== "boolean") return "unknown";
+  return store.durable ? "durable" : "ephemeral";
+}
+
+function normalizeStore(store) {
+  return {
+    available: store?.available === true,
+    backend: typeof store?.backend === "string" ? store.backend : null,
+    durable: store?.durable === true,
+    nonce_replay_protection: store?.nonce_replay_protection === true,
+  };
+}
+
+function normalizeDurableStateReleaseClaim(result) {
+  const releaseClaims = isRecord(result.release_claims) ? result.release_claims : null;
+  return result.durable_state_release_claimed === true || releaseClaims?.durable_state === true;
 }
 
 function hasCommandSummary(commandSummary) {

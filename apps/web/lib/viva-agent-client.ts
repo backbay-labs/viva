@@ -342,6 +342,7 @@ function isVivaAgentStoreReadinessEndpoint(
     typeof value.backend === "string" &&
     isBoolean(value.available) &&
     isBoolean(value.durable) &&
+    isBoolean(value.nonce_replay_protection) &&
     isBoolean(value.raw_audio_persistence) &&
     isBoolean(value.transcript_persistence) &&
     isBoolean(value.uuid_schema_translation)

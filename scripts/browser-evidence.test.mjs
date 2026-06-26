@@ -7,6 +7,7 @@ import {
   assertBrowserStoryArtifactFiles,
   assertReleaseBrowserEvidence,
   normalizeBrowserEvidence,
+  releaseDurableStateClaim,
   shouldSkipMissingBrowserResult,
 } from "./browser-evidence.mjs";
 
@@ -27,6 +28,13 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
     post_answer_concept_status_event_seen: true,
     second_tab_session_cap_observed: true,
     local_only_actions_hidden: true,
+    durable_state_release_claimed: true,
+    store: {
+      available: true,
+      backend: "postgres",
+      durable: true,
+      nonce_replay_protection: true,
+    },
     browser_story: completeBrowserStory(),
     console_errors: ["console failure"],
     page_errors: [],
@@ -48,6 +56,14 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
     post_answer_concept_status_event_seen: true,
     second_tab_session_cap_observed: true,
     local_only_actions_hidden: true,
+    durable_state_release_claimed: true,
+    store: {
+      available: true,
+      backend: "postgres",
+      durable: true,
+      nonce_replay_protection: true,
+    },
+    store_durability_mode: "durable",
     browser_story: {
       artifact_forbidden_hits: 0,
       artifact_files: [
@@ -155,6 +171,84 @@ test("rejects browser evidence without next-session review recommendations", () 
 test("requires sanitized browser-story frames for the manuscript release artifact", () => {
   assert.doesNotThrow(() =>
     assertReleaseBrowserEvidence(normalizeBrowserEvidence(completeBrowserResult())),
+  );
+});
+
+test("allows default no-secret browser evidence without a durable-state release claim", () => {
+  assert.doesNotThrow(() =>
+    assertReleaseBrowserEvidence(
+      normalizeBrowserEvidence(
+        completeBrowserResult({
+          durable_state_release_claimed: false,
+          store: {
+            available: true,
+            backend: "in_memory",
+            durable: false,
+            nonce_replay_protection: true,
+          },
+        }),
+      ),
+    ),
+  );
+});
+
+test("rejects browser evidence with an ephemeral store while durable state is claimed", () => {
+  assert.throws(
+    () =>
+      assertReleaseBrowserEvidence(
+        normalizeBrowserEvidence(
+          completeBrowserResult({
+            durable_state_release_claimed: true,
+            store: {
+              available: true,
+              backend: "in_memory",
+              durable: false,
+              nonce_replay_protection: true,
+            },
+          }),
+        ),
+      ),
+    /store_durability_mode/,
+  );
+});
+
+test("rejects browser evidence with unavailable store while durable state is claimed", () => {
+  assert.throws(
+    () =>
+      assertReleaseBrowserEvidence(
+        normalizeBrowserEvidence(
+          completeBrowserResult({
+            durable_state_release_claimed: true,
+            store: {
+              available: false,
+              backend: "postgres",
+              durable: true,
+              nonce_replay_protection: true,
+            },
+          }),
+        ),
+      ),
+    /store.available/,
+  );
+});
+
+test("rejects browser evidence without nonce replay protection while durable state is claimed", () => {
+  assert.throws(
+    () =>
+      assertReleaseBrowserEvidence(
+        normalizeBrowserEvidence(
+          completeBrowserResult({
+            durable_state_release_claimed: true,
+            store: {
+              available: true,
+              backend: "postgres",
+              durable: true,
+              nonce_replay_protection: false,
+            },
+          }),
+        ),
+      ),
+    /store.nonce_replay_protection/,
   );
 });
 
@@ -392,8 +486,15 @@ test("only missing browser result files are skippable in release-check skip mode
   const validation = new Error("Browser E2E release evidence is incomplete");
 
   assert.equal(shouldSkipMissingBrowserResult(missing, "1"), true);
+  assert.equal(shouldSkipMissingBrowserResult(missing, "1", true), false);
   assert.equal(shouldSkipMissingBrowserResult(validation, "1"), false);
   assert.equal(shouldSkipMissingBrowserResult(missing, undefined), false);
+});
+
+test("release durable-state claim reflects reused durable browser evidence", () => {
+  assert.equal(releaseDurableStateClaim({ durable_state_release_claimed: true }, false), true);
+  assert.equal(releaseDurableStateClaim({ durable_state_release_claimed: false }, true), true);
+  assert.equal(releaseDurableStateClaim({ durable_state_release_claimed: false }, false), false);
 });
 
 function completeBrowserResult(overrides = {}) {
@@ -413,6 +514,13 @@ function completeBrowserResult(overrides = {}) {
     post_answer_concept_status_event_seen: true,
     second_tab_session_cap_observed: true,
     local_only_actions_hidden: true,
+    durable_state_release_claimed: true,
+    store: {
+      available: true,
+      backend: "postgres",
+      durable: true,
+      nonce_replay_protection: true,
+    },
     browser_story: completeBrowserStory(),
     console_errors: [],
     page_errors: [],

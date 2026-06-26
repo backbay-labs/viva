@@ -1,4 +1,7 @@
-import type { AgentTerminalSessionReason } from "./agent-contract";
+import {
+  type AgentTerminalSessionReason,
+  VIVA_AGENT_TERMINAL_SESSION_REASONS,
+} from "./agent-contract";
 import contractData from "./learner-loop-contract.json";
 
 export const VIVA_RUNTIME_COPY_CAUSES = [
@@ -59,6 +62,8 @@ export type LearnerLoopAuthority =
   | "server_control_event"
   | "session_event";
 
+export type LearnerLoopTerminalReason = AgentTerminalSessionReason | "durability_degraded";
+
 export type LearnerLoopCopy = {
   capsule_label: string;
   marginalia_title: string;
@@ -79,7 +84,7 @@ export type LearnerLoopState = {
   learner_safe: true;
   authority: LearnerLoopAuthority;
   failure_class?: string;
-  terminal_reason?: AgentTerminalSessionReason;
+  terminal_reason?: LearnerLoopTerminalReason;
   evidence_code?: string;
   readiness_failure_kind?: string;
   sanitized_evidence: true;
@@ -129,6 +134,7 @@ export function validateLearnerLoopContract(contract: LearnerLoopContract): Lear
   const mappedRuntimeCauses = new Set<string>();
   const knownRuntimeCauses = new Set<string>(VIVA_RUNTIME_COPY_CAUSES);
   const knownEvidenceFields = new Set<string>(VIVA_LEARNER_LOOP_EVIDENCE_FIELDS);
+  const knownTerminalReasons = new Set<string>(VIVA_AGENT_TERMINAL_SESSION_REASONS);
 
   for (const state of contract.states) {
     if (stateIds.has(state.id)) {
@@ -138,6 +144,9 @@ export function validateLearnerLoopContract(contract: LearnerLoopContract): Lear
 
     if (state.resolution_kind === "terminal" && !state.terminal_reason) {
       throw new Error(`Terminal learner loop state ${state.id} is missing terminal_reason`);
+    }
+    if (state.terminal_reason && !knownTerminalReasons.has(state.terminal_reason)) {
+      throw new Error(`Unknown learner loop terminal reason ${state.terminal_reason}`);
     }
 
     if (state.submitted_answer_resolution) {

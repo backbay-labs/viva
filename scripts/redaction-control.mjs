@@ -102,6 +102,24 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     marker: "token",
     patterns: Object.freeze([/let token = initial\.session_token\.as_deref\(\)/]),
   },
+  {
+    file: "agent/crates/agent-service/src/ws.rs",
+    marker: "missing_api_key",
+    patterns: Object.freeze([/BrainError::MissingApiKey => false/]),
+  },
+  {
+    file: "agent/crates/agent-service/src/config.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /config\.ws_access\.session_token_secret\.is_none\(\)/,
+      /session_token_secret: Some\("session-secret"\.to_owned\(\)\)/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/config.rs",
+    marker: "session_token_secret",
+    patterns: Object.freeze([/session_token_secret: Some\("session-secret"\.to_owned\(\)\)/]),
+  },
 ]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);

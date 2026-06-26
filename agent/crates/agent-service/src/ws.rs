@@ -308,13 +308,36 @@ async fn handle_socket(
         .expect("authorized session config has required identity");
     let voice_session_id = initial.config.session_id.as_deref().map(ToOwned::to_owned);
     let study_context = match validate_study_set_access(&state, &initial.config).await {
-        Ok(study_context) => study_context,
-        Err(error) => {
+        StudySetAccessResult::Allowed(study_context) => study_context,
+        StudySetAccessResult::Denied(error) => {
             record_session_auth_failure(&state, voice_session_id.clone(), error.auth_failure_code)
                 .await;
             let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
             let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
             record_terminal(&state, voice_session_id, error.terminal_reason).await;
+            return;
+        }
+        StudySetAccessResult::DurabilityDegraded => {
+            state.evidence.record(VoiceEvidenceEvent::new(
+                VoiceEvidenceEventKind::StoreCounts,
+                voice_session_id.clone(),
+                "durability_degraded",
+            ));
+            let close_terminal_reason = close_with_terminal_session_phase_only(
+                &mut sender,
+                TerminalSessionReason::DurabilityDegraded,
+                close_code::ERROR,
+            )
+            .await;
+            record_terminal(
+                &state,
+                voice_session_id,
+                terminal_label_after_terminal_phase_close(
+                    TerminalSessionReason::DurabilityDegraded,
+                    close_terminal_reason,
+                ),
+            )
+            .await;
             return;
         }
     };
@@ -389,19 +412,48 @@ async fn handle_socket(
         }
     };
     if let Some(claim) = initial.token_nonce_claim.take() {
-        let claim_result = state.study_store.claim_session_token_nonce(claim).await;
-        if let Err(store_error) = claim_result {
-            let error = if nonce_claim_was_replayed(&store_error) {
-                ClientFrameError::session_auth_failed(SessionAuthFailureCode::Replayed)
-            } else {
-                ClientFrameError::nonce_store_unavailable()
-            };
-            record_session_auth_failure(&state, voice_session_id.clone(), error.auth_failure_code)
+        match state.study_store.claim_session_token_nonce(claim).await {
+            Ok(()) => {}
+            Err(error) if store_error_is_durability_degraded(&state, &error) => {
+                state.evidence.record(VoiceEvidenceEvent::new(
+                    VoiceEvidenceEventKind::StoreCounts,
+                    voice_session_id.clone(),
+                    "durability_degraded",
+                ));
+                let close_terminal_reason = close_with_terminal_session_phase_only(
+                    &mut sender,
+                    TerminalSessionReason::DurabilityDegraded,
+                    close_code::ERROR,
+                )
                 .await;
-            let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
-            let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
-            record_terminal(&state, voice_session_id, error.terminal_reason).await;
-            return;
+                record_terminal(
+                    &state,
+                    voice_session_id,
+                    terminal_label_after_terminal_phase_close(
+                        TerminalSessionReason::DurabilityDegraded,
+                        close_terminal_reason,
+                    ),
+                )
+                .await;
+                return;
+            }
+            Err(store_error) => {
+                let error = if nonce_claim_was_replayed(&store_error) {
+                    ClientFrameError::session_auth_failed(SessionAuthFailureCode::Replayed)
+                } else {
+                    ClientFrameError::nonce_store_unavailable()
+                };
+                record_session_auth_failure(
+                    &state,
+                    voice_session_id.clone(),
+                    error.auth_failure_code,
+                )
+                .await;
+                let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+                let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
+                record_terminal(&state, voice_session_id, error.terminal_reason).await;
+                return;
+            }
         }
     }
     let mut initial_config = initial.config;
@@ -422,13 +474,25 @@ async fn handle_socket(
     let mut session = match session_result {
         Ok(session) => session,
         Err(error) => {
-            let terminal_reason = close_with_terminal_session_phase_only(
+            let terminal_reason = if brain_error_is_durability_degraded(&state, &error) {
+                state.evidence.record(VoiceEvidenceEvent::new(
+                    VoiceEvidenceEventKind::StoreCounts,
+                    voice_session_id.clone(),
+                    "durability_degraded",
+                ));
+                TerminalSessionReason::DurabilityDegraded
+            } else {
+                terminal_reason_for_brain_error(&error)
+            };
+            let close_terminal_reason = close_with_terminal_session_phase_only(
                 &mut sender,
-                terminal_reason_for_brain_error(&error),
+                terminal_reason,
                 close_code::ERROR,
             )
             .await;
-            record_terminal(&state, voice_session_id, terminal_reason).await;
+            let recorded_terminal_reason =
+                terminal_label_after_terminal_phase_close(terminal_reason, close_terminal_reason);
+            record_terminal(&state, voice_session_id, recorded_terminal_reason).await;
             return;
         }
     };
@@ -438,6 +502,7 @@ async fn handle_socket(
         "session opened",
     ));
     let mut terminal_reason = "event_stream_closed";
+    let mut terminal_persisted = false;
     let mut cancelled_responses = CancelledResponseTracker::default();
     let mut session_limits = SessionLimitRuntime::new();
     let session_cap = tokio::time::sleep(state.ws_timeouts.session);
@@ -455,11 +520,14 @@ async fn handle_socket(
         terminal_reason = close_with_terminal_session_phase(
             &mut sender,
             &session.input,
+            &state,
+            voice_session_id.clone(),
+            &mut terminal_persisted,
             TerminalSessionReason::Drained,
             close_code::NORMAL,
         )
         .await;
-        record_terminal(&state, voice_session_id, terminal_reason).await;
+        record_terminal_evidence(&state, voice_session_id, terminal_reason);
         return;
     }
 
@@ -470,6 +538,9 @@ async fn handle_socket(
                     terminal_reason = close_with_terminal_session_phase(
                         &mut sender,
                         &session.input,
+                        &state,
+                        voice_session_id.clone(),
+                        &mut terminal_persisted,
                         TerminalSessionReason::Drained,
                         close_code::NORMAL,
                     )
@@ -481,6 +552,9 @@ async fn handle_socket(
                 terminal_reason = close_with_terminal_session_phase(
                     &mut sender,
                     &session.input,
+                    &state,
+                    voice_session_id.clone(),
+                    &mut terminal_persisted,
                     TerminalSessionReason::SessionCap,
                     close_code::POLICY,
                 )
@@ -492,6 +566,9 @@ async fn handle_socket(
                 terminal_reason = close_with_terminal_session_phase(
                     &mut sender,
                     &session.input,
+                    &state,
+                    voice_session_id.clone(),
+                    &mut terminal_persisted,
                     TerminalSessionReason::TurnCap,
                     close_code::POLICY,
                 )
@@ -503,6 +580,9 @@ async fn handle_socket(
                 terminal_reason = close_with_terminal_session_phase(
                     &mut sender,
                     &session.input,
+                    &state,
+                    voice_session_id.clone(),
+                    &mut terminal_persisted,
                     TerminalSessionReason::TurnCap,
                     close_code::POLICY,
                 )
@@ -531,6 +611,9 @@ async fn handle_socket(
                         terminal_reason = close_with_terminal_session_phase(
                             &mut sender,
                             &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
                             TerminalSessionReason::Drained,
                             close_code::NORMAL,
                         )
@@ -541,6 +624,9 @@ async fn handle_socket(
                         terminal_reason = close_with_terminal_session_phase(
                             &mut sender,
                             &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
                             TerminalSessionReason::RateLimit,
                             close_code::POLICY,
                         )
@@ -581,7 +667,6 @@ async fn handle_socket(
                         record_client_action(&state, voice_session_id.clone(), action);
                         match action {
                             ClientAction::Stop => {
-                                terminal_reason = "client_stop";
                                 let mut forward_context = BrainForwardContext {
                                     state: &state,
                                     voice_session_id: voice_session_id.clone(),
@@ -609,10 +694,26 @@ async fn handle_socket(
                                         .await;
                                         break;
                                     }
+                                    Ok(ForwardBrainEvent::DurabilityDegraded) => {
+                                        terminal_reason = close_with_terminal_session_phase(
+                                            &mut sender,
+                                            &session.input,
+                                            &state,
+                                            voice_session_id.clone(),
+                                            &mut terminal_persisted,
+                                            TerminalSessionReason::DurabilityDegraded,
+                                            close_code::ERROR,
+                                        )
+                                        .await;
+                                        break;
+                                    }
                                     Ok(ForwardBrainEvent::CostBudgetExceeded) => {
                                         terminal_reason = close_with_terminal_session_phase(
                                             &mut sender,
                                             &session.input,
+                                            &state,
+                                            voice_session_id.clone(),
+                                            &mut terminal_persisted,
                                             TerminalSessionReason::CostBudget,
                                             close_code::POLICY,
                                         )
@@ -623,6 +724,9 @@ async fn handle_socket(
                                         terminal_reason = close_with_terminal_session_phase(
                                             &mut sender,
                                             &session.input,
+                                            &state,
+                                            voice_session_id.clone(),
+                                            &mut terminal_persisted,
                                             reason,
                                             close_code::ERROR,
                                         )
@@ -631,16 +735,32 @@ async fn handle_socket(
                                     }
                                     Err(_) => {
                                         terminal_reason = "send_failed";
+                                        let _ = close_with(
+                                            &mut sender,
+                                            close_code::NORMAL,
+                                            "client stop",
+                                        )
+                                        .await;
+                                        break;
                                     }
                                 }
-                                let _ =
-                                    close_with(&mut sender, close_code::NORMAL, "client stop").await;
+                                terminal_reason = close_with_client_stop(
+                                    &mut sender,
+                                    &state,
+                                    voice_session_id.clone(),
+                                    &mut terminal_persisted,
+                                )
+                                .await;
                                 break;
                             }
                             ClientAction::Close => {
-                                terminal_reason = "client_stop";
-                                let _ =
-                                    close_with(&mut sender, close_code::NORMAL, "client stop").await;
+                                terminal_reason = close_with_client_stop(
+                                    &mut sender,
+                                    &state,
+                                    voice_session_id.clone(),
+                                    &mut terminal_persisted,
+                                )
+                                .await;
                                 break;
                             }
                             _ => {}
@@ -650,6 +770,9 @@ async fn handle_socket(
                         terminal_reason = close_with_terminal_session_phase(
                             &mut sender,
                             &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
                             TerminalSessionReason::Drained,
                             close_code::NORMAL,
                         )
@@ -660,6 +783,9 @@ async fn handle_socket(
                         terminal_reason = close_with_terminal_session_phase(
                             &mut sender,
                             &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
                             TerminalSessionReason::RateLimit,
                             close_code::POLICY,
                         )
@@ -677,6 +803,9 @@ async fn handle_socket(
                         terminal_reason = close_with_terminal_session_phase(
                             &mut sender,
                             &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
                             TerminalSessionReason::TurnCap,
                             close_code::POLICY,
                         )
@@ -741,10 +870,26 @@ async fn handle_socket(
                         .await;
                         break;
                     }
+                    Ok(ForwardBrainEvent::DurabilityDegraded) => {
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
+                            TerminalSessionReason::DurabilityDegraded,
+                            close_code::ERROR,
+                        )
+                        .await;
+                        break;
+                    }
                     Ok(ForwardBrainEvent::CostBudgetExceeded) => {
                         terminal_reason = close_with_terminal_session_phase(
                             &mut sender,
                             &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
                             TerminalSessionReason::CostBudget,
                             close_code::POLICY,
                         )
@@ -755,6 +900,9 @@ async fn handle_socket(
                         terminal_reason = close_with_terminal_session_phase(
                             &mut sender,
                             &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
                             reason,
                             close_code::ERROR,
                         )
@@ -769,7 +917,11 @@ async fn handle_socket(
             }
         }
     }
-    record_terminal(&state, voice_session_id, terminal_reason).await;
+    if terminal_persisted {
+        record_terminal_evidence(&state, voice_session_id, terminal_reason);
+    } else {
+        record_terminal(&state, voice_session_id, terminal_reason).await;
+    }
 }
 
 fn abort_realtime_session_tasks(session: &mut agent_domain::RealtimeSession) {
@@ -807,6 +959,9 @@ fn brain_event_submitted_answer_resolution(
 async fn close_with_terminal_session_phase<S>(
     sender: &mut S,
     input: &mpsc::Sender<BrainInput>,
+    state: &AppState,
+    voice_session_id: Option<String>,
+    terminal_persisted: &mut bool,
     terminal_reason: TerminalSessionReason,
     close_code: u16,
 ) -> &'static str
@@ -814,12 +969,16 @@ where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
     let _ = input.try_send(BrainInput::Stop);
+    let terminal_reason =
+        persist_terminal_session_reason(state, voice_session_id, terminal_reason).await;
+    *terminal_persisted = true;
     if send_terminal_session_phase(sender, terminal_reason)
         .await
         .is_err()
     {
         return "send_failed";
     }
+    let close_code = terminal_close_code(terminal_reason, close_code);
     let _ = close_with(sender, close_code, terminal_reason.close_reason()).await;
     terminal_reason.as_str()
 }
@@ -840,6 +999,44 @@ where
     }
     let _ = close_with(sender, close_code, terminal_reason.close_reason()).await;
     terminal_reason.as_str()
+}
+
+fn terminal_label_after_terminal_phase_close(
+    terminal_reason: TerminalSessionReason,
+    close_terminal_reason: &'static str,
+) -> &'static str {
+    if terminal_reason == TerminalSessionReason::DurabilityDegraded {
+        terminal_reason.as_str()
+    } else {
+        close_terminal_reason
+    }
+}
+
+async fn close_with_client_stop<S>(
+    sender: &mut S,
+    state: &AppState,
+    voice_session_id: Option<String>,
+    terminal_persisted: &mut bool,
+) -> &'static str
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    let terminal_label =
+        persist_terminal_label_or_durability_degraded(state, voice_session_id, "client_stop").await;
+    *terminal_persisted = true;
+    if terminal_label == TerminalSessionReason::DurabilityDegraded.as_str() {
+        let _ =
+            send_terminal_session_phase(sender, TerminalSessionReason::DurabilityDegraded).await;
+        let _ = close_with(
+            sender,
+            close_code::ERROR,
+            TerminalSessionReason::DurabilityDegraded.close_reason(),
+        )
+        .await;
+        return TerminalSessionReason::DurabilityDegraded.as_str();
+    }
+    let _ = close_with(sender, close_code::NORMAL, "client stop").await;
+    terminal_label
 }
 
 async fn send_terminal_session_phase<S>(
@@ -907,6 +1104,7 @@ enum ForwardBrainEvent {
     Continue,
     Suppressed,
     Rejected,
+    DurabilityDegraded,
     CostBudgetExceeded,
     ProviderFailure(TerminalSessionReason),
 }
@@ -925,19 +1123,38 @@ where
         return Ok(ForwardBrainEvent::Suppressed);
     }
     if let agent_domain::BrainEvent::Error(error) = &event {
+        if provider_error_is_durability_degraded(context.state, error) {
+            context.state.evidence.record(VoiceEvidenceEvent::new(
+                VoiceEvidenceEventKind::StoreCounts,
+                context.voice_session_id.clone(),
+                "durability_degraded",
+            ));
+            return Ok(ForwardBrainEvent::DurabilityDegraded);
+        }
         return Ok(ForwardBrainEvent::ProviderFailure(
             terminal_reason_for_provider_error(error),
         ));
     }
-    if !authorize_browser_event(context.state, context.session_binding, &event).await {
-        send_json(
-            sender,
-            &ServerFrame::error("provider source authority rejected"),
-        )
-        .await?;
-        return Ok(ForwardBrainEvent::Rejected);
+    match authorize_browser_event(context.state, context.session_binding, &event).await {
+        BrowserEventAuthorization::Authorized => {}
+        BrowserEventAuthorization::Rejected => {
+            send_json(
+                sender,
+                &ServerFrame::error("provider source authority rejected"),
+            )
+            .await?;
+            return Ok(ForwardBrainEvent::Rejected);
+        }
+        BrowserEventAuthorization::DurabilityDegraded => {
+            context.state.evidence.record(VoiceEvidenceEvent::new(
+                VoiceEvidenceEventKind::StoreCounts,
+                context.voice_session_id.clone(),
+                "durability_degraded",
+            ));
+            return Ok(ForwardBrainEvent::DurabilityDegraded);
+        }
     }
-    if let Some(usage_record) = record_brain_event(
+    match record_brain_event(
         context.state,
         context.voice_session_id.clone(),
         &event,
@@ -945,11 +1162,17 @@ where
     )
     .await
     {
-        if !context
-            .session_limits
-            .record_session_cost(context.limits, usage_record.cost_estimate_usd)
-        {
-            return Ok(ForwardBrainEvent::CostBudgetExceeded);
+        BrainEventRecordResult::None => {}
+        BrainEventRecordResult::DurabilityDegraded => {
+            return Ok(ForwardBrainEvent::DurabilityDegraded);
+        }
+        BrainEventRecordResult::Usage(usage_record) => {
+            if !context
+                .session_limits
+                .record_session_cost(context.limits, usage_record.cost_estimate_usd)
+            {
+                return Ok(ForwardBrainEvent::CostBudgetExceeded);
+            }
         }
     }
     let Some(frame) = ServerFrame::browser_event(event) else {
@@ -974,9 +1197,54 @@ fn terminal_reason_for_brain_error(error: &BrainError) -> TerminalSessionReason 
     }
 }
 
+fn brain_error_is_durability_degraded(state: &AppState, error: &BrainError) -> bool {
+    if !state.study_store.capabilities().durable {
+        return false;
+    }
+    match error {
+        BrainError::Connection(message) | BrainError::Protocol(message) => {
+            provider_store_error_message_is_durability_degraded(message)
+        }
+        BrainError::MissingApiKey => false,
+    }
+}
+
 fn terminal_reason_for_provider_error(error: &BrainProviderError) -> TerminalSessionReason {
     let combined = format!("{} {}", error.source, error.message);
     terminal_reason_for_provider_message(&combined)
+}
+
+fn provider_error_is_durability_degraded(state: &AppState, error: &BrainProviderError) -> bool {
+    if !state.study_store.capabilities().durable {
+        return false;
+    }
+    provider_store_error_is_durability_degraded(&error.source, &error.message)
+}
+
+fn provider_store_error_is_durability_degraded(source: &str, message: &str) -> bool {
+    let source = source.to_ascii_lowercase();
+    if !matches!(
+        source.as_str(),
+        "synthetic-memory" | "fake-provider-store" | "cartesia-gemini-store"
+    ) {
+        return false;
+    }
+    message.trim().eq_ignore_ascii_case("store adapter error")
+        || provider_store_error_message_is_durability_degraded(message)
+}
+
+fn provider_store_error_message_is_durability_degraded(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("store unavailable")
+        || normalized.contains("database unavailable")
+        || normalized.contains("durable store")
+        || ((normalized.contains("postgres")
+            || normalized.contains("database")
+            || normalized.contains("store"))
+            && (normalized.contains("connection")
+                || normalized.contains("pool")
+                || normalized.contains("timed out")
+                || normalized.contains("timeout")))
 }
 
 fn terminal_reason_for_provider_message(message: &str) -> TerminalSessionReason {
@@ -1155,11 +1423,18 @@ fn unix_timestamp_now() -> Result<u64, std::time::SystemTimeError> {
         .map(|duration| duration.as_secs())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrowserEventAuthorization {
+    Authorized,
+    Rejected,
+    DurabilityDegraded,
+}
+
 async fn authorize_browser_event(
     state: &AppState,
     session_binding: &AuthorizedClientSession,
     event: &agent_domain::BrainEvent,
-) -> bool {
+) -> BrowserEventAuthorization {
     let result = match event {
         agent_domain::BrainEvent::QuestionStarted { question, .. } => {
             state
@@ -1239,9 +1514,40 @@ async fn authorize_browser_event(
                 )
                 .await
         }
-        _ => return true,
+        _ => return BrowserEventAuthorization::Authorized,
     };
-    result.is_ok()
+    match result {
+        Ok(()) => BrowserEventAuthorization::Authorized,
+        Err(error) if store_error_is_durability_degraded(state, &error) => {
+            BrowserEventAuthorization::DurabilityDegraded
+        }
+        Err(_) => BrowserEventAuthorization::Rejected,
+    }
+}
+
+fn store_error_is_durability_degraded(state: &AppState, error: &PortError) -> bool {
+    state.study_store.capabilities().durable && store_adapter_error_is_durability_degraded(error)
+}
+
+fn store_write_error_is_durability_degraded(state: &AppState, error: &PortError) -> bool {
+    state.study_store.capabilities().durable && store_adapter_error_is_durability_degraded(error)
+}
+
+fn store_adapter_error_is_durability_degraded(error: &PortError) -> bool {
+    match error {
+        PortError::Adapter { reason, .. } => {
+            let normalized = reason.to_ascii_lowercase();
+            normalized.contains("durable store")
+                || normalized.contains("store unavailable")
+                || normalized.contains("database unavailable")
+                || normalized.contains("postgres unavailable")
+                || normalized.contains("connection")
+                || normalized.contains("pool")
+                || normalized.contains("timed out")
+                || normalized.contains("timeout")
+        }
+        PortError::Unavailable { .. } => false,
+    }
 }
 
 #[derive(Default)]
@@ -1282,19 +1588,28 @@ fn should_suppress_cancelled_response(
     }
 }
 
+enum StudySetAccessResult {
+    Allowed(serde_json::Value),
+    Denied(ClientFrameError),
+    DurabilityDegraded,
+}
+
 async fn validate_study_set_access(
     state: &AppState,
     config: &SessionConfig,
-) -> Result<serde_json::Value, ClientFrameError> {
+) -> StudySetAccessResult {
     let (Some(user_id), Some(study_set_id)) =
         (config.user_id.as_deref(), config.study_set_id.as_deref())
     else {
-        return Err(ClientFrameError::invalid_session_identity());
+        return StudySetAccessResult::Denied(ClientFrameError::invalid_session_identity());
     };
     match state.study_store.study_context(user_id, study_set_id).await {
-        Ok(Some(study_context)) => Ok(study_context),
-        Ok(None) => Err(ClientFrameError::study_set_access_denied()),
-        Err(_) => Err(ClientFrameError::study_store_unavailable()),
+        Ok(Some(study_context)) => StudySetAccessResult::Allowed(study_context),
+        Ok(None) => StudySetAccessResult::Denied(ClientFrameError::study_set_access_denied()),
+        Err(error) if store_error_is_durability_degraded(state, &error) => {
+            StudySetAccessResult::DurabilityDegraded
+        }
+        Err(_) => StudySetAccessResult::Denied(ClientFrameError::study_store_unavailable()),
     }
 }
 
@@ -1967,12 +2282,19 @@ fn record_turn_cap_config(state: &AppState, voice_session_id: Option<String>) {
     ));
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum BrainEventRecordResult {
+    None,
+    Usage(VoiceUsageRecord),
+    DurabilityDegraded,
+}
+
 async fn record_brain_event(
     state: &AppState,
     voice_session_id: Option<String>,
     event: &agent_domain::BrainEvent,
     session_elapsed: Duration,
-) -> Option<VoiceUsageRecord> {
+) -> BrainEventRecordResult {
     if let agent_domain::BrainEvent::Usage(usage) = event {
         let elapsed_ms = session_elapsed.as_millis().try_into().unwrap_or(u64::MAX);
         let usage_record = state.usage.record(
@@ -1988,15 +2310,24 @@ async fn record_brain_event(
             .record_voice_usage(usage_record.clone())
             .await
         {
-            state.evidence.record(VoiceEvidenceEvent::new(
-                VoiceEvidenceEventKind::StoreCounts,
-                voice_session_id,
-                format!("usage_persist_failed: {error}"),
-            ));
+            if store_write_error_is_durability_degraded(state, &error) {
+                state.evidence.record(VoiceEvidenceEvent::new(
+                    VoiceEvidenceEventKind::StoreCounts,
+                    voice_session_id,
+                    "durability_degraded",
+                ));
+                return BrainEventRecordResult::DurabilityDegraded;
+            } else {
+                state.evidence.record(VoiceEvidenceEvent::new(
+                    VoiceEvidenceEventKind::StoreCounts,
+                    voice_session_id,
+                    format!("usage_persist_failed: {error}"),
+                ));
+            }
         }
-        return Some(usage_record);
+        return BrainEventRecordResult::Usage(usage_record);
     }
-    let (kind, detail) = (match event {
+    let Some((kind, detail)) = (match event {
         agent_domain::BrainEvent::QuestionStarted { response_id, .. } => Some((
             VoiceEvidenceEventKind::QuestionEmitted,
             response_id.as_str(),
@@ -2015,27 +2346,108 @@ async fn record_brain_event(
             Some((VoiceEvidenceEventKind::CancelReceived, "response cancelled"))
         }
         _ => None,
-    })?;
+    }) else {
+        return BrainEventRecordResult::None;
+    };
     state
         .evidence
         .record(VoiceEvidenceEvent::new(kind, voice_session_id, detail));
-    None
+    BrainEventRecordResult::None
 }
 
 async fn record_terminal(state: &AppState, voice_session_id: Option<String>, reason: &str) {
+    let mut terminal_reason = reason;
     if let Some(session_id) = voice_session_id.as_deref() {
         if let Err(error) = state
             .study_store
             .close_voice_session(session_id, reason)
             .await
         {
+            let detail = if store_write_error_is_durability_degraded(state, &error) {
+                terminal_reason = TerminalSessionReason::DurabilityDegraded.as_str();
+                "session_close_failed: durability_degraded".to_owned()
+            } else {
+                format!("session_close_failed: {error}")
+            };
             state.evidence.record(VoiceEvidenceEvent::new(
                 VoiceEvidenceEventKind::StoreCounts,
                 voice_session_id.clone(),
-                format!("session_close_failed: {error}"),
+                detail,
             ));
         }
     }
+    record_terminal_evidence(state, voice_session_id, terminal_reason);
+}
+
+async fn persist_terminal_session_reason(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    reason: TerminalSessionReason,
+) -> TerminalSessionReason {
+    let Some(session_id) = voice_session_id.as_deref() else {
+        return reason;
+    };
+    if let Err(error) = state
+        .study_store
+        .close_voice_session(session_id, reason.as_str())
+        .await
+    {
+        if store_write_error_is_durability_degraded(state, &error) {
+            state.evidence.record(VoiceEvidenceEvent::new(
+                VoiceEvidenceEventKind::StoreCounts,
+                voice_session_id,
+                "session_close_failed: durability_degraded",
+            ));
+            return TerminalSessionReason::DurabilityDegraded;
+        }
+        state.evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::StoreCounts,
+            voice_session_id,
+            format!("session_close_failed: {error}"),
+        ));
+    }
+    reason
+}
+
+async fn persist_terminal_label_or_durability_degraded(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    reason: &'static str,
+) -> &'static str {
+    let Some(session_id) = voice_session_id.as_deref() else {
+        return reason;
+    };
+    if let Err(error) = state
+        .study_store
+        .close_voice_session(session_id, reason)
+        .await
+    {
+        if store_write_error_is_durability_degraded(state, &error) {
+            state.evidence.record(VoiceEvidenceEvent::new(
+                VoiceEvidenceEventKind::StoreCounts,
+                voice_session_id,
+                "session_close_failed: durability_degraded",
+            ));
+            return TerminalSessionReason::DurabilityDegraded.as_str();
+        }
+        state.evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::StoreCounts,
+            voice_session_id,
+            format!("session_close_failed: {error}"),
+        ));
+    }
+    reason
+}
+
+fn terminal_close_code(reason: TerminalSessionReason, close_code: u16) -> u16 {
+    if reason == TerminalSessionReason::DurabilityDegraded {
+        close_code::ERROR
+    } else {
+        close_code
+    }
+}
+
+fn record_terminal_evidence(state: &AppState, voice_session_id: Option<String>, reason: &str) {
     let counts = state.study_store.write_counts();
     state.evidence.record(VoiceEvidenceEvent::new(
         VoiceEvidenceEventKind::StoreCounts,
@@ -2096,8 +2508,10 @@ fn ws_access_error(error: VoiceWsAccessError) -> (StatusCode, Json<serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_adapters::SyntheticBrain;
     use std::{
         pin::Pin,
+        sync::Arc,
         task::{Context, Poll},
     };
 
@@ -2139,6 +2553,48 @@ mod tests {
             terminal_reason_for_provider_message("synthetic partial stage success typed fallback"),
             TerminalSessionReason::PartialStageSuccess
         );
+    }
+
+    #[test]
+    fn durability_classifier_ignores_semantic_adapter_errors() {
+        assert!(provider_store_error_message_is_durability_degraded(
+            "postgres adapter error: durable store write failed"
+        ));
+        assert!(provider_store_error_message_is_durability_degraded(
+            "postgres connection pool timed out"
+        ));
+        assert!(!provider_store_error_message_is_durability_degraded(
+            "postgres adapter error: closed voice session cannot be reopened"
+        ));
+        assert!(!provider_store_error_message_is_durability_degraded(
+            "postgres unavailable for missing-study-set: study set does not exist"
+        ));
+        assert!(!provider_store_error_message_is_durability_degraded(
+            "postgres unavailable for concept-1: concept is not available for this study set"
+        ));
+        assert!(!provider_store_error_message_is_durability_degraded(
+            "shared Cartesia/Gemini runner is wired but live transports remain gated; no network connection was attempted"
+        ));
+    }
+
+    #[test]
+    fn durability_classifier_preserves_sanitized_store_adapter_marker_for_store_sources() {
+        assert!(provider_store_error_is_durability_degraded(
+            "fake-provider-store",
+            "store adapter error"
+        ));
+        assert!(provider_store_error_is_durability_degraded(
+            "cartesia-gemini-store",
+            "store adapter error"
+        ));
+        assert!(!provider_store_error_is_durability_degraded(
+            "agent-service",
+            "store adapter error"
+        ));
+        assert!(!provider_store_error_is_durability_degraded(
+            "fake-provider-store",
+            "postgres adapter error: closed voice session cannot be reopened"
+        ));
     }
 
     #[test]
@@ -2666,17 +3122,46 @@ mod tests {
     async fn terminal_session_phase_close_reports_send_failed_when_writer_fails() {
         let (input, mut received) = mpsc::channel(1);
         let mut sender = FailingSink;
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "synthetic",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let mut terminal_persisted = false;
 
         let reason = close_with_terminal_session_phase(
             &mut sender,
             &input,
+            &state,
+            None,
+            &mut terminal_persisted,
             TerminalSessionReason::Drained,
             close_code::NORMAL,
         )
         .await;
 
         assert_eq!(reason, "send_failed");
+        assert!(terminal_persisted);
         assert!(matches!(received.recv().await.unwrap(), BrainInput::Stop));
+    }
+
+    #[test]
+    fn terminal_phase_close_preserves_durability_label_after_send_failure() {
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::DurabilityDegraded,
+                "send_failed",
+            ),
+            "durability_degraded"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::Drained,
+                "send_failed"
+            ),
+            "send_failed"
+        );
     }
 
     #[tokio::test]
@@ -2686,12 +3171,22 @@ mod tests {
             .try_send(BrainInput::Text("queued".to_owned()))
             .unwrap();
         let mut sender = RecordingSink::new();
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "synthetic",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let mut terminal_persisted = false;
 
         let reason = timeout(
             Duration::from_millis(100),
             close_with_terminal_session_phase(
                 &mut sender,
                 &input,
+                &state,
+                None,
+                &mut terminal_persisted,
                 TerminalSessionReason::Drained,
                 close_code::NORMAL,
             ),
@@ -2700,6 +3195,7 @@ mod tests {
         .expect("terminal close must not block behind provider input backpressure");
 
         assert_eq!(reason, "drained");
+        assert!(terminal_persisted);
         assert_eq!(sender.sent.len(), 2);
         let Message::Text(text) = &sender.sent[0] else {
             panic!("expected terminal session phase text frame");
@@ -2790,8 +3286,10 @@ mod tests {
             }),
             Duration::from_secs(2),
         )
-        .await
-        .expect("usage events should return a usage record");
+        .await;
+        let BrainEventRecordResult::Usage(record) = record else {
+            panic!("usage events should return a usage record");
+        };
 
         let usage = state.usage.snapshot();
         assert_eq!(usage.len(), 1);

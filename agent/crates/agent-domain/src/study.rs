@@ -30,6 +30,7 @@ pub enum TerminalSessionReason {
     SlowClient,
     ProviderCancelled,
     PartialStageSuccess,
+    DurabilityDegraded,
     Rollback,
 }
 
@@ -49,6 +50,7 @@ impl TerminalSessionReason {
             Self::SlowClient => "slow_client",
             Self::ProviderCancelled => "provider_cancelled",
             Self::PartialStageSuccess => "partial_stage_success",
+            Self::DurabilityDegraded => "durability_degraded",
             Self::Rollback => "rollback",
         }
     }
@@ -68,6 +70,7 @@ impl TerminalSessionReason {
             Self::SlowClient => "slow client",
             Self::ProviderCancelled => "provider cancelled",
             Self::PartialStageSuccess => "partial stage success",
+            Self::DurabilityDegraded => "durability degraded",
             Self::Rollback => "rollback",
         }
     }

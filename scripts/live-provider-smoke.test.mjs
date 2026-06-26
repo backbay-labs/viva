@@ -69,7 +69,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
   const frames = [
     {
       type: "ready",
-      version: 2,
+      version: 3,
       sample_rate_hz: 24000,
       input_encoding: "pcm_s16le",
       brain: {
@@ -82,6 +82,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
         backend: "postgres",
         available: true,
         durable: true,
+        nonce_replay_protection: true,
         raw_audio_persistence: false,
         transcript_persistence: false,
         uuid_schema_translation: true,
@@ -89,7 +90,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 2,
+      version: 3,
       event: {
         type: "transcript_final",
         response_id: "response-1",
@@ -99,7 +100,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 2,
+      version: 3,
       event: {
         type: "answer_evaluated",
         response_id: "response-1",
@@ -110,7 +111,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 2,
+      version: 3,
       event: {
         type: "source_reference",
         response_id: "response-1",
@@ -122,7 +123,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 2,
+      version: 3,
       event: {
         type: "audio_delta",
         response_id: "response-1",
@@ -133,7 +134,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 2,
+      version: 3,
       event: {
         type: "recap_ready",
         response_id: "response-1",
@@ -412,6 +413,101 @@ test("runLiveProviderSmoke fails closed when the live provider is not selectable
   assert.equal(socketOpened, false);
 });
 
+test("runLiveProviderSmoke fails closed when readiness lacks nonce replay protection", async () => {
+  let socketOpened = false;
+
+  const evidence = await runLiveProviderSmoke({
+    env: {
+      VIVA_LIVE_PROVIDER_SMOKE: "1",
+      CARTESIA_API_KEY: "cartesia-secret-value",
+      GEMINI_API_KEY: "gemini-secret-value",
+      CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+      GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
+      VIVA_LIVE_SMOKE_AUDIO_FILE: "/tmp/not-read-before-readiness.pcm",
+      VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
+      VIVA_LIVE_SMOKE_MAX_TURNS: "1",
+      VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
+      VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
+      VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "http://127.0.0.1:4318",
+    },
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/health/brain")) {
+        return jsonResponse(200, brainHealth({ nonceReplayProtection: false }));
+      }
+      if (String(url).endsWith("/ready")) {
+        return jsonResponse(200, readyBody({ nonceReplayProtection: false }));
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    },
+    createWebSocket: () => {
+      socketOpened = true;
+      throw new Error("must not open socket before durable readiness passes");
+    },
+    now: () => new Date("2026-06-18T00:00:00.000Z"),
+  });
+
+  assert.equal(evidence.status, "failed");
+  assert.equal(evidence.failure_stage, "readiness");
+  assert.equal(evidence.failure.failure_class, "durability_degraded");
+  assert.equal(evidence.failure.terminal_reason, "durability_degraded");
+  assert.deepEqual(evidence.failure.terminal_session_phase, {
+    type: "session_phase",
+    phase: "recap",
+    terminal_reason: "durability_degraded",
+  });
+  assert.equal(evidence.failure.sanitized_evidence, true);
+  assert.equal(evidence.failure.user_copy.next_action_label, "Start a fresh turn");
+  assert.equal(evidence.terminal_reason, "durability_degraded");
+  assert.equal(evidence.readiness.store.available, true);
+  assert.equal(evidence.readiness.store.durable, true);
+  assert.equal(evidence.readiness.store.nonce_replay_protection, false);
+  assert.equal(socketOpened, false);
+});
+
+test("runLiveProviderSmoke preserves access-denied readiness failures without store evidence", async () => {
+  let socketOpened = false;
+
+  const evidence = await runLiveProviderSmoke({
+    env: {
+      VIVA_LIVE_PROVIDER_SMOKE: "1",
+      CARTESIA_API_KEY: "cartesia-secret-value",
+      GEMINI_API_KEY: "gemini-secret-value",
+      CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+      GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
+      VIVA_LIVE_SMOKE_AUDIO_FILE: "/tmp/not-read-before-readiness.pcm",
+      VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
+      VIVA_LIVE_SMOKE_MAX_TURNS: "1",
+      VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
+      VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
+      VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "http://127.0.0.1:4318",
+    },
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/health/brain")) {
+        return jsonResponse(403, accessDeniedReadinessBody());
+      }
+      if (String(url).endsWith("/ready")) {
+        return jsonResponse(403, accessDeniedReadinessBody());
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    },
+    createWebSocket: () => {
+      socketOpened = true;
+      throw new Error("must not open socket after access-denied readiness");
+    },
+    now: () => new Date("2026-06-18T00:00:00.000Z"),
+  });
+
+  assert.equal(evidence.status, "failed");
+  assert.equal(evidence.failure_stage, "readiness");
+  assert.equal(evidence.failure.failure_class, "provider_auth_failure");
+  assert.equal(evidence.failure.terminal_reason, "provider_auth_failed");
+  assert.equal(evidence.terminal_reason, "readiness_not_live_selectable");
+  assert.equal(evidence.readiness.access.status, "denied");
+  assert.equal(evidence.readiness.failure_kind, "access_denied");
+  assert.equal(evidence.readiness.store.observed, false);
+  assert.equal(socketOpened, false);
+});
+
 test("runLiveProviderSmoke classifies malformed-stream failures without retaining payloads", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "viva-live-smoke-"));
   const audioPath = path.join(tempDir, "answer.pcm");
@@ -616,7 +712,12 @@ function jsonResponse(status, body) {
   };
 }
 
-function readyBody({ ready = true, selectable = true, liveRuntime = true } = {}) {
+function readyBody({
+  ready = true,
+  selectable = true,
+  liveRuntime = true,
+  nonceReplayProtection = true,
+} = {}) {
   return {
     ready,
     brain: {
@@ -629,6 +730,7 @@ function readyBody({ ready = true, selectable = true, liveRuntime = true } = {})
       backend: "postgres",
       available: true,
       durable: true,
+      nonce_replay_protection: nonceReplayProtection,
       raw_audio_persistence: false,
       transcript_persistence: false,
       uuid_schema_translation: true,
@@ -636,7 +738,12 @@ function readyBody({ ready = true, selectable = true, liveRuntime = true } = {})
   };
 }
 
-function brainHealth({ usageEvents = 7, selectable = true, liveRuntime = true } = {}) {
+function brainHealth({
+  usageEvents = 7,
+  selectable = true,
+  liveRuntime = true,
+  nonceReplayProtection = true,
+} = {}) {
   return {
     provider: "cartesia_gemini",
     status: selectable ? "configured" : "unavailable",
@@ -650,6 +757,7 @@ function brainHealth({ usageEvents = 7, selectable = true, liveRuntime = true } 
       backend: "postgres",
       available: true,
       durable: true,
+      nonce_replay_protection: nonceReplayProtection,
       raw_audio_persistence: false,
       transcript_persistence: false,
       uuid_schema_translation: true,
@@ -660,10 +768,22 @@ function brainHealth({ usageEvents = 7, selectable = true, liveRuntime = true } 
   };
 }
 
+function accessDeniedReadinessBody() {
+  return {
+    access: {
+      reason: "missing_live_smoke_bearer",
+      status: "denied",
+    },
+    error: "access_denied",
+    failure_kind: "access_denied",
+    readiness_status: "access_denied",
+  };
+}
+
 function readyFrame() {
   return {
     type: "ready",
-    version: 2,
+    version: 3,
     sample_rate_hz: 24000,
     input_encoding: "pcm_s16le",
     brain: {
@@ -676,6 +796,7 @@ function readyFrame() {
       backend: "postgres",
       available: true,
       durable: true,
+      nonce_replay_protection: true,
       raw_audio_persistence: false,
       transcript_persistence: false,
       uuid_schema_translation: true,
@@ -799,7 +920,7 @@ class MalformedStreamSocket extends FakeSocket {
       queueMicrotask(() => {
         this.message({
           type: "error",
-          version: 2,
+          version: 3,
           message: "provider raw payload with prompt text must not be retained",
         });
         this.close(1011, "provider stream failed");
@@ -821,7 +942,7 @@ class InvalidJsonSocket extends FakeSocket {
       }
     } else if (Buffer.isBuffer(data)) {
       queueMicrotask(() => {
-        this.rawMessage('{"type":"event","version":2,"event":');
+        this.rawMessage('{"type":"event","version":3,"event":');
         this.close(1011, "provider stream failed");
       });
     }
@@ -861,7 +982,7 @@ class TerminalReasonSocket extends FakeSocket {
 function eventFrame(type, event) {
   return {
     type: "event",
-    version: 2,
+    version: 3,
     event: {
       type,
       ...event,
