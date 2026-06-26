@@ -288,8 +288,10 @@ async function collectReadiness(config, fetchImpl) {
   });
   const healthBrain = health.body?.brain ?? {};
   const readyBrain = ready.body?.brain ?? {};
-  const healthStore = health.body?.store ?? {};
-  const readyStore = ready.body?.store ?? {};
+  const healthStore = objectOrNull(health.body?.store);
+  const readyStore = objectOrNull(ready.body?.store);
+  const healthStoreFields = healthStore ?? {};
+  const readyStoreFields = readyStore ?? {};
   return {
     access: summarizeAccess(ready.body?.access ?? health.body?.access),
     failure_kind: stringOrNull(ready.body?.failure_kind ?? health.body?.failure_kind),
@@ -304,12 +306,13 @@ async function collectReadiness(config, fetchImpl) {
       live_runtime: healthBrain.live_runtime === true || readyBrain.live_runtime === true,
     },
     store: {
-      backend: healthStore.backend ?? readyStore.backend ?? null,
-      available: healthStore.available === true && readyStore.available === true,
-      durable: healthStore.durable === true && readyStore.durable === true,
+      backend: healthStoreFields.backend ?? readyStoreFields.backend ?? null,
+      observed: healthStore !== null || readyStore !== null,
+      available: healthStoreFields.available === true && readyStoreFields.available === true,
+      durable: healthStoreFields.durable === true && readyStoreFields.durable === true,
       nonce_replay_protection:
-        healthStore.nonce_replay_protection === true &&
-        readyStore.nonce_replay_protection === true,
+        healthStoreFields.nonce_replay_protection === true &&
+        readyStoreFields.nonce_replay_protection === true,
     },
     usage_events: integerOrNull(health.body?.usage?.events),
   };
@@ -337,6 +340,9 @@ function readinessPasses(readiness) {
 }
 
 function readinessFailureSmokeReason(readiness) {
+  if (readinessIsAccessOrProbeFailure(readiness)) {
+    return "readiness_not_live_selectable";
+  }
   if (
     readiness.store.available !== true ||
     readiness.store.durable !== true ||
@@ -345,6 +351,24 @@ function readinessFailureSmokeReason(readiness) {
     return "durability_degraded";
   }
   return "readiness_not_live_selectable";
+}
+
+function readinessIsAccessOrProbeFailure(readiness) {
+  if (
+    readiness.access.status !== "unknown" &&
+    readiness.access.status !== "ok" &&
+    readiness.access.status !== "allowed"
+  ) {
+    return true;
+  }
+  if (readiness.failure_kind === "access_denied") return true;
+  if (readiness.readiness_status === "access_denied") return true;
+  if (readiness.ready_http_status === 401 || readiness.ready_http_status === 403) return true;
+  if (readiness.health_http_status === 401 || readiness.health_http_status === 403) return true;
+  return (
+    readiness.store.observed !== true &&
+    (readiness.ready_http_status !== 200 || readiness.health_http_status !== 200)
+  );
 }
 
 async function bootstrapSession(config, fetchImpl) {
@@ -741,6 +765,7 @@ function summarizeStore(store) {
     available: store?.available === true,
     backend: typeof store?.backend === "string" ? store.backend : null,
     durable: store?.durable === true,
+    observed: store !== null && typeof store === "object",
     nonce_replay_protection: store?.nonce_replay_protection === true,
   };
 }
@@ -797,6 +822,10 @@ function requiredValue(env, name, message) {
 
 function hasValue(value) {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function objectOrNull(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
 
 function trimTrailingSlash(value) {

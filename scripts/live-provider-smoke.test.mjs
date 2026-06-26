@@ -464,6 +464,50 @@ test("runLiveProviderSmoke fails closed when readiness lacks nonce replay protec
   assert.equal(socketOpened, false);
 });
 
+test("runLiveProviderSmoke preserves access-denied readiness failures without store evidence", async () => {
+  let socketOpened = false;
+
+  const evidence = await runLiveProviderSmoke({
+    env: {
+      VIVA_LIVE_PROVIDER_SMOKE: "1",
+      CARTESIA_API_KEY: "cartesia-secret-value",
+      GEMINI_API_KEY: "gemini-secret-value",
+      CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+      GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
+      VIVA_LIVE_SMOKE_AUDIO_FILE: "/tmp/not-read-before-readiness.pcm",
+      VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
+      VIVA_LIVE_SMOKE_MAX_TURNS: "1",
+      VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
+      VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
+      VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "http://127.0.0.1:4318",
+    },
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/health/brain")) {
+        return jsonResponse(403, accessDeniedReadinessBody());
+      }
+      if (String(url).endsWith("/ready")) {
+        return jsonResponse(403, accessDeniedReadinessBody());
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    },
+    createWebSocket: () => {
+      socketOpened = true;
+      throw new Error("must not open socket after access-denied readiness");
+    },
+    now: () => new Date("2026-06-18T00:00:00.000Z"),
+  });
+
+  assert.equal(evidence.status, "failed");
+  assert.equal(evidence.failure_stage, "readiness");
+  assert.equal(evidence.failure.failure_class, "provider_auth_failure");
+  assert.equal(evidence.failure.terminal_reason, "provider_auth_failed");
+  assert.equal(evidence.terminal_reason, "readiness_not_live_selectable");
+  assert.equal(evidence.readiness.access.status, "denied");
+  assert.equal(evidence.readiness.failure_kind, "access_denied");
+  assert.equal(evidence.readiness.store.observed, false);
+  assert.equal(socketOpened, false);
+});
+
 test("runLiveProviderSmoke classifies malformed-stream failures without retaining payloads", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "viva-live-smoke-"));
   const audioPath = path.join(tempDir, "answer.pcm");
@@ -721,6 +765,18 @@ function brainHealth({
     usage: {
       events: usageEvents,
     },
+  };
+}
+
+function accessDeniedReadinessBody() {
+  return {
+    access: {
+      reason: "missing_live_smoke_bearer",
+      status: "denied",
+    },
+    error: "access_denied",
+    failure_kind: "access_denied",
+    readiness_status: "access_denied",
   };
 }
 

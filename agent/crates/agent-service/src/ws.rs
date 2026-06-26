@@ -323,13 +323,21 @@ async fn handle_socket(
                 voice_session_id.clone(),
                 "durability_degraded",
             ));
-            let terminal_reason = close_with_terminal_session_phase_only(
+            let close_terminal_reason = close_with_terminal_session_phase_only(
                 &mut sender,
                 TerminalSessionReason::DurabilityDegraded,
                 close_code::ERROR,
             )
             .await;
-            record_terminal(&state, voice_session_id, terminal_reason).await;
+            record_terminal(
+                &state,
+                voice_session_id,
+                terminal_label_after_terminal_phase_close(
+                    TerminalSessionReason::DurabilityDegraded,
+                    close_terminal_reason,
+                ),
+            )
+            .await;
             return;
         }
     };
@@ -412,13 +420,21 @@ async fn handle_socket(
                     voice_session_id.clone(),
                     "durability_degraded",
                 ));
-                let terminal_reason = close_with_terminal_session_phase_only(
+                let close_terminal_reason = close_with_terminal_session_phase_only(
                     &mut sender,
                     TerminalSessionReason::DurabilityDegraded,
                     close_code::ERROR,
                 )
                 .await;
-                record_terminal(&state, voice_session_id, terminal_reason).await;
+                record_terminal(
+                    &state,
+                    voice_session_id,
+                    terminal_label_after_terminal_phase_close(
+                        TerminalSessionReason::DurabilityDegraded,
+                        close_terminal_reason,
+                    ),
+                )
+                .await;
                 return;
             }
             Err(store_error) => {
@@ -468,13 +484,15 @@ async fn handle_socket(
             } else {
                 terminal_reason_for_brain_error(&error)
             };
-            let terminal_reason = close_with_terminal_session_phase_only(
+            let close_terminal_reason = close_with_terminal_session_phase_only(
                 &mut sender,
                 terminal_reason,
                 close_code::ERROR,
             )
             .await;
-            record_terminal(&state, voice_session_id, terminal_reason).await;
+            let recorded_terminal_reason =
+                terminal_label_after_terminal_phase_close(terminal_reason, close_terminal_reason);
+            record_terminal(&state, voice_session_id, recorded_terminal_reason).await;
             return;
         }
     };
@@ -981,6 +999,17 @@ where
     }
     let _ = close_with(sender, close_code, terminal_reason.close_reason()).await;
     terminal_reason.as_str()
+}
+
+fn terminal_label_after_terminal_phase_close(
+    terminal_reason: TerminalSessionReason,
+    close_terminal_reason: &'static str,
+) -> &'static str {
+    if terminal_reason == TerminalSessionReason::DurabilityDegraded {
+        terminal_reason.as_str()
+    } else {
+        close_terminal_reason
+    }
 }
 
 async fn close_with_client_stop<S>(
@@ -3115,6 +3144,24 @@ mod tests {
         assert_eq!(reason, "send_failed");
         assert!(terminal_persisted);
         assert!(matches!(received.recv().await.unwrap(), BrainInput::Stop));
+    }
+
+    #[test]
+    fn terminal_phase_close_preserves_durability_label_after_send_failure() {
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::DurabilityDegraded,
+                "send_failed",
+            ),
+            "durability_degraded"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::Drained,
+                "send_failed"
+            ),
+            "send_failed"
+        );
     }
 
     #[tokio::test]
