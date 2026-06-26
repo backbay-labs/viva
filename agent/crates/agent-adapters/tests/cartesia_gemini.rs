@@ -45,7 +45,7 @@ fn adapter_defaults_define_stage_deadlines_under_bac_510_turn_cap() {
     let expected_live_path_budget = [
         config.ink.stage_timeout,
         config.gemini.stage_timeout.saturating_mul(2),
-        config.tool_stage_timeout.saturating_mul(4),
+        config.tool_stage_timeout.saturating_mul(8),
         config.sonic.stage_timeout,
         config.recap_stage_timeout,
     ]

@@ -41,7 +41,7 @@ use runner::{
 pub(crate) const FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT: &str =
     "NADH donates electrons to the electron transport chain.";
 pub(crate) const MAX_GEMINI_TOOL_LOOP_PASSES: u32 = 2;
-pub(crate) const MAX_GEMINI_EXECUTED_TOOL_STAGES: u32 = 1;
+pub(crate) const MAX_GEMINI_EXECUTED_TOOL_STAGES: u32 = 5;
 pub(crate) const DETERMINISTIC_STUDY_TOOL_STAGES: u32 = 3;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -89,7 +89,7 @@ impl Default for CartesiaGeminiConfig {
             gemini: GeminiConfig::default(),
             ink: InkConfig::default(),
             sonic: SonicConfig::default(),
-            tool_stage_timeout: Duration::from_secs(3),
+            tool_stage_timeout: Duration::from_secs(2),
             recap_stage_timeout: Duration::from_secs(3),
             live_runtime_enabled: false,
             cartesia_zero_data_retention_enabled: false,
@@ -665,6 +665,7 @@ fn is_placeholder_live_key(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_domain::viva_max_submitted_answer_resolution;
 
     #[test]
     fn from_env_applies_ink_transport_overrides() {
@@ -722,6 +723,15 @@ mod tests {
         assert_eq!(config.sonic.sample_rate, 16_000);
         assert_eq!(config.sonic.max_buffer_delay_ms, 40);
         assert_eq!(config.sonic.cartesia_version, "2026-03-01");
+    }
+
+    #[test]
+    fn defaults_allow_declared_live_tool_sequence_under_outer_turn_cap() {
+        let config = CartesiaGeminiConfig::default();
+
+        assert_eq!(MAX_GEMINI_EXECUTED_TOOL_STAGES, 5);
+        assert_eq!(config.tool_stage_timeout, Duration::from_secs(2));
+        assert!(config.total_live_stage_deadline() <= viva_max_submitted_answer_resolution());
     }
 
     #[test]

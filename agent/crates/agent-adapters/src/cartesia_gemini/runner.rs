@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    future::Future,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -527,30 +528,6 @@ where
                         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
                             return Ok(response_prompt);
                         }
-                        if name == "emit_manuscript_intent" {
-                            let accepted =
-                                if let Some(intent) = parse_gemini_manuscript_intent(&args) {
-                                    if self
-                                        .authorize_gemini_manuscript_intent(session, &intent)
-                                        .await
-                                    {
-                                        events.push(BrainEvent::ManuscriptIntent {
-                                            response_id: response_id.to_owned(),
-                                            intent,
-                                        });
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                };
-                            conversation.push_function_response(&ToolResult {
-                                proposal: ToolProposal::new(name, args).with_call_id(id),
-                                result: json!({ "accepted": accepted }),
-                            });
-                            continue;
-                        }
                         let proposal = if name == "evaluate_spoken_answer" {
                             ToolProposal::evaluate_spoken_answer(
                                 &session.study_set_id,
@@ -562,14 +539,39 @@ where
                         } else {
                             ToolProposal::new(name, args).with_call_id(id)
                         };
-                        if executed_gemini_tool_stages >= MAX_GEMINI_EXECUTED_TOOL_STAGES {
-                            return Err(gemini_tool_loop_budget_error(
-                                proposal.name(),
-                                &self.config.gemini.model_id,
-                                gemini_started.elapsed(),
-                            ));
+                        reserve_gemini_tool_stage(
+                            &mut executed_gemini_tool_stages,
+                            proposal.name(),
+                            &self.config.gemini.model_id,
+                            gemini_started.elapsed(),
+                        )?;
+                        if proposal.name() == "emit_manuscript_intent" {
+                            let accepted = if let Some(intent) =
+                                parse_gemini_manuscript_intent(proposal.arguments())
+                            {
+                                if manuscript_intent_authorization_stage(
+                                    self.authorize_gemini_manuscript_intent(session, &intent),
+                                    self.config.tool_stage_timeout,
+                                )
+                                .await?
+                                {
+                                    events.push(BrainEvent::ManuscriptIntent {
+                                        response_id: response_id.to_owned(),
+                                        intent,
+                                    });
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                            conversation.push_function_response(&ToolResult {
+                                proposal,
+                                result: json!({ "accepted": accepted }),
+                            });
+                            continue;
                         }
-                        executed_gemini_tool_stages = executed_gemini_tool_stages.saturating_add(1);
                         let result = execute_tool_stage(
                             executor,
                             response_id,
@@ -984,6 +986,40 @@ async fn execute_tool_stage(
     }
 }
 
+fn reserve_gemini_tool_stage(
+    executed_gemini_tool_stages: &mut u32,
+    tool_name: &str,
+    model: &str,
+    latency: Duration,
+) -> Result<(), BrainError> {
+    if *executed_gemini_tool_stages >= MAX_GEMINI_EXECUTED_TOOL_STAGES {
+        return Err(gemini_tool_loop_budget_error(tool_name, model, latency));
+    }
+    *executed_gemini_tool_stages = executed_gemini_tool_stages.saturating_add(1);
+    Ok(())
+}
+
+async fn manuscript_intent_authorization_stage<F>(
+    authorization: F,
+    deadline: Duration,
+) -> Result<bool, BrainError>
+where
+    F: Future<Output = bool>,
+{
+    match timeout(deadline, authorization).await {
+        Ok(accepted) => Ok(accepted),
+        Err(_) => Err(tool_stage_error(
+            "emit_manuscript_intent",
+            "timeout",
+            "tools",
+            TerminalSessionReason::ProviderTimeout,
+            true,
+            deadline,
+            "deadline_elapsed",
+        )),
+    }
+}
+
 fn tool_stage_error(
     tool_name: &str,
     failure_class: &'static str,
@@ -1002,7 +1038,7 @@ fn tool_stage_error(
             latency_ms: duration_ms(latency),
             provider: "server".to_owned(),
             model: "viva-tools".to_owned(),
-            metadata: format!("tool={tool_name} error_kind={error_kind}"),
+            metadata: tool_stage_metadata(tool_name, error_kind),
         },
     )))
 }
@@ -1049,7 +1085,7 @@ fn gemini_tool_stage_error(
             latency_ms: duration_ms(latency),
             provider: "gemini".to_owned(),
             model: model.to_owned(),
-            metadata: format!("tool={tool_name} error_kind={error_kind}"),
+            metadata: tool_stage_metadata(tool_name, error_kind),
         },
     )))
 }
@@ -1192,6 +1228,27 @@ fn tool_execution_error_kind(error: &ToolExecutionError) -> &'static str {
     }
 }
 
+fn tool_stage_metadata(tool_name: &str, error_kind: &'static str) -> String {
+    format!(
+        "tool={} error_kind={error_kind}",
+        sanitized_tool_metadata_name(tool_name)
+    )
+}
+
+fn sanitized_tool_metadata_name(tool_name: &str) -> &'static str {
+    match tool_name {
+        "select_next_question" => "select_next_question",
+        "evaluate_spoken_answer" => "evaluate_spoken_answer",
+        "retrieve_source_reference" => "retrieve_source_reference",
+        "mark_concept_status" => "mark_concept_status",
+        "emit_manuscript_intent" => "emit_manuscript_intent",
+        "build_session_recap" => "build_session_recap",
+        "challenge_correction" => "challenge_correction",
+        "schedule_review_item" => "schedule_review_item",
+        _ => "unrecognized_tool",
+    }
+}
+
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
@@ -1242,14 +1299,92 @@ mod tests {
         );
         assert!(failure.retry_eligible);
         assert_eq!(failure.latency_ms, 42);
-        assert!(failure.metadata.contains("tool=unknown_tool"));
+        assert!(failure.metadata.contains("tool=unrecognized_tool"));
         assert!(failure.metadata.contains("error_kind=invalid_arguments"));
+    }
+
+    #[test]
+    fn provider_controlled_tool_names_are_redacted_from_stage_metadata() {
+        let error = gemini_tool_stage_error(
+            "retrieve_source_reference raw answer text and source excerpt",
+            "gemini-test-model",
+            Duration::from_millis(12),
+            "invalid_arguments",
+        );
+        let BrainError::StageFailure(failure) = error else {
+            panic!("malformed provider tool names should produce a stage failure");
+        };
+
+        assert_eq!(
+            failure.metadata,
+            "tool=unrecognized_tool error_kind=invalid_arguments"
+        );
+        assert!(!failure.metadata.contains("raw answer text"));
+        assert!(!failure.metadata.contains("source excerpt"));
+    }
+
+    #[test]
+    fn manuscript_intent_counts_against_gemini_tool_budget() {
+        let mut executed = MAX_GEMINI_EXECUTED_TOOL_STAGES;
+
+        let error = reserve_gemini_tool_stage(
+            &mut executed,
+            "emit_manuscript_intent",
+            "gemini-test-model",
+            Duration::from_millis(9),
+        )
+        .unwrap_err();
+        let BrainError::StageFailure(failure) = error else {
+            panic!("tool loop budget should produce a stage failure");
+        };
+
+        assert_eq!(failure.failure_class, "malformed_stream");
+        assert_eq!(failure.stage, "gemini");
+        assert_eq!(
+            failure.terminal_reason,
+            TerminalSessionReason::ProviderMalformedStream
+        );
+        assert_eq!(
+            failure.metadata,
+            "tool=emit_manuscript_intent error_kind=tool_loop_budget_exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn manuscript_intent_authorization_uses_stage_deadline() {
+        let error = manuscript_intent_authorization_stage(
+            async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                true
+            },
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        let BrainError::StageFailure(failure) = error else {
+            panic!("manuscript intent timeout should produce a stage failure");
+        };
+
+        assert_eq!(failure.failure_class, "timeout");
+        assert_eq!(failure.stage, "tools");
+        assert_eq!(failure.provider, "server");
+        assert_eq!(failure.model, "viva-tools");
+        assert_eq!(
+            failure.terminal_reason,
+            TerminalSessionReason::ProviderTimeout
+        );
+        assert!(failure.retry_eligible);
+        assert_eq!(failure.latency_ms, 1);
+        assert_eq!(
+            failure.metadata,
+            "tool=emit_manuscript_intent error_kind=deadline_elapsed"
+        );
     }
 
     #[test]
     fn server_tool_invalid_arguments_remain_tool_executor_failures() {
         let error = tool_execution_stage_error(
-            "record_status",
+            "mark_concept_status",
             "tool_executor_failure",
             "tools",
             Duration::from_millis(11),
@@ -1270,7 +1405,7 @@ mod tests {
         );
         assert!(failure.retry_eligible);
         assert_eq!(failure.latency_ms, 11);
-        assert!(failure.metadata.contains("tool=record_status"));
+        assert!(failure.metadata.contains("tool=mark_concept_status"));
         assert!(failure.metadata.contains("error_kind=invalid_arguments"));
     }
 
