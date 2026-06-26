@@ -43,6 +43,9 @@ export function LibraryStatusPanel({
   if (!currentSnapshot) return null;
   const projection = projectLibrarySnapshot(currentSnapshot, { now });
   const controlToken = projection.privacy.export.controlToken ?? undefined;
+  const deleteCapableStudySetIds = new Set(
+    projection.libraryRows.filter((row) => row.delete.available).map((row) => row.id),
+  );
   const refreshLibrary = async () => {
     const nextSnapshot = await fetchVivaLibrarySnapshot({
       controlToken,
@@ -186,7 +189,9 @@ export function LibraryStatusPanel({
                   <button
                     aria-label={`Delete recap for ${row.studySetTitle}`}
                     className="viva-library__action--danger"
-                    disabled={!projection.privacy.export.available || busyAction === "Delete recap"}
+                    disabled={
+                      !deleteCapableStudySetIds.has(row.studySetId) || busyAction === "Delete recap"
+                    }
                     onClick={() => deleteSession(row)}
                     type="button"
                   >

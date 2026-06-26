@@ -6,6 +6,7 @@ export type VivaLibraryAction =
       session_id?: string | null;
       session_bootstrap_token?: string | null;
       session_token?: string | null;
+      same_origin_control?: true;
       control_token?: string | null;
     }
   | {
@@ -99,6 +100,7 @@ export type ProjectedLibraryAction = {
   sessionId?: string;
   sessionBootstrapToken?: string | null;
   sessionToken?: string | null;
+  sameOriginControl?: boolean;
   controlToken?: string | null;
   unavailableReason?: string;
 };
@@ -186,21 +188,32 @@ export function redactVivaLibrarySessionTokens(snapshot: VivaLibrarySnapshot): V
 
 export function browserInitialLibrarySnapshot(
   snapshot: VivaLibrarySnapshot,
-  options: { staticExport?: boolean } = {},
+  options: {
+    directSessionTokens?: boolean;
+    sameOriginControl?: boolean;
+    staticExport?: boolean;
+  } = {},
 ): VivaLibrarySnapshot {
   return stripBrowserOnlyTokenFields(snapshot, {
     controlToken: !options.staticExport,
-    sessionToken: !options.staticExport,
+    sameOriginControl: Boolean(options.sameOriginControl && !options.staticExport),
+    sessionToken: !(options.staticExport || options.directSessionTokens),
   }) as VivaLibrarySnapshot;
 }
 
 function stripBrowserOnlyTokenFields(
   value: unknown,
-  options: { controlToken: boolean; sessionToken: boolean },
+  options: { controlToken: boolean; sameOriginControl?: boolean; sessionToken: boolean },
 ): unknown {
   if (Array.isArray(value))
     return value.map((child) => stripBrowserOnlyTokenFields(child, options));
   if (!value || typeof value !== "object") return value;
+  const record = value as Record<string, unknown>;
+  const hasSameOriginControl =
+    options.sameOriginControl &&
+    options.controlToken &&
+    record.available === true &&
+    typeof record.control_token === "string";
   const output: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
     if (
@@ -211,6 +224,7 @@ function stripBrowserOnlyTokenFields(
     }
     output[key] = stripBrowserOnlyTokenFields(child, options);
   }
+  if (hasSameOriginControl) output.same_origin_control = true;
   return output;
 }
 
@@ -294,13 +308,17 @@ function projectMutationAction(action: VivaLibraryAction): ProjectedLibraryActio
       unavailableReason: action.unavailable_reason,
     };
   }
-  if (!action.control_token) {
+  if (!action.control_token && !action.same_origin_control) {
     return {
       available: false,
       unavailableReason: "control_token_unavailable",
     };
   }
-  return { available: true, controlToken: action.control_token };
+  return {
+    available: true,
+    controlToken: action.control_token,
+    sameOriginControl: action.same_origin_control === true,
+  };
 }
 
 function projectPrivacy(privacy: VivaLibraryPrivacy): ProjectedLibraryPrivacy {

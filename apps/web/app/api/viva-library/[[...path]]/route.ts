@@ -34,10 +34,11 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   );
   upstream.search = request.nextUrl.search;
 
-  const controlGuard = guardAllowedLibraryControlRoute(request, path);
+  const controlTarget = libraryControlRouteTarget(request.method, path);
+  const controlGuard = guardAllowedLibraryControlRoute(request, controlTarget);
   if (controlGuard) return controlGuard;
 
-  const serverBearer = serverBearerForBrowserLibrarySnapshot(request, path);
+  const serverBearer = serverBearerForBrowserLibraryRequest(request, path, controlTarget);
   if (!serverBearer.ok) return serverBearer.response;
   const headers = vivaLibraryProxyHeaders(request, {
     serverBearerToken: serverBearer.token,
@@ -116,9 +117,10 @@ function vivaLibraryProxyOrigin(request: NextRequest): string | null {
   return request.nextUrl.origin;
 }
 
-function serverBearerForBrowserLibrarySnapshot(
+function serverBearerForBrowserLibraryRequest(
   request: NextRequest,
   path: string[],
+  controlTarget: LibraryControlRouteTarget | null,
 ):
   | {
       ok: true;
@@ -126,7 +128,13 @@ function serverBearerForBrowserLibrarySnapshot(
       token?: string;
     }
   | { ok: false; response: NextResponse<{ error: string }> } {
-  if (request.method !== "GET" || path.join("/") !== "study-sets/library") {
+  const browserSnapshotRequest =
+    request.method === "GET" && path.join("/") === "study-sets/library";
+  const sameOriginControlRequest =
+    request.method === "DELETE" &&
+    controlTarget?.studySetId &&
+    !request.headers.get("x-viva-library-control-token");
+  if (!browserSnapshotRequest && !sameOriginControlRequest) {
     return { ok: true };
   }
   const token = process.env.VIVA_AGENT_REST_BEARER_TOKEN?.trim();
@@ -135,6 +143,9 @@ function serverBearerForBrowserLibrarySnapshot(
       ok: false,
       response: vivaLibraryProxyJsonError(503, "viva_library_auth_unavailable"),
     };
+  }
+  if (sameOriginControlRequest) {
+    return { ok: true, token };
   }
 
   const userId = request.nextUrl.searchParams.get("user_id")?.trim();
@@ -161,11 +172,12 @@ function serverBearerForBrowserLibrarySnapshot(
   return { ok: true, snapshotFilter: { allowedStudySetIds, userId }, token };
 }
 
+type LibraryControlRouteTarget = { studySetId: string | null };
+
 function guardAllowedLibraryControlRoute(
   request: NextRequest,
-  path: string[],
+  controlTarget: LibraryControlRouteTarget | null,
 ): NextResponse | null {
-  const controlTarget = libraryControlRouteTarget(request.method, path);
   if (!controlTarget) return null;
 
   const userId = request.nextUrl.searchParams.get("user_id")?.trim();
@@ -189,11 +201,26 @@ function guardAllowedLibraryControlRoute(
 function libraryControlRouteTarget(
   method: string,
   path: string[],
-): { studySetId: string | null } | null {
+): LibraryControlRouteTarget | null {
   if (method === "GET" && path.join("/") === "study-sets/export") {
     return { studySetId: null };
   }
-  if (method === "DELETE" && path[0] === "study-sets" && typeof path[1] === "string") {
+  if (
+    method === "DELETE" &&
+    path.length === 2 &&
+    path[0] === "study-sets" &&
+    typeof path[1] === "string"
+  ) {
+    return { studySetId: path[1] };
+  }
+  if (
+    method === "DELETE" &&
+    path.length === 4 &&
+    path[0] === "study-sets" &&
+    typeof path[1] === "string" &&
+    path[2] === "sessions" &&
+    typeof path[3] === "string"
+  ) {
     return { studySetId: path[1] };
   }
   return null;
@@ -306,10 +333,14 @@ function librarySessionAllowed(
 function stripBrowserLibraryCapabilityTokens(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stripBrowserLibraryCapabilityTokens);
   if (!value || typeof value !== "object") return value;
+  const record = value as Record<string, unknown>;
+  const hasSameOriginControl =
+    record.available === true && typeof record.control_token === "string";
   const output: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
     if (key === "control_token" || key === "session_token") continue;
     output[key] = stripBrowserLibraryCapabilityTokens(child);
   }
+  if (hasSameOriginControl) output.same_origin_control = true;
   return output;
 }

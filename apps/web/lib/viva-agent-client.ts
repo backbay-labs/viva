@@ -48,6 +48,7 @@ export type VivaPasteStudySetOptions = {
 export type VivaLibrarySnapshotOptions = {
   apiBaseUrl?: string;
   bearerToken?: string;
+  cache?: RequestCache;
   controlToken?: string;
   fetchImpl?: typeof fetch;
   userId?: string;
@@ -364,6 +365,7 @@ export async function fetchVivaLibrarySnapshot(
     url.searchParams.set("user_id", options.userId.trim());
   }
   const response = await fetchImpl(url.toString(), {
+    cache: options.cache,
     headers: vivaLibraryAuthHeaders(options),
     method: "GET",
   });

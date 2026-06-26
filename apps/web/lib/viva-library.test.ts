@@ -281,6 +281,40 @@ describe("Viva library projection", () => {
     });
   });
 
+  test("keeps same-origin control actions available without exposing raw control tokens", () => {
+    const readyStudySet = snapshot.study_sets[0];
+    if (!readyStudySet) throw new Error("test fixture must include a ready study set");
+    const sameOriginSnapshot: VivaLibrarySnapshot = {
+      ...snapshot,
+      privacy: {
+        ...snapshot.privacy,
+        export: {
+          available: false,
+          unavailable_reason: "allowlist_filtered_export_unavailable",
+        },
+      },
+      study_sets: [
+        {
+          ...readyStudySet,
+          actions: {
+            ...readyStudySet.actions,
+            delete: { available: true, same_origin_control: true },
+          },
+        },
+      ],
+      sessions: [],
+    };
+
+    const projection = projectLibrarySnapshot(sameOriginSnapshot);
+
+    expect(projection.privacy.export.available).toBe(false);
+    expect(projection.libraryRows[0]?.delete).toEqual({
+      available: true,
+      controlToken: undefined,
+      sameOriginControl: true,
+    });
+  });
+
   test("redacts session tokens from browser-bound snapshots while preserving control capabilities", () => {
     const redacted = redactVivaLibrarySessionTokens(snapshot);
 
@@ -336,6 +370,42 @@ describe("Viva library projection", () => {
       available: true,
       control_token: "viva1.control-token",
     });
+  });
+
+  test("preserves direct session tokens for non-bootstrap initial snapshots only", () => {
+    const directSessionSnapshot = browserInitialLibrarySnapshot(snapshot, {
+      directSessionTokens: true,
+      staticExport: false,
+    });
+
+    expect(directSessionSnapshot.study_sets[0]?.actions.start).toEqual({
+      available: true,
+      session_id: "start-session-1",
+      session_token: "viva1.start-token",
+    });
+    expect(directSessionSnapshot.privacy.export).toEqual({
+      available: true,
+    });
+    expect(directSessionSnapshot.study_sets[0]?.actions.delete).toEqual({
+      available: true,
+    });
+    expect(JSON.stringify(directSessionSnapshot)).not.toContain("control_token");
+    expect(JSON.stringify(directSessionSnapshot)).not.toContain("viva1.control-token");
+  });
+
+  test("marks server-bootstrap mutation controls as same-origin capabilities", () => {
+    const serverBootstrapSnapshot = browserInitialLibrarySnapshot(snapshot, {
+      sameOriginControl: true,
+      staticExport: false,
+    });
+
+    expect(serverBootstrapSnapshot.study_sets[0]?.actions.delete).toEqual({
+      available: true,
+      same_origin_control: true,
+    });
+    expect(JSON.stringify(serverBootstrapSnapshot)).not.toContain("control_token");
+    expect(JSON.stringify(serverBootstrapSnapshot)).not.toContain("viva1.control-token");
+    expect(JSON.stringify(serverBootstrapSnapshot)).not.toContain("session_token");
   });
 
   test("formats completed-session next review from the persisted server schedule only", () => {

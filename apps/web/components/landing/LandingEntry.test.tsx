@@ -80,6 +80,7 @@ const librarySnapshot: VivaLibrarySnapshot = {
 
 const originalFetch = globalThis.fetch;
 const originalAgentUrl = process.env.VIVA_AGENT_HTTP_URL;
+const originalPublicApiUrl = process.env.NEXT_PUBLIC_VIVA_API_URL;
 const originalRestBearer = process.env.VIVA_AGENT_REST_BEARER_TOKEN;
 const originalAllowedUsers = process.env.VIVA_SESSION_ALLOWED_USER_IDS;
 const originalAllowedStudySets = process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS;
@@ -176,6 +177,7 @@ describe("LandingEntry", () => {
       expect(page.type).toBe(LandingEntry);
       expect(calls).toHaveLength(1);
       expect(calls[0]?.input).toBe("https://agent.example/study-sets/library?user_id=user-1");
+      expect(calls[0]?.init?.cache).toBe("no-store");
       expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBe(
         "Bearer server-rest-bearer",
       );
@@ -188,10 +190,58 @@ describe("LandingEntry", () => {
       });
       expect(page.props.initialLibrarySnapshot.study_sets[0]?.actions.delete).toEqual({
         available: true,
+        same_origin_control: true,
       });
     } finally {
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+    }
+  });
+
+  test("server-side initial library fetch preserves direct session tokens when bootstrap is disabled", async () => {
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    try {
+      delete process.env.VIVA_AGENT_HTTP_URL;
+      delete process.env.VIVA_AGENT_REST_BEARER_TOKEN;
+      delete process.env.VIVA_SESSION_ALLOWED_USER_IDS;
+      delete process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS;
+      process.env.NEXT_PUBLIC_VIVA_API_URL = "https://agent.example";
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ input: String(input), init });
+        return new Response(JSON.stringify(librarySnapshot), {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        });
+      }) as typeof fetch;
+
+      const page = (await Page()) as ReactElement<{ initialLibrarySnapshot: VivaLibrarySnapshot }>;
+
+      expect(page.type).toBe(LandingEntry);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.input).toBe("https://agent.example/study-sets/library");
+      expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBe(null);
+      expect(page.props.initialLibrarySnapshot.study_sets[0]?.actions.start).toEqual({
+        available: true,
+        session_id: "server-session",
+        session_token: "viva1.server-token",
+      });
+      expect(page.props.initialLibrarySnapshot.privacy.export).toEqual({
+        available: true,
+      });
+      expect(page.props.initialLibrarySnapshot.study_sets[0]?.actions.delete).toEqual({
+        available: true,
+      });
+      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("control_token");
+      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain(
+        "viva1.control-token",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("NEXT_PUBLIC_VIVA_API_URL", originalPublicApiUrl);
       restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
       restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
@@ -227,8 +277,8 @@ describe("LandingEntry", () => {
     }
   });
 
-  test("the landing page forces dynamic rendering for server-minted bootstrap snapshots", () => {
-    expect(dynamic).toBe("force-dynamic");
+  test("the landing page keeps static export compatible", () => {
+    expect(dynamic).toBe("auto");
   });
 
   test("refreshes expired bootstrap capabilities before retrying session start", async () => {

@@ -7,7 +7,7 @@ import {
 import { browserInitialLibrarySnapshot, type VivaLibrarySnapshot } from "../lib/viva-library";
 import { attachVivaSessionBootstrapTokensToLibrarySnapshot } from "./api/viva-session/shared";
 
-export const dynamic = "force-dynamic";
+export const dynamic = "auto";
 
 export default async function Page() {
   const initialLibrarySnapshot = await initialSnapshot();
@@ -19,7 +19,9 @@ async function initialSnapshot(): Promise<VivaLibrarySnapshot | null> {
     const config = serverLibrarySnapshotConfig();
     if (config.kind === "incomplete") return null;
 
-    const snapshot = await fetchVivaLibrarySnapshot(config.kind === "ready" ? config.options : {});
+    const snapshot = await fetchVivaLibrarySnapshot(
+      config.kind === "ready" ? { ...config.options, cache: "no-store" } : {},
+    );
     const filteredSnapshot =
       config.kind === "ready"
         ? filterInitialLibrarySnapshot(snapshot, {
@@ -35,6 +37,8 @@ async function initialSnapshot(): Promise<VivaLibrarySnapshot | null> {
           })
         : filteredSnapshot;
     return browserInitialLibrarySnapshot(browserSnapshot as VivaLibrarySnapshot, {
+      directSessionTokens: config.kind === "disabled",
+      sameOriginControl: config.kind === "ready",
       staticExport: vivaStaticExportEnabled(),
     });
   } catch {
