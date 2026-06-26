@@ -2303,20 +2303,27 @@ fn record_provider_stage_failure(
 
 fn provider_stage_failure_detail(failure: &BrainProviderFailure) -> String {
     let retry_after_ms = metadata_field(&failure.metadata, "retry_after_ms");
+    let retry_after_source = metadata_field(&failure.metadata, "retry_after_source");
     let reset_hint = metadata_field(&failure.metadata, "reset_hint");
+    let budget_state = metadata_field(&failure.metadata, "budget_state");
+    let deploy_sha = metadata_field(&failure.metadata, "deploy_sha");
     format!(
-        "failure_class={} stage={} terminal_reason={} latency_ms={} retry_after_ms={} reset_hint={} provider={} model={} retry_eligible={} metadata={}",
+        "failure_class={} stage={} latency_ms={} provider={} model={} retry_after_ms={} retry_after_source={} reset_hint={} budget_state={} deploy_sha={}",
         failure.failure_class,
         failure.stage,
-        failure.terminal_reason.as_str(),
         failure.latency_ms,
+        bounded_evidence_value(&failure.provider, 24),
+        bounded_evidence_value(&failure.model, 24),
         retry_after_ms.unwrap_or("unknown"),
+        retry_after_source.unwrap_or("unknown"),
         reset_hint.unwrap_or("unknown"),
-        failure.provider,
-        failure.model,
-        failure.retry_eligible,
-        failure.metadata
+        budget_state.unwrap_or("unknown"),
+        deploy_sha.unwrap_or("unknown")
     )
+}
+
+fn bounded_evidence_value(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 fn metadata_field<'a>(metadata: &'a str, key: &str) -> Option<&'a str> {
@@ -2864,7 +2871,10 @@ mod tests {
         assert!(detail.contains("provider=gemini"));
         assert!(detail.contains("model=gemini-35-flash"));
         assert!(detail.contains("retry_after_ms=7000"));
+        assert!(detail.contains("retry_after_source=retry_after_delta"));
         assert!(detail.contains("reset_hint=2030-01-01T00:00:00Z"));
+        assert!(detail.contains("budget_state=unknown"));
+        assert!(detail.contains("deploy_sha=unknown"));
     }
 
     #[test]
@@ -2902,7 +2912,10 @@ mod tests {
         let detail = &events[0].detail;
         assert!(detail.len() <= 240);
         assert!(detail.contains("retry_after_ms=7000"));
+        assert!(detail.contains("retry_after_source=retry_after_delta"));
         assert!(detail.contains("reset_hint=2030-01-01T00:00:00Z"));
+        assert!(detail.contains("budget_state=unknown"));
+        assert!(detail.contains("deploy_sha=unknown"));
     }
 
     struct FailingSink;

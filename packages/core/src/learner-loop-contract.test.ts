@@ -41,6 +41,10 @@ const REQUIRED_EVIDENCE_FIELDS = Object.freeze([
   "model",
   "deploy_sha",
   "latency_ms",
+  "retry_after_ms",
+  "retry_after_source",
+  "reset_hint",
+  "budget_state",
   "usage",
   "cost_usd",
   "token_refresh_outcome",
@@ -203,6 +207,9 @@ describe("BAC-510 learner loop contract", () => {
     expect(/retry/i.test(copyText)).toBe(true);
     expect(/wait window/i.test(copyText)).toBe(true);
     expect(/\b(provider|quota|429|gemini|cartesia)\b/i.test(copyText)).toBe(false);
+    for (const field of ["retry_after_ms", "retry_after_source", "reset_hint", "budget_state"]) {
+      expect(providerRateLimit?.operator_diagnostics).toContain(field);
+    }
   });
 
   test("reconciles every runtime copy cause with a learner-loop state", () => {

@@ -24,6 +24,10 @@
     "model",
     "deploy_sha",
     "latency_ms",
+    "retry_after_ms",
+    "retry_after_source",
+    "reset_hint",
+    "budget_state",
     "usage",
     "cost_usd",
     "token_refresh_outcome",
@@ -388,6 +392,10 @@
         "model",
         "deploy_sha",
         "latency_ms",
+        "retry_after_ms",
+        "retry_after_source",
+        "reset_hint",
+        "budget_state",
         "usage",
         "cost_usd"
       ]
