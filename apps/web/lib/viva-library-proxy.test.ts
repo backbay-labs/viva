@@ -955,7 +955,180 @@ describe("Viva library proxy", () => {
       restoreEnv("VIVA_LIBRARY_PROXY_TIMEOUT_MS", originalProxyTimeout);
     }
   });
+
+  test("keeps the upload proxy timeout active while reading the upstream body", async () => {
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_LIBRARY_PROXY_TIMEOUT_MS = "5";
+      let observedSignal: AbortSignal | undefined;
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        observedSignal = init?.signal ?? undefined;
+        return hangingJsonResponse(
+          observedSignal,
+          "raw stalled upload body with file_base64 JVBERi0xLjc=",
+          201,
+        );
+      }) as typeof fetch;
+
+      const request = fileUploadRequest();
+      const response = await Promise.race([
+        POST(request, {
+          params: Promise.resolve({ path: ["study-sets", "files"] }),
+        }),
+        rejectAfter(100, "library upload body read did not time out"),
+      ]);
+      const body = await response.json();
+
+      expect(response.status).toBe(504);
+      expect(observedSignal?.aborted).toBe(true);
+      expect(body).toEqual({
+        error: "viva_library_pre_loop_timeout",
+        failure_class: "pre_loop_unavailable",
+        stage: "pre_loop",
+        terminal_reason: "pre_loop_upload_unavailable",
+      });
+      expect(JSON.stringify(body)).not.toContain("JVBERi0xLjc=");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_LIBRARY_PROXY_TIMEOUT_MS", originalProxyTimeout);
+    }
+  });
+
+  test("uses the contract upload timeout when no proxy override is configured", async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const scheduledTimeouts: number[] = [];
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      delete process.env.VIVA_LIBRARY_PROXY_TIMEOUT_MS;
+      globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+        scheduledTimeouts.push(Number(timeout));
+        return originalSetTimeout(handler, 0, ...args);
+      }) as typeof setTimeout;
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("raw file_base64 JVBERi0xLjc= should stay private")),
+            { once: true },
+          );
+        });
+      }) as typeof fetch;
+
+      const response = await POST(fileUploadRequest(), {
+        params: Promise.resolve({ path: ["study-sets", "files"] }),
+      });
+      const body = await response.json();
+
+      expect(scheduledTimeouts).toContain(15_000);
+      expect(response.status).toBe(504);
+      expect(body.terminal_reason).toBe("pre_loop_upload_unavailable");
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_LIBRARY_PROXY_TIMEOUT_MS", originalProxyTimeout);
+    }
+  });
+
+  test("sanitizes upstream HTTP failures with route-specific pre-loop terminal reasons", async () => {
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_AGENT_REST_BEARER_TOKEN = "server-rest-bearer";
+      process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      const rawFailure = { error: "raw upstream failure with file_base64 JVBERi0xLjc=" };
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify(rawFailure), {
+          headers: { "content-type": "application/json" },
+          status: 503,
+        })) as typeof fetch;
+
+      const uploadResponse = await POST(fileUploadRequest(), {
+        params: Promise.resolve({ path: ["study-sets", "files"] }),
+      });
+      const uploadBody = await uploadResponse.json();
+      const libraryRequest = {
+        headers: new Headers(),
+        method: "GET",
+        nextUrl: new URL(
+          "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-1",
+        ),
+      } as unknown as NextRequest;
+      const libraryResponse = await GET(libraryRequest, {
+        params: Promise.resolve({ path: ["study-sets", "library"] }),
+      });
+      const libraryBody = await libraryResponse.json();
+
+      expect(uploadResponse.status).toBe(502);
+      expect(uploadBody).toEqual({
+        error: "viva_library_pre_loop_unavailable",
+        failure_class: "pre_loop_unavailable",
+        stage: "pre_loop",
+        terminal_reason: "pre_loop_upload_unavailable",
+      });
+      expect(libraryResponse.status).toBe(502);
+      expect(libraryBody).toEqual({
+        error: "viva_library_pre_loop_unavailable",
+        failure_class: "pre_loop_unavailable",
+        stage: "pre_loop",
+        terminal_reason: "pre_loop_ingestion_unavailable",
+      });
+      expect(JSON.stringify(uploadBody)).not.toContain("JVBERi0xLjc=");
+      expect(JSON.stringify(libraryBody)).not.toContain("JVBERi0xLjc=");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+    }
+  });
 });
+
+function fileUploadRequest(): NextRequest {
+  const request = new Request("http://localhost:3000/api/viva-library/study-sets/files", {
+    body: JSON.stringify({
+      content_type: "application/pdf",
+      file_base64: "JVBERi0xLjc=",
+      file_name: "Lecture 9.pdf",
+      title: "Bio PDF",
+    }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }) as unknown as NextRequest;
+  Object.defineProperty(request, "nextUrl", {
+    value: new URL("http://localhost:3000/api/viva-library/study-sets/files"),
+  });
+  return request;
+}
+
+function hangingJsonResponse(
+  signal: AbortSignal | undefined,
+  abortMessage: string,
+  status: number,
+): Response {
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            controller.error(new Error(abortMessage));
+          },
+          { once: true },
+        );
+      },
+    }),
+    {
+      headers: { "content-type": "application/json" },
+      status,
+    },
+  );
+}
+
+async function rejectAfter(ms: number, message: string): Promise<never> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+  throw new Error(message);
+}
 
 function restoreEnv(name: string, value: string | undefined) {
   if (value === undefined) {

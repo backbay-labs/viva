@@ -30,6 +30,7 @@ export function OPTIONS() {
 }
 
 const DEFAULT_LIBRARY_PROXY_TIMEOUT_MS = 30_000;
+const DEFAULT_LIBRARY_UPLOAD_PROXY_TIMEOUT_MS = 15_000;
 
 async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibraryRouteContext) {
   const agentBaseUrl = vivaAgentServerHttpBaseUrl();
@@ -52,45 +53,51 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
     forwardControlToken: !serverBearer.consumedControlToken,
     serverBearerToken: serverBearer.token,
   });
-  let response: Response;
   let timedOut = false;
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, vivaLibraryProxyTimeoutMs());
+  const timeoutId = setTimeout(
+    () => {
+      timedOut = true;
+      controller.abort();
+    },
+    vivaLibraryProxyTimeoutMs(path, request.method),
+  );
+  const terminalReason = libraryPreLoopTerminalReason(path, request.method);
   try {
-    response = await fetch(upstream, {
+    const response = await fetch(upstream, {
       body: request.method === "POST" ? await request.text() : undefined,
       cache: "no-store",
       headers,
       method: request.method,
       signal: controller.signal,
     });
+    if (!response.ok) {
+      return libraryPreLoopJsonError(502, "viva_library_pre_loop_unavailable", terminalReason);
+    }
+    const responseHeaders = new Headers();
+    const contentType = response.headers.get("content-type");
+    if (contentType) responseHeaders.set("content-type", contentType);
+    responseHeaders.set("cache-control", "no-store");
+    const responseBody = await browserSafeLibraryResponseBody(response, path, contentType, {
+      origin: vivaLibraryProxyOrigin(request),
+      snapshotFilter: serverBearer.snapshotFilter,
+    });
+    if (timedOut) {
+      return libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason);
+    }
+    return new NextResponse(responseBody, {
+      headers: responseHeaders,
+      status: response.status,
+    });
   } catch {
     return libraryPreLoopJsonError(
       timedOut ? 504 : 502,
       timedOut ? "viva_library_pre_loop_timeout" : "viva_library_pre_loop_unavailable",
-      libraryPreLoopTerminalReason(path, request.method),
+      terminalReason,
     );
   } finally {
     clearTimeout(timeoutId);
   }
-  if (serverBearer.snapshotFilter && !response.ok) {
-    return vivaLibraryProxyJsonError(response.status, "viva_library_proxy_unavailable");
-  }
-  const responseHeaders = new Headers();
-  const contentType = response.headers.get("content-type");
-  if (contentType) responseHeaders.set("content-type", contentType);
-  responseHeaders.set("cache-control", "no-store");
-  const responseBody = await browserSafeLibraryResponseBody(response, path, contentType, {
-    origin: vivaLibraryProxyOrigin(request),
-    snapshotFilter: serverBearer.snapshotFilter,
-  });
-  return new NextResponse(responseBody, {
-    headers: responseHeaders,
-    status: response.status,
-  });
 }
 
 function libraryPreLoopJsonError(
@@ -117,9 +124,12 @@ function libraryPreLoopTerminalReason(path: string[], method: string): string {
   return "pre_loop_ingestion_unavailable";
 }
 
-function vivaLibraryProxyTimeoutMs(): number {
+function vivaLibraryProxyTimeoutMs(path: string[], method: string): number {
   const value = Number.parseInt(process.env.VIVA_LIBRARY_PROXY_TIMEOUT_MS ?? "", 10);
-  return Number.isFinite(value) && value > 0 ? value : DEFAULT_LIBRARY_PROXY_TIMEOUT_MS;
+  if (Number.isFinite(value) && value > 0) return value;
+  return libraryPreLoopTerminalReason(path, method) === "pre_loop_upload_unavailable"
+    ? DEFAULT_LIBRARY_UPLOAD_PROXY_TIMEOUT_MS
+    : DEFAULT_LIBRARY_PROXY_TIMEOUT_MS;
 }
 
 function vivaAgentServerHttpBaseUrl(): string | null {

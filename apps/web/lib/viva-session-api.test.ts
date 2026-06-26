@@ -191,6 +191,40 @@ describe("Viva same-origin session API", () => {
     expect(JSON.stringify(body)).not.toContain("redacted-rest-bearer");
   });
 
+  test("start keeps the bootstrap timeout active while reading the library body", async () => {
+    process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS = "5";
+    let observedSignal: AbortSignal | undefined;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      observedSignal = init?.signal ?? undefined;
+      return hangingJsonResponse(
+        observedSignal,
+        "raw stalled library body with bearer redacted-rest-bearer",
+      );
+    }) as typeof fetch;
+
+    const response = await Promise.race([
+      startSession(
+        sessionRequest("/api/viva-session/start", {
+          study_set_id: "biology-midterm",
+          user_id: "synthetic-user",
+        }),
+      ),
+      rejectAfter(100, "session bootstrap body read did not time out"),
+    ]);
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(504);
+    expect(observedSignal?.aborted).toBe(true);
+    expect(body).toEqual({
+      error: "viva_session_agent_timeout",
+      failure_class: "session_bootstrap_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_session_unavailable",
+      token_refresh_outcome: "failed",
+    });
+    expect(JSON.stringify(body)).not.toContain("redacted-rest-bearer");
+  });
+
   test("start rejects cross-origin callers before contacting the agent", async () => {
     const calls: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
@@ -714,6 +748,31 @@ function jsonResponse(status: number, body: unknown): Response {
     headers: { "content-type": "application/json" },
     status,
   });
+}
+
+function hangingJsonResponse(signal: AbortSignal | undefined, abortMessage: string): Response {
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            controller.error(new Error(abortMessage));
+          },
+          { once: true },
+        );
+      },
+    }),
+    {
+      headers: { "content-type": "application/json" },
+      status: 200,
+    },
+  );
+}
+
+async function rejectAfter(ms: number, message: string): Promise<never> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+  throw new Error(message);
 }
 
 function librarySnapshot({

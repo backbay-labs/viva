@@ -513,8 +513,8 @@ async function mintSessionFromLibrary(input: {
       ),
     };
   }
-  let response: Response;
   let timedOut = false;
+  let snapshot: VivaLibrarySnapshot;
   const timeout = sessionBootstrapTimeoutMs();
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
@@ -522,7 +522,7 @@ async function mintSessionFromLibrary(input: {
     controller.abort();
   }, timeout);
   try {
-    response = await fetch(upstream, {
+    const response = await fetch(upstream, {
       cache: "no-store",
       headers: {
         authorization: `Bearer ${bearerToken}`,
@@ -531,6 +531,31 @@ async function mintSessionFromLibrary(input: {
       method: "GET",
       signal: controller.signal,
     });
+    if (!response.ok) {
+      return {
+        ok: false,
+        response: sessionPreLoopJsonError(
+          502,
+          "viva_session_agent_unavailable",
+          "failed",
+          "session_bootstrap_unavailable",
+          PRE_LOOP_SESSION_TERMINAL_REASON,
+        ),
+      };
+    }
+    snapshot = await readJson(response);
+    if (timedOut) {
+      return {
+        ok: false,
+        response: sessionPreLoopJsonError(
+          504,
+          "viva_session_agent_timeout",
+          "failed",
+          "session_bootstrap_unavailable",
+          PRE_LOOP_SESSION_TERMINAL_REASON,
+        ),
+      };
+    }
   } catch {
     return {
       ok: false,
@@ -545,20 +570,7 @@ async function mintSessionFromLibrary(input: {
   } finally {
     clearTimeout(timeoutId);
   }
-  if (!response.ok) {
-    return {
-      ok: false,
-      response: sessionPreLoopJsonError(
-        502,
-        "viva_session_agent_unavailable",
-        "failed",
-        "session_bootstrap_unavailable",
-        PRE_LOOP_SESSION_TERMINAL_REASON,
-      ),
-    };
-  }
 
-  const snapshot = await readJson(response);
   const studySet = snapshot.study_sets?.find(
     (entry) => entry.id === input.studySetId && entry.user_id === input.userId,
   );
