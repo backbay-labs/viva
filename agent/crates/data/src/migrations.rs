@@ -54,6 +54,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0012_review_items_atomic_replay_guard.sql",
         include_str!("../../../migrations/0012_review_items_atomic_replay_guard.sql"),
     ),
+    (
+        "0013_recap_and_concept_status_atomic_replay_guard.sql",
+        include_str!("../../../migrations/0013_recap_and_concept_status_atomic_replay_guard.sql"),
+    ),
 ];
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
@@ -319,6 +323,19 @@ mod tests {
             "ON review_items (user_id, study_set_id, voice_session_id, concept_id, due_at)"
         ));
         assert!(sql.contains("WHERE status = 'scheduled' AND voice_session_id IS NOT NULL"));
+    }
+
+    #[test]
+    fn migrations_define_atomic_recap_and_concept_status_replay_guards() {
+        let sql = migration_sql();
+        assert!(sql.contains("session_recaps_voice_session_payload_idx"));
+        assert!(sql.contains(
+            "ON session_recaps (user_id, study_set_id, voice_session_id, strong_concepts, shaky_concepts, missed_concepts, review_later, source_span_ids)"
+        ));
+        assert!(sql.contains("concept_status_events"));
+        assert!(sql.contains(
+            "PRIMARY KEY (user_id, study_set_id, voice_session_id, response_id, concept_id, payload_sha256)"
+        ));
     }
 
     #[test]
@@ -885,6 +902,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optional_postgres_record_recap_concurrent_replay_is_atomic_when_database_url_is_set() {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let first_store = PostgresStudyStore::new(pool.clone());
+        let second_store = PostgresStudyStore::new(pool.clone());
+        record_fixture_session(&first_store).await;
+        let recap = fixture_recap();
+
+        let first = first_store.record_recap(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "response-recap",
+            recap.clone(),
+        );
+        let second = second_store.record_recap(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "response-recap",
+            recap,
+        );
+        let (first, second) = tokio::join!(first, second);
+        first.expect("first replay records recap");
+        second.expect("second replay observes atomic duplicate guard");
+
+        assert_eq!(
+            first_store.write_counts().recaps + second_store.write_counts().recaps,
+            1
+        );
+        let row_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM session_recaps
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND voice_session_id = $3",
+        )
+        .bind("user-1")
+        .bind(fixture_uuid("biology-midterm").expect("study set fixture UUID"))
+        .bind(fixture_uuid("voice-session-1").expect("voice session fixture UUID"))
+        .fetch_one(&pool)
+        .await
+        .expect("recap row count query succeeds");
+        assert_eq!(row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn optional_postgres_record_concept_status_concurrent_replay_is_atomic_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let first_store = PostgresStudyStore::new(pool.clone());
+        let second_store = PostgresStudyStore::new(pool.clone());
+        record_fixture_session(&first_store).await;
+
+        let first = first_store.record_concept_status(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "response-concept-status",
+            "oxidative-phosphorylation",
+            ConceptStatus::Strong,
+        );
+        let second = second_store.record_concept_status(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "response-concept-status",
+            "oxidative-phosphorylation",
+            ConceptStatus::Strong,
+        );
+        let (first, second) = tokio::join!(first, second);
+        first.expect("first replay records concept status");
+        second.expect("second replay observes atomic duplicate guard");
+
+        assert_eq!(
+            first_store.write_counts().concept_statuses
+                + second_store.write_counts().concept_statuses,
+            1
+        );
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT status
+             FROM concepts
+             WHERE study_set_id = $1 AND public_id = $2",
+        )
+        .bind(fixture_uuid("biology-midterm").expect("study set fixture UUID"))
+        .bind("oxidative-phosphorylation")
+        .fetch_one(&pool)
+        .await
+        .expect("concept status query succeeds");
+        assert_eq!(status, "strong");
+    }
+
+    #[tokio::test]
     async fn optional_postgres_privacy_deletes_purge_usage_and_preserve_deleted_sessions_when_database_url_is_set(
     ) {
         let Some(pool) = optional_postgres_pool().await else {
@@ -1102,6 +1223,24 @@ mod tests {
             })
             .await
             .expect("records count-table fixture session");
+    }
+
+    fn fixture_recap() -> StudySessionRecap {
+        StudySessionRecap {
+            voice_session_id: "voice-session-1".to_owned(),
+            headline: "Done".to_owned(),
+            summary: "Recap".to_owned(),
+            strong_concepts: vec!["NADH".to_owned()],
+            shaky_concepts: vec!["ATP synthase".to_owned()],
+            missed_concepts: vec![],
+            review_later: vec!["ATP synthase".to_owned()],
+            next_action: "Review tomorrow".to_owned(),
+            source_moments: vec![agent_domain::RecapSourceMoment {
+                text: "NADH donates electrons.".to_owned(),
+                source: fixture_source_reference(),
+                status: ConceptStatus::Strong,
+            }],
+        }
     }
 
     fn count_table_executor(

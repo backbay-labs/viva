@@ -3531,6 +3531,100 @@ async fn websocket_provider_queue_depth_waits_for_slot_before_forwarding() {
 }
 
 #[tokio::test]
+async fn websocket_provider_admission_does_not_count_audio_continuation_frames_as_new_turns() {
+    let audio_inputs = Arc::new(AtomicUsize::new(0));
+    let state = AppState::new(
+        Arc::new(AudioContinuationResolutionProbeBrain {
+            audio_inputs: audio_inputs.clone(),
+        }),
+        "cartesia_gemini",
+        VoiceWsAccess::default(),
+        4,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_provider_concurrent_turns: Some(1),
+        max_provider_queue_depth: Some(0),
+        ..VoiceLimitConfig::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "cartesia_gemini").await;
+    socket
+        .send(WsMessage::Text(
+            format!(
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Event { event, .. }
+            if matches!(
+                event.as_ref(),
+                VivaServerEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                    terminal_reason: None,
+                }
+            )
+    ));
+
+    socket
+        .send(WsMessage::Binary(vec![1_u8, 2].into()))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![3_u8, 4].into()))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Event { event, .. }
+            if matches!(
+                event.as_ref(),
+                VivaServerEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Feedback,
+                    terminal_reason: None,
+                }
+            )
+    ));
+    let post_resolution_turn_cap = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            let frame = read_server_frame(&mut socket).await;
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                return frame;
+            }
+        }
+    })
+    .await;
+    assert!(
+        post_resolution_turn_cap.is_err(),
+        "continuation frames must not leave stale submitted-answer turn-cap counts"
+    );
+    let provider_events = evidence
+        .snapshot()
+        .into_iter()
+        .filter(|event| event.kind == VoiceEvidenceEventKind::ProviderAdmission)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        provider_events.len(),
+        1,
+        "only the first audio frame should start a provider turn"
+    );
+    assert_eq!(audio_inputs.load(Ordering::SeqCst), 2);
+
+    socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut socket).await;
+}
+
+#[tokio::test]
 async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwarding() {
     let text_inputs = Arc::new(AtomicUsize::new(0));
     let state = provider_limiter_test_state(
@@ -9718,6 +9812,60 @@ impl RealtimeBrain for QueuedAudioProviderProbeBrain {
                         }
                     }
                     _ => {}
+                }
+            }
+        });
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+struct AudioContinuationResolutionProbeBrain {
+    audio_inputs: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for AudioContinuationResolutionProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "cartesia_gemini".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        _config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let audio_inputs = self.audio_inputs.clone();
+        let task = tokio::spawn(async move {
+            let _ = event_tx
+                .send(BrainEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                })
+                .await;
+            let mut completed = false;
+            while let Some(input) = input_rx.recv().await {
+                if matches!(
+                    input,
+                    BrainInput::Audio(_) | BrainInput::AudioWithMetadata { .. }
+                ) {
+                    let audio_count = audio_inputs.fetch_add(1, Ordering::SeqCst) + 1;
+                    if audio_count == 2 && !completed {
+                        completed = true;
+                        let _ = event_tx
+                            .send(BrainEvent::ResponseCompleted {
+                                response_id: "audio-continuation-response".to_owned(),
+                            })
+                            .await;
+                    }
                 }
             }
         });

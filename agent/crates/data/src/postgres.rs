@@ -2080,14 +2080,43 @@ impl StudyMemoryStore for PostgresStudyStore {
             concept_id,
             status: &status,
         };
-        if self.has_event_authorization(
-            user_id,
-            study_set_id,
-            voice_session_id,
-            response_id,
-            EventAuthorizationKind::ConceptStatus,
-            &payload,
-        )? {
+        let payload_digest =
+            payload_sha256(EventAuthorizationKind::ConceptStatus, response_id, &payload)?;
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        let event_insert = sqlx::query(
+            "INSERT INTO concept_status_events (
+                 user_id,
+                 study_set_id,
+                 voice_session_id,
+                 response_id,
+                 concept_id,
+                 payload_sha256,
+                 status
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (user_id, study_set_id, voice_session_id, response_id, concept_id, payload_sha256)
+             DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .bind(response_id)
+        .bind(concept_uuid)
+        .bind(&payload_digest)
+        .bind(concept_status_str(&status))
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        if event_insert.rows_affected() == 0 {
+            tx.commit().await.map_err(pg_error)?;
+            self.record_event_authorization(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                EventAuthorizationKind::ConceptStatus,
+                &payload,
+            )?;
             return Ok(status);
         }
         let result = sqlx::query(
@@ -2103,16 +2132,18 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(concept_uuid)
         .bind(study_set_uuid)
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(pg_error)?;
         if result.rows_affected() == 0 {
+            tx.rollback().await.map_err(pg_error)?;
             return Err(PortError::unavailable(
                 "postgres",
                 concept_id,
                 "concept is not available for this study set",
             ));
         }
+        tx.commit().await.map_err(pg_error)?;
         self.increment_count(WriteCountKind::ConceptStatus)?;
         self.record_event_authorization(
             user_id,
@@ -2201,36 +2232,11 @@ impl StudyMemoryStore for PostgresStudyStore {
             }
             source_span_ids.push(Self::uuid_for(&moment.source.source_id)?);
         }
-        if self
-            .recap_was_recorded(
-                user_id,
-                study_set_uuid,
-                voice_session_uuid,
-                &recap,
-                &source_span_ids,
-            )
-            .await?
-        {
-            self.record_event_authorization(
-                user_id,
-                study_set_id,
-                voice_session_id,
-                response_id,
-                EventAuthorizationKind::StudySessionRecap,
-                &recap,
-            )?;
-            return Ok(json!({
-                "voice_session_id": voice_session_id,
-                "strong_concepts": recap.strong_concepts,
-                "shaky_concepts": recap.shaky_concepts,
-                "missed_concepts": recap.missed_concepts,
-                "review_later": recap.review_later,
-                "source_span_ids": source_span_ids,
-            }));
-        }
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO session_recaps (id, user_id, study_set_id, voice_session_id, strong_concepts, shaky_concepts, missed_concepts, review_later, source_span_ids)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (user_id, study_set_id, voice_session_id, strong_concepts, shaky_concepts, missed_concepts, review_later, source_span_ids)
+             DO NOTHING",
         )
         .bind(Uuid::new_v4())
         .bind(user_id)
@@ -2244,7 +2250,9 @@ impl StudyMemoryStore for PostgresStudyStore {
         .execute(&self.pool)
         .await
         .map_err(pg_error)?;
-        self.increment_count(WriteCountKind::Recap)?;
+        if result.rows_affected() > 0 {
+            self.increment_count(WriteCountKind::Recap)?;
+        }
         self.record_event_authorization(
             user_id,
             study_set_id,

@@ -1036,6 +1036,8 @@ async fn handle_socket(
                             }
                             if let Some(lease) = provider_admission_lease.take() {
                                 pending_provider_admissions.push(lease);
+                                active_provider_turn_accepts_audio_continuations =
+                                    accepts_audio_continuations;
                             }
                         }
                         match action {
@@ -3242,7 +3244,7 @@ fn record_provider_admission(
 ) {
     let detail = match &admission.decision {
         ProviderAdmissionDecision::Admitted => format!(
-            "admission_decision=admitted queue_depth={} queue_delay_ms={} budget_state={}",
+            "admission_decision=admitted queue_depth={} queue_delay_ms={} retry_after_ms=0 reset_hint=none terminal_reason=none budget_state={}",
             admission.queue_depth, admission.queue_delay_ms, admission.budget_state
         ),
         ProviderAdmissionDecision::Denied(denial) => format!(
