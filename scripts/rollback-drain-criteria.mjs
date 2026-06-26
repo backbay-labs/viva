@@ -1,11 +1,15 @@
 import learnerLoopContract from "../packages/core/src/learner-loop-contract.json" with {
   type: "json",
 };
+import { assertNoForbiddenEvidenceMarkers } from "./redaction-control.mjs";
 
 const CRITERIA_SCHEMA = "viva.rollback_drain_criteria.v1";
 const DECISION_SCHEMA = "viva.rollback_decision.v1";
 const EVIDENCE_SCHEMA = "viva.rollback_release_gate.v1";
 const OWNER_DECISIONS = new Set(["proceed", "hold", "rollback"]);
+const PRODUCTION_READY_POSTGRES_STATE = "postgres_ready";
+const PRODUCTION_READY_RECOVERY_VALIDATION = "release-check-and-drain-smoke-passed";
+const UTC_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/;
 
 export const REQUIRED_ROLLBACK_TRIGGER_IDS = Object.freeze([
   "provider_429_rate_percent",
@@ -15,6 +19,73 @@ export const REQUIRED_ROLLBACK_TRIGGER_IDS = Object.freeze([
   "recap_failure_rate_percent",
   "token_refresh_failure_rate_percent",
   "live_monitor_consecutive_failures",
+]);
+
+export const ROLLBACK_DRAIN_PROOF_COMMANDS = Object.freeze([
+  Object.freeze({
+    name: "rollback_drain_ready_route_reports_unavailable_during_voice_drain",
+    command: "cargo",
+    args: Object.freeze([
+      "test",
+      "--manifest-path",
+      "agent/Cargo.toml",
+      "-p",
+      "agent-service",
+      "--test",
+      "voice_ws",
+      "ready_route_reports_unavailable_during_voice_drain",
+      "--",
+      "--nocapture",
+    ]),
+  }),
+  Object.freeze({
+    name: "rollback_drain_websocket_preflight_rejects_new_sessions_after_drain_begins",
+    command: "cargo",
+    args: Object.freeze([
+      "test",
+      "--manifest-path",
+      "agent/Cargo.toml",
+      "-p",
+      "agent-service",
+      "--test",
+      "voice_ws",
+      "websocket_preflight_rejects_new_sessions_after_drain_begins",
+      "--",
+      "--nocapture",
+    ]),
+  }),
+  Object.freeze({
+    name: "rollback_drain_websocket_drain_emits_terminal_phase_before_close",
+    command: "cargo",
+    args: Object.freeze([
+      "test",
+      "--manifest-path",
+      "agent/Cargo.toml",
+      "-p",
+      "agent-service",
+      "--test",
+      "voice_ws",
+      "websocket_drain_emits_terminal_phase_before_close",
+      "--",
+      "--nocapture",
+    ]),
+  }),
+  Object.freeze({
+    name: "rollback_drain_websocket_drain_interrupts_active_provider_response",
+    command: "cargo",
+    args: Object.freeze([
+      "test",
+      "--manifest-path",
+      "agent/Cargo.toml",
+      "-p",
+      "agent-service",
+      "--test",
+      "voice_ws",
+      "websocket_drain_interrupts_active_provider_response",
+      "--",
+      "--nocapture",
+    ]),
+  }),
 ]);
 
 export const ROLLBACK_DRAIN_BEHAVIOR = Object.freeze({
@@ -37,12 +108,7 @@ export const ROLLBACK_DRAIN_BEHAVIOR = Object.freeze({
     terminal_reason: "drained",
     learner_copy_contract_state_id: "deploy_drain",
   }),
-  proof_commands: Object.freeze([
-    "cargo test --manifest-path agent/Cargo.toml -p agent-service --test voice_ws ready_route_reports_unavailable_during_voice_drain",
-    "cargo test --manifest-path agent/Cargo.toml -p agent-service --test voice_ws websocket_preflight_rejects_new_sessions_after_drain_begins",
-    "cargo test --manifest-path agent/Cargo.toml -p agent-service --test voice_ws websocket_drain_emits_terminal_phase_before_close",
-    "cargo test --manifest-path agent/Cargo.toml -p agent-service --test voice_ws websocket_drain_interrupts_active_provider_response",
-  ]),
+  proof_commands: Object.freeze(ROLLBACK_DRAIN_PROOF_COMMANDS.map(commandLineFromSpec)),
 });
 
 const threshold = ({
@@ -371,8 +437,9 @@ export function buildRollbackReleaseEvidence({ env = process.env, generatedAt = 
   const criteria = rollbackCriteriaEvidence();
   const productionRequested = env.VIVA_PRODUCTION_RELEASE === "1";
   const ownerDecision = normalizeOwnerDecision(env);
-  const productionSnapshot = normalizeProductionSnapshot(env);
+  const productionSnapshot = normalizeProductionSnapshot(env, productionRequested);
   const missingProductionFields = missingRequiredProductionFields(productionSnapshot);
+  const invalidProductionFields = invalidProductionRecoveryFields(productionSnapshot);
   const thresholdsPresent = REQUIRED_ROLLBACK_TRIGGER_IDS.every((id) =>
     criteria.thresholds.some((thresholdEntry) => thresholdEntry.id === id),
   );
@@ -386,7 +453,8 @@ export function buildRollbackReleaseEvidence({ env = process.env, generatedAt = 
     thresholdsPresent &&
     ownerDecisionPresent &&
     ownerProceed &&
-    missingProductionFields.length === 0;
+    missingProductionFields.length === 0 &&
+    invalidProductionFields.length === 0;
 
   const evidence = {
     schema: EVIDENCE_SCHEMA,
@@ -401,12 +469,18 @@ export function buildRollbackReleaseEvidence({ env = process.env, generatedAt = 
       owner_decision_present: ownerDecisionPresent,
       owner_decision_allows_release: ownerProceed,
       missing_production_fields: missingProductionFields,
+      invalid_production_fields: invalidProductionFields,
+      postgres_ready: productionSnapshot.postgres_state === PRODUCTION_READY_POSTGRES_STATE,
+      recovery_validation_passed:
+        productionSnapshot.recovery_validation === PRODUCTION_READY_RECOVERY_VALIDATION,
       allowed: productionAllowed,
       reason: productionAllowed
         ? "owner_proceed_decision_and_required_rollback_evidence_present"
-        : productionRequested
-          ? "production_release_missing_required_rollback_evidence_or_owner_proceed_decision"
-          : "non_production_release_check",
+        : productionRequested && invalidProductionFields.length > 0
+          ? "production_release_recovery_state_not_ready"
+          : productionRequested
+            ? "production_release_missing_required_rollback_evidence_or_owner_proceed_decision"
+            : "non_production_release_check",
     },
     sanitized: true,
   };
@@ -444,16 +518,31 @@ function normalizeOwnerDecision(env) {
   return {
     decision,
     owner: stringOrNull(env.VIVA_RELEASE_OWNER),
-    decided_at_utc: stringOrNull(env.VIVA_RELEASE_OWNER_DECIDED_AT_UTC),
+    decided_at_utc: utcTimestampOrNull(env.VIVA_RELEASE_OWNER_DECIDED_AT_UTC),
   };
 }
 
-function normalizeProductionSnapshot(env) {
+function normalizeProductionSnapshot(env, productionRequested) {
   return {
-    web_deploy_id: stringOrNull(env.VIVA_RELEASE_WEB_DEPLOY_ID ?? env.VIVA_WEB_DEPLOY_ID),
-    agent_deploy_id: stringOrNull(env.VIVA_RELEASE_AGENT_DEPLOY_ID ?? env.VIVA_AGENT_DEPLOY_ID),
+    web_deploy_id: releaseScopedStringOrFallback(
+      env,
+      "VIVA_RELEASE_WEB_DEPLOY_ID",
+      "VIVA_WEB_DEPLOY_ID",
+      productionRequested,
+    ),
+    agent_deploy_id: releaseScopedStringOrFallback(
+      env,
+      "VIVA_RELEASE_AGENT_DEPLOY_ID",
+      "VIVA_AGENT_DEPLOY_ID",
+      productionRequested,
+    ),
     config_diff_sha256: sha256OrNull(env.VIVA_RELEASE_CONFIG_DIFF_SHA256),
-    provider_mode: stringOrNull(env.VIVA_RELEASE_PROVIDER_MODE ?? env.VIVA_AGENT_PROVIDER),
+    provider_mode: releaseScopedStringOrFallback(
+      env,
+      "VIVA_RELEASE_PROVIDER_MODE",
+      "VIVA_AGENT_PROVIDER",
+      productionRequested,
+    ),
     postgres_state: stringOrNull(env.VIVA_RELEASE_POSTGRES_STATE),
     recovery_validation: stringOrNull(env.VIVA_RELEASE_RECOVERY_VALIDATION),
   };
@@ -472,6 +561,62 @@ function requiredProductionFields() {
 
 function missingRequiredProductionFields(snapshot) {
   return requiredProductionFields().filter((field) => !snapshot[field]);
+}
+
+function invalidProductionRecoveryFields(snapshot) {
+  const invalid = [];
+  if (
+    snapshot.postgres_state !== null &&
+    snapshot.postgres_state !== PRODUCTION_READY_POSTGRES_STATE
+  ) {
+    invalid.push("postgres_state");
+  }
+  if (
+    snapshot.recovery_validation !== null &&
+    snapshot.recovery_validation !== PRODUCTION_READY_RECOVERY_VALIDATION
+  ) {
+    invalid.push("recovery_validation");
+  }
+  return invalid;
+}
+
+function releaseScopedStringOrFallback(env, releaseKey, fallbackKey, productionRequested) {
+  const releaseValue = stringOrNull(env[releaseKey]);
+  if (productionRequested) return releaseValue;
+  return releaseValue ?? stringOrNull(env[fallbackKey]);
+}
+
+function utcTimestampOrNull(value) {
+  const normalized = stringOrNull(value);
+  if (normalized === null) return null;
+  const match = normalized.match(UTC_TIMESTAMP_PATTERN);
+  if (!match) {
+    throw new Error("VIVA_RELEASE_OWNER_DECIDED_AT_UTC must be a valid UTC ISO timestamp");
+  }
+
+  const [, year, month, day, hour, minute, second, millisecond = "0"] = match;
+  const date = new Date(
+    Date.UTC(
+      Number.parseInt(year, 10),
+      Number.parseInt(month, 10) - 1,
+      Number.parseInt(day, 10),
+      Number.parseInt(hour, 10),
+      Number.parseInt(minute, 10),
+      Number.parseInt(second, 10),
+      Number.parseInt(millisecond.padEnd(3, "0"), 10),
+    ),
+  );
+  if (
+    date.getUTCFullYear() !== Number.parseInt(year, 10) ||
+    date.getUTCMonth() !== Number.parseInt(month, 10) - 1 ||
+    date.getUTCDate() !== Number.parseInt(day, 10) ||
+    date.getUTCHours() !== Number.parseInt(hour, 10) ||
+    date.getUTCMinutes() !== Number.parseInt(minute, 10) ||
+    date.getUTCSeconds() !== Number.parseInt(second, 10)
+  ) {
+    throw new Error("VIVA_RELEASE_OWNER_DECIDED_AT_UTC must be a valid UTC ISO timestamp");
+  }
+  return normalized;
 }
 
 function integerMetric(sample, key) {
@@ -506,40 +651,14 @@ function stringOrNull(value) {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function assertNoForbiddenEvidenceMarkers(value) {
-  const serialized = JSON.stringify(value);
-  const forbidden = [
-    "pcm16_base64",
-    "answer_text",
-    "transcript_final",
-    "source_context",
-    "pasted_text",
-    "session_token",
-    "viva1.",
-    "session-secret",
-    "raw_prompt",
-    "provider_prompt",
-    "CARTESIA_API_KEY",
-    "GEMINI_API_KEY",
-    "Bearer ",
-  ];
-  for (const needle of forbidden) {
-    if (serialized.includes(needle)) {
-      throw new Error(`rollback evidence includes forbidden payload marker: ${needle}`);
-    }
-  }
-  for (const [name, envValue] of Object.entries(process.env)) {
-    if (!/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) continue;
-    if (envValue && envValue.length >= 8 && serialized.includes(envValue)) {
-      throw new Error(`rollback evidence includes secret value from ${name}`);
-    }
-  }
-}
-
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function commandLineFromSpec(spec) {
+  return [spec.command, ...spec.args].join(" ");
 }

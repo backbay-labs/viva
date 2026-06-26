@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import learnerLoopContract from "../packages/core/src/learner-loop-contract.json" with {
   type: "json",
@@ -11,6 +12,7 @@ import {
   evaluateRollbackDecision,
   REQUIRED_ROLLBACK_TRIGGER_IDS,
   ROLLBACK_DRAIN_BEHAVIOR,
+  ROLLBACK_DRAIN_PROOF_COMMANDS,
   ROLLBACK_TRIGGER_THRESHOLDS,
   rollbackCriteriaEvidence,
 } from "./rollback-drain-criteria.mjs";
@@ -85,6 +87,39 @@ test("rollback drain criteria reconcile to BAC-510 deploy drain and rollback sta
   assert(ROLLBACK_DRAIN_BEHAVIOR.proof_commands.length >= 4);
 });
 
+test("rollback drain proof commands are shared between evidence and the release gate", async () => {
+  assert.equal(ROLLBACK_DRAIN_PROOF_COMMANDS.length, 4);
+  assert.deepEqual(
+    ROLLBACK_DRAIN_BEHAVIOR.proof_commands,
+    ROLLBACK_DRAIN_PROOF_COMMANDS.map((entry) => [entry.command, ...entry.args].join(" ")),
+  );
+  assert.equal(
+    new Set(ROLLBACK_DRAIN_PROOF_COMMANDS.map((entry) => entry.name)).size,
+    ROLLBACK_DRAIN_PROOF_COMMANDS.length,
+  );
+  for (const proofCommand of ROLLBACK_DRAIN_PROOF_COMMANDS) {
+    assert.equal(proofCommand.command, "cargo");
+    assert.deepEqual(proofCommand.args.slice(0, 5), [
+      "test",
+      "--manifest-path",
+      "agent/Cargo.toml",
+      "-p",
+      "agent-service",
+    ]);
+    assert(proofCommand.args.includes("voice_ws"));
+    assert(proofCommand.args.includes("--nocapture"));
+  }
+
+  const releaseCheck = await readFile("scripts/release-check.mjs", "utf8");
+  assert.match(releaseCheck, /ROLLBACK_DRAIN_PROOF_COMMANDS/);
+  assert.match(releaseCheck, /await runRollbackDrainProofCommands\(\);/);
+  assert(
+    releaseCheck.indexOf("await runRollbackDrainProofCommands();") <
+      releaseCheck.indexOf("const rollbackDrain = buildRollbackReleaseEvidence();"),
+    "release-check must run drain proofs before writing rollback release evidence",
+  );
+});
+
 test("rollback release evidence is sanitized and blocks production without owner decision", () => {
   const evidence = buildRollbackReleaseEvidence({
     env: {
@@ -139,19 +174,141 @@ test("rollback release evidence allows production only with complete deploy and 
   assert.equal(evidence.production_release_gate.owner_decision_present, true);
   assert.equal(evidence.production_release_gate.owner_decision_allows_release, true);
   assert.deepEqual(evidence.production_release_gate.missing_production_fields, []);
+  assert.deepEqual(evidence.production_release_gate.invalid_production_fields, []);
+  assert.equal(evidence.production_release_gate.postgres_ready, true);
+  assert.equal(evidence.production_release_gate.recovery_validation_passed, true);
   assert.equal(evidence.production_release_gate.allowed, true);
   assert.doesNotThrow(() => assertRollbackReleaseGate(evidence));
 });
 
+test("production release evidence blocks failed Postgres or recovery validation states", () => {
+  const evidence = buildRollbackReleaseEvidence({
+    env: {
+      VIVA_PRODUCTION_RELEASE: "1",
+      VIVA_RELEASE_WEB_DEPLOY_ID: "web-deploy-123",
+      VIVA_RELEASE_AGENT_DEPLOY_ID: "agent-deploy-456",
+      VIVA_RELEASE_CONFIG_DIFF_SHA256:
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      VIVA_RELEASE_PROVIDER_MODE: "cartesia_gemini",
+      VIVA_RELEASE_POSTGRES_STATE: "postgres_down",
+      VIVA_RELEASE_RECOVERY_VALIDATION: "failed",
+      VIVA_RELEASE_OWNER_DECIDED_AT_UTC: "2026-06-25T00:00:00Z",
+      VIVA_RELEASE_OWNER_DECISION: "proceed",
+      VIVA_RELEASE_OWNER: "release-owner",
+    },
+    generatedAt: new Date("2026-06-25T00:00:00Z"),
+  });
+
+  assert.deepEqual(evidence.production_release_gate.missing_production_fields, []);
+  assert.deepEqual(evidence.production_release_gate.invalid_production_fields, [
+    "postgres_state",
+    "recovery_validation",
+  ]);
+  assert.equal(evidence.production_release_gate.postgres_ready, false);
+  assert.equal(evidence.production_release_gate.recovery_validation_passed, false);
+  assert.equal(evidence.production_release_gate.allowed, false);
+  assert.equal(
+    evidence.production_release_gate.reason,
+    "production_release_recovery_state_not_ready",
+  );
+  assert.throws(() => assertRollbackReleaseGate(evidence), /production release blocked/);
+});
+
+test("production release evidence requires release-scoped deploy and provider fields", () => {
+  const evidence = buildRollbackReleaseEvidence({
+    env: {
+      VIVA_PRODUCTION_RELEASE: "1",
+      VIVA_WEB_DEPLOY_ID: "generic-web-deploy",
+      VIVA_AGENT_DEPLOY_ID: "generic-agent-deploy",
+      VIVA_RELEASE_CONFIG_DIFF_SHA256:
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      VIVA_AGENT_PROVIDER: "cartesia_gemini",
+      VIVA_RELEASE_POSTGRES_STATE: "postgres_ready",
+      VIVA_RELEASE_RECOVERY_VALIDATION: "release-check-and-drain-smoke-passed",
+      VIVA_RELEASE_OWNER_DECIDED_AT_UTC: "2026-06-25T00:00:00Z",
+      VIVA_RELEASE_OWNER_DECISION: "proceed",
+      VIVA_RELEASE_OWNER: "release-owner",
+    },
+    generatedAt: new Date("2026-06-25T00:00:00Z"),
+  });
+
+  assert.equal(evidence.production_snapshot.web_deploy_id, null);
+  assert.equal(evidence.production_snapshot.agent_deploy_id, null);
+  assert.equal(evidence.production_snapshot.provider_mode, null);
+  assert.deepEqual(evidence.production_release_gate.missing_production_fields, [
+    "web_deploy_id",
+    "agent_deploy_id",
+    "provider_mode",
+  ]);
+  assert.equal(evidence.production_release_gate.allowed, false);
+  assert.throws(() => assertRollbackReleaseGate(evidence), /production release blocked/);
+});
+
+test("owner decision timestamps must be valid UTC instants", () => {
+  assert.throws(
+    () =>
+      buildRollbackReleaseEvidence({
+        env: {
+          VIVA_PRODUCTION_RELEASE: "1",
+          VIVA_RELEASE_WEB_DEPLOY_ID: "web-deploy-123",
+          VIVA_RELEASE_AGENT_DEPLOY_ID: "agent-deploy-456",
+          VIVA_RELEASE_CONFIG_DIFF_SHA256:
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          VIVA_RELEASE_PROVIDER_MODE: "cartesia_gemini",
+          VIVA_RELEASE_POSTGRES_STATE: "postgres_ready",
+          VIVA_RELEASE_RECOVERY_VALIDATION: "release-check-and-drain-smoke-passed",
+          VIVA_RELEASE_OWNER_DECIDED_AT_UTC: "not-a-date",
+          VIVA_RELEASE_OWNER_DECISION: "proceed",
+          VIVA_RELEASE_OWNER: "release-owner",
+        },
+      }),
+    /VIVA_RELEASE_OWNER_DECIDED_AT_UTC must be a valid UTC ISO timestamp/,
+  );
+  assert.throws(
+    () =>
+      buildRollbackReleaseEvidence({
+        env: {
+          VIVA_RELEASE_OWNER_DECIDED_AT_UTC: "2026-06-25T00:00:00+00:00",
+        },
+      }),
+    /VIVA_RELEASE_OWNER_DECIDED_AT_UTC must be a valid UTC ISO timestamp/,
+  );
+  assert.throws(
+    () =>
+      buildRollbackReleaseEvidence({
+        env: {
+          VIVA_RELEASE_OWNER_DECIDED_AT_UTC: "2026-02-31T00:00:00Z",
+        },
+      }),
+    /VIVA_RELEASE_OWNER_DECIDED_AT_UTC must be a valid UTC ISO timestamp/,
+  );
+  assert.throws(
+    () =>
+      buildRollbackReleaseEvidence({
+        env: {
+          VIVA_RELEASE_OWNER_DECIDED_AT_UTC: "2026-06-25T24:00:00Z",
+        },
+      }),
+    /VIVA_RELEASE_OWNER_DECIDED_AT_UTC must be a valid UTC ISO timestamp/,
+  );
+});
+
 test("default non-production release evidence carries thresholds without allowing production", () => {
   const evidence = buildRollbackReleaseEvidence({
-    env: {},
+    env: {
+      VIVA_WEB_DEPLOY_ID: "generic-web-deploy",
+      VIVA_AGENT_DEPLOY_ID: "generic-agent-deploy",
+      VIVA_AGENT_PROVIDER: "fake_cartesia_gemini",
+    },
     generatedAt: new Date("2026-06-25T00:00:00Z"),
   });
 
   assert.equal(evidence.production_release_gate.production_requested, false);
   assert.equal(evidence.production_release_gate.thresholds_present, true);
   assert.equal(evidence.production_release_gate.allowed, false);
+  assert.equal(evidence.production_snapshot.web_deploy_id, "generic-web-deploy");
+  assert.equal(evidence.production_snapshot.agent_deploy_id, "generic-agent-deploy");
+  assert.equal(evidence.production_snapshot.provider_mode, "fake_cartesia_gemini");
   assert.doesNotThrow(() => assertRollbackReleaseGate(evidence));
   assert.equal(rollbackCriteriaEvidence().schema, "viva.rollback_drain_criteria.v1");
 });

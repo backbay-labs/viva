@@ -21,13 +21,11 @@ import {
   LIVE_PROVIDER_GATE_COMMAND_NAME,
   PROVIDER_READINESS_TARGETS,
 } from "./provider-readiness-matrix.mjs";
-import {
-  assertNoForbiddenEvidenceMarkers,
-  auditTextArtifacts,
-} from "./redaction-control.mjs";
+import { assertNoForbiddenEvidenceMarkers, auditTextArtifacts } from "./redaction-control.mjs";
 import {
   assertRollbackReleaseGate,
   buildRollbackReleaseEvidence,
+  ROLLBACK_DRAIN_PROOF_COMMANDS,
 } from "./rollback-drain-criteria.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -66,6 +64,7 @@ try {
     "--test",
     "scripts/rollback-drain-criteria.test.mjs",
   ]);
+  await runRollbackDrainProofCommands();
   await run("provider_gate_tests", "cargo", [
     "test",
     "--manifest-path",
@@ -196,6 +195,12 @@ async function runBrowserE2E() {
     VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "1",
   });
   return readExistingBrowserResult();
+}
+
+async function runRollbackDrainProofCommands() {
+  for (const proofCommand of ROLLBACK_DRAIN_PROOF_COMMANDS) {
+    await run(proofCommand.name, proofCommand.command, proofCommand.args);
+  }
 }
 
 async function readExistingBrowserResult() {
