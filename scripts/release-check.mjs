@@ -99,6 +99,16 @@ try {
     "--",
     "--nocapture",
   ]);
+  await run("provider_limiter_behavior_tests", "cargo", [
+    "test",
+    "--manifest-path",
+    "agent/Cargo.toml",
+    "-p",
+    "agent-service",
+    "websocket_provider_backoff_denies_next_answer_before_brain_input",
+    "--",
+    "--nocapture",
+  ]);
   await run(LIVE_PROVIDER_GATE_COMMAND_NAME, "cargo", [
     "test",
     "--manifest-path",

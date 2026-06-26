@@ -858,6 +858,73 @@ async fn handle_socket(
                     }
                     Err(ClientMessageError::TurnCap) => unreachable!("pre-send parsing cannot trip turn cap"),
                 };
+                if !pending_provider_admission.is_terminated()
+                    && client_input.action() == ClientAction::Cancel
+                {
+                    pending_provider_admission = Fuse::terminated();
+                    pending_provider_admission_accepts_audio_continuations = false;
+                    queued_provider_continuations.clear();
+                    queued_provider_continuation_bytes = 0;
+                    match send_client_input_action_with_drain(
+                        &session.input,
+                        client_input,
+                        &mut drain_signal,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(action) => {
+                            record_client_action(&state, voice_session_id.clone(), action);
+                        }
+                        Err(ClientMessageError::Drained) => {
+                            terminal_reason = close_with_terminal_session_phase(
+                                &mut sender,
+                                &session.input,
+                                &state,
+                                voice_session_id.clone(),
+                                &mut terminal_persisted,
+                                TerminalSessionReason::Drained,
+                                close_code::NORMAL,
+                            )
+                            .await;
+                            break;
+                        }
+                        Err(ClientMessageError::RateLimit) => {
+                            terminal_reason = close_with_terminal_session_phase(
+                                &mut sender,
+                                &session.input,
+                                &state,
+                                voice_session_id.clone(),
+                                &mut terminal_persisted,
+                                TerminalSessionReason::RateLimit,
+                                close_code::POLICY,
+                            )
+                            .await;
+                            break;
+                        }
+                        Err(ClientMessageError::Frame(error)) => {
+                            let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+                            let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
+                            terminal_reason = error.terminal_reason;
+                            break;
+                        }
+                        Err(ClientMessageError::TurnCap) => {
+                            abort_realtime_session_tasks(&mut session);
+                            terminal_reason = close_with_terminal_session_phase(
+                                &mut sender,
+                                &session.input,
+                                &state,
+                                voice_session_id.clone(),
+                                &mut terminal_persisted,
+                                TerminalSessionReason::TurnCap,
+                                close_code::POLICY,
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 if pending_provider_admission_accepts_audio_continuations
                     && client_input_is_provider_continuation_audio(&client_input)
                 {
@@ -1306,8 +1373,7 @@ fn brain_event_provider_turn_completion(
         | agent_domain::BrainEvent::TerminalSessionPhase { .. } => {
             Some(SubmittedAnswerResolution::All)
         }
-        agent_domain::BrainEvent::AnswerEvaluated { .. }
-        | agent_domain::BrainEvent::ResponseCompleted { .. }
+        agent_domain::BrainEvent::ResponseCompleted { .. }
         | agent_domain::BrainEvent::ResponseCancelledFor { .. } => {
             Some(SubmittedAnswerResolution::One {
                 response_id: event.response_id().map(ToOwned::to_owned),
@@ -1526,7 +1592,7 @@ where
                 .state
                 .limit_state
                 .record_provider_failure(context.limits, failure);
-        } else {
+        } else if error.source != "failure_control" {
             context
                 .state
                 .limit_state
@@ -3929,7 +3995,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_turn_completion_accepts_answer_evaluation() {
+    fn provider_turn_completion_waits_for_end_of_turn_after_answer_evaluation() {
         let question = agent_domain::fixture_question();
         let evaluation = agent_domain::AnswerEvaluation {
             question_id: question.question_id,
@@ -3953,9 +4019,7 @@ mod tests {
         );
         assert_eq!(
             brain_event_provider_turn_completion(&answer_evaluated),
-            Some(SubmittedAnswerResolution::One {
-                response_id: Some("response-1".to_owned())
-            })
+            None
         );
 
         let response_completed = BrainEvent::ResponseCompleted {
