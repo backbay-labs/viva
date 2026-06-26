@@ -42,13 +42,10 @@ export function LibraryStatusPanel({
 
   if (!currentSnapshot) return null;
   const projection = projectLibrarySnapshot(currentSnapshot, { now });
-  const controlToken = projection.privacy.export.controlToken ?? undefined;
-  const deleteCapableStudySetIds = new Set(
-    projection.libraryRows.filter((row) => row.delete.available).map((row) => row.id),
-  );
+  const exportControlToken = libraryActionControlToken(projection.privacy.export);
   const refreshLibrary = async () => {
     const nextSnapshot = await fetchVivaLibrarySnapshot({
-      controlToken,
+      controlToken: exportControlToken,
       userId: projection.userId,
     });
     setCurrentSnapshot(nextSnapshot);
@@ -69,7 +66,7 @@ export function LibraryStatusPanel({
   const exportLibrary = () =>
     runControl("Export data", async () => {
       const exported = await exportVivaLibraryData({
-        controlToken,
+        controlToken: exportControlToken,
         userId: projection.userId,
       });
       downloadJson(`viva-export-${projection.userId}.json`, exported);
@@ -77,7 +74,7 @@ export function LibraryStatusPanel({
   const deleteStudySet = (row: LibraryRow) =>
     runControl("Delete source", async () => {
       await deleteVivaStudySet(row.id, {
-        controlToken,
+        controlToken: libraryActionControlToken(row.delete),
         userId: projection.userId,
       });
       await refreshLibrary();
@@ -85,7 +82,7 @@ export function LibraryStatusPanel({
   const deleteSession = (row: SessionRow) =>
     runControl("Delete recap", async () => {
       await deleteVivaSessionHistory(row.studySetId, row.id, {
-        controlToken,
+        controlToken: libraryActionControlToken(row.delete),
         userId: projection.userId,
       });
       await refreshLibrary();
@@ -189,9 +186,7 @@ export function LibraryStatusPanel({
                   <button
                     aria-label={`Delete recap for ${row.studySetTitle}`}
                     className="viva-library__action--danger"
-                    disabled={
-                      !deleteCapableStudySetIds.has(row.studySetId) || busyAction === "Delete recap"
-                    }
+                    disabled={!row.delete.available || busyAction === "Delete recap"}
                     onClick={() => deleteSession(row)}
                     type="button"
                   >
@@ -205,6 +200,13 @@ export function LibraryStatusPanel({
       </div>
     </section>
   );
+}
+
+function libraryActionControlToken(action: {
+  controlToken?: string | null;
+  sameOriginControlToken?: string | null;
+}): string | undefined {
+  return action.controlToken?.trim() || action.sameOriginControlToken?.trim() || undefined;
 }
 
 function LibraryStudySetRow({

@@ -281,9 +281,11 @@ describe("Viva library projection", () => {
     });
   });
 
-  test("keeps same-origin control actions available without exposing raw control tokens", () => {
+  test("keeps signed same-origin control actions available without exposing raw control tokens", () => {
     const readyStudySet = snapshot.study_sets[0];
     if (!readyStudySet) throw new Error("test fixture must include a ready study set");
+    const completedSession = snapshot.sessions[0];
+    if (!completedSession) throw new Error("test fixture must include a completed session");
     const sameOriginSnapshot: VivaLibrarySnapshot = {
       ...snapshot,
       privacy: {
@@ -298,11 +300,18 @@ describe("Viva library projection", () => {
           ...readyStudySet,
           actions: {
             ...readyStudySet.actions,
-            delete: { available: true, same_origin_control: true },
+            delete: { available: true, same_origin_control_token: "viva-control1.delete-source" },
           },
         },
       ],
-      sessions: [],
+      sessions: [
+        {
+          ...completedSession,
+          actions: {
+            delete: { available: true, same_origin_control_token: "viva-control1.delete-recap" },
+          },
+        },
+      ],
     };
 
     const projection = projectLibrarySnapshot(sameOriginSnapshot);
@@ -311,7 +320,12 @@ describe("Viva library projection", () => {
     expect(projection.libraryRows[0]?.delete).toEqual({
       available: true,
       controlToken: undefined,
-      sameOriginControl: true,
+      sameOriginControlToken: "viva-control1.delete-source",
+    });
+    expect(projection.sessionRows[0]?.delete).toEqual({
+      available: true,
+      controlToken: undefined,
+      sameOriginControlToken: "viva-control1.delete-recap",
     });
   });
 
@@ -326,7 +340,7 @@ describe("Viva library projection", () => {
       available: false,
       unavailable_reason: "no_open_session",
     });
-    expect(JSON.stringify(redacted)).not.toContain("session_token");
+    expect(JSON.stringify(redacted)).not.toContain('"session_token"');
     expect(JSON.stringify(redacted)).not.toContain("viva1.start-token");
     expect(redacted.privacy.export).toEqual({
       available: true,
@@ -347,9 +361,9 @@ describe("Viva library projection", () => {
     const serverful = browserInitialLibrarySnapshot(snapshot, { staticExport: false });
     const staticExport = browserInitialLibrarySnapshot(snapshot, { staticExport: true });
 
-    expect(JSON.stringify(serverful)).not.toContain("session_token");
+    expect(JSON.stringify(serverful)).not.toContain('"session_token"');
     expect(JSON.stringify(serverful)).not.toContain("viva1.start-token");
-    expect(JSON.stringify(serverful)).not.toContain("control_token");
+    expect(JSON.stringify(serverful)).not.toContain('"control_token"');
     expect(JSON.stringify(serverful)).not.toContain("viva1.control-token");
     expect(serverful.privacy.export).toEqual({
       available: true,
@@ -389,23 +403,40 @@ describe("Viva library projection", () => {
     expect(directSessionSnapshot.study_sets[0]?.actions.delete).toEqual({
       available: true,
     });
-    expect(JSON.stringify(directSessionSnapshot)).not.toContain("control_token");
+    expect(JSON.stringify(directSessionSnapshot)).not.toContain('"control_token"');
     expect(JSON.stringify(directSessionSnapshot)).not.toContain("viva1.control-token");
   });
 
-  test("marks server-bootstrap mutation controls as same-origin capabilities", () => {
-    const serverBootstrapSnapshot = browserInitialLibrarySnapshot(snapshot, {
-      sameOriginControl: true,
+  test("preserves signed same-origin mutation controls in server-bootstrap snapshots", () => {
+    const readyStudySet = snapshot.study_sets[0];
+    if (!readyStudySet) throw new Error("test fixture must include a ready study set");
+    const controlSnapshot: VivaLibrarySnapshot = {
+      ...snapshot,
+      study_sets: [
+        {
+          ...readyStudySet,
+          actions: {
+            ...readyStudySet.actions,
+            delete: {
+              available: true,
+              control_token: "viva1.control-token",
+              same_origin_control_token: "viva-control1.delete-source",
+            },
+          },
+        },
+      ],
+    };
+    const serverBootstrapSnapshot = browserInitialLibrarySnapshot(controlSnapshot, {
       staticExport: false,
     });
 
     expect(serverBootstrapSnapshot.study_sets[0]?.actions.delete).toEqual({
       available: true,
-      same_origin_control: true,
+      same_origin_control_token: "viva-control1.delete-source",
     });
-    expect(JSON.stringify(serverBootstrapSnapshot)).not.toContain("control_token");
+    expect(JSON.stringify(serverBootstrapSnapshot)).not.toContain('"control_token"');
     expect(JSON.stringify(serverBootstrapSnapshot)).not.toContain("viva1.control-token");
-    expect(JSON.stringify(serverBootstrapSnapshot)).not.toContain("session_token");
+    expect(JSON.stringify(serverBootstrapSnapshot)).not.toContain('"session_token"');
   });
 
   test("formats completed-session next review from the persisted server schedule only", () => {

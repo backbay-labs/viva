@@ -1,5 +1,11 @@
 import { type NextRequest, NextResponse } from "next/server";
-import { attachVivaSessionBootstrapTokensToLibrarySnapshot } from "../../viva-session/shared";
+import {
+  attachVivaLibraryControlTokensToLibrarySnapshot,
+  attachVivaSessionBootstrapTokensToLibrarySnapshot,
+  isVivaLibraryControlToken,
+  type VivaLibraryControlScope,
+  verifyVivaLibraryControlToken,
+} from "../../viva-session/shared";
 
 export const dynamic = "force-dynamic";
 
@@ -41,6 +47,7 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   const serverBearer = serverBearerForBrowserLibraryRequest(request, path, controlTarget);
   if (!serverBearer.ok) return serverBearer.response;
   const headers = vivaLibraryProxyHeaders(request, {
+    forwardControlToken: !serverBearer.consumedControlToken,
     serverBearerToken: serverBearer.token,
   });
   let response: Response;
@@ -87,7 +94,7 @@ function vivaLibraryProxyJsonError(status: number, error: string): NextResponse<
 
 function vivaLibraryProxyHeaders(
   request: NextRequest,
-  options: { serverBearerToken?: string } = {},
+  options: { forwardControlToken?: boolean; serverBearerToken?: string } = {},
 ): Headers {
   const headers = new Headers();
   const authorization = request.headers.get("authorization");
@@ -97,7 +104,9 @@ function vivaLibraryProxyHeaders(
     headers.set("authorization", authorization);
   }
   const controlToken = request.headers.get("x-viva-library-control-token");
-  if (controlToken) headers.set("x-viva-library-control-token", controlToken);
+  if (controlToken && options.forwardControlToken !== false) {
+    headers.set("x-viva-library-control-token", controlToken);
+  }
   const contentType = request.headers.get("content-type");
   if (contentType) headers.set("content-type", contentType);
   const origin = vivaLibraryProxyOrigin(request);
@@ -123,6 +132,7 @@ function serverBearerForBrowserLibraryRequest(
   controlTarget: LibraryControlRouteTarget | null,
 ):
   | {
+      consumedControlToken?: boolean;
       ok: true;
       snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
       token?: string;
@@ -130,12 +140,21 @@ function serverBearerForBrowserLibraryRequest(
   | { ok: false; response: NextResponse<{ error: string }> } {
   const browserSnapshotRequest =
     request.method === "GET" && path.join("/") === "study-sets/library";
+  const controlToken = request.headers.get("x-viva-library-control-token")?.trim() || null;
   const sameOriginControlRequest =
     request.method === "DELETE" &&
-    controlTarget?.studySetId &&
-    !request.headers.get("x-viva-library-control-token");
-  if (!browserSnapshotRequest && !sameOriginControlRequest) {
+    Boolean(controlTarget?.studySetId) &&
+    isVivaLibraryControlToken(controlToken);
+  const missingControlCapabilityRequest =
+    request.method === "DELETE" && Boolean(controlTarget?.studySetId) && !controlToken;
+  if (!browserSnapshotRequest && !sameOriginControlRequest && !missingControlCapabilityRequest) {
     return { ok: true };
+  }
+  if (missingControlCapabilityRequest) {
+    return {
+      ok: false,
+      response: vivaLibraryProxyJsonError(403, "viva_library_control_capability_required"),
+    };
   }
   const token = process.env.VIVA_AGENT_REST_BEARER_TOKEN?.trim();
   if (!token) {
@@ -145,7 +164,28 @@ function serverBearerForBrowserLibraryRequest(
     };
   }
   if (sameOriginControlRequest) {
-    return { ok: true, token };
+    const userId = request.nextUrl.searchParams.get("user_id")?.trim() || "";
+    const verification = verifyVivaLibraryControlToken({
+      origin: vivaLibraryProxyOrigin(request),
+      scope: controlTarget?.scope ?? "study_set_delete",
+      studySetId: controlTarget?.studySetId ?? "",
+      token: controlToken ?? "",
+      userId,
+      voiceSessionId: controlTarget?.voiceSessionId ?? null,
+    });
+    if (verification === "missing_secret") {
+      return {
+        ok: false,
+        response: vivaLibraryProxyJsonError(503, "viva_library_control_unavailable"),
+      };
+    }
+    if (verification !== "valid") {
+      return {
+        ok: false,
+        response: vivaLibraryProxyJsonError(403, "viva_library_control_capability_required"),
+      };
+    }
+    return { consumedControlToken: true, ok: true, token };
   }
 
   const userId = request.nextUrl.searchParams.get("user_id")?.trim();
@@ -172,7 +212,11 @@ function serverBearerForBrowserLibraryRequest(
   return { ok: true, snapshotFilter: { allowedStudySetIds, userId }, token };
 }
 
-type LibraryControlRouteTarget = { studySetId: string | null };
+type LibraryControlRouteTarget = {
+  scope: VivaLibraryControlScope | null;
+  studySetId: string | null;
+  voiceSessionId: string | null;
+};
 
 function guardAllowedLibraryControlRoute(
   request: NextRequest,
@@ -203,7 +247,7 @@ function libraryControlRouteTarget(
   path: string[],
 ): LibraryControlRouteTarget | null {
   if (method === "GET" && path.join("/") === "study-sets/export") {
-    return { studySetId: null };
+    return { scope: null, studySetId: null, voiceSessionId: null };
   }
   if (
     method === "DELETE" &&
@@ -211,7 +255,7 @@ function libraryControlRouteTarget(
     path[0] === "study-sets" &&
     typeof path[1] === "string"
   ) {
-    return { studySetId: path[1] };
+    return { scope: "study_set_delete", studySetId: path[1], voiceSessionId: null };
   }
   if (
     method === "DELETE" &&
@@ -221,7 +265,7 @@ function libraryControlRouteTarget(
     path[2] === "sessions" &&
     typeof path[3] === "string"
   ) {
-    return { studySetId: path[1] };
+    return { scope: "session_history_delete", studySetId: path[1], voiceSessionId: path[3] };
   }
   return null;
 }
@@ -266,7 +310,14 @@ async function browserSafeLibraryResponseBody(
             userId: options.snapshotFilter.userId,
           })
         : filtered;
-      return JSON.stringify(stripBrowserLibraryCapabilityTokens(withBootstrapTokens));
+      const withControlTokens = options.snapshotFilter
+        ? attachVivaLibraryControlTokensToLibrarySnapshot(withBootstrapTokens, {
+            allowedStudySetIds: options.snapshotFilter.allowedStudySetIds,
+            origin: options.origin,
+            userId: options.snapshotFilter.userId,
+          })
+        : withBootstrapTokens;
+      return JSON.stringify(stripBrowserLibraryCapabilityTokens(withControlTokens));
     } catch {
       return "{}";
     }
@@ -333,14 +384,10 @@ function librarySessionAllowed(
 function stripBrowserLibraryCapabilityTokens(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stripBrowserLibraryCapabilityTokens);
   if (!value || typeof value !== "object") return value;
-  const record = value as Record<string, unknown>;
-  const hasSameOriginControl =
-    record.available === true && typeof record.control_token === "string";
   const output: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
     if (key === "control_token" || key === "session_token") continue;
     output[key] = stripBrowserLibraryCapabilityTokens(child);
   }
-  if (hasSameOriginControl) output.same_origin_control = true;
   return output;
 }

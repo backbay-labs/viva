@@ -5,7 +5,10 @@ import {
   vivaStaticExportEnabled,
 } from "../lib/viva-agent-client";
 import { browserInitialLibrarySnapshot, type VivaLibrarySnapshot } from "../lib/viva-library";
-import { attachVivaSessionBootstrapTokensToLibrarySnapshot } from "./api/viva-session/shared";
+import {
+  attachVivaLibraryControlTokensToLibrarySnapshot,
+  attachVivaSessionBootstrapTokensToLibrarySnapshot,
+} from "./api/viva-session/shared";
 
 export const dynamic = "auto";
 
@@ -29,16 +32,22 @@ async function initialSnapshot(): Promise<VivaLibrarySnapshot | null> {
             userId: config.options.userId ?? "",
           })
         : snapshot;
-    const browserSnapshot =
+    const bootstrapSnapshot =
       config.kind === "ready"
         ? attachVivaSessionBootstrapTokensToLibrarySnapshot(filteredSnapshot, {
             allowedStudySetIds: config.allowedStudySetIds,
             userId: config.options.userId ?? "",
           })
         : filteredSnapshot;
+    const browserSnapshot =
+      config.kind === "ready"
+        ? attachVivaLibraryControlTokensToLibrarySnapshot(bootstrapSnapshot, {
+            allowedStudySetIds: config.allowedStudySetIds,
+            userId: config.options.userId ?? "",
+          })
+        : bootstrapSnapshot;
     return browserInitialLibrarySnapshot(browserSnapshot as VivaLibrarySnapshot, {
       directSessionTokens: config.kind === "disabled",
-      sameOriginControl: config.kind === "ready",
       staticExport: vivaStaticExportEnabled(),
     });
   } catch {

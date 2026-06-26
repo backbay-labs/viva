@@ -44,11 +44,26 @@ type SessionBootstrapTokenClaims = {
   user_id: string;
 };
 
+export type VivaLibraryControlScope = "session_history_delete" | "study_set_delete";
+
+type LibraryControlTokenClaims = {
+  expires_at: number;
+  nonce: string;
+  origin: string | null;
+  purpose: "viva_library_control";
+  scope: VivaLibraryControlScope;
+  study_set_id: string;
+  user_id: string;
+  voice_session_id: string | null;
+};
+
 type VivaLibraryAction =
   | {
       available: true;
       session_id?: string | null;
       session_token?: string | null;
+      same_origin_control_token?: string | null;
+      control_token?: string | null;
     }
   | {
       available: false;
@@ -57,6 +72,7 @@ type VivaLibraryAction =
 
 type VivaLibraryStudySet = {
   actions?: {
+    delete?: VivaLibraryAction;
     resume?: VivaLibraryAction;
     start?: VivaLibraryAction;
   };
@@ -65,6 +81,7 @@ type VivaLibraryStudySet = {
 };
 
 type VivaLibrarySnapshot = {
+  sessions?: unknown[];
   study_sets?: VivaLibraryStudySet[];
 };
 
@@ -81,6 +98,8 @@ const RATE_LIMIT_WINDOW_MS = 60_000;
 const SESSION_BOOTSTRAP_TOKEN_TTL_SECONDS = 5 * 60;
 const SESSION_BOOTSTRAP_TOKEN_PREFIX = "viva-bootstrap1";
 const SESSION_BOOTSTRAP_TOKEN_PURPOSE = "viva_session_bootstrap";
+const LIBRARY_CONTROL_TOKEN_PREFIX = "viva-control1";
+const LIBRARY_CONTROL_TOKEN_PURPOSE = "viva_library_control";
 const mintRateLimits = new Map<string, RateLimitBucket>();
 
 export async function handleVivaSessionStart(request: NextRequest) {
@@ -216,6 +235,60 @@ export function signVivaSessionBootstrapToken(input: {
   return `${payload}.${signature}`;
 }
 
+export function signVivaLibraryControlToken(input: {
+  origin?: string | null;
+  scope: VivaLibraryControlScope;
+  studySetId: string;
+  userId: string;
+  voiceSessionId?: string | null;
+}): string | null {
+  const secret = sessionBootstrapSecret();
+  if (!secret) return null;
+  const claims: LibraryControlTokenClaims = {
+    expires_at: Math.floor(Date.now() / 1000) + SESSION_BOOTSTRAP_TOKEN_TTL_SECONDS,
+    nonce: randomUUID(),
+    origin: input.origin?.trim() || null,
+    purpose: LIBRARY_CONTROL_TOKEN_PURPOSE,
+    scope: input.scope,
+    study_set_id: input.studySetId,
+    user_id: input.userId,
+    voice_session_id: input.voiceSessionId?.trim() || null,
+  };
+  const claimsPart = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  const payload = `${LIBRARY_CONTROL_TOKEN_PREFIX}.${claimsPart}`;
+  const signature = createHmac("sha256", secret).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+
+export function isVivaLibraryControlToken(token: string | null | undefined): boolean {
+  return token?.startsWith(`${LIBRARY_CONTROL_TOKEN_PREFIX}.`) ?? false;
+}
+
+export function verifyVivaLibraryControlToken(input: {
+  origin?: string | null;
+  scope: VivaLibraryControlScope;
+  studySetId: string;
+  token: string;
+  userId: string;
+  voiceSessionId?: string | null;
+}): "invalid" | "missing_secret" | "valid" {
+  const secret = sessionBootstrapSecret();
+  if (!secret) return "missing_secret";
+  const claims = verifyLibraryControlTokenClaims(input.token, secret);
+  if (
+    !claims ||
+    claims.purpose !== LIBRARY_CONTROL_TOKEN_PURPOSE ||
+    claims.scope !== input.scope ||
+    claims.user_id !== input.userId ||
+    claims.study_set_id !== input.studySetId ||
+    claims.voice_session_id !== (input.voiceSessionId?.trim() || null) ||
+    (claims.origin && claims.origin !== input.origin)
+  ) {
+    return "invalid";
+  }
+  return "valid";
+}
+
 export function attachVivaSessionBootstrapTokensToLibrarySnapshot(
   value: unknown,
   options: {
@@ -231,6 +304,28 @@ export function attachVivaSessionBootstrapTokensToLibrarySnapshot(
       )
     : value.study_sets;
   return { ...value, study_sets: studySets };
+}
+
+export function attachVivaLibraryControlTokensToLibrarySnapshot(
+  value: unknown,
+  options: {
+    allowedStudySetIds?: ReadonlySet<string> | null;
+    origin?: string | null;
+    userId: string;
+  },
+): unknown {
+  if (!isRecord(value)) return value;
+  const studySets = Array.isArray(value.study_sets)
+    ? value.study_sets.map((studySet) =>
+        attachVivaLibraryControlTokenToStudySetDelete(studySet, options),
+      )
+    : value.study_sets;
+  const sessions = Array.isArray(value.sessions)
+    ? value.sessions.map((session) =>
+        attachVivaLibraryControlTokenToSessionDelete(session, options),
+      )
+    : value.sessions;
+  return { ...value, sessions, study_sets: studySets };
 }
 
 function guardSameOrigin(request: NextRequest): NextResponse | null {
@@ -643,6 +738,76 @@ function verifySessionBootstrapTokenClaims(
   }
 }
 
+function verifyLibraryControlTokenClaims(
+  token: string,
+  secret: string,
+): LibraryControlTokenClaims | null {
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts[0] !== LIBRARY_CONTROL_TOKEN_PREFIX) return null;
+  const claimsPart = parts[1] ?? "";
+  const signaturePart = parts[2] ?? "";
+  const signedPayload = `${LIBRARY_CONTROL_TOKEN_PREFIX}.${claimsPart}`;
+  let providedSignature: Buffer;
+  try {
+    providedSignature = Buffer.from(signaturePart, "base64url");
+  } catch {
+    return null;
+  }
+  const expectedSignature = createHmac("sha256", secret).update(signedPayload).digest();
+  if (
+    providedSignature.length !== expectedSignature.length ||
+    !timingSafeEqual(providedSignature, expectedSignature)
+  ) {
+    return null;
+  }
+  try {
+    const record = JSON.parse(Buffer.from(claimsPart, "base64url").toString("utf8")) as unknown;
+    if (!isRecord(record)) return null;
+    const expiresAt = numberClaim(record.expires_at);
+    const nonce = requiredString(record.nonce);
+    const purpose = record.purpose === LIBRARY_CONTROL_TOKEN_PURPOSE ? record.purpose : null;
+    const scope =
+      record.scope === "session_history_delete" || record.scope === "study_set_delete"
+        ? record.scope
+        : null;
+    const studySetId = requiredString(record.study_set_id);
+    const userId = requiredString(record.user_id);
+    const voiceSessionId =
+      record.voice_session_id === null || record.voice_session_id === undefined
+        ? null
+        : requiredString(record.voice_session_id);
+    const origin =
+      record.origin === null || record.origin === undefined ? null : requiredString(record.origin);
+    if (
+      expiresAt === null ||
+      expiresAt <= Math.floor(Date.now() / 1000) ||
+      !nonce ||
+      !purpose ||
+      !scope ||
+      !studySetId ||
+      !userId ||
+      (record.voice_session_id !== null &&
+        record.voice_session_id !== undefined &&
+        !voiceSessionId) ||
+      (record.origin !== null && record.origin !== undefined && !origin)
+    ) {
+      return null;
+    }
+    return {
+      expires_at: expiresAt,
+      nonce,
+      origin,
+      purpose,
+      scope,
+      study_set_id: studySetId,
+      user_id: userId,
+      voice_session_id: voiceSessionId,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function attachVivaSessionBootstrapTokensToStudySet(
   value: unknown,
   options: {
@@ -680,6 +845,96 @@ function attachVivaSessionBootstrapTokensToStudySet(
       }),
     },
   };
+}
+
+function attachVivaLibraryControlTokenToStudySetDelete(
+  value: unknown,
+  options: {
+    allowedStudySetIds?: ReadonlySet<string> | null;
+    origin?: string | null;
+    userId: string;
+  },
+): unknown {
+  if (!isRecord(value)) return value;
+  const id = requiredString(value.id);
+  const userId = requiredString(value.user_id);
+  if (
+    !id ||
+    userId !== options.userId ||
+    (options.allowedStudySetIds && !options.allowedStudySetIds.has(id)) ||
+    !isRecord(value.actions)
+  ) {
+    return value;
+  }
+  return {
+    ...value,
+    actions: {
+      ...value.actions,
+      delete: attachVivaLibraryControlTokenToAction(value.actions.delete, {
+        origin: options.origin,
+        scope: "study_set_delete",
+        studySetId: id,
+        userId: options.userId,
+        voiceSessionId: null,
+      }),
+    },
+  };
+}
+
+function attachVivaLibraryControlTokenToSessionDelete(
+  value: unknown,
+  options: {
+    allowedStudySetIds?: ReadonlySet<string> | null;
+    origin?: string | null;
+    userId: string;
+  },
+): unknown {
+  if (!isRecord(value)) return value;
+  const studySetId = requiredString(value.study_set_id);
+  const userId = requiredString(value.user_id);
+  const voiceSessionId = requiredString(value.voice_session_id);
+  if (
+    !studySetId ||
+    !voiceSessionId ||
+    userId !== options.userId ||
+    (options.allowedStudySetIds && !options.allowedStudySetIds.has(studySetId))
+  ) {
+    return value;
+  }
+  const token = signVivaLibraryControlToken({
+    origin: options.origin,
+    scope: "session_history_delete",
+    studySetId,
+    userId: options.userId,
+    voiceSessionId,
+  });
+  if (!token) return value;
+  const actions = isRecord(value.actions) ? value.actions : {};
+  return {
+    ...value,
+    actions: {
+      ...actions,
+      delete: {
+        available: true,
+        same_origin_control_token: token,
+      },
+    },
+  };
+}
+
+function attachVivaLibraryControlTokenToAction(
+  value: unknown,
+  input: {
+    origin?: string | null;
+    scope: VivaLibraryControlScope;
+    studySetId: string;
+    userId: string;
+    voiceSessionId: string | null;
+  },
+): unknown {
+  if (!isRecord(value) || value.available !== true) return value;
+  const token = signVivaLibraryControlToken(input);
+  return token ? { ...value, same_origin_control_token: token } : value;
 }
 
 function attachVivaSessionBootstrapTokenToAction(

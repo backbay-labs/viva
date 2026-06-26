@@ -84,6 +84,7 @@ const originalPublicApiUrl = process.env.NEXT_PUBLIC_VIVA_API_URL;
 const originalRestBearer = process.env.VIVA_AGENT_REST_BEARER_TOKEN;
 const originalAllowedUsers = process.env.VIVA_SESSION_ALLOWED_USER_IDS;
 const originalAllowedStudySets = process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS;
+const originalBootstrapSecret = process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET;
 
 describe("LandingEntry", () => {
   test("renders the hero without mounting the legacy study app", () => {
@@ -164,6 +165,7 @@ describe("LandingEntry", () => {
       process.env.VIVA_AGENT_REST_BEARER_TOKEN = "server-rest-bearer";
       process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
       process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = "redacted-bootstrap-signing-secret";
       globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
         calls.push({ input: String(input), init });
         return new Response(JSON.stringify(librarySnapshot), {
@@ -181,23 +183,32 @@ describe("LandingEntry", () => {
       expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBe(
         "Bearer server-rest-bearer",
       );
-      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("session_token");
-      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("control_token");
+      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain('"session_token"');
+      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain('"control_token"');
       expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("viva1.server-token");
       expect(page.props.initialLibrarySnapshot.privacy.export).toEqual({
         available: false,
         unavailable_reason: "allowlist_filtered_export_unavailable",
       });
-      expect(page.props.initialLibrarySnapshot.study_sets[0]?.actions.delete).toEqual({
-        available: true,
-        same_origin_control: true,
-      });
+      const studySetDelete = page.props.initialLibrarySnapshot.study_sets[0]?.actions.delete;
+      const sessionDelete = page.props.initialLibrarySnapshot.sessions[0]?.actions?.delete;
+      expect(studySetDelete?.available).toBe(true);
+      expect(
+        studySetDelete?.available &&
+          studySetDelete.same_origin_control_token?.startsWith("viva-control1."),
+      ).toBe(true);
+      expect(sessionDelete?.available).toBe(true);
+      expect(
+        sessionDelete?.available &&
+          sessionDelete.same_origin_control_token?.startsWith("viva-control1."),
+      ).toBe(true);
     } finally {
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
       restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
       restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+      restoreEnv("VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET", originalBootstrapSecret);
     }
   });
 
@@ -234,7 +245,7 @@ describe("LandingEntry", () => {
       expect(page.props.initialLibrarySnapshot.study_sets[0]?.actions.delete).toEqual({
         available: true,
       });
-      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("control_token");
+      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain('"control_token"');
       expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain(
         "viva1.control-token",
       );

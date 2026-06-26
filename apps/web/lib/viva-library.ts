@@ -6,7 +6,7 @@ export type VivaLibraryAction =
       session_id?: string | null;
       session_bootstrap_token?: string | null;
       session_token?: string | null;
-      same_origin_control?: true;
+      same_origin_control_token?: string | null;
       control_token?: string | null;
     }
   | {
@@ -58,6 +58,9 @@ export type VivaLibraryNextReview = {
 };
 
 export type VivaLibrarySession = {
+  actions?: {
+    delete?: VivaLibraryAction;
+  };
   voice_session_id: string;
   user_id?: string;
   study_set_id: string;
@@ -100,7 +103,7 @@ export type ProjectedLibraryAction = {
   sessionId?: string;
   sessionBootstrapToken?: string | null;
   sessionToken?: string | null;
-  sameOriginControl?: boolean;
+  sameOriginControlToken?: string | null;
   controlToken?: string | null;
   unavailableReason?: string;
 };
@@ -135,6 +138,7 @@ export type ProjectedSessionRow = {
   recapLabel: string;
   mastery: ProjectedSessionMastery | null;
   nextReview: ProjectedNextReview | null;
+  delete: ProjectedLibraryAction;
 };
 
 export type ProjectedNextReview = {
@@ -190,30 +194,22 @@ export function browserInitialLibrarySnapshot(
   snapshot: VivaLibrarySnapshot,
   options: {
     directSessionTokens?: boolean;
-    sameOriginControl?: boolean;
     staticExport?: boolean;
   } = {},
 ): VivaLibrarySnapshot {
   return stripBrowserOnlyTokenFields(snapshot, {
     controlToken: !options.staticExport,
-    sameOriginControl: Boolean(options.sameOriginControl && !options.staticExport),
     sessionToken: !(options.staticExport || options.directSessionTokens),
   }) as VivaLibrarySnapshot;
 }
 
 function stripBrowserOnlyTokenFields(
   value: unknown,
-  options: { controlToken: boolean; sameOriginControl?: boolean; sessionToken: boolean },
+  options: { controlToken: boolean; sessionToken: boolean },
 ): unknown {
   if (Array.isArray(value))
     return value.map((child) => stripBrowserOnlyTokenFields(child, options));
   if (!value || typeof value !== "object") return value;
-  const record = value as Record<string, unknown>;
-  const hasSameOriginControl =
-    options.sameOriginControl &&
-    options.controlToken &&
-    record.available === true &&
-    typeof record.control_token === "string";
   const output: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
     if (
@@ -224,7 +220,6 @@ function stripBrowserOnlyTokenFields(
     }
     output[key] = stripBrowserOnlyTokenFields(child, options);
   }
-  if (hasSameOriginControl) output.same_origin_control = true;
   return output;
 }
 
@@ -253,6 +248,12 @@ function projectSessionRow(session: VivaLibrarySession): ProjectedSessionRow {
     recapLabel: recapLabel(session.recap),
     mastery: projectSessionMastery(session.recap),
     nextReview: projectNextReview(session.next_review),
+    delete: projectMutationAction(
+      session.actions?.delete ?? {
+        available: false,
+        unavailable_reason: "server_mutation_unavailable",
+      },
+    ),
   };
 }
 
@@ -308,7 +309,7 @@ function projectMutationAction(action: VivaLibraryAction): ProjectedLibraryActio
       unavailableReason: action.unavailable_reason,
     };
   }
-  if (!action.control_token && !action.same_origin_control) {
+  if (!action.control_token && !action.same_origin_control_token) {
     return {
       available: false,
       unavailableReason: "control_token_unavailable",
@@ -317,7 +318,7 @@ function projectMutationAction(action: VivaLibraryAction): ProjectedLibraryActio
   return {
     available: true,
     controlToken: action.control_token,
-    sameOriginControl: action.same_origin_control === true,
+    sameOriginControlToken: action.same_origin_control_token,
   };
 }
 
