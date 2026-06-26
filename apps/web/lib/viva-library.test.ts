@@ -207,7 +207,7 @@ describe("Viva library projection", () => {
     );
   });
 
-  test("keeps tokenless server session actions bootstrap-capable for same-origin start", () => {
+  test("disables tokenless server session actions without a bootstrap capability", () => {
     const readyStudySet = snapshot.study_sets[0];
     if (!readyStudySet) throw new Error("test fixture must include a ready study set");
     const unsignedSnapshot: VivaLibrarySnapshot = {
@@ -228,12 +228,54 @@ describe("Viva library projection", () => {
     const projection = projectLibrarySnapshot(unsignedSnapshot);
 
     expect(projection.libraryRows[0]?.start).toEqual({
+      available: false,
+      unavailableReason: "session_capability_unavailable",
+    });
+    expect(projection.libraryRows[0]?.resume).toEqual({
+      available: false,
+      unavailableReason: "session_capability_unavailable",
+    });
+  });
+
+  test("keeps signed bootstrap session actions available for same-origin start", () => {
+    const readyStudySet = snapshot.study_sets[0];
+    if (!readyStudySet) throw new Error("test fixture must include a ready study set");
+    const bootstrapSnapshot: VivaLibrarySnapshot = {
+      ...snapshot,
+      study_sets: [
+        {
+          ...readyStudySet,
+          actions: {
+            ...readyStudySet.actions,
+            resume: {
+              available: true,
+              session_bootstrap_token: "viva-bootstrap1.resume-capability",
+              session_id: "open-session",
+              session_token: null,
+            },
+            start: {
+              available: true,
+              session_bootstrap_token: "viva-bootstrap1.start-capability",
+              session_id: "bootstrap-start-session",
+              session_token: null,
+            },
+          },
+        },
+      ],
+      sessions: [],
+    };
+
+    const projection = projectLibrarySnapshot(bootstrapSnapshot);
+
+    expect(projection.libraryRows[0]?.start).toEqual({
       available: true,
-      sessionId: "unsigned-start-session",
+      sessionBootstrapToken: "viva-bootstrap1.start-capability",
+      sessionId: "bootstrap-start-session",
       sessionToken: undefined,
     });
     expect(projection.libraryRows[0]?.resume).toEqual({
       available: true,
+      sessionBootstrapToken: "viva-bootstrap1.resume-capability",
       sessionId: "open-session",
       sessionToken: undefined,
     });

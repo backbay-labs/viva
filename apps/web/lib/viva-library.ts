@@ -273,6 +273,12 @@ function projectSessionAction(action: VivaLibraryAction): ProjectedLibraryAction
       unavailableReason: "session_id_unavailable",
     };
   }
+  if (!action.session_token && !action.session_bootstrap_token) {
+    return {
+      available: false,
+      unavailableReason: "session_capability_unavailable",
+    };
+  }
   return {
     available: true,
     sessionId: action.session_id ?? undefined,

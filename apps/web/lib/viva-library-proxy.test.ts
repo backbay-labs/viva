@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { NextRequest } from "next/server";
-import { GET, POST } from "../app/api/viva-library/[[...path]]/route";
+import { DELETE, GET, POST } from "../app/api/viva-library/[[...path]]/route";
 
 const originalFetch = globalThis.fetch;
 const originalAgentUrl = process.env.VIVA_AGENT_HTTP_URL;
@@ -16,6 +16,8 @@ describe("Viva library proxy", () => {
     try {
       process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
       process.env.VIVA_VOICE_WS_BEARER_TOKEN = "server-secret";
+      process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
       globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
         calls.push({ input: String(input), init });
         return new Response(JSON.stringify({ ok: true }), {
@@ -26,17 +28,19 @@ describe("Viva library proxy", () => {
 
       const request = {
         headers: new Headers({ "x-viva-library-control-token": "viva1.control-token" }),
-        method: "GET",
-        nextUrl: new URL("http://localhost:3000/api/viva-library/study-sets/export?user_id=user-1"),
+        method: "DELETE",
+        nextUrl: new URL(
+          "http://localhost:3000/api/viva-library/study-sets/biology-midterm?user_id=user-1",
+        ),
       } as unknown as NextRequest;
 
-      const response = await GET(request, {
-        params: Promise.resolve({ path: ["study-sets", "export"] }),
+      const response = await DELETE(request, {
+        params: Promise.resolve({ path: ["study-sets", "biology-midterm"] }),
       });
 
       expect(response.status).toBe(200);
       expect(calls).toHaveLength(1);
-      expect(calls[0]?.input).toBe("http://agent.test/study-sets/export?user_id=user-1");
+      expect(calls[0]?.input).toBe("http://agent.test/study-sets/biology-midterm?user_id=user-1");
       const headers = new Headers(calls[0]?.init?.headers);
       expect(headers.get("x-viva-library-control-token")).toBe("viva1.control-token");
       expect(headers.get("origin")).toBe("http://localhost:3000");
@@ -46,6 +50,8 @@ describe("Viva library proxy", () => {
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
       restoreEnv("VIVA_VOICE_WS_BEARER_TOKEN", originalBearer);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
     }
   });
 
@@ -208,7 +214,10 @@ describe("Viva library proxy", () => {
       expect(JSON.stringify(body)).not.toContain("user-2");
       expect(JSON.stringify(body)).not.toContain("history-final");
       expect(JSON.stringify(body)).not.toContain("session_token");
-      expect(body.privacy.export.control_token).toBe("viva1.export-control");
+      expect(body.privacy.export).toEqual({
+        available: false,
+        unavailable_reason: "allowlist_filtered_export_unavailable",
+      });
       expect(body.study_sets[0].actions.delete.control_token).toBe("viva1.delete-control");
       expect(JSON.stringify(body)).not.toContain("session_token");
       expect(JSON.stringify(body)).not.toContain("viva1.disallowed");
@@ -317,7 +326,10 @@ describe("Viva library proxy", () => {
       expect(JSON.stringify(body)).not.toContain("user-2");
       expect(JSON.stringify(body)).not.toContain("history-final");
       expect(JSON.stringify(body)).not.toContain("session_token");
-      expect(body.privacy.export.control_token).toBe("viva1.export-control");
+      expect(body.privacy.export).toEqual({
+        available: false,
+        unavailable_reason: "allowlist_filtered_export_unavailable",
+      });
       expect(body.study_sets[0].actions.delete.control_token).toBe("viva1.delete-control");
       expect(JSON.stringify(body)).not.toContain("session_token");
       expect(JSON.stringify(body)).not.toContain("viva1.disallowed");
@@ -367,6 +379,82 @@ describe("Viva library proxy", () => {
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
       restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+    }
+  });
+
+  test("blocks user-wide export through bearer-backed allowlisted proxy snapshots", async () => {
+    const calls: string[] = [];
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        calls.push(String(input));
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        });
+      }) as typeof fetch;
+
+      const request = {
+        headers: new Headers({ "x-viva-library-control-token": "viva1.control-token" }),
+        method: "GET",
+        nextUrl: new URL("http://localhost:3000/api/viva-library/study-sets/export?user_id=user-1"),
+      } as unknown as NextRequest;
+
+      const response = await GET(request, {
+        params: Promise.resolve({ path: ["study-sets", "export"] }),
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(403);
+      expect(body).toEqual({ error: "viva_library_control_scope_not_allowed" });
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(calls).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+    }
+  });
+
+  test("blocks disallowed study-set control routes before reaching the agent", async () => {
+    const calls: string[] = [];
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        calls.push(String(input));
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        });
+      }) as typeof fetch;
+
+      const request = {
+        headers: new Headers({ "x-viva-library-control-token": "viva1.control-token" }),
+        method: "DELETE",
+        nextUrl: new URL(
+          "http://localhost:3000/api/viva-library/study-sets/history-final?user_id=user-1",
+        ),
+      } as unknown as NextRequest;
+
+      const response = await DELETE(request, {
+        params: Promise.resolve({ path: ["study-sets", "history-final"] }),
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(403);
+      expect(body).toEqual({ error: "viva_library_control_scope_not_allowed" });
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(calls).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
       restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
     }
@@ -555,18 +643,22 @@ describe("Viva library proxy", () => {
   test("converts agent fetch failures to sanitized uncached proxy errors", async () => {
     try {
       process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
       globalThis.fetch = (async () => {
         throw new Error("connection refused for server-rest-bearer at http://agent.test");
       }) as typeof fetch;
 
       const request = {
         headers: new Headers({ "x-viva-library-control-token": "viva1.control-token" }),
-        method: "GET",
-        nextUrl: new URL("http://localhost:3000/api/viva-library/study-sets/export?user_id=user-1"),
+        method: "DELETE",
+        nextUrl: new URL(
+          "http://localhost:3000/api/viva-library/study-sets/biology-midterm?user_id=user-1",
+        ),
       } as unknown as NextRequest;
 
-      const response = await GET(request, {
-        params: Promise.resolve({ path: ["study-sets", "export"] }),
+      const response = await DELETE(request, {
+        params: Promise.resolve({ path: ["study-sets", "biology-midterm"] }),
       });
       const body = await response.json();
 
@@ -578,6 +670,8 @@ describe("Viva library proxy", () => {
     } finally {
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
     }
   });
 });

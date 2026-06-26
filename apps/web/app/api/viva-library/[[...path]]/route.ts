@@ -34,6 +34,9 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   );
   upstream.search = request.nextUrl.search;
 
+  const controlGuard = guardAllowedLibraryControlRoute(request, path);
+  if (controlGuard) return controlGuard;
+
   const serverBearer = serverBearerForBrowserLibrarySnapshot(request, path);
   if (!serverBearer.ok) return serverBearer.response;
   const headers = vivaLibraryProxyHeaders(request, {
@@ -158,6 +161,44 @@ function serverBearerForBrowserLibrarySnapshot(
   return { ok: true, snapshotFilter: { allowedStudySetIds, userId }, token };
 }
 
+function guardAllowedLibraryControlRoute(
+  request: NextRequest,
+  path: string[],
+): NextResponse | null {
+  const controlTarget = libraryControlRouteTarget(request.method, path);
+  if (!controlTarget) return null;
+
+  const userId = request.nextUrl.searchParams.get("user_id")?.trim();
+  const allowedUserIds = configuredAllowlist("VIVA_SESSION_ALLOWED_USER_IDS");
+  const allowedStudySetIds = configuredAllowlist("VIVA_SESSION_ALLOWED_STUDY_SET_IDS");
+  if (!allowedUserIds || !allowedStudySetIds) {
+    return vivaLibraryProxyJsonError(503, "viva_library_identity_allowlist_unavailable");
+  }
+  if (!userId || !allowedUserIds.has(userId)) {
+    return vivaLibraryProxyJsonError(403, "viva_library_identity_not_allowed");
+  }
+  if (!controlTarget.studySetId) {
+    return vivaLibraryProxyJsonError(403, "viva_library_control_scope_not_allowed");
+  }
+  if (!allowedStudySetIds.has(controlTarget.studySetId)) {
+    return vivaLibraryProxyJsonError(403, "viva_library_control_scope_not_allowed");
+  }
+  return null;
+}
+
+function libraryControlRouteTarget(
+  method: string,
+  path: string[],
+): { studySetId: string | null } | null {
+  if (method === "GET" && path.join("/") === "study-sets/export") {
+    return { studySetId: null };
+  }
+  if (method === "DELETE" && path[0] === "study-sets" && typeof path[1] === "string") {
+    return { studySetId: path[1] };
+  }
+  return null;
+}
+
 function configuredAllowlist(envName: string): Set<string> | null {
   const raw = process.env[envName]?.trim();
   if (!raw) return null;
@@ -214,6 +255,7 @@ function filterBearerBackedLibrarySnapshot(
   const snapshot = value as Record<string, unknown>;
   return {
     ...snapshot,
+    privacy: filterBearerBackedPrivacy(snapshot.privacy),
     sessions: Array.isArray(snapshot.sessions)
       ? snapshot.sessions.filter((session) => librarySessionAllowed(session, filter))
       : snapshot.sessions,
@@ -221,6 +263,17 @@ function filterBearerBackedLibrarySnapshot(
       ? snapshot.study_sets.filter((studySet) => libraryStudySetAllowed(studySet, filter))
       : snapshot.study_sets,
     user_id: filter.userId,
+  };
+}
+
+function filterBearerBackedPrivacy(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  return {
+    ...(value as Record<string, unknown>),
+    export: {
+      available: false,
+      unavailable_reason: "allowlist_filtered_export_unavailable",
+    },
   };
 }
 
