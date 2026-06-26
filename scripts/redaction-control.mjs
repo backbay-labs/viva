@@ -122,15 +122,9 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   },
   {
     file: "scripts/e2e-browser.mjs",
-    marker: "authorization",
-    patterns: Object.freeze([/headers\.authorization = `Bearer \$\{restBearerToken\}`/]),
-  },
-  {
-    file: "scripts/e2e-browser.mjs",
     marker: "Bearer ",
     patterns: Object.freeze([
       /\.replace\(\/Bearer\\s\+\[A-Za-z0-9\._~\+\/=-\]\+\/gi, "Bearer redacted"\)/,
-      /headers\.authorization = `Bearer \$\{restBearerToken\}`/,
     ]),
   },
   {
@@ -145,24 +139,23 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   },
   {
     file: "scripts/e2e-browser.mjs",
-    marker: "rest_bearer_token",
-    patterns: Object.freeze([
-      /async \(\{ restBearerToken, userId, studySetId \}\) =>/,
-      /\{ \.\.\.identity, restBearerToken: hostedRestBearerToken \}/,
-    ]),
-  },
-  {
-    file: "scripts/e2e-browser.mjs",
     marker: "session_token",
     patterns: Object.freeze([
       /VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan\.enabled/,
       /failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET/,
       /\.replace\(\/#session_token=/,
       /\.replace\(\/\[\?&\]session_token=/,
-      /action\?\.session_token/,
       /#session_token=\$\{encodeURIComponent\(/,
-      /action\.session_token/,
+      /sessionPayload\.session_token/,
       /^\s*session_token: session\.sessionToken,?$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "session_bootstrap_token",
+    patterns: Object.freeze([
+      /action\?\.session_bootstrap_token/,
+      /^\s*session_bootstrap_token: action\.session_bootstrap_token,?$/,
     ]),
   },
   {

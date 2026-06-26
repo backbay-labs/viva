@@ -88,11 +88,13 @@ let page;
 let traceStarted = false;
 let traceArtifact = null;
 const storyFrames = [];
+let hostedSecondTabIdentity = null;
 let sessionUrlLifecycle = null;
 let sourceFolioVisible = false;
 let boundedSourceVisible = false;
 let correctionMarginaliaVisible = false;
 let writtenAnswerFallbackUsed = false;
+let hostedWebSocketVerified = false;
 let postAnswerSourceFolioVisible = false;
 let postAnswerBoundedSourceVisible = false;
 let secondTabSessionCap = null;
@@ -220,6 +222,7 @@ try {
   } else if (hostedMode) {
     const identity = hostedSyntheticIdentity();
     assertHostedSyntheticIdentity(identity);
+    hostedSecondTabIdentity = identity;
     const signedStartTarget = await fetchSignedSessionStartTarget(page, identity);
     await navigateToSessionTarget(page, signedStartTarget);
   } else {
@@ -268,12 +271,18 @@ try {
       timeout: 20_000,
     });
     manuscriptReady = await isVisible(page.getByText(listeningText));
+    if (hostedMode) {
+      assertHostedWebSocketTarget(websocketUrls, wsUrl);
+      hostedWebSocketVerified = true;
+    }
     if (!failureControlPlan.enabled) {
-      if (hostedMode) {
-        assertHostedWebSocketTarget(websocketUrls, wsUrl);
-      } else {
-        secondTabSessionCap = await auditSecondTabSessionCap(context, page.url());
-      }
+      const secondTabTarget = hostedMode
+        ? await fetchSignedSessionStartTarget(
+            page,
+            hostedSecondTabIdentity ?? hostedSyntheticIdentity(),
+          )
+        : page.url();
+      secondTabSessionCap = await auditSecondTabSessionCap(context, secondTabTarget);
     }
     await page.screenshot({
       path: path.join(artifactDir, "session-ready.png"),
@@ -487,7 +496,7 @@ try {
           synthetic_user_id: hostedSyntheticIdentity().userId,
         }
       : null,
-    hosted_websocket_verified: hostedMode,
+    hosted_websocket_verified: hostedWebSocketVerified,
     store: summarizeStore(agentReadiness?.store),
     durable_state_release_claimed: durableStateReleaseClaimed,
     stop_to_recap: stopToRecap,
@@ -672,38 +681,54 @@ async function capturePendingLocalPreview(targetPage) {
 }
 
 async function fetchSignedSessionStartTarget(targetPage, identity) {
-  return targetPage.evaluate(
-    async ({ restBearerToken, userId, studySetId }) => {
-      const libraryParams = new URLSearchParams({ user_id: userId });
-      const headers = {};
-      if (restBearerToken) headers.authorization = `Bearer ${restBearerToken}`;
-      const response = await fetch(
-        `/api/viva-library/study-sets/library?${libraryParams.toString()}`,
-        {
-          cache: "no-store",
-          headers,
-        },
-      );
-      if (!response.ok) {
-        throw new Error(`hosted library token fetch failed with HTTP ${response.status}`);
-      }
-      const snapshot = await response.json();
-      const studySet = snapshot.study_sets?.find((entry) => entry.id === studySetId);
-      const action = studySet?.actions?.start;
-      if (!studySet || !action?.session_id || !action?.session_token) {
-        throw new Error("failure-control library token fetch did not return a start token");
-      }
-      const params = new URLSearchParams({
-        user_id: studySet.user_id,
+  return targetPage.evaluate(async ({ userId, studySetId }) => {
+    const libraryParams = new URLSearchParams({ user_id: userId });
+    const response = await fetch(
+      `/api/viva-library/study-sets/library?${libraryParams.toString()}`,
+      {
+        cache: "no-store",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`hosted library action fetch failed with HTTP ${response.status}`);
+    }
+    const snapshot = await response.json();
+    const studySet = snapshot.study_sets?.find((entry) => entry.id === studySetId);
+    const action = studySet?.actions?.start;
+    if (!studySet?.user_id || !action?.session_bootstrap_token) {
+      throw new Error("hosted library action fetch did not return a bootstrap capability");
+    }
+    const startResponse = await fetch("/api/viva-session/start", {
+      body: JSON.stringify({
+        session_bootstrap_token: action.session_bootstrap_token,
         study_set_id: studySet.id,
-        session_id: action.session_id,
-      });
-      return `/session?${params.toString()}#session_token=${encodeURIComponent(
-        action.session_token,
-      )}`;
-    },
-    { ...identity, restBearerToken: hostedRestBearerToken },
-  );
+        user_id: studySet.user_id,
+      }),
+      cache: "no-store",
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    if (!startResponse.ok) {
+      throw new Error(`hosted session bootstrap failed with HTTP ${startResponse.status}`);
+    }
+    const sessionPayload = await startResponse.json();
+    if (
+      !sessionPayload?.session?.session_id ||
+      !sessionPayload.session.study_set_id ||
+      !sessionPayload.session.user_id ||
+      !sessionPayload.session_token
+    ) {
+      throw new Error("hosted session bootstrap did not return a signed session token");
+    }
+    const params = new URLSearchParams({
+      user_id: sessionPayload.session.user_id,
+      study_set_id: sessionPayload.session.study_set_id,
+      session_id: sessionPayload.session.session_id,
+    });
+    return `/session?${params.toString()}#session_token=${encodeURIComponent(
+      sessionPayload.session_token,
+    )}`;
+  }, identity);
 }
 
 async function navigateToSessionTarget(targetPage, target) {

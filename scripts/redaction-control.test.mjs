@@ -269,7 +269,7 @@ test("per-PR redaction check permits required auth source identifiers only in so
         file: "scripts/e2e-browser.mjs",
       },
     ),
-    false,
+    true,
   );
   assert.equal(
     addedLineViolatesRedactionAudit(
@@ -284,6 +284,21 @@ test("per-PR redaction check permits required auth source identifiers only in so
     addedLineViolatesRedactionAudit("        session_token: session.sessionToken,", {
       file: "scripts/e2e-browser.mjs",
     }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("        !sessionPayload.session_token", {
+      file: "scripts/e2e-browser.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      "        session_bootstrap_token: action.session_bootstrap_token,",
+      {
+        file: "scripts/e2e-browser.mjs",
+      },
+    ),
     false,
   );
   assert.equal(
