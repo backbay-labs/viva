@@ -546,6 +546,7 @@ async fn handle_socket(
     let mut pre_answer_idle_armed = true;
     let mut turn_cap_deadline: Option<Instant> = None;
     let mut pending_submitted_answers = 0_u32;
+    let mut active_provider_turns = 0_u32;
     let mut pending_provider_admissions = Vec::<VoiceLimitLease>::new();
     let mut pending_provider_admission: Fuse<BoxFuture<'static, QueuedProviderAdmission>> =
         Fuse::terminated();
@@ -642,6 +643,9 @@ async fn handle_socket(
                     terminal_reason = close_with_terminal_session_phase(
                         &mut sender,
                         &session.input,
+                        &state,
+                        voice_session_id.clone(),
+                        &mut terminal_persisted,
                         denial.terminal_reason,
                         close_code::POLICY,
                     )
@@ -673,25 +677,20 @@ async fn handle_socket(
                     Ok(action) => {
                         record_client_action(&state, voice_session_id.clone(), action);
                         if action.arms_turn_cap() {
+                            active_provider_turns = active_provider_turns.saturating_add(1);
+                            active_provider_turn_accepts_audio_continuations =
+                                accepts_audio_continuations;
                             if let Some(lease) = provider_admission_lease.take() {
                                 pending_provider_admissions.push(lease);
-                                active_provider_turn_accepts_audio_continuations =
-                                    accepts_audio_continuations;
                             }
                             queued_provider_continuation_bytes = 0;
                             while let Some(continuation) = queued_provider_continuations.pop_front() {
-                                let continuation_turn_send_deadline = if continuation.action().arms_turn_cap() {
-                                    pre_answer_idle_armed = false;
-                                    pending_submitted_answers =
-                                        pending_submitted_answers.saturating_add(1);
-                                    Some(*turn_cap_deadline.get_or_insert_with(|| {
-                                        let deadline = Instant::now() + state.ws_timeouts.idle;
-                                        turn_cap.as_mut().reset(deadline);
-                                        deadline
-                                    }))
-                                } else {
-                                    None
-                                };
+                                let continuation_turn_send_deadline =
+                                    if continuation.action().arms_turn_cap() {
+                                        turn_cap_deadline
+                                    } else {
+                                        None
+                                    };
                                 match send_client_input_action_with_drain(
                                     &session.input,
                                     continuation,
@@ -711,6 +710,9 @@ async fn handle_socket(
                                         terminal_reason = close_with_terminal_session_phase(
                                             &mut sender,
                                             &session.input,
+                                            &state,
+                                            voice_session_id.clone(),
+                                            &mut terminal_persisted,
                                             TerminalSessionReason::Drained,
                                             close_code::NORMAL,
                                         )
@@ -721,6 +723,9 @@ async fn handle_socket(
                                         terminal_reason = close_with_terminal_session_phase(
                                             &mut sender,
                                             &session.input,
+                                            &state,
+                                            voice_session_id.clone(),
+                                            &mut terminal_persisted,
                                             TerminalSessionReason::RateLimit,
                                             close_code::POLICY,
                                         )
@@ -738,6 +743,9 @@ async fn handle_socket(
                                         terminal_reason = close_with_terminal_session_phase(
                                             &mut sender,
                                             &session.input,
+                                            &state,
+                                            voice_session_id.clone(),
+                                            &mut terminal_persisted,
                                             TerminalSessionReason::TurnCap,
                                             close_code::POLICY,
                                         )
@@ -752,6 +760,9 @@ async fn handle_socket(
                         terminal_reason = close_with_terminal_session_phase(
                             &mut sender,
                             &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
                             TerminalSessionReason::Drained,
                             close_code::NORMAL,
                         )
@@ -762,6 +773,9 @@ async fn handle_socket(
                         terminal_reason = close_with_terminal_session_phase(
                             &mut sender,
                             &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
                             TerminalSessionReason::RateLimit,
                             close_code::POLICY,
                         )
@@ -779,6 +793,9 @@ async fn handle_socket(
                         terminal_reason = close_with_terminal_session_phase(
                             &mut sender,
                             &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
                             TerminalSessionReason::TurnCap,
                             close_code::POLICY,
                         )
@@ -853,6 +870,9 @@ async fn handle_socket(
                         terminal_reason = close_with_terminal_session_phase(
                             &mut sender,
                             &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
                             TerminalSessionReason::RateLimit,
                             close_code::POLICY,
                         )
@@ -867,7 +887,7 @@ async fn handle_socket(
                 let mut provider_admission_lease = None;
                 let requires_provider_admission = client_input_requires_provider_admission(
                     &client_input,
-                    !pending_provider_admissions.is_empty(),
+                    active_provider_turns > 0 || !pending_provider_admissions.is_empty(),
                     active_provider_turn_accepts_audio_continuations,
                 );
                 if requires_provider_admission {
@@ -885,6 +905,9 @@ async fn handle_socket(
                         if pending_provider_admissions.is_empty()
                             && pending_provider_admission.is_terminated()
                         {
+                            if client_input.action().arms_turn_cap() {
+                                pre_answer_idle_armed = false;
+                            }
                             pending_provider_admission_accepts_audio_continuations =
                                 client_input_starts_audio_provider_turn(&client_input);
                             pending_provider_admission = start_provider_admission(
@@ -910,6 +933,9 @@ async fn handle_socket(
                         terminal_reason = close_with_terminal_session_phase(
                             &mut sender,
                             &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
                             denial.terminal_reason,
                             close_code::POLICY,
                         )
@@ -920,7 +946,9 @@ async fn handle_socket(
                 }
                 let accepts_audio_continuations =
                     client_input_starts_audio_provider_turn(&client_input);
-                let turn_send_deadline = if client_input.action().arms_turn_cap() {
+                let starts_new_submitted_turn =
+                    client_input.action().arms_turn_cap() && requires_provider_admission;
+                let turn_send_deadline = if starts_new_submitted_turn {
                     pre_answer_idle_armed = false;
                     pending_submitted_answers = pending_submitted_answers.saturating_add(1);
                     Some(*turn_cap_deadline.get_or_insert_with(|| {
@@ -928,6 +956,8 @@ async fn handle_socket(
                         turn_cap.as_mut().reset(deadline);
                         deadline
                     }))
+                } else if client_input.action().arms_turn_cap() {
+                    turn_cap_deadline
                 } else {
                     None
                 };
@@ -942,10 +972,13 @@ async fn handle_socket(
                     Ok(action) => {
                         record_client_action(&state, voice_session_id.clone(), action);
                         if action.arms_turn_cap() {
-                            if let Some(lease) = provider_admission_lease.take() {
-                                pending_provider_admissions.push(lease);
+                            if requires_provider_admission {
+                                active_provider_turns = active_provider_turns.saturating_add(1);
                                 active_provider_turn_accepts_audio_continuations =
                                     accepts_audio_continuations;
+                            }
+                            if let Some(lease) = provider_admission_lease.take() {
+                                pending_provider_admissions.push(lease);
                             }
                         }
                         match action {
@@ -1151,12 +1184,16 @@ async fn handle_socket(
                                         None => true,
                                     };
                                     if count_completion {
-                                        if pending_provider_admissions.pop().is_some() {
+                                        active_provider_turns =
+                                            active_provider_turns.saturating_sub(1);
+                                        let _ = pending_provider_admissions.pop();
+                                        if active_provider_turns == 0 {
                                             active_provider_turn_accepts_audio_continuations = false;
                                         }
                                     }
                                 }
                                 SubmittedAnswerResolution::All => {
+                                    active_provider_turns = 0;
                                     completed_provider_turn_response_ids.clear();
                                     pending_provider_admissions.clear();
                                     active_provider_turn_accepts_audio_continuations = false;
@@ -1269,7 +1306,8 @@ fn brain_event_provider_turn_completion(
         | agent_domain::BrainEvent::TerminalSessionPhase { .. } => {
             Some(SubmittedAnswerResolution::All)
         }
-        agent_domain::BrainEvent::ResponseCompleted { .. }
+        agent_domain::BrainEvent::AnswerEvaluated { .. }
+        | agent_domain::BrainEvent::ResponseCompleted { .. }
         | agent_domain::BrainEvent::ResponseCancelledFor { .. } => {
             Some(SubmittedAnswerResolution::One {
                 response_id: event.response_id().map(ToOwned::to_owned),
@@ -1587,7 +1625,12 @@ fn record_brain_open_provider_failure(
                 .limit_state
                 .record_provider_failure(&state.voice_limits, failure);
         }
-        _ => {}
+        _ => {
+            state.limit_state.record_provider_terminal_failure(
+                &state.voice_limits,
+                terminal_reason_for_brain_error(error),
+            );
+        }
     }
 }
 
@@ -3886,7 +3929,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_turn_completion_waits_past_answer_evaluation() {
+    fn provider_turn_completion_accepts_answer_evaluation() {
         let question = agent_domain::fixture_question();
         let evaluation = agent_domain::AnswerEvaluation {
             question_id: question.question_id,
@@ -3910,7 +3953,9 @@ mod tests {
         );
         assert_eq!(
             brain_event_provider_turn_completion(&answer_evaluated),
-            None
+            Some(SubmittedAnswerResolution::One {
+                response_id: Some("response-1".to_owned())
+            })
         );
 
         let response_completed = BrainEvent::ResponseCompleted {

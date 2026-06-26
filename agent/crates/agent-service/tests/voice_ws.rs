@@ -3310,6 +3310,11 @@ async fn websocket_provider_queue_buffers_audio_continuation_until_admitted() {
         max_provider_concurrent_turns: Some(1),
         max_provider_queue_depth: Some(1),
         ..VoiceLimitConfig::default()
+    })
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(200),
+        session: Duration::from_secs(5),
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -3423,6 +3428,25 @@ async fn websocket_provider_queue_buffers_audio_continuation_until_admitted() {
     })
     .await
     .expect("provider completion should release the queued audio turn");
+    let phantom_turn_cap = tokio::time::timeout(Duration::from_millis(240), async {
+        loop {
+            match second_socket.next().await.unwrap().unwrap() {
+                WsMessage::Text(text) => {
+                    let frame = serde_json::from_str::<ServerFrame>(&text).unwrap();
+                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                        return frame;
+                    }
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
+                other => panic!("unexpected close after queued audio completion: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        phantom_turn_cap.is_err(),
+        "queued audio continuation frames left a phantom submitted turn armed"
+    );
     assert!(evidence.snapshot().iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::ProviderAdmission
             && event.detail.contains("admission_decision=admitted")
@@ -6303,6 +6327,259 @@ async fn websocket_turn_cap_disarms_after_answer_resolution() {
 }
 
 #[tokio::test]
+async fn websocket_provider_slot_releases_after_answer_evaluated_completion() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(AnswerEvaluatedProviderProbeBrain {
+            text_inputs: text_inputs.clone(),
+            study_store: store.clone(),
+        }),
+        "answer_evaluated_provider_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_provider_concurrent_turns: Some(1),
+        max_provider_queue_depth: Some(0),
+        ..VoiceLimitConfig::default()
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "answer_evaluated_provider_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "first provider turn".to_owned(),
+            client_generation_id: Some("bac519-answer-evaluated-release-1".to_owned()),
+        },
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = read_server_frame(&mut socket).await;
+            if matches!(
+                &frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(
+                        event.as_ref(),
+                        VivaServerEvent::AnswerEvaluated { .. }
+                    )
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("first answer evaluation should arrive");
+
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "second provider turn".to_owned(),
+            client_generation_id: Some("bac519-answer-evaluated-release-2".to_owned()),
+        },
+    )
+    .await;
+    wait_until(Duration::from_secs(2), || {
+        text_inputs.load(Ordering::SeqCst) == 2
+    })
+    .await;
+
+    socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_provider_slot_prefers_queued_completion_before_same_socket_overlap() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(AnswerEvaluatedProviderProbeBrain {
+            text_inputs: text_inputs.clone(),
+            study_store: store.clone(),
+        }),
+        "answer_evaluated_provider_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_provider_concurrent_turns: Some(1),
+        max_provider_queue_depth: Some(0),
+        ..VoiceLimitConfig::default()
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "answer_evaluated_provider_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "first provider turn".to_owned(),
+            client_generation_id: Some("bac519-queued-completion-release-1".to_owned()),
+        },
+    )
+    .await;
+    wait_until(Duration::from_secs(2), || {
+        text_inputs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "second provider turn".to_owned(),
+            client_generation_id: Some("bac519-queued-completion-release-2".to_owned()),
+        },
+    )
+    .await;
+    wait_until(Duration::from_secs(2), || {
+        text_inputs.load(Ordering::SeqCst) == 2
+    })
+    .await;
+
+    socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_audio_continuations_do_not_leave_phantom_turn_cap() {
+    websocket_audio_continuations_do_not_leave_phantom_turn_cap_with_limits(
+        VoiceLimitConfig::default(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn websocket_audio_continuations_do_not_leave_phantom_turn_cap_when_limiter_disabled() {
+    websocket_audio_continuations_do_not_leave_phantom_turn_cap_with_limits(VoiceLimitConfig {
+        provider_limiter_enabled: false,
+        ..VoiceLimitConfig::default()
+    })
+    .await;
+}
+
+async fn websocket_audio_continuations_do_not_leave_phantom_turn_cap_with_limits(
+    voice_limits: VoiceLimitConfig,
+) {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let audio_inputs = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let state = AppState::new(
+        Arc::new(QueuedAudioProviderProbeBrain {
+            text_inputs,
+            audio_inputs,
+        }),
+        "cartesia_gemini",
+        VoiceWsAccess::default(),
+        1,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(40),
+        session: Duration::from_secs(5),
+    })
+    .with_voice_limits(voice_limits);
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "cartesia_gemini").await;
+    socket
+        .send(WsMessage::Text(
+            format!(
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![1_u8, 2].into()))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![3_u8, 4].into()))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = read_server_frame(&mut socket).await;
+            if matches!(
+                frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(
+                        event.as_ref(),
+                        VivaServerEvent::SessionPhase {
+                            phase: agent_domain::StudySessionPhase::Feedback,
+                            terminal_reason: None,
+                        }
+                    )
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("audio provider completion should arrive");
+
+    let phantom_turn_cap = tokio::time::timeout(Duration::from_millis(90), async {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                WsMessage::Text(text) => {
+                    let frame = serde_json::from_str::<ServerFrame>(&text).unwrap();
+                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                        return frame;
+                    }
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
+                other => panic!("unexpected close after audio continuation completion: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        phantom_turn_cap.is_err(),
+        "audio continuation frames left a phantom submitted turn armed"
+    );
+
+    socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
 async fn websocket_turn_cap_stays_armed_for_newer_submission_after_one_resolution() {
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let state = AppState::with_study_store(
@@ -6316,6 +6593,10 @@ async fn websocket_turn_cap_stays_armed_for_newer_submission_after_one_resolutio
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+    })
+    .with_voice_limits(VoiceLimitConfig {
+        provider_limiter_enabled: false,
+        ..VoiceLimitConfig::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -6330,14 +6611,24 @@ async fn websocket_turn_cap_stays_armed_for_newer_submission_after_one_resolutio
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "first pending answer".to_owned(),
+            client_generation_id: Some("turn-cap-newer-submission-1".to_owned()),
+        },
+    )
+    .await;
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "second pending answer".to_owned(),
+            client_generation_id: Some("turn-cap-newer-submission-2".to_owned()),
+        },
+    )
+    .await;
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -6396,6 +6687,10 @@ async fn websocket_turn_cap_dedupes_duplicate_response_resolution_ids() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+    })
+    .with_voice_limits(VoiceLimitConfig {
+        provider_limiter_enabled: false,
+        ..VoiceLimitConfig::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -6410,14 +6705,24 @@ async fn websocket_turn_cap_dedupes_duplicate_response_resolution_ids() {
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "first duplicate-resolution answer".to_owned(),
+            client_generation_id: Some("turn-cap-duplicate-resolution-1".to_owned()),
+        },
+    )
+    .await;
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "second duplicate-resolution answer".to_owned(),
+            client_generation_id: Some("turn-cap-duplicate-resolution-2".to_owned()),
+        },
+    )
+    .await;
 
     let terminal = tokio::time::timeout(Duration::from_millis(100), async {
         loop {
@@ -9222,6 +9527,100 @@ impl RealtimeBrain for AnswerResolutionProbeBrain {
                         .await;
                     sent = true;
                 }
+            }
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+struct AnswerEvaluatedProviderProbeBrain {
+    text_inputs: Arc<AtomicUsize>,
+    study_store: Arc<dyn StudyMemoryStore>,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for AnswerEvaluatedProviderProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "answer_evaluated_provider_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(
+        &self,
+        config: agent_domain::SessionConfig,
+    ) -> Result<RealtimeSession, BrainError> {
+        self.study_store
+            .record_voice_session(&config)
+            .await
+            .map_err(|error| BrainError::Connection(error.to_string()))?;
+        let user_id = config
+            .user_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .to_owned();
+        let study_set_id = config
+            .study_set_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .to_owned();
+        let voice_session_id = config
+            .session_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .to_owned();
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let text_inputs = self.text_inputs.clone();
+        let study_store = self.study_store.clone();
+        let task = tokio::spawn(async move {
+            while let Some(input) = input_rx.recv().await {
+                if !matches!(
+                    input,
+                    BrainInput::Text(_) | BrainInput::TextWithMetadata { .. }
+                ) {
+                    continue;
+                }
+                let turn_index = text_inputs.fetch_add(1, Ordering::SeqCst) + 1;
+                let question = agent_domain::fixture_question();
+                let evaluation = agent_domain::AnswerEvaluation {
+                    question_id: question.question_id,
+                    answer_text: "provider turn evaluated".to_owned(),
+                    label: "mostly correct".to_owned(),
+                    concise_feedback: "Review the next step.".to_owned(),
+                    retry_prompt: question.follow_up,
+                    source: question.source,
+                    concept_status: agent_domain::ConceptStatus::Strong,
+                    confidence_score: 0.84,
+                };
+                let response_id = format!("answer-evaluated-{turn_index}");
+                if study_store
+                    .record_answer_evaluation(
+                        &user_id,
+                        &study_set_id,
+                        &voice_session_id,
+                        &response_id,
+                        evaluation.clone(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let _ = event_tx
+                    .send(BrainEvent::AnswerEvaluated {
+                        response_id,
+                        evaluation,
+                    })
+                    .await;
             }
         });
 
