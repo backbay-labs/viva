@@ -1061,6 +1061,21 @@ mod tests {
             session_token_nonce_rows(&pool, &session_delete_nonce).await,
             1
         );
+        store
+            .record_concept_status(
+                "user-1",
+                "biology-midterm",
+                session_id,
+                "response-session-delete",
+                "nadh",
+                ConceptStatus::Strong,
+            )
+            .await
+            .expect("records concept status event for session deletion proof");
+        assert_eq!(
+            concept_status_event_rows_for_session(&pool, session_id).await,
+            1
+        );
 
         store
             .delete_session_history("user-1", "biology-midterm", session_id)
@@ -1069,6 +1084,10 @@ mod tests {
         assert_eq!(usage_rows_for_session(&pool, session_id).await, 0);
         assert_eq!(
             session_token_nonce_rows(&pool, &session_delete_nonce).await,
+            0
+        );
+        assert_eq!(
+            concept_status_event_rows_for_session(&pool, session_id).await,
             0
         );
         store
@@ -1147,6 +1166,21 @@ mod tests {
             session_token_nonce_rows(&pool, &study_delete_nonce).await,
             1
         );
+        store
+            .record_concept_status(
+                "user-1",
+                "biology-midterm",
+                study_delete_session_id,
+                "response-study-delete",
+                "atp-synthase",
+                ConceptStatus::Shaky,
+            )
+            .await
+            .expect("records concept status event for study set deletion proof");
+        assert_eq!(
+            concept_status_event_rows_for_session(&pool, study_delete_session_id).await,
+            1
+        );
 
         store
             .delete_study_set("user-1", "biology-midterm")
@@ -1158,6 +1192,10 @@ mod tests {
         );
         assert_eq!(
             session_token_nonce_rows(&pool, &study_delete_nonce).await,
+            0
+        );
+        assert_eq!(
+            concept_status_event_rows_for_session(&pool, study_delete_session_id).await,
             0
         );
         store
@@ -1491,6 +1529,21 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("session token nonce row count query succeeds")
+    }
+
+    async fn concept_status_event_rows_for_session(
+        pool: &sqlx::PgPool,
+        voice_session_id: &str,
+    ) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM concept_status_events
+             WHERE voice_session_id = $1",
+        )
+        .bind(fixture_uuid(voice_session_id).expect("voice session fixture UUID"))
+        .fetch_one(pool)
+        .await
+        .expect("concept status event row count query succeeds")
     }
 
     async fn count_rows(pool: &sqlx::PgPool, table: &str) -> i64 {
