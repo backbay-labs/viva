@@ -172,10 +172,7 @@ describe("Viva same-origin session API", () => {
     }) as typeof fetch;
 
     const response = await startSession(
-      sessionRequest("/api/viva-session/start", {
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
     );
     const body = (await response.json()) as Record<string, unknown>;
 
@@ -203,12 +200,7 @@ describe("Viva same-origin session API", () => {
     }) as typeof fetch;
 
     const response = await Promise.race([
-      startSession(
-        sessionRequest("/api/viva-session/start", {
-          study_set_id: "biology-midterm",
-          user_id: "synthetic-user",
-        }),
-      ),
+      startSession(sessionRequest("/api/viva-session/start", sessionStartPayload())),
       rejectAfter(100, "session bootstrap body read did not time out"),
     ]);
     const body = (await response.json()) as Record<string, unknown>;
@@ -479,10 +471,7 @@ describe("Viva same-origin session API", () => {
       globalThis.fetch = (async () => jsonResponse(200, testCase.snapshot)) as typeof fetch;
 
       const response = await startSession(
-        sessionRequest("/api/viva-session/start", {
-          study_set_id: "biology-midterm",
-          user_id: "synthetic-user",
-        }),
+        sessionRequest("/api/viva-session/start", sessionStartPayload()),
       );
       const body = (await response.json()) as Record<string, unknown>;
 
