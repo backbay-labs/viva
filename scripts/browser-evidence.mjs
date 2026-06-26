@@ -5,6 +5,7 @@ const REQUIRED_BROWSER_STORY_FRAME_IDS = [
   "pending_local_preview",
   "server_ready_study_set",
   "active_synthetic_manuscript",
+  "second_tab_session_cap",
   "correction_marginalia",
   "recap",
 ];
@@ -25,6 +26,7 @@ export function normalizeBrowserEvidence(result) {
     post_answer_source_reference_event_seen:
       result.post_answer_source_reference_event_seen === true,
     post_answer_concept_status_event_seen: result.post_answer_concept_status_event_seen === true,
+    second_tab_session_cap_observed: result.second_tab_session_cap_observed === true,
     local_only_actions_hidden: result.local_only_actions_hidden === true,
     browser_story: normalizeBrowserStory(result.browser_story),
     console_error_count: Array.isArray(result.console_errors) ? result.console_errors.length : 0,
@@ -39,7 +41,8 @@ export function assertReleaseBrowserEvidence(evidence) {
   };
   if (evidence.agent_provider !== "synthetic")
     failures.push("agent_provider must be synthetic for release browser story evidence");
-  if (evidence.legacy_upload_visible !== false) failures.push("legacy_upload_visible must be false");
+  if (evidence.legacy_upload_visible !== false)
+    failures.push("legacy_upload_visible must be false");
   if (evidence.manuscript_ready !== true) failures.push("manuscript_ready must be true");
   if (evidence.conductor_terminal_fold !== true)
     failures.push("conductor_terminal_fold must be true");
@@ -47,7 +50,8 @@ export function assertReleaseBrowserEvidence(evidence) {
   if (evidence.next_session_recommendation_visible !== true)
     failures.push("next_session_recommendation_visible must be true");
   if (evidence.source_folio_visible !== true) failures.push("source_folio_visible must be true");
-  if (evidence.bounded_source_visible !== true) failures.push("bounded_source_visible must be true");
+  if (evidence.bounded_source_visible !== true)
+    failures.push("bounded_source_visible must be true");
   if (evidence.post_answer_source_folio_visible !== true)
     failures.push("post_answer_source_folio_visible must be true");
   if (evidence.post_answer_bounded_source_visible !== true)
@@ -56,6 +60,8 @@ export function assertReleaseBrowserEvidence(evidence) {
     failures.push("post_answer_source_reference_event_seen must be true");
   if (evidence.post_answer_concept_status_event_seen !== true)
     failures.push("post_answer_concept_status_event_seen must be true");
+  if (evidence.second_tab_session_cap_observed !== true)
+    failures.push("second_tab_session_cap_observed must be true");
   if (evidence.local_only_actions_hidden !== true)
     failures.push("local_only_actions_hidden must be true");
   if (browserStory.schema !== "viva.browser_story.v1")
@@ -190,8 +196,7 @@ function normalizeBrowserStory(story) {
       : null,
     artifact_files: artifactFiles,
     command_summary_present: hasCommandSummary(commandSummary),
-    command_provider:
-      typeof commandSummary?.provider === "string" ? commandSummary.provider : null,
+    command_provider: typeof commandSummary?.provider === "string" ? commandSummary.provider : null,
     fixture_hash_count: countFixtureHashes(story?.fixture_hashes),
     frame_ids: frameIds,
     frame_screenshot_ids: frameScreenshotIds,
@@ -201,7 +206,9 @@ function normalizeBrowserStory(story) {
     screenshot_count: new Set(screenshots).size,
     trace_retained: typeof story?.trace_retained === "boolean" ? story.trace_retained : null,
     validation_run_id:
-      typeof commandSummary?.validation_run_id === "string" ? commandSummary.validation_run_id : null,
+      typeof commandSummary?.validation_run_id === "string"
+        ? commandSummary.validation_run_id
+        : null,
   };
 }
 

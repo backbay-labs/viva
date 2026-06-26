@@ -164,6 +164,8 @@ pub struct VoiceLimitState {
 #[derive(Clone, Debug, Default)]
 struct ActiveVoiceLimits {
     users: HashMap<String, usize>,
+    failure_control_identities: HashMap<String, usize>,
+    user_study_sets: HashMap<String, usize>,
     ips: HashMap<String, usize>,
 }
 
@@ -177,12 +179,32 @@ pub struct VoiceLimitLease {
 #[derive(Clone, Copy, Debug)]
 enum VoiceLimitKind {
     User,
+    FailureControlIdentity,
+    UserStudySet,
     Ip,
 }
 
 impl VoiceLimitState {
     pub fn try_acquire_user(&self, user_id: &str, max: usize) -> Option<VoiceLimitLease> {
         self.try_acquire(VoiceLimitKind::User, user_id, max)
+    }
+
+    pub fn try_acquire_failure_control_identity(
+        &self,
+        user_id: &str,
+        max: usize,
+    ) -> Option<VoiceLimitLease> {
+        self.try_acquire(VoiceLimitKind::FailureControlIdentity, user_id, max)
+    }
+
+    pub fn try_acquire_user_study_set(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        max: usize,
+    ) -> Option<VoiceLimitLease> {
+        let key = user_study_set_limit_key(user_id, study_set_id);
+        self.try_acquire(VoiceLimitKind::UserStudySet, &key, max)
     }
 
     pub fn try_acquire_ip(&self, ip: &str, max: usize) -> Option<VoiceLimitLease> {
@@ -193,6 +215,8 @@ impl VoiceLimitState {
         let mut active = self.active.lock().expect("voice limit state lock poisoned");
         let counts = match kind {
             VoiceLimitKind::User => &mut active.users,
+            VoiceLimitKind::FailureControlIdentity => &mut active.failure_control_identities,
+            VoiceLimitKind::UserStudySet => &mut active.user_study_sets,
             VoiceLimitKind::Ip => &mut active.ips,
         };
         let count = counts.entry(key.to_owned()).or_default();
@@ -211,6 +235,8 @@ impl VoiceLimitState {
         let mut active = self.active.lock().expect("voice limit state lock poisoned");
         let counts = match kind {
             VoiceLimitKind::User => &mut active.users,
+            VoiceLimitKind::FailureControlIdentity => &mut active.failure_control_identities,
+            VoiceLimitKind::UserStudySet => &mut active.user_study_sets,
             VoiceLimitKind::Ip => &mut active.ips,
         };
         if let Some(count) = counts.get_mut(key) {
@@ -220,6 +246,10 @@ impl VoiceLimitState {
             }
         }
     }
+}
+
+fn user_study_set_limit_key(user_id: &str, study_set_id: &str) -> String {
+    format!("{user_id}\0{study_set_id}")
 }
 
 impl Drop for VoiceLimitLease {
