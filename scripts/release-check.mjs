@@ -7,11 +7,6 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  buildProviderReadinessMatrix,
-  LIVE_PROVIDER_GATE_COMMAND_NAME,
-  PROVIDER_READINESS_TARGETS,
-} from "./provider-readiness-matrix.mjs";
-import {
   assertBrowserStoryArtifactFiles,
   assertReleaseBrowserEvidence,
   normalizeBrowserEvidence,
@@ -22,9 +17,16 @@ import {
   failureControlHarnessEvidence,
 } from "./failure-control-harness.mjs";
 import {
-  assertNoForbiddenEvidenceMarkers,
-  auditTextArtifacts,
-} from "./redaction-control.mjs";
+  buildProviderReadinessMatrix,
+  LIVE_PROVIDER_GATE_COMMAND_NAME,
+  PROVIDER_READINESS_TARGETS,
+} from "./provider-readiness-matrix.mjs";
+import { assertNoForbiddenEvidenceMarkers, auditTextArtifacts } from "./redaction-control.mjs";
+import {
+  assertRollbackReleaseGate,
+  buildRollbackReleaseEvidence,
+  ROLLBACK_DRAIN_PROOF_COMMANDS,
+} from "./rollback-drain-criteria.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactDir = path.resolve(
@@ -58,6 +60,11 @@ try {
     "--test",
     "scripts/failure-control-harness.test.mjs",
   ]);
+  await run("rollback_drain_criteria_unit_tests", "node", [
+    "--test",
+    "scripts/rollback-drain-criteria.test.mjs",
+  ]);
+  await runRollbackDrainProofCommands();
   await run("provider_gate_tests", "cargo", [
     "test",
     "--manifest-path",
@@ -91,6 +98,8 @@ try {
       ? await readExistingBrowserResult()
       : await runBrowserE2E();
   const providerReadiness = await collectProviderReadiness();
+  const rollbackDrain = buildRollbackReleaseEvidence();
+  assertRollbackReleaseGate(rollbackDrain);
   const fixtureHashes = await hashFixtureFiles(path.join(root, "agent/fixtures/voice-protocol"));
   const artifactAudit = await auditGeneratedArtifacts([
     artifactDir,
@@ -105,6 +114,7 @@ try {
     fixture_hashes: fixtureHashes,
     provider_readiness: providerReadiness,
     failure_control_harness: failureControlEvidence,
+    rollback_drain: rollbackDrain,
     browser_e2e: browserResult,
     artifact_audit: artifactAudit,
     release_bundle: buildReleaseBundleManifest(outputPath, commands, browserResult),
@@ -185,6 +195,12 @@ async function runBrowserE2E() {
     VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "1",
   });
   return readExistingBrowserResult();
+}
+
+async function runRollbackDrainProofCommands() {
+  for (const proofCommand of ROLLBACK_DRAIN_PROOF_COMMANDS) {
+    await run(proofCommand.name, proofCommand.command, proofCommand.args);
+  }
 }
 
 async function readExistingBrowserResult() {
@@ -384,6 +400,7 @@ function buildReleaseBundleManifest(outputPath, commandRecords, browserResult) {
       browserArtifactDir === null
         ? []
         : browserFiles.map((file) => path.posix.join(browserArtifactDir, file)),
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions expands this literal.
     workflow_artifact_name: "viva-release-evidence-${{ github.sha }}",
   };
 }

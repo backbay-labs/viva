@@ -1,0 +1,124 @@
+{
+  "schema": "viva.rollback_threshold_fixture.v1",
+  "cases": [
+    {
+      "id": "below_all_thresholds",
+      "window_seconds": 600,
+      "sustained_seconds": 300,
+      "metrics": {
+        "provider_turn_count": 20,
+        "provider_429_count": 1,
+        "provider_429_rate_percent": 5,
+        "provider_timeout_count": 1,
+        "provider_timeout_rate_percent": 4.9,
+        "provider_auth_failure_count": 0,
+        "stuck_checking_sessions": 2,
+        "recap_attempt_count": 20,
+        "recap_failure_count": 1,
+        "recap_failure_rate_percent": 4.9,
+        "token_refresh_attempt_count": 20,
+        "token_refresh_failure_count": 2,
+        "token_refresh_failure_rate_percent": 1.9,
+        "live_monitor_attempt_count": 2,
+        "live_monitor_consecutive_failures": 1
+      },
+      "expected": {
+        "rollback_required": false,
+        "triggered_thresholds": []
+      }
+    },
+    {
+      "id": "provider_429_crosses_threshold",
+      "window_seconds": 600,
+      "sustained_seconds": 300,
+      "metrics": {
+        "provider_turn_count": 20,
+        "provider_429_count": 3,
+        "provider_429_rate_percent": 10
+      },
+      "expected": {
+        "rollback_required": true,
+        "triggered_thresholds": ["provider_429_rate_percent"]
+      }
+    },
+    {
+      "id": "provider_timeout_crosses_threshold",
+      "window_seconds": 600,
+      "sustained_seconds": 300,
+      "metrics": {
+        "provider_turn_count": 20,
+        "provider_timeout_count": 2,
+        "provider_timeout_rate_percent": 5
+      },
+      "expected": {
+        "rollback_required": true,
+        "triggered_thresholds": ["provider_timeout_rate_percent"]
+      }
+    },
+    {
+      "id": "provider_auth_failure_crosses_threshold",
+      "window_seconds": 300,
+      "sustained_seconds": 60,
+      "metrics": {
+        "provider_auth_failure_count": 1
+      },
+      "expected": {
+        "rollback_required": true,
+        "triggered_thresholds": ["provider_auth_failure_count"]
+      }
+    },
+    {
+      "id": "stuck_checking_crosses_threshold",
+      "window_seconds": 120,
+      "sustained_seconds": 120,
+      "metrics": {
+        "stuck_checking_sessions": 3
+      },
+      "expected": {
+        "rollback_required": true,
+        "triggered_thresholds": ["stuck_checking_sessions"]
+      }
+    },
+    {
+      "id": "recap_failure_crosses_threshold",
+      "window_seconds": 600,
+      "sustained_seconds": 300,
+      "metrics": {
+        "recap_attempt_count": 20,
+        "recap_failure_count": 2,
+        "recap_failure_rate_percent": 5
+      },
+      "expected": {
+        "rollback_required": true,
+        "triggered_thresholds": ["recap_failure_rate_percent"]
+      }
+    },
+    {
+      "id": "token_refresh_failure_crosses_threshold",
+      "window_seconds": 600,
+      "sustained_seconds": 180,
+      "metrics": {
+        "token_refresh_attempt_count": 20,
+        "token_refresh_failure_count": 3,
+        "token_refresh_failure_rate_percent": 2
+      },
+      "expected": {
+        "rollback_required": true,
+        "triggered_thresholds": ["token_refresh_failure_rate_percent"]
+      }
+    },
+    {
+      "id": "live_monitor_crosses_threshold",
+      "window_seconds": 300,
+      "sustained_seconds": 120,
+      "metrics": {
+        "live_monitor_attempt_count": 2,
+        "live_monitor_consecutive_failures": 2
+      },
+      "expected": {
+        "rollback_required": true,
+        "triggered_thresholds": ["live_monitor_consecutive_failures"]
+      }
+    }
+  ]
+}

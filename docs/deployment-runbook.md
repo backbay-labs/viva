@@ -322,8 +322,8 @@ VIVA_E2E_FAILURE_CONTROL_SCENARIO=provider_rate_limited \
 
 The release evidence bundle is sanitized output only: command summaries,
 fixture hashes, browser story filenames/screenshots, provider readiness matrix,
-failure_control_harness disabled state, and artifact audit summary. It must show
-forbidden hits equal to zero. `bun run release:check` must fail if
+failure_control_harness disabled state, rollback_drain criteria, and artifact
+audit summary. It must show forbidden hits equal to zero. `bun run release:check` must fail if
 `VIVA_FAILURE_CONTROL_ENABLED=1`; deterministic provider failure coverage must
 come from the signed harness, not flaky real outages.
 
@@ -369,6 +369,21 @@ or source excerpts.
 
 ## Rollback And Drain
 
+The numeric rollback thresholds live in `scripts/rollback-drain-criteria.mjs`
+and are reused by the BAC-525 alert work. Do not fork these numbers into a
+second alert table. Production rollback is required when any threshold below is
+met for its full sustained duration:
+
+| Signal | Threshold | Window | Sustained |
+| --- | ---: | ---: | ---: |
+| Provider 429 rate | >=10% of provider turns, minimum 20 turns and 3 failures | 600s | 300s |
+| Provider timeout rate | >=5% of provider turns, minimum 20 turns and 2 failures | 600s | 300s |
+| Provider auth failure | >=1 auth failure | 300s | 60s |
+| Stuck checking | >=3 active submitted-answer sessions past the 45s BAC-510 bound | 120s | 120s |
+| Recap failure rate | >=5% of recap attempts, minimum 20 attempts and 2 failures | 600s | 300s |
+| Token refresh failure rate | >=2% of refresh attempts, minimum 20 attempts and 3 failures | 600s | 180s |
+| Live monitor failure | >=2 consecutive synthetic monitor failures, minimum 2 attempts | 300s | 120s |
+
 Rollback is a two-step operation: remove the bad web/agent revision from routing,
 then let the old agent drain voice sessions before process exit.
 
@@ -385,6 +400,13 @@ two-second grace period, then allowing shutdown to complete. During drain, the
 manuscript must close honestly as a drained session instead of pretending it
 reached recap.
 
+The release proof for drain is anchored by these tests:
+
+- `ready_route_reports_unavailable_during_voice_drain`
+- `websocket_preflight_rejects_new_sessions_after_drain_begins`
+- `websocket_drain_emits_terminal_phase_before_close`
+- `websocket_drain_interrupts_active_provider_response`
+
 Operator checks:
 
 ```sh
@@ -400,6 +422,23 @@ If rollback is due to a provider or store fault, return `VIVA_AGENT_PROVIDER` to
 `synthetic` and unset `DATABASE_URL` / `VIVA_AGENT_DATABASE_URL` only for the
 default no-secret validation path. Do not delete managed Postgres data as part
 of application rollback.
+
+Before any production release, the sanitized release evidence must include:
+
+- `VIVA_RELEASE_WEB_DEPLOY_ID`
+- `VIVA_RELEASE_AGENT_DEPLOY_ID`
+- `VIVA_RELEASE_CONFIG_DIFF_SHA256`
+- `VIVA_RELEASE_PROVIDER_MODE`
+- `VIVA_RELEASE_POSTGRES_STATE`
+- `VIVA_RELEASE_RECOVERY_VALIDATION`
+- `VIVA_RELEASE_OWNER`
+- `VIVA_RELEASE_OWNER_DECISION=proceed`
+- `VIVA_RELEASE_OWNER_DECIDED_AT_UTC`
+
+Set `VIVA_PRODUCTION_RELEASE=1` only for the production release gate. With that
+flag present, `bun run release:check` fails unless rollback thresholds, deploy
+ids, redacted config diff hash, provider mode, Postgres state, recovery
+validation, and the owner proceed decision are present.
 
 ## Logs And Evidence Redaction
 
