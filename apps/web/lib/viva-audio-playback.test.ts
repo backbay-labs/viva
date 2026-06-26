@@ -130,6 +130,30 @@ describe("Viva audio playback queue", () => {
     expect(state.queue.map((frame) => frame.responseId)).toEqual(["response-2"]);
   });
 
+  test("sink generation reset clears cancelled response ids without relocking playback", async () => {
+    const context = new FakeAudioContext();
+    const sink = createVivaAudioPlaybackSink({ contextFactory: () => context });
+
+    await sink.unlock();
+    sink.enqueue({
+      frame: { pcm16_base64: pcm16LeBytesToBase64(new Uint8Array([0, 0])) },
+      responseId: "response-1",
+    });
+    sink.cancel("response-1");
+
+    expect(sink.getState().cancelledResponseIds).toEqual(["response-1"]);
+
+    sink.resetForGeneration();
+    sink.enqueue({
+      frame: { pcm16_base64: pcm16LeBytesToBase64(new Uint8Array([1, 0])) },
+      responseId: "response-1",
+    });
+
+    expect(sink.getState().cancelledResponseIds).toEqual([]);
+    expect(sink.getState().userGestureUnlocked).toBe(true);
+    expect(context.sources.at(-1)?.stopped).toBe(false);
+  });
+
   test("rejects unbound or malformed playback frames", () => {
     expect(() =>
       enqueueVivaAudioPlaybackFrame(initialVivaAudioPlaybackState(), {

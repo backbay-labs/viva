@@ -71,6 +71,8 @@ pub struct SessionConfig {
     pub initial_goal: Option<String>,
     pub source_context: Vec<SourceContext>,
     pub active_concepts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_generation_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

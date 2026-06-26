@@ -765,12 +765,18 @@ function sanitizeAgentError(message: string): string {
     .slice(0, 160);
 }
 
+function webSocketErrorMessage(token?: string | null): string {
+  if (token) return "WebSocket session token preflight failed";
+  return "WebSocket error";
+}
+
 export function createVivaAgentSessionController(
   options: VivaAgentSessionControllerOptions,
 ): VivaAgentSessionController {
   let socket: WebSocket | undefined;
   let activeGeneration = options.initialState?.generation;
   let generationSequence = options.initialState?.generation?.sequence ?? 0;
+  let currentWebSocketToken = options.token ?? null;
   let currentSession = options.session;
   let currentSessionToken = options.sessionToken ?? null;
   let state = options.initialState ?? initialVivaAgentSessionState();
@@ -827,7 +833,10 @@ export function createVivaAgentSessionController(
     const generation = createGeneration(reason);
     activeGeneration = generation;
     previousSocket?.close();
-    const nextSocket = connectVivaAgent(options);
+    const nextSocket = connectVivaAgent({
+      ...options,
+      token: currentWebSocketToken ?? undefined,
+    });
     socket = nextSocket;
     setState({ ...initialVivaAgentSessionState(), generation, status: "connecting" });
     setSocketHandler(nextSocket, "open", () => {
@@ -864,7 +873,7 @@ export function createVivaAgentSessionController(
         ...state,
         pendingSubmission: undefined,
         status: "error",
-        errors: [...state.errors, "WebSocket error"],
+        errors: [...state.errors, webSocketErrorMessage(currentSessionToken)],
       });
     });
     return nextSocket;
@@ -888,6 +897,7 @@ export function createVivaAgentSessionController(
       currentSession = input.session ?? currentSession;
       if ("sessionToken" in input) {
         currentSessionToken = input.sessionToken ?? null;
+        currentWebSocketToken = input.sessionToken ?? null;
       }
       return openSocket(input.reason ?? "token_refresh");
     },

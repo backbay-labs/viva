@@ -1468,7 +1468,9 @@ fn initial_session_config_from_message(
     if frame.frame_type != "session_config" {
         return Err(ClientFrameError::invalid_first_frame());
     }
+    let client_generation_id = validated_client_generation_id(frame.client_generation_id)?;
     Ok(InitialSessionConfig {
+        client_generation_id,
         session: frame.session,
         session_token: frame.session_token,
     })
@@ -1498,6 +1500,7 @@ fn sanitize_client_session_config(
     }
     config.source_context.clear();
     config.active_concepts.clear();
+    config.client_generation_id = None;
     Ok(config)
 }
 
@@ -1558,6 +1561,7 @@ fn authorize_initial_session_config(
             )
         };
     let mut config = sanitize_client_session_config(initial.session, &binding)?;
+    config.client_generation_id = initial.client_generation_id;
     if rotate_trusted_session {
         config.session_id = Some(agent_domain::SessionId::new(
             state.next_trusted_voice_session_id(),
@@ -1586,6 +1590,7 @@ struct AuthorizedClientSession {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct InitialSessionConfig {
+    client_generation_id: Option<String>,
     session: SessionConfig,
     session_token: Option<String>,
 }
@@ -1603,6 +1608,8 @@ struct InitialClientFrame {
     frame_type: String,
     version: u32,
     session: SessionConfig,
+    #[serde(default)]
+    client_generation_id: Option<String>,
     #[serde(default)]
     session_token: Option<String>,
 }
@@ -2102,6 +2109,38 @@ mod tests {
             received.recv().await.unwrap(),
             BrainInput::CancelResponse
         ));
+    }
+
+    #[test]
+    fn preserves_initial_session_config_generation_metadata() {
+        let initial = initial_session_config_from_message(Message::Text(
+            json!({
+                "type": "session_config",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "session": {
+                    "session_id": "voice-session-1",
+                    "user_id": "user-1",
+                    "study_set_id": "biology-midterm",
+                    "source_context": [],
+                    "active_concepts": [],
+                },
+                "session_token": "placeholder-session-material",
+                "client_generation_id": "token_refresh-3",
+            })
+            .to_string()
+            .into(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            initial.client_generation_id.as_deref(),
+            Some("token_refresh-3")
+        );
+        assert_eq!(
+            initial.session_token.as_deref(),
+            Some("placeholder-session-material")
+        );
+        assert_eq!(initial.session.client_generation_id, None);
     }
 
     #[tokio::test]

@@ -149,6 +149,9 @@ export function LiveSessionPage() {
     playbackRef.current = sink;
     return sink;
   }, []);
+  const resetPlaybackForGeneration = useCallback(() => {
+    playbackRef.current?.resetForGeneration();
+  }, []);
 
   useEffect(() => {
     if (!shouldRefreshBrowserSessionToken(routeIdentity)) {
@@ -202,6 +205,7 @@ export function LiveSessionPage() {
       setTextRetryOpen(false);
       setSubmittedTextAnswer(undefined);
       stopCaptureForRecap(captureRef, captureStartedRef, levelRef, capturedTurnPcm16Ref);
+      resetPlaybackForGeneration();
       if (plan.action === "refresh_session_token") {
         void refreshVivaSessionToken({
           sessionId: plan.sessionId,
@@ -237,7 +241,12 @@ export function LiveSessionPage() {
       agentRef.current.reset();
       agentRef.current.connect(reason);
     },
-    [activeStudySet.id, activeStudySet.sessionId, activeStudySet.userId],
+    [
+      activeStudySet.id,
+      activeStudySet.sessionId,
+      activeStudySet.userId,
+      resetPlaybackForGeneration,
+    ],
   );
 
   useEffect(() => {
@@ -508,9 +517,10 @@ export function LiveSessionPage() {
     setSourceOpen(false);
     setHintShown(false);
     setTextRetryOpen(false);
+    resetPlaybackForGeneration();
     agentRef.current.reset();
     agentRef.current.connect("socket_retry");
-  }, []);
+  }, [resetPlaybackForGeneration]);
   const refreshSession = useCallback(() => {
     const attempt = browserLifecycleAttemptRef.current + 1;
     browserLifecycleAttemptRef.current = attempt;
@@ -518,6 +528,7 @@ export function LiveSessionPage() {
     setHintShown(false);
     setTextRetryOpen(false);
     setSubmittedTextAnswer(undefined);
+    resetPlaybackForGeneration();
     const sessionToken = sessionTokenRef.current;
     if (!sessionToken || !activeStudySet.userId || !activeStudySet.sessionId) {
       retryAgent();
@@ -551,7 +562,13 @@ export function LiveSessionPage() {
           retryAgent();
         }
       });
-  }, [activeStudySet.id, activeStudySet.sessionId, activeStudySet.userId, retryAgent]);
+  }, [
+    activeStudySet.id,
+    activeStudySet.sessionId,
+    activeStudySet.userId,
+    resetPlaybackForGeneration,
+    retryAgent,
+  ]);
   const startNewSession = useCallback(() => {
     setSourceOpen(false);
     setHintShown(false);

@@ -86,6 +86,7 @@ where
             )
         })?;
         self.transports.authorize_open().await?;
+        let session_generation_id = session_config.client_generation_id.clone();
         let session = AuthorizedStudySession::from_config(&session_config)
             .map_err(|error| BrainError::Protocol(error.to_string()))?;
         store
@@ -99,6 +100,7 @@ where
         let (event_tx, events) = mpsc::channel::<BrainEvent>(32);
         let runner = self.clone();
         let task = tokio::spawn(async move {
+            let first_response_id = response_id_for_turn(1, session_generation_id.as_deref());
             let _ = event_tx
                 .send(BrainEvent::SessionPhase {
                     phase: StudySessionPhase::Ready,
@@ -106,7 +108,7 @@ where
                 .await;
             let _ = event_tx
                 .send(BrainEvent::QuestionStarted {
-                    response_id: "response-1".to_owned(),
+                    response_id: first_response_id,
                     question: question.clone(),
                 })
                 .await;
@@ -160,7 +162,8 @@ where
                                 active.response_id.clone()
                             }
                             None => {
-                                let response_id = format!("response-{turn}");
+                                let response_id =
+                                    response_id_for_turn(turn, session_generation_id.as_deref());
                                 turn += 1;
                                 response_id
                             }
@@ -189,7 +192,12 @@ where
                         .await;
                 }
                 let submission_sequence = turn as u32;
-                let response_id = format!("response-{turn}");
+                let response_id = response_id_for_turn(
+                    turn,
+                    runner_input
+                        .client_generation_id()
+                        .or(session_generation_id.as_deref()),
+                );
                 turn += 1;
                 active_response = Some(runner.spawn_turn(
                     RunnerTurnJob {
@@ -868,6 +876,30 @@ pub(crate) fn answer_attempt_envelope(
         transcript_confidence_bucket: None,
         pre_provider_state: pre_provider_state.to_owned(),
     }
+}
+
+fn response_id_for_turn(turn: usize, client_generation_id: Option<&str>) -> String {
+    let base = format!("response-{turn}");
+    let Some(generation_id) = client_generation_id else {
+        return base;
+    };
+    let generation_id = sanitized_response_generation_id(generation_id);
+    if generation_id.is_empty() {
+        base
+    } else {
+        format!("{base}-generation-{generation_id}")
+    }
+}
+
+fn sanitized_response_generation_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => character,
+            _ => '-',
+        })
+        .take(96)
+        .collect()
 }
 
 struct GeminiToolLoopJob<'a> {

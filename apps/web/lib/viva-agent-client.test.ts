@@ -703,6 +703,7 @@ describe("Viva agent browser client", () => {
     const refreshed = controller.refreshSession({
       sessionToken: "placeholder-refreshed-material",
     }) as unknown as FakeWebSocket;
+    expect(refreshed.protocols).toEqual(vivaAgentProtocols("placeholder-refreshed-material"));
     expect(controller.getState().status).toBe("connecting");
     expect(controller.getState().phase).toBe("ready");
     expect(controller.getState().generation?.id).toBe("token_refresh-2");
@@ -728,6 +729,23 @@ describe("Viva agent browser client", () => {
     expect(controller.getState().phase).toBe("ready");
     expect(controller.getState().close).toBeUndefined();
     expect(controller.getState().generation?.id).toBe("token_refresh-2");
+  });
+
+  test("controller marks token-backed websocket errors as refreshable preflight failures", () => {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      session: sessionFixture as AgentSessionConfig,
+      sessionToken: "placeholder-expired-material",
+      token: "placeholder-expired-material",
+      url: "ws://localhost:4318/ws",
+    });
+
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.error();
+
+    expect(controller.getState().status).toBe("error");
+    expect(controller.getState().errors.at(-1)).toBe("WebSocket session token preflight failed");
   });
 
   test("controller drops duplicate answer submits while a provider turn is pending", () => {
@@ -1357,6 +1375,10 @@ class FakeWebSocket {
 
   message(data: string) {
     this.emit("message", Object.assign(new Event("message"), { data }));
+  }
+
+  error() {
+    this.emit("error", new Event("error"));
   }
 
   private emit(type: string, event: Event & { data?: unknown }) {
