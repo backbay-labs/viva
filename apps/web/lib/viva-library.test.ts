@@ -309,19 +309,19 @@ describe("Viva library projection", () => {
     });
   });
 
-  test("preserves direct session tokens only for static-export initial snapshots", () => {
+  test("preserves direct capability tokens only for static-export initial snapshots", () => {
     const serverful = browserInitialLibrarySnapshot(snapshot, { staticExport: false });
     const staticExport = browserInitialLibrarySnapshot(snapshot, { staticExport: true });
 
     expect(JSON.stringify(serverful)).not.toContain("session_token");
     expect(JSON.stringify(serverful)).not.toContain("viva1.start-token");
+    expect(JSON.stringify(serverful)).not.toContain("control_token");
+    expect(JSON.stringify(serverful)).not.toContain("viva1.control-token");
     expect(serverful.privacy.export).toEqual({
       available: true,
-      control_token: "viva1.control-token",
     });
     expect(serverful.study_sets[0]?.actions.delete).toEqual({
       available: true,
-      control_token: "viva1.control-token",
     });
     expect(staticExport.study_sets[0]?.actions.start).toEqual({
       available: true,

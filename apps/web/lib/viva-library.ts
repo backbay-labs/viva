@@ -189,7 +189,7 @@ export function browserInitialLibrarySnapshot(
   options: { staticExport?: boolean } = {},
 ): VivaLibrarySnapshot {
   return stripBrowserOnlyTokenFields(snapshot, {
-    controlToken: false,
+    controlToken: !options.staticExport,
     sessionToken: !options.staticExport,
   }) as VivaLibrarySnapshot;
 }

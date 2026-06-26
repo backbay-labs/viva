@@ -7,7 +7,7 @@ import {
 import { browserInitialLibrarySnapshot, type VivaLibrarySnapshot } from "../lib/viva-library";
 import { attachVivaSessionBootstrapTokensToLibrarySnapshot } from "./api/viva-session/shared";
 
-export const dynamic = "auto";
+export const dynamic = "force-dynamic";
 
 export default async function Page() {
   const initialLibrarySnapshot = await initialSnapshot();
@@ -16,23 +16,24 @@ export default async function Page() {
 
 async function initialSnapshot(): Promise<VivaLibrarySnapshot | null> {
   try {
-    const options = serverLibrarySnapshotOptions();
-    const allowedStudySetIds = configuredAllowlist("VIVA_SESSION_ALLOWED_STUDY_SET_IDS");
-    if (options && !allowedStudySetIds) return null;
-    const snapshot = await fetchVivaLibrarySnapshot(options ?? {});
+    const config = serverLibrarySnapshotConfig();
+    if (config.kind === "incomplete") return null;
+
+    const snapshot = await fetchVivaLibrarySnapshot(config.kind === "ready" ? config.options : {});
     const filteredSnapshot =
-      options && allowedStudySetIds
+      config.kind === "ready"
         ? filterInitialLibrarySnapshot(snapshot, {
-            allowedStudySetIds,
-            userId: options.userId ?? "",
+            allowedStudySetIds: config.allowedStudySetIds,
+            userId: config.options.userId ?? "",
           })
         : snapshot;
-    const browserSnapshot = options
-      ? attachVivaSessionBootstrapTokensToLibrarySnapshot(filteredSnapshot, {
-          allowedStudySetIds,
-          userId: options.userId ?? "",
-        })
-      : filteredSnapshot;
+    const browserSnapshot =
+      config.kind === "ready"
+        ? attachVivaSessionBootstrapTokensToLibrarySnapshot(filteredSnapshot, {
+            allowedStudySetIds: config.allowedStudySetIds,
+            userId: config.options.userId ?? "",
+          })
+        : filteredSnapshot;
     return browserInitialLibrarySnapshot(browserSnapshot as VivaLibrarySnapshot, {
       staticExport: vivaStaticExportEnabled(),
     });
@@ -41,12 +42,32 @@ async function initialSnapshot(): Promise<VivaLibrarySnapshot | null> {
   }
 }
 
-function serverLibrarySnapshotOptions(): VivaLibrarySnapshotOptions | null {
+type ServerLibrarySnapshotConfig =
+  | { kind: "disabled" }
+  | { kind: "incomplete" }
+  | {
+      allowedStudySetIds: Set<string>;
+      kind: "ready";
+      options: VivaLibrarySnapshotOptions;
+    };
+
+function serverLibrarySnapshotConfig(): ServerLibrarySnapshotConfig {
   const apiBaseUrl = process.env.VIVA_AGENT_HTTP_URL?.trim();
   const bearerToken = process.env.VIVA_AGENT_REST_BEARER_TOKEN?.trim();
   const userId = firstConfiguredValue("VIVA_SESSION_ALLOWED_USER_IDS");
-  if (!apiBaseUrl || !bearerToken || !userId) return null;
-  return { apiBaseUrl, bearerToken, userId };
+  const allowedStudySetIds = configuredAllowlist("VIVA_SESSION_ALLOWED_STUDY_SET_IDS");
+  const hasServerBootstrapConfig = Boolean(
+    apiBaseUrl || bearerToken || userId || allowedStudySetIds,
+  );
+  if (!hasServerBootstrapConfig) return { kind: "disabled" };
+  if (!apiBaseUrl || !bearerToken || !userId || !allowedStudySetIds) {
+    return { kind: "incomplete" };
+  }
+  return {
+    allowedStudySetIds,
+    kind: "ready",
+    options: { apiBaseUrl, bearerToken, userId },
+  };
 }
 
 function firstConfiguredValue(envName: string): string | null {
@@ -72,6 +93,7 @@ function filterInitialLibrarySnapshot(
 ): VivaLibrarySnapshot {
   return {
     ...snapshot,
+    privacy: filterInitialLibraryPrivacy(snapshot.privacy),
     sessions: snapshot.sessions.filter(
       (session) =>
         session.user_id === filter.userId && filter.allowedStudySetIds.has(session.study_set_id),
@@ -81,5 +103,17 @@ function filterInitialLibrarySnapshot(
         studySet.user_id === filter.userId && filter.allowedStudySetIds.has(studySet.id),
     ),
     user_id: filter.userId,
+  };
+}
+
+function filterInitialLibraryPrivacy(
+  privacy: VivaLibrarySnapshot["privacy"],
+): VivaLibrarySnapshot["privacy"] {
+  return {
+    ...privacy,
+    export: {
+      available: false,
+      unavailable_reason: "allowlist_filtered_export_unavailable",
+    },
   };
 }

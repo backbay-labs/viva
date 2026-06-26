@@ -180,10 +180,14 @@ describe("LandingEntry", () => {
         "Bearer server-rest-bearer",
       );
       expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("session_token");
+      expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("control_token");
       expect(JSON.stringify(page.props.initialLibrarySnapshot)).not.toContain("viva1.server-token");
       expect(page.props.initialLibrarySnapshot.privacy.export).toEqual({
+        available: false,
+        unavailable_reason: "allowlist_filtered_export_unavailable",
+      });
+      expect(page.props.initialLibrarySnapshot.study_sets[0]?.actions.delete).toEqual({
         available: true,
-        control_token: "viva1.control-token",
       });
     } finally {
       globalThis.fetch = originalFetch;
@@ -194,8 +198,37 @@ describe("LandingEntry", () => {
     }
   });
 
-  test("the landing page stays compatible with static export builds", () => {
-    expect(dynamic).toBe("auto");
+  test("server-side initial library fetch fails closed when bootstrap config is incomplete", async () => {
+    const calls: string[] = [];
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
+      delete process.env.VIVA_AGENT_REST_BEARER_TOKEN;
+      process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        calls.push(String(input));
+        return new Response(JSON.stringify(librarySnapshot), {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        });
+      }) as typeof fetch;
+
+      const page = (await Page()) as ReactElement<{ initialLibrarySnapshot: VivaLibrarySnapshot }>;
+
+      expect(page.type).toBe(LandingEntry);
+      expect(page.props.initialLibrarySnapshot).toBe(null);
+      expect(calls).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+    }
+  });
+
+  test("the landing page forces dynamic rendering for server-minted bootstrap snapshots", () => {
+    expect(dynamic).toBe("force-dynamic");
   });
 
   test("refreshes expired bootstrap capabilities before retrying session start", async () => {

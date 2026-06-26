@@ -239,7 +239,7 @@ async function browserSafeLibraryResponseBody(
             userId: options.snapshotFilter.userId,
           })
         : filtered;
-      return JSON.stringify(stripLibrarySessionTokens(withBootstrapTokens));
+      return JSON.stringify(stripBrowserLibraryCapabilityTokens(withBootstrapTokens));
     } catch {
       return "{}";
     }
@@ -303,13 +303,13 @@ function librarySessionAllowed(
   );
 }
 
-function stripLibrarySessionTokens(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripLibrarySessionTokens);
+function stripBrowserLibraryCapabilityTokens(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripBrowserLibraryCapabilityTokens);
   if (!value || typeof value !== "object") return value;
   const output: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
-    if (key === "session_token") continue;
-    output[key] = stripLibrarySessionTokens(child);
+    if (key === "control_token" || key === "session_token") continue;
+    output[key] = stripBrowserLibraryCapabilityTokens(child);
   }
   return output;
 }

@@ -14,7 +14,9 @@ import {
   micStateForAudioCaptureError,
   micStateForCaptureEndReason,
   pcm16ChunksToBase64,
+  refreshBrowserSessionToken,
   sessionRouteWsAccessToken,
+  shouldRefreshBrowserSessionToken,
   shouldStopReadinessPolling,
   shouldUseLiveMicAudioTransport,
   spokenTurnFallbackAction,
@@ -124,6 +126,64 @@ describe("sessionRouteWsAccessToken", () => {
       "viva1.signed-session-token",
     );
     expect(sessionRouteWsAccessToken({ sessionToken: null })).toBeUndefined();
+  });
+
+  test("refreshes complete route session identities before socket connection", async () => {
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    const token = await refreshBrowserSessionToken(
+      {
+        sessionId: "server-session",
+        sessionToken: "viva1.expired-route-token",
+        studySetId: "biology-midterm",
+        userId: "user-1",
+      },
+      (async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ input: String(input), init });
+        return new Response(JSON.stringify({ session_token: "viva1.fresh-route-token" }), {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        });
+      }) as typeof fetch,
+    );
+
+    expect(shouldRefreshBrowserSessionToken({ sessionToken: "viva1.only-token" })).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.input).toBe("/api/viva-session/refresh");
+    expect(new Headers(calls[0]?.init?.headers).get("content-type")).toBe("application/json");
+    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
+      session_id: "server-session",
+      session_token: "viva1.expired-route-token",
+      study_set_id: "biology-midterm",
+      user_id: "user-1",
+    });
+    expect(token).toBe("viva1.fresh-route-token");
+  });
+
+  test("falls back to the original route token when refresh cannot run", async () => {
+    const calls: string[] = [];
+    const missingIdentityToken = await refreshBrowserSessionToken(
+      { sessionToken: " viva1.route-token " },
+      (async (input: RequestInfo | URL) => {
+        calls.push(String(input));
+        return new Response("{}", { status: 500 });
+      }) as typeof fetch,
+    );
+    const failedRefreshToken = await refreshBrowserSessionToken(
+      {
+        sessionId: "server-session",
+        sessionToken: "viva1.route-token",
+        studySetId: "biology-midterm",
+        userId: "user-1",
+      },
+      (async (input: RequestInfo | URL) => {
+        calls.push(String(input));
+        return new Response("{}", { status: 401 });
+      }) as typeof fetch,
+    );
+
+    expect(missingIdentityToken).toBe("viva1.route-token");
+    expect(failedRefreshToken).toBe("viva1.route-token");
+    expect(calls).toEqual(["/api/viva-session/refresh"]);
   });
 });
 

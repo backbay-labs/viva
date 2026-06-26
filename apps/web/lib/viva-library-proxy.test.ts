@@ -218,10 +218,12 @@ describe("Viva library proxy", () => {
         available: false,
         unavailable_reason: "allowlist_filtered_export_unavailable",
       });
-      expect(body.study_sets[0].actions.delete.control_token).toBe("viva1.delete-control");
+      expect(body.study_sets[0].actions.delete).toEqual({ available: true });
       expect(JSON.stringify(body)).not.toContain("session_token");
+      expect(JSON.stringify(body)).not.toContain("control_token");
       expect(JSON.stringify(body)).not.toContain("viva1.disallowed");
       expect(JSON.stringify(body)).not.toContain("viva1.allowed-session-token");
+      expect(JSON.stringify(body)).not.toContain("viva1.delete-control");
       expect(response.headers.get("cache-control")).toBe("no-store");
     } finally {
       globalThis.fetch = originalFetch;
@@ -330,10 +332,12 @@ describe("Viva library proxy", () => {
         available: false,
         unavailable_reason: "allowlist_filtered_export_unavailable",
       });
-      expect(body.study_sets[0].actions.delete.control_token).toBe("viva1.delete-control");
+      expect(body.study_sets[0].actions.delete).toEqual({ available: true });
       expect(JSON.stringify(body)).not.toContain("session_token");
+      expect(JSON.stringify(body)).not.toContain("control_token");
       expect(JSON.stringify(body)).not.toContain("viva1.disallowed");
       expect(JSON.stringify(body)).not.toContain("viva1.allowed-session-token");
+      expect(JSON.stringify(body)).not.toContain("viva1.delete-control");
     } finally {
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
