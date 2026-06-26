@@ -8,7 +8,11 @@ import type {
   SourceReference,
   VivaReadyFrame,
 } from "@viva/core";
-import { VIVA_LEARNER_LOOP_CONTRACT, VIVA_VOICE_PROTOCOL_VERSION } from "@viva/core";
+import {
+  VIVA_AGENT_TERMINAL_SESSION_REASONS,
+  VIVA_LEARNER_LOOP_CONTRACT,
+  VIVA_VOICE_PROTOCOL_VERSION,
+} from "@viva/core";
 import type { VivaAgentDerivedState } from "./use-viva-agent-session";
 import {
   checklistFromExpectedTerms,
@@ -29,6 +33,11 @@ import {
 } from "./viva-session-projection";
 
 const NOW = new Date("2026-06-17T12:00:00.000Z");
+const AGENT_TERMINAL_REASONS = new Set<string>(VIVA_AGENT_TERMINAL_SESSION_REASONS);
+
+function isAgentTerminalSessionReason(reason: string): reason is AgentTerminalSessionReason {
+  return AGENT_TERMINAL_REASONS.has(reason);
+}
 
 const source: SourceReference = {
   label: "Lecture 5 · Slide 18",
@@ -659,9 +668,8 @@ describe("projectRuntimeCopy", () => {
 
   test("keeps terminal runtime copy reconciled with the BAC-510 contract", () => {
     for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {
-      if (!state.terminal_reason) continue;
-      if (state.stage === "pre_loop") continue;
-      const terminalReason = state.terminal_reason as AgentTerminalSessionReason;
+      if (!state.terminal_reason || !isAgentTerminalSessionReason(state.terminal_reason)) continue;
+      const terminalReason = state.terminal_reason;
 
       const copy = projectRuntimeCopy({
         close: { code: 1011, reason: terminalReason, wasClean: true },
@@ -817,6 +825,24 @@ describe("projectTurnTakingState", () => {
     expect(recovery.detail).toBe("Retry agent");
   });
 
+  test("prioritizes recovery over pending placeholders when the session is unavailable", () => {
+    const runtime = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: undefined,
+      status: "closed",
+    });
+    const turn = projectTurnTakingState({
+      question: { ...liveQuestion, pending: true, prompt: "Connecting to your examiner..." },
+      runtime,
+      state: "listening",
+    });
+
+    expect(turn.phase).toBe("recovery");
+    expect(turn.label).toBe("Agent offline");
+    expect(turn.detail).toBe("Retry agent");
+    expect(turn.headline).not.toBe("Preparing the question.");
+  });
+
   test("renders learner-safe no-speech and barge-in nudges", () => {
     const silence = projectTurnTakingState({
       question: liveQuestion,
@@ -836,6 +862,21 @@ describe("projectTurnTakingState", () => {
     expect(interrupted.nudge?.label).toBe("Interruption acknowledged");
     expect(interrupted.nudge?.text).toContain("stopped speaking");
     expect(interrupted.interruptAcknowledged).toBe(true);
+  });
+
+  test("clears stale barge-in and no-speech nudges after leaving listening", () => {
+    const turn = projectTurnTakingState({
+      interruptAcknowledged: true,
+      question: liveQuestion,
+      state: "thinking",
+      textAnswerFallbackActive: true,
+    });
+
+    expect(turn.phase).toBe("thinking");
+    expect(turn.interruptAcknowledged).toBe(false);
+    expect(turn.nudge).toBeUndefined();
+    expect(turn.ariaStatus).not.toContain("stopped speaking");
+    expect(turn.ariaStatus).not.toContain("No speech captured");
   });
 
   test("captions the spoken question and feedback without surfacing source excerpts", () => {
@@ -859,14 +900,15 @@ describe("projectTurnTakingState", () => {
 
   test("covers every BAC-510 terminal runtime state as recovery copy", () => {
     for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {
-      if (!state.terminal_reason) continue;
+      if (!state.terminal_reason || !isAgentTerminalSessionReason(state.terminal_reason)) continue;
+      const terminalReason = state.terminal_reason;
 
       const runtime = projectRuntimeCopy({
-        close: { code: 1011, reason: state.terminal_reason, wasClean: true },
+        close: { code: 1011, reason: terminalReason, wasClean: true },
         readiness: trustedReadiness,
         ready: ready("cartesia_gemini", { live_runtime: true }),
         status: "closed",
-        terminalReason: state.terminal_reason,
+        terminalReason,
       });
       const turn = projectTurnTakingState({
         question: { ...liveQuestion, prompt: "This session has ended.", terminal: true },

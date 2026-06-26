@@ -110,6 +110,11 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     patterns: Object.freeze([/BrainError::MissingApiKey => false/]),
   },
   {
+    file: "apps/web/lib/viva-session-projection.ts",
+    marker: "prompt",
+    patterns: Object.freeze([/text: question\.prompt,/]),
+  },
+  {
     file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
     marker: "api_key",
     patterns: Object.freeze([

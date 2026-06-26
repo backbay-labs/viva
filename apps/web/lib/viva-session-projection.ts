@@ -1094,12 +1094,7 @@ export function projectTurnTakingState(input: {
   state: SessionState;
   textAnswerFallbackActive?: boolean;
 }): VoiceTurnTakingState {
-  const interruptAcknowledged = Boolean(input.interruptAcknowledged);
   const captions = turnCaptions(input.question);
-  const nudge = turnNudge({
-    interruptAcknowledged,
-    textAnswerFallbackActive: input.textAnswerFallbackActive,
-  });
   const speaking = Boolean(input.hasPendingAudio || input.playbackSpeaking);
   const base = turnBaseState({
     pending: Boolean(input.question.pending),
@@ -1107,6 +1102,11 @@ export function projectTurnTakingState(input: {
     runtime: input.runtime,
     speaking,
     state: input.state,
+  });
+  const interruptAcknowledged = base.phase === "listening" && Boolean(input.interruptAcknowledged);
+  const nudge = turnNudge({
+    interruptAcknowledged,
+    textAnswerFallbackActive: base.phase === "listening" && input.textAnswerFallbackActive,
   });
   const ariaStatus = compactSentences([
     base.label,
@@ -1134,21 +1134,21 @@ function turnBaseState(input: {
   speaking: boolean;
   state: SessionState;
 }): Pick<VoiceTurnTakingState, "detail" | "headline" | "label" | "phase"> {
-  if (input.pending) {
-    return {
-      detail: "Waiting for the examiner to open the first turn.",
-      headline: "Preparing the question.",
-      label: "Preparing",
-      phase: "preparing",
-    };
-  }
-
   if (input.recovery) {
     return {
       detail: input.runtime?.nextActionLabel ?? "Recover the session before answering again.",
       headline: input.runtime?.marginaliaTitle ?? "The voice turn is paused.",
       label: input.runtime?.capsuleLabel ?? "Recovery",
       phase: "recovery",
+    };
+  }
+
+  if (input.pending) {
+    return {
+      detail: "Waiting for the examiner to open the first turn.",
+      headline: "Preparing the question.",
+      label: "Preparing",
+      phase: "preparing",
     };
   }
 

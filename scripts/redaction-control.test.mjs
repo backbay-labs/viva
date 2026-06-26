@@ -162,6 +162,21 @@ test("per-PR redaction check rejects marker constants with forbidden comment tai
   }
 });
 
+test("per-PR redaction check permits learner question prompt caption projection only", () => {
+  assert.equal(
+    addedLineViolatesRedactionAudit("      text: question.prompt,", {
+      file: "apps/web/lib/viva-session-projection.ts",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("      text: question.prompt,", {
+      file: "apps/web/lib/viva-agent-client.ts",
+    }),
+    true,
+  );
+});
+
 test("per-PR redaction check catches structural raw-payload fields", () => {
   assert.equal(
     redactForVivaLog({

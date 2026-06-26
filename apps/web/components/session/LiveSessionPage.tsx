@@ -139,12 +139,12 @@ export function LiveSessionPage() {
     if (reducedMotion) levelRef.current.user = 0;
   }, [reducedMotion]);
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
       mountedRef.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
 
   const getPlayback = useCallback(() => {
     if (playbackRef.current) return playbackRef.current;
@@ -764,9 +764,7 @@ export function LiveSessionPage() {
         question: projection.question,
         runtime,
         state: effectiveState,
-        textAnswerFallbackActive: Boolean(
-          textAnswerState?.active && !textAnswerState.required && !textAnswerState.lastAnswer,
-        ),
+        textAnswerFallbackActive: shouldShowNoSpeechNudge({ textAnswerState, textRetryOpen }),
       }),
     [
       agent.agentState.audio.length,
@@ -776,6 +774,7 @@ export function LiveSessionPage() {
       projection.question,
       runtime,
       textAnswerState,
+      textRetryOpen,
     ],
   );
   const submitRuntimePrimaryAction =
@@ -890,6 +889,14 @@ export function textAnswerStateForSession(input: {
     ),
     required: input.textAnswerRequired,
   };
+}
+
+export function shouldShowNoSpeechNudge(input: {
+  textAnswerState?: TextAnswerState;
+  textRetryOpen: boolean;
+}) {
+  const state = input.textAnswerState;
+  return Boolean(state?.active && !state.lastAnswer && (state.required || input.textRetryOpen));
 }
 
 export type BrowserSessionReconnectEvent =
