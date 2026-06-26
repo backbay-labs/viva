@@ -85,19 +85,9 @@ const ALLOWED_SANITIZED_BOOLEAN_PROOF_FIELDS = new Set([
   "refresh_replayed_token",
 ]);
 
-const SAFE_FORBIDDEN_MARKER_LITERALS = new Map([
-  ["session_token", ["invalid_session_token"]],
-]);
+const SAFE_FORBIDDEN_MARKER_LITERALS = new Map([["session_token", ["invalid_session_token"]]]);
 
-const AUDITED_FILE_EXTENSIONS = new Set([
-  ".js",
-  ".mjs",
-  ".ts",
-  ".tsx",
-  ".rs",
-  ".yml",
-  ".yaml",
-]);
+const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);
 
 const RUNTIME_REDACTION_BOUNDARY_FILES = new Set([
   "apps/web/lib/viva-redaction.ts",
@@ -194,15 +184,16 @@ export function assertNoForbiddenEvidenceMarkers(
   const structuralHits = collectForbiddenStructuralFields(value);
   if (structuralHits.length > 0) {
     throw new Error(
-      `${context} includes forbidden evidence field: ${structuralHits
-        .slice(0, 5)
-        .join(", ")}`,
+      `${context} includes forbidden evidence field: ${structuralHits.slice(0, 5).join(", ")}`,
     );
   }
   assertNoForbiddenTextMarkers(serializedForAudit(value), { context, env });
 }
 
-export function assertNoForbiddenTextMarkers(text, { context = "artifact", env = process.env } = {}) {
+export function assertNoForbiddenTextMarkers(
+  text,
+  { context = "artifact", env = process.env } = {},
+) {
   const marker = forbiddenEvidenceMarkerInText(text);
   if (marker) {
     throw new Error(`${context} includes forbidden payload marker: ${marker}`);
@@ -257,10 +248,7 @@ export function changedFileNeedsRedactionAudit(file) {
   ) {
     return false;
   }
-  if (
-    file === "scripts/redaction-control.mjs" ||
-    file === "scripts/redaction-control-check.mjs"
-  ) {
+  if (file === "scripts/redaction-control.mjs" || file === "scripts/redaction-control-check.mjs") {
     return false;
   }
   const extension = path.extname(file);
@@ -292,9 +280,9 @@ export function forbiddenStructuralFieldInText(text) {
     { pattern: /(^|[^A-Za-z0-9_$])([A-Za-z_][A-Za-z0-9_-]*)\s*[:=]/g, group: 2 },
     { pattern: /[{,]\s*([A-Za-z_][A-Za-z0-9_-]*)\s*(?=[,}])/g, group: 1 },
     { pattern: /\[\s*["']([A-Za-z_][A-Za-z0-9_-]*)["']\s*\]/g, group: 1 },
-    { pattern: /=\s*([A-Za-z_][A-Za-z0-9_-]*)\s*(?=[;,\]\)}]|$)/g, group: 1 },
-    { pattern: /\breturn\s+([A-Za-z_][A-Za-z0-9_-]*)\s*(?=[;,\]\)}]|$)/g, group: 1 },
-    { pattern: /\.([A-Za-z_][A-Za-z0-9_-]*)\s*(?=[;,\]\)}]|$)/g, group: 1 },
+    { pattern: /=\s*([A-Za-z_][A-Za-z0-9_-]*)\s*(?=[;,\])}]|$)/g, group: 1 },
+    { pattern: /\breturn\s+([A-Za-z_][A-Za-z0-9_-]*)\s*(?=[;,\])}]|$)/g, group: 1 },
+    { pattern: /\.([A-Za-z_][A-Za-z0-9_-]*)\s*(?=[;,\])}]|$)/g, group: 1 },
   ];
   for (const { pattern, group } of candidatePatterns) {
     let match = pattern.exec(text);
@@ -321,7 +309,9 @@ function assertNoForbiddenStructuralTextFields(text, { context = "artifact" } = 
 function redactValue(value, key) {
   if (key && isForbiddenStructuralField(key)) return REDACTED_VALUE;
   if (typeof value === "string") {
-    return forbiddenEvidenceMarkerInText(value) ? REDACTED_VALUE : value.replace(/\s+/g, " ").slice(0, 240);
+    return forbiddenEvidenceMarkerInText(value)
+      ? REDACTED_VALUE
+      : value.replace(/\s+/g, " ").slice(0, 240);
   }
   if (Array.isArray(value)) {
     return value.map((entry) => redactValue(entry, null));
@@ -371,7 +361,10 @@ function isForbiddenStructuralField(key) {
 function isForbiddenCompoundStructuralField(normalized) {
   return forbiddenCompoundStructuralFieldStems.some((stem) => {
     if (!normalized.startsWith(`${stem}_`)) return false;
-    const tail = normalized.slice(stem.length + 1).split("_").at(-1);
+    const tail = normalized
+      .slice(stem.length + 1)
+      .split("_")
+      .at(-1);
     return Boolean(tail && forbiddenCompoundStructuralFieldTails.has(tail));
   });
 }

@@ -68,7 +68,10 @@ test("redacts structurally forbidden log fields instead of serializing raw value
   });
   assert.doesNotMatch(JSON.stringify(redacted), /NADH|viva1|raw answer/i);
   assert.equal(redactForVivaLog({ message: "bearer lower-case-token" }).message, "[redacted]");
-  assert.equal(redactForVivaLog({ protocols: "audio bearer.redacted-token" }).protocols, "[redacted]");
+  assert.equal(
+    redactForVivaLog({ protocols: "audio bearer.redacted-token" }).protocols,
+    "[redacted]",
+  );
 });
 
 test("per-PR redaction check targets changed logging and evidence code", () => {
@@ -76,7 +79,10 @@ test("per-PR redaction check targets changed logging and evidence code", () => {
   assert.equal(changedFileNeedsRedactionAudit("scripts/redaction-control.mjs"), false);
   assert.equal(changedFileNeedsRedactionAudit("scripts/redaction-control-check.mjs"), false);
   assert.equal(changedFileNeedsRedactionAudit("scripts/redaction-control.test.mjs"), false);
-  assert.equal(changedFileNeedsRedactionAudit("agent/crates/agent-service/tests/voice_ws.rs"), false);
+  assert.equal(
+    changedFileNeedsRedactionAudit("agent/crates/agent-service/tests/voice_ws.rs"),
+    false,
+  );
   assert.equal(changedFileNeedsRedactionAudit("apps/web/lib/viva-redaction.ts"), true);
   assert.equal(changedFileNeedsRedactionAudit("agent/crates/observe/src/lib.rs"), true);
   assert.equal(changedFileNeedsRedactionAudit("agent/fixtures/voice-protocol/session.json"), false);
@@ -183,7 +189,10 @@ test("per-PR redaction check catches structural raw-payload fields", () => {
   assert.equal(forbiddenStructuralFieldInText("Self { cartesiaAPIKey }"), "cartesia_api_key");
   assert.equal(forbiddenStructuralFieldInText("record({ promptContent })"), "prompt_content");
   assert.equal(forbiddenStructuralFieldInText("record({ rawAnswerText })"), "raw_answer_text");
-  assert.equal(forbiddenStructuralFieldInText("record({ sourceExcerptText })"), "source_excerpt_text");
+  assert.equal(
+    forbiddenStructuralFieldInText("record({ sourceExcerptText })"),
+    "source_excerpt_text",
+  );
   assert.equal(forbiddenStructuralFieldInText('{"message":"invalid session token"}'), undefined);
   assert.equal(forbiddenStructuralFieldInText("invalid session token"), undefined);
   assert.equal(addedLineViolatesRedactionAudit("  prompt_content_retained: true"), false);
@@ -346,5 +355,8 @@ test("per-PR redaction check fails when the configured base cannot be diffed", (
   });
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /Unable to compute redaction diff from refs\/heads\/definitely-missing-redaction-base/);
+  assert.match(
+    result.stderr,
+    /Unable to compute redaction diff from refs\/heads\/definitely-missing-redaction-base/,
+  );
 });
