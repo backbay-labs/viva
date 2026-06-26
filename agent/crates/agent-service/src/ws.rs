@@ -932,10 +932,14 @@ async fn handle_socket(
                                 .await;
                                 break;
                             }
-                            Ok(ForwardBrainEvent::ProviderFailure(reason)) => {
+                            Ok(ForwardBrainEvent::ProviderFailure {
+                                reason,
+                                response_id,
+                            }) => {
                                 if send_partial_recap_for_provider_failure(
                                     &forward_context,
                                     reason,
+                                    response_id.as_deref(),
                                     &mut sender,
                                 )
                                 .await
@@ -1115,10 +1119,14 @@ async fn handle_socket(
                                         .await;
                                         break;
                                     }
-                                    Ok(ForwardBrainEvent::ProviderFailure(reason)) => {
+                                    Ok(ForwardBrainEvent::ProviderFailure {
+                                        reason,
+                                        response_id,
+                                    }) => {
                                         if send_partial_recap_for_provider_failure(
                                             &forward_context,
                                             reason,
+                                            response_id.as_deref(),
                                             &mut sender,
                                         )
                                         .await
@@ -1288,10 +1296,14 @@ async fn handle_socket(
                         .await;
                         break;
                     }
-                    Ok(ForwardBrainEvent::ProviderFailure(reason)) => {
+                    Ok(ForwardBrainEvent::ProviderFailure {
+                        reason,
+                        response_id,
+                    }) => {
                         if send_partial_recap_for_provider_failure(
                             &forward_context,
                             reason,
+                            response_id.as_deref(),
                             &mut sender,
                         )
                         .await
@@ -1508,6 +1520,7 @@ where
 async fn send_partial_recap_for_provider_failure<S>(
     context: &BrainForwardContext<'_>,
     terminal_reason: TerminalSessionReason,
+    response_id: Option<&str>,
     sender: &mut S,
 ) -> Result<bool, axum::Error>
 where
@@ -1519,6 +1532,43 @@ where
     let Some(voice_session_id) = context.voice_session_id.as_deref() else {
         return Ok(false);
     };
+    let Some(response_id) = response_id else {
+        context.state.evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::PartialRecap,
+            context.voice_session_id.clone(),
+            "skipped reason=no_durable_response_id",
+        ));
+        return Ok(false);
+    };
+    let answer_attempt_recorded = match context
+        .state
+        .study_store
+        .answer_attempt_was_recorded(
+            &context.session_binding.user_id,
+            &context.session_binding.study_set_id,
+            voice_session_id,
+            response_id,
+        )
+        .await
+    {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            context.state.evidence.record(VoiceEvidenceEvent::new(
+                VoiceEvidenceEventKind::PartialRecap,
+                context.voice_session_id.clone(),
+                format!("skipped reason=answer_attempt_check_failed error={error}"),
+            ));
+            return Ok(false);
+        }
+    };
+    if !answer_attempt_recorded {
+        context.state.evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::PartialRecap,
+            context.voice_session_id.clone(),
+            format!("skipped reason=response_answer_attempt_missing response_id={response_id}"),
+        ));
+        return Ok(false);
+    }
     let counts = match context
         .state
         .study_store
@@ -1540,6 +1590,17 @@ where
         }
     };
     if counts.answer_attempts == 0 {
+        return Ok(false);
+    }
+    if counts.prior_recaps > 0 {
+        context.state.evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::PartialRecap,
+            context.voice_session_id.clone(),
+            format!(
+                "skipped reason=prior_recap_exists prior_recaps={}",
+                counts.prior_recaps
+            ),
+        ));
         return Ok(false);
     }
     let question = match context
@@ -1575,7 +1636,6 @@ where
         terminal_reason,
         &counts,
     );
-    let response_id = format!("partial-recap-{}", terminal_reason.as_str());
     if let Err(error) = context
         .state
         .study_store
@@ -1583,7 +1643,7 @@ where
             &context.session_binding.user_id,
             &context.session_binding.study_set_id,
             voice_session_id,
-            &response_id,
+            response_id,
             recap.clone(),
         )
         .await
@@ -1615,7 +1675,7 @@ where
         &ServerFrame::Event {
             version: VIVA_VOICE_PROTOCOL_VERSION,
             event: Box::new(VivaServerEvent::RecapReady {
-                response_id,
+                response_id: response_id.to_owned(),
                 recap,
                 partial_reason: Some(terminal_reason),
             }),
@@ -1871,14 +1931,17 @@ fn should_suppress_superseded_recap(
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ForwardBrainEvent {
     Continue,
     Suppressed,
     Rejected,
     DurabilityDegraded,
     CostBudgetExceeded,
-    ProviderFailure(TerminalSessionReason),
+    ProviderFailure {
+        reason: TerminalSessionReason,
+        response_id: Option<String>,
+    },
 }
 
 async fn forward_brain_event<S>(
@@ -1916,7 +1979,10 @@ where
                 .limit_state
                 .record_provider_terminal_failure(context.limits, terminal_reason);
         }
-        return Ok(ForwardBrainEvent::ProviderFailure(terminal_reason));
+        return Ok(ForwardBrainEvent::ProviderFailure {
+            reason: terminal_reason,
+            response_id: cancelled_responses.partial_recap_response_id(),
+        });
     }
     match authorize_browser_event(context.state, context.session_binding, &event).await {
         BrowserEventAuthorization::Authorized => {}
@@ -2613,7 +2679,16 @@ fn store_adapter_error_is_durability_degraded(error: &PortError) -> bool {
 #[derive(Default)]
 struct CancelledResponseTracker {
     active_response_id: Option<String>,
+    last_durable_response_id: Option<String>,
     response_ids: HashSet<String>,
+}
+
+impl CancelledResponseTracker {
+    fn partial_recap_response_id(&self) -> Option<String> {
+        self.active_response_id
+            .clone()
+            .or_else(|| self.last_durable_response_id.clone())
+    }
 }
 
 fn should_suppress_cancelled_response(
@@ -2623,6 +2698,7 @@ fn should_suppress_cancelled_response(
     match event {
         agent_domain::BrainEvent::QuestionStarted { response_id, .. } => {
             cancelled_responses.active_response_id = Some(response_id.clone());
+            cancelled_responses.last_durable_response_id = None;
             false
         }
         agent_domain::BrainEvent::ResponseCancelledFor { response_id } => {
@@ -2634,11 +2710,46 @@ fn should_suppress_cancelled_response(
             {
                 cancelled_responses.active_response_id = None;
             }
+            if cancelled_responses
+                .last_durable_response_id
+                .as_deref()
+                .is_some_and(|durable| durable == response_id)
+            {
+                cancelled_responses.last_durable_response_id = None;
+            }
             false
         }
         agent_domain::BrainEvent::ResponseCancelled => {
             if let Some(response_id) = cancelled_responses.active_response_id.take() {
                 cancelled_responses.response_ids.insert(response_id);
+            }
+            cancelled_responses.last_durable_response_id = None;
+            false
+        }
+        agent_domain::BrainEvent::ResponseCompleted { response_id } => {
+            if cancelled_responses.response_ids.contains(response_id) {
+                return true;
+            }
+            cancelled_responses.last_durable_response_id = Some(response_id.clone());
+            false
+        }
+        agent_domain::BrainEvent::RecapReady { response_id, .. } => {
+            if cancelled_responses.response_ids.contains(response_id) {
+                return true;
+            }
+            if cancelled_responses
+                .active_response_id
+                .as_deref()
+                .is_some_and(|active| active == response_id)
+            {
+                cancelled_responses.active_response_id = None;
+            }
+            if cancelled_responses
+                .last_durable_response_id
+                .as_deref()
+                .is_some_and(|durable| durable == response_id)
+            {
+                cancelled_responses.last_durable_response_id = None;
             }
             false
         }

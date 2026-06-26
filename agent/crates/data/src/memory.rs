@@ -1980,6 +1980,25 @@ impl StudyMemoryStore for InMemoryStudyStore {
         })
     }
 
+    async fn answer_attempt_was_recorded(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+    ) -> Result<bool, PortError> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        Ok(state.answer_attempts.iter().any(|attempt| {
+            attempt.user_id == user_id
+                && attempt.study_set_id == study_set_id
+                && attempt.voice_session_id == voice_session_id
+                && attempt.response_id == response_id
+        }))
+    }
+
     async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
         let user_id = required_user_id(config)?;
         let study_set_id = required_study_set_id(config)?;

@@ -1449,7 +1449,7 @@ class PartialFailureRecapSocket extends FakeSocket {
       queueMicrotask(() => {
         this.message(
           eventFrame("recap_ready", {
-            response_id: "partial-recap-provider-timeout",
+            response_id: "response-1",
             partial_reason: this.terminalReason,
             recap: {
               nextAction: "raw partial recap",

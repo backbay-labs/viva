@@ -406,6 +406,16 @@ pub trait StudyMemoryStore: Send + Sync {
         Ok(StudySessionDurableCounts::default())
     }
 
+    async fn answer_attempt_was_recorded(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        _response_id: &str,
+    ) -> Result<bool, PortError> {
+        Ok(false)
+    }
+
     async fn claim_session_token_nonce(
         &self,
         claim: SessionTokenNonceClaim,

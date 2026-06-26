@@ -130,7 +130,7 @@ describe("Viva voice agent contract", () => {
       version: VIVA_VOICE_PROTOCOL_VERSION,
       event: {
         type: "recap_ready",
-        response_id: "partial-recap-provider-timeout",
+        response_id: "response-1",
         partial_reason: "provider_timeout",
         recap: {
           voice_session_id: "voice-session-1",
@@ -157,7 +157,7 @@ describe("Viva voice agent contract", () => {
         version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "recap_ready",
-          response_id: "partial-recap-raw",
+          response_id: "response-1",
           partial_reason: "raw provider payload",
           recap: {
             voice_session_id: "voice-session-1",
@@ -441,7 +441,7 @@ describe("Viva voice agent contract", () => {
 
   test("keeps fake Cartesia/Gemini evidence pack sanitized and tied to release contract", () => {
     expect(fakeEvidencePackFixture.client_frame_count).toBe(fakeSessionFixture.client.length);
-    expect(fakeEvidencePackFixture.server_frame_count).toBe(fakeSessionFixture.server.length - 1);
+    expect(fakeEvidencePackFixture.server_frame_count).toBe(fakeSessionFixture.server.length);
     expect(fakeEvidencePackFixture.store_snapshot).toEqual({
       sessions: 1,
       answer_attempts: 1,

@@ -2998,6 +2998,81 @@ async fn websocket_provider_timeout_after_partial_stage_success_records_partial_
 }
 
 #[tokio::test]
+async fn websocket_provider_failure_after_cancelled_turn_skips_partial_recap() {
+    let Some((frames, evidence, store)) =
+        run_partial_recap_provider_failure_probe_cancelled(TerminalSessionReason::ProviderTimeout)
+            .await
+    else {
+        return;
+    };
+
+    assert!(!frames.iter().any(|frame| {
+        matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::RecapReady {
+                        partial_reason: Some(TerminalSessionReason::ProviderTimeout),
+                        ..
+                    }
+                )
+        )
+    }));
+    assert!(frames.iter().any(|frame| {
+        terminal_session_reason(frame) == Some(TerminalSessionReason::ProviderTimeout)
+    }));
+    let counts = store.write_counts();
+    assert_eq!(counts.answer_attempts, 1);
+    assert_eq!(counts.recaps, 0);
+    assert!(evidence.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::PartialRecap
+            && event.detail.contains("reason=no_durable_response_id")
+    }));
+}
+
+#[tokio::test]
+async fn websocket_provider_failure_requires_current_response_answer_attempt() {
+    let Some((frames, evidence, store)) =
+        run_partial_recap_provider_failure_probe_with_prior_attempt_only(
+            TerminalSessionReason::ProviderRateLimited,
+        )
+        .await
+    else {
+        return;
+    };
+
+    assert!(!frames.iter().any(|frame| {
+        matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::RecapReady {
+                        partial_reason: Some(TerminalSessionReason::ProviderRateLimited),
+                        ..
+                    }
+                )
+        )
+    }));
+    assert!(frames.iter().any(|frame| {
+        terminal_session_reason(frame) == Some(TerminalSessionReason::ProviderRateLimited)
+    }));
+    let counts = store.write_counts();
+    assert_eq!(counts.answer_attempts, 1);
+    assert_eq!(counts.recaps, 0);
+    assert!(evidence.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::PartialRecap
+            && event
+                .detail
+                .contains("reason=response_answer_attempt_missing")
+            && event
+                .detail
+                .contains("response_id=response-partial-provider-failure")
+    }));
+}
+
+#[tokio::test]
 async fn websocket_stop_drain_provider_failure_emits_deterministic_partial_recap() {
     let Some((frames, evidence, store)) =
         run_partial_recap_provider_failure_probe_after_stop(TerminalSessionReason::ProviderTimeout)
@@ -9297,6 +9372,44 @@ async fn run_partial_recap_provider_failure_probe_after_stop_with_existing_recap
     run_partial_recap_provider_failure_probe_with_options(terminal_reason, false, true, true).await
 }
 
+async fn run_partial_recap_provider_failure_probe_cancelled(
+    terminal_reason: TerminalSessionReason,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
+    run_partial_recap_provider_failure_probe_with_extended_options(
+        terminal_reason,
+        false,
+        false,
+        false,
+        true,
+        false,
+        true,
+    )
+    .await
+}
+
+async fn run_partial_recap_provider_failure_probe_with_prior_attempt_only(
+    terminal_reason: TerminalSessionReason,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
+    run_partial_recap_provider_failure_probe_with_extended_options(
+        terminal_reason,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+    )
+    .await
+}
+
 async fn run_partial_recap_provider_failure_probe_with_stop(
     terminal_reason: TerminalSessionReason,
     record_concept_status: bool,
@@ -9325,6 +9438,31 @@ async fn run_partial_recap_provider_failure_probe_with_options(
     Vec<observe::VoiceEvidenceEvent>,
     Arc<data::InMemoryStudyStore>,
 )> {
+    run_partial_recap_provider_failure_probe_with_extended_options(
+        terminal_reason,
+        record_concept_status,
+        failure_after_stop,
+        recap_before_failure,
+        true,
+        false,
+        false,
+    )
+    .await
+}
+
+async fn run_partial_recap_provider_failure_probe_with_extended_options(
+    terminal_reason: TerminalSessionReason,
+    record_concept_status: bool,
+    failure_after_stop: bool,
+    recap_before_failure: bool,
+    record_current_answer_attempt: bool,
+    record_prior_answer_attempt: bool,
+    cancel_before_failure: bool,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let state = AppState::with_study_store(
         Arc::new(PartialRecapProviderFailureProbeBrain {
@@ -9333,6 +9471,9 @@ async fn run_partial_recap_provider_failure_probe_with_options(
             record_concept_status,
             failure_after_stop,
             recap_before_failure,
+            record_current_answer_attempt,
+            record_prior_answer_attempt,
+            cancel_before_failure,
         }),
         "partial_recap_probe",
         VoiceWsAccess::default(),
@@ -9928,6 +10069,9 @@ struct PartialRecapProviderFailureProbeBrain {
     record_concept_status: bool,
     failure_after_stop: bool,
     recap_before_failure: bool,
+    record_current_answer_attempt: bool,
+    record_prior_answer_attempt: bool,
+    cancel_before_failure: bool,
 }
 
 #[async_trait::async_trait]
@@ -9966,6 +10110,9 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
         let record_concept_status = self.record_concept_status;
         let failure_after_stop = self.failure_after_stop;
         let recap_before_failure = self.recap_before_failure;
+        let record_current_answer_attempt = self.record_current_answer_attempt;
+        let record_prior_answer_attempt = self.record_prior_answer_attempt;
+        let cancel_before_failure = self.cancel_before_failure;
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
         let task = tokio::spawn(async move {
@@ -9992,34 +10139,66 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                     BrainInput::Stop => break,
                     _ => continue,
                 };
-                let _ = study_store
-                    .record_answer_attempt_envelope(
-                        &user_id,
-                        &study_set_id,
-                        &voice_session_id,
-                        AnswerAttemptEnvelope {
-                            response_id: response_id.to_owned(),
-                            question_id: question.question_id.clone(),
-                            submission_sequence: 1,
-                            idempotency_key: format!(
-                                "{voice_session_id}:{}:1",
-                                question.question_id
-                            ),
-                            capture_mode: AnswerCaptureMode::Typed,
-                            byte_count: None,
-                            char_count,
-                            duration_ms: None,
-                            client_generation_id,
-                            locale: Some("en-US".to_owned()),
-                            capture_status: AnswerCaptureStatus::Accepted,
-                            content_policy: AnswerContentPolicy::None,
-                            answer_digest_hmac: None,
-                            transcript_status: None,
-                            transcript_confidence_bucket: None,
-                            pre_provider_state: "accepted_before_provider".to_owned(),
-                        },
-                    )
-                    .await;
+                if record_current_answer_attempt {
+                    let _ = study_store
+                        .record_answer_attempt_envelope(
+                            &user_id,
+                            &study_set_id,
+                            &voice_session_id,
+                            AnswerAttemptEnvelope {
+                                response_id: response_id.to_owned(),
+                                question_id: question.question_id.clone(),
+                                submission_sequence: 1,
+                                idempotency_key: format!(
+                                    "{voice_session_id}:{}:1",
+                                    question.question_id
+                                ),
+                                capture_mode: AnswerCaptureMode::Typed,
+                                byte_count: None,
+                                char_count,
+                                duration_ms: None,
+                                client_generation_id: client_generation_id.clone(),
+                                locale: Some("en-US".to_owned()),
+                                capture_status: AnswerCaptureStatus::Accepted,
+                                content_policy: AnswerContentPolicy::None,
+                                answer_digest_hmac: None,
+                                transcript_status: None,
+                                transcript_confidence_bucket: None,
+                                pre_provider_state: "accepted_before_provider".to_owned(),
+                            },
+                        )
+                        .await;
+                }
+                if record_prior_answer_attempt {
+                    let _ = study_store
+                        .record_answer_attempt_envelope(
+                            &user_id,
+                            &study_set_id,
+                            &voice_session_id,
+                            AnswerAttemptEnvelope {
+                                response_id: "response-prior-provider-failure".to_owned(),
+                                question_id: question.question_id.clone(),
+                                submission_sequence: 1,
+                                idempotency_key: format!(
+                                    "{voice_session_id}:{}:prior",
+                                    question.question_id
+                                ),
+                                capture_mode: AnswerCaptureMode::Typed,
+                                byte_count: None,
+                                char_count,
+                                duration_ms: None,
+                                client_generation_id,
+                                locale: Some("en-US".to_owned()),
+                                capture_status: AnswerCaptureStatus::Accepted,
+                                content_policy: AnswerContentPolicy::None,
+                                answer_digest_hmac: None,
+                                transcript_status: None,
+                                transcript_confidence_bucket: None,
+                                pre_provider_state: "accepted_before_provider".to_owned(),
+                            },
+                        )
+                        .await;
+                }
                 if record_concept_status {
                     let _ = study_store
                         .record_concept_status(
@@ -10072,6 +10251,13 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                         .send(BrainEvent::RecapReady {
                             response_id: response_id.to_owned(),
                             recap,
+                        })
+                        .await;
+                }
+                if cancel_before_failure {
+                    let _ = event_tx
+                        .send(BrainEvent::ResponseCancelledFor {
+                            response_id: response_id.to_owned(),
                         })
                         .await;
                 }
