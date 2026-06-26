@@ -995,6 +995,43 @@ describe("Viva library proxy", () => {
     }
   });
 
+  test("times out stalled upload request bodies before contacting the agent", async () => {
+    const calls: string[] = [];
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_LIBRARY_PROXY_TIMEOUT_MS = "5";
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        calls.push(String(input));
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { "content-type": "application/json" },
+          status: 201,
+        });
+      }) as typeof fetch;
+
+      const response = await Promise.race([
+        POST(stalledUploadRequest(), {
+          params: Promise.resolve({ path: ["study-sets", "files"] }),
+        }),
+        rejectAfter(100, "library upload request body read did not time out"),
+      ]);
+      const body = await response.json();
+
+      expect(response.status).toBe(504);
+      expect(calls).toEqual([]);
+      expect(body).toEqual({
+        error: "viva_library_pre_loop_timeout",
+        failure_class: "pre_loop_unavailable",
+        stage: "pre_loop",
+        terminal_reason: "pre_loop_upload_unavailable",
+      });
+      expect(JSON.stringify(body)).not.toContain("JVBERi0xLjc=");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_LIBRARY_PROXY_TIMEOUT_MS", originalProxyTimeout);
+    }
+  });
+
   test("uses the contract upload timeout when no proxy override is configured", async () => {
     const originalSetTimeout = globalThis.setTimeout;
     const scheduledTimeouts: number[] = [];
@@ -1082,6 +1119,63 @@ describe("Viva library proxy", () => {
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
     }
   });
+
+  test("preserves upstream control-route failures without pre-loop ingestion labels", async () => {
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (init?.method === "DELETE") {
+          return new Response(JSON.stringify({ error: "study_set_not_found" }), {
+            headers: { "content-type": "application/json" },
+            status: 404,
+          });
+        }
+        if (url.endsWith("/study-sets/export?user_id=user-1")) {
+          return new Response(JSON.stringify({ error: "control_token_required" }), {
+            headers: { "content-type": "application/json" },
+            status: 403,
+          });
+        }
+        return new Response(JSON.stringify({ error: "unexpected_route" }), {
+          headers: { "content-type": "application/json" },
+          status: 500,
+        });
+      }) as typeof fetch;
+
+      const exportRequest = {
+        headers: new Headers(),
+        method: "GET",
+        nextUrl: new URL("http://localhost:3000/api/viva-library/study-sets/export?user_id=user-1"),
+      } as unknown as NextRequest;
+      const exportResponse = await GET(exportRequest, {
+        params: Promise.resolve({ path: ["study-sets", "export"] }),
+      });
+      const exportBody = await exportResponse.json();
+
+      const deleteRequest = {
+        headers: new Headers({ "x-viva-library-control-token": "viva1.control-token" }),
+        method: "DELETE",
+        nextUrl: new URL(
+          "http://localhost:3000/api/viva-library/study-sets/biology-midterm?user_id=user-1",
+        ),
+      } as unknown as NextRequest;
+      const deleteResponse = await DELETE(deleteRequest, {
+        params: Promise.resolve({ path: ["study-sets", "biology-midterm"] }),
+      });
+      const deleteBody = await deleteResponse.json();
+
+      expect(exportResponse.status).toBe(403);
+      expect(exportBody).toEqual({ error: "control_token_required" });
+      expect(JSON.stringify(exportBody)).not.toContain("pre_loop_ingestion_unavailable");
+      expect(deleteResponse.status).toBe(404);
+      expect(deleteBody).toEqual({ error: "study_set_not_found" });
+      expect(JSON.stringify(deleteBody)).not.toContain("pre_loop_ingestion_unavailable");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+    }
+  });
 });
 
 function fileUploadRequest(): NextRequest {
@@ -1095,6 +1189,23 @@ function fileUploadRequest(): NextRequest {
     headers: { "content-type": "application/json" },
     method: "POST",
   }) as unknown as NextRequest;
+  Object.defineProperty(request, "nextUrl", {
+    value: new URL("http://localhost:3000/api/viva-library/study-sets/files"),
+  });
+  return request;
+}
+
+function stalledUploadRequest(): NextRequest {
+  const request = new Request("http://localhost:3000/api/viva-library/study-sets/files", {
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"title":"Bio PDF","stalled":"'));
+      },
+    }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+    duplex: "half",
+  } as RequestInit & { duplex: "half" }) as unknown as NextRequest;
   Object.defineProperty(request, "nextUrl", {
     value: new URL("http://localhost:3000/api/viva-library/study-sets/files"),
   });

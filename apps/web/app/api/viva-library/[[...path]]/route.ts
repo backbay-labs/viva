@@ -64,14 +64,18 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   );
   const terminalReason = libraryPreLoopTerminalReason(path, request.method);
   try {
+    const body =
+      request.method === "POST"
+        ? await requestTextWithAbort(request, controller.signal)
+        : undefined;
     const response = await fetch(upstream, {
-      body: request.method === "POST" ? await request.text() : undefined,
+      body,
       cache: "no-store",
       headers,
       method: request.method,
       signal: controller.signal,
     });
-    if (!response.ok) {
+    if (!response.ok && terminalReason) {
       return libraryPreLoopJsonError(502, "viva_library_pre_loop_unavailable", terminalReason);
     }
     const responseHeaders = new Headers();
@@ -83,17 +87,25 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
       snapshotFilter: serverBearer.snapshotFilter,
     });
     if (timedOut) {
-      return libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason);
+      return terminalReason
+        ? libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason)
+        : libraryProxyJsonError(504, "viva_library_proxy_timeout");
     }
     return new NextResponse(responseBody, {
       headers: responseHeaders,
       status: response.status,
     });
   } catch {
-    return libraryPreLoopJsonError(
+    if (terminalReason) {
+      return libraryPreLoopJsonError(
+        timedOut ? 504 : 502,
+        timedOut ? "viva_library_pre_loop_timeout" : "viva_library_pre_loop_unavailable",
+        terminalReason,
+      );
+    }
+    return libraryProxyJsonError(
       timedOut ? 504 : 502,
-      timedOut ? "viva_library_pre_loop_timeout" : "viva_library_pre_loop_unavailable",
-      terminalReason,
+      timedOut ? "viva_library_proxy_timeout" : "viva_library_proxy_unavailable",
     );
   } finally {
     clearTimeout(timeoutId);
@@ -116,12 +128,26 @@ function libraryPreLoopJsonError(
   );
 }
 
-function libraryPreLoopTerminalReason(path: string[], method: string): string {
+function libraryProxyJsonError(status: number, error: string): NextResponse {
+  return NextResponse.json({ error }, { status });
+}
+
+function libraryPreLoopTerminalReason(path: string[], method: string): string | null {
   const route = path.join("/");
-  if (method === "POST" && route === "study-sets/files") {
+  if (
+    method === "POST" &&
+    (route === "study-sets/files" ||
+      (path.length === 4 && path[0] === "study-sets" && path[2] === "files" && path[3] === "retry"))
+  ) {
     return "pre_loop_upload_unavailable";
   }
-  return "pre_loop_ingestion_unavailable";
+  if (
+    (method === "GET" && route === "study-sets/library") ||
+    (method === "POST" && route === "study-sets/paste")
+  ) {
+    return "pre_loop_ingestion_unavailable";
+  }
+  return null;
 }
 
 function vivaLibraryProxyTimeoutMs(path: string[], method: string): number {
@@ -130,6 +156,36 @@ function vivaLibraryProxyTimeoutMs(path: string[], method: string): number {
   return libraryPreLoopTerminalReason(path, method) === "pre_loop_upload_unavailable"
     ? DEFAULT_LIBRARY_UPLOAD_PROXY_TIMEOUT_MS
     : DEFAULT_LIBRARY_PROXY_TIMEOUT_MS;
+}
+
+async function requestTextWithAbort(request: NextRequest, signal: AbortSignal): Promise<string> {
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let abortHandler: (() => void) | undefined;
+  const abortError = new Error("viva_library_proxy_timeout");
+  const abort = new Promise<never>((_, reject) => {
+    abortHandler = () => {
+      void reader.cancel().catch(() => undefined);
+      reject(abortError);
+    };
+    signal.addEventListener("abort", abortHandler, { once: true });
+  });
+
+  try {
+    while (true) {
+      if (signal.aborted) throw abortError;
+      const chunk = await Promise.race([reader.read(), abort]);
+      if (signal.aborted) throw abortError;
+      if (chunk.done) break;
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    if (abortHandler) signal.removeEventListener("abort", abortHandler);
+    reader.releaseLock();
+  }
 }
 
 function vivaAgentServerHttpBaseUrl(): string | null {
