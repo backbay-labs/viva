@@ -17,7 +17,11 @@ import {
   parseFailureControlSessionTarget,
 } from "./failure-control-harness.mjs";
 import { auditTextArtifacts } from "./redaction-control.mjs";
-import { buildHostedBrowserEvidence, withHostedEvidenceAudit } from "./hosted-e2e-matrix.mjs";
+import {
+  buildHostedBrowserEvidence,
+  hostedEvidenceStageForScenario,
+  withHostedEvidenceAudit,
+} from "./hosted-e2e-matrix.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactDir = path.resolve(
@@ -512,12 +516,12 @@ try {
         ? "completed"
         : null);
   const hostedEvidenceStage =
-    failureControlTerminalProof?.stage ??
-    (deterministicPartialRecapScenario && recapPayloadVisible
-      ? "websocket"
-      : recapPayloadVisible
-        ? "feedback"
-        : null);
+    hostedEvidenceStageForScenario({
+      deterministicPartialRecap: deterministicPartialRecapScenario,
+      failureControlStage: failureControlTerminalProof?.stage ?? null,
+      recapVisible: recapPayloadVisible,
+      scenarioId: hostedScenarioId,
+    });
   let result = {
     artifact_dir: path.relative(root, artifactDir),
     agent_provider: agentProvider,

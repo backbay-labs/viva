@@ -6,6 +6,7 @@ import {
   buildHostedBrowserEvidence,
   buildHostedE2eMatrixContract,
   failureControlScenarioIdsForProfile,
+  hostedEvidenceStageForScenario,
   HOSTED_E2E_MATRIX_SCHEMA,
   HOSTED_E2E_MONITOR_POLICY_SCHEMA,
   HOSTED_E2E_RESULT_SCHEMA,
@@ -112,6 +113,53 @@ test("hosted PR profile expands to every deterministic failure-control scenario"
   assert.throws(() => scenariosForProfile("typo"), /unsupported hosted E2E matrix profile/);
 });
 
+test("hosted matrix contract can publish a selected PR scenario subset", () => {
+  const contract = buildHostedE2eMatrixContract({
+    mode: "pr",
+    profile: "full",
+    runId: "subset-run",
+    scenarioIds: [
+      "happy_path",
+      "fake_provider_happy_path",
+      "token_free_session_history",
+      "deterministic_partial_recap",
+      "provider_rate_limited",
+      "provider_timeout",
+    ],
+    scenarioSubset: {
+      selected: true,
+      configured_env: "VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS",
+      scenario_ids: [
+        "happy_path",
+        "fake_provider_happy_path",
+        "token_free_session_history",
+        "deterministic_partial_recap",
+        "provider_rate_limited",
+        "provider_timeout",
+      ],
+    },
+  });
+
+  assert.equal(contract.scenario_count, 6);
+  assert.equal(contract.scenario_subset.selected, true);
+  assert.deepEqual(
+    contract.scenarios.map((scenario) => scenario.id),
+    [
+      "happy_path",
+      "fake_provider_happy_path",
+      "token_free_session_history",
+      "deterministic_partial_recap",
+      "provider_rate_limited",
+      "provider_timeout",
+    ],
+  );
+  assert.doesNotThrow(() => assertHostedE2eMatrixContract(contract));
+  assert.throws(
+    () => buildHostedE2eMatrixContract({ scenarioIds: ["unknown_scenario"] }),
+    /unknown hosted E2E matrix scenario/,
+  );
+});
+
 test("hosted failure-control rows only expect recap success for recap-stage scenarios", () => {
   const rows = scenariosForProfile("full", "pr");
 
@@ -123,6 +171,33 @@ test("hosted failure-control rows only expect recap success for recap-stage scen
     rows.find((scenario) => scenario.id === "deterministic_partial_recap").recap_success_expected,
     true,
   );
+});
+
+test("hosted browser evidence stage matches scenario-specific matrix rows", () => {
+  assert.equal(
+    hostedEvidenceStageForScenario({
+      recapVisible: true,
+      scenarioId: "token_free_session_history",
+    }),
+    "client",
+  );
+  assert.equal(
+    hostedEvidenceStageForScenario({
+      deterministicPartialRecap: true,
+      recapVisible: true,
+      scenarioId: "deterministic_partial_recap",
+    }),
+    "websocket",
+  );
+  assert.equal(
+    hostedEvidenceStageForScenario({
+      failureControlStage: "gemini",
+      recapVisible: true,
+      scenarioId: "provider_rate_limited",
+    }),
+    "gemini",
+  );
+  assert.equal(hostedEvidenceStageForScenario({ recapVisible: true }), "feedback");
 });
 
 test("hosted monitor policy caps live cadence and self-quarantines sustained provider 429s", () => {

@@ -315,7 +315,10 @@ fn fake_cartesia_gemini_state_with_store(
 
 #[tokio::test]
 async fn ready_and_brain_health_routes_report_configured_synthetic_provider() {
-    let app = build_router(test_state(4));
+    let app = build_router(test_state(4).with_voice_limits(VoiceLimitConfig {
+        max_session_cost_usd: Some(0.25),
+        ..VoiceLimitConfig::default()
+    }));
 
     let ready = app
         .clone()
@@ -337,6 +340,11 @@ async fn ready_and_brain_health_routes_report_configured_synthetic_provider() {
         serde_json::from_slice::<serde_json::Value>(&ready_body).unwrap()["store"]["durable"],
         false
     );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&ready_body).unwrap()["voice_limits"]
+            ["max_session_cost_usd"],
+        0.25
+    );
 
     let brain = app
         .oneshot(
@@ -355,6 +363,11 @@ async fn ready_and_brain_health_routes_report_configured_synthetic_provider() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&brain_body).unwrap()["brain"]["selectable"],
         true
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&brain_body).unwrap()["voice_limits"]
+            ["max_session_cost_usd"],
+        0.25
     );
 }
 

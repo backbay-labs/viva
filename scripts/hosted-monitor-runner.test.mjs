@@ -91,7 +91,15 @@ test("hosted monitor plan runs scheduled synthetic browser proof against hosted 
 test("hosted monitor scheduled live opt-in runs bounded live smoke", () => {
   const plan = buildHostedMonitorPlan({
     ...baseEnv,
+    VIVA_HOSTED_LIVE_MONITOR_AGENT_HTTP_URL: "https://live-agent.example.com/",
+    VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD: "0.25",
+    VIVA_HOSTED_LIVE_MONITOR_AGENT_WS_URL: "wss://live-agent.example.com/ws",
     VIVA_HOSTED_LIVE_MONITOR_ENABLED: "1",
+    VIVA_HOSTED_LIVE_MONITOR_REST_BEARER_TOKEN: "redacted-live-rest-bearer",
+    VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY: "1",
+    VIVA_HOSTED_LIVE_MONITOR_STATE_DATE: "2026-06-23",
+    VIVA_HOSTED_LIVE_MONITOR_WEB_URL: "https://live-web.example.com/",
+    VIVA_HOSTED_LIVE_MONITOR_NOW: "2026-06-23T19:20:00.000Z",
   });
 
   assert.deepEqual(
@@ -102,15 +110,86 @@ test("hosted monitor scheduled live opt-in runs bounded live smoke", () => {
   assert.equal(plan.runs[1].resultFileName, "evidence.json");
   assert.equal(plan.runs[1].env.VIVA_LIVE_PROVIDER_SMOKE, "1");
   assert.equal(plan.runs[1].env.VIVA_AGENT_PROVIDER, "cartesia_gemini");
-  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_AGENT_HTTP_URL, "https://agent.example.com");
-  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_AGENT_WS_URL, "wss://agent.example.com/ws");
-  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_ORIGIN, "https://web.example.com");
+  assert.equal(
+    plan.runs[1].env.VIVA_LIVE_SMOKE_AGENT_HTTP_URL,
+    "https://live-agent.example.com",
+  );
+  assert.equal(
+    plan.runs[1].env.VIVA_LIVE_SMOKE_AGENT_WS_URL,
+    "wss://live-agent.example.com/ws",
+  );
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_ORIGIN, "https://live-web.example.com");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_DURATION_MS, "90000");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_TURNS, "1");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES, "262144");
+  assert.equal(plan.runs[1].env.VIVA_VOICE_WS_BEARER_TOKEN, "redacted-live-rest-bearer");
   assert.equal(plan.runs[1].env.VIVA_VOICE_WS_MAX_SESSION_COST_USD, "0.25");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD, "0.25");
   assert.equal(plan.runs[1].env.VIVA_HOSTED_LIVE_MONITOR_BUDGET_BUCKET, "viva-monitor-live-smoke");
   assert.equal(plan.runs[1].timeoutMs, 120000);
+  assert.equal(plan.liveMonitor.should_run, true);
+  assert.equal(plan.liveMonitor.runs_today, 1);
+});
+
+test("hosted monitor scheduled live opt-in gates cadence and daily budget before scheduling", () => {
+  const cadence = buildHostedMonitorPlan({
+    ...baseEnv,
+    VIVA_HOSTED_LIVE_MONITOR_ENABLED: "1",
+    VIVA_HOSTED_LIVE_MONITOR_LAST_RUN_AT: "2026-06-23T18:20:00.000Z",
+    VIVA_HOSTED_LIVE_MONITOR_NOW: "2026-06-23T19:20:00.000Z",
+    VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY: "1",
+    VIVA_HOSTED_LIVE_MONITOR_STATE_DATE: "2026-06-23",
+  });
+  assert.deepEqual(
+    cadence.runs.map((run) => run.name),
+    ["scheduled_hosted_synthetic_monitor"],
+  );
+  assert.equal(cadence.liveMonitor.skip_reason, "cadence_wait");
+
+  const dailyBudget = buildHostedMonitorPlan({
+    ...baseEnv,
+    VIVA_HOSTED_LIVE_MONITOR_ENABLED: "1",
+    VIVA_HOSTED_LIVE_MONITOR_NOW: "2026-06-23T19:20:00.000Z",
+    VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY: "2",
+    VIVA_HOSTED_LIVE_MONITOR_STATE_DATE: "2026-06-23",
+  });
+  assert.deepEqual(
+    dailyBudget.runs.map((run) => run.name),
+    ["scheduled_hosted_synthetic_monitor"],
+  );
+  assert.equal(dailyBudget.liveMonitor.skip_reason, "daily_budget_exhausted");
+});
+
+test("hosted monitor scheduled live opt-in requires remote cap evidence for runnable live targets", () => {
+  assert.throws(
+    () =>
+      buildHostedMonitorPlan({
+        ...baseEnv,
+        VIVA_HOSTED_LIVE_MONITOR_AGENT_HTTP_URL: "https://live-agent.example.com/",
+        VIVA_HOSTED_LIVE_MONITOR_AGENT_WS_URL: "wss://live-agent.example.com/ws",
+        VIVA_HOSTED_LIVE_MONITOR_ENABLED: "1",
+        VIVA_HOSTED_LIVE_MONITOR_NOW: "2026-06-23T19:20:00.000Z",
+        VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY: "0",
+        VIVA_HOSTED_LIVE_MONITOR_STATE_DATE: "2026-06-23",
+        VIVA_HOSTED_LIVE_MONITOR_WEB_URL: "https://live-web.example.com/",
+      }),
+    /VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD/,
+  );
+  assert.throws(
+    () =>
+      buildHostedMonitorPlan({
+        ...baseEnv,
+        VIVA_HOSTED_LIVE_MONITOR_AGENT_HTTP_URL: "https://live-agent.example.com/",
+        VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD: "0.5",
+        VIVA_HOSTED_LIVE_MONITOR_AGENT_WS_URL: "wss://live-agent.example.com/ws",
+        VIVA_HOSTED_LIVE_MONITOR_ENABLED: "1",
+        VIVA_HOSTED_LIVE_MONITOR_NOW: "2026-06-23T19:20:00.000Z",
+        VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY: "0",
+        VIVA_HOSTED_LIVE_MONITOR_STATE_DATE: "2026-06-23",
+        VIVA_HOSTED_LIVE_MONITOR_WEB_URL: "https://live-web.example.com/",
+      }),
+    /must be less than or equal to the hosted live monitor policy cap/,
+  );
 });
 
 test("hosted monitor scheduled mode refuses PR matrix profiles", () => {
@@ -199,6 +278,19 @@ test("hosted monitor PR mode allows a smaller explicit failure-control scenario 
 
   assert.deepEqual(
     plan.runs.map((run) => run.scenario_id),
+    [
+      "happy_path",
+      "fake_provider_happy_path",
+      "token_free_session_history",
+      "deterministic_partial_recap",
+      "provider_rate_limited",
+      "provider_timeout",
+    ],
+  );
+  assert.equal(plan.matrix.scenario_count, 6);
+  assert.equal(plan.matrix.scenario_subset.selected, true);
+  assert.deepEqual(
+    plan.matrix.scenarios.map((scenario) => scenario.id),
     [
       "happy_path",
       "fake_provider_happy_path",

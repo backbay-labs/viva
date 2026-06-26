@@ -149,6 +149,7 @@ export const HOSTED_E2E_SCENARIOS = Object.freeze([
 const failureControlScenarioIdSet = new Set(
   FAILURE_CONTROL_SCENARIO_ROWS.map((entry) => entry.control_scenario_id),
 );
+const hostedScenarioIdSet = new Set(HOSTED_E2E_SCENARIOS.map((entry) => entry.id));
 
 export const HOSTED_MONITOR_POLICY = Object.freeze({
   schema: HOSTED_E2E_MONITOR_POLICY_SCHEMA,
@@ -191,8 +192,10 @@ export function buildHostedE2eMatrixContract({
   mode = "pr",
   profile = defaultMatrixProfile(mode),
   runId = null,
+  scenarioIds = null,
+  scenarioSubset = null,
 } = {}) {
-  const scenarios = scenariosForProfile(profile, mode);
+  const scenarios = scenariosForProfileInternal(profile, mode, { scenarioIds });
   return {
     schema: HOSTED_E2E_MATRIX_SCHEMA,
     generated_at: generatedAt,
@@ -206,6 +209,7 @@ export function buildHostedE2eMatrixContract({
     },
     monitor_policy: HOSTED_MONITOR_POLICY,
     scenario_count: scenarios.length,
+    ...(scenarioSubset ? { scenario_subset: scenarioSubset } : {}),
     scenarios,
     stop_rules: {
       ready_endpoint_alone_counts: false,
@@ -223,6 +227,10 @@ export function defaultMatrixProfile(mode) {
 }
 
 export function scenariosForProfile(profile, mode = "pr") {
+  return scenariosForProfileInternal(profile, mode);
+}
+
+function scenariosForProfileInternal(profile, mode = "pr", { scenarioIds = null } = {}) {
   const normalized = profile || defaultMatrixProfile(mode);
   if (!SUPPORTED_MATRIX_PROFILES.has(normalized)) {
     throw new Error(
@@ -231,11 +239,22 @@ export function scenariosForProfile(profile, mode = "pr") {
       ).join(", ")}`,
     );
   }
-  if (normalized === "contract") return HOSTED_E2E_SCENARIOS;
-  if (normalized === "full") {
-    return HOSTED_E2E_SCENARIOS.filter((entry) => entry.profiles.includes("pr"));
+  let scenarios;
+  if (normalized === "contract") scenarios = HOSTED_E2E_SCENARIOS;
+  else if (normalized === "full") {
+    scenarios = HOSTED_E2E_SCENARIOS.filter((entry) => entry.profiles.includes("pr"));
+  } else {
+    scenarios = HOSTED_E2E_SCENARIOS.filter((entry) => entry.profiles.includes(normalized));
   }
-  return HOSTED_E2E_SCENARIOS.filter((entry) => entry.profiles.includes(normalized));
+  if (!scenarioIds) return scenarios;
+  const selectedIds = Array.from(new Set(scenarioIds));
+  for (const id of selectedIds) {
+    if (!hostedScenarioIdSet.has(id)) {
+      throw new Error(`unknown hosted E2E matrix scenario ${id}`);
+    }
+  }
+  const selectedIdSet = new Set(selectedIds);
+  return scenarios.filter((entry) => selectedIdSet.has(entry.id));
 }
 
 export function failureControlScenarioIdsForProfile({
@@ -322,6 +341,18 @@ export function buildHostedBrowserEvidence({
   };
 }
 
+export function hostedEvidenceStageForScenario({
+  deterministicPartialRecap = false,
+  failureControlStage = null,
+  recapVisible = false,
+  scenarioId = null,
+} = {}) {
+  if (failureControlStage) return failureControlStage;
+  if (deterministicPartialRecap && recapVisible) return "websocket";
+  if (scenarioId === "token_free_session_history" && recapVisible) return "client";
+  return recapVisible ? "feedback" : null;
+}
+
 export function withHostedEvidenceAudit(result, artifactAudit) {
   if (!result?.hosted_e2e) return result;
   return {
@@ -387,22 +418,25 @@ export function assertHostedE2eMatrixContract(contract) {
     if (!scenarioRow.runner) failures.push(`${scenarioRow.id} must name runner`);
     if (scenarioRow.sanitized !== true) failures.push(`${scenarioRow.id} must be sanitized`);
   }
-  for (const required of [
-    "happy_path",
-    "provider_rate_limited",
-    "provider_timeout",
-    "silent_stall",
-    "provider_auth_failed",
-    "provider_malformed_stream",
-    "invalid_token",
-    "expired_token",
-    "replayed_token",
-    "double_submit_race",
-    "mic_denied",
-    "typed_fallback",
-    "token_free_session_history",
-    "deterministic_partial_recap",
-  ]) {
+  const requiredScenarioIds = contract?.scenario_subset?.selected
+    ? []
+    : [
+        "happy_path",
+        "provider_rate_limited",
+        "provider_timeout",
+        "silent_stall",
+        "provider_auth_failed",
+        "provider_malformed_stream",
+        "invalid_token",
+        "expired_token",
+        "replayed_token",
+        "double_submit_race",
+        "mic_denied",
+        "typed_fallback",
+        "token_free_session_history",
+        "deterministic_partial_recap",
+      ];
+  for (const required of requiredScenarioIds) {
     if (!ids.has(required)) failures.push(`matrix scenario missing: ${required}`);
   }
   if (failures.length > 0) {

@@ -435,10 +435,14 @@ VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS="provider_rate_limited,provider_timeout
 ```
 
 The full PR manifest publishes under `viva-hosted-monitor/pr/<run_id>/` and
-records one sanitized `hosted_e2e` result summary per scenario. The matrix
-contract also names future product slices for ingestion/pre-loop failure
-(`BAC-532`) and second-tab reconciliation (`BAC-535`) without treating them as
-passing default PR legs before their owning product issues land.
+records one sanitized `hosted_e2e` result summary per scenario. When
+`VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS` names a smaller subset, the published
+matrix is filtered to the four PR browser legs plus the selected
+failure-control rows and includes `scenario_subset` metadata, so consumers do
+not treat unexecuted failure controls as covered. The matrix contract also names
+future product slices for ingestion/pre-loop failure (`BAC-532`) and second-tab
+reconciliation (`BAC-535`) without treating them as passing default PR legs
+before their owning product issues land.
 
 The optional live monitor is low cadence and opt-in only:
 
@@ -452,13 +456,17 @@ quota evidence are current. The BAC-524 policy caps it to one turn, 90 seconds,
 8192 tokens per day, at most two runs per day, and a minimum six-hour cadence.
 The live monitor must charge the separate `viva-monitor-live-smoke` budget
 bucket, never learner traffic. When enabled, the scheduled runner adds
-`scheduled_hosted_live_smoke`, invokes `bun run live:smoke`, passes the policy
-caps as `VIVA_LIVE_SMOKE_*` and `VIVA_VOICE_WS_MAX_SESSION_COST_USD`, publishes
-the sanitized live-smoke evidence beside the browser proof, and records the
-self-quarantine cooldown evidence when the smoke terminates with
-`provider_rate_limited` / `quota_rate_failure`. If the monitor itself observes
-two consecutive provider-rate-limit terminal results inside one hour,
-self-quarantine live runs for six hours and dedupe alerts for 30 minutes.
+`scheduled_hosted_live_smoke` only when persisted scheduler state proves the
+minimum cadence, daily budget, and self-quarantine gates are open. It invokes
+`bun run live:smoke` against the dedicated live-monitor target, maps the hosted
+bearer into `VIVA_VOICE_WS_BEARER_TOKEN`, passes the policy caps as
+`VIVA_LIVE_SMOKE_*`, `VIVA_VOICE_WS_MAX_SESSION_COST_USD`, and
+`VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD`, publishes the sanitized
+live-smoke evidence beside the browser proof, and records the self-quarantine
+cooldown evidence when the smoke terminates with `provider_rate_limited` /
+`quota_rate_failure`. If the monitor itself observes two consecutive
+provider-rate-limit terminal results inside one hour, self-quarantine live runs
+for six hours and dedupe alerts for 30 minutes.
 
 Common monitor variables:
 
@@ -514,9 +522,20 @@ scenario.
 
 When `VIVA_HOSTED_LIVE_MONITOR_ENABLED=1`, also provide the live provider
 secrets, zero-retention confirmations, and local PCM input expected by
-`bun run live:smoke`:
+`bun run live:smoke`, plus persisted scheduler state and a dedicated
+live-provider target whose deployed agent reports the same remote cost cap on
+`/ready` and `/health/brain`:
 
 ```sh
+VIVA_HOSTED_LIVE_MONITOR_STATE_DATE="2026-06-26"
+VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY=0
+VIVA_HOSTED_LIVE_MONITOR_LAST_RUN_AT="2026-06-26T00:00:00.000Z"
+VIVA_HOSTED_LIVE_MONITOR_QUARANTINED_UNTIL=""
+VIVA_HOSTED_LIVE_MONITOR_WEB_URL="https://viva-live-monitor-web.example.com"
+VIVA_HOSTED_LIVE_MONITOR_AGENT_HTTP_URL="https://viva-live-monitor-agent.example.com"
+VIVA_HOSTED_LIVE_MONITOR_AGENT_WS_URL="wss://viva-live-monitor-agent.example.com/ws"
+VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD=0.25
+VIVA_HOSTED_LIVE_MONITOR_REST_BEARER_TOKEN="<optional live monitor REST auth secret>"
 VIVA_AGENT_PROVIDER="cartesia_gemini"
 CARTESIA_ZERO_DATA_RETENTION_ENABLED=1
 GEMINI_ZERO_DATA_RETENTION_APPROVED=1
@@ -526,15 +545,19 @@ VIVA_LIVE_SMOKE_AUDIO_FILE="/app/evidence/live-smoke-answer.pcm"
 ```
 
 The hosted agent URL must point at a synthetic or fake monitor deployment whose
-provider matches `VIVA_E2E_AGENT_PROVIDER`; do not aim the scheduled monitor at a
-live learner tutor endpoint. The control secret and session signing secret must
-come from the deployment secret store and must match the hosted agent variables.
-The PR failure-control leg must use its own hosted web and agent target that is
-preconfigured with matching `VIVA_FAILURE_CONTROL_*` gates; the normal synthetic
-leg and failure-control leg must not share one hosted agent origin. The runner
-identity must be an allowlisted synthetic monitor identity, never a learner or
-real tester. Do not print secret values while checking variables; verify presence
-by key name and service configuration only.
+provider matches `VIVA_E2E_AGENT_PROVIDER`; do not aim the scheduled synthetic
+monitor at a live learner tutor endpoint. The live-monitor URL must point at a
+separate `cartesia_gemini` deployment configured with
+`VIVA_VOICE_WS_MAX_SESSION_COST_USD=0.25` or lower; `bun run live:smoke` rejects
+the target if readiness omits that cap or reports a higher cap. The control
+secret and session signing secret must come from the deployment secret store and
+must match the hosted agent variables. The PR failure-control leg must use its
+own hosted web and agent target that is preconfigured with matching
+`VIVA_FAILURE_CONTROL_*` gates; the normal synthetic leg, live-monitor leg, and
+failure-control leg must not share one hosted agent origin. The runner identity
+must be an allowlisted synthetic monitor identity, never a learner or real
+tester. Do not print secret values while checking variables; verify presence by
+key name and service configuration only.
 
 The hosted monitor evidence is safe to attach only after `manifest.json` reports
 `learner_identity_used: false`, each run reports `sanitized: true`, and the

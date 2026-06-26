@@ -101,6 +101,10 @@ export function buildLiveSmokeConfig({ env = process.env, rootDir = root } = {})
     caps,
     deploySha,
     enabled,
+    expectedRemoteMaxSessionCostUsd: optionalPositiveNumber(
+      env,
+      "VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD",
+    ),
     httpBaseUrl,
     liveMonitorConsecutiveFailures: optionalNonNegativeInteger(
       env.VIVA_LIVE_MONITOR_CONSECUTIVE_FAILURES,
@@ -168,6 +172,18 @@ export async function runLiveProviderSmoke({
       monitor: failedMonitorEvidence(monitorConfig, terminalReason),
       readiness,
       terminal_reason: terminalReason,
+    };
+    auditLiveSmokeEvidence(evidence, env);
+    return evidence;
+  }
+  if (!remoteCostCapPasses(readiness, config)) {
+    const evidence = {
+      ...base,
+      status: "failed",
+      failure_stage: "readiness",
+      failure: liveProviderFailureForSmokeReason("cost_budget"),
+      readiness,
+      terminal_reason: "cost_budget",
     };
     auditLiveSmokeEvidence(evidence, env);
     return evidence;
@@ -342,6 +358,12 @@ async function collectReadiness(config, fetchImpl) {
       selectable: healthBrain.selectable === true && readyBrain.selectable === true,
       live_runtime: healthBrain.live_runtime === true || readyBrain.live_runtime === true,
     },
+    voice_limits: {
+      max_session_cost_usd: numberOrNull(
+        ready.body?.voice_limits?.max_session_cost_usd ??
+          health.body?.voice_limits?.max_session_cost_usd,
+      ),
+    },
     store: {
       backend: healthStoreFields.backend ?? readyStoreFields.backend ?? null,
       observed: healthStore !== null || readyStore !== null,
@@ -405,6 +427,17 @@ function readinessIsAccessOrProbeFailure(readiness) {
   return (
     readiness.store.observed !== true &&
     (readiness.ready_http_status !== 200 || readiness.health_http_status !== 200)
+  );
+}
+
+function remoteCostCapPasses(readiness, config) {
+  if (config.expectedRemoteMaxSessionCostUsd == null) return true;
+  const reported = readiness.voice_limits?.max_session_cost_usd;
+  return (
+    typeof reported === "number" &&
+    Number.isFinite(reported) &&
+    reported > 0 &&
+    reported <= config.expectedRemoteMaxSessionCostUsd
   );
 }
 
@@ -870,6 +903,9 @@ function readinessUnavailable() {
       provider: null,
       selectable: false,
     },
+    voice_limits: {
+      max_session_cost_usd: null,
+    },
     store: {
       available: false,
       backend: null,
@@ -951,6 +987,16 @@ function optionalNonNegativeInteger(value) {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isSafeInteger(parsed)) {
     throw new Error("invalid live monitor consecutive failure count");
+  }
+  return parsed;
+}
+
+function optionalPositiveNumber(env, name) {
+  const value = env[name]?.trim();
+  if (!value) return null;
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`invalid live smoke cap ${name}`);
   }
   return parsed;
 }
@@ -1066,6 +1112,10 @@ function base64Url(value) {
 
 function integerOrNull(value) {
   return Number.isInteger(value) ? value : null;
+}
+
+function numberOrNull(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function stringOrNull(value) {

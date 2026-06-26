@@ -495,6 +495,9 @@ async fn ready(
                 "selectable": brain.selectable,
                 "live_runtime": brain.live_runtime,
             },
+            "voice_limits": {
+                "max_session_cost_usd": state.voice_limits.max_session_cost_usd,
+            },
             "store": {
                 "backend": store.backend.as_str(),
                 "available": store.available,
@@ -548,6 +551,9 @@ async fn brain_health(
                 "configured": brain.configured,
                 "selectable": brain.selectable,
                 "live_runtime": brain.live_runtime,
+            },
+            "voice_limits": {
+                "max_session_cost_usd": state.voice_limits.max_session_cost_usd,
             },
             "store": {
                 "backend": store.backend.as_str(),

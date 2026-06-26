@@ -19,6 +19,26 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const hostedArtifactRoot = path.join(root, "artifacts/hosted-monitor");
 const defaultRunTimeoutMs = 10 * 60 * 1000;
 const defaultPublishTimeoutMs = 2 * 60 * 1000;
+const forbiddenArtifactMarkers = [
+  "pcm16_base64",
+  "answer_text",
+  "transcript_final",
+  "source_context",
+  "pasted_text",
+  "session_token",
+  "viva1.",
+  "session-secret",
+  "CARTESIA_API_KEY",
+  "GEMINI_API_KEY",
+  "Bearer ",
+  "bearer.",
+];
+const PR_BROWSER_SCENARIO_IDS = Object.freeze([
+  "happy_path",
+  "fake_provider_happy_path",
+  "token_free_session_history",
+  "deterministic_partial_recap",
+]);
 
 export function buildHostedMonitorPlan(env = process.env) {
   const mode = (env.VIVA_HOSTED_RUNNER_MODE || "scheduled").trim();
@@ -45,10 +65,30 @@ export function buildHostedMonitorPlan(env = process.env) {
   );
   const matrixProfile = matrixProfileForMode(env, mode);
   const deploySha = (env.VIVA_HOSTED_DEPLOY_SHA || env.GITHUB_SHA || "").trim();
+  const failureControlScenarioIds =
+    mode === "pr"
+      ? failureControlScenarioIdsForProfile({
+          configuredValue: env.VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS ?? "",
+          profile: matrixProfile,
+        })
+      : [];
+  const explicitFailureControlSubset =
+    mode === "pr" && hasExplicitFailureControlScenarioSubset(env);
+  const matrixScenarioIds = explicitFailureControlSubset
+    ? [...PR_BROWSER_SCENARIO_IDS, ...failureControlScenarioIds]
+    : null;
   const matrix = buildHostedE2eMatrixContract({
     mode,
     profile: matrixProfile,
     runId,
+    scenarioIds: matrixScenarioIds,
+    scenarioSubset: explicitFailureControlSubset
+      ? {
+          selected: true,
+          configured_env: "VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS",
+          scenario_ids: matrixScenarioIds,
+        }
+      : null,
   });
   const artifactPrefix = `viva-hosted-monitor/${mode}/${runId}`;
   const baseTarget = hostedTargetFromEnv(env, {
@@ -80,13 +120,6 @@ export function buildHostedMonitorPlan(env = process.env) {
           webName: "VIVA_HOSTED_FAKE_PROVIDER_WEB_URL",
         })
       : null;
-  const failureControlScenarioIds =
-    mode === "pr"
-      ? failureControlScenarioIdsForProfile({
-          configuredValue: env.VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS ?? "",
-          profile: matrixProfile,
-        })
-      : [];
   const failureControlTargets =
     mode === "pr"
       ? new Map(
@@ -98,6 +131,21 @@ export function buildHostedMonitorPlan(env = process.env) {
           ]),
         )
       : new Map();
+  const liveMonitorDecision =
+    mode === "scheduled"
+      ? liveMonitorScheduleDecision(
+          env,
+          matrix.monitor_policy.live_monitor,
+          matrix.monitor_policy.self_quarantine,
+        )
+      : {
+          enabled: false,
+          should_run: false,
+          skip_reason: "pr_mode",
+        };
+  const liveMonitorConfig = liveMonitorDecision.should_run
+    ? hostedLiveMonitorConfigFromEnv(env, matrix.monitor_policy.live_monitor)
+    : null;
   const scheduledRuns = [
     {
       name: "scheduled_hosted_synthetic_monitor",
@@ -108,13 +156,14 @@ export function buildHostedMonitorPlan(env = process.env) {
       }),
       timeoutMs: runTimeoutMs,
     },
-    ...(hostedLiveMonitorEnabled(env)
+    ...(liveMonitorDecision.should_run
       ? [
           scheduledLiveMonitorRun(
-            baseTarget,
+            liveMonitorConfig.target,
             matrix.monitor_policy.live_monitor,
             runTimeoutMs,
             runId,
+            liveMonitorConfig,
           ),
         ]
       : []),
@@ -191,6 +240,7 @@ export function buildHostedMonitorPlan(env = process.env) {
     hostedAgentHttpUrl: baseTarget.agentHttpUrl,
     hostedAgentWsUrl: baseTarget.agentWsUrl,
     hostedWebUrl: baseTarget.webUrl,
+    liveMonitor: liveMonitorDecision,
     matrix,
     matrixProfile,
     mode,
@@ -268,11 +318,115 @@ function runEnv(baseEnv, target, extra = {}) {
   };
 }
 
-function hostedLiveMonitorEnabled(env) {
-  return env.VIVA_HOSTED_LIVE_MONITOR_ENABLED === "1";
+function hasExplicitFailureControlScenarioSubset(env) {
+  return (env.VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS ?? "").trim().length > 0;
 }
 
-function scheduledLiveMonitorRun(target, livePolicy, runTimeoutMs, runId) {
+function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
+  if (env.VIVA_HOSTED_LIVE_MONITOR_ENABLED !== "1") {
+    return {
+      enabled: false,
+      should_run: false,
+      skip_reason: "disabled",
+    };
+  }
+  const now = dateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_NOW", new Date());
+  const stateDate = (env.VIVA_HOSTED_LIVE_MONITOR_STATE_DATE ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(stateDate)) {
+    return {
+      enabled: true,
+      now: now.toISOString(),
+      should_run: false,
+      skip_reason: "state_date_missing",
+    };
+  }
+  const today = now.toISOString().slice(0, 10);
+  const runsToday =
+    stateDate === today
+      ? nonNegativeInteger(
+          env.VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY,
+          "VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY",
+        )
+      : 0;
+  const quarantinedUntil = optionalDateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_QUARANTINED_UNTIL");
+  if (quarantinedUntil && quarantinedUntil.getTime() > now.getTime()) {
+    return {
+      enabled: true,
+      now: now.toISOString(),
+      quarantined_until: quarantinedUntil.toISOString(),
+      should_run: false,
+      skip_reason: "self_quarantined",
+    };
+  }
+  if (runsToday >= livePolicy.max_runs_per_day) {
+    return {
+      enabled: true,
+      now: now.toISOString(),
+      runs_today: runsToday,
+      should_run: false,
+      skip_reason: "daily_budget_exhausted",
+    };
+  }
+  const lastRunAt = optionalDateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_LAST_RUN_AT");
+  if (lastRunAt) {
+    const elapsedSeconds = Math.floor((now.getTime() - lastRunAt.getTime()) / 1000);
+    if (elapsedSeconds < livePolicy.min_cadence_seconds) {
+      return {
+        enabled: true,
+        last_run_at: lastRunAt.toISOString(),
+        min_cadence_seconds: livePolicy.min_cadence_seconds,
+        now: now.toISOString(),
+        seconds_since_last_run: Math.max(0, elapsedSeconds),
+        should_run: false,
+        skip_reason: "cadence_wait",
+      };
+    }
+  }
+  return {
+    enabled: true,
+    max_runs_per_day: livePolicy.max_runs_per_day,
+    min_cadence_seconds: livePolicy.min_cadence_seconds,
+    now: now.toISOString(),
+    quarantine_cooldown_seconds: quarantinePolicy.cooldown_seconds,
+    runs_today: runsToday,
+    should_run: true,
+  };
+}
+
+function hostedLiveMonitorConfigFromEnv(env, livePolicy) {
+  const target = hostedTargetFromEnv(env, {
+    agentHttpName: "VIVA_HOSTED_LIVE_MONITOR_AGENT_HTTP_URL",
+    agentWsName: "VIVA_HOSTED_LIVE_MONITOR_AGENT_WS_URL",
+    provider: "cartesia_gemini",
+    webName: "VIVA_HOSTED_LIVE_MONITOR_WEB_URL",
+  });
+  const bearerToken = (
+    env.VIVA_HOSTED_LIVE_MONITOR_REST_BEARER_TOKEN ??
+    env.VIVA_HOSTED_REST_BEARER_TOKEN ??
+    ""
+  ).trim();
+  if (!bearerToken) {
+    throw new Error(
+      "VIVA_HOSTED_LIVE_MONITOR_REST_BEARER_TOKEN or VIVA_HOSTED_REST_BEARER_TOKEN is required",
+    );
+  }
+  const remoteMaxSessionCostUsd = positiveNumber(
+    requiredValue(env, "VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD"),
+    "VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD",
+  );
+  if (remoteMaxSessionCostUsd > livePolicy.max_cost_usd_per_run) {
+    throw new Error(
+      "VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD must be less than or equal to the hosted live monitor policy cap",
+    );
+  }
+  return {
+    bearerToken,
+    remoteMaxSessionCostUsd,
+    target,
+  };
+}
+
+function scheduledLiveMonitorRun(target, livePolicy, runTimeoutMs, runId, liveConfig) {
   const timeoutMs = Math.min(runTimeoutMs, livePolicy.max_duration_ms_per_run + 30_000);
   return {
     name: "scheduled_hosted_live_smoke",
@@ -287,10 +441,14 @@ function scheduledLiveMonitorRun(target, livePolicy, runTimeoutMs, runId) {
       VIVA_LIVE_SMOKE: "1",
       VIVA_LIVE_SMOKE_AGENT_HTTP_URL: target.agentHttpUrl,
       VIVA_LIVE_SMOKE_AGENT_WS_URL: target.agentWsUrl,
+      VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD: String(
+        livePolicy.max_cost_usd_per_run,
+      ),
       VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: String(livePolicy.max_audio_bytes_per_run),
       VIVA_LIVE_SMOKE_MAX_DURATION_MS: String(livePolicy.max_duration_ms_per_run),
       VIVA_LIVE_SMOKE_MAX_TURNS: String(livePolicy.max_turns_per_run),
       VIVA_LIVE_SMOKE_ORIGIN: target.webUrl,
+      VIVA_VOICE_WS_BEARER_TOKEN: liveConfig.bearerToken,
       VIVA_VOICE_WS_MAX_SESSION_COST_USD: String(livePolicy.max_cost_usd_per_run),
     },
     timeoutMs,
@@ -334,6 +492,7 @@ async function main() {
     hosted_e2e_matrix: plan.matrix,
     hosted_web_origin: plan.hostedWebUrl,
     hosted_agent_origin: plan.hostedAgentHttpUrl,
+    live_monitor: plan.liveMonitor,
     runner_identity: {
       synthetic_user_id: plan.syntheticUserId,
       study_set_id: plan.syntheticStudySetId,
@@ -787,6 +946,41 @@ function positiveInteger(value, fallback, name) {
     throw new Error(`${name} must be a positive integer`);
   }
   return parsed;
+}
+
+function nonNegativeInteger(value, name) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    throw new Error(`${name} is required`);
+  }
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return parsed;
+}
+
+function positiveNumber(value, name) {
+  const parsed = Number.parseFloat(String(value));
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive number`);
+  }
+  return parsed;
+}
+
+function dateFromEnv(env, name, fallback) {
+  const value = env[name];
+  if (value === undefined || value === null || String(value).trim() === "") return fallback;
+  const parsed = new Date(String(value));
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(`${name} must be an ISO date`);
+  }
+  return parsed;
+}
+
+function optionalDateFromEnv(env, name) {
+  const value = env[name];
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  return dateFromEnv(env, name, null);
 }
 
 function sanitizeRunId(value) {
