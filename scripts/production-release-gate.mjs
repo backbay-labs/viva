@@ -97,7 +97,10 @@ export function buildProductionReleaseGateEvidence({ evidence, env = process.env
     evidence_age_seconds: ageSeconds,
     skip_browser_requested: env.VIVA_RELEASE_CHECK_SKIP_BROWSER === "1",
     hosted_browser_evidence: summarizeHostedBrowserEvidence(hostedBrowser),
-    live_smoke: summarizeLiveSmoke(evidence.live_smoke),
+    live_smoke: summarizeLiveSmoke(evidence.live_smoke, {
+      maxAgeSeconds,
+      now: observedAt,
+    }),
     submitted_answer_recovery_matrix: summarizeRecoveryMatrix(evidence.hosted_e2e_matrix),
     provider_failure_recovery_proof: summarizeProviderFailureProof(
       evidence.provider_failure_observability,
@@ -229,7 +232,7 @@ function missingProductionEvidence(gate, { env, evidence }) {
   pushUnless(missing, "bac531_consent_deletion_proof", gate.issue_proofs.bac_531_consent_deletion);
   pushUnless(missing, "bac529_gemini_quota_sufficiency", gate.issue_proofs.bac_529_quota_sufficient);
   pushUnless(missing, "bundle_signing_secret", stringOrNull(env.VIVA_RELEASE_BUNDLE_SIGNING_SECRET) !== null);
-  pushUnless(missing, "release_evidence_sanitized", evidence.sanitized !== false);
+  pushUnless(missing, "release_evidence_sanitized", evidence.sanitized === true);
   return missing;
 }
 
@@ -255,7 +258,7 @@ function summarizeHostedBrowserEvidence(hostedBrowser) {
   };
 }
 
-function summarizeLiveSmoke(liveSmoke) {
+function summarizeLiveSmoke(liveSmoke, { maxAgeSeconds = null, now = null } = {}) {
   const caps = liveSmoke?.caps ?? {};
   const capSummary = {
     max_duration_ms: numberOrNull(caps.max_duration_ms),
@@ -268,19 +271,38 @@ function summarizeLiveSmoke(liveSmoke) {
     positiveWithin(capSummary.max_turns, 1) &&
     positiveWithin(capSummary.max_audio_bytes, 262_144) &&
     positiveWithin(capSummary.max_session_cost_usd, 0.25);
+  const generatedAt = parseDate(liveSmoke?.generated_at);
+  const observedAt = now instanceof Date ? now : parseDate(now);
+  const ageSeconds =
+    generatedAt instanceof Date &&
+    observedAt instanceof Date &&
+    !Number.isNaN(generatedAt.getTime()) &&
+    !Number.isNaN(observedAt.getTime())
+      ? Math.max(0, Math.floor((observedAt.getTime() - generatedAt.getTime()) / 1000))
+      : null;
+  const fresh =
+    Number.isInteger(ageSeconds) &&
+    Number.isInteger(maxAgeSeconds) &&
+    ageSeconds >= 0 &&
+    ageSeconds <= maxAgeSeconds;
+  const passedWithBudgetCaps =
+    liveSmoke?.schema === "viva.live_provider_smoke.v1" &&
+    liveSmoke.enabled === true &&
+    liveSmoke.status === "passed" &&
+    liveSmoke.provider === "cartesia_gemini" &&
+    budgetCapped;
   return {
     present: liveSmoke?.schema === "viva.live_provider_smoke.v1",
+    generated_at: liveSmoke?.generated_at ?? null,
+    age_seconds: ageSeconds,
+    fresh,
     enabled: liveSmoke?.enabled === true,
     status: liveSmoke?.status ?? null,
     provider: liveSmoke?.provider ?? null,
     caps: capSummary,
     durable_store_observed: liveSmoke?.readiness?.store?.durable === true,
-    passed_budget_capped:
-      liveSmoke?.schema === "viva.live_provider_smoke.v1" &&
-      liveSmoke.enabled === true &&
-      liveSmoke.status === "passed" &&
-      liveSmoke.provider === "cartesia_gemini" &&
-      budgetCapped,
+    budget_capped: passedWithBudgetCaps,
+    passed_budget_capped: passedWithBudgetCaps && fresh,
   };
 }
 
@@ -290,11 +312,24 @@ function summarizeRecoveryMatrix(matrix) {
     : [];
   const scenarioIdSet = new Set(scenarioIds);
   const missingScenarioIds = REQUIRED_RECOVERY_SCENARIOS.filter((id) => !scenarioIdSet.has(id));
+  const executedScenarioIds = new Set(
+    (Array.isArray(matrix?.results) ? matrix.results : [])
+      .filter((result) => result?.status === "passed" && result.sanitized === true)
+      .map((result) => result.scenario_id ?? result.id)
+      .filter(Boolean),
+  );
+  const missingExecutedScenarioIds = REQUIRED_RECOVERY_SCENARIOS.filter(
+    (id) => !executedScenarioIds.has(id),
+  );
   return {
     schema: matrix?.schema ?? null,
     required_scenario_ids: [...REQUIRED_RECOVERY_SCENARIOS],
     missing_scenario_ids: missingScenarioIds,
-    complete: matrix?.schema === "viva.hosted_e2e_matrix.v1" && missingScenarioIds.length === 0,
+    missing_executed_scenario_ids: missingExecutedScenarioIds,
+    complete:
+      matrix?.schema === "viva.hosted_e2e_matrix.v1" &&
+      missingScenarioIds.length === 0 &&
+      missingExecutedScenarioIds.length === 0,
   };
 }
 
@@ -304,12 +339,27 @@ function summarizeProviderFailureProof(observability) {
     : [];
   const queryIdSet = new Set(queryIds);
   const missingQueryIds = REQUIRED_PROVIDER_FAILURE_QUERIES.filter((id) => !queryIdSet.has(id));
+  const observationRows = [
+    ...(Array.isArray(observability?.observations) ? observability.observations : []),
+    ...(Array.isArray(observability?.fixture?.events) ? observability.fixture.events : []),
+  ];
+  const observedQueryIds = new Set(
+    observationRows
+      .filter((observation) => observation?.sanitized === true)
+      .map((observation) => observation.query_id ?? observation.id)
+      .filter(Boolean),
+  );
+  const missingObservedQueryIds = REQUIRED_PROVIDER_FAILURE_QUERIES.filter(
+    (id) => !observedQueryIds.has(id),
+  );
   return {
     schema: observability?.schema ?? null,
     missing_query_ids: missingQueryIds,
+    missing_observed_query_ids: missingObservedQueryIds,
     complete:
       observability?.schema === "viva.provider_failure_observability.v1" &&
       missingQueryIds.length === 0 &&
+      missingObservedQueryIds.length === 0 &&
       observability.sanitized === true,
   };
 }
@@ -335,6 +385,11 @@ function summarizeConfigParity({ env, hostedBrowser }) {
   );
   const evidenceWebOrigin = originFromUrl(hostedBrowser?.web_url);
   const evidenceAgentOrigin = originFromUrl(hostedBrowser?.agent_url);
+  const originsMatch =
+    expectedWebOrigin !== null &&
+    expectedAgentOrigin !== null &&
+    evidenceWebOrigin === expectedWebOrigin &&
+    evidenceAgentOrigin === expectedAgentOrigin;
   return {
     config_diff_sha256_present: configDiffSha !== null,
     secrets_snapshot_sha256_present: secretsSnapshotSha !== null,
@@ -342,12 +397,8 @@ function summarizeConfigParity({ env, hostedBrowser }) {
     agent_origin: evidenceAgentOrigin,
     expected_web_origin: expectedWebOrigin,
     expected_agent_origin: expectedAgentOrigin,
-    origins_match:
-      expectedWebOrigin !== null &&
-      expectedAgentOrigin !== null &&
-      evidenceWebOrigin === expectedWebOrigin &&
-      evidenceAgentOrigin === expectedAgentOrigin,
-    complete: configDiffSha !== null && secretsSnapshotSha !== null,
+    origins_match: originsMatch,
+    complete: configDiffSha !== null && secretsSnapshotSha !== null && originsMatch,
   };
 }
 
@@ -357,8 +408,9 @@ function summarizeBudgetControls({ env, liveSmoke }) {
   return {
     limiter_state: limiterState,
     limiter_configured: limiterState !== null && ACCEPTED_LIMITER_STATES.has(limiterState),
-    live_smoke_caps_configured: liveCaps.passed_budget_capped,
-    complete: limiterState !== null && ACCEPTED_LIMITER_STATES.has(limiterState) && liveCaps.passed_budget_capped,
+    live_smoke_caps_configured: liveCaps.budget_capped,
+    complete:
+      limiterState !== null && ACCEPTED_LIMITER_STATES.has(limiterState) && liveCaps.budget_capped,
   };
 }
 

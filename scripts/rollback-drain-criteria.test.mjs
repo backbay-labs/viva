@@ -44,6 +44,10 @@ test("rollback criteria define concrete BAC-527 thresholds and BAC-525 alert ids
   assert.equal(thresholdsById.get("provider_auth_failure_count").value, 1);
   assert.equal(thresholdsById.get("stuck_checking_sessions").value, 3);
   assert.equal(thresholdsById.get("recap_failure_rate_percent").value, 5);
+  assert.equal(
+    thresholdsById.get("recap_failure_rate_percent").failure_class,
+    "partial_stage_success",
+  );
   assert.equal(thresholdsById.get("token_refresh_failure_rate_percent").value, 2);
   assert.equal(
     thresholdsById.get("token_refresh_failure_rate_percent").failure_class,

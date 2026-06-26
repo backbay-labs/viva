@@ -119,6 +119,18 @@ test("per-PR redaction check permits marker constants in runtime redaction bound
     }),
     false,
   );
+  assert.equal(
+    addedLineViolatesRedactionAudit('  "pcm16_base64",', {
+      file: "scripts/production-release-gate.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('    "viva-release-check-cartesia-placeholder-key",', {
+      file: "scripts/release-check.mjs",
+    }),
+    false,
+  );
   assert.equal(addedLineViolatesRedactionAudit('    "session_token",'), true);
   assert.equal(
     addedLineViolatesRedactionAudit('  const leak = "session_token";', {
@@ -173,6 +185,36 @@ test("per-PR redaction check permits learner question prompt caption projection 
     addedLineViolatesRedactionAudit("      text: question.prompt,", {
       file: "apps/web/lib/viva-agent-client.ts",
     }),
+    true,
+  );
+});
+
+test("per-PR redaction check permits release bundle signing-secret proof only", () => {
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      '  const signingSecret = stringOrNull(env.VIVA_RELEASE_BUNDLE_SIGNING_SECRET);',
+      {
+        file: "scripts/production-release-gate.mjs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      '  pushUnless(missing, "bundle_signing_secret", stringOrNull(env.VIVA_RELEASE_BUNDLE_SIGNING_SECRET) !== null);',
+      {
+        file: "scripts/production-release-gate.mjs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      '  const signingSecret = stringOrNull(env.VIVA_RELEASE_BUNDLE_SIGNING_SECRET);',
+      {
+        file: "scripts/release-check.mjs",
+      },
+    ),
     true,
   );
 });

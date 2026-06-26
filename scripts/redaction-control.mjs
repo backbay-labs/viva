@@ -306,6 +306,26 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     marker: "password",
     patterns: Object.freeze([/url\.password = ""/]),
   },
+  {
+    file: "scripts/production-release-gate.mjs",
+    marker: "signing_secret",
+    patterns: Object.freeze([
+      /const signingSecret = stringOrNull\(env\.VIVA_RELEASE_BUNDLE_SIGNING_SECRET\);/,
+      /signingSecret === null/,
+      /createHmac\("sha256", signingSecret\)\.update\(payloadSha256\)\.digest\("hex"\)/,
+      /signature_algorithm: signingSecret === null \? "sha256-self" : "hmac-sha256",/,
+      /signature_key_present: signingSecret !== null,/,
+      /pushUnless\(missing, "bundle_signing_secret", stringOrNull\(env\.VIVA_RELEASE_BUNDLE_SIGNING_SECRET\) !== null\);/,
+    ]),
+  },
+  {
+    file: "scripts/production-release-gate.mjs",
+    marker: "viva_release_bundle_signing_secret",
+    patterns: Object.freeze([
+      /const signingSecret = stringOrNull\(env\.VIVA_RELEASE_BUNDLE_SIGNING_SECRET\);/,
+      /pushUnless\(missing, "bundle_signing_secret", stringOrNull\(env\.VIVA_RELEASE_BUNDLE_SIGNING_SECRET\) !== null\);/,
+    ]),
+  },
 ]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);
@@ -313,6 +333,8 @@ const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".
 const RUNTIME_REDACTION_BOUNDARY_FILES = new Set([
   "apps/web/lib/viva-redaction.ts",
   "agent/crates/observe/src/lib.rs",
+  "scripts/production-release-gate.mjs",
+  "scripts/release-check.mjs",
 ]);
 
 const RUNTIME_REDACTION_BOUNDARY_MARKER_CONSTANTS = new Map([
@@ -390,6 +412,33 @@ const RUNTIME_REDACTION_BOUNDARY_MARKER_CONSTANTS = new Map([
       "transcript_final",
       "transcriptfinal",
       "viva1.",
+    ]),
+  ],
+  [
+    "scripts/production-release-gate.mjs",
+    new Set([
+      "answer_text",
+      "Bearer ",
+      "CARTESIA_API_KEY",
+      "GEMINI_API_KEY",
+      "pasted_text",
+      "pcm16_base64",
+      "provider_prompt",
+      "raw_prompt",
+      "session-secret",
+      "session_token",
+      "source_context",
+      "transcript_final",
+      "viva1.",
+    ]),
+  ],
+  [
+    "scripts/release-check.mjs",
+    new Set([
+      "NADH donates high-energy electrons",
+      "received 4 PCM16 bytes",
+      "viva-release-check-cartesia-placeholder-key",
+      "viva-release-check-gemini-placeholder-key",
     ]),
   ],
 ]);

@@ -85,6 +85,82 @@ test("production release gate rejects stale and live-deploy-mismatched evidence"
   );
 });
 
+test("production release gate rejects hosted origin mismatches despite config hashes", () => {
+  assert.throws(
+    () =>
+      finalizeReleaseEvidenceBundle({
+        evidence: completeEvidence({
+          browser_e2e: completeBrowserEvidence({
+            hosted_e2e: completeHostedE2e({ web_url: "https://wrong-web.example.com" }),
+          }),
+        }),
+        env: productionEnv(),
+        now: new Date("2026-06-25T00:30:00.000Z"),
+      }),
+    /config_parity/,
+  );
+});
+
+test("production release gate rejects stale live-smoke evidence", () => {
+  assert.throws(
+    () =>
+      finalizeReleaseEvidenceBundle({
+        evidence: completeEvidence({
+          live_smoke: completeLiveSmoke({ generated_at: "2026-06-23T00:00:00.000Z" }),
+        }),
+        env: productionEnv(),
+        now: new Date("2026-06-25T00:30:00.000Z"),
+      }),
+    /budget_capped_live_smoke/,
+  );
+});
+
+test("production release gate requires executed recovery results", () => {
+  assert.throws(
+    () =>
+      finalizeReleaseEvidenceBundle({
+        evidence: completeEvidence({
+          hosted_e2e_matrix: buildHostedE2eMatrixContract({
+            generatedAt: "2026-06-25T00:00:00.000Z",
+          }),
+        }),
+        env: productionEnv(),
+        now: new Date("2026-06-25T00:30:00.000Z"),
+      }),
+    /submitted_answer_recovery_matrix/,
+  );
+});
+
+test("production release gate requires observed provider failure proof", () => {
+  assert.throws(
+    () =>
+      finalizeReleaseEvidenceBundle({
+        evidence: completeEvidence({
+          provider_failure_observability: completeProviderFailureObservability({
+            observations: [{ query_id: "provider_429", sanitized: true }],
+          }),
+        }),
+        env: productionEnv(),
+        now: new Date("2026-06-25T00:30:00.000Z"),
+      }),
+    /provider_failure_recovery_proof/,
+  );
+});
+
+test("production release gate requires explicit sanitized release evidence", () => {
+  const evidence = completeEvidence();
+  delete evidence.sanitized;
+  assert.throws(
+    () =>
+      finalizeReleaseEvidenceBundle({
+        evidence,
+        env: productionEnv(),
+        now: new Date("2026-06-25T00:30:00.000Z"),
+      }),
+    /release_evidence_sanitized/,
+  );
+});
+
 test("production release gate rejects ephemeral durability when durable tickets are claimed", () => {
   assert.throws(
     () =>
@@ -166,7 +242,7 @@ function completeEvidence(overrides = {}) {
       sanitized: true,
     },
     fixture_hashes: {},
-    hosted_e2e_matrix: buildHostedE2eMatrixContract({ generatedAt }),
+    hosted_e2e_matrix: completeHostedE2eMatrix(generatedAt),
     live_smoke: completeLiveSmoke(),
     privacy: completePrivacy(),
     provider_failure_observability: completeProviderFailureObservability(),
@@ -223,12 +299,32 @@ function completeLiveSmoke(overrides = {}) {
       max_turns: 1,
     },
     enabled: true,
+    generated_at: "2026-06-25T00:10:00.000Z",
     provider: "cartesia_gemini",
     readiness: {
       store: { durable: true },
     },
     status: "passed",
     ...overrides,
+  };
+}
+
+function completeHostedE2eMatrix(generatedAt) {
+  return {
+    ...buildHostedE2eMatrixContract({ generatedAt }),
+    results: [
+      "provider_rate_limited",
+      "provider_timeout",
+      "invalid_token",
+      "expired_token",
+      "replayed_token",
+      "double_submit_race",
+      "deterministic_partial_recap",
+    ].map((scenarioId) => ({
+      scenario_id: scenarioId,
+      status: "passed",
+      sanitized: true,
+    })),
   };
 }
 
@@ -245,7 +341,7 @@ function completePrivacy() {
   };
 }
 
-function completeProviderFailureObservability() {
+function completeProviderFailureObservability(overrides = {}) {
   return {
     schema: "viva.provider_failure_observability.v1",
     log_queries: [
@@ -255,7 +351,15 @@ function completeProviderFailureObservability() {
       { id: "recap_failure" },
       { id: "release_gate_stale_evidence" },
     ],
+    observations: [
+      { query_id: "provider_429", sanitized: true },
+      { query_id: "provider_timeout", sanitized: true },
+      { query_id: "token_refresh_failure", sanitized: true },
+      { query_id: "recap_failure", sanitized: true },
+      { query_id: "release_gate_stale_evidence", sanitized: true },
+    ],
     sanitized: true,
+    ...overrides,
   };
 }
 
