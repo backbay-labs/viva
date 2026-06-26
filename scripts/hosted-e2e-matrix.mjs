@@ -6,6 +6,7 @@ import { FAILURE_CONTROL_SCENARIOS } from "./failure-control-harness.mjs";
 export const HOSTED_E2E_MATRIX_SCHEMA = "viva.hosted_e2e_matrix.v1";
 export const HOSTED_E2E_RESULT_SCHEMA = "viva.hosted_e2e_result.v1";
 export const HOSTED_E2E_MONITOR_POLICY_SCHEMA = "viva.hosted_monitor_policy.v1";
+const SUPPORTED_MATRIX_PROFILES = new Set(["contract", "full", "pr", "scheduled"]);
 
 export const HOSTED_E2E_REQUIRED_EVIDENCE_FIELDS = Object.freeze([
   "web_url",
@@ -134,7 +135,7 @@ const FAILURE_CONTROL_SCENARIO_ROWS = Object.freeze(
       failure_class: entry.failure_class,
       stage: entry.stage,
       terminal_reason: entry.terminal_reason,
-      recap_success_expected: entry.failure_class === "partial_stage_success",
+      recap_success_expected: failureControlScenarioExpectsRecapSuccess(entry),
       coverage: coverageForFailureControlScenario(entry.id),
     }),
   ),
@@ -223,6 +224,13 @@ export function defaultMatrixProfile(mode) {
 
 export function scenariosForProfile(profile, mode = "pr") {
   const normalized = profile || defaultMatrixProfile(mode);
+  if (!SUPPORTED_MATRIX_PROFILES.has(normalized)) {
+    throw new Error(
+      `unsupported hosted E2E matrix profile ${normalized}; expected one of ${Array.from(
+        SUPPORTED_MATRIX_PROFILES,
+      ).join(", ")}`,
+    );
+  }
   if (normalized === "contract") return HOSTED_E2E_SCENARIOS;
   if (normalized === "full") {
     return HOSTED_E2E_SCENARIOS.filter((entry) => entry.profiles.includes("pr"));
@@ -258,6 +266,7 @@ export function buildHostedBrowserEvidence({
   agentUrl,
   controlMode,
   deployIds = {},
+  deploySha = null,
   failureClass = null,
   hostedMode,
   latencyMs = null,
@@ -286,6 +295,7 @@ export function buildHostedBrowserEvidence({
       agent: deployIds.agent ?? null,
       web: deployIds.web ?? null,
     },
+    deploy_sha: deploySha ?? deployIds.sha ?? null,
     provider,
     model: model ?? modelForProvider(provider),
     control_mode: controlMode ?? "none",
@@ -349,6 +359,7 @@ export function summarizeHostedE2eResult(result) {
     token_refresh_outcome: evidence.token_refresh_outcome,
     redaction_audit: evidence.redaction_audit,
     deploy_ids: evidence.deploy_ids,
+    deploy_sha: evidence.deploy_sha,
     log_correlation: evidence.log_correlation,
     sanitized: evidence.sanitized === true,
   };
@@ -440,6 +451,10 @@ function coverageForFailureControlScenario(id) {
     typed_fallback: ["typed_fallback"],
   };
   return [...common, ...(perScenario[id] ?? [])];
+}
+
+function failureControlScenarioExpectsRecapSuccess(entry) {
+  return entry.failure_class === "partial_stage_success" && entry.stage === "recap";
 }
 
 function titleFromScenarioId(id) {

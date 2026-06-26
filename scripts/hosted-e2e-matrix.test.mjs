@@ -105,6 +105,24 @@ test("hosted PR profile expands to every deterministic failure-control scenario"
     () => failureControlScenarioIdsForProfile({ configuredValue: "unknown_scenario" }),
     /unknown hosted failure-control matrix scenario/,
   );
+  assert.throws(
+    () => failureControlScenarioIdsForProfile({ profile: "typo" }),
+    /unsupported hosted E2E matrix profile/,
+  );
+  assert.throws(() => scenariosForProfile("typo"), /unsupported hosted E2E matrix profile/);
+});
+
+test("hosted failure-control rows only expect recap success for recap-stage scenarios", () => {
+  const rows = scenariosForProfile("full", "pr");
+
+  assert.equal(
+    rows.find((scenario) => scenario.id === "typed_fallback").recap_success_expected,
+    false,
+  );
+  assert.equal(
+    rows.find((scenario) => scenario.id === "deterministic_partial_recap").recap_success_expected,
+    true,
+  );
 });
 
 test("hosted monitor policy caps live cadence and self-quarantines sustained provider 429s", () => {
@@ -125,6 +143,7 @@ test("hosted browser evidence records required production fields without forbidd
     agentUrl: "https://agent.example.com/ws?debug=secret#fragment",
     controlMode: "failure_control",
     deployIds: { agent: "railway-agent-123", web: "vercel-web-456" },
+    deploySha: "abc123hostedsha",
     failureClass: "quota_rate_failure",
     hostedMode: true,
     postgresDurability: "durable",
@@ -146,6 +165,7 @@ test("hosted browser evidence records required production fields without forbidd
   assert.equal(evidence.model, "synthetic-viva");
   assert.equal(evidence.deploy_ids.agent, "railway-agent-123");
   assert.equal(evidence.deploy_ids.web, "vercel-web-456");
+  assert.equal(evidence.deploy_sha, "abc123hostedsha");
   assert.equal(evidence.failure_class, "quota_rate_failure");
   assert.equal(evidence.terminal_reason, "provider_rate_limited");
   assert.equal(evidence.stage, "gemini");
@@ -165,6 +185,7 @@ test("hosted browser evidence audit is reflected in runner summaries", () => {
       browser_story: { validation_run_id: "browser-story-synthetic-run" },
       hosted_e2e: buildHostedBrowserEvidence({
         agentUrl: "https://agent.example.com",
+        deploySha: "abc123summarysha",
         hostedMode: true,
         provider: "synthetic",
         recapSuccess: true,
@@ -180,6 +201,7 @@ test("hosted browser evidence audit is reflected in runner summaries", () => {
   const summary = summarizeHostedE2eResult(result);
 
   assert.equal(summary.scenario_id, "happy_path");
+  assert.equal(summary.deploy_sha, "abc123summarysha");
   assert.equal(summary.redaction_audit.forbidden_hits, 0);
   assert.equal(summary.redaction_audit.scanned_files, 4);
   assert.equal(summary.log_correlation.validation_run_id, "browser-story-synthetic-run");

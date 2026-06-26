@@ -43,6 +43,7 @@ export function buildHostedMonitorPlan(env = process.env) {
     env.VIVA_HOSTED_RUN_ID || new Date().toISOString().replaceAll(/[:.]/g, "-"),
   );
   const matrixProfile = (env.VIVA_HOSTED_MATRIX_PROFILE || defaultMatrixProfile(mode)).trim();
+  const deploySha = (env.VIVA_HOSTED_DEPLOY_SHA || env.GITHUB_SHA || "").trim();
   const matrix = buildHostedE2eMatrixContract({
     mode,
     profile: matrixProfile,
@@ -63,6 +64,7 @@ export function buildHostedMonitorPlan(env = process.env) {
     VIVA_E2E_SYNTHETIC_USER_ID: syntheticUserId,
     VIVA_HOSTED_RUN_ID: runId,
     VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"),
+    ...(deploySha ? { VIVA_E2E_DEPLOY_SHA: deploySha } : {}),
   };
   const syntheticTarget = {
     ...baseTarget,
@@ -77,15 +79,6 @@ export function buildHostedMonitorPlan(env = process.env) {
           webName: "VIVA_HOSTED_FAKE_PROVIDER_WEB_URL",
         })
       : null;
-  const failureControlTarget =
-    mode === "pr"
-      ? hostedTargetFromEnv(env, {
-          agentHttpName: "VIVA_HOSTED_FAILURE_CONTROL_AGENT_HTTP_URL",
-          agentWsName: "VIVA_HOSTED_FAILURE_CONTROL_AGENT_WS_URL",
-          provider: "synthetic",
-          webName: "VIVA_HOSTED_FAILURE_CONTROL_WEB_URL",
-        })
-      : null;
   const failureControlScenarioIds =
     mode === "pr"
       ? failureControlScenarioIdsForProfile({
@@ -93,6 +86,17 @@ export function buildHostedMonitorPlan(env = process.env) {
           profile: matrixProfile,
         })
       : [];
+  const failureControlTargets =
+    mode === "pr"
+      ? new Map(
+          failureControlScenarioIds.map((scenarioId) => [
+            scenarioId,
+            hostedFailureControlTargetFromEnv(env, scenarioId, {
+              allowGenericTarget: failureControlScenarioIds.length === 1,
+            }),
+          ]),
+        )
+      : new Map();
   const runs =
     mode === "scheduled"
       ? [
@@ -125,14 +129,24 @@ export function buildHostedMonitorPlan(env = process.env) {
             }),
             timeoutMs: runTimeoutMs,
           },
+          {
+            name: "pr_hosted_deterministic_partial_recap",
+            scenario_id: "deterministic_partial_recap",
+            env: runEnv(baseEnv, fakeTarget, {
+              VIVA_E2E_HOSTED_SCENARIO_ID: "deterministic_partial_recap",
+              VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
+              VIVA_E2E_STOP_TO_RECAP: "1",
+            }),
+            timeoutMs: runTimeoutMs,
+          },
           ...failureControlScenarioIds.map((scenarioId) => ({
             name: `pr_hosted_failure_control_${scenarioId}`,
             scenario_id: scenarioId,
-            env: runEnv(baseEnv, failureControlTarget, {
+            env: runEnv(baseEnv, failureControlTargets.get(scenarioId), {
               VIVA_E2E_FAILURE_CONTROL_SCENARIO: scenarioId,
               VIVA_E2E_HOSTED_SCENARIO_ID: scenarioId,
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
-              VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS: failureControlTarget.webUrl,
+              VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS: failureControlTargets.get(scenarioId).webUrl,
               VIVA_FAILURE_CONTROL_ENABLED: "1",
               VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY:
                 env.VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY || "1",
@@ -175,6 +189,41 @@ function hostedTargetFromEnv(env, { agentHttpName, agentWsName, provider, webNam
     provider,
     webUrl: normalizeHostedUrl(requiredValue(env, webName)),
   };
+}
+
+function hostedFailureControlTargetFromEnv(env, scenarioId, { allowGenericTarget = false } = {}) {
+  const prefix = failureControlScenarioEnvPrefix(scenarioId);
+  const specificTargetKeys = [
+    `${prefix}_AGENT_HTTP_URL`,
+    `${prefix}_AGENT_WS_URL`,
+    `${prefix}_WEB_URL`,
+  ];
+  const hasSpecificTarget = specificTargetKeys.some((key) => env[key]);
+  if (hasSpecificTarget) {
+    return hostedTargetFromEnv(env, {
+      agentHttpName: specificTargetKeys[0],
+      agentWsName: specificTargetKeys[1],
+      provider: "synthetic",
+      webName: specificTargetKeys[2],
+    });
+  }
+  if (allowGenericTarget) {
+    return hostedTargetFromEnv(env, {
+      agentHttpName: "VIVA_HOSTED_FAILURE_CONTROL_AGENT_HTTP_URL",
+      agentWsName: "VIVA_HOSTED_FAILURE_CONTROL_AGENT_WS_URL",
+      provider: "synthetic",
+      webName: "VIVA_HOSTED_FAILURE_CONTROL_WEB_URL",
+    });
+  }
+  throw new Error(
+    `multi-scenario hosted failure-control PR runs require per-scenario target ${specificTargetKeys.join(
+      ", ",
+    )}`,
+  );
+}
+
+function failureControlScenarioEnvPrefix(scenarioId) {
+  return `VIVA_HOSTED_FAILURE_CONTROL_${scenarioId.toUpperCase().replaceAll(/[^A-Z0-9]+/g, "_")}`;
 }
 
 function runEnv(baseEnv, target, extra = {}) {

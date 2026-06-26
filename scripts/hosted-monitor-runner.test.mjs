@@ -28,6 +28,7 @@ const baseEnv = Object.freeze({
   VIVA_HOSTED_FAKE_PROVIDER_AGENT_HTTP_URL: "https://fake-agent.example.com/",
   VIVA_HOSTED_FAKE_PROVIDER_AGENT_WS_URL: "wss://fake-agent.example.com/ws",
   VIVA_HOSTED_FAKE_PROVIDER_WEB_URL: "https://fake-web.example.com/",
+  VIVA_HOSTED_DEPLOY_SHA: "abc123hostedsha",
   VIVA_HOSTED_FAILURE_CONTROL_AGENT_HTTP_URL: "https://failure-agent.example.com/",
   VIVA_HOSTED_FAILURE_CONTROL_AGENT_WS_URL: "wss://failure-agent.example.com/ws",
   VIVA_HOSTED_FAILURE_CONTROL_WEB_URL: "https://failure-web.example.com/",
@@ -38,6 +39,27 @@ const baseEnv = Object.freeze({
   VIVA_HOSTED_WEB_URL: "https://web.example.com/",
   VIVA_VOICE_SESSION_TOKEN_SECRET: "redacted-session-secret",
 });
+
+function failureControlEnvPrefix(scenarioId) {
+  return `VIVA_HOSTED_FAILURE_CONTROL_${scenarioId.toUpperCase().replaceAll(/[^A-Z0-9]+/g, "_")}`;
+}
+
+function failureControlTargetEnvFor(scenarioId) {
+  const prefix = failureControlEnvPrefix(scenarioId);
+  const hostSegment = scenarioId.replaceAll("_", "-");
+  return {
+    [`${prefix}_AGENT_HTTP_URL`]: `https://failure-${hostSegment}-agent.example.com/`,
+    [`${prefix}_AGENT_WS_URL`]: `wss://failure-${hostSegment}-agent.example.com/ws`,
+    [`${prefix}_WEB_URL`]: `https://failure-${hostSegment}-web.example.com/`,
+  };
+}
+
+function allFailureControlTargetEnv() {
+  return Object.assign(
+    {},
+    ...FAILURE_CONTROL_SCENARIOS.map((scenario) => failureControlTargetEnvFor(scenario.id)),
+  );
+}
 
 test("hosted monitor plan runs scheduled synthetic browser proof against hosted URLs", () => {
   const plan = buildHostedMonitorPlan(baseEnv);
@@ -54,6 +76,7 @@ test("hosted monitor plan runs scheduled synthetic browser proof against hosted 
   assert.equal(plan.runs[0].env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID, "biology-midterm");
   assert.equal(plan.runs[0].env.VIVA_E2E_SYNTHETIC_USER_ID, "synthetic-monitor-user");
   assert.equal(plan.runs[0].env.VIVA_E2E_SYNTHETIC_STUDY_SET_ID, "biology-midterm");
+  assert.equal(plan.runs[0].env.VIVA_E2E_DEPLOY_SHA, "abc123hostedsha");
   assert.equal(plan.runs[0].env.VIVA_E2E_STOP_TO_RECAP, undefined);
   assert.equal(plan.runs[0].env.VIVA_E2E_HOSTED_SCENARIO_ID, "happy_path");
   assert.equal(plan.runs[0].env.VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO, "0");
@@ -68,6 +91,7 @@ test("hosted monitor plan runs scheduled synthetic browser proof against hosted 
 test("hosted monitor PR mode expands the deterministic failure-control matrix", () => {
   const plan = buildHostedMonitorPlan({
     ...baseEnv,
+    ...allFailureControlTargetEnv(),
     VIVA_FAILURE_CONTROL_SECRET: "redacted-control-secret",
     VIVA_HOSTED_RUNNER_MODE: "pr",
   });
@@ -80,32 +104,54 @@ test("hosted monitor PR mode expands the deterministic failure-control matrix", 
     [
       "pr_hosted_synthetic_matrix",
       "pr_hosted_fake_provider_matrix",
+      "pr_hosted_deterministic_partial_recap",
       ...FAILURE_CONTROL_SCENARIOS.map((scenario) => `pr_hosted_failure_control_${scenario.id}`),
     ],
   );
   assert.equal(plan.runs[1].env.VIVA_E2E_AGENT_PROVIDER, "fake_cartesia_gemini");
   assert.equal(plan.runs[1].env.VIVA_E2E_HOSTED_WEB_URL, "https://fake-web.example.com");
   assert.equal(plan.runs[1].env.VIVA_E2E_HOSTED_SCENARIO_ID, "fake_provider_happy_path");
-  assert.equal(plan.runs[2].scenario_id, FAILURE_CONTROL_SCENARIOS[0].id);
-  assert.equal(plan.runs[2].env.VIVA_E2E_FAILURE_CONTROL_SCENARIO, "provider_rate_limited");
-  assert.equal(plan.runs[2].env.VIVA_E2E_HOSTED_SCENARIO_ID, "provider_rate_limited");
-  assert.equal(plan.runs[2].env.VIVA_E2E_HOSTED_WEB_URL, "https://failure-web.example.com");
+  assert.equal(plan.runs[2].scenario_id, "deterministic_partial_recap");
+  assert.equal(plan.runs[2].env.VIVA_E2E_AGENT_PROVIDER, "fake_cartesia_gemini");
+  assert.equal(plan.runs[2].env.VIVA_E2E_HOSTED_SCENARIO_ID, "deterministic_partial_recap");
+  assert.equal(plan.runs[2].env.VIVA_E2E_STOP_TO_RECAP, "1");
+  assert.equal(plan.runs[3].scenario_id, FAILURE_CONTROL_SCENARIOS[0].id);
+  assert.equal(plan.runs[3].env.VIVA_E2E_FAILURE_CONTROL_SCENARIO, "provider_rate_limited");
+  assert.equal(plan.runs[3].env.VIVA_E2E_HOSTED_SCENARIO_ID, "provider_rate_limited");
   assert.equal(
-    plan.runs[2].env.VIVA_E2E_HOSTED_AGENT_HTTP_URL,
-    "https://failure-agent.example.com",
+    plan.runs[3].env.VIVA_E2E_HOSTED_WEB_URL,
+    "https://failure-provider-rate-limited-web.example.com",
   );
   assert.equal(
-    plan.runs[2].env.VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS,
-    "https://failure-web.example.com",
+    plan.runs[3].env.VIVA_E2E_HOSTED_AGENT_HTTP_URL,
+    "https://failure-provider-rate-limited-agent.example.com",
   );
-  assert.equal(plan.runs[2].env.VIVA_FAILURE_CONTROL_ENABLED, "1");
-  assert.equal(plan.runs[2].env.VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS, "synthetic-monitor-user");
-  assert.equal(plan.runs[2].env.VIVA_FAILURE_CONTROL_STUDY_SET_IDS, "biology-midterm");
+  assert.equal(
+    plan.runs[3].env.VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS,
+    "https://failure-provider-rate-limited-web.example.com",
+  );
+  assert.equal(plan.runs[3].env.VIVA_FAILURE_CONTROL_ENABLED, "1");
+  assert.equal(plan.runs[3].env.VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS, "synthetic-monitor-user");
+  assert.equal(plan.runs[3].env.VIVA_FAILURE_CONTROL_STUDY_SET_IDS, "biology-midterm");
+});
+
+test("hosted monitor PR mode requires per-scenario targets for multi-scenario failure-control runs", () => {
+  assert.throws(
+    () =>
+      buildHostedMonitorPlan({
+        ...baseEnv,
+        VIVA_FAILURE_CONTROL_SECRET: "redacted-control-secret",
+        VIVA_HOSTED_RUNNER_MODE: "pr",
+      }),
+    /multi-scenario hosted failure-control PR runs require per-scenario target/,
+  );
 });
 
 test("hosted monitor PR mode allows a smaller explicit failure-control scenario subset", () => {
   const plan = buildHostedMonitorPlan({
     ...baseEnv,
+    ...failureControlTargetEnvFor("provider_rate_limited"),
+    ...failureControlTargetEnvFor("provider_timeout"),
     VIVA_FAILURE_CONTROL_SECRET: "redacted-control-secret",
     VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS: "provider_rate_limited,provider_timeout",
     VIVA_HOSTED_RUNNER_MODE: "pr",
@@ -113,7 +159,40 @@ test("hosted monitor PR mode allows a smaller explicit failure-control scenario 
 
   assert.deepEqual(
     plan.runs.map((run) => run.scenario_id),
-    ["happy_path", "fake_provider_happy_path", "provider_rate_limited", "provider_timeout"],
+    [
+      "happy_path",
+      "fake_provider_happy_path",
+      "deterministic_partial_recap",
+      "provider_rate_limited",
+      "provider_timeout",
+    ],
+  );
+});
+
+test("hosted monitor PR mode allows the generic failure-control target for one explicit scenario", () => {
+  const plan = buildHostedMonitorPlan({
+    ...baseEnv,
+    VIVA_FAILURE_CONTROL_SECRET: "redacted-control-secret",
+    VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS: "provider_rate_limited",
+    VIVA_HOSTED_RUNNER_MODE: "pr",
+  });
+  const failureRun = plan.runs.at(-1);
+
+  assert.equal(failureRun.scenario_id, "provider_rate_limited");
+  assert.equal(failureRun.env.VIVA_E2E_HOSTED_WEB_URL, "https://failure-web.example.com");
+  assert.equal(failureRun.env.VIVA_E2E_HOSTED_AGENT_HTTP_URL, "https://failure-agent.example.com");
+});
+
+test("hosted monitor rejects unknown matrix profiles", () => {
+  assert.throws(
+    () =>
+      buildHostedMonitorPlan({
+        ...baseEnv,
+        VIVA_FAILURE_CONTROL_SECRET: "redacted-control-secret",
+        VIVA_HOSTED_MATRIX_PROFILE: "typo",
+        VIVA_HOSTED_RUNNER_MODE: "pr",
+      }),
+    /unsupported hosted E2E matrix profile/,
   );
 });
 

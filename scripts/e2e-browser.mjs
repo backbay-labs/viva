@@ -545,6 +545,7 @@ try {
       agentUrl,
       controlMode: failureControlPlan.enabled ? "failure_control" : "none",
       deployIds: hostedDeployIds(),
+      deploySha: hostedDeploySha(),
       failureClass: failureControlTerminalProof?.failure_class ?? null,
       hostedMode,
       postgresDurability: hostedPostgresDurability(),
@@ -818,6 +819,15 @@ function hostedDeployIds() {
       process.env.VIVA_HOSTED_WEB_DEPLOY_ID?.trim() ||
       null,
   };
+}
+
+function hostedDeploySha() {
+  return (
+    process.env.VIVA_E2E_DEPLOY_SHA?.trim() ||
+    process.env.VIVA_HOSTED_DEPLOY_SHA?.trim() ||
+    process.env.GITHUB_SHA?.trim() ||
+    null
+  );
 }
 
 function hostedPostgresDurability() {
