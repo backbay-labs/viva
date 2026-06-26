@@ -405,9 +405,12 @@ It runs one hosted Playwright browser-story proof against hosted web + hosted
 agent, using a synthetic monitor identity, then publishes sanitized evidence to
 the object prefix `viva-hosted-monitor/scheduled/<run_id>/` in the durable
 artifact store. The scheduled manifest includes the BAC-524 hosted matrix
-contract and the BAC-510 evidence-field contract, but only the high-cadence
-synthetic happy-path leg runs on the cron cadence. The cron cadence remains 30
-minutes, so the synthetic monitor is bounded to at most 48 runs per day.
+contract and the BAC-510 evidence-field contract for the scheduled profile; the
+high-cadence synthetic happy-path leg is the only default cron leg. Leave
+`VIVA_HOSTED_MATRIX_PROFILE` unset for scheduled cron, or set it explicitly to
+`scheduled`; the runner rejects `full` in scheduled mode so the manifest cannot
+claim PR-only failure-control coverage. The cron cadence remains 30 minutes, so
+the synthetic monitor is bounded to at most 48 runs per day.
 
 The PR-equivalent trigger uses the same service image with:
 
@@ -417,14 +420,15 @@ VIVA_HOSTED_RUNNER_MODE=pr
 
 Run that mode from a Railway deployment or manual service run for the branch
 under review. It executes the hosted synthetic provider leg, hosted
-`fake_cartesia_gemini` provider leg, and the BAC-528 deterministic
-failure-control browser matrix for provider 429, provider timeout, silent stall,
-provider auth failure, malformed stream, network disconnect, Sonic/TTS timeout,
-recap timeout, invalid/expired/replayed/malformed auth material, stale socket,
-double submit, mic denied, and typed fallback. The default PR profile is
-`VIVA_HOSTED_MATRIX_PROFILE=full`; to run a smaller operational subset during
-manual triage, set `VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS` to a comma
-separated list such as:
+`fake_cartesia_gemini` provider leg, token-free session-history URL audit leg,
+deterministic partial-recap leg, and the BAC-528 deterministic failure-control
+browser matrix for provider 429, provider timeout, silent stall, provider auth
+failure, malformed stream, network disconnect, Sonic/TTS timeout, recap timeout,
+invalid/expired/replayed/malformed auth material, stale socket, double submit,
+mic denied, and typed fallback. The default PR profile is
+`VIVA_HOSTED_MATRIX_PROFILE=full` when the variable is unset in PR mode; to run
+a smaller operational subset during manual triage, set
+`VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS` to a comma separated list such as:
 
 ```sh
 VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS="provider_rate_limited,provider_timeout"
@@ -447,25 +451,26 @@ quota evidence are current. The BAC-524 policy caps it to one turn, 90 seconds,
 262144 audio bytes, 0.25 USD per run, 0.50 USD per day, 4096 tokens per run,
 8192 tokens per day, at most two runs per day, and a minimum six-hour cadence.
 The live monitor must charge the separate `viva-monitor-live-smoke` budget
-bucket, never learner traffic. If the monitor itself observes two consecutive
-provider-rate-limit terminal results inside one hour, self-quarantine live runs
-for six hours and dedupe alerts for 30 minutes.
+bucket, never learner traffic. When enabled, the scheduled runner adds
+`scheduled_hosted_live_smoke`, invokes `bun run live:smoke`, passes the policy
+caps as `VIVA_LIVE_SMOKE_*` and `VIVA_VOICE_WS_MAX_SESSION_COST_USD`, publishes
+the sanitized live-smoke evidence beside the browser proof, and records the
+self-quarantine cooldown evidence when the smoke terminates with
+`provider_rate_limited` / `quota_rate_failure`. If the monitor itself observes
+two consecutive provider-rate-limit terminal results inside one hour,
+self-quarantine live runs for six hours and dedupe alerts for 30 minutes.
 
-Required monitor variables:
+Common monitor variables:
 
 ```sh
 VIVA_HOSTED_WEB_URL="https://viva-web.example.com"
 VIVA_HOSTED_AGENT_HTTP_URL="https://viva-agent.example.com"
 VIVA_HOSTED_AGENT_WS_URL="wss://viva-agent.example.com/ws"
 VIVA_E2E_AGENT_PROVIDER="synthetic"
-VIVA_HOSTED_MATRIX_PROFILE="full"
 VIVA_HOSTED_REST_BEARER_TOKEN="<from the hosted agent REST auth secret store>"
 VIVA_HOSTED_FAKE_PROVIDER_WEB_URL="https://viva-fake-web.example.com"
 VIVA_HOSTED_FAKE_PROVIDER_AGENT_HTTP_URL="https://viva-fake-agent.example.com"
 VIVA_HOSTED_FAKE_PROVIDER_AGENT_WS_URL="wss://viva-fake-agent.example.com/ws"
-VIVA_HOSTED_FAILURE_CONTROL_WEB_URL="https://viva-failure-control-web.example.com"
-VIVA_HOSTED_FAILURE_CONTROL_AGENT_HTTP_URL="https://viva-failure-control-agent.example.com"
-VIVA_HOSTED_FAILURE_CONTROL_AGENT_WS_URL="wss://viva-failure-control-agent.example.com/ws"
 VIVA_HOSTED_SYNTHETIC_USER_ID="synthetic-monitor-user"
 VIVA_HOSTED_SYNTHETIC_STUDY_SET_ID="biology-midterm"
 VIVA_VOICE_SESSION_TOKEN_SECRET="<from the hosted agent secret store>"
@@ -475,6 +480,49 @@ VIVA_HOSTED_ARTIFACT_ENDPOINT="<Railway object bucket endpoint>"
 VIVA_HOSTED_ARTIFACT_REGION="auto"
 VIVA_HOSTED_ARTIFACT_KEY_ID="<Railway object bucket access key id>"
 VIVA_HOSTED_ARTIFACT_SECRET_KEY="<Railway object bucket secret key>"
+```
+
+Full PR mode needs one isolated failure-control target per selected scenario,
+because the failure-control server is single-scenario by construction. For the
+default `full` profile, configure each of these variable triples:
+
+```sh
+VIVA_HOSTED_FAILURE_CONTROL_PROVIDER_RATE_LIMITED_WEB_URL="https://failure-provider-rate-limited-web.example.com"
+VIVA_HOSTED_FAILURE_CONTROL_PROVIDER_RATE_LIMITED_AGENT_HTTP_URL="https://failure-provider-rate-limited-agent.example.com"
+VIVA_HOSTED_FAILURE_CONTROL_PROVIDER_RATE_LIMITED_AGENT_WS_URL="wss://failure-provider-rate-limited-agent.example.com/ws"
+VIVA_HOSTED_FAILURE_CONTROL_PROVIDER_AUTH_FAILED_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_PROVIDER_TIMEOUT_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_SILENT_STALL_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_PROVIDER_MALFORMED_STREAM_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_PROVIDER_NETWORK_DISCONNECT_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_SONIC_TTS_TIMEOUT_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_RECAP_TIMEOUT_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_INVALID_TOKEN_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_EXPIRED_TOKEN_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_REPLAYED_TOKEN_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_MALFORMED_TOKEN_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_SLOW_STALE_SOCKET_CLOSE_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_DOUBLE_SUBMIT_RACE_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_MIC_DENIED_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+VIVA_HOSTED_FAILURE_CONTROL_TYPED_FALLBACK_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}
+```
+
+The legacy generic
+`VIVA_HOSTED_FAILURE_CONTROL_{WEB_URL,AGENT_HTTP_URL,AGENT_WS_URL}` target is
+allowed only when `VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS` names exactly one
+scenario.
+
+When `VIVA_HOSTED_LIVE_MONITOR_ENABLED=1`, also provide the live provider
+secrets, zero-retention confirmations, and local PCM input expected by
+`bun run live:smoke`:
+
+```sh
+VIVA_AGENT_PROVIDER="cartesia_gemini"
+CARTESIA_ZERO_DATA_RETENTION_ENABLED=1
+GEMINI_ZERO_DATA_RETENTION_APPROVED=1
+CARTESIA_API_KEY="<from provider secret store>"
+GEMINI_API_KEY="<from provider secret store>"
+VIVA_LIVE_SMOKE_AUDIO_FILE="/app/evidence/live-smoke-answer.pcm"
 ```
 
 The hosted agent URL must point at a synthetic or fake monitor deployment whose

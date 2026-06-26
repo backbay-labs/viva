@@ -82,10 +82,46 @@ test("hosted monitor plan runs scheduled synthetic browser proof against hosted 
   assert.equal(plan.runs[0].env.VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO, "0");
   assert.equal(plan.matrix.schema, "viva.hosted_e2e_matrix.v1");
   assert.equal(plan.matrix.profile, "scheduled");
-  assert.equal(plan.matrix.scenario_count, 2);
+  assert.equal(plan.matrix.scenario_count, 1);
   assert.equal(plan.matrix.monitor_policy.live_monitor.max_cost_usd_per_run, 0.25);
   assert.equal(plan.runTimeoutMs, 600000);
   assert.equal(plan.publishTimeoutMs, 120000);
+});
+
+test("hosted monitor scheduled live opt-in runs bounded live smoke", () => {
+  const plan = buildHostedMonitorPlan({
+    ...baseEnv,
+    VIVA_HOSTED_LIVE_MONITOR_ENABLED: "1",
+  });
+
+  assert.deepEqual(
+    plan.runs.map((run) => run.name),
+    ["scheduled_hosted_synthetic_monitor", "scheduled_hosted_live_smoke"],
+  );
+  assert.equal(plan.runs[1].runner, "live-provider-smoke");
+  assert.equal(plan.runs[1].resultFileName, "evidence.json");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_PROVIDER_SMOKE, "1");
+  assert.equal(plan.runs[1].env.VIVA_AGENT_PROVIDER, "cartesia_gemini");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_AGENT_HTTP_URL, "https://agent.example.com");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_AGENT_WS_URL, "wss://agent.example.com/ws");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_ORIGIN, "https://web.example.com");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_DURATION_MS, "90000");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_TURNS, "1");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES, "262144");
+  assert.equal(plan.runs[1].env.VIVA_VOICE_WS_MAX_SESSION_COST_USD, "0.25");
+  assert.equal(plan.runs[1].env.VIVA_HOSTED_LIVE_MONITOR_BUDGET_BUCKET, "viva-monitor-live-smoke");
+  assert.equal(plan.runs[1].timeoutMs, 120000);
+});
+
+test("hosted monitor scheduled mode refuses PR matrix profiles", () => {
+  assert.throws(
+    () =>
+      buildHostedMonitorPlan({
+        ...baseEnv,
+        VIVA_HOSTED_MATRIX_PROFILE: "full",
+      }),
+    /scheduled hosted monitor requires VIVA_HOSTED_MATRIX_PROFILE=scheduled or unset/,
+  );
 });
 
 test("hosted monitor PR mode expands the deterministic failure-control matrix", () => {
@@ -104,6 +140,7 @@ test("hosted monitor PR mode expands the deterministic failure-control matrix", 
     [
       "pr_hosted_synthetic_matrix",
       "pr_hosted_fake_provider_matrix",
+      "pr_hosted_token_free_session_history",
       "pr_hosted_deterministic_partial_recap",
       ...FAILURE_CONTROL_SCENARIOS.map((scenario) => `pr_hosted_failure_control_${scenario.id}`),
     ],
@@ -111,28 +148,31 @@ test("hosted monitor PR mode expands the deterministic failure-control matrix", 
   assert.equal(plan.runs[1].env.VIVA_E2E_AGENT_PROVIDER, "fake_cartesia_gemini");
   assert.equal(plan.runs[1].env.VIVA_E2E_HOSTED_WEB_URL, "https://fake-web.example.com");
   assert.equal(plan.runs[1].env.VIVA_E2E_HOSTED_SCENARIO_ID, "fake_provider_happy_path");
-  assert.equal(plan.runs[2].scenario_id, "deterministic_partial_recap");
-  assert.equal(plan.runs[2].env.VIVA_E2E_AGENT_PROVIDER, "fake_cartesia_gemini");
-  assert.equal(plan.runs[2].env.VIVA_E2E_HOSTED_SCENARIO_ID, "deterministic_partial_recap");
-  assert.equal(plan.runs[2].env.VIVA_E2E_STOP_TO_RECAP, "1");
-  assert.equal(plan.runs[3].scenario_id, FAILURE_CONTROL_SCENARIOS[0].id);
-  assert.equal(plan.runs[3].env.VIVA_E2E_FAILURE_CONTROL_SCENARIO, "provider_rate_limited");
-  assert.equal(plan.runs[3].env.VIVA_E2E_HOSTED_SCENARIO_ID, "provider_rate_limited");
+  assert.equal(plan.runs[2].scenario_id, "token_free_session_history");
+  assert.equal(plan.runs[2].env.VIVA_E2E_AGENT_PROVIDER, "synthetic");
+  assert.equal(plan.runs[2].env.VIVA_E2E_HOSTED_SCENARIO_ID, "token_free_session_history");
+  assert.equal(plan.runs[3].scenario_id, "deterministic_partial_recap");
+  assert.equal(plan.runs[3].env.VIVA_E2E_AGENT_PROVIDER, "fake_cartesia_gemini");
+  assert.equal(plan.runs[3].env.VIVA_E2E_HOSTED_SCENARIO_ID, "deterministic_partial_recap");
+  assert.equal(plan.runs[3].env.VIVA_E2E_STOP_TO_RECAP, "1");
+  assert.equal(plan.runs[4].scenario_id, FAILURE_CONTROL_SCENARIOS[0].id);
+  assert.equal(plan.runs[4].env.VIVA_E2E_FAILURE_CONTROL_SCENARIO, "provider_rate_limited");
+  assert.equal(plan.runs[4].env.VIVA_E2E_HOSTED_SCENARIO_ID, "provider_rate_limited");
   assert.equal(
-    plan.runs[3].env.VIVA_E2E_HOSTED_WEB_URL,
+    plan.runs[4].env.VIVA_E2E_HOSTED_WEB_URL,
     "https://failure-provider-rate-limited-web.example.com",
   );
   assert.equal(
-    plan.runs[3].env.VIVA_E2E_HOSTED_AGENT_HTTP_URL,
+    plan.runs[4].env.VIVA_E2E_HOSTED_AGENT_HTTP_URL,
     "https://failure-provider-rate-limited-agent.example.com",
   );
   assert.equal(
-    plan.runs[3].env.VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS,
+    plan.runs[4].env.VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS,
     "https://failure-provider-rate-limited-web.example.com",
   );
-  assert.equal(plan.runs[3].env.VIVA_FAILURE_CONTROL_ENABLED, "1");
-  assert.equal(plan.runs[3].env.VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS, "synthetic-monitor-user");
-  assert.equal(plan.runs[3].env.VIVA_FAILURE_CONTROL_STUDY_SET_IDS, "biology-midterm");
+  assert.equal(plan.runs[4].env.VIVA_FAILURE_CONTROL_ENABLED, "1");
+  assert.equal(plan.runs[4].env.VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS, "synthetic-monitor-user");
+  assert.equal(plan.runs[4].env.VIVA_FAILURE_CONTROL_STUDY_SET_IDS, "biology-midterm");
 });
 
 test("hosted monitor PR mode requires per-scenario targets for multi-scenario failure-control runs", () => {
@@ -162,6 +202,7 @@ test("hosted monitor PR mode allows a smaller explicit failure-control scenario 
     [
       "happy_path",
       "fake_provider_happy_path",
+      "token_free_session_history",
       "deterministic_partial_recap",
       "provider_rate_limited",
       "provider_timeout",
@@ -194,6 +235,31 @@ test("hosted monitor rejects unknown matrix profiles", () => {
       }),
     /unsupported hosted E2E matrix profile/,
   );
+});
+
+test("hosted monitor summaries include live smoke quarantine evidence", () => {
+  const summary = summarizeHostedRun(
+    { name: "scheduled_hosted_live_smoke", runner: "live-provider-smoke" },
+    "/tmp/run",
+    "/tmp/run/live-smoke",
+    { exit_code: 0, sanitized: true, status: "passed" },
+    {
+      schema: "viva.live_provider_smoke.v1",
+      status: "failed",
+      provider: "cartesia_gemini",
+      terminal_reason: "provider_rate_limited",
+      failure: { failure_class: "quota_rate_failure" },
+      caps: { max_session_cost_usd: 0.25 },
+      privacy: { raw_audio_retained: false },
+    },
+    "/tmp",
+  );
+
+  assert.equal(summary.runner, "live-provider-smoke");
+  assert.equal(summary.live_smoke.status, "failed");
+  assert.equal(summary.live_smoke.self_quarantine.triggered, true);
+  assert.equal(summary.live_smoke.self_quarantine.cooldown_seconds, 21600);
+  assert.equal(summary.hosted_e2e, null);
 });
 
 test("hosted monitor rejects learner-like runner identities", () => {

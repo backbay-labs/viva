@@ -11,6 +11,7 @@ import {
   buildHostedE2eMatrixContract,
   defaultMatrixProfile,
   failureControlScenarioIdsForProfile,
+  HOSTED_MONITOR_POLICY,
   summarizeHostedE2eResult,
 } from "./hosted-e2e-matrix.mjs";
 
@@ -42,7 +43,7 @@ export function buildHostedMonitorPlan(env = process.env) {
   const runId = sanitizeRunId(
     env.VIVA_HOSTED_RUN_ID || new Date().toISOString().replaceAll(/[:.]/g, "-"),
   );
-  const matrixProfile = (env.VIVA_HOSTED_MATRIX_PROFILE || defaultMatrixProfile(mode)).trim();
+  const matrixProfile = matrixProfileForMode(env, mode);
   const deploySha = (env.VIVA_HOSTED_DEPLOY_SHA || env.GITHUB_SHA || "").trim();
   const matrix = buildHostedE2eMatrixContract({
     mode,
@@ -97,19 +98,30 @@ export function buildHostedMonitorPlan(env = process.env) {
           ]),
         )
       : new Map();
+  const scheduledRuns = [
+    {
+      name: "scheduled_hosted_synthetic_monitor",
+      scenario_id: "happy_path",
+      env: runEnv(baseEnv, syntheticTarget, {
+        VIVA_E2E_HOSTED_SCENARIO_ID: "happy_path",
+        VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
+      }),
+      timeoutMs: runTimeoutMs,
+    },
+    ...(hostedLiveMonitorEnabled(env)
+      ? [
+          scheduledLiveMonitorRun(
+            baseTarget,
+            matrix.monitor_policy.live_monitor,
+            runTimeoutMs,
+            runId,
+          ),
+        ]
+      : []),
+  ];
   const runs =
     mode === "scheduled"
-      ? [
-          {
-            name: "scheduled_hosted_synthetic_monitor",
-            scenario_id: "happy_path",
-            env: runEnv(baseEnv, syntheticTarget, {
-              VIVA_E2E_HOSTED_SCENARIO_ID: "happy_path",
-              VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
-            }),
-            timeoutMs: runTimeoutMs,
-          },
-        ]
+      ? scheduledRuns
       : [
           {
             name: "pr_hosted_synthetic_matrix",
@@ -125,6 +137,15 @@ export function buildHostedMonitorPlan(env = process.env) {
             scenario_id: "fake_provider_happy_path",
             env: runEnv(baseEnv, fakeTarget, {
               VIVA_E2E_HOSTED_SCENARIO_ID: "fake_provider_happy_path",
+              VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
+            }),
+            timeoutMs: runTimeoutMs,
+          },
+          {
+            name: "pr_hosted_token_free_session_history",
+            scenario_id: "token_free_session_history",
+            env: runEnv(baseEnv, syntheticTarget, {
+              VIVA_E2E_HOSTED_SCENARIO_ID: "token_free_session_history",
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
             }),
             timeoutMs: runTimeoutMs,
@@ -182,6 +203,16 @@ export function buildHostedMonitorPlan(env = process.env) {
   };
 }
 
+function matrixProfileForMode(env, mode) {
+  const profile = (env.VIVA_HOSTED_MATRIX_PROFILE || defaultMatrixProfile(mode)).trim();
+  if (mode === "scheduled" && profile !== "scheduled") {
+    throw new Error(
+      "scheduled hosted monitor requires VIVA_HOSTED_MATRIX_PROFILE=scheduled or unset",
+    );
+  }
+  return profile;
+}
+
 function hostedTargetFromEnv(env, { agentHttpName, agentWsName, provider, webName }) {
   return {
     agentHttpUrl: normalizeHostedUrl(requiredValue(env, agentHttpName)),
@@ -237,6 +268,35 @@ function runEnv(baseEnv, target, extra = {}) {
   };
 }
 
+function hostedLiveMonitorEnabled(env) {
+  return env.VIVA_HOSTED_LIVE_MONITOR_ENABLED === "1";
+}
+
+function scheduledLiveMonitorRun(target, livePolicy, runTimeoutMs, runId) {
+  const timeoutMs = Math.min(runTimeoutMs, livePolicy.max_duration_ms_per_run + 30_000);
+  return {
+    name: "scheduled_hosted_live_smoke",
+    scenario_id: "live_provider_smoke",
+    runner: "live-provider-smoke",
+    resultFileName: "evidence.json",
+    env: {
+      VIVA_AGENT_PROVIDER: "cartesia_gemini",
+      VIVA_HOSTED_LIVE_MONITOR_BUDGET_BUCKET: livePolicy.budget_bucket,
+      VIVA_HOSTED_RUN_ID: runId,
+      VIVA_LIVE_PROVIDER_SMOKE: "1",
+      VIVA_LIVE_SMOKE: "1",
+      VIVA_LIVE_SMOKE_AGENT_HTTP_URL: target.agentHttpUrl,
+      VIVA_LIVE_SMOKE_AGENT_WS_URL: target.agentWsUrl,
+      VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: String(livePolicy.max_audio_bytes_per_run),
+      VIVA_LIVE_SMOKE_MAX_DURATION_MS: String(livePolicy.max_duration_ms_per_run),
+      VIVA_LIVE_SMOKE_MAX_TURNS: String(livePolicy.max_turns_per_run),
+      VIVA_LIVE_SMOKE_ORIGIN: target.webUrl,
+      VIVA_VOICE_WS_MAX_SESSION_COST_USD: String(livePolicy.max_cost_usd_per_run),
+    },
+    timeoutMs,
+  };
+}
+
 export function normalizeHostedUrl(value) {
   const url = new URL(value);
   if (!["http:", "https:"].includes(url.protocol)) {
@@ -284,10 +344,10 @@ async function main() {
 
   for (const run of plan.runs) {
     const runDir = path.join(outputDir, run.name);
-    const browserArtifactDir = path.join(runDir, "browser");
+    const evidenceArtifactDir = path.join(runDir, artifactSubdirForRun(run));
     await mkdir(runDir, { recursive: true });
-    let outcome = await runHostedE2E(run, runDir, browserArtifactDir);
-    const resultRead = await readRunResult(browserArtifactDir);
+    let outcome = await runHostedMonitorCommand(run, runDir, evidenceArtifactDir);
+    const resultRead = await readRunResult(evidenceArtifactDir, run);
     if (outcome.status === "passed" && !resultRead.result) {
       outcome = await writeRunOutcomeArtifact(
         runDir,
@@ -297,7 +357,7 @@ async function main() {
     }
     await auditHostedArtifacts(runDir);
     summary.runs.push(
-      summarizeHostedRun(run, runDir, browserArtifactDir, outcome, resultRead.result),
+      summarizeHostedRun(run, runDir, evidenceArtifactDir, outcome, resultRead.result),
     );
   }
 
@@ -348,15 +408,24 @@ export async function writePublishedManifest(outputDir, summary, plan) {
   return published;
 }
 
-async function readRunResult(runDir) {
+function artifactSubdirForRun(run) {
+  return run.runner === "live-provider-smoke" ? "live-smoke" : "browser";
+}
+
+async function readRunResult(runDir, run = {}) {
+  const fileName =
+    run.resultFileName ?? (run.runner === "live-provider-smoke" ? "evidence.json" : "result.json");
   try {
     return {
       failureClass: null,
-      result: JSON.parse(await readFile(path.join(runDir, "result.json"), "utf8")),
+      result: JSON.parse(await readFile(path.join(runDir, fileName), "utf8")),
     };
   } catch (error) {
     return {
-      failureClass: error?.code === "ENOENT" ? "missing_result" : "invalid_result_json",
+      failureClass:
+        error?.code === "ENOENT"
+          ? `missing_${path.basename(fileName, ".json")}`
+          : "invalid_result_json",
       result: null,
     };
   }
@@ -370,6 +439,7 @@ export function summarizeHostedRun(run, runDir, resultDir, outcome, result, root
       : (result?.browser_story_artifact ?? null);
   return {
     name: run.name,
+    runner: run.runner ?? "e2e-browser",
     scenario_id: run.scenario_id ?? result?.hosted_e2e?.scenario_id ?? null,
     artifact_dir: path.relative(rootDir, runDir),
     status: outcome.status,
@@ -389,24 +459,57 @@ export function summarizeHostedRun(run, runDir, resultDir, outcome, result, root
         }
       : null,
     hosted_e2e: summarizeHostedE2eResult(result),
+    live_smoke: summarizeLiveSmokeResult(result),
     manuscript_ready: result?.manuscript_ready === true,
     page_error_count: Array.isArray(result?.page_errors) ? result.page_errors.length : 0,
     sanitized: true,
   };
 }
 
-async function runHostedE2E(run, runDir, browserArtifactDir) {
-  const stdout = createWriteStream(path.join(runDir, "e2e.stdout.log"));
-  const stderr = createWriteStream(path.join(runDir, "e2e.stderr.log"));
+function summarizeLiveSmokeResult(result) {
+  if (result?.schema !== "viva.live_provider_smoke.v1") return null;
+  return {
+    schema: result.schema,
+    status: result.status ?? null,
+    provider: result.provider ?? null,
+    terminal_reason: result.terminal_reason ?? null,
+    failure_class: result.failure?.failure_class ?? result.failure_class ?? null,
+    caps: result.caps ?? null,
+    privacy: result.privacy ?? null,
+    self_quarantine: liveMonitorSelfQuarantine(result),
+    sanitized: true,
+  };
+}
+
+function liveMonitorSelfQuarantine(result) {
+  const policy = HOSTED_MONITOR_POLICY.self_quarantine;
+  const terminalReason = result?.terminal_reason ?? null;
+  const failureClass = result?.failure?.failure_class ?? result?.failure_class ?? null;
+  const triggered =
+    terminalReason === policy.terminal_reason || failureClass === policy.failure_class;
+  return {
+    triggered,
+    terminal_reason: triggered ? terminalReason : null,
+    failure_class: triggered ? failureClass : null,
+    cooldown_seconds: policy.cooldown_seconds,
+    observation_window_seconds: policy.observation_window_seconds,
+  };
+}
+
+async function runHostedMonitorCommand(run, runDir, evidenceArtifactDir) {
+  const runner = run.runner ?? "e2e-browser";
+  const logPrefix = runner === "live-provider-smoke" ? "live-smoke" : "e2e";
+  const stdout = createWriteStream(path.join(runDir, `${logPrefix}.stdout.log`));
+  const stderr = createWriteStream(path.join(runDir, `${logPrefix}.stderr.log`));
   const stdoutFinished = finished(stdout);
   const stderrFinished = finished(stderr);
-  const child = spawn("bun", ["run", "e2e:browser"], {
+  const command = hostedMonitorCommand(run, evidenceArtifactDir);
+  const child = spawn(command.bin, command.args, {
     cwd: root,
     env: {
       ...process.env,
       ...run.env,
-      VIVA_E2E_ARTIFACT_DIR: browserArtifactDir,
-      VIVA_E2E_TRACE: "0",
+      ...command.env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -470,6 +573,31 @@ async function runHostedE2E(run, runDir, browserArtifactDir) {
     sanitized: true,
     exit_code: 0,
   };
+}
+
+function hostedMonitorCommand(run, evidenceArtifactDir) {
+  const runner = run.runner ?? "e2e-browser";
+  if (runner === "e2e-browser") {
+    return {
+      bin: "bun",
+      args: ["run", "e2e:browser"],
+      env: {
+        VIVA_E2E_ARTIFACT_DIR: evidenceArtifactDir,
+        VIVA_E2E_TRACE: "0",
+      },
+    };
+  }
+  if (runner === "live-provider-smoke") {
+    return {
+      bin: "bun",
+      args: ["run", "live:smoke"],
+      env: {
+        VIVA_LIVE_SMOKE_ARTIFACT_DIR: evidenceArtifactDir,
+        VIVA_LIVE_SMOKE_EVIDENCE_PATH: path.join(evidenceArtifactDir, "evidence.json"),
+      },
+    };
+  }
+  throw new Error(`unsupported hosted monitor runner ${runner}`);
 }
 
 async function flushHostedRunLogs(stdoutFinished, stderrFinished) {

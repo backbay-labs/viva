@@ -68,6 +68,7 @@ if (!allowedBrowserStoryProviders.has(agentProvider)) {
 const stopToRecap = process.env.VIVA_E2E_STOP_TO_RECAP === "1";
 const hostedScenarioId =
   process.env.VIVA_E2E_HOSTED_SCENARIO_ID?.trim() || defaultHostedScenarioId();
+const deterministicPartialRecapScenario = hostedScenarioId === "deterministic_partial_recap";
 const traceRequested = process.env.VIVA_E2E_TRACE === "1";
 if (hostedMode && traceRequested) {
   throw new Error("Hosted browser E2E cannot retain Playwright traces.");
@@ -448,15 +449,18 @@ try {
     nextSessionRecommendationVisible =
       (await isVisible(page.getByText("Next session", { exact: false }).first())) &&
       (await isVisible(page.getByText("core FSRS", { exact: false }).first()));
+    const recapConceptProofVisible =
+      stopToRecap ||
+      (Boolean(postAnswerProtocolProof.conceptId) &&
+        (await isVisible(
+          page
+            .getByText(conceptLabelText(postAnswerProtocolProof.conceptId), { exact: true })
+            .first(),
+        )));
     recapPayloadVisible =
       (await isVisible(page.getByText("Closing fold / Recap ready").first())) &&
       (await isVisible(page.getByText(recapSummaryText, { exact: false }).first())) &&
-      Boolean(postAnswerProtocolProof.conceptId) &&
-      (await isVisible(
-        page
-          .getByText(conceptLabelText(postAnswerProtocolProof.conceptId), { exact: true })
-          .first(),
-      )) &&
+      recapConceptProofVisible &&
       (await isVisible(page.getByText("Conductor next action", { exact: false }).first()));
   }
   const shareVisible = await isVisible(page.getByRole("button", { name: "Share" }));
@@ -501,9 +505,19 @@ try {
       : ["connected-terminal-fold.png"]),
   ];
   const terminalReason =
-    failureControlTerminalProof?.terminal_reason ?? (recapPayloadVisible ? "completed" : null);
+    failureControlTerminalProof?.terminal_reason ??
+    (deterministicPartialRecapScenario && recapPayloadVisible
+      ? "partial_stage_success"
+      : recapPayloadVisible
+        ? "completed"
+        : null);
   const hostedEvidenceStage =
-    failureControlTerminalProof?.stage ?? (recapPayloadVisible ? "feedback" : null);
+    failureControlTerminalProof?.stage ??
+    (deterministicPartialRecapScenario && recapPayloadVisible
+      ? "websocket"
+      : recapPayloadVisible
+        ? "feedback"
+        : null);
   let result = {
     artifact_dir: path.relative(root, artifactDir),
     agent_provider: agentProvider,
@@ -546,7 +560,9 @@ try {
       controlMode: failureControlPlan.enabled ? "failure_control" : "none",
       deployIds: hostedDeployIds(),
       deploySha: hostedDeploySha(),
-      failureClass: failureControlTerminalProof?.failure_class ?? null,
+      failureClass:
+        failureControlTerminalProof?.failure_class ??
+        (deterministicPartialRecapScenario && recapPayloadVisible ? "partial_stage_success" : null),
       hostedMode,
       postgresDurability: hostedPostgresDurability(),
       provider: agentProvider,

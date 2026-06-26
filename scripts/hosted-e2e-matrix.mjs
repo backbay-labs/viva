@@ -63,7 +63,7 @@ const BASELINE_SCENARIOS = Object.freeze([
     milestone: "M1",
     owner_issue: "BAC-515",
     runner: "e2e-browser-url-audit",
-    profiles: ["scheduled", "pr"],
+    profiles: ["pr"],
     provider: "synthetic",
     stage: "client",
     terminal_reason: "completed",
