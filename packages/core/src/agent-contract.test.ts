@@ -124,6 +124,57 @@ describe("Viva voice agent contract", () => {
     ).toThrow("Invalid terminal session reason");
   });
 
+  test("parses provider-failure partial recap markers as sanitized terminal reasons", () => {
+    const frame = parseVivaServerFrame({
+      type: "event",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      event: {
+        type: "recap_ready",
+        response_id: "partial-recap-provider-timeout",
+        partial_reason: "provider_timeout",
+        recap: {
+          voice_session_id: "voice-session-1",
+          headline: "Partial recap",
+          summary: "Durable state only.",
+          strong_concepts: [],
+          shaky_concepts: [],
+          missed_concepts: [],
+          review_later: [],
+          next_action: "Retry when available.",
+          source_moments: [],
+        },
+      },
+    });
+
+    if (frame.type !== "event" || frame.event.type !== "recap_ready") {
+      throw new Error("Expected recap event frame");
+    }
+    expect(frame.event.partial_reason).toBe("provider_timeout");
+
+    expect(() =>
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "recap_ready",
+          response_id: "partial-recap-raw",
+          partial_reason: "raw provider payload",
+          recap: {
+            voice_session_id: "voice-session-1",
+            headline: "Partial recap",
+            summary: "Durable state only.",
+            strong_concepts: [],
+            shaky_concepts: [],
+            missed_concepts: [],
+            review_later: [],
+            next_action: "Retry when available.",
+            source_moments: [],
+          },
+        },
+      }),
+    ).toThrow("Invalid terminal session reason");
+  });
+
   test("parses shared structured error fixture from Rust service", () => {
     const frame = parseVivaServerFrame(structuredErrorFixture);
 

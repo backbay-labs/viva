@@ -328,6 +328,9 @@ export function summarizeServerFrame(frame) {
       summary.terminal_reason = safeEnum(frame.event.terminal_reason);
     }
   }
+  if (eventCode === "recap" && typeof frame.event.partial_reason === "string") {
+    summary.partial_reason = safeEnum(frame.event.partial_reason);
+  }
   return summary;
 }
 
@@ -575,7 +578,11 @@ async function collectWebSocketProof({ audioBytes, bootstrap, config, createWebS
       if (code === "structured_error") {
         proof.terminal_reason = "server_error_frame";
       }
-      if (code === "recap") {
+      if (code === "recap" && summary.partial_reason) {
+        if (!proof.terminal_reason || proof.terminal_reason === "recap_observed") {
+          proof.terminal_reason = summary.partial_reason;
+        }
+      } else if (code === "recap" && !proof.terminal_reason) {
         proof.terminal_reason = "recap_observed";
         sendJson(socket, {
           type: "stop",

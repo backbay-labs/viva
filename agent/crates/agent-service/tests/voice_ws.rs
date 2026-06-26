@@ -2901,12 +2901,16 @@ async fn websocket_provider_rate_limit_after_answer_emits_deterministic_partial_
     else {
         return;
     };
-    let (recap_index, recap) = frames
+    let (recap_index, recap, partial_reason) = frames
         .iter()
         .enumerate()
         .find_map(|(index, frame)| match frame {
             ServerFrame::Event { event, .. } => match event.as_ref() {
-                VivaServerEvent::RecapReady { recap, .. } => Some((index, recap)),
+                VivaServerEvent::RecapReady {
+                    recap,
+                    partial_reason,
+                    ..
+                } => Some((index, recap, *partial_reason)),
                 _ => None,
             },
             _ => None,
@@ -2922,6 +2926,10 @@ async fn websocket_provider_rate_limit_after_answer_emits_deterministic_partial_
     assert!(
         recap_index < terminal_index,
         "partial recap must be visible before the terminal provider phase"
+    );
+    assert_eq!(
+        partial_reason,
+        Some(TerminalSessionReason::ProviderRateLimited)
     );
     assert_eq!(
         recap.voice_session_id,
@@ -2964,7 +2972,11 @@ async fn websocket_provider_timeout_after_partial_stage_success_records_partial_
         .iter()
         .find_map(|frame| match frame {
             ServerFrame::Event { event, .. } => match event.as_ref() {
-                VivaServerEvent::RecapReady { recap, .. } => Some(recap),
+                VivaServerEvent::RecapReady {
+                    recap,
+                    partial_reason,
+                    ..
+                } if *partial_reason == Some(TerminalSessionReason::ProviderTimeout) => Some(recap),
                 _ => None,
             },
             _ => None,
@@ -2982,6 +2994,99 @@ async fn websocket_provider_timeout_after_partial_stage_success_records_partial_
         event.kind == VoiceEvidenceEventKind::PartialRecap
             && event.detail.contains("terminal_reason=provider_timeout")
             && event.detail.contains("concept_statuses=1")
+    }));
+}
+
+#[tokio::test]
+async fn websocket_stop_drain_provider_failure_emits_deterministic_partial_recap() {
+    let Some((frames, evidence, store)) =
+        run_partial_recap_provider_failure_probe_after_stop(TerminalSessionReason::ProviderTimeout)
+            .await
+    else {
+        return;
+    };
+    let recap_index = frames
+        .iter()
+        .position(|frame| {
+            matches!(
+                frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(
+                        event.as_ref(),
+                        VivaServerEvent::RecapReady {
+                            partial_reason: Some(TerminalSessionReason::ProviderTimeout),
+                            ..
+                        }
+                    )
+            )
+        })
+        .expect("partial recap frame");
+    let terminal_index = frames
+        .iter()
+        .position(|frame| {
+            terminal_session_reason(frame) == Some(TerminalSessionReason::ProviderTimeout)
+        })
+        .expect("provider-timeout terminal phase");
+
+    assert!(
+        recap_index < terminal_index,
+        "stop-drain partial recap must be visible before the terminal provider phase"
+    );
+    let counts = store.write_counts();
+    assert_eq!(counts.answer_attempts, 1);
+    assert_eq!(counts.recaps, 1);
+    assert!(evidence.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::PartialRecap
+            && event.detail.contains("terminal_reason=provider_timeout")
+            && event.detail.contains("answer_attempts=1")
+    }));
+}
+
+#[tokio::test]
+async fn websocket_stop_drain_provider_failure_does_not_replace_existing_recap() {
+    let Some((frames, evidence, store)) =
+        run_partial_recap_provider_failure_probe_after_stop_with_existing_recap(
+            TerminalSessionReason::ProviderTimeout,
+        )
+        .await
+    else {
+        return;
+    };
+    let recap_frames = frames
+        .iter()
+        .filter(|frame| {
+            matches!(
+                frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(event.as_ref(), VivaServerEvent::RecapReady { .. })
+            )
+        })
+        .count();
+
+    assert_eq!(recap_frames, 1);
+    assert!(frames.iter().any(|frame| {
+        matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::RecapReady {
+                        partial_reason: None,
+                        ..
+                    }
+                )
+        )
+    }));
+    assert!(frames.iter().any(|frame| {
+        terminal_session_reason(frame) == Some(TerminalSessionReason::ProviderTimeout)
+    }));
+    let counts = store.write_counts();
+    assert_eq!(counts.answer_attempts, 1);
+    assert_eq!(counts.recaps, 1);
+    assert!(evidence.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::PartialRecap
+            && event.detail.contains("reason=prior_recap_exists")
+            && event.detail.contains("prior_recaps=1")
     }));
 }
 
@@ -9164,12 +9269,70 @@ async fn run_partial_recap_provider_failure_probe(
     Vec<observe::VoiceEvidenceEvent>,
     Arc<data::InMemoryStudyStore>,
 )> {
+    run_partial_recap_provider_failure_probe_with_stop(
+        terminal_reason,
+        record_concept_status,
+        false,
+    )
+    .await
+}
+
+async fn run_partial_recap_provider_failure_probe_after_stop(
+    terminal_reason: TerminalSessionReason,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
+    run_partial_recap_provider_failure_probe_with_stop(terminal_reason, false, true).await
+}
+
+async fn run_partial_recap_provider_failure_probe_after_stop_with_existing_recap(
+    terminal_reason: TerminalSessionReason,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
+    run_partial_recap_provider_failure_probe_with_options(terminal_reason, false, true, true).await
+}
+
+async fn run_partial_recap_provider_failure_probe_with_stop(
+    terminal_reason: TerminalSessionReason,
+    record_concept_status: bool,
+    failure_after_stop: bool,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
+    run_partial_recap_provider_failure_probe_with_options(
+        terminal_reason,
+        record_concept_status,
+        failure_after_stop,
+        false,
+    )
+    .await
+}
+
+async fn run_partial_recap_provider_failure_probe_with_options(
+    terminal_reason: TerminalSessionReason,
+    record_concept_status: bool,
+    failure_after_stop: bool,
+    recap_before_failure: bool,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let state = AppState::with_study_store(
         Arc::new(PartialRecapProviderFailureProbeBrain {
             study_store: store.clone(),
             terminal_reason,
             record_concept_status,
+            failure_after_stop,
+            recap_before_failure,
         }),
         "partial_recap_probe",
         VoiceWsAccess::default(),
@@ -9214,6 +9377,19 @@ async fn run_partial_recap_provider_failure_probe(
         },
     )
     .await;
+    if failure_after_stop {
+        wait_until(Duration::from_secs(2), || {
+            store.write_counts().answer_attempts == 1
+        })
+        .await;
+        send_client_frame(
+            &mut socket,
+            &ClientFrame::Stop {
+                version: VIVA_VOICE_PROTOCOL_VERSION,
+            },
+        )
+        .await;
+    }
     frames.extend(read_server_frames_until_close(&mut socket).await);
     Some((frames, evidence.snapshot(), store))
 }
@@ -9750,6 +9926,8 @@ struct PartialRecapProviderFailureProbeBrain {
     study_store: Arc<dyn StudyMemoryStore>,
     terminal_reason: TerminalSessionReason,
     record_concept_status: bool,
+    failure_after_stop: bool,
+    recap_before_failure: bool,
 }
 
 #[async_trait::async_trait]
@@ -9786,6 +9964,8 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
         let study_store = self.study_store.clone();
         let terminal_reason = self.terminal_reason;
         let record_concept_status = self.record_concept_status;
+        let failure_after_stop = self.failure_after_stop;
+        let recap_before_failure = self.recap_before_failure;
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
         let task = tokio::spawn(async move {
@@ -9856,6 +10036,42 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                             response_id: response_id.to_owned(),
                             concept_id: "nadh".to_owned(),
                             status: ConceptStatus::Review,
+                        })
+                        .await;
+                }
+                if failure_after_stop {
+                    while let Some(input) = input_rx.recv().await {
+                        if matches!(input, BrainInput::Stop) {
+                            break;
+                        }
+                    }
+                }
+                if recap_before_failure {
+                    let recap = StudySessionRecap {
+                        voice_session_id: voice_session_id.clone(),
+                        headline: "Full recap".to_owned(),
+                        summary: "Durable model recap already exists.".to_owned(),
+                        strong_concepts: vec!["NADH".to_owned()],
+                        shaky_concepts: vec![],
+                        missed_concepts: vec![],
+                        review_later: vec!["ATP synthase".to_owned()],
+                        next_action: "Continue".to_owned(),
+                        source_moments: vec![],
+                    };
+                    let response_id = "response-normal-recap";
+                    let _ = study_store
+                        .record_recap(
+                            &user_id,
+                            &study_set_id,
+                            &voice_session_id,
+                            response_id,
+                            recap.clone(),
+                        )
+                        .await;
+                    let _ = event_tx
+                        .send(BrainEvent::RecapReady {
+                            response_id: response_id.to_owned(),
+                            recap,
                         })
                         .await;
                 }

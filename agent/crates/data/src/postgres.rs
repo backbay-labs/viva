@@ -553,9 +553,12 @@ impl StudyMemoryStore for PostgresStudyStore {
         let voice_session_uuid = Self::uuid_for(voice_session_id)?;
         let row = sqlx::query(
             "SELECT
-                (SELECT COUNT(*) FROM answer_attempts
-                 WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3) AS answer_attempts,
-                (SELECT COUNT(*) FROM concept_statuses
+                (SELECT COUNT(*) FROM answer_attempts attempts
+                 JOIN voice_sessions sessions ON sessions.id = attempts.voice_session_id
+                 WHERE sessions.user_id = $1
+                   AND sessions.study_set_id = $2
+                   AND attempts.voice_session_id = $3) AS answer_attempts,
+                (SELECT COUNT(*) FROM concept_status_events
                  WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3) AS concept_statuses,
                 (SELECT COUNT(*) FROM review_items
                  WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3) AS review_items,

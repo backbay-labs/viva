@@ -233,6 +233,22 @@ test("server frames summarize to safe counters without raw protocol payload", ()
   assert.equal(summaries[3].event_code, "source_ref");
   assert.equal(summaries[4].event_code, "audio_chunk");
   assert.equal(summaries[5].event_code, "recap");
+  assert.deepEqual(
+    summarizeServerFrame(
+      eventFrame("recap_ready", {
+        response_id: "response-partial",
+        partial_reason: "provider_timeout",
+        recap: {
+          nextAction: "raw partial recap must not be retained",
+        },
+      }),
+    ),
+    {
+      event_code: "recap",
+      kind: "event",
+      partial_reason: "provider_timeout",
+    },
+  );
 
   const serialized = JSON.stringify(summaries);
   assert.doesNotMatch(serialized, /raw speech text/);
@@ -1061,6 +1077,68 @@ test("runLiveProviderSmoke resets persisted live-monitor failures across deploys
   }
 });
 
+test("runLiveProviderSmoke does not pass on provider-failure partial recap", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "viva-live-smoke-"));
+  const audioPath = path.join(tempDir, "answer.pcm");
+  await writeFile(audioPath, Buffer.from([1, 2, 3, 4]));
+  const socket = new PartialFailureRecapSocket("provider_timeout");
+
+  try {
+    const evidence = await runLiveProviderSmoke({
+      env: {
+        VIVA_LIVE_PROVIDER_SMOKE: "1",
+        CARTESIA_API_KEY: "cartesia-secret-value",
+        GEMINI_API_KEY: "gemini-secret-value",
+        CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+        GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
+        VIVA_LIVE_SMOKE_AUDIO_FILE: audioPath,
+        VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
+        VIVA_LIVE_SMOKE_MAX_TURNS: "1",
+        VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
+        VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
+        VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "https://agent.viva.test",
+      },
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/health/brain")) {
+          return jsonResponse(200, brainHealth());
+        }
+        if (String(url).endsWith("/ready")) {
+          return jsonResponse(200, readyBody());
+        }
+        if (String(url).endsWith("/study-sets/paste")) {
+          return jsonResponse(201, {
+            study_set: {
+              id: "server-study-set",
+              user_id: "user-1",
+              ingestion_status: "ready",
+            },
+            session_id: "server-session",
+            session_token: "viva1.server-token-secret",
+          });
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      },
+      createWebSocket: () => {
+        queueMicrotask(() => {
+          socket.open();
+          socket.message(readyFrame());
+        });
+        return socket;
+      },
+      now: () => new Date("2026-06-18T00:00:00.000Z"),
+    });
+
+    assert.equal(evidence.status, "failed");
+    assert.equal(evidence.failure_stage, "websocket");
+    assert.equal(evidence.websocket.terminal_reason, "provider_timeout");
+    assert.equal(evidence.failure.failure_class, "timeout");
+    assert.equal(evidence.failure.terminal_reason, "provider_timeout");
+    assert.equal(evidence.websocket.event_counts.recap, 2);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 function jsonResponse(status, body) {
   return {
     ok: status >= 200 && status < 300,
@@ -1346,6 +1424,53 @@ class TerminalReasonSocket extends FakeSocket {
           }),
         );
         this.close(1008, this.terminalReason);
+      });
+    }
+  }
+}
+
+class PartialFailureRecapSocket extends FakeSocket {
+  constructor(terminalReason) {
+    super();
+    this.terminalReason = terminalReason;
+  }
+
+  send(data) {
+    this.sent.push(data);
+    if (typeof data === "string") {
+      const frame = JSON.parse(data);
+      if (frame.type === "session_config") {
+        queueMicrotask(() => {
+          this.message(eventFrame("session_phase", { phase: "listening" }));
+          this.message(eventFrame("question_started", { response_id: "response-1", question: {} }));
+        });
+      }
+    } else if (Buffer.isBuffer(data)) {
+      queueMicrotask(() => {
+        this.message(
+          eventFrame("recap_ready", {
+            response_id: "partial-recap-provider-timeout",
+            partial_reason: this.terminalReason,
+            recap: {
+              nextAction: "raw partial recap",
+            },
+          }),
+        );
+        this.message(
+          eventFrame("recap_ready", {
+            response_id: "response-late-normal-recap",
+            recap: {
+              nextAction: "raw late normal recap",
+            },
+          }),
+        );
+        this.message(
+          eventFrame("session_phase", {
+            phase: "recap",
+            terminal_reason: this.terminalReason,
+          }),
+        );
+        this.close(1011, this.terminalReason);
       });
     }
   }

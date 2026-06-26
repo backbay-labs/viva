@@ -737,6 +737,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optional_postgres_study_session_durable_counts_match_real_schema_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+
+        let store = Arc::new(crate::PostgresStudyStore::new(pool.clone()));
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(store.as_ref(), &session_id).await;
+        let executor = count_table_executor(store.clone(), &session_id);
+        replay_counted_provider_turn(&executor, &session_id).await;
+
+        let counts = store
+            .study_session_durable_counts("user-1", "biology-midterm", &session_id)
+            .await
+            .expect("durable count query uses the migrated postgres schema");
+        assert_eq!(counts.answer_attempts, 1);
+        assert_eq!(counts.concept_statuses, 1);
+        assert_eq!(counts.review_items, 1);
+        assert_eq!(counts.prior_recaps, 1);
+    }
+
+    #[tokio::test]
     async fn optional_postgres_session_token_nonce_claims_reject_replay_when_database_url_is_set() {
         let Some(pool) = optional_postgres_pool().await else {
             return;

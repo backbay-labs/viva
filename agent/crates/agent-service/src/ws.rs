@@ -40,7 +40,7 @@ use crate::{
         SessionTokenClaims, VoiceLimitConfig, VoiceWsAccessError,
     },
     protocol::{
-        ClientFrame, ServerFrame, VIVA_VOICE_MAX_BINARY_FRAME_BYTES,
+        ClientFrame, ServerFrame, VivaServerEvent, VIVA_VOICE_MAX_BINARY_FRAME_BYTES,
         VIVA_VOICE_MAX_TEXT_FRAME_BYTES, VIVA_VOICE_PROTOCOL_VERSION,
     },
 };
@@ -933,6 +933,17 @@ async fn handle_socket(
                                 break;
                             }
                             Ok(ForwardBrainEvent::ProviderFailure(reason)) => {
+                                if send_partial_recap_for_provider_failure(
+                                    &forward_context,
+                                    reason,
+                                    &mut sender,
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    terminal_reason = "send_failed";
+                                    break;
+                                }
                                 terminal_reason = close_with_terminal_session_phase(
                                     &mut sender,
                                     &session.input,
@@ -1105,6 +1116,17 @@ async fn handle_socket(
                                         break;
                                     }
                                     Ok(ForwardBrainEvent::ProviderFailure(reason)) => {
+                                        if send_partial_recap_for_provider_failure(
+                                            &forward_context,
+                                            reason,
+                                            &mut sender,
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            terminal_reason = "send_failed";
+                                            break;
+                                        }
                                         terminal_reason = close_with_terminal_session_phase(
                                             &mut sender,
                                             &session.input,
@@ -1590,7 +1612,14 @@ where
     ));
     send_json(
         sender,
-        &ServerFrame::event(agent_domain::BrainEvent::RecapReady { response_id, recap }),
+        &ServerFrame::Event {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            event: Box::new(VivaServerEvent::RecapReady {
+                response_id,
+                recap,
+                partial_reason: Some(terminal_reason),
+            }),
+        },
     )
     .await?;
     Ok(true)
