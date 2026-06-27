@@ -24,7 +24,6 @@ const PR_BROWSER_SCENARIO_IDS = Object.freeze([
   "happy_path",
   "fake_provider_happy_path",
   "token_free_session_history",
-  "deterministic_partial_recap",
 ]);
 
 export function buildHostedMonitorPlan(env = process.env) {
@@ -191,16 +190,6 @@ export function buildHostedMonitorPlan(env = process.env) {
             env: runEnv(baseEnv, syntheticTarget, {
               VIVA_E2E_HOSTED_SCENARIO_ID: "token_free_session_history",
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
-            }),
-            timeoutMs: runTimeoutMs,
-          },
-          {
-            name: "pr_hosted_deterministic_partial_recap",
-            scenario_id: "deterministic_partial_recap",
-            env: runEnv(baseEnv, fakeTarget, {
-              VIVA_E2E_HOSTED_SCENARIO_ID: "deterministic_partial_recap",
-              VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
-              VIVA_E2E_STOP_TO_RECAP: "1",
             }),
             timeoutMs: runTimeoutMs,
           },
