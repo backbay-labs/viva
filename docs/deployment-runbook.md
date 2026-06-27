@@ -521,10 +521,15 @@ allowed only when `VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS` names exactly one
 scenario.
 
 When `VIVA_HOSTED_LIVE_MONITOR_ENABLED=1`, also provide the live provider
-secrets, zero-retention confirmations, and local PCM input expected by
-`bun run live:smoke`, plus persisted scheduler state and a dedicated
+secrets, zero-retention confirmations, a pre-provisioned synthetic live-session
+identity, plus persisted scheduler state and a dedicated
 live-provider target whose deployed agent reports the same remote cost cap on
-`/ready` and `/health/brain`:
+`/ready` and `/health/brain`. The monitor image creates
+`/app/evidence/live-smoke-answer.pcm` at build time; override
+`VIVA_HOSTED_LIVE_MONITOR_AUDIO_FILE` only when replacing it with another
+sanitized PCM fixture. The scheduled runner maps these hosted variables into
+`VIVA_LIVE_SMOKE_*` and must not let `bun run live:smoke` bootstrap durable
+study text through `/study-sets/paste`.
 
 ```sh
 VIVA_HOSTED_LIVE_MONITOR_STATE_DATE="2026-06-26"
@@ -536,12 +541,16 @@ VIVA_HOSTED_LIVE_MONITOR_AGENT_HTTP_URL="https://viva-live-monitor-agent.example
 VIVA_HOSTED_LIVE_MONITOR_AGENT_WS_URL="wss://viva-live-monitor-agent.example.com/ws"
 VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD=0.25
 VIVA_HOSTED_LIVE_MONITOR_REST_BEARER_TOKEN="<optional live monitor REST auth secret>"
+VIVA_HOSTED_LIVE_MONITOR_AUDIO_FILE="/app/evidence/live-smoke-answer.pcm"
+VIVA_HOSTED_LIVE_MONITOR_USER_ID="synthetic-live-monitor-user"
+VIVA_HOSTED_LIVE_MONITOR_STUDY_SET_ID="live-monitor-study-set"
+VIVA_HOSTED_LIVE_MONITOR_SESSION_ID="live-monitor-session-1"
+VIVA_HOSTED_LIVE_MONITOR_SESSION_TOKEN="<optional pre-minted signed session token>"
 VIVA_AGENT_PROVIDER="cartesia_gemini"
 CARTESIA_ZERO_DATA_RETENTION_ENABLED=1
 GEMINI_ZERO_DATA_RETENTION_APPROVED=1
 CARTESIA_API_KEY="<from provider secret store>"
 GEMINI_API_KEY="<from provider secret store>"
-VIVA_LIVE_SMOKE_AUDIO_FILE="/app/evidence/live-smoke-answer.pcm"
 ```
 
 The hosted agent URL must point at a synthetic or fake monitor deployment whose

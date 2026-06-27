@@ -106,8 +106,11 @@ test("hosted monitor scheduled live opt-in runs bounded live smoke", () => {
     VIVA_HOSTED_LIVE_MONITOR_LAST_FAILURE_AT: "2026-06-23T19:10:00.000Z",
     VIVA_HOSTED_LIVE_MONITOR_REST_BEARER_TOKEN: "redacted-live-rest-bearer",
     VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY: "1",
+    VIVA_HOSTED_LIVE_MONITOR_SESSION_ID: "live-monitor-session-1",
     VIVA_HOSTED_LIVE_MONITOR_STATE_DATE: "2026-06-23",
+    VIVA_HOSTED_LIVE_MONITOR_STUDY_SET_ID: "live-monitor-study-set",
     VIVA_HOSTED_LIVE_MONITOR_TOKENS_TODAY: "2048",
+    VIVA_HOSTED_LIVE_MONITOR_USER_ID: "synthetic-live-monitor-user",
     VIVA_HOSTED_LIVE_MONITOR_WEB_URL: "https://live-web.example.com/",
     VIVA_HOSTED_LIVE_MONITOR_NOW: "2026-06-23T19:20:00.000Z",
   });
@@ -126,7 +129,12 @@ test("hosted monitor scheduled live opt-in runs bounded live smoke", () => {
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_DURATION_MS, "90000");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_TURNS, "1");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES, "262144");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_AUDIO_FILE, "/app/evidence/live-smoke-answer.pcm");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_TOKENS, "4096");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_SESSION_ID, "live-monitor-session-1");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_STUDY_SET_ID, "live-monitor-study-set");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_USER_ID, "synthetic-live-monitor-user");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_SESSION_TOKEN, undefined);
   assert.equal(plan.runs[1].env.VIVA_VOICE_WS_BEARER_TOKEN, "redacted-live-rest-bearer");
   assert.equal(plan.runs[1].env.VIVA_VOICE_WS_MAX_SESSION_COST_USD, "0.1");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD, "0.1");
@@ -164,6 +172,26 @@ test("hosted monitor scheduled live opt-in runs bounded live smoke", () => {
   );
   assert.equal(summary.live_smoke.self_quarantine.triggered, true);
   assert.equal(summary.live_smoke.self_quarantine.consecutive_failures, 2);
+});
+
+test("hosted monitor scheduled live opt-in requires a pre-provisioned synthetic session", () => {
+  assert.throws(
+    () =>
+      buildHostedMonitorPlan({
+        ...baseEnv,
+        VIVA_HOSTED_LIVE_MONITOR_AGENT_HTTP_URL: "https://live-agent.example.com/",
+        VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD: "0.10",
+        VIVA_HOSTED_LIVE_MONITOR_AGENT_WS_URL: "wss://live-agent.example.com/ws",
+        VIVA_HOSTED_LIVE_MONITOR_ENABLED: "1",
+        VIVA_HOSTED_LIVE_MONITOR_REST_BEARER_TOKEN: "redacted-live-rest-bearer",
+        VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY: "0",
+        VIVA_HOSTED_LIVE_MONITOR_STATE_DATE: "2026-06-23",
+        VIVA_HOSTED_LIVE_MONITOR_TOKENS_TODAY: "0",
+        VIVA_HOSTED_LIVE_MONITOR_WEB_URL: "https://live-web.example.com/",
+        VIVA_HOSTED_LIVE_MONITOR_NOW: "2026-06-23T19:20:00.000Z",
+      }),
+    /VIVA_HOSTED_LIVE_MONITOR_USER_ID/,
+  );
 });
 
 test("hosted monitor scheduled live opt-in gates cadence and daily budget before scheduling", () => {

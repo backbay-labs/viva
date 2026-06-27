@@ -526,7 +526,8 @@ try {
       : null;
   const terminalProof = failureControlTerminalProof ?? deterministicPartialRecapTerminalProof;
   const terminalReason =
-    terminalProof?.terminal_reason ?? (recapPayloadVisible ? "completed" : null);
+    terminalProof?.terminal_reason ??
+    (deterministicPartialRecapScenario ? null : recapPayloadVisible ? "completed" : null);
   const hostedEvidenceStage = hostedEvidenceStageForScenario({
     deterministicPartialRecap: Boolean(deterministicPartialRecapTerminalProof),
     failureControlStage: terminalProof?.stage ?? null,
@@ -620,6 +621,10 @@ try {
     if (!sessionTokenFailureScenario && failureControlTerminalProof?.stage_verified !== true) {
       throw new Error("Failure-control provider scenario did not prove the scenario stage marker.");
     }
+  } else if (deterministicPartialRecapScenario && !deterministicPartialRecapTerminalProof) {
+    throw new Error(
+      "Deterministic partial recap scenario did not observe partial_stage_success terminal proof.",
+    );
   } else {
     if (!recapPayloadVisible)
       throw new Error("Connected fake-provider session did not render the recap_ready payload.");

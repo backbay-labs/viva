@@ -162,7 +162,13 @@ test("deployment runbook covers the beta operating path and stop rules", async (
     "VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY",
     "VIVA_HOSTED_LIVE_MONITOR_AGENT_HTTP_URL",
     "VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD",
+    "VIVA_HOSTED_LIVE_MONITOR_AUDIO_FILE",
+    "VIVA_HOSTED_LIVE_MONITOR_SESSION_ID",
+    "VIVA_HOSTED_LIVE_MONITOR_STUDY_SET_ID",
+    "VIVA_HOSTED_LIVE_MONITOR_USER_ID",
     "VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD",
+    "/app/evidence/live-smoke-answer.pcm",
+    "pre-provisioned synthetic live-session",
     "scheduled_hosted_live_smoke",
     "bun run live:smoke",
     "viva-monitor-live-smoke",
@@ -274,6 +280,7 @@ test("hosted monitor substrate config is deployable off GitHub Actions", async (
   assert.match(dockerfile, /mcr\.microsoft\.com\/playwright:v1\.61\.0/);
   assert.match(dockerfile, /bun-v1\.3\.3/);
   assert.match(dockerfile, /bun install --frozen-lockfile/);
+  assert.match(dockerfile, /\/app\/evidence\/live-smoke-answer\.pcm/);
   assert.match(dockerfile, /bun", "run", "hosted:monitor"/);
 });
 

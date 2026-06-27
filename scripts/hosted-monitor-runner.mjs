@@ -464,10 +464,27 @@ function hostedLiveMonitorConfigFromEnv(env, livePolicy) {
       "VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD must be less than or equal to the hosted live monitor policy cap",
     );
   }
+  const session = hostedLiveMonitorSessionFromEnv(env);
   return {
     bearerToken,
+    audioFile:
+      env.VIVA_HOSTED_LIVE_MONITOR_AUDIO_FILE?.trim() || "/app/evidence/live-smoke-answer.pcm",
     remoteMaxSessionCostUsd,
+    session,
     target,
+  };
+}
+
+function hostedLiveMonitorSessionFromEnv(env) {
+  const userId = requiredValue(env, "VIVA_HOSTED_LIVE_MONITOR_USER_ID");
+  const studySetId = requiredValue(env, "VIVA_HOSTED_LIVE_MONITOR_STUDY_SET_ID");
+  const sessionId = requiredValue(env, "VIVA_HOSTED_LIVE_MONITOR_SESSION_ID");
+  assertSyntheticIdentity(userId);
+  return {
+    sessionId,
+    signedSession: env.VIVA_HOSTED_LIVE_MONITOR_SESSION_TOKEN?.trim() || null,
+    studySetId,
+    userId,
   };
 }
 
@@ -498,6 +515,7 @@ function scheduledLiveMonitorRun(
       VIVA_LIVE_SMOKE: "1",
       VIVA_LIVE_SMOKE_AGENT_HTTP_URL: target.agentHttpUrl,
       VIVA_LIVE_SMOKE_AGENT_WS_URL: target.agentWsUrl,
+      VIVA_LIVE_SMOKE_AUDIO_FILE: liveConfig.audioFile,
       VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD: String(
         liveConfig.remoteMaxSessionCostUsd,
       ),
@@ -506,6 +524,12 @@ function scheduledLiveMonitorRun(
       VIVA_LIVE_SMOKE_MAX_TOKENS: String(livePolicy.max_tokens_per_run),
       VIVA_LIVE_SMOKE_MAX_TURNS: String(livePolicy.max_turns_per_run),
       VIVA_LIVE_SMOKE_ORIGIN: target.webUrl,
+      VIVA_LIVE_SMOKE_SESSION_ID: liveConfig.session.sessionId,
+      ...(liveConfig.session.signedSession
+        ? { VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig.session.signedSession }
+        : {}),
+      VIVA_LIVE_SMOKE_STUDY_SET_ID: liveConfig.session.studySetId,
+      VIVA_LIVE_SMOKE_USER_ID: liveConfig.session.userId,
       VIVA_VOICE_WS_BEARER_TOKEN: liveConfig.bearerToken,
       VIVA_VOICE_WS_MAX_SESSION_COST_USD: String(liveConfig.remoteMaxSessionCostUsd),
     },

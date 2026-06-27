@@ -43,7 +43,14 @@ test("hosted browser E2E does not infer partial recap evidence from visible reca
   const source = await readFile(E2E_BROWSER_PATH, "utf8");
 
   assert.match(source, /terminalProofFromServerEvents\(serverEvents/);
-  assert.match(source, /const terminalReason =\s*terminalProof\?\.terminal_reason/);
+  assert.match(
+    source,
+    /deterministicPartialRecapScenario \? null : recapPayloadVisible \? "completed" : null/,
+  );
+  assert.match(
+    source,
+    /Deterministic partial recap scenario did not observe partial_stage_success terminal proof/,
+  );
   assert.doesNotMatch(
     source,
     /deterministicPartialRecapScenario && recapPayloadVisible\s*\?\s*"partial_stage_success"/,
