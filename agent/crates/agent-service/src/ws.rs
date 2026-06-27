@@ -1223,8 +1223,18 @@ fn terminal_reason_for_provider_error(error: &BrainProviderError) -> TerminalSes
 }
 
 fn provider_error_is_durability_degraded(state: &AppState, error: &BrainProviderError) -> bool {
-    if !state.study_store.capabilities().durable {
+    provider_error_is_durability_degraded_for_store(state.study_store.capabilities().durable, error)
+}
+
+fn provider_error_is_durability_degraded_for_store(
+    store_is_durable: bool,
+    error: &BrainProviderError,
+) -> bool {
+    if !store_is_durable {
         return false;
+    }
+    if let Some(failure) = &error.failure {
+        return failure.terminal_reason == TerminalSessionReason::DurabilityDegraded;
     }
     provider_store_error_is_durability_degraded(&error.source, &error.message)
 }
@@ -2711,6 +2721,33 @@ mod tests {
             TerminalSessionReason::ToolExecutorFailure
         );
         assert!(!error.message.contains("retrieve_source_reference"));
+    }
+
+    #[test]
+    fn structured_durability_provider_error_uses_durability_path_classifier() {
+        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+            BrainProviderFailureParts {
+                failure_class: "store_adapter_error".to_owned(),
+                stage: "tools".to_owned(),
+                terminal_reason: TerminalSessionReason::DurabilityDegraded,
+                retry_eligible: true,
+                latency_ms: 12,
+                provider: "server".to_owned(),
+                model: "viva-tools".to_owned(),
+                metadata: "tool=retrieve_source_reference error_kind=store".to_owned(),
+            },
+        ));
+        assert!(!provider_store_error_is_durability_degraded(
+            &error.source,
+            &error.message
+        ));
+
+        assert!(provider_error_is_durability_degraded_for_store(
+            true, &error
+        ));
+        assert!(!provider_error_is_durability_degraded_for_store(
+            false, &error
+        ));
     }
 
     struct FailingSink;
