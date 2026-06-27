@@ -527,8 +527,11 @@ live-provider target whose deployed agent reports the same remote cost cap on
 `/ready` and `/health/brain`. The monitor image creates
 `/app/evidence/live-smoke-answer.pcm` at build time; override
 `VIVA_HOSTED_LIVE_MONITOR_AUDIO_FILE` only when replacing it with another
-sanitized PCM fixture. The scheduled runner maps these hosted variables into
-`VIVA_LIVE_SMOKE_*` and must not let `bun run live:smoke` bootstrap durable
+sanitized spoken PCM fixture. The scheduled runner derives a fresh UUID voice
+session id from `VIVA_HOSTED_LIVE_MONITOR_SESSION_ID`, `VIVA_HOSTED_RUN_ID`, and
+a per-invocation nonce, signs a fresh single-use session capability with
+`VIVA_VOICE_SESSION_TOKEN_SECRET`, maps these hosted variables into
+`VIVA_LIVE_SMOKE_*`, and must not let `bun run live:smoke` bootstrap durable
 study text through `/study-sets/paste`.
 
 ```sh
@@ -545,7 +548,6 @@ VIVA_HOSTED_LIVE_MONITOR_AUDIO_FILE="/app/evidence/live-smoke-answer.pcm"
 VIVA_HOSTED_LIVE_MONITOR_USER_ID="synthetic-live-monitor-user"
 VIVA_HOSTED_LIVE_MONITOR_STUDY_SET_ID="live-monitor-study-set"
 VIVA_HOSTED_LIVE_MONITOR_SESSION_ID="live-monitor-session-1"
-VIVA_HOSTED_LIVE_MONITOR_SESSION_TOKEN="<optional pre-minted signed session token>"
 VIVA_AGENT_PROVIDER="cartesia_gemini"
 CARTESIA_ZERO_DATA_RETENTION_ENABLED=1
 GEMINI_ZERO_DATA_RETENTION_APPROVED=1

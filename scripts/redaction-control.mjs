@@ -198,12 +198,22 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "scripts/hosted-monitor-runner.mjs",
     marker: "session_token",
-    patterns: Object.freeze([/VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/]),
+    patterns: Object.freeze([
+      /VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/,
+      /^\s*VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession,?$/,
+    ]),
   },
   {
     file: "scripts/hosted-monitor-runner.mjs",
     marker: "viva_voice_ws_bearer_token",
     patterns: Object.freeze([/^\s*VIVA_VOICE_WS_BEARER_TOKEN: liveConfig\.bearerToken,?$/]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
+    marker: "viva_live_smoke_session_token",
+    patterns: Object.freeze([
+      /^\s*VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession,?$/,
+    ]),
   },
   {
     file: "scripts/hosted-monitor-runner.mjs",

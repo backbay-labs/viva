@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -24,6 +24,7 @@ const PR_BROWSER_SCENARIO_IDS = Object.freeze([
   "happy_path",
   "fake_provider_happy_path",
   "token_free_session_history",
+  "deterministic_partial_recap",
 ]);
 
 export function buildHostedMonitorPlan(env = process.env) {
@@ -137,7 +138,7 @@ export function buildHostedMonitorPlan(env = process.env) {
           skip_reason: "pr_mode",
         };
   const liveMonitorConfig = liveMonitorDecision.should_run
-    ? hostedLiveMonitorConfigFromEnv(env, matrix.monitor_policy.live_monitor)
+    ? hostedLiveMonitorConfigFromEnv(env, matrix.monitor_policy.live_monitor, runId)
     : null;
   const scheduledRuns = [
     {
@@ -190,6 +191,16 @@ export function buildHostedMonitorPlan(env = process.env) {
             env: runEnv(baseEnv, syntheticTarget, {
               VIVA_E2E_HOSTED_SCENARIO_ID: "token_free_session_history",
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
+            }),
+            timeoutMs: runTimeoutMs,
+          },
+          {
+            name: "pr_hosted_deterministic_partial_recap",
+            scenario_id: "deterministic_partial_recap",
+            env: runEnv(baseEnv, fakeTarget, {
+              VIVA_E2E_HOSTED_SCENARIO_ID: "deterministic_partial_recap",
+              VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
+              VIVA_E2E_STOP_TO_RECAP: "1",
             }),
             timeoutMs: runTimeoutMs,
           },
@@ -430,7 +441,7 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
   };
 }
 
-function hostedLiveMonitorConfigFromEnv(env, livePolicy) {
+function hostedLiveMonitorConfigFromEnv(env, livePolicy, runId) {
   const target = hostedTargetFromEnv(env, {
     agentHttpName: "VIVA_HOSTED_LIVE_MONITOR_AGENT_HTTP_URL",
     agentWsName: "VIVA_HOSTED_LIVE_MONITOR_AGENT_WS_URL",
@@ -456,7 +467,7 @@ function hostedLiveMonitorConfigFromEnv(env, livePolicy) {
       "VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD must be less than or equal to the hosted live monitor policy cap",
     );
   }
-  const session = hostedLiveMonitorSessionFromEnv(env);
+  const session = hostedLiveMonitorSessionFromEnv(env, runId);
   return {
     bearerToken,
     audioFile:
@@ -467,17 +478,56 @@ function hostedLiveMonitorConfigFromEnv(env, livePolicy) {
   };
 }
 
-function hostedLiveMonitorSessionFromEnv(env) {
+function hostedLiveMonitorSessionFromEnv(env, runId) {
   const userId = requiredValue(env, "VIVA_HOSTED_LIVE_MONITOR_USER_ID");
   const studySetId = requiredValue(env, "VIVA_HOSTED_LIVE_MONITOR_STUDY_SET_ID");
-  const sessionId = requiredValue(env, "VIVA_HOSTED_LIVE_MONITOR_SESSION_ID");
+  const baseSessionId = requiredValue(env, "VIVA_HOSTED_LIVE_MONITOR_SESSION_ID");
+  const sessionId = liveMonitorRunSessionId(baseSessionId, runId);
   assertSyntheticIdentity(userId);
   return {
     sessionId,
-    signedSession: env.VIVA_HOSTED_LIVE_MONITOR_SESSION_TOKEN?.trim() || null,
+    signedSession: signedLiveMonitorSession({
+      secret: requiredValue(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"),
+      sessionId,
+      studySetId,
+      userId,
+    }),
     studySetId,
     userId,
   };
+}
+
+function liveMonitorRunSessionId(baseSessionId, runId) {
+  return uuidFromStableInput(`viva-live-monitor:${baseSessionId}:${runId}:${randomUUID()}`);
+}
+
+function signedLiveMonitorSession({ secret, sessionId, studySetId, userId }) {
+  const expiresAt = Math.floor(Date.now() / 1000) + 15 * 60;
+  const claims = {
+    user_id: userId,
+    study_set_id: studySetId,
+    session_id: sessionId,
+    expires_at: expiresAt,
+    nonce: randomUUID(),
+  };
+  const claimsPart = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  const payload = `viva1.${claimsPart}`;
+  const signature = createHmac("sha256", secret).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+
+function uuidFromStableInput(value) {
+  const bytes = createHash("sha256").update(value).digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20, 32),
+  ].join("-");
 }
 
 function scheduledLiveMonitorRun(

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHmac } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -131,10 +132,21 @@ test("hosted monitor scheduled live opt-in runs bounded live smoke", () => {
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES, "262144");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_AUDIO_FILE, "/app/evidence/live-smoke-answer.pcm");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_TOKENS, "4096");
-  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_SESSION_ID, "live-monitor-session-1");
+  assert.match(
+    plan.runs[1].env.VIVA_LIVE_SMOKE_SESSION_ID,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
+  assert.notEqual(plan.runs[1].env.VIVA_LIVE_SMOKE_SESSION_ID, "live-monitor-session-1");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_STUDY_SET_ID, "live-monitor-study-set");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_USER_ID, "synthetic-live-monitor-user");
-  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_SESSION_TOKEN, undefined);
+  const liveSessionClaims = decodedSignedSession(
+    plan.runs[1].env.VIVA_LIVE_SMOKE_SESSION_TOKEN,
+    "redacted-session-secret",
+  );
+  assert.equal(liveSessionClaims.session_id, plan.runs[1].env.VIVA_LIVE_SMOKE_SESSION_ID);
+  assert.equal(liveSessionClaims.study_set_id, "live-monitor-study-set");
+  assert.equal(liveSessionClaims.user_id, "synthetic-live-monitor-user");
+  assert.equal(typeof liveSessionClaims.nonce, "string");
   assert.equal(plan.runs[1].env.VIVA_VOICE_WS_BEARER_TOKEN, "redacted-live-rest-bearer");
   assert.equal(plan.runs[1].env.VIVA_VOICE_WS_MAX_SESSION_COST_USD, "0.1");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD, "0.1");
@@ -177,7 +189,10 @@ test("hosted monitor scheduled live opt-in runs bounded live smoke", () => {
 test("hosted monitor image generates the live-smoke fixture at protocol sample rate", async () => {
   const dockerfile = await readFile(path.join(process.cwd(), "Dockerfile.monitor"), "utf8");
 
-  assert.match(dockerfile, /const sampleRate=24000/);
+  assert.match(dockerfile, /espeak-ng/);
+  assert.match(dockerfile, /-ar 24000/);
+  assert.match(dockerfile, /-f s16le/);
+  assert.doesNotMatch(dockerfile, /440/);
   assert.doesNotMatch(dockerfile, /const sampleRate=16000/);
 });
 
@@ -326,7 +341,7 @@ test("hosted monitor PR mode expands the deterministic failure-control matrix", 
 
   assert.equal(plan.mode, "pr");
   assert.equal(plan.matrixProfile, "full");
-  assert.equal(plan.matrix.scenario_count, 3 + runnableFailureControlScenarios.length);
+  assert.equal(plan.matrix.scenario_count, 4 + runnableFailureControlScenarios.length);
   assert.equal(plan.matrix.scenario_subset.selected, true);
   assert.equal(plan.matrix.scenario_subset.explicitly_configured, false);
   assert.deepEqual(plan.matrix.scenario_subset.excluded_requires_browser_action, [
@@ -340,6 +355,7 @@ test("hosted monitor PR mode expands the deterministic failure-control matrix", 
       "pr_hosted_synthetic_matrix",
       "pr_hosted_fake_provider_matrix",
       "pr_hosted_token_free_session_history",
+      "pr_hosted_deterministic_partial_recap",
       ...runnableFailureControlScenarios.map(
         (scenario) => `pr_hosted_failure_control_${scenario.id}`,
       ),
@@ -351,24 +367,28 @@ test("hosted monitor PR mode expands the deterministic failure-control matrix", 
   assert.equal(plan.runs[2].scenario_id, "token_free_session_history");
   assert.equal(plan.runs[2].env.VIVA_E2E_AGENT_PROVIDER, "synthetic");
   assert.equal(plan.runs[2].env.VIVA_E2E_HOSTED_SCENARIO_ID, "token_free_session_history");
-  assert.equal(plan.runs[3].scenario_id, runnableFailureControlScenarios[0].id);
-  assert.equal(plan.runs[3].env.VIVA_E2E_FAILURE_CONTROL_SCENARIO, "provider_rate_limited");
-  assert.equal(plan.runs[3].env.VIVA_E2E_HOSTED_SCENARIO_ID, "provider_rate_limited");
+  assert.equal(plan.runs[3].scenario_id, "deterministic_partial_recap");
+  assert.equal(plan.runs[3].env.VIVA_E2E_AGENT_PROVIDER, "fake_cartesia_gemini");
+  assert.equal(plan.runs[3].env.VIVA_E2E_HOSTED_SCENARIO_ID, "deterministic_partial_recap");
+  assert.equal(plan.runs[3].env.VIVA_E2E_STOP_TO_RECAP, "1");
+  assert.equal(plan.runs[4].scenario_id, runnableFailureControlScenarios[0].id);
+  assert.equal(plan.runs[4].env.VIVA_E2E_FAILURE_CONTROL_SCENARIO, "provider_rate_limited");
+  assert.equal(plan.runs[4].env.VIVA_E2E_HOSTED_SCENARIO_ID, "provider_rate_limited");
   assert.equal(
-    plan.runs[3].env.VIVA_E2E_HOSTED_WEB_URL,
+    plan.runs[4].env.VIVA_E2E_HOSTED_WEB_URL,
     "https://failure-provider-rate-limited-web.example.com",
   );
   assert.equal(
-    plan.runs[3].env.VIVA_E2E_HOSTED_AGENT_HTTP_URL,
+    plan.runs[4].env.VIVA_E2E_HOSTED_AGENT_HTTP_URL,
     "https://failure-provider-rate-limited-agent.example.com",
   );
   assert.equal(
-    plan.runs[3].env.VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS,
+    plan.runs[4].env.VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS,
     "https://failure-provider-rate-limited-web.example.com",
   );
-  assert.equal(plan.runs[3].env.VIVA_FAILURE_CONTROL_ENABLED, "1");
-  assert.equal(plan.runs[3].env.VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS, "synthetic-monitor-user");
-  assert.equal(plan.runs[3].env.VIVA_FAILURE_CONTROL_STUDY_SET_IDS, "biology-midterm");
+  assert.equal(plan.runs[4].env.VIVA_FAILURE_CONTROL_ENABLED, "1");
+  assert.equal(plan.runs[4].env.VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS, "synthetic-monitor-user");
+  assert.equal(plan.runs[4].env.VIVA_FAILURE_CONTROL_STUDY_SET_IDS, "biology-midterm");
 });
 
 test("hosted monitor PR mode refuses non-PR matrix profiles", () => {
@@ -422,11 +442,12 @@ test("hosted monitor PR mode allows a smaller explicit failure-control scenario 
       "happy_path",
       "fake_provider_happy_path",
       "token_free_session_history",
+      "deterministic_partial_recap",
       "provider_rate_limited",
       "provider_timeout",
     ],
   );
-  assert.equal(plan.matrix.scenario_count, 5);
+  assert.equal(plan.matrix.scenario_count, 6);
   assert.equal(plan.matrix.scenario_subset.selected, true);
   assert.equal(plan.matrix.scenario_subset.explicitly_configured, true);
   assert.deepEqual(plan.matrix.scenario_subset.excluded_requires_browser_action, [
@@ -440,6 +461,7 @@ test("hosted monitor PR mode allows a smaller explicit failure-control scenario 
       "happy_path",
       "fake_provider_happy_path",
       "token_free_session_history",
+      "deterministic_partial_recap",
       "provider_rate_limited",
       "provider_timeout",
     ],
@@ -472,6 +494,15 @@ test("hosted monitor PR mode allows the generic failure-control target for one e
   assert.equal(failureRun.env.VIVA_E2E_HOSTED_WEB_URL, "https://failure-web.example.com");
   assert.equal(failureRun.env.VIVA_E2E_HOSTED_AGENT_HTTP_URL, "https://failure-agent.example.com");
 });
+
+function decodedSignedSession(value, secret) {
+  assert.match(value, /^viva1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+  const [prefix, claimsPart, signature] = value.split(".");
+  const payload = `${prefix}.${claimsPart}`;
+  const expected = createHmac("sha256", secret).update(payload).digest("base64url");
+  assert.equal(signature, expected);
+  return JSON.parse(Buffer.from(claimsPart, "base64url").toString("utf8"));
+}
 
 test("hosted monitor rejects unknown matrix profiles", () => {
   assert.throws(

@@ -13,6 +13,12 @@ COPY docs ./docs
 COPY agent/fixtures ./agent/fixtures
 
 RUN bun install --frozen-lockfile
-RUN mkdir -p /app/evidence && node -e "const fs=require('node:fs'); const sampleRate=24000; const seconds=1; const data=Buffer.alloc(sampleRate*seconds*2); for (let i=0; i<sampleRate*seconds; i += 1) { const sample=Math.round(Math.sin((2*Math.PI*440*i)/sampleRate)*12000); data.writeInt16LE(sample, i*2); } fs.writeFileSync('/app/evidence/live-smoke-answer.pcm', data);"
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends espeak-ng ffmpeg \
+  && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /app/evidence \
+  && espeak-ng -v en-us -s 145 -w /tmp/live-smoke-answer.wav "The proton gradient drives ATP synthase to make ATP." \
+  && ffmpeg -hide_banner -loglevel error -y -i /tmp/live-smoke-answer.wav -ac 1 -ar 24000 -f s16le /app/evidence/live-smoke-answer.pcm \
+  && rm -f /tmp/live-smoke-answer.wav
 
 CMD ["bun", "run", "hosted:monitor"]

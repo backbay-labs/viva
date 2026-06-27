@@ -359,6 +359,15 @@ test("per-PR redaction check permits required auth source identifiers only in so
     false,
   );
   assert.equal(
+    addedLineViolatesRedactionAudit(
+      "      VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig.session.signedSession,",
+      {
+        file: "scripts/hosted-monitor-runner.mjs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
     addedLineViolatesRedactionAudit('      "invalid_token",', {
       file: "scripts/hosted-e2e-matrix.mjs",
     }),
