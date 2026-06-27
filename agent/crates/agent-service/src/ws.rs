@@ -2302,30 +2302,82 @@ fn record_provider_stage_failure(
 }
 
 const PROVIDER_STAGE_FAILURE_DETAIL_MAX_CHARS: usize = 240;
+const PROVIDER_STAGE_FAILURE_DEPLOY_SHA_MAX_CHARS: usize = 8;
+const PROVIDER_STAGE_FAILURE_MODEL_MAX_CHARS: usize = 10;
+const PROVIDER_STAGE_FAILURE_PROVIDER_MAX_CHARS: usize = 24;
+const PROVIDER_STAGE_FAILURE_METADATA_VALUE_MAX_CHARS: usize = 32;
 
 fn provider_stage_failure_detail(failure: &BrainProviderFailure) -> String {
     let retry_after_ms = metadata_field(&failure.metadata, "retry_after_ms");
     let retry_after_source = metadata_field(&failure.metadata, "retry_after_source");
     let reset_hint = metadata_field(&failure.metadata, "reset_hint");
     let budget_state = metadata_field(&failure.metadata, "budget_state");
-    let deploy_sha = metadata_field(&failure.metadata, "deploy_sha");
-    let fields = [
+    let deploy_sha = metadata_field(&failure.metadata, "deploy_sha")
+        .map(|value| bounded_evidence_value(value, PROVIDER_STAGE_FAILURE_DEPLOY_SHA_MAX_CHARS))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let mut fields = vec![
         format!("failure_class={}", failure.failure_class),
         format!("stage={}", failure.stage),
         format!("terminal_reason={}", failure.terminal_reason.as_str()),
-        format!("provider={}", bounded_evidence_value(&failure.provider, 24)),
-        format!("model={}", bounded_evidence_value(&failure.model, 24)),
-        format!("latency_ms={}", failure.latency_ms),
-        format!("deploy_sha={}", deploy_sha.unwrap_or("unknown")),
-        format!("retry_after_ms={}", retry_after_ms.unwrap_or("unknown")),
         format!(
-            "retry_after_source={}",
-            retry_after_source.unwrap_or("unknown")
+            "provider={}",
+            bounded_evidence_value(&failure.provider, PROVIDER_STAGE_FAILURE_PROVIDER_MAX_CHARS)
         ),
-        format!("reset_hint={}", reset_hint.unwrap_or("unknown")),
-        format!("budget_state={}", budget_state.unwrap_or("unknown")),
+        format!(
+            "model={}",
+            bounded_evidence_value(&failure.model, PROVIDER_STAGE_FAILURE_MODEL_MAX_CHARS)
+        ),
+        format!("latency_ms={}", failure.latency_ms),
+        format!("deploy_sha={deploy_sha}"),
     ];
+    if provider_stage_failure_has_rate_metadata(
+        failure,
+        retry_after_ms,
+        retry_after_source,
+        reset_hint,
+        budget_state,
+    ) {
+        fields.extend([
+            format!("retry_after_ms={}", retry_after_ms.unwrap_or("unknown")),
+            format!(
+                "retry_after_source={}",
+                retry_after_source.unwrap_or("unknown")
+            ),
+            format!("reset_hint={}", reset_hint.unwrap_or("unknown")),
+            format!("budget_state={}", budget_state.unwrap_or("unknown")),
+        ]);
+    }
+    fields.extend(safe_provider_stage_metadata_fields(&failure.metadata));
     bounded_evidence_detail(fields)
+}
+
+fn provider_stage_failure_has_rate_metadata(
+    failure: &BrainProviderFailure,
+    retry_after_ms: Option<&str>,
+    retry_after_source: Option<&str>,
+    reset_hint: Option<&str>,
+    budget_state: Option<&str>,
+) -> bool {
+    failure.failure_class == "quota_rate_failure"
+        || failure.terminal_reason.as_str() == "provider_rate_limited"
+        || retry_after_ms.is_some()
+        || retry_after_source.is_some()
+        || reset_hint.is_some()
+        || budget_state.is_some()
+}
+
+fn safe_provider_stage_metadata_fields(metadata: &str) -> Vec<String> {
+    ["tool", "error_kind"]
+        .into_iter()
+        .filter_map(|key| {
+            metadata_field(metadata, key).map(|value| {
+                format!(
+                    "{key}={}",
+                    bounded_evidence_value(value, PROVIDER_STAGE_FAILURE_METADATA_VALUE_MAX_CHARS)
+                )
+            })
+        })
+        .collect()
 }
 
 fn bounded_evidence_detail(fields: impl IntoIterator<Item = String>) -> String {
@@ -2852,6 +2904,8 @@ mod tests {
                 && event.detail.contains("stage=recap")
                 && event.detail.contains("terminal_reason=durability_degraded")
                 && event.detail.contains("latency_ms=37")
+                && event.detail.contains("tool=build_session_recap")
+                && event.detail.contains("error_kind=store")
         }));
         assert!(evidence.iter().any(|event| {
             event.kind == VoiceEvidenceEventKind::StoreCounts
@@ -2877,7 +2931,7 @@ mod tests {
                 provider: "gemini".to_owned(),
                 model: "gemini-35-flash".to_owned(),
                 metadata:
-                    "http_status=429 retry_after_ms=7000 retry_after_source=retry_after_delta reset_hint=2030-01-01T00:00:00Z body_status=resource_exhausted budget_state=unknown deploy_sha=unknown"
+                    "http_status=429 retry_after_ms=7000 retry_after_source=retry_after_delta reset_hint=2030-01-01T00:00:00Z body_status=resource_exhausted budget_state=unknown deploy_sha=abcdef1234567890abcdef1234567890abcdef12"
                         .to_owned(),
             },
         ));
@@ -2892,12 +2946,12 @@ mod tests {
         assert!(detail.contains("stage=gemini"));
         assert!(detail.contains("terminal_reason=provider_rate_limited"));
         assert!(detail.contains("provider=gemini"));
-        assert!(detail.contains("model=gemini-35-flash"));
+        assert!(detail.contains("model=gemini-35-"));
         assert!(detail.contains("latency_ms=123"));
-        assert!(detail.contains("deploy_sha=unknown"));
+        assert!(detail.contains("deploy_sha=abcdef12"));
         assert!(detail.contains("retry_after_ms=7000"));
         assert!(detail.contains("retry_after_source=retry_after_delta"));
-        assert!(detail.contains("budget_state=unknown"));
+        assert!(detail.contains("reset_hint=2030-01-01T00:00:00Z"));
     }
 
     #[test]
@@ -2938,11 +2992,12 @@ mod tests {
         assert!(detail.contains("stage=gemini"));
         assert!(detail.contains("terminal_reason=provider_rate_limited"));
         assert!(detail.contains("provider=gemini"));
-        assert!(detail.contains("model=gemini-35-flash-preview-"));
+        assert!(detail.contains("model=gemini-35-"));
         assert!(detail.contains("latency_ms=123"));
         assert!(detail.contains("deploy_sha=unknown"));
         assert!(detail.contains("retry_after_ms=7000"));
         assert!(detail.contains("retry_after_source=retry_after_delta"));
+        assert!(detail.contains("reset_hint=2030-01-01T00:00:00Z"));
     }
 
     struct FailingSink;
