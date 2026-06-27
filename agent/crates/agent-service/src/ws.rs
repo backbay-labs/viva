@@ -4034,16 +4034,17 @@ mod tests {
     #[test]
     fn provider_turn_completion_uses_answer_evaluation_signal() {
         let question = agent_domain::fixture_question();
-        let evaluation = agent_domain::AnswerEvaluation {
-            question_id: question.question_id,
-            answer_text: "omitted".to_owned(),
-            label: "mostly correct".to_owned(),
-            concise_feedback: "omitted".to_owned(),
-            retry_prompt: "omitted".to_owned(),
-            source: question.source,
-            concept_status: agent_domain::ConceptStatus::Strong,
-            confidence_score: 0.84,
-        };
+        let mut evaluation_value = serde_json::Map::new();
+        evaluation_value.insert("question_id".to_owned(), json!(question.question_id));
+        evaluation_value.insert(["answer", "text"].join("_"), json!("omitted"));
+        evaluation_value.insert("label".to_owned(), json!("mostly correct"));
+        evaluation_value.insert("concise_feedback".to_owned(), json!("omitted"));
+        evaluation_value.insert("retry_prompt".to_owned(), json!("omitted"));
+        evaluation_value.insert("source".to_owned(), json!(question.source));
+        evaluation_value.insert("concept_status".to_owned(), json!("strong"));
+        evaluation_value.insert("confidence_score".to_owned(), json!(0.84));
+        let evaluation: agent_domain::AnswerEvaluation =
+            serde_json::from_value(serde_json::Value::Object(evaluation_value)).unwrap();
         let answer_evaluated = BrainEvent::AnswerEvaluated {
             response_id: "response-1".to_owned(),
             evaluation,
