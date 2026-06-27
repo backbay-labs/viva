@@ -2447,6 +2447,7 @@ fn should_suppress_cancelled_response(
             }
             false
         }
+        agent_domain::BrainEvent::ProviderFallbackActivated { .. } => false,
         _ => event
             .response_id()
             .is_some_and(|response_id| cancelled_responses.response_ids.contains(response_id)),
@@ -3369,6 +3370,24 @@ async fn record_brain_event(
             }
         }
         return BrainEventRecordResult::Usage(usage_record);
+    }
+    if let agent_domain::BrainEvent::ProviderFallbackActivated {
+        provider,
+        from_model,
+        to_model,
+        reason,
+        failure: _,
+        ..
+    } = event
+    {
+        state.evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::ProviderFallback,
+            voice_session_id,
+            format!(
+                "provider={provider} from_model={from_model} to_model={to_model} reason={reason}"
+            ),
+        ));
+        return BrainEventRecordResult::None;
     }
     let Some((kind, detail)) = (match event {
         agent_domain::BrainEvent::QuestionStarted { response_id, .. } => Some((
@@ -4996,5 +5015,147 @@ mod tests {
         assert_eq!(usage[0].text_input_tokens, 20);
         assert_eq!(record.cost_estimate_usd, usage[0].cost_estimate_usd);
         assert!(state.evidence.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn records_provider_fallback_activations_internally_without_browser_evidence() {
+        use std::sync::Arc;
+
+        use agent_adapters::SyntheticBrain;
+
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "cartesia_gemini",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let event = agent_domain::BrainEvent::ProviderFallbackActivated {
+            response_id: "response-1".to_owned(),
+            provider: "gemini".to_owned(),
+            from_model: "gemini-3.5-pro".to_owned(),
+            to_model: "gemini-3.5-flash".to_owned(),
+            reason: "primary_429".to_owned(),
+            failure: None,
+        };
+
+        assert!(matches!(
+            record_brain_event(
+                &state,
+                Some("voice-session-1".to_owned()),
+                &event,
+                Duration::from_secs(1),
+            )
+            .await,
+            BrainEventRecordResult::None
+        ));
+        assert!(crate::protocol::ServerFrame::browser_event(event).is_none());
+        let evidence = state.evidence.snapshot();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].kind, VoiceEvidenceEventKind::ProviderFallback);
+        assert_eq!(
+            evidence[0].voice_session_id.as_deref(),
+            Some("voice-session-1")
+        );
+        assert!(evidence[0].detail.contains("provider=gemini"));
+        assert!(evidence[0].detail.contains("from_model=gemini-3.5-pro"));
+        assert!(evidence[0].detail.contains("to_model=gemini-3.5-flash"));
+        assert!(evidence[0].detail.contains("reason=primary_429"));
+    }
+
+    #[tokio::test]
+    async fn provider_fallback_activation_rate_limit_does_not_feed_provider_backoff() {
+        use std::sync::Arc;
+
+        use agent_adapters::SyntheticBrain;
+
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "cartesia_gemini",
+            crate::VoiceWsAccess::default(),
+            1,
+        )
+        .with_voice_limits(VoiceLimitConfig {
+            provider_backoff_default_ms: 1_000,
+            provider_backoff_max_ms: 5_000,
+            ..VoiceLimitConfig::default()
+        });
+        let event = agent_domain::BrainEvent::ProviderFallbackActivated {
+            response_id: "response-1".to_owned(),
+            provider: "gemini".to_owned(),
+            from_model: "gemini-3.5-pro".to_owned(),
+            to_model: "gemini-3.5-flash".to_owned(),
+            reason: "primary_429".to_owned(),
+            failure: Some(BrainProviderFailure::new(BrainProviderFailureParts {
+                failure_class: "quota_rate_failure".to_owned(),
+                stage: "gemini".to_owned(),
+                terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                retry_eligible: true,
+                latency_ms: 17,
+                provider: "gemini".to_owned(),
+                model: "gemini-3.5-pro".to_owned(),
+                metadata: "http_status=429 retry_after_ms=750 retry_after_source=retry_after_delta reset_hint=2030-01-01T00:00:00Z body_status=resource_exhausted budget_state=within_limit deploy_sha=test-sha".to_owned(),
+            })),
+        };
+
+        assert!(matches!(
+            record_brain_event(
+                &state,
+                Some("voice-session-1".to_owned()),
+                &event,
+                Duration::from_secs(1),
+            )
+            .await,
+            BrainEventRecordResult::None
+        ));
+
+        let admission = state
+            .limit_state
+            .try_admit_provider_turn(&state.voice_limits, ProviderQueueBehavior::Wait)
+            .await;
+        let ProviderAdmissionDecision::Admitted = admission.decision else {
+            panic!("successful fallback activation must not install provider-wide backoff");
+        };
+        assert!(state.evidence.snapshot().iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::ProviderFallback
+                && event.detail.contains("reason=primary_429")
+        }));
+    }
+
+    #[test]
+    fn cancellation_suppression_keeps_internal_provider_fallback_activations() {
+        let mut tracker = CancelledResponseTracker::default();
+        let question = fixture_question();
+
+        assert!(!should_suppress_cancelled_response(
+            &mut tracker,
+            &agent_domain::BrainEvent::QuestionStarted {
+                response_id: "response-1".to_owned(),
+                question,
+            },
+        ));
+        assert!(!should_suppress_cancelled_response(
+            &mut tracker,
+            &agent_domain::BrainEvent::ResponseCancelledFor {
+                response_id: "response-1".to_owned(),
+            },
+        ));
+        assert!(!should_suppress_cancelled_response(
+            &mut tracker,
+            &agent_domain::BrainEvent::ProviderFallbackActivated {
+                response_id: "response-1".to_owned(),
+                provider: "gemini".to_owned(),
+                from_model: "gemini-3.5-pro".to_owned(),
+                to_model: "gemini-3.5-flash".to_owned(),
+                reason: "primary_429".to_owned(),
+                failure: None,
+            },
+        ));
+        assert!(should_suppress_cancelled_response(
+            &mut tracker,
+            &agent_domain::BrainEvent::ResponseTranscriptDelta {
+                response_id: "response-1".to_owned(),
+                text: "suppressed browser text".to_owned(),
+            },
+        ));
     }
 }

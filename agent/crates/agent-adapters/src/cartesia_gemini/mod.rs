@@ -129,6 +129,12 @@ impl CartesiaGeminiConfig {
         {
             config.gemini.model_id = model;
         }
+        if let Some(fallback_models) =
+            env_value("GEMINI_FALLBACK_MODELS").or_else(|| env_value("GEMINI_FALLBACK_MODEL"))
+        {
+            config.gemini.fallback_model_ids =
+                parse_gemini_fallback_models(&fallback_models, &config.gemini.model_id);
+        }
         if let Some(base_url) = env_value("GEMINI_BASE_URL") {
             config.gemini.base_url = base_url;
         }
@@ -663,6 +669,22 @@ fn is_placeholder_live_key(value: &str) -> bool {
     normalized.starts_with("viva-release-check-") || normalized.contains("placeholder")
 }
 
+fn parse_gemini_fallback_models(value: &str, primary_model: &str) -> Vec<String> {
+    let primary = primary_model.trim();
+    let mut models = Vec::new();
+    for model in value
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        if model == primary || models.iter().any(|existing| existing == model) {
+            continue;
+        }
+        models.push(model.to_owned());
+    }
+    models
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,6 +760,22 @@ mod tests {
                 .total_live_stage_deadline()
                 .saturating_add(Duration::from_secs(1))
                 <= viva_max_submitted_answer_resolution()
+        );
+    }
+
+    #[test]
+    fn from_env_applies_deduped_gemini_fallback_models() {
+        let config = CartesiaGeminiConfig::from_env_with(|name| match name {
+            "GEMINI_MODEL" => Some(" gemini-3.5-pro ".to_owned()),
+            "GEMINI_FALLBACK_MODELS" => {
+                Some(" gemini-3.5-flash , gemini-3.0-flash ,, gemini-3.5-flash ".to_owned())
+            }
+            _ => None,
+        });
+
+        assert_eq!(
+            config.gemini.fallback_model_ids,
+            vec!["gemini-3.5-flash", "gemini-3.0-flash"]
         );
     }
 

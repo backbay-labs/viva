@@ -23,14 +23,16 @@ use agent_domain::{
 };
 use tokio::time::timeout;
 
-use super::llm::{stream_gemini_http, GeminiConversation};
+use super::llm::{
+    stream_gemini_http_with_attempt_events, GeminiConversation, GeminiStreamAttemptFailure,
+};
 use super::stt::transcribe_ink_websocket;
 use super::tts::synthesize_sonic_websocket;
 use super::{
     audio_frame_bytes, gemini_request, parse_gemini_sse_line, parse_ink_event, parse_sonic_event,
     select_next_question, send_fake_unless_cancelled, sonic_generation_request,
-    CartesiaGeminiConfig, FakeRuntimeInterrupt, FakeRuntimeReport, GeminiStreamEvent, InkEvent,
-    SonicEvent, FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT, MAX_GEMINI_EXECUTED_TOOL_STAGES,
+    CartesiaGeminiConfig, FakeRuntimeInterrupt, FakeRuntimeReport, GeminiConfig, GeminiStreamEvent,
+    InkEvent, SonicEvent, FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT, MAX_GEMINI_EXECUTED_TOOL_STAGES,
     MAX_GEMINI_TOOL_LOOP_PASSES,
 };
 use super::{emit_fake_provider_error, parse_result_field};
@@ -446,6 +448,14 @@ where
         {
             Ok(response_prompt) => response_prompt,
             Err(error) => {
+                for event in deferred_events {
+                    if !matches!(event, BrainEvent::ProviderFallbackActivated { .. }) {
+                        continue;
+                    }
+                    if !send_fake_unless_cancelled(&job.event_tx, event, &job.cancelled).await {
+                        return;
+                    }
+                }
                 emit_fake_provider_error(&job.event_tx, error).await;
                 return;
             }
@@ -510,22 +520,47 @@ where
         conversation.push_user_text(answer_text);
         let mut response_prompt = String::new();
         let mut executed_gemini_tool_stages = 0_u32;
+        let mut active_gemini = self.config.gemini.clone();
 
         for pass_index in 0..MAX_GEMINI_TOOL_LOOP_PASSES {
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
                 return Ok(response_prompt);
             }
+            let mut active_config = self.config.clone();
+            active_config.gemini = active_gemini.clone();
             let tools = if pass_index + 1 >= MAX_GEMINI_TOOL_LOOP_PASSES {
                 &[] as &[Value]
             } else {
-                &self.config.tools
+                &active_config.tools
             };
-            let request = gemini_request(&self.config.gemini, conversation.snapshot(), tools);
+            let request = gemini_request(&active_config.gemini, conversation.snapshot(), tools);
             let gemini_started = Instant::now();
-            let stream = fake_interrupt_gemini_stream(
-                self.transports.stream_gemini(&self.config, request).await?,
-                interrupt,
-            );
+            let stream = match self.transports.stream_gemini(&active_config, request).await {
+                Ok(stream) => stream,
+                Err(failure) => {
+                    for event in failure.events {
+                        if let GeminiStreamEvent::FallbackActivated {
+                            from_model,
+                            to_model,
+                            reason,
+                            failure,
+                        } = event
+                        {
+                            promote_active_gemini_fallback(&mut active_gemini, &to_model);
+                            events.push(BrainEvent::ProviderFallbackActivated {
+                                response_id: response_id.to_owned(),
+                                provider: "gemini".to_owned(),
+                                from_model,
+                                to_model,
+                                reason,
+                                failure,
+                            });
+                        }
+                    }
+                    return Err(failure.error);
+                }
+            };
+            let stream = fake_interrupt_gemini_stream(stream, interrupt);
             {
                 let tool_call_names = gemini_function_call_names(&stream);
                 if !tool_call_names.is_empty() {
@@ -538,14 +573,14 @@ where
                     if pass_index + 1 >= MAX_GEMINI_TOOL_LOOP_PASSES {
                         return Err(gemini_tool_loop_budget_error(
                             tool_call_names[0],
-                            &self.config.gemini.model_id,
+                            &active_gemini.model_id,
                             gemini_started.elapsed(),
                         ));
                     }
                     reserve_gemini_tool_batch(
                         &mut executed_gemini_tool_stages,
                         &tool_call_names,
-                        &self.config.gemini.model_id,
+                        &active_gemini.model_id,
                         gemini_started.elapsed(),
                     )?;
                 }
@@ -613,7 +648,7 @@ where
                             self.config.tool_stage_timeout,
                             "tools",
                             "tool_executor_failure",
-                            Some(&self.config.gemini.model_id),
+                            Some(&active_gemini.model_id),
                         )
                         .await?;
                         if result.proposal.name() == "evaluate_spoken_answer" {
@@ -650,10 +685,28 @@ where
                         text_output_tokens: output_tokens,
                         ..BrainUsage::default()
                     }),
+                    GeminiStreamEvent::FallbackActivated {
+                        from_model,
+                        to_model,
+                        reason,
+                        failure,
+                    } => {
+                        promote_active_gemini_fallback(&mut active_gemini, &to_model);
+                        events.push(BrainEvent::ProviderFallbackActivated {
+                            response_id: response_id.to_owned(),
+                            provider: "gemini".to_owned(),
+                            from_model,
+                            to_model,
+                            reason,
+                            failure,
+                        });
+                    }
                     GeminiStreamEvent::Error(message) => {
-                        return Err(gemini_stream_event_error(
-                            message,
-                            &self.config.gemini.model_id,
+                        return Err(provider_stage_error_from_brain_error(
+                            BrainError::Protocol(message),
+                            "gemini",
+                            "gemini",
+                            &active_gemini.model_id,
                             gemini_started.elapsed(),
                         ))
                     }
@@ -1201,6 +1254,7 @@ fn gemini_tool_loop_budget_error(tool_name: &str, model: &str, latency: Duration
     gemini_tool_stage_error(tool_name, model, latency, "tool_loop_budget_exceeded")
 }
 
+#[cfg(test)]
 fn gemini_stream_event_error(message: String, model: &str, latency: Duration) -> BrainError {
     provider_stage_error_from_brain_error(
         BrainError::Protocol(message),
@@ -1209,6 +1263,17 @@ fn gemini_stream_event_error(message: String, model: &str, latency: Duration) ->
         model,
         latency,
     )
+}
+
+fn promote_active_gemini_fallback(active_gemini: &mut GeminiConfig, to_model: &str) {
+    let remaining_fallbacks = active_gemini
+        .fallback_model_ids
+        .iter()
+        .position(|model_id| model_id == to_model)
+        .map(|index| active_gemini.fallback_model_ids[index + 1..].to_vec())
+        .unwrap_or_default();
+    active_gemini.model_id = to_model.to_owned();
+    active_gemini.fallback_model_ids = remaining_fallbacks;
 }
 
 fn provider_stage_error_from_brain_error(
@@ -1361,7 +1426,7 @@ fn duration_ms(duration: Duration) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+mod fallback_tests {
     use super::*;
     use agent_domain::{SessionId, StudyMode};
 
@@ -1682,7 +1747,7 @@ mod tests {
             &self,
             _config: &CartesiaGeminiConfig,
             _request: Value,
-        ) -> Result<Vec<GeminiStreamEvent>, BrainError> {
+        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
             Ok((0..=MAX_GEMINI_EXECUTED_TOOL_STAGES)
                 .map(|index| {
                     let args = json!({
@@ -1885,7 +1950,7 @@ pub(crate) trait CartesiaGeminiTransports: Clone + Send + Sync + 'static {
         &self,
         config: &CartesiaGeminiConfig,
         request: Value,
-    ) -> Result<Vec<GeminiStreamEvent>, BrainError>;
+    ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure>;
 
     async fn synthesize_sonic(
         &self,
@@ -1926,7 +1991,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         &self,
         _config: &CartesiaGeminiConfig,
         request: Value,
-    ) -> Result<Vec<GeminiStreamEvent>, BrainError> {
+    ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
         let has_function_response =
             request["contents"]
                 .as_array()
@@ -1941,18 +2006,24 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
                 });
         if has_function_response {
             if request.get("tools").is_some() {
-                return Err(BrainError::Protocol(
-                    "fake Gemini final request advertised Viva tools".to_owned(),
-                ));
+                return Err(GeminiStreamAttemptFailure {
+                    events: Vec::new(),
+                    error: BrainError::Protocol(
+                        "fake Gemini final request advertised Viva tools".to_owned(),
+                    ),
+                });
             }
             Ok(parse_gemini_sse_line(
                 r#"data: {"candidates":[{"content":{"parts":[{"text":"Good. Now connect the proton gradient to ATP synthase."}]}}],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":2}}"#,
             ))
         } else {
             if request.get("tools").is_none() {
-                return Err(BrainError::Protocol(
-                    "fake Gemini request omitted Viva tools".to_owned(),
-                ));
+                return Err(GeminiStreamAttemptFailure {
+                    events: Vec::new(),
+                    error: BrainError::Protocol(
+                        "fake Gemini request omitted Viva tools".to_owned(),
+                    ),
+                });
             }
             let answer_text = first_user_text(&request)
                 .unwrap_or_else(|| FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT.to_owned());
@@ -2204,18 +2275,19 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
         &self,
         config: &CartesiaGeminiConfig,
         request: Value,
-    ) -> Result<Vec<GeminiStreamEvent>, BrainError> {
+    ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
         let started = Instant::now();
-        stream_gemini_http(&config.gemini, request)
+        stream_gemini_http_with_attempt_events(&config.gemini, request)
             .await
-            .map_err(|error| {
-                provider_stage_error_from_brain_error(
-                    error,
+            .map_err(|failure| GeminiStreamAttemptFailure {
+                events: failure.events,
+                error: provider_stage_error_from_brain_error(
+                    failure.error,
                     "gemini",
                     "gemini",
                     &config.gemini.model_id,
                     started.elapsed(),
-                )
+                ),
             })
     }
 
@@ -2243,5 +2315,836 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
                 started.elapsed(),
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Mutex;
+
+    use agent_domain::{SessionId, StudyMode};
+
+    #[tokio::test]
+    async fn gemini_tool_loop_keeps_fallback_model_for_tool_continuations() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        store.record_voice_session(&session_config).await.unwrap();
+        let session = AuthorizedStudySession::from_config(&session_config).unwrap();
+        let executor = VivaToolExecutor::new(store.clone(), session.clone());
+        let question = select_next_question(&executor, &session).await.unwrap();
+        let transports = FallbackContinuationCaptureTransports::default();
+        let runner = CartesiaGeminiRunner {
+            config: CartesiaGeminiConfig {
+                gemini: super::super::GeminiConfig {
+                    api_key: "gemini-test-key".to_owned(),
+                    model_id: "gemini-3.5-pro".to_owned(),
+                    fallback_model_ids: vec!["gemini-3.5-flash".to_owned()],
+                    ..super::super::GeminiConfig::default()
+                },
+                ..CartesiaGeminiConfig::default()
+            },
+            transports: transports.clone(),
+            store: Some(store),
+        };
+        let mut events = Vec::new();
+        let mut usage = BrainUsage::default();
+
+        let response_prompt = runner
+            .run_gemini_tool_loop(GeminiToolLoopJob {
+                answer_text: "omitted",
+                cancelled: None,
+                emit_text_delta: false,
+                events: &mut events,
+                executor: &executor,
+                interrupt: FakeRuntimeInterrupt::None,
+                question: &question,
+                response_id: "response-1",
+                session: &session,
+                usage: &mut usage,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response_prompt, "fallback continuation");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            BrainEvent::ProviderFallbackActivated {
+                from_model,
+                to_model,
+                ..
+            } if from_model == "gemini-3.5-pro" && to_model == "gemini-3.5-flash"
+        )));
+        assert_eq!(
+            transports
+                .models
+                .lock()
+                .expect("models lock poisoned")
+                .as_slice(),
+            ["gemini-3.5-pro", "gemini-3.5-flash"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_tool_loop_preserves_unused_fallbacks_after_model_switch() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        store.record_voice_session(&session_config).await.unwrap();
+        let session = AuthorizedStudySession::from_config(&session_config).unwrap();
+        let executor = VivaToolExecutor::new(store.clone(), session.clone());
+        let question = select_next_question(&executor, &session).await.unwrap();
+        let transports = FallbackContinuationCaptureTransports::default();
+        let runner = CartesiaGeminiRunner {
+            config: CartesiaGeminiConfig {
+                gemini: super::super::GeminiConfig {
+                    api_key: "gemini-test-key".to_owned(),
+                    model_id: "gemini-3.5-pro".to_owned(),
+                    fallback_model_ids: vec![
+                        "gemini-3.5-flash".to_owned(),
+                        "gemini-3.5-lite".to_owned(),
+                    ],
+                    ..super::super::GeminiConfig::default()
+                },
+                ..CartesiaGeminiConfig::default()
+            },
+            transports: transports.clone(),
+            store: Some(store),
+        };
+        let mut events = Vec::new();
+        let mut usage = BrainUsage::default();
+
+        runner
+            .run_gemini_tool_loop(GeminiToolLoopJob {
+                answer_text: "omitted",
+                cancelled: None,
+                emit_text_delta: false,
+                events: &mut events,
+                executor: &executor,
+                interrupt: FakeRuntimeInterrupt::None,
+                question: &question,
+                response_id: "response-1",
+                session: &session,
+                usage: &mut usage,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transports
+                .models
+                .lock()
+                .expect("models lock poisoned")
+                .as_slice(),
+            ["gemini-3.5-pro", "gemini-3.5-flash"]
+        );
+        assert_eq!(
+            transports
+                .fallback_lists
+                .lock()
+                .expect("fallback lists lock poisoned")
+                .as_slice(),
+            [
+                vec!["gemini-3.5-flash".to_owned(), "gemini-3.5-lite".to_owned()],
+                vec!["gemini-3.5-lite".to_owned()]
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_tool_loop_budget_error_uses_active_fallback_model() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        store.record_voice_session(&session_config).await.unwrap();
+        let session = AuthorizedStudySession::from_config(&session_config).unwrap();
+        let executor = VivaToolExecutor::new(store.clone(), session.clone());
+        let question = select_next_question(&executor, &session).await.unwrap();
+        let runner = CartesiaGeminiRunner {
+            config: CartesiaGeminiConfig {
+                gemini: super::super::GeminiConfig {
+                    api_key: "gemini-test-key".to_owned(),
+                    model_id: "gemini-3.5-pro".to_owned(),
+                    fallback_model_ids: vec!["gemini-3.5-flash".to_owned()],
+                    ..super::super::GeminiConfig::default()
+                },
+                ..CartesiaGeminiConfig::default()
+            },
+            transports: FallbackToolLoopBudgetTransports::default(),
+            store: Some(store),
+        };
+        let mut events = Vec::new();
+        let mut usage = BrainUsage::default();
+
+        let error = runner
+            .run_gemini_tool_loop(GeminiToolLoopJob {
+                answer_text: "omitted",
+                cancelled: None,
+                emit_text_delta: false,
+                events: &mut events,
+                executor: &executor,
+                interrupt: FakeRuntimeInterrupt::None,
+                question: &question,
+                response_id: "response-1",
+                session: &session,
+                usage: &mut usage,
+            })
+            .await
+            .unwrap_err();
+
+        let BrainError::StageFailure(failure) = error else {
+            panic!("tool loop budget should produce a Gemini stage failure");
+        };
+        assert_eq!(failure.failure_class, "malformed_stream");
+        assert_eq!(failure.provider, "gemini");
+        assert_eq!(failure.model, "gemini-35-flash");
+        assert!(failure
+            .metadata
+            .contains("error_kind=tool_loop_budget_exceeded"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            BrainEvent::ProviderFallbackActivated {
+                from_model,
+                to_model,
+                ..
+            } if from_model == "gemini-3.5-pro" && to_model == "gemini-3.5-flash"
+        )));
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_error_events_use_elapsed_request_latency() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        store.record_voice_session(&session_config).await.unwrap();
+        let session = AuthorizedStudySession::from_config(&session_config).unwrap();
+        let executor = VivaToolExecutor::new(store.clone(), session.clone());
+        let question = select_next_question(&executor, &session).await.unwrap();
+        let runner = CartesiaGeminiRunner {
+            config: CartesiaGeminiConfig {
+                gemini: super::super::GeminiConfig {
+                    api_key: "gemini-test-key".to_owned(),
+                    model_id: "gemini-3.5-pro".to_owned(),
+                    ..super::super::GeminiConfig::default()
+                },
+                ..CartesiaGeminiConfig::default()
+            },
+            transports: GeminiStreamErrorTransports {
+                delay: Duration::from_millis(5),
+            },
+            store: Some(store),
+        };
+        let mut events = Vec::new();
+        let mut usage = BrainUsage::default();
+
+        let error = runner
+            .run_gemini_tool_loop(GeminiToolLoopJob {
+                answer_text: "omitted",
+                cancelled: None,
+                emit_text_delta: false,
+                events: &mut events,
+                executor: &executor,
+                interrupt: FakeRuntimeInterrupt::None,
+                question: &question,
+                response_id: "response-1",
+                session: &session,
+                usage: &mut usage,
+            })
+            .await
+            .unwrap_err();
+
+        let BrainError::StageFailure(failure) = error else {
+            panic!("Gemini stream errors should produce stage failures");
+        };
+        assert_eq!(failure.failure_class, "malformed_stream");
+        assert_eq!(failure.provider, "gemini");
+        assert_eq!(failure.model, "gemini-35-pro");
+        assert!(failure.latency_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn gemini_tool_loop_emits_fallback_activation_before_returning_failure() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        store.record_voice_session(&session_config).await.unwrap();
+        let session = AuthorizedStudySession::from_config(&session_config).unwrap();
+        let executor = VivaToolExecutor::new(store.clone(), session.clone());
+        let question = select_next_question(&executor, &session).await.unwrap();
+        let runner = CartesiaGeminiRunner {
+            config: CartesiaGeminiConfig {
+                gemini: super::super::GeminiConfig {
+                    api_key: "gemini-test-key".to_owned(),
+                    model_id: "gemini-3.5-pro".to_owned(),
+                    fallback_model_ids: vec!["gemini-3.5-flash".to_owned()],
+                    ..super::super::GeminiConfig::default()
+                },
+                ..CartesiaGeminiConfig::default()
+            },
+            transports: FallbackFailureTransports,
+            store: Some(store),
+        };
+        let mut events = Vec::new();
+        let mut usage = BrainUsage::default();
+
+        let error = runner
+            .run_gemini_tool_loop(GeminiToolLoopJob {
+                answer_text: "omitted",
+                cancelled: None,
+                emit_text_delta: false,
+                events: &mut events,
+                executor: &executor,
+                interrupt: FakeRuntimeInterrupt::None,
+                question: &question,
+                response_id: "response-1",
+                session: &session,
+                usage: &mut usage,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            BrainEvent::ProviderFallbackActivated {
+                from_model,
+                to_model,
+                reason,
+                ..
+            } if from_model == "gemini-3.5-pro"
+                && to_model == "gemini-3.5-flash"
+                && reason == "primary_429"
+        )));
+        let BrainError::StageFailure(failure) = error else {
+            panic!("expected carried fallback stage failure");
+        };
+        assert_eq!(failure.provider, "gemini");
+        assert_eq!(failure.model, "gemini-35-flash");
+    }
+
+    #[tokio::test]
+    async fn emit_turn_drains_fallback_activation_before_provider_failure() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        store.record_voice_session(&session_config).await.unwrap();
+        let session = AuthorizedStudySession::from_config(&session_config).unwrap();
+        let executor = VivaToolExecutor::new(store.clone(), session.clone());
+        let question = select_next_question(&executor, &session).await.unwrap();
+        let runner = CartesiaGeminiRunner {
+            config: CartesiaGeminiConfig {
+                gemini: super::super::GeminiConfig {
+                    api_key: "gemini-test-key".to_owned(),
+                    model_id: "gemini-3.5-pro".to_owned(),
+                    fallback_model_ids: vec!["gemini-3.5-flash".to_owned()],
+                    ..super::super::GeminiConfig::default()
+                },
+                ..CartesiaGeminiConfig::default()
+            },
+            transports: FallbackFailureTransports,
+            store: Some(store),
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+
+        runner
+            .emit_turn(RunnerTurnJob {
+                event_tx,
+                executor,
+                session,
+                question,
+                response_id: "response-1".to_owned(),
+                submission_sequence: 1,
+                input: RunnerInput::Text {
+                    text: "omitted".to_owned(),
+                    client_generation_id: None,
+                },
+                confidence: Some(1.0),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                completed: Arc::new(AtomicBool::new(false)),
+            })
+            .await;
+
+        let mut events = Vec::new();
+        while let Ok(Some(event)) = timeout(Duration::from_millis(50), event_rx.recv()).await {
+            events.push(event);
+        }
+
+        let fallback_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    BrainEvent::ProviderFallbackActivated {
+                        from_model,
+                        to_model,
+                        reason,
+                        ..
+                    } if from_model == "gemini-3.5-pro"
+                        && to_model == "gemini-3.5-flash"
+                        && reason == "primary_429"
+                )
+            })
+            .expect("fallback activation should be emitted before provider failure");
+        let error_index = events
+            .iter()
+            .position(|event| matches!(event, BrainEvent::Error(_)))
+            .expect("fallback failure should emit provider error");
+        assert!(
+            fallback_index < error_index,
+            "fallback activation must precede terminal provider error"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_turn_does_not_flush_tool_events_when_continuation_fails() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        store.record_voice_session(&session_config).await.unwrap();
+        let session = AuthorizedStudySession::from_config(&session_config).unwrap();
+        let executor = VivaToolExecutor::new(store.clone(), session.clone());
+        let question = select_next_question(&executor, &session).await.unwrap();
+        let runner = CartesiaGeminiRunner {
+            config: CartesiaGeminiConfig {
+                gemini: super::super::GeminiConfig {
+                    api_key: "gemini-test-key".to_owned(),
+                    model_id: "gemini-3.5-pro".to_owned(),
+                    fallback_model_ids: vec!["gemini-3.5-flash".to_owned()],
+                    ..super::super::GeminiConfig::default()
+                },
+                ..CartesiaGeminiConfig::default()
+            },
+            transports: FallbackContinuationFailureAfterToolTransports::default(),
+            store: Some(store),
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+
+        runner
+            .emit_turn(RunnerTurnJob {
+                event_tx,
+                executor,
+                session,
+                question,
+                response_id: "response-1".to_owned(),
+                submission_sequence: 1,
+                input: RunnerInput::Text {
+                    text: "omitted".to_owned(),
+                    client_generation_id: None,
+                },
+                confidence: Some(1.0),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                completed: Arc::new(AtomicBool::new(false)),
+            })
+            .await;
+
+        let mut events = Vec::new();
+        while let Ok(Some(event)) = timeout(Duration::from_millis(50), event_rx.recv()).await {
+            events.push(event);
+        }
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            BrainEvent::ProviderFallbackActivated {
+                from_model,
+                to_model,
+                reason,
+                ..
+            } if from_model == "gemini-3.5-pro"
+                && to_model == "gemini-3.5-flash"
+                && reason == "primary_429"
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BrainEvent::Error(_))),
+            "continuation failure should emit provider error"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, BrainEvent::AnswerEvaluated { .. })),
+            "tool-derived browser events must remain deferred when continuation fails"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct FallbackContinuationCaptureTransports {
+        models: Arc<Mutex<Vec<String>>>,
+        fallback_lists: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[derive(Clone)]
+    struct FallbackFailureTransports;
+
+    #[derive(Clone, Default)]
+    struct FallbackToolLoopBudgetTransports {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FallbackContinuationFailureAfterToolTransports {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[derive(Clone)]
+    struct GeminiStreamErrorTransports {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for FallbackContinuationCaptureTransports {
+        async fn transcribe_audio(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _frame: &AudioFrame,
+        ) -> Result<RunnerTranscript, BrainError> {
+            Ok(RunnerTranscript {
+                interim_text: String::new(),
+                final_text: "omitted".to_owned(),
+                confidence: Some(1.0),
+            })
+        }
+
+        async fn stream_gemini(
+            &self,
+            config: &CartesiaGeminiConfig,
+            request: Value,
+        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+            let mut models = self.models.lock().expect("models lock poisoned");
+            models.push(config.gemini.model_id.clone());
+            let call_index = models.len();
+            drop(models);
+            self.fallback_lists
+                .lock()
+                .expect("fallback lists lock poisoned")
+                .push(config.gemini.fallback_model_ids.clone());
+
+            if call_index == 1 {
+                let args = json!({
+                    "study_set_id": "biology-midterm",
+                    "voice_session_id": "voice-session-1",
+                    "question_id": "q-oxidative-phosphorylation-nadh",
+                    "answer_text": "omitted",
+                });
+                Ok(vec![
+                    GeminiStreamEvent::FallbackActivated {
+                        from_model: "gemini-3.5-pro".to_owned(),
+                        to_model: "gemini-3.5-flash".to_owned(),
+                        reason: "primary_429".to_owned(),
+                        failure: None,
+                    },
+                    GeminiStreamEvent::FunctionCall {
+                        id: "call-eval-1".to_owned(),
+                        name: "evaluate_spoken_answer".to_owned(),
+                        args: args.clone(),
+                        part: json!({
+                            "functionCall": {
+                                "id": "call-eval-1",
+                                "name": "evaluate_spoken_answer",
+                                "args": args,
+                            }
+                        }),
+                    },
+                ])
+            } else {
+                assert!(request["contents"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|content| {
+                        content["parts"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|part| part.get("functionResponse").is_some())
+                    }));
+                Ok(vec![GeminiStreamEvent::ModelPart {
+                    text: Some("fallback continuation".to_owned()),
+                    part: json!({ "text": "fallback continuation" }),
+                }])
+            }
+        }
+
+        async fn synthesize_sonic(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _transcript: &str,
+            _interrupt: FakeRuntimeInterrupt,
+        ) -> Result<Vec<AudioFrame>, BrainError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for FallbackFailureTransports {
+        async fn transcribe_audio(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _frame: &AudioFrame,
+        ) -> Result<RunnerTranscript, BrainError> {
+            Ok(RunnerTranscript {
+                interim_text: String::new(),
+                final_text: "omitted".to_owned(),
+                confidence: Some(1.0),
+            })
+        }
+
+        async fn stream_gemini(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _request: Value,
+        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+            Err(GeminiStreamAttemptFailure {
+                events: vec![GeminiStreamEvent::FallbackActivated {
+                    from_model: "gemini-3.5-pro".to_owned(),
+                    to_model: "gemini-3.5-flash".to_owned(),
+                    reason: "primary_429".to_owned(),
+                    failure: None,
+                }],
+                error: BrainError::StageFailure(Box::new(BrainProviderFailure::new(
+                    BrainProviderFailureParts {
+                        failure_class: "timeout".to_owned(),
+                        stage: "gemini".to_owned(),
+                        terminal_reason: TerminalSessionReason::ProviderTimeout,
+                        retry_eligible: true,
+                        latency_ms: 1,
+                        provider: "gemini".to_owned(),
+                        model: "gemini-3.5-flash".to_owned(),
+                        metadata: "error_kind=deadline_elapsed".to_owned(),
+                    },
+                ))),
+            })
+        }
+
+        async fn synthesize_sonic(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _transcript: &str,
+            _interrupt: FakeRuntimeInterrupt,
+        ) -> Result<Vec<AudioFrame>, BrainError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for FallbackContinuationFailureAfterToolTransports {
+        async fn transcribe_audio(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _frame: &AudioFrame,
+        ) -> Result<RunnerTranscript, BrainError> {
+            Ok(RunnerTranscript {
+                interim_text: String::new(),
+                final_text: "omitted".to_owned(),
+                confidence: Some(1.0),
+            })
+        }
+
+        async fn stream_gemini(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _request: Value,
+        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+            let mut calls = self.calls.lock().expect("calls lock poisoned");
+            *calls += 1;
+            let call_index = *calls;
+            drop(calls);
+
+            if call_index == 1 {
+                let args = json!({
+                    "study_set_id": "biology-midterm",
+                    "voice_session_id": "voice-session-1",
+                    "question_id": "q-oxidative-phosphorylation-nadh",
+                    "answer_text": "omitted",
+                });
+                return Ok(vec![
+                    GeminiStreamEvent::FallbackActivated {
+                        from_model: "gemini-3.5-pro".to_owned(),
+                        to_model: "gemini-3.5-flash".to_owned(),
+                        reason: "primary_429".to_owned(),
+                        failure: None,
+                    },
+                    GeminiStreamEvent::FunctionCall {
+                        id: "call-eval-1".to_owned(),
+                        name: "evaluate_spoken_answer".to_owned(),
+                        args: args.clone(),
+                        part: json!({
+                            "functionCall": {
+                                "id": "call-eval-1",
+                                "name": "evaluate_spoken_answer",
+                                "args": args,
+                            }
+                        }),
+                    },
+                ]);
+            }
+
+            Err(GeminiStreamAttemptFailure {
+                events: Vec::new(),
+                error: BrainError::StageFailure(Box::new(BrainProviderFailure::new(
+                    BrainProviderFailureParts {
+                        failure_class: "timeout".to_owned(),
+                        stage: "gemini".to_owned(),
+                        terminal_reason: TerminalSessionReason::ProviderTimeout,
+                        retry_eligible: true,
+                        latency_ms: 1,
+                        provider: "gemini".to_owned(),
+                        model: "gemini-3.5-flash".to_owned(),
+                        metadata: "error_kind=deadline_elapsed".to_owned(),
+                    },
+                ))),
+            })
+        }
+
+        async fn synthesize_sonic(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _transcript: &str,
+            _interrupt: FakeRuntimeInterrupt,
+        ) -> Result<Vec<AudioFrame>, BrainError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for FallbackToolLoopBudgetTransports {
+        async fn transcribe_audio(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _frame: &AudioFrame,
+        ) -> Result<RunnerTranscript, BrainError> {
+            Ok(RunnerTranscript {
+                interim_text: String::new(),
+                final_text: "omitted".to_owned(),
+                confidence: Some(1.0),
+            })
+        }
+
+        async fn stream_gemini(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _request: Value,
+        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+            let mut calls = self.calls.lock().expect("calls lock poisoned");
+            *calls += 1;
+            let call_index = *calls;
+            drop(calls);
+
+            let tool_call = GeminiStreamEvent::FunctionCall {
+                id: format!("call-intent-{call_index}"),
+                name: "emit_manuscript_intent".to_owned(),
+                args: json!({}),
+                part: json!({
+                    "functionCall": {
+                        "id": format!("call-intent-{call_index}"),
+                        "name": "emit_manuscript_intent",
+                        "args": {},
+                    }
+                }),
+            };
+            if call_index == 1 {
+                Ok(vec![
+                    GeminiStreamEvent::FallbackActivated {
+                        from_model: "gemini-3.5-pro".to_owned(),
+                        to_model: "gemini-3.5-flash".to_owned(),
+                        reason: "primary_429".to_owned(),
+                        failure: None,
+                    },
+                    tool_call,
+                ])
+            } else {
+                Ok(vec![tool_call])
+            }
+        }
+
+        async fn synthesize_sonic(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _transcript: &str,
+            _interrupt: FakeRuntimeInterrupt,
+        ) -> Result<Vec<AudioFrame>, BrainError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for GeminiStreamErrorTransports {
+        async fn transcribe_audio(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _frame: &AudioFrame,
+        ) -> Result<RunnerTranscript, BrainError> {
+            Ok(RunnerTranscript {
+                interim_text: String::new(),
+                final_text: "omitted".to_owned(),
+                confidence: Some(1.0),
+            })
+        }
+
+        async fn stream_gemini(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _request: Value,
+        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+            tokio::time::sleep(self.delay).await;
+            Ok(vec![GeminiStreamEvent::Error(
+                "Gemini stream provider error".to_owned(),
+            )])
+        }
+
+        async fn synthesize_sonic(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _transcript: &str,
+            _interrupt: FakeRuntimeInterrupt,
+        ) -> Result<Vec<AudioFrame>, BrainError> {
+            Ok(Vec::new())
+        }
     }
 }

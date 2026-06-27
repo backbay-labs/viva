@@ -114,7 +114,28 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     marker: "api_key",
     patterns: Object.freeze([
       /api_key: "local-fixture"\.to_owned\(\),/,
+      /api_key: "gemini-test-key"\.to_owned\(\),/,
       /assert_eq!\(capture\.api_key\.as_deref\(\), Some\("local-fixture"\)\);/,
+      /assert_eq!\(capture\.api_key\.as_deref\(\), Some\("gemini-test-key"\)\);/,
+      /api_key: Some\(request\.api_key\),/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
+    marker: "missing_api_key",
+    patterns: Object.freeze([/BrainError::MissingApiKey => \(/]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
+    marker: "api_key",
+    patterns: Object.freeze([/api_key: "gemini-test-key"\.to_owned\(\),/]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /answer_text: "omitted",/,
+      /"answer_text": "omitted",/,
     ]),
   },
   {
