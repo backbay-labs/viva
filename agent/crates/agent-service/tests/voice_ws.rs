@@ -3531,7 +3531,7 @@ async fn websocket_provider_queue_depth_waits_for_slot_before_forwarding() {
 }
 
 #[tokio::test]
-async fn websocket_provider_admission_does_not_count_audio_continuation_frames_as_new_turns() {
+async fn websocket_provider_admission_rejects_audio_continuation_without_second_lease() {
     let audio_inputs = Arc::new(AtomicUsize::new(0));
     let state = AppState::new(
         Arc::new(AudioContinuationResolutionProbeBrain {
@@ -3579,49 +3579,41 @@ async fn websocket_provider_admission_does_not_count_audio_continuation_frames_a
         .send(WsMessage::Binary(vec![1_u8, 2].into()))
         .await
         .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        audio_inputs.load(Ordering::SeqCst) == 1
+    })
+    .await;
     socket
         .send(WsMessage::Binary(vec![3_u8, 4].into()))
         .await
         .unwrap();
 
-    assert!(matches!(
-        read_server_frame(&mut socket).await,
-        ServerFrame::Event { event, .. }
-            if matches!(
-                event.as_ref(),
-                VivaServerEvent::SessionPhase {
-                    phase: agent_domain::StudySessionPhase::Feedback,
-                    terminal_reason: None,
-                }
-            )
-    ));
-    let post_resolution_turn_cap = tokio::time::timeout(Duration::from_millis(100), async {
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let frame = read_server_frame(&mut socket).await;
-            if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::SlowClient) {
                 return frame;
             }
         }
     })
-    .await;
-    assert!(
-        post_resolution_turn_cap.is_err(),
-        "continuation frames must not leave stale submitted-answer turn-cap counts"
-    );
+    .await
+    .expect("audio continuation without a second provider lease should be denied");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::SlowClient);
+    assert_close_code(&mut socket, CloseCode::Policy).await;
     let provider_events = evidence
         .snapshot()
         .into_iter()
         .filter(|event| event.kind == VoiceEvidenceEventKind::ProviderAdmission)
         .collect::<Vec<_>>();
     assert_eq!(
-        provider_events.len(),
+        audio_inputs.load(Ordering::SeqCst),
         1,
-        "only the first audio frame should start a provider turn"
+        "second audio frame must not reach the provider without its own lease"
     );
-    assert_eq!(audio_inputs.load(Ordering::SeqCst), 2);
-
-    socket.close(None).await.unwrap();
-    let _ = read_server_frames_until_close(&mut socket).await;
+    assert!(provider_events.iter().any(|event| {
+        event.detail.contains("admission_decision=denied")
+            && event.detail.contains("reason=overlapping_provider_turn")
+    }));
 }
 
 #[tokio::test]
@@ -6827,17 +6819,23 @@ async fn websocket_post_config_idle_timeout_closes_without_answer_frame() {
 
 #[tokio::test]
 async fn websocket_turn_cap_disarms_after_answer_resolution() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let completion_gate = Arc::new(Notify::new());
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let state = AppState::with_study_store(
-        Arc::new(AnswerResolutionProbeBrain),
-        "answer_resolution_probe",
+        Arc::new(GatedCompletionProviderProbeBrain {
+            text_inputs: text_inputs.clone(),
+            study_store: store.clone(),
+            completion_gate: completion_gate.clone(),
+        }),
+        "gated_completion_provider_probe",
         VoiceWsAccess::default(),
         1,
         store,
     )
     .with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
-        idle: Duration::from_millis(25),
+        idle: Duration::from_millis(250),
         session: Duration::from_secs(5),
     });
     let Some(url) = spawn_server(state).await else {
@@ -6846,18 +6844,22 @@ async fn websocket_turn_cap_disarms_after_answer_resolution() {
     let (mut socket, _) = connect_async(url).await.unwrap();
     let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
 
-    assert_ready_provider(&mut socket, "answer_resolution_probe").await;
+    assert_ready_provider(&mut socket, "gated_completion_provider_probe").await;
     socket
         .send(WsMessage::Text(
             format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(Vec::new().into()))
-        .await
-        .unwrap();
-
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "resolved answer".to_owned(),
+            client_generation_id: Some("turn-cap-resolution".to_owned()),
+        },
+    )
+    .await;
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let frame = read_server_frame(&mut socket).await;
@@ -6866,10 +6868,7 @@ async fn websocket_turn_cap_disarms_after_answer_resolution() {
                 ServerFrame::Event { event, .. }
                     if matches!(
                         event.as_ref(),
-                        VivaServerEvent::SessionPhase {
-                            phase: agent_domain::StudySessionPhase::Feedback,
-                            terminal_reason: None,
-                        }
+                        VivaServerEvent::AnswerEvaluated { .. }
                     )
             ) {
                 break;
@@ -6878,6 +6877,7 @@ async fn websocket_turn_cap_disarms_after_answer_resolution() {
     })
     .await
     .expect("answer evaluation should arrive before the turn cap");
+    assert_eq!(text_inputs.load(Ordering::SeqCst), 1);
 
     let post_resolution_turn_cap = tokio::time::timeout(Duration::from_millis(60), async {
         loop {
@@ -6898,6 +6898,8 @@ async fn websocket_turn_cap_disarms_after_answer_resolution() {
         post_resolution_turn_cap.is_err(),
         "turn cap fired after the submitted answer resolved"
     );
+    completion_gate.notify_waiters();
+    socket.close(None).await.unwrap();
 }
 
 #[tokio::test]
@@ -7248,7 +7250,7 @@ async fn websocket_audio_continuations_keep_turn_cap_with_limits(voice_limits: V
     let state = AppState::new(
         Arc::new(QueuedAudioProviderProbeBrain {
             text_inputs,
-            audio_inputs,
+            audio_inputs: audio_inputs.clone(),
         }),
         "cartesia_gemini",
         VoiceWsAccess::default(),
@@ -7256,7 +7258,7 @@ async fn websocket_audio_continuations_keep_turn_cap_with_limits(voice_limits: V
     )
     .with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
-        idle: Duration::from_millis(40),
+        idle: Duration::from_millis(250),
         session: Duration::from_secs(5),
     })
     .with_voice_limits(voice_limits);
@@ -7280,33 +7282,20 @@ async fn websocket_audio_continuations_keep_turn_cap_with_limits(voice_limits: V
         .send(WsMessage::Binary(vec![1_u8, 2].into()))
         .await
         .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        audio_inputs.lock().unwrap().len() == 1
+    })
+    .await;
     socket
         .send(WsMessage::Binary(vec![3_u8, 4].into()))
         .await
         .unwrap();
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let frame = read_server_frame(&mut socket).await;
-            if matches!(
-                frame,
-                ServerFrame::Event { event, .. }
-                    if matches!(
-                        event.as_ref(),
-                        VivaServerEvent::SessionPhase {
-                            phase: agent_domain::StudySessionPhase::Feedback,
-                            terminal_reason: None,
-                        }
-                    )
-            ) {
-                break;
-            }
-        }
+    wait_until(Duration::from_secs(2), || {
+        audio_inputs.lock().unwrap().len() == 2
     })
-    .await
-    .expect("audio provider completion should arrive");
+    .await;
 
-    let terminal = tokio::time::timeout(Duration::from_millis(90), async {
+    let terminal = tokio::time::timeout(Duration::from_millis(350), async {
         loop {
             match socket.next().await.unwrap().unwrap() {
                 WsMessage::Text(text) => {
@@ -7328,17 +7317,21 @@ async fn websocket_audio_continuations_keep_turn_cap_with_limits(voice_limits: V
 
 #[tokio::test]
 async fn websocket_turn_cap_stays_armed_for_newer_submission_after_one_resolution() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let state = AppState::with_study_store(
-        Arc::new(DelayedSingleResolutionProbeBrain),
-        "delayed_single_resolution_probe",
+        Arc::new(FirstAnswerOnlyProbeBrain {
+            text_inputs: text_inputs.clone(),
+            study_store: store.clone(),
+        }),
+        "first_answer_only_probe",
         VoiceWsAccess::default(),
         1,
         store,
     )
     .with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
-        idle: Duration::from_millis(40),
+        idle: Duration::from_millis(250),
         session: Duration::from_secs(5),
     })
     .with_voice_limits(VoiceLimitConfig {
@@ -7351,7 +7344,7 @@ async fn websocket_turn_cap_stays_armed_for_newer_submission_after_one_resolutio
     let (mut socket, _) = connect_async(url).await.unwrap();
     let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
 
-    assert_ready_provider(&mut socket, "delayed_single_resolution_probe").await;
+    assert_ready_provider(&mut socket, "first_answer_only_probe").await;
     socket
         .send(WsMessage::Text(
             format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
@@ -7385,10 +7378,7 @@ async fn websocket_turn_cap_stays_armed_for_newer_submission_after_one_resolutio
                 ServerFrame::Event { event, .. }
                     if matches!(
                         event.as_ref(),
-                        VivaServerEvent::SessionPhase {
-                            phase: agent_domain::StudySessionPhase::Feedback,
-                            terminal_reason: None,
-                        }
+                        VivaServerEvent::AnswerEvaluated { .. }
                     )
             ) {
                 break;
@@ -7397,8 +7387,12 @@ async fn websocket_turn_cap_stays_armed_for_newer_submission_after_one_resolutio
     })
     .await
     .expect("first answer resolution should arrive before the turn cap");
+    wait_until(Duration::from_secs(2), || {
+        text_inputs.load(Ordering::SeqCst) == 2
+    })
+    .await;
 
-    let terminal = tokio::time::timeout(Duration::from_millis(80), async {
+    let terminal = tokio::time::timeout(Duration::from_millis(350), async {
         loop {
             match socket.next().await.unwrap().unwrap() {
                 WsMessage::Text(text) => {
@@ -10255,13 +10249,16 @@ impl RealtimeBrain for ChattyPhaseProbeBrain {
     }
 }
 
-struct AnswerResolutionProbeBrain;
+struct FirstAnswerOnlyProbeBrain {
+    text_inputs: Arc<AtomicUsize>,
+    study_store: Arc<dyn StudyMemoryStore>,
+}
 
 #[async_trait::async_trait]
-impl RealtimeBrain for AnswerResolutionProbeBrain {
+impl RealtimeBrain for FirstAnswerOnlyProbeBrain {
     fn capabilities(&self) -> RealtimeBrainCapabilities {
         RealtimeBrainCapabilities {
-            provider: "answer_resolution_probe".to_owned(),
+            provider: "first_answer_only_probe".to_owned(),
             configured: true,
             selectable: true,
             live_runtime: false,
@@ -10270,30 +10267,74 @@ impl RealtimeBrain for AnswerResolutionProbeBrain {
 
     async fn open(
         &self,
-        _config: agent_domain::SessionConfig,
+        config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
+        self.study_store
+            .record_voice_session(&config)
+            .await
+            .map_err(|error| BrainError::Connection(error.to_string()))?;
+        let user_id = config
+            .user_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .to_owned();
+        let study_set_id = config
+            .study_set_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .to_owned();
+        let voice_session_id = config
+            .session_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .to_owned();
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
+        let text_inputs = self.text_inputs.clone();
+        let study_store = self.study_store.clone();
         let task = tokio::spawn(async move {
-            let mut sent = false;
             while let Some(input) = input_rx.recv().await {
-                if sent {
+                if !matches!(
+                    input,
+                    BrainInput::Text(_) | BrainInput::TextWithMetadata { .. }
+                ) {
                     continue;
                 }
-                if matches!(
-                    input,
-                    BrainInput::Audio(_)
-                        | BrainInput::AudioWithMetadata { .. }
-                        | BrainInput::Text(_)
-                        | BrainInput::TextWithMetadata { .. }
-                ) {
-                    let _ = event_tx
-                        .send(BrainEvent::ResponseCompleted {
-                            response_id: "response-1".to_owned(),
-                        })
-                        .await;
-                    sent = true;
+                let turn_index = text_inputs.fetch_add(1, Ordering::SeqCst) + 1;
+                if turn_index != 1 {
+                    continue;
                 }
+                let question = agent_domain::fixture_question();
+                let evaluation = agent_domain::AnswerEvaluation {
+                    question_id: question.question_id,
+                    answer_text: "first provider turn evaluated".to_owned(),
+                    label: "mostly correct".to_owned(),
+                    concise_feedback: "Review the next step.".to_owned(),
+                    retry_prompt: question.follow_up,
+                    source: question.source,
+                    concept_status: agent_domain::ConceptStatus::Strong,
+                    confidence_score: 0.84,
+                };
+                let response_id = "first-answer-only-1".to_owned();
+                if study_store
+                    .record_answer_evaluation(
+                        &user_id,
+                        &study_set_id,
+                        &voice_session_id,
+                        &response_id,
+                        evaluation.clone(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let _ = event_tx
+                    .send(BrainEvent::AnswerEvaluated {
+                        response_id,
+                        evaluation,
+                    })
+                    .await;
             }
         });
 
@@ -10497,57 +10538,6 @@ impl RealtimeBrain for AnswerEvaluatedProviderProbeBrain {
                 let _ = event_tx
                     .send(BrainEvent::ResponseCompleted { response_id })
                     .await;
-            }
-        });
-
-        Ok(RealtimeSession {
-            input,
-            events,
-            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
-        })
-    }
-}
-
-struct DelayedSingleResolutionProbeBrain;
-
-#[async_trait::async_trait]
-impl RealtimeBrain for DelayedSingleResolutionProbeBrain {
-    fn capabilities(&self) -> RealtimeBrainCapabilities {
-        RealtimeBrainCapabilities {
-            provider: "delayed_single_resolution_probe".to_owned(),
-            configured: true,
-            selectable: true,
-            live_runtime: false,
-        }
-    }
-
-    async fn open(
-        &self,
-        _config: agent_domain::SessionConfig,
-    ) -> Result<RealtimeSession, BrainError> {
-        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
-        let (event_tx, events) = mpsc::channel(8);
-        let task = tokio::spawn(async move {
-            let mut sent = false;
-            while let Some(input) = input_rx.recv().await {
-                if sent {
-                    continue;
-                }
-                if matches!(
-                    input,
-                    BrainInput::Audio(_)
-                        | BrainInput::AudioWithMetadata { .. }
-                        | BrainInput::Text(_)
-                        | BrainInput::TextWithMetadata { .. }
-                ) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    let _ = event_tx
-                        .send(BrainEvent::ResponseCompleted {
-                            response_id: "response-1".to_owned(),
-                        })
-                        .await;
-                    sent = true;
-                }
             }
         });
 

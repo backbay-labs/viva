@@ -242,14 +242,6 @@
       "type": "event",
       "version": 4,
       "event": {
-        "type": "session_phase",
-        "phase": "feedback"
-      }
-    },
-    {
-      "type": "event",
-      "version": 3,
-      "event": {
         "type": "cancellation",
         "response_id": "response-2"
       }

@@ -550,6 +550,7 @@ async fn handle_socket(
     let mut pending_provider_admission_reserved_submission = false;
     let mut resolved_submitted_answer_response_ids = HashSet::<String>::new();
     let mut completed_provider_turn_response_ids = HashSet::<String>::new();
+    let mut superseded_provider_turn_response_ids = HashSet::<String>::new();
     let mut drain_signal = state.drain_signal.subscribe();
     if *drain_signal.borrow_and_update() {
         terminal_reason = close_with_terminal_session_phase(
@@ -673,6 +674,10 @@ async fn handle_socket(
                     Ok(action) => {
                         record_client_action(&state, voice_session_id.clone(), action);
                         if action.arms_turn_cap() {
+                            mark_completed_provider_turns_superseded(
+                                &completed_provider_turn_response_ids,
+                                &mut superseded_provider_turn_response_ids,
+                            );
                             active_provider_turns = active_provider_turns.saturating_add(1);
                             if let Some(lease) = provider_admission_lease.take() {
                                 pending_provider_admissions.push(lease);
@@ -876,6 +881,7 @@ async fn handle_socket(
                             pending_provider_admissions: &mut pending_provider_admissions,
                             resolved_submitted_answer_response_ids: &mut resolved_submitted_answer_response_ids,
                             completed_provider_turn_response_ids: &mut completed_provider_turn_response_ids,
+                            superseded_provider_turn_response_ids: &mut superseded_provider_turn_response_ids,
                             turn_cap_deadline: &mut turn_cap_deadline,
                         };
                         match forward_ready_brain_events(
@@ -1032,12 +1038,14 @@ async fn handle_socket(
                         record_client_action(&state, voice_session_id.clone(), action);
                         if action.arms_turn_cap() {
                             if requires_provider_admission {
+                                mark_completed_provider_turns_superseded(
+                                    &completed_provider_turn_response_ids,
+                                    &mut superseded_provider_turn_response_ids,
+                                );
                                 active_provider_turns = active_provider_turns.saturating_add(1);
                             }
                             if let Some(lease) = provider_admission_lease.take() {
                                 pending_provider_admissions.push(lease);
-                                active_provider_turn_accepts_audio_continuations =
-                                    accepts_audio_continuations;
                             }
                         }
                         match action {
@@ -1206,6 +1214,7 @@ async fn handle_socket(
                     pending_provider_admissions: &mut pending_provider_admissions,
                     resolved_submitted_answer_response_ids: &mut resolved_submitted_answer_response_ids,
                     completed_provider_turn_response_ids: &mut completed_provider_turn_response_ids,
+                    superseded_provider_turn_response_ids: &mut superseded_provider_turn_response_ids,
                     turn_cap_deadline: &mut turn_cap_deadline,
                 };
                 match forward_brain_event_with_turn_accounting(
@@ -1511,6 +1520,7 @@ struct ProviderTurnRuntime<'a> {
     pending_provider_admissions: &'a mut Vec<VoiceLimitLease>,
     resolved_submitted_answer_response_ids: &'a mut HashSet<String>,
     completed_provider_turn_response_ids: &'a mut HashSet<String>,
+    superseded_provider_turn_response_ids: &'a mut HashSet<String>,
     turn_cap_deadline: &'a mut Option<Instant>,
 }
 
@@ -1562,6 +1572,9 @@ async fn forward_brain_event_with_turn_accounting<S>(
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
+    if should_suppress_superseded_recap(&event, runtime.superseded_provider_turn_response_ids) {
+        return Ok(ForwardBrainEvent::Suppressed);
+    }
     let submitted_answer_resolution = brain_event_submitted_answer_resolution(&event);
     let provider_turn_completion = brain_event_provider_turn_completion(&event);
     let result = forward_brain_event(
@@ -1614,9 +1627,18 @@ fn apply_provider_turn_accounting(
         match completion {
             SubmittedAnswerResolution::One { response_id } => {
                 let count_completion = match response_id {
-                    Some(response_id) => runtime
-                        .completed_provider_turn_response_ids
-                        .insert(response_id),
+                    Some(response_id) => {
+                        let superseded_by_active_turn = *runtime.active_provider_turns > 1;
+                        let count_completion = runtime
+                            .completed_provider_turn_response_ids
+                            .insert(response_id.clone());
+                        if superseded_by_active_turn {
+                            runtime
+                                .superseded_provider_turn_response_ids
+                                .insert(response_id);
+                        }
+                        count_completion
+                    }
                     None => true,
                 };
                 if count_completion {
@@ -1628,10 +1650,30 @@ fn apply_provider_turn_accounting(
             SubmittedAnswerResolution::All => {
                 *runtime.active_provider_turns = 0;
                 runtime.completed_provider_turn_response_ids.clear();
+                runtime.superseded_provider_turn_response_ids.clear();
                 runtime.pending_provider_admissions.clear();
             }
         }
     }
+}
+
+fn mark_completed_provider_turns_superseded(
+    completed_provider_turn_response_ids: &HashSet<String>,
+    superseded_provider_turn_response_ids: &mut HashSet<String>,
+) {
+    superseded_provider_turn_response_ids
+        .extend(completed_provider_turn_response_ids.iter().cloned());
+}
+
+fn should_suppress_superseded_recap(
+    event: &agent_domain::BrainEvent,
+    superseded_provider_turn_response_ids: &HashSet<String>,
+) -> bool {
+    matches!(
+        event,
+        agent_domain::BrainEvent::RecapReady { response_id, .. }
+            if superseded_provider_turn_response_ids.contains(response_id)
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4090,6 +4132,40 @@ mod tests {
             brain_event_provider_turn_completion(&terminal_phase),
             Some(SubmittedAnswerResolution::All)
         );
+    }
+
+    #[test]
+    fn superseded_recap_suppression_uses_response_identity_not_active_turn_count() {
+        let recap = agent_domain::StudySessionRecap {
+            voice_session_id: "voice-session-1".to_owned(),
+            headline: "Session recap".to_owned(),
+            summary: "Review oxidative phosphorylation.".to_owned(),
+            strong_concepts: vec![],
+            shaky_concepts: vec![],
+            missed_concepts: vec![],
+            review_later: vec![],
+            next_action: "Review the source moment.".to_owned(),
+            source_moments: vec![],
+        };
+        let stale_recap = BrainEvent::RecapReady {
+            response_id: "response-a".to_owned(),
+            recap: recap.clone(),
+        };
+        let current_recap = BrainEvent::RecapReady {
+            response_id: "response-b".to_owned(),
+            recap,
+        };
+        let mut completed = HashSet::new();
+        completed.insert("response-a".to_owned());
+        let mut superseded = HashSet::new();
+
+        mark_completed_provider_turns_superseded(&completed, &mut superseded);
+
+        assert!(should_suppress_superseded_recap(&stale_recap, &superseded));
+        assert!(!should_suppress_superseded_recap(
+            &current_recap,
+            &superseded
+        ));
     }
 
     #[tokio::test]
