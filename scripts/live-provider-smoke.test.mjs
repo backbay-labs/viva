@@ -8,6 +8,7 @@ import {
   auditLiveSmokeEvidence,
   buildLiveSmokeConfig,
   configurationFailureEvidence,
+  configurationFailureEvidenceWithMonitorState,
   liveMonitorEvidence,
   runLiveProviderSmoke,
   summarizeServerFrame,
@@ -106,6 +107,43 @@ test("configuration failures emit live-monitor rollback evidence", () => {
   assert.equal(evidence.monitor.model, "gemini-live-test");
   assert.equal(evidence.monitor.signal, "live_monitor_failure");
   assert.equal(evidence.monitor.terminal_reason, "configuration_error");
+});
+
+test("configuration failures preserve previous persisted live-monitor failures", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "viva-live-smoke-config-prior-"));
+  const evidencePath = path.join(tempDir, "evidence.json");
+  await writeFile(
+    evidencePath,
+    `${JSON.stringify({
+      schema: "viva.live_provider_smoke.v1",
+      deploy_sha: "deploy-sha-123",
+      model: "gemini-live-test",
+      status: "failed",
+      monitor: {
+        deploy_sha: "deploy-sha-123",
+        live_monitor_consecutive_failures: 2,
+        model: "gemini-live-test",
+      },
+    })}\n`,
+  );
+
+  try {
+    const evidence = await configurationFailureEvidenceWithMonitorState({
+      env: {
+        VIVA_LIVE_PROVIDER_SMOKE: "1",
+        VIVA_LIVE_SMOKE_EVIDENCE_PATH: evidencePath,
+        GEMINI_MODEL: "gemini-live-test",
+        GITHUB_SHA: "deploy-sha-123",
+      },
+      now: () => new Date("2026-06-18T00:00:00.000Z"),
+    });
+
+    assert.equal(evidence.status, "failed");
+    assert.equal(evidence.monitor.live_monitor_consecutive_failures, 3);
+    assert.equal(evidence.monitor.terminal_reason, "configuration_error");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("server frames summarize to safe counters without raw protocol payload", () => {

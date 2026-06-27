@@ -67,6 +67,10 @@ test("provider failure observability defines reusable sanitized log queries", ()
     /failure_class:"session_bootstrap_unavailable"/,
   );
   assert.match(
+    queriesById.get("startup_unavailable").railway_query,
+    /viva_session_identity_allowlist_unavailable/,
+  );
+  assert.match(
     queriesById.get("live_monitor_failure").railway_query,
     /monitor\.live_monitor_consecutive_failures/,
   );
@@ -78,6 +82,10 @@ test("provider failure observability defines reusable sanitized log queries", ()
   assert.match(
     queriesById.get("rollback_observed").railway_query,
     /rollback_drain\.production_release_gate\.reason/,
+  );
+  assert.doesNotMatch(
+    queriesById.get("rollback_observed").railway_query,
+    /rollback_drain\.schema/,
   );
   assert.match(
     queriesById.get("token_refresh_failure").railway_query,

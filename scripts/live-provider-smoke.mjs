@@ -791,11 +791,15 @@ export function liveMonitorEvidence({
   };
 }
 
-export function configurationFailureEvidence({ env = process.env, now = () => new Date() } = {}) {
+export function configurationFailureEvidence({
+  env = process.env,
+  liveMonitorConsecutiveFailures = safeLiveMonitorConsecutiveFailures(env),
+  now = () => new Date(),
+} = {}) {
   const failure = liveProviderFailureForSmokeReason("configuration_error");
   const config = {
     deploySha: deploymentSha(env),
-    liveMonitorConsecutiveFailures: safeLiveMonitorConsecutiveFailures(env),
+    liveMonitorConsecutiveFailures,
     model: liveSmokeModel(env),
   };
   return {
@@ -814,6 +818,29 @@ export function configurationFailureEvidence({ env = process.env, now = () => ne
     terminal_reason: "configuration_error",
     privacy: privacyEvidence(),
   };
+}
+
+export async function configurationFailureEvidenceWithMonitorState({
+  env = process.env,
+  now = () => new Date(),
+  outputPath = liveSmokeOutputPath(env),
+  readFileImpl = readFile,
+} = {}) {
+  const config = {
+    deploySha: deploymentSha(env),
+    liveMonitorConsecutiveFailures: safeLiveMonitorConsecutiveFailures(env),
+    model: liveSmokeModel(env),
+    outputPath,
+  };
+  const liveMonitorConsecutiveFailures = await previousLiveMonitorConsecutiveFailures(
+    config,
+    readFileImpl,
+  );
+  return configurationFailureEvidence({
+    env,
+    liveMonitorConsecutiveFailures,
+    now,
+  });
 }
 
 function failedMonitorEvidence(config, terminalReason) {
@@ -1091,7 +1118,7 @@ async function main() {
   try {
     evidence = await runLiveProviderSmoke();
   } catch {
-    evidence = configurationFailureEvidence();
+    evidence = await configurationFailureEvidenceWithMonitorState({ outputPath });
   }
   auditLiveSmokeEvidence(evidence, process.env);
   await writeEvidence(outputPath, evidence);
