@@ -425,6 +425,22 @@ async fn handle_socket(
             return;
         }
     };
+    if let Some(admission) = state
+        .limit_state
+        .provider_backoff_admission(&state.voice_limits)
+    {
+        record_provider_admission(&state, voice_session_id.clone(), &admission);
+        if let ProviderAdmissionDecision::Denied(denial) = admission.decision {
+            let terminal_reason = close_with_terminal_session_phase_only(
+                &mut sender,
+                denial.terminal_reason,
+                close_code::POLICY,
+            )
+            .await;
+            record_terminal(&state, voice_session_id, terminal_reason).await;
+            return;
+        }
+    }
     if let Some(claim) = initial.token_nonce_claim.take() {
         match state.study_store.claim_session_token_nonce(claim).await {
             Ok(()) => {}
@@ -481,23 +497,6 @@ async fn handle_socket(
     record_turn_cap_config(&state, voice_session_id.clone());
     let session_started_at = Instant::now();
 
-    if let Some(admission) = state
-        .limit_state
-        .provider_backoff_admission(&state.voice_limits)
-    {
-        record_provider_admission(&state, voice_session_id.clone(), &admission);
-        if let ProviderAdmissionDecision::Denied(denial) = admission.decision {
-            let terminal_reason = close_with_terminal_session_phase_only(
-                &mut sender,
-                denial.terminal_reason,
-                close_code::POLICY,
-            )
-            .await;
-            record_terminal(&state, voice_session_id, terminal_reason).await;
-            return;
-        }
-    }
-
     let session_result = match failure_control {
         Some(scenario) => open_failure_control_session(&state, initial_config, scenario).await,
         None => state.brain.open(initial_config).await,
@@ -551,6 +550,7 @@ async fn handle_socket(
     let mut pending_provider_admission: Fuse<BoxFuture<'static, QueuedProviderAdmission>> =
         Fuse::terminated();
     let mut pending_provider_admission_accepts_audio_continuations = false;
+    let mut pending_provider_admission_reserved_submission = false;
     let mut active_provider_turn_accepts_audio_continuations = false;
     let mut queued_provider_continuations = VecDeque::<ClientInputAction>::new();
     let mut queued_provider_continuation_bytes = 0_u64;
@@ -638,6 +638,9 @@ async fn handle_socket(
                     mut admission,
                 } = queued;
                 pending_provider_admission_accepts_audio_continuations = false;
+                let admission_reserved_submission =
+                    pending_provider_admission_reserved_submission;
+                pending_provider_admission_reserved_submission = false;
                 record_provider_admission(&state, voice_session_id.clone(), &admission);
                 if let ProviderAdmissionDecision::Denied(denial) = &admission.decision {
                     terminal_reason = close_with_terminal_session_phase(
@@ -657,7 +660,9 @@ async fn handle_socket(
                 let mut provider_admission_lease = admission.lease.take();
                 let turn_send_deadline = if client_input.action().arms_turn_cap() {
                     pre_answer_idle_armed = false;
-                    pending_submitted_answers = pending_submitted_answers.saturating_add(1);
+                    if !admission_reserved_submission {
+                        pending_submitted_answers = pending_submitted_answers.saturating_add(1);
+                    }
                     Some(*turn_cap_deadline.get_or_insert_with(|| {
                         let deadline = Instant::now() + state.ws_timeouts.idle;
                         turn_cap.as_mut().reset(deadline);
@@ -863,6 +868,13 @@ async fn handle_socket(
                 {
                     pending_provider_admission = Fuse::terminated();
                     pending_provider_admission_accepts_audio_continuations = false;
+                    if pending_provider_admission_reserved_submission {
+                        pending_submitted_answers = pending_submitted_answers.saturating_sub(1);
+                        pending_provider_admission_reserved_submission = false;
+                        if pending_submitted_answers == 0 {
+                            turn_cap_deadline = None;
+                        }
+                    }
                     queued_provider_continuations.clear();
                     queued_provider_continuation_bytes = 0;
                     match send_client_input_action_with_drain(
@@ -974,6 +986,16 @@ async fn handle_socket(
                         {
                             if client_input.action().arms_turn_cap() {
                                 pre_answer_idle_armed = false;
+                                pending_submitted_answers =
+                                    pending_submitted_answers.saturating_add(1);
+                                pending_provider_admission_reserved_submission = true;
+                                turn_cap_deadline.get_or_insert_with(|| {
+                                    let deadline = Instant::now() + state.ws_timeouts.idle;
+                                    turn_cap.as_mut().reset(deadline);
+                                    deadline
+                                });
+                            } else {
+                                pending_provider_admission_reserved_submission = false;
                             }
                             pending_provider_admission_accepts_audio_continuations =
                                 client_input_starts_audio_provider_turn(&client_input);
@@ -1373,7 +1395,8 @@ fn brain_event_provider_turn_completion(
         | agent_domain::BrainEvent::TerminalSessionPhase { .. } => {
             Some(SubmittedAnswerResolution::All)
         }
-        agent_domain::BrainEvent::ResponseCompleted { .. }
+        agent_domain::BrainEvent::AnswerEvaluated { .. }
+        | agent_domain::BrainEvent::ResponseCompleted { .. }
         | agent_domain::BrainEvent::ResponseCancelledFor { .. } => {
             Some(SubmittedAnswerResolution::One {
                 response_id: event.response_id().map(ToOwned::to_owned),
@@ -4009,7 +4032,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_turn_completion_waits_for_end_of_turn_after_answer_evaluation() {
+    fn provider_turn_completion_uses_answer_evaluation_signal() {
         let question = agent_domain::fixture_question();
         let evaluation = agent_domain::AnswerEvaluation {
             question_id: question.question_id,
@@ -4033,7 +4056,9 @@ mod tests {
         );
         assert_eq!(
             brain_event_provider_turn_completion(&answer_evaluated),
-            None
+            Some(SubmittedAnswerResolution::One {
+                response_id: Some("response-1".to_owned())
+            })
         );
 
         let response_completed = BrainEvent::ResponseCompleted {

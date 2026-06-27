@@ -3127,6 +3127,81 @@ async fn websocket_open_rate_limit_backoff_denies_next_socket_before_brain_open(
 }
 
 #[tokio::test]
+async fn websocket_provider_backoff_denial_does_not_consume_signed_nonce() {
+    let opens = Arc::new(AtomicUsize::new(0));
+    let state = provider_limiter_test_state(
+        Arc::new(OpenRateLimitFailureBrain {
+            opens: opens.clone(),
+        }),
+        "cartesia_gemini",
+        VoiceLimitConfig::default(),
+    );
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
+    first_socket
+        .send(WsMessage::Text(
+            provider_limiter_session_config(
+                "biology-midterm",
+                "voice-session-1",
+                "nonce-open-backoff-first",
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut first_socket).await,
+        TerminalSessionReason::ProviderRateLimited,
+    );
+    assert_close_code(&mut first_socket, CloseCode::Error).await;
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+    let retry_session = provider_limiter_session_config(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-open-backoff-retry",
+    );
+    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
+    second_socket
+        .send(WsMessage::Text(retry_session.clone().into()))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut second_socket).await,
+        TerminalSessionReason::ProviderRateLimited,
+    );
+    assert_close_code(&mut second_socket, CloseCode::Policy).await;
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        1,
+        "active provider backoff should deny before reopening the provider"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut retry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut retry_socket, "cartesia_gemini").await;
+    retry_socket
+        .send(WsMessage::Text(retry_session.into()))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut retry_socket).await,
+        TerminalSessionReason::ProviderRateLimited,
+    );
+    assert_close_code(&mut retry_socket, CloseCode::Error).await;
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        2,
+        "backoff-only denial consumed the signed nonce before the retry window"
+    );
+}
+
+#[tokio::test]
 async fn websocket_provider_global_turn_limit_denies_queue_overflow() {
     let text_inputs = Arc::new(AtomicUsize::new(0));
     let state = provider_limiter_test_state(
@@ -3561,6 +3636,118 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
 
     second_socket.close(None).await.unwrap();
     let _ = read_server_frames_until_close(&mut second_socket).await;
+}
+
+#[tokio::test]
+async fn websocket_provider_queue_arms_turn_cap_while_waiting_for_admission() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let state = provider_limiter_test_state(
+        Arc::new(BlockingProviderProbeBrain {
+            text_inputs: text_inputs.clone(),
+        }),
+        "cartesia_gemini",
+        VoiceLimitConfig {
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        },
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(40),
+        session: Duration::from_secs(5),
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
+    first_socket
+        .send(WsMessage::Text(
+            provider_limiter_session_config(
+                "biology-midterm",
+                "voice-session-1",
+                "nonce-provider-limiter-biology",
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_server_frame(&mut first_socket).await,
+        ServerFrame::Event { event, .. }
+            if matches!(
+                event.as_ref(),
+                VivaServerEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                    terminal_reason: None,
+                }
+            )
+    ));
+    send_client_frame(
+        &mut first_socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "admission holder".to_owned(),
+            client_generation_id: Some("bac519-queue-turn-cap-holder".to_owned()),
+        },
+    )
+    .await;
+    wait_until(Duration::from_secs(2), || {
+        text_inputs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
+    second_socket
+        .send(WsMessage::Text(
+            provider_limiter_session_config(
+                "chemistry-final",
+                "voice-session-2",
+                "nonce-provider-limiter-chemistry",
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_server_frame(&mut second_socket).await,
+        ServerFrame::Event { event, .. }
+            if matches!(
+                event.as_ref(),
+                VivaServerEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                    terminal_reason: None,
+                }
+            )
+    ));
+    send_client_frame(
+        &mut second_socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "queued admission should time out".to_owned(),
+            client_generation_id: Some("bac519-queue-turn-cap-pending".to_owned()),
+        },
+    )
+    .await;
+
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = read_server_frame(&mut second_socket).await;
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                break frame;
+            }
+        }
+    })
+    .await
+    .expect("queued provider admission did not arm the BAC-510 turn cap");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
+    assert_close_code(&mut second_socket, CloseCode::Policy).await;
+
+    first_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut first_socket).await;
 }
 
 #[tokio::test]
@@ -6599,7 +6786,7 @@ async fn websocket_turn_cap_disarms_after_answer_resolution() {
 }
 
 #[tokio::test]
-async fn websocket_provider_slot_waits_for_response_completed_after_answer_evaluated() {
+async fn websocket_provider_slot_releases_on_answer_evaluated() {
     let text_inputs = Arc::new(AtomicUsize::new(0));
     let completion_gate = Arc::new(Notify::new());
     let store = provider_limiter_test_store();
@@ -6691,7 +6878,7 @@ async fn websocket_provider_slot_waits_for_response_completed_after_answer_evalu
         },
     )
     .await;
-    let forwarded_before_completion = tokio::time::timeout(Duration::from_millis(150), async {
+    tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if text_inputs.load(Ordering::SeqCst) == 2 {
                 return;
@@ -6699,18 +6886,10 @@ async fn websocket_provider_slot_waits_for_response_completed_after_answer_evalu
             tokio::task::yield_now().await;
         }
     })
-    .await;
-    assert!(
-        forwarded_before_completion.is_err(),
-        "queued provider turn was forwarded after AnswerEvaluated but before ResponseCompleted"
-    );
+    .await
+    .expect("normal AnswerEvaluated completion should release the provider slot");
 
-    completion_gate.notify_one();
-    wait_until(Duration::from_secs(2), || {
-        text_inputs.load(Ordering::SeqCst) == 2
-    })
-    .await;
-
+    completion_gate.notify_waiters();
     first_socket.close(None).await.unwrap();
     second_socket.close(None).await.unwrap();
 }
