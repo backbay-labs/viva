@@ -10,6 +10,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -39,6 +40,9 @@ use runner::{
 
 pub(crate) const FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT: &str =
     "NADH donates electrons to the electron transport chain.";
+pub(crate) const MAX_GEMINI_TOOL_LOOP_PASSES: u32 = 2;
+pub(crate) const MAX_GEMINI_EXECUTED_TOOL_STAGES: u32 = 5;
+pub(crate) const DETERMINISTIC_STUDY_TOOL_STAGES: u32 = 3;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct CartesiaGeminiConfig {
@@ -46,6 +50,8 @@ pub struct CartesiaGeminiConfig {
     pub gemini: GeminiConfig,
     pub ink: InkConfig,
     pub sonic: SonicConfig,
+    pub tool_stage_timeout: Duration,
+    pub recap_stage_timeout: Duration,
     pub live_runtime_enabled: bool,
     pub cartesia_zero_data_retention_enabled: bool,
     pub gemini_zero_data_retention_approved: bool,
@@ -60,6 +66,8 @@ impl fmt::Debug for CartesiaGeminiConfig {
             .field("gemini", &self.gemini)
             .field("ink", &self.ink)
             .field("sonic", &self.sonic)
+            .field("tool_stage_timeout", &self.tool_stage_timeout)
+            .field("recap_stage_timeout", &self.recap_stage_timeout)
             .field("live_runtime_enabled", &self.live_runtime_enabled)
             .field(
                 "cartesia_zero_data_retention_enabled",
@@ -81,6 +89,8 @@ impl Default for CartesiaGeminiConfig {
             gemini: GeminiConfig::default(),
             ink: InkConfig::default(),
             sonic: SonicConfig::default(),
+            tool_stage_timeout: Duration::from_secs(2),
+            recap_stage_timeout: Duration::from_secs(2),
             live_runtime_enabled: false,
             cartesia_zero_data_retention_enabled: false,
             gemini_zero_data_retention_approved: false,
@@ -207,6 +217,24 @@ impl CartesiaGeminiConfig {
             && self.selectable_live_keys()
             && self.provider_zero_data_retention_confirmed()
     }
+
+    pub fn total_live_stage_deadline(&self) -> Duration {
+        [
+            self.ink.stage_timeout,
+            self.gemini
+                .stage_timeout
+                .saturating_mul(MAX_GEMINI_TOOL_LOOP_PASSES),
+            self.tool_stage_timeout.saturating_mul(
+                MAX_GEMINI_EXECUTED_TOOL_STAGES.saturating_add(DETERMINISTIC_STUDY_TOOL_STAGES),
+            ),
+            self.sonic.stage_timeout,
+            self.recap_stage_timeout,
+        ]
+        .into_iter()
+        .fold(Duration::ZERO, |total, duration| {
+            total.saturating_add(duration)
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -275,6 +303,7 @@ pub enum FakeRuntimeInterrupt {
     MalformedGeminiManuscriptIntent,
     UnauthorizedGeminiManuscriptIntent,
     NoGeminiManuscriptIntent,
+    GeminiToolCallOnFinalPass,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -363,7 +392,7 @@ impl FakeCartesiaGeminiRuntime {
                 let question = match select_next_question(&executor, &session).await {
                     Ok(question) => question,
                     Err(error) => {
-                        emit_fake_provider_error(&event_tx, error.to_string()).await;
+                        emit_fake_provider_error(&event_tx, error).await;
                         break;
                     }
                 };
@@ -377,7 +406,8 @@ impl FakeCartesiaGeminiRuntime {
                     ))
                     .await
                 {
-                    emit_fake_provider_error(&event_tx, error.to_string()).await;
+                    emit_fake_provider_error(&event_tx, BrainError::Protocol(error.to_string()))
+                        .await;
                     break;
                 }
                 let final_transcript = match runner_input {
@@ -564,11 +594,24 @@ where
         .map_err(|error| BrainError::Protocol(error.to_string()))
 }
 
-async fn emit_fake_provider_error(event_tx: &mpsc::Sender<BrainEvent>, message: String) {
-    let (source, message) = fake_provider_error_source_and_message(&message);
-    let _ = event_tx
-        .send(BrainEvent::Error(BrainProviderError { source, message }))
-        .await;
+async fn emit_fake_provider_error(event_tx: &mpsc::Sender<BrainEvent>, error: BrainError) {
+    let provider_error = match error {
+        BrainError::StageFailure(failure) => BrainProviderError::from_stage_failure(*failure),
+        BrainError::Connection(message) | BrainError::Protocol(message) => {
+            let (source, message) = fake_provider_error_source_and_message(&message);
+            BrainProviderError {
+                source,
+                message,
+                failure: None,
+            }
+        }
+        _ => BrainProviderError {
+            source: "agent-service".to_owned(),
+            message: "fake provider turn failed".to_owned(),
+            failure: None,
+        },
+    };
+    let _ = event_tx.send(BrainEvent::Error(provider_error)).await;
 }
 
 fn fake_provider_error_source_and_message(message: &str) -> (String, String) {
@@ -623,6 +666,7 @@ fn is_placeholder_live_key(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_domain::viva_max_submitted_answer_resolution;
 
     #[test]
     fn from_env_applies_ink_transport_overrides() {
@@ -680,6 +724,21 @@ mod tests {
         assert_eq!(config.sonic.sample_rate, 16_000);
         assert_eq!(config.sonic.max_buffer_delay_ms, 40);
         assert_eq!(config.sonic.cartesia_version, "2026-03-01");
+    }
+
+    #[test]
+    fn defaults_allow_declared_live_tool_sequence_under_outer_turn_cap() {
+        let config = CartesiaGeminiConfig::default();
+
+        assert_eq!(MAX_GEMINI_EXECUTED_TOOL_STAGES, 5);
+        assert_eq!(config.tool_stage_timeout, Duration::from_secs(2));
+        assert_eq!(config.recap_stage_timeout, Duration::from_secs(2));
+        assert!(
+            config
+                .total_live_stage_deadline()
+                .saturating_add(Duration::from_secs(1))
+                <= viva_max_submitted_answer_resolution()
+        );
     }
 
     #[test]

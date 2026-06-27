@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const E2E_BROWSER_PATH = "scripts/e2e-browser.mjs";
+const AGENT_CONTRACT_PATH = "packages/core/src/agent-contract.ts";
 
 test("hosted browser E2E mints sessions through the same-origin bootstrap route", async () => {
   const source = await readFile(E2E_BROWSER_PATH, "utf8");
@@ -35,3 +36,20 @@ test("hosted browser E2E records only actually verified websocket and session-ca
     /secondTabSessionCap = await auditSecondTabSessionCap\(context, secondTabTarget\)/,
   );
 });
+
+test("hosted browser E2E uses the shared voice protocol version", async () => {
+  const [browserSource, contractSource] = await Promise.all([
+    readFile(E2E_BROWSER_PATH, "utf8"),
+    readFile(AGENT_CONTRACT_PATH, "utf8"),
+  ]);
+  const browserVersion = numericConstant(browserSource, "VIVA_VOICE_PROTOCOL_VERSION");
+  const contractVersion = numericConstant(contractSource, "VIVA_VOICE_PROTOCOL_VERSION");
+
+  assert.equal(browserVersion, contractVersion);
+});
+
+function numericConstant(source, name) {
+  const match = source.match(new RegExp(`const ${name} = (\\d+)`));
+  assert(match, `missing numeric constant ${name}`);
+  return Number(match[1]);
+}

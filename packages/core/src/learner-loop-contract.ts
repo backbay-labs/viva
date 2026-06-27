@@ -30,6 +30,7 @@ export const VIVA_RUNTIME_COPY_CAUSES = [
   "slow_client",
   "store_unavailable",
   "synthetic",
+  "tool_executor_failure",
   "turn_cap",
   "unexpected_close",
 ] as const;

@@ -792,6 +792,7 @@ async fn emit_store_error(event_tx: &mpsc::Sender<BrainEvent>, message: String) 
         .send(BrainEvent::Error(BrainProviderError {
             source: "synthetic-memory".to_owned(),
             message,
+            failure: None,
         }))
         .await;
 }

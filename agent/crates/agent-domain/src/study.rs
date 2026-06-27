@@ -31,6 +31,7 @@ pub enum TerminalSessionReason {
     ProviderCancelled,
     PartialStageSuccess,
     DurabilityDegraded,
+    ToolExecutorFailure,
     Rollback,
 }
 
@@ -51,6 +52,7 @@ impl TerminalSessionReason {
             Self::ProviderCancelled => "provider_cancelled",
             Self::PartialStageSuccess => "partial_stage_success",
             Self::DurabilityDegraded => "durability_degraded",
+            Self::ToolExecutorFailure => "tool_executor_failure",
             Self::Rollback => "rollback",
         }
     }
@@ -71,6 +73,7 @@ impl TerminalSessionReason {
             Self::ProviderCancelled => "provider cancelled",
             Self::PartialStageSuccess => "partial stage success",
             Self::DurabilityDegraded => "durability degraded",
+            Self::ToolExecutorFailure => "tool executor failure",
             Self::Rollback => "rollback",
         }
     }

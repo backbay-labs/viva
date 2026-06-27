@@ -1123,6 +1123,7 @@ where
         return Ok(ForwardBrainEvent::Suppressed);
     }
     if let agent_domain::BrainEvent::Error(error) = &event {
+        record_provider_stage_failure(context.state, context.voice_session_id.clone(), error);
         if provider_error_is_durability_degraded(context.state, error) {
             context.state.evidence.record(VoiceEvidenceEvent::new(
                 VoiceEvidenceEventKind::StoreCounts,
@@ -1185,6 +1186,7 @@ where
 fn terminal_reason_for_brain_error(error: &BrainError) -> TerminalSessionReason {
     match error {
         BrainError::MissingApiKey => TerminalSessionReason::ProviderAuthFailed,
+        BrainError::StageFailure(failure) => failure.terminal_reason,
         BrainError::Connection(message) => terminal_reason_for_provider_message(message),
         BrainError::Protocol(message) => {
             let reason = terminal_reason_for_provider_message(message);
@@ -1205,18 +1207,34 @@ fn brain_error_is_durability_degraded(state: &AppState, error: &BrainError) -> b
         BrainError::Connection(message) | BrainError::Protocol(message) => {
             provider_store_error_message_is_durability_degraded(message)
         }
+        BrainError::StageFailure(failure) => {
+            failure.terminal_reason == TerminalSessionReason::DurabilityDegraded
+        }
         BrainError::MissingApiKey => false,
     }
 }
 
 fn terminal_reason_for_provider_error(error: &BrainProviderError) -> TerminalSessionReason {
+    if let Some(failure) = &error.failure {
+        return failure.terminal_reason;
+    }
     let combined = format!("{} {}", error.source, error.message);
     terminal_reason_for_provider_message(&combined)
 }
 
 fn provider_error_is_durability_degraded(state: &AppState, error: &BrainProviderError) -> bool {
-    if !state.study_store.capabilities().durable {
+    provider_error_is_durability_degraded_for_store(state.study_store.capabilities().durable, error)
+}
+
+fn provider_error_is_durability_degraded_for_store(
+    store_is_durable: bool,
+    error: &BrainProviderError,
+) -> bool {
+    if !store_is_durable {
         return false;
+    }
+    if let Some(failure) = &error.failure {
+        return failure.terminal_reason == TerminalSessionReason::DurabilityDegraded;
     }
     provider_store_error_is_durability_degraded(&error.source, &error.message)
 }
@@ -1277,6 +1295,9 @@ fn terminal_reason_for_provider_message(message: &str) -> TerminalSessionReason 
     }
     if normalized.contains("partial stage success") || normalized.contains("typed fallback") {
         return TerminalSessionReason::PartialStageSuccess;
+    }
+    if normalized.contains("tool_executor_failure") || normalized.contains("tool executor") {
+        return TerminalSessionReason::ToolExecutorFailure;
     }
     if normalized.contains("cancel") || normalized.contains("abort") {
         return TerminalSessionReason::ProviderCancelled;
@@ -1362,6 +1383,7 @@ fn failure_control_provider_error(scenario: FailureControlScenario) -> BrainProv
     BrainProviderError {
         source: "failure_control".to_owned(),
         message: failure_control_provider_message(scenario),
+        failure: None,
     }
 }
 
@@ -2264,6 +2286,31 @@ async fn record_session_auth_failure(
     ));
 }
 
+fn record_provider_stage_failure(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    error: &BrainProviderError,
+) {
+    let Some(failure) = &error.failure else {
+        return;
+    };
+    state.evidence.record(VoiceEvidenceEvent::new(
+        VoiceEvidenceEventKind::ProviderStageFailure,
+        voice_session_id,
+        format!(
+            "failure_class={} stage={} terminal_reason={} retry_eligible={} latency_ms={} provider={} model={} metadata={}",
+            failure.failure_class,
+            failure.stage,
+            failure.terminal_reason.as_str(),
+            failure.retry_eligible,
+            failure.latency_ms,
+            failure.provider,
+            failure.model,
+            failure.metadata
+        ),
+    ));
+}
+
 fn record_turn_cap_config(state: &AppState, voice_session_id: Option<String>) {
     let source = if state.turn_cap_override {
         "explicit_override"
@@ -2509,6 +2556,7 @@ fn ws_access_error(error: VoiceWsAccessError) -> (StatusCode, Json<serde_json::V
 mod tests {
     use super::*;
     use agent_adapters::SyntheticBrain;
+    use agent_domain::{BrainProviderFailure, BrainProviderFailureParts};
     use std::{
         pin::Pin,
         sync::Arc,
@@ -2651,6 +2699,120 @@ mod tests {
         .await;
 
         assert!(lease.is_none());
+    }
+
+    #[test]
+    fn provider_error_stage_metadata_overrides_message_classifier() {
+        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+            BrainProviderFailureParts {
+                failure_class: "tool_executor_failure".to_owned(),
+                stage: "tools".to_owned(),
+                terminal_reason: TerminalSessionReason::ToolExecutorFailure,
+                retry_eligible: true,
+                latency_ms: 12,
+                provider: "server".to_owned(),
+                model: "viva-tools".to_owned(),
+                metadata: "tool=retrieve_source_reference error_kind=store".to_owned(),
+            },
+        ));
+
+        assert_eq!(
+            terminal_reason_for_provider_error(&error),
+            TerminalSessionReason::ToolExecutorFailure
+        );
+        assert!(!error.message.contains("retrieve_source_reference"));
+    }
+
+    #[test]
+    fn structured_durability_provider_error_uses_durability_path_classifier() {
+        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+            BrainProviderFailureParts {
+                failure_class: "store_adapter_error".to_owned(),
+                stage: "tools".to_owned(),
+                terminal_reason: TerminalSessionReason::DurabilityDegraded,
+                retry_eligible: true,
+                latency_ms: 12,
+                provider: "server".to_owned(),
+                model: "viva-tools".to_owned(),
+                metadata: "tool=retrieve_source_reference error_kind=store".to_owned(),
+            },
+        ));
+        assert!(!provider_store_error_is_durability_degraded(
+            &error.source,
+            &error.message
+        ));
+
+        assert!(provider_error_is_durability_degraded_for_store(
+            true, &error
+        ));
+        assert!(!provider_error_is_durability_degraded_for_store(
+            false, &error
+        ));
+    }
+
+    #[tokio::test]
+    async fn structured_durability_provider_error_records_stage_failure_before_return() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/viva_test")
+            .unwrap();
+        let state_store: Arc<dyn agent_domain::StudyMemoryStore> =
+            Arc::new(data::PostgresStudyStore::new(pool));
+        let state = AppState::with_study_store(
+            Arc::new(SyntheticBrain::default()),
+            "synthetic",
+            crate::VoiceWsAccess::default(),
+            1,
+            state_store,
+        );
+        let binding = fixture_binding();
+        let limits = VoiceLimitConfig::default();
+        let mut session_limits = SessionLimitRuntime::new();
+        let mut context = BrainForwardContext {
+            state: &state,
+            voice_session_id: Some("voice-session-1".to_owned()),
+            session_binding: &binding,
+            limits: &limits,
+            session_limits: &mut session_limits,
+        };
+        let mut cancelled_responses = CancelledResponseTracker::default();
+        let mut sender = RecordingSink::new();
+        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+            BrainProviderFailureParts {
+                failure_class: "store_adapter_error".to_owned(),
+                stage: "recap".to_owned(),
+                terminal_reason: TerminalSessionReason::DurabilityDegraded,
+                retry_eligible: true,
+                latency_ms: 37,
+                provider: "server".to_owned(),
+                model: "viva-tools".to_owned(),
+                metadata: "tool=build_session_recap error_kind=store".to_owned(),
+            },
+        ));
+
+        let result = forward_brain_event(
+            &mut context,
+            agent_domain::BrainEvent::Error(error),
+            &mut cancelled_responses,
+            Duration::from_millis(37),
+            &mut sender,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, ForwardBrainEvent::DurabilityDegraded);
+        assert!(sender.sent.is_empty());
+        let evidence = state.evidence.snapshot();
+        assert!(evidence.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::ProviderStageFailure
+                && event.detail.contains("failure_class=store_adapter_error")
+                && event.detail.contains("stage=recap")
+                && event.detail.contains("terminal_reason=durability_degraded")
+                && event.detail.contains("latency_ms=37")
+        }));
+        assert!(evidence.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::StoreCounts
+                && event.detail == "durability_degraded"
+        }));
     }
 
     struct FailingSink;

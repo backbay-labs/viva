@@ -53,7 +53,7 @@ const failureControlIdentity = failureControlPlan.enabled
 const sessionTokenFailureScenario =
   failureControlPlan.enabled && isFailureControlSessionTokenScenario(failureControlPlan.scenario);
 const allowedBrowserStoryProviders = new Set(["synthetic", "fake_cartesia_gemini"]);
-const VIVA_VOICE_PROTOCOL_VERSION = 3;
+const VIVA_VOICE_PROTOCOL_VERSION = 4;
 const durableStateReleaseClaimed =
   process.env.VIVA_E2E_DURABLE_STATE_RELEASE_CLAIMED === "1" ||
   process.env.VIVA_RELEASE_DURABLE_STATE_CLAIMED === "1";

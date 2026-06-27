@@ -10,7 +10,7 @@ import {
 import { assertNoForbiddenEvidenceMarkers } from "./redaction-control.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
 const LIVE_PROVIDER = "cartesia_gemini";
 const DEFAULT_AGENT_HTTP_URL = "http://127.0.0.1:4318";
 const DEFAULT_BOOTSTRAP_TEXT =

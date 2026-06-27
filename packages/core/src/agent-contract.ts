@@ -1,4 +1,4 @@
-export const VIVA_VOICE_PROTOCOL_VERSION = 3;
+export const VIVA_VOICE_PROTOCOL_VERSION = 4;
 export const VIVA_VOICE_SAMPLE_RATE_HZ = 24_000;
 export const VIVA_VOICE_INPUT_ENCODING = "pcm_s16le";
 export const VIVA_VOICE_MAX_TEXT_FRAME_BYTES = 64 * 1024;
@@ -54,6 +54,7 @@ export const VIVA_AGENT_TERMINAL_SESSION_REASONS = [
   "provider_cancelled",
   "partial_stage_success",
   "durability_degraded",
+  "tool_executor_failure",
   "rollback",
 ] as const;
 

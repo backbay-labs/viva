@@ -1,8 +1,9 @@
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use serde_json::{json, Value};
+use tokio::time::timeout;
 
 use agent_domain::{BrainError, ToolResult};
 
@@ -48,6 +49,7 @@ pub struct GeminiConfig {
     pub base_url: String,
     pub thinking_level: Option<ThinkingLevel>,
     pub system_instruction: String,
+    pub stage_timeout: Duration,
 }
 
 impl fmt::Debug for GeminiConfig {
@@ -59,6 +61,7 @@ impl fmt::Debug for GeminiConfig {
             .field("base_url", &self.base_url)
             .field("thinking_level", &self.thinking_level)
             .field("system_instruction", &self.system_instruction)
+            .field("stage_timeout", &self.stage_timeout)
             .finish()
     }
 }
@@ -71,6 +74,7 @@ impl Default for GeminiConfig {
             base_url: DEFAULT_GEMINI_BASE_URL.to_owned(),
             thinking_level: ThinkingLevel::parse(DEFAULT_GEMINI_THINKING_LEVEL),
             system_instruction: viva_system_instruction(),
+            stage_timeout: Duration::from_secs(9),
         }
     }
 }
@@ -215,16 +219,41 @@ where
     C: GeminiSseClient,
 {
     let stream_request = GeminiStreamRequest::new(config, request)?;
-    let response = client
-        .stream(stream_request)
+    let response = timeout(config.stage_timeout, client.stream(stream_request))
         .await
-        .map_err(|_| BrainError::Connection("Gemini stream request failed".to_owned()))?;
+        .map_err(|_| BrainError::Connection("Gemini generation stage timeout".to_owned()))?
+        .map_err(sanitize_gemini_stream_error)?;
     if response.trim().is_empty() {
         return Err(BrainError::Protocol(
             "Gemini stream returned no events".to_owned(),
         ));
     }
     Ok(parse_gemini_sse_stream(&response))
+}
+
+fn sanitize_gemini_stream_error(error: BrainError) -> BrainError {
+    match error {
+        BrainError::Connection(message) | BrainError::Protocol(message) => {
+            if let Some(status) = sanitized_gemini_http_status(&message) {
+                return BrainError::Protocol(format!(
+                    "Gemini stream request failed with status {status}"
+                ));
+            }
+            BrainError::Connection("Gemini stream request failed".to_owned())
+        }
+        BrainError::MissingApiKey => BrainError::MissingApiKey,
+        BrainError::StageFailure(failure) => BrainError::StageFailure(failure),
+    }
+}
+
+fn sanitized_gemini_http_status(message: &str) -> Option<u16> {
+    let normalized = message.to_ascii_lowercase();
+    [401_u16, 403_u16, 429_u16].into_iter().find(|status| {
+        let status = status.to_string();
+        normalized.contains(&format!("status {status}"))
+            || normalized.contains(&format!("status: {status}"))
+            || normalized.contains(&format!("status={status}"))
+    })
 }
 
 pub(crate) async fn stream_gemini_http(
@@ -628,6 +657,7 @@ fn viva_system_instruction() -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -828,6 +858,88 @@ data: [DONE]
         assert!(!error.contains("gemini-test-key"));
     }
 
+    #[tokio::test]
+    async fn streaming_transport_preserves_safe_http_status_failures() {
+        let prompt_text = "do not leak this prompt or source excerpt";
+        let client = RecordingGeminiSseClient {
+            capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
+            response: RecordingGeminiResponse::Error(format!(
+                "Gemini stream request failed with status 401 after {prompt_text}"
+            )),
+        };
+
+        let error = stream_gemini_with_client(
+            &client,
+            &GeminiConfig {
+                api_key: "gemini-test-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [{ "parts": [{ "text": prompt_text }] }] }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Gemini stream request failed with status 401"));
+        assert!(!error.contains(prompt_text));
+        assert!(!error.contains("gemini-test-key"));
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_redacts_unclassified_http_status_failures() {
+        let prompt_text = "do not leak this prompt or source excerpt";
+        let client = RecordingGeminiSseClient {
+            capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
+            response: RecordingGeminiResponse::Error(format!(
+                "Gemini stream request failed with status 503 after {prompt_text}"
+            )),
+        };
+
+        let error = stream_gemini_with_client(
+            &client,
+            &GeminiConfig {
+                api_key: "gemini-test-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [{ "parts": [{ "text": prompt_text }] }] }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(
+            error,
+            "brain connection failed: Gemini stream request failed"
+        );
+        assert!(!error.contains("503"));
+        assert!(!error.contains(prompt_text));
+        assert!(!error.contains("gemini-test-key"));
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_times_out_without_leaking_prompt_or_credentials() {
+        let client = DelayedGeminiSseClient;
+        let config = GeminiConfig {
+            api_key: "gemini-timeout-secret".to_owned(),
+            stage_timeout: Duration::from_millis(5),
+            ..GeminiConfig::default()
+        };
+        let prompt_text = "do not leak this prompt or source excerpt";
+
+        let error = stream_gemini_with_client(
+            &client,
+            &config,
+            json!({ "contents": [{ "parts": [{ "text": prompt_text }] }] }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Gemini generation stage timeout"));
+        assert!(!error.contains(prompt_text));
+        assert!(!error.contains("gemini-timeout-secret"));
+    }
+
     #[derive(Default)]
     struct GeminiRequestCapture {
         url: Option<String>,
@@ -839,6 +951,8 @@ data: [DONE]
         capture: Arc<Mutex<GeminiRequestCapture>>,
         response: RecordingGeminiResponse,
     }
+
+    struct DelayedGeminiSseClient;
 
     #[derive(Clone)]
     enum RecordingGeminiResponse {
@@ -860,6 +974,14 @@ data: [DONE]
                     Err(BrainError::Connection(message.clone()))
                 }
             }
+        }
+    }
+
+    #[async_trait]
+    impl GeminiSseClient for DelayedGeminiSseClient {
+        async fn stream(&self, _request: GeminiStreamRequest) -> Result<String, BrainError> {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(r#"data: {"candidates":[{"content":{"parts":[{"text":"too late"}]}}]}"#.to_owned())
         }
     }
 }
