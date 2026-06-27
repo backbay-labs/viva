@@ -101,8 +101,9 @@ test("hosted browser E2E records answer-resolution latency evidence", async () =
   assert.match(source, /const answerResolutionStartedAt = Date\.now\(\)/);
   assert.match(
     source,
-    /waitForPostAnswerProtocolProof\(\s*serverEvents,\s*25_000,\s*answerResolutionStartedAt/s,
+    /waitForPostAnswerProtocolProof\(\s*serverEvents,\s*HOSTED_MAX_SUBMITTED_ANSWER_RESOLUTION_MS,\s*answerResolutionStartedAt/s,
   );
+  assert.match(source, /HOSTED_MAX_SUBMITTED_ANSWER_RESOLUTION_MS/);
   assert.match(source, /latencyMs: postAnswerProtocolProof\.latencyMs/);
   assert.match(source, /latencyMs:\s*null/);
 });

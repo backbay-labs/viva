@@ -9,6 +9,7 @@ import {
   failureControlScenarioRequiresExplicitBrowserAction,
   HOSTED_E2E_MATRIX_SCHEMA,
   HOSTED_E2E_MONITOR_POLICY_SCHEMA,
+  HOSTED_E2E_REQUIRED_EVIDENCE_FIELDS,
   HOSTED_E2E_RESULT_SCHEMA,
   HOSTED_MONITOR_POLICY,
   hostedEvidenceStageForScenario,
@@ -337,11 +338,25 @@ test("hosted browser evidence audit is reflected in runner summaries", () => {
   const summary = summarizeHostedE2eResult(result);
 
   assert.equal(summary.scenario_id, "happy_path");
+  assert.equal(summary.web_url, "https://web.example.com");
+  assert.equal(summary.agent_url, "https://agent.example.com");
   assert.equal(summary.deploy_sha, "abc123summarysha");
+  assert.equal(summary.latency_ms, null);
+  assert.equal(summary.retry_after_ms, null);
+  assert.equal(summary.retry_after_source, null);
+  assert.equal(summary.reset_hint, null);
+  assert.equal(summary.budget_state, null);
+  assert.equal(summary.usage.redacted, true);
+  assert.equal(summary.cost_usd, null);
+  assert.deepEqual(summary.screenshots, []);
+  assert.equal(summary.traces, "none");
   assert.equal(summary.redaction_audit.forbidden_hits, 0);
   assert.equal(summary.redaction_audit.scanned_files, 4);
   assert.equal(summary.log_correlation.validation_run_id, "browser-story-synthetic-run");
   assert.equal(summary.sanitized, true);
+  for (const field of HOSTED_E2E_REQUIRED_EVIDENCE_FIELDS) {
+    assert.ok(Object.hasOwn(summary, field), `summary preserves ${field}`);
+  }
 });
 
 function escapeRegExp(value) {

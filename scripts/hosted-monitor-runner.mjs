@@ -806,7 +806,9 @@ function liveMonitorSelfQuarantine(result, env = {}) {
     consecutive_failures: consecutiveFailures,
     current_failure: currentFailure,
     prior_failure_stale: priorFailureState.stale,
-    last_failure_at: priorFailureState.lastFailureAt?.toISOString() ?? null,
+    last_failure_at: currentFailure
+      ? observedAt.toISOString()
+      : (priorFailureState.lastFailureAt?.toISOString() ?? null),
     seconds_since_last_failure: priorFailureState.secondsSinceLastFailure,
     required_consecutive_failures: policy.consecutive_failures,
     terminal_reason: currentFailure ? terminalReason : null,

@@ -196,6 +196,11 @@ test("hosted monitor scheduled live opt-in runs bounded live smoke", () => {
   );
   assert.equal(summary.live_smoke.self_quarantine.triggered, true);
   assert.equal(summary.live_smoke.self_quarantine.consecutive_failures, 2);
+  assert.equal(
+    summary.live_smoke.self_quarantine.last_failure_at,
+    "2026-06-23T19:20:00.000Z",
+  );
+  assert.equal(summary.live_smoke.self_quarantine.seconds_since_last_failure, 600);
 });
 
 test("hosted monitor image generates the live-smoke fixture at protocol sample rate", async () => {

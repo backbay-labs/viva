@@ -18,6 +18,7 @@ import {
 } from "./failure-control-harness.mjs";
 import {
   buildHostedBrowserEvidence,
+  HOSTED_MAX_SUBMITTED_ANSWER_RESOLUTION_MS,
   hostedEvidenceStageForScenario,
   withHostedEvidenceAudit,
 } from "./hosted-e2e-matrix.mjs";
@@ -354,7 +355,7 @@ try {
       } else {
         postAnswerProtocolProof = await waitForPostAnswerProtocolProof(
           serverEvents,
-          25_000,
+          HOSTED_MAX_SUBMITTED_ANSWER_RESOLUTION_MS,
           answerResolutionStartedAt,
         );
         if (requireCorrectionMarginalia) {

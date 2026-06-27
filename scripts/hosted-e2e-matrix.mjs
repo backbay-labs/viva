@@ -6,6 +6,8 @@ import { FAILURE_CONTROL_SCENARIOS } from "./failure-control-harness.mjs";
 export const HOSTED_E2E_MATRIX_SCHEMA = "viva.hosted_e2e_matrix.v1";
 export const HOSTED_E2E_RESULT_SCHEMA = "viva.hosted_e2e_result.v1";
 export const HOSTED_E2E_MONITOR_POLICY_SCHEMA = "viva.hosted_monitor_policy.v1";
+export const HOSTED_MAX_SUBMITTED_ANSWER_RESOLUTION_MS =
+  learnerLoopContract.max_submitted_answer_resolution_ms;
 const SUPPORTED_MATRIX_PROFILES = new Set(["contract", "full", "pr", "scheduled"]);
 
 export const HOSTED_E2E_REQUIRED_EVIDENCE_FIELDS = Object.freeze([
@@ -206,7 +208,7 @@ export function buildHostedE2eMatrixContract({
     run_id: runId,
     bac_510_contract: {
       schema: learnerLoopContract.schema,
-      max_submitted_answer_resolution_ms: learnerLoopContract.max_submitted_answer_resolution_ms,
+      max_submitted_answer_resolution_ms: HOSTED_MAX_SUBMITTED_ANSWER_RESOLUTION_MS,
       required_evidence_fields: HOSTED_E2E_REQUIRED_EVIDENCE_FIELDS,
     },
     monitor_policy: HOSTED_MONITOR_POLICY,
@@ -311,6 +313,9 @@ export function buildHostedBrowserEvidence({
   provider,
   recapSuccess,
   redactionAudit = null,
+  resetHint = null,
+  retryAfterMs = null,
+  retryAfterSource = null,
   runId = null,
   scenarioId,
   screenshots = [],
@@ -340,6 +345,10 @@ export function buildHostedBrowserEvidence({
     failure_class: failureClass ?? null,
     stage: stage ?? null,
     latency_ms: latencyMs,
+    retry_after_ms: retryAfterMs,
+    retry_after_source: retryAfterSource,
+    reset_hint: resetHint,
+    budget_state: null,
     usage: usage ?? usageUnavailable(),
     cost_usd: null,
     token_refresh_outcome: tokenRefreshOutcome,
@@ -396,6 +405,8 @@ export function summarizeHostedE2eResult(result) {
     schema: evidence.schema,
     scenario_id: evidence.scenario_id,
     hosted_mode: evidence.hosted_mode === true,
+    web_url: evidence.web_url,
+    agent_url: evidence.agent_url,
     provider: evidence.provider,
     model: evidence.model,
     control_mode: evidence.control_mode,
@@ -403,8 +414,17 @@ export function summarizeHostedE2eResult(result) {
     terminal_reason: evidence.terminal_reason,
     failure_class: evidence.failure_class,
     stage: evidence.stage,
+    latency_ms: evidence.latency_ms,
+    retry_after_ms: evidence.retry_after_ms,
+    retry_after_source: evidence.retry_after_source,
+    reset_hint: evidence.reset_hint,
+    budget_state: evidence.budget_state,
+    usage: evidence.usage,
+    cost_usd: evidence.cost_usd,
     recap_success: evidence.recap_success === true,
     token_refresh_outcome: evidence.token_refresh_outcome,
+    screenshots: evidence.screenshots,
+    traces: evidence.traces,
     redaction_audit: evidence.redaction_audit,
     deploy_ids: evidence.deploy_ids,
     deploy_sha: evidence.deploy_sha,
