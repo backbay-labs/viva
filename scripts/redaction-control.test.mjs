@@ -201,6 +201,24 @@ test("per-PR redaction check catches structural raw-payload fields", () => {
 test("per-PR redaction check permits required auth source identifiers only in source audit", () => {
   assert.equal(
     addedLineViolatesRedactionAudit(
+      '        | "session_token_nonce_store_unavailable" => TerminalObservabilityClassification {',
+      {
+        file: "agent/crates/agent-service/src/ws.rs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      '        detail: "session_token_nonce_store_unavailable=value",',
+      {
+        file: "agent/crates/agent-service/src/ws.rs",
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
       "let claim_result = state.study_store.claim_session_token_nonce(claim).await;",
       {
         file: "agent/crates/agent-service/src/ws.rs",

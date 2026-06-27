@@ -85,7 +85,9 @@ const ALLOWED_SANITIZED_BOOLEAN_PROOF_FIELDS = new Set([
   "refresh_replayed_token",
 ]);
 
-const SAFE_FORBIDDEN_MARKER_LITERALS = new Map([["session_token", ["invalid_session_token"]]]);
+const SAFE_FORBIDDEN_MARKER_LITERALS = new Map([
+  ["session_token", ["invalid_session_token", "session_token_nonce_store_unavailable"]],
+]);
 
 const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {

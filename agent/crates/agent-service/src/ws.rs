@@ -1030,6 +1030,7 @@ fn terminal_reason_overrides_send_failure(terminal_reason: TerminalSessionReason
             | TerminalSessionReason::RateLimit
             | TerminalSessionReason::SessionCap
             | TerminalSessionReason::SlowClient
+            | TerminalSessionReason::ToolExecutorFailure
             | TerminalSessionReason::TurnCap
             | TerminalSessionReason::Rollback
     )
@@ -3804,6 +3805,13 @@ mod tests {
                 "send_failed"
             ),
             "slow_client"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::ToolExecutorFailure,
+                "send_failed",
+            ),
+            "tool_executor_failure"
         );
     }
 
