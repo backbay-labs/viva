@@ -185,7 +185,7 @@ export function LiveSessionShell({
 function TurnTakingPanel({ turnTaking }: { turnTaking: VoiceTurnTakingState }) {
   return (
     <section aria-label="Voice turn state" className="turn-taking" data-phase={turnTaking.phase}>
-      <div aria-atomic="true" aria-live="polite" className="turn-taking__status" role="status">
+      <div className="turn-taking__status">
         <span className="turn-taking__label">{turnTaking.label}</span>
         <strong className="turn-taking__headline">{turnTaking.headline}</strong>
         <span className="turn-taking__detail">{turnTaking.detail}</span>

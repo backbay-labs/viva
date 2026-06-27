@@ -524,7 +524,9 @@ describe("LiveSessionShell scene intent wiring", () => {
 
     expect(markup).toContain('aria-label="Voice turn state"');
     expect(markup).toContain('data-phase="speaking"');
-    expect(markup).toContain('role="status"');
+    expect(markup).toContain('class="turn-taking__status"');
+    expect(markup).toContain('class="sr-only"');
+    expect(markup).not.toContain('role="status"');
     expect(markup).toContain('aria-live="polite"');
     expect(markup).toContain("Viva is speaking.");
     expect(markup).toContain('aria-label="Spoken captions"');
