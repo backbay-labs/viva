@@ -22,6 +22,7 @@ import {
   sameBrowserSessionRouteIdentity,
   sessionRouteWsAccessToken,
   shouldRefreshBrowserSessionToken,
+  shouldShowNoSpeechNudge,
   shouldStopReadinessPolling,
   shouldUseLiveMicAudioTransport,
   spokenTurnFallbackAction,
@@ -537,6 +538,52 @@ describe("LiveSessionPage recap cleanup", () => {
   test("opens typed answer mode instead of synthesizing a spoken-answer placeholder", () => {
     expect(spokenTurnFallbackAction({ websocketReady: true })).toBe("open_text_answer");
     expect(spokenTurnFallbackAction({ websocketReady: false })).toBe("ignore");
+  });
+
+  test("labels only failed spoken fallback as no-speech, not voluntary text entry", () => {
+    const voluntaryText = textAnswerStateForSession({
+      canSubmitAnswer: true,
+      finalTranscript: undefined,
+      submittedTextAnswer: undefined,
+      textAnswerActive: true,
+      textAnswerAvailable: true,
+      textAnswerRequired: false,
+      textRetryOpen: false,
+      transcriptConfidence: undefined,
+    });
+    const failedSpokenFallback = textAnswerStateForSession({
+      canSubmitAnswer: true,
+      finalTranscript: undefined,
+      submittedTextAnswer: undefined,
+      textAnswerActive: true,
+      textAnswerAvailable: true,
+      textAnswerRequired: false,
+      textRetryOpen: true,
+      transcriptConfidence: undefined,
+    });
+    const requiredFallback = textAnswerStateForSession({
+      canSubmitAnswer: true,
+      finalTranscript: undefined,
+      submittedTextAnswer: undefined,
+      textAnswerActive: true,
+      textAnswerAvailable: true,
+      textAnswerRequired: true,
+      textRetryOpen: false,
+      transcriptConfidence: undefined,
+    });
+
+    expect(shouldShowNoSpeechNudge({ textAnswerState: voluntaryText, textRetryOpen: false })).toBe(
+      false,
+    );
+    expect(
+      shouldShowNoSpeechNudge({
+        textAnswerState: failedSpokenFallback,
+        textRetryOpen: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldShowNoSpeechNudge({ textAnswerState: requiredFallback, textRetryOpen: false }),
+    ).toBe(true);
   });
 
   test("uses worklet-computed RMS for the user bloom while reduced motion keeps it at floor", () => {

@@ -8,7 +8,11 @@ import type {
   SourceReference,
   VivaReadyFrame,
 } from "@viva/core";
-import { VIVA_LEARNER_LOOP_CONTRACT, VIVA_VOICE_PROTOCOL_VERSION } from "@viva/core";
+import {
+  VIVA_AGENT_TERMINAL_SESSION_REASONS,
+  VIVA_LEARNER_LOOP_CONTRACT,
+  VIVA_VOICE_PROTOCOL_VERSION,
+} from "@viva/core";
 import type { VivaAgentDerivedState } from "./use-viva-agent-session";
 import {
   checklistFromExpectedTerms,
@@ -24,10 +28,16 @@ import {
   projectSessionState,
   projectSourceFolio,
   projectTrace,
+  projectTurnTakingState,
   transcriptionWasUncertain,
 } from "./viva-session-projection";
 
 const NOW = new Date("2026-06-17T12:00:00.000Z");
+const AGENT_TERMINAL_REASONS = new Set<string>(VIVA_AGENT_TERMINAL_SESSION_REASONS);
+
+function isAgentTerminalSessionReason(reason: string): reason is AgentTerminalSessionReason {
+  return AGENT_TERMINAL_REASONS.has(reason);
+}
 
 const source: SourceReference = {
   label: "Lecture 5 · Slide 18",
@@ -102,6 +112,8 @@ const trustedReadiness: AgentStudySetReadiness = {
   reason: "trusted",
   message: "Connected agent is mapped to a trusted server study set.",
 };
+
+const liveQuestion = projectSessionQuestion(derived({ question }), "open", NOW);
 
 describe("projectSessionState", () => {
   test("maps agent phases onto the manuscript states", () => {
@@ -656,9 +668,8 @@ describe("projectRuntimeCopy", () => {
 
   test("keeps terminal runtime copy reconciled with the BAC-510 contract", () => {
     for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {
-      if (!state.terminal_reason) continue;
-      if (state.stage === "pre_loop") continue;
-      const terminalReason = state.terminal_reason as AgentTerminalSessionReason;
+      if (!state.terminal_reason || !isAgentTerminalSessionReason(state.terminal_reason)) continue;
+      const terminalReason = state.terminal_reason;
 
       const copy = projectRuntimeCopy({
         close: { code: 1011, reason: terminalReason, wasClean: true },
@@ -761,6 +772,158 @@ describe("expectedTermsRevealed", () => {
     expect(expectedTermsRevealed("thinking")).toBe(true);
     expect(expectedTermsRevealed("correction")).toBe(true);
     expect(expectedTermsRevealed("source")).toBe(true);
+  });
+});
+
+describe("projectTurnTakingState", () => {
+  test("gives every manuscript turn state a distinct textual phase", () => {
+    const cases = [
+      ["listening", "listening", "Your turn"],
+      ["thinking", "thinking", "Checking"],
+      ["correction", "feedback", "Feedback"],
+      ["source", "source", "Source"],
+      ["recap", "recap", "Recap"],
+    ] as const;
+
+    for (const [state, phase, label] of cases) {
+      const turn = projectTurnTakingState({ question: liveQuestion, state });
+
+      expect(turn.phase).toBe(phase);
+      expect(turn.label).toBe(label);
+      expect(turn.headline.length).toBeGreaterThan(0);
+      expect(turn.detail.length).toBeGreaterThan(0);
+      expect(turn.ariaStatus).toContain(turn.headline);
+    }
+  });
+
+  test("prioritizes preparing, speaking, and recovery over the generic listening state", () => {
+    const preparing = projectTurnTakingState({
+      question: { ...liveQuestion, pending: true, prompt: "Connecting to your examiner..." },
+      state: "listening",
+    });
+    const speaking = projectTurnTakingState({
+      hasPendingAudio: true,
+      question: liveQuestion,
+      state: "correction",
+    });
+    const recovery = projectTurnTakingState({
+      question: { ...liveQuestion, prompt: "This session has ended.", terminal: true },
+      runtime: projectRuntimeCopy({
+        readiness: trustedReadiness,
+        ready: ready("cartesia_gemini", { live_runtime: true }),
+        status: "open",
+        terminalReason: "provider_timeout",
+      }),
+      state: "recap",
+    });
+
+    expect(preparing.phase).toBe("preparing");
+    expect(speaking.phase).toBe("speaking");
+    expect(speaking.headline).toBe("Viva is speaking.");
+    expect(recovery.phase).toBe("recovery");
+    expect(recovery.label).toBe("Provider timeout");
+    expect(recovery.detail).toBe("Retry agent");
+  });
+
+  test("prioritizes recovery over pending placeholders when the session is unavailable", () => {
+    const runtime = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: undefined,
+      status: "closed",
+    });
+    const turn = projectTurnTakingState({
+      question: { ...liveQuestion, pending: true, prompt: "Connecting to your examiner..." },
+      runtime,
+      state: "listening",
+    });
+
+    expect(turn.phase).toBe("recovery");
+    expect(turn.label).toBe("Agent offline");
+    expect(turn.detail).toBe("Retry agent");
+    expect(turn.headline).not.toBe("Preparing the question.");
+  });
+
+  test("renders learner-safe no-speech and barge-in nudges", () => {
+    const silence = projectTurnTakingState({
+      question: liveQuestion,
+      state: "listening",
+      textAnswerFallbackActive: true,
+    });
+    const interrupted = projectTurnTakingState({
+      interruptAcknowledged: true,
+      question: liveQuestion,
+      state: "listening",
+      textAnswerFallbackActive: true,
+    });
+
+    expect(silence.nudge?.label).toBe("No speech captured");
+    expect(silence.nudge?.text).toContain("Write the answer");
+    expect(/raw|transcript|pcm16|secret/i.test(silence.ariaStatus)).toBe(false);
+    expect(interrupted.nudge?.label).toBe("Interruption acknowledged");
+    expect(interrupted.nudge?.text).toContain("stopped speaking");
+    expect(interrupted.interruptAcknowledged).toBe(true);
+  });
+
+  test("clears stale barge-in and no-speech nudges after leaving listening", () => {
+    const turn = projectTurnTakingState({
+      interruptAcknowledged: true,
+      question: liveQuestion,
+      state: "thinking",
+      textAnswerFallbackActive: true,
+    });
+
+    expect(turn.phase).toBe("thinking");
+    expect(turn.interruptAcknowledged).toBe(false);
+    expect(turn.nudge).toBeUndefined();
+    expect(turn.ariaStatus).not.toContain("stopped speaking");
+    expect(turn.ariaStatus).not.toContain("No speech captured");
+  });
+
+  test("captions the spoken question and feedback without surfacing source excerpts", () => {
+    const feedbackQuestion = projectSessionQuestion(
+      derived({ evaluation: evaluation(), phase: "feedback", question }),
+      "open",
+      NOW,
+    );
+    const turn = projectTurnTakingState({ question: feedbackQuestion, state: "correction" });
+
+    expect(turn.captions.map((caption) => caption.label)).toEqual([
+      "Question",
+      "Feedback",
+      "Try again",
+    ]);
+    expect(turn.captions.some((caption) => caption.text.includes(question.prompt))).toBe(true);
+    expect(turn.captions.some((caption) => caption.text.includes("Good mechanism"))).toBe(true);
+    expect(turn.captions.some((caption) => caption.text.includes("Try again naming"))).toBe(true);
+    expect(turn.captions.some((caption) => caption.text.includes(source.excerpt))).toBe(false);
+  });
+
+  test("covers every BAC-510 terminal runtime state as recovery copy", () => {
+    for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {
+      if (!state.terminal_reason || !isAgentTerminalSessionReason(state.terminal_reason)) continue;
+      const terminalReason = state.terminal_reason;
+
+      const runtime = projectRuntimeCopy({
+        close: { code: 1011, reason: terminalReason, wasClean: true },
+        readiness: trustedReadiness,
+        ready: ready("cartesia_gemini", { live_runtime: true }),
+        status: "closed",
+        terminalReason,
+      });
+      const turn = projectTurnTakingState({
+        question: { ...liveQuestion, prompt: "This session has ended.", terminal: true },
+        runtime,
+        state: "recap",
+      });
+
+      expect(turn.phase).toBe("recovery");
+      expect(turn.label).toBe(state.copy.capsule_label);
+      expect(turn.headline).toBe(state.copy.marginalia_title);
+      expect(turn.detail).toBe(state.copy.next_action_label);
+      expect(/payload|prompt transcript|pcm16|secret|source excerpt/i.test(turn.ariaStatus)).toBe(
+        false,
+      );
+    }
   });
 });
 

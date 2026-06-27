@@ -40,6 +40,7 @@ import {
   projectRuntimeCopy,
   projectSourceFolio,
   projectTrace,
+  projectTurnTakingState,
   type RuntimeMicState,
   transcriptionWasUncertain,
 } from "../../lib/viva-session-projection";
@@ -102,6 +103,8 @@ export function LiveSessionPage() {
   const [textRetryOpen, setTextRetryOpen] = useState(false);
   const [submittedTextAnswer, setSubmittedTextAnswer] = useState<string>();
   const [recordingConsentAcknowledged, setRecordingConsentAcknowledged] = useState(false);
+  const [playbackSpeaking, setPlaybackSpeaking] = useState(false);
+  const [interruptAcknowledged, setInterruptAcknowledged] = useState(false);
   const routeIdentityRef = useRef(routeIdentity);
   const sessionTokenRef = useRef(routeIdentity.sessionToken ?? STUDY_SET.sessionToken ?? null);
   const browserLifecycleAttemptRef = useRef(0);
@@ -129,11 +132,19 @@ export function LiveSessionPage() {
   const playbackRef = useRef<VivaAudioPlaybackSink | null>(null);
   const handledCancelRef = useRef(0);
   const reducedMotionRef = useRef(reducedMotion);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
     reducedMotionRef.current = reducedMotion;
     if (reducedMotion) levelRef.current.user = 0;
   }, [reducedMotion]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const getPlayback = useCallback(() => {
     if (playbackRef.current) return playbackRef.current;
@@ -143,6 +154,11 @@ export function LiveSessionPage() {
         const AudioContextCtor = audioWindow.AudioContext ?? audioWindow.webkitAudioContext;
         if (!AudioContextCtor) throw new Error("Browser audio playback is unavailable");
         return new AudioContextCtor({ sampleRate: VIVA_AUDIO_SAMPLE_RATE_HZ });
+      },
+      onStateChange: (playbackState) => {
+        if (mountedRef.current) {
+          setPlaybackSpeaking(playbackState.responding || playbackState.speaking);
+        }
       },
       outputSampleRateHz: VIVA_AUDIO_SAMPLE_RATE_HZ,
     });
@@ -307,6 +323,7 @@ export function LiveSessionPage() {
     const audio = agent.agentState.audio;
     const cancellations = agent.agentState.cancelledResponseIds;
     if (audio.length === 0 && cancellations.length === handledCancelRef.current) return;
+    const previousHandledCancel = handledCancelRef.current;
     handledCancelRef.current = drainAgentAudio({
       acknowledgeAudio: (consumed) => agentRef.current.acknowledgeAudio(consumed),
       audio,
@@ -314,6 +331,9 @@ export function LiveSessionPage() {
       handledCancel: handledCancelRef.current,
       sink: getPlayback(),
     });
+    if (cancellations.length > previousHandledCancel) {
+      setInterruptAcknowledged(true);
+    }
   }, [agent.agentState.audio, agent.agentState.cancelledResponseIds, getPlayback]);
 
   // Examiner amplitude → bloom "breathes back in gold" (off when reduced-motion).
@@ -610,6 +630,7 @@ export function LiveSessionPage() {
     setSubmittedTextAnswer(undefined);
     setTextAnswerEnabled(false);
     setTextRetryOpen(false);
+    setInterruptAcknowledged(false);
   }, [activeQuestionId]);
 
   // Stable session-start reference so FSRS review intervals are deterministic
@@ -711,6 +732,51 @@ export function LiveSessionPage() {
   const textAnswerRequired = micState === "denied" || micState === "unsupported";
   const textAnswerAvailable = websocketReady;
   const textAnswerActive = textAnswerAvailable && (textAnswerRequired || textAnswerEnabled);
+  const textAnswerState = useMemo(
+    () =>
+      textAnswerStateForSession({
+        canSubmitAnswer: agent.derived.canSubmitAnswer,
+        finalTranscript: agent.derived.finalTranscript,
+        submittedTextAnswer,
+        textAnswerActive,
+        textAnswerAvailable,
+        textAnswerRequired,
+        textRetryOpen,
+        transcriptConfidence: agent.derived.transcriptConfidence,
+      }),
+    [
+      agent.derived.canSubmitAnswer,
+      agent.derived.finalTranscript,
+      agent.derived.transcriptConfidence,
+      submittedTextAnswer,
+      textAnswerActive,
+      textAnswerAvailable,
+      textAnswerRequired,
+      textRetryOpen,
+    ],
+  );
+  const turnTaking = useMemo(
+    () =>
+      projectTurnTakingState({
+        hasPendingAudio: agent.agentState.audio.length > 0,
+        interruptAcknowledged,
+        playbackSpeaking,
+        question: projection.question,
+        runtime,
+        state: effectiveState,
+        textAnswerFallbackActive: shouldShowNoSpeechNudge({ textAnswerState, textRetryOpen }),
+      }),
+    [
+      agent.agentState.audio.length,
+      effectiveState,
+      interruptAcknowledged,
+      playbackSpeaking,
+      projection.question,
+      runtime,
+      textAnswerState,
+      textRetryOpen,
+    ],
+  );
   const submitRuntimePrimaryAction =
     runtime.primaryActionIntent === "refresh_session"
       ? refreshSession
@@ -792,16 +858,8 @@ export function LiveSessionPage() {
       sourceFolio={sourceFolio}
       state={effectiveState}
       transcript={agent.derived.transcript}
-      textAnswer={textAnswerStateForSession({
-        canSubmitAnswer: agent.derived.canSubmitAnswer,
-        finalTranscript: agent.derived.finalTranscript,
-        submittedTextAnswer,
-        textAnswerActive,
-        textAnswerAvailable,
-        textAnswerRequired,
-        textRetryOpen,
-        transcriptConfidence: agent.derived.transcriptConfidence,
-      })}
+      textAnswer={textAnswerState}
+      turnTaking={turnTaking}
     />
   );
 }
@@ -831,6 +889,14 @@ export function textAnswerStateForSession(input: {
     ),
     required: input.textAnswerRequired,
   };
+}
+
+export function shouldShowNoSpeechNudge(input: {
+  textAnswerState?: TextAnswerState;
+  textRetryOpen: boolean;
+}) {
+  const state = input.textAnswerState;
+  return Boolean(state?.active && !state.lastAnswer && (state.required || input.textRetryOpen));
 }
 
 export type BrowserSessionReconnectEvent =
