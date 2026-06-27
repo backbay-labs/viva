@@ -1692,12 +1692,26 @@ fn record_brain_open_provider_failure(
                 .record_provider_failure(&state.voice_limits, failure);
         }
         _ => {
+            if brain_open_error_is_local_store_failure(error) {
+                return;
+            }
             state.limit_state.record_provider_terminal_failure(
                 &state.voice_limits,
                 terminal_reason_for_brain_error(error),
             );
         }
     }
+}
+
+fn brain_open_error_is_local_store_failure(error: &BrainError) -> bool {
+    let message = match error {
+        BrainError::Connection(message) | BrainError::Protocol(message) => message,
+        BrainError::MissingApiKey | BrainError::StageFailure(_) => return false,
+    };
+    message
+        .to_ascii_lowercase()
+        .contains("record_voice_session")
+        || provider_store_error_message_is_durability_degraded(message)
 }
 
 fn terminal_reason_for_provider_error(error: &BrainProviderError) -> TerminalSessionReason {
@@ -4071,6 +4085,36 @@ mod tests {
         assert!(
             matches!(admission.decision, ProviderAdmissionDecision::Admitted),
             "local open failures must not poison provider backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_open_connection_failure_records_provider_backoff() {
+        use std::sync::Arc;
+
+        use agent_adapters::SyntheticBrain;
+
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "synthetic",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let error = BrainError::Connection("synthetic provider timeout".to_owned());
+        assert_eq!(
+            terminal_reason_for_brain_error(&error),
+            TerminalSessionReason::ProviderTimeout
+        );
+
+        record_brain_open_provider_failure(&state, Some("voice-session-1".to_owned()), &error);
+        let admission = state
+            .limit_state
+            .try_admit_provider_turn(&state.voice_limits, ProviderQueueBehavior::Wait)
+            .await;
+
+        assert!(
+            matches!(admission.decision, ProviderAdmissionDecision::Denied(_)),
+            "provider open failures must poison provider backoff"
         );
     }
 

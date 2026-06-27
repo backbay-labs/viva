@@ -2,7 +2,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     task::{Context, Poll},
@@ -69,6 +69,40 @@ fn test_state_with_store(max_sessions: usize, store: Arc<data::InMemoryStudyStor
         max_sessions,
         store,
     )
+}
+
+fn provider_limiter_test_store() -> Arc<data::InMemoryStudyStore> {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "chemistry-final".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Chemistry Final".to_owned(),
+        course: Some("Chemistry 201".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    store
+}
+
+fn provider_limiter_test_state(
+    brain: Arc<dyn RealtimeBrain>,
+    provider: &str,
+    voice_limits: VoiceLimitConfig,
+) -> AppState {
+    AppState::with_study_store(
+        brain,
+        provider,
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
+        4,
+        provider_limiter_test_store(),
+    )
+    .with_voice_limits(voice_limits)
 }
 
 fn test_state_with_rest_auth(
@@ -3095,31 +3129,30 @@ async fn websocket_open_rate_limit_backoff_denies_next_socket_before_brain_open(
 #[tokio::test]
 async fn websocket_provider_global_turn_limit_denies_queue_overflow() {
     let text_inputs = Arc::new(AtomicUsize::new(0));
-    let state = AppState::new(
+    let state = provider_limiter_test_state(
         Arc::new(BlockingProviderProbeBrain {
             text_inputs: text_inputs.clone(),
         }),
         "cartesia_gemini",
-        VoiceWsAccess::default(),
-        4,
-    )
-    .with_voice_limits(VoiceLimitConfig {
-        max_provider_concurrent_turns: Some(1),
-        max_provider_queue_depth: Some(0),
-        ..VoiceLimitConfig::default()
-    });
+        VoiceLimitConfig {
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(0),
+            ..VoiceLimitConfig::default()
+        },
+    );
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
 
     let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            provider_limiter_session_config(
+                "biology-midterm",
+                "voice-session-1",
+                "nonce-provider-limiter-biology",
             )
             .into(),
         ))
@@ -3158,24 +3191,30 @@ async fn websocket_provider_global_turn_limit_denies_queue_overflow() {
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            provider_limiter_session_config(
+                "chemistry-final",
+                "voice-session-2",
+                "nonce-provider-limiter-chemistry",
             )
             .into(),
         ))
         .await
         .unwrap();
-    assert!(matches!(
-        read_server_frame(&mut second_socket).await,
-        ServerFrame::Event { event, .. }
-            if matches!(
-                event.as_ref(),
-                VivaServerEvent::SessionPhase {
-                    phase: agent_domain::StudySessionPhase::Ready,
-                    terminal_reason: None,
-                }
-            )
-    ));
+    let second_ready_frame = read_server_frame(&mut second_socket).await;
+    assert!(
+        matches!(
+            second_ready_frame,
+            ServerFrame::Event { ref event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::SessionPhase {
+                        phase: agent_domain::StudySessionPhase::Ready,
+                        terminal_reason: None,
+                    }
+                )
+        ),
+        "unexpected second ready frame: {second_ready_frame:?}"
+    );
     send_client_frame(
         &mut second_socket,
         &ClientFrame::Text {
@@ -3298,31 +3337,30 @@ async fn websocket_provider_queue_rejects_overlapping_same_socket_turn_without_d
 #[tokio::test]
 async fn websocket_provider_queue_depth_waits_for_slot_before_forwarding() {
     let text_inputs = Arc::new(AtomicUsize::new(0));
-    let state = AppState::new(
+    let state = provider_limiter_test_state(
         Arc::new(BlockingProviderProbeBrain {
             text_inputs: text_inputs.clone(),
         }),
         "cartesia_gemini",
-        VoiceWsAccess::default(),
-        4,
-    )
-    .with_voice_limits(VoiceLimitConfig {
-        max_provider_concurrent_turns: Some(1),
-        max_provider_queue_depth: Some(1),
-        ..VoiceLimitConfig::default()
-    });
+        VoiceLimitConfig {
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        },
+    );
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
 
     let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            provider_limiter_session_config(
+                "biology-midterm",
+                "voice-session-1",
+                "nonce-provider-limiter-biology",
             )
             .into(),
         ))
@@ -3357,24 +3395,30 @@ async fn websocket_provider_queue_depth_waits_for_slot_before_forwarding() {
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            provider_limiter_session_config(
+                "chemistry-final",
+                "voice-session-2",
+                "nonce-provider-limiter-chemistry",
             )
             .into(),
         ))
         .await
         .unwrap();
-    assert!(matches!(
-        read_server_frame(&mut second_socket).await,
-        ServerFrame::Event { event, .. }
-            if matches!(
-                event.as_ref(),
-                VivaServerEvent::SessionPhase {
-                    phase: agent_domain::StudySessionPhase::Ready,
-                    terminal_reason: None,
-                }
-            )
-    ));
+    let second_ready_frame = read_server_frame(&mut second_socket).await;
+    assert!(
+        matches!(
+            second_ready_frame,
+            ServerFrame::Event { ref event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::SessionPhase {
+                        phase: agent_domain::StudySessionPhase::Ready,
+                        terminal_reason: None,
+                    }
+                )
+        ),
+        "unexpected second ready frame: {second_ready_frame:?}"
+    );
     send_client_frame(
         &mut second_socket,
         &ClientFrame::Text {
@@ -3414,30 +3458,29 @@ async fn websocket_provider_queue_depth_waits_for_slot_before_forwarding() {
 #[tokio::test]
 async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwarding() {
     let text_inputs = Arc::new(AtomicUsize::new(0));
-    let state = AppState::new(
+    let state = provider_limiter_test_state(
         Arc::new(BlockingProviderProbeBrain {
             text_inputs: text_inputs.clone(),
         }),
         "cartesia_gemini",
-        VoiceWsAccess::default(),
-        4,
-    )
-    .with_voice_limits(VoiceLimitConfig {
-        max_provider_concurrent_turns: Some(1),
-        max_provider_queue_depth: Some(1),
-        ..VoiceLimitConfig::default()
-    });
+        VoiceLimitConfig {
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        },
+    );
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
 
     let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            provider_limiter_session_config(
+                "biology-midterm",
+                "voice-session-1",
+                "nonce-provider-limiter-biology",
             )
             .into(),
         ))
@@ -3472,24 +3515,15 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            provider_limiter_session_config(
+                "chemistry-final",
+                "voice-session-2",
+                "nonce-provider-limiter-chemistry",
             )
             .into(),
         ))
         .await
         .unwrap();
-    assert!(matches!(
-        read_server_frame(&mut second_socket).await,
-        ServerFrame::Event { event, .. }
-            if matches!(
-                event.as_ref(),
-                VivaServerEvent::SessionPhase {
-                    phase: agent_domain::StudySessionPhase::Ready,
-                    terminal_reason: None,
-                }
-            )
-    ));
     send_client_frame(
         &mut second_socket,
         &ClientFrame::Text {
@@ -3533,20 +3567,18 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
 async fn websocket_provider_queue_buffers_audio_continuation_until_admitted() {
     let text_inputs = Arc::new(AtomicUsize::new(0));
     let audio_inputs = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-    let state = AppState::new(
+    let state = provider_limiter_test_state(
         Arc::new(QueuedAudioProviderProbeBrain {
             text_inputs: text_inputs.clone(),
             audio_inputs: audio_inputs.clone(),
         }),
         "cartesia_gemini",
-        VoiceWsAccess::default(),
-        4,
+        VoiceLimitConfig {
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        },
     )
-    .with_voice_limits(VoiceLimitConfig {
-        max_provider_concurrent_turns: Some(1),
-        max_provider_queue_depth: Some(1),
-        ..VoiceLimitConfig::default()
-    })
     .with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(200),
@@ -3556,14 +3588,15 @@ async fn websocket_provider_queue_buffers_audio_continuation_until_admitted() {
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
 
     let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            provider_limiter_session_config(
+                "biology-midterm",
+                "voice-session-1",
+                "nonce-provider-limiter-biology",
             )
             .into(),
         ))
@@ -3598,8 +3631,10 @@ async fn websocket_provider_queue_buffers_audio_continuation_until_admitted() {
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            provider_limiter_session_config(
+                "chemistry-final",
+                "voice-session-2",
+                "nonce-provider-limiter-chemistry",
             )
             .into(),
         ))
@@ -3710,31 +3745,30 @@ async fn websocket_provider_queue_buffers_audio_continuation_until_admitted() {
 async fn websocket_provider_queue_caps_buffered_audio_continuations() {
     let text_inputs = Arc::new(AtomicUsize::new(0));
     let audio_inputs = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-    let state = AppState::new(
+    let state = provider_limiter_test_state(
         Arc::new(QueuedAudioProviderProbeBrain {
             text_inputs: text_inputs.clone(),
             audio_inputs,
         }),
         "cartesia_gemini",
-        VoiceWsAccess::default(),
-        4,
-    )
-    .with_voice_limits(VoiceLimitConfig {
-        max_provider_concurrent_turns: Some(1),
-        max_provider_queue_depth: Some(1),
-        ..VoiceLimitConfig::default()
-    });
+        VoiceLimitConfig {
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        },
+    );
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
 
     let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            provider_limiter_session_config(
+                "biology-midterm",
+                "voice-session-1",
+                "nonce-provider-limiter-biology",
             )
             .into(),
         ))
@@ -3769,8 +3803,10 @@ async fn websocket_provider_queue_caps_buffered_audio_continuations() {
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            provider_limiter_session_config(
+                "chemistry-final",
+                "voice-session-2",
+                "nonce-provider-limiter-chemistry",
             )
             .into(),
         ))
@@ -6566,7 +6602,7 @@ async fn websocket_turn_cap_disarms_after_answer_resolution() {
 async fn websocket_provider_slot_waits_for_response_completed_after_answer_evaluated() {
     let text_inputs = Arc::new(AtomicUsize::new(0));
     let completion_gate = Arc::new(Notify::new());
-    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = provider_limiter_test_store();
     let state = AppState::with_study_store(
         Arc::new(GatedCompletionProviderProbeBrain {
             text_inputs: text_inputs.clone(),
@@ -6574,7 +6610,11 @@ async fn websocket_provider_slot_waits_for_response_completed_after_answer_evalu
             completion_gate: completion_gate.clone(),
         }),
         "gated_completion_provider_probe",
-        VoiceWsAccess::default(),
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".to_owned()),
+            allowed_origins: vec![],
+        },
         4,
         store,
     )
@@ -6586,14 +6626,15 @@ async fn websocket_provider_slot_waits_for_response_completed_after_answer_evalu
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
 
     let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut first_socket, "gated_completion_provider_probe").await;
     first_socket
         .send(WsMessage::Text(
-            format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            provider_limiter_session_config(
+                "biology-midterm",
+                "voice-session-1",
+                "nonce-provider-slot-biology",
             )
             .into(),
         ))
@@ -6632,8 +6673,10 @@ async fn websocket_provider_slot_waits_for_response_completed_after_answer_evalu
     assert_ready_provider(&mut second_socket, "gated_completion_provider_probe").await;
     second_socket
         .send(WsMessage::Text(
-            format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            provider_limiter_session_config(
+                "chemistry-final",
+                "voice-session-2",
+                "nonce-provider-slot-chemistry",
             )
             .into(),
         ))
@@ -8329,6 +8372,18 @@ fn session_config_json_with_ids_and_token(
     .to_string()
 }
 
+fn provider_limiter_session_config(study_set_id: &str, session_id: &str, nonce: &str) -> String {
+    let token = signed_session_token(
+        "session-secret",
+        "user-1",
+        study_set_id,
+        session_id,
+        unix_timestamp_now() + 60,
+        nonce,
+    );
+    session_config_json_with_ids_and_token(study_set_id, session_id, &token)
+}
+
 fn signed_session_token(
     secret: &str,
     user_id: &str,
@@ -9499,10 +9554,6 @@ struct IdleProbeBrain {
     study_store: Option<Arc<dyn StudyMemoryStore>>,
 }
 
-struct BudgetGateProbeBrain {
-    text_inputs: Arc<AtomicUsize>,
-}
-
 struct ResponseReplayProbeBrain {
     study_store: Arc<dyn StudyMemoryStore>,
 }
@@ -9606,53 +9657,6 @@ impl RealtimeBrain for EventProbeBrain {
         let task = tokio::spawn(async move {
             for event in events_to_send {
                 let _ = event_tx.send(event).await;
-            }
-        });
-
-        Ok(RealtimeSession {
-            input,
-            events,
-            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl RealtimeBrain for BudgetGateProbeBrain {
-    fn capabilities(&self) -> RealtimeBrainCapabilities {
-        RealtimeBrainCapabilities {
-            provider: "budget_gate_probe".to_owned(),
-            configured: true,
-            selectable: true,
-            live_runtime: false,
-        }
-    }
-
-    async fn open(
-        &self,
-        _config: agent_domain::SessionConfig,
-    ) -> Result<RealtimeSession, BrainError> {
-        let text_inputs = self.text_inputs.clone();
-        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
-        let (event_tx, events) = mpsc::channel(8);
-        let task = tokio::spawn(async move {
-            while let Some(input) = input_rx.recv().await {
-                if matches!(
-                    input,
-                    BrainInput::Text(_) | BrainInput::TextWithMetadata { .. }
-                ) {
-                    let turn_index = text_inputs.fetch_add(1, Ordering::SeqCst) + 1;
-                    let response_id = format!("budget-{turn_index}");
-                    let _ = event_tx
-                        .send(BrainEvent::Usage(BrainUsage {
-                            text_output_tokens: 1,
-                            ..BrainUsage::default()
-                        }))
-                        .await;
-                    let _ = event_tx
-                        .send(BrainEvent::ResponseCompleted { response_id })
-                        .await;
-                }
             }
         });
 
