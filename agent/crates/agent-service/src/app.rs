@@ -4,13 +4,14 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agent_domain::{
-    BrainUsage, CreateFileStudySet, CreatePasteStudySet, LibrarySessionSummary,
-    LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError, RealtimeBrain,
-    StudyMemoryStore, StudySetIngestionRecord, StudySetIngestionStatus, VoiceUsageRecord,
+    BrainProviderFailure, BrainUsage, CreateFileStudySet, CreatePasteStudySet,
+    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
+    RealtimeBrain, StudyMemoryStore, StudySetIngestionRecord, StudySetIngestionStatus,
+    TerminalSessionReason, VoiceUsageRecord,
 };
 use axum::{
     extract::{Path, Query},
@@ -22,7 +23,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use observe::{usage_event, CostModel, VoiceEvidenceEvent, VoiceUsageEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{watch, Notify, Semaphore};
 use uuid::Uuid;
 
 use crate::{
@@ -156,9 +157,19 @@ impl AppState {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct VoiceLimitState {
     active: Arc<Mutex<ActiveVoiceLimits>>,
+    provider_notify: Arc<Notify>,
+}
+
+impl Default for VoiceLimitState {
+    fn default() -> Self {
+        Self {
+            active: Arc::new(Mutex::new(ActiveVoiceLimits::default())),
+            provider_notify: Arc::new(Notify::new()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -167,6 +178,9 @@ struct ActiveVoiceLimits {
     failure_control_identities: HashMap<String, usize>,
     user_study_sets: HashMap<String, usize>,
     ips: HashMap<String, usize>,
+    provider_inflight: usize,
+    provider_waiting: usize,
+    provider_backoff: Option<ProviderBackoffState>,
 }
 
 #[derive(Debug)]
@@ -176,12 +190,41 @@ pub struct VoiceLimitLease {
     key: String,
 }
 
+#[derive(Debug)]
+struct ProviderQueueReservation {
+    state: VoiceLimitState,
+    released: bool,
+}
+
+impl ProviderQueueReservation {
+    fn new(state: VoiceLimitState) -> Self {
+        Self {
+            state,
+            released: false,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.released = true;
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum VoiceLimitKind {
     User,
     FailureControlIdentity,
     UserStudySet,
     Ip,
+    Provider,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ProviderQueueBehavior {
+    Wait,
+    Deny {
+        reason: &'static str,
+        terminal_reason: TerminalSessionReason,
+    },
 }
 
 impl VoiceLimitState {
@@ -211,6 +254,272 @@ impl VoiceLimitState {
         self.try_acquire(VoiceLimitKind::Ip, ip, max)
     }
 
+    pub(crate) async fn try_admit_provider_turn(
+        &self,
+        limits: &VoiceLimitConfig,
+        queue_behavior: ProviderQueueBehavior,
+    ) -> ProviderAdmission {
+        if !limits.provider_limiter_enabled {
+            return ProviderAdmission::admitted(None, 0, "disabled");
+        }
+        let mut reservation: Option<ProviderQueueReservation> = None;
+        let mut reserved_queue_depth = 0;
+        let queue_started_at = Instant::now();
+        loop {
+            let notified = {
+                let mut active = self.active.lock().expect("voice limit state lock poisoned");
+                let now = Instant::now();
+                if active
+                    .provider_backoff
+                    .as_ref()
+                    .is_some_and(|backoff| backoff.until <= now)
+                {
+                    active.provider_backoff = None;
+                }
+                if let Some(backoff) = &active.provider_backoff {
+                    let terminal_reason = backoff.terminal_reason;
+                    let retry_after_ms = backoff.retry_after_ms;
+                    let reset_hint = backoff.reset_hint.clone();
+                    let budget_state = backoff.budget_state.clone();
+                    let queue_depth = reservation
+                        .as_ref()
+                        .map_or(active.provider_inflight + active.provider_waiting, |_| {
+                            reserved_queue_depth
+                        });
+                    let was_queued = reservation.is_some();
+                    if let Some(reservation) = reservation.take() {
+                        active.provider_waiting = active.provider_waiting.saturating_sub(1);
+                        reservation.disarm();
+                    }
+                    return ProviderAdmission::denied(ProviderAdmissionDenial {
+                        reason: "provider_backoff",
+                        terminal_reason,
+                        retry_after_ms,
+                        reset_hint,
+                        budget_state,
+                        queue_depth,
+                        queue_delay_ms: if was_queued {
+                            elapsed_ms(queue_started_at)
+                        } else {
+                            0
+                        },
+                    });
+                }
+                if let ProviderQueueBehavior::Deny {
+                    reason,
+                    terminal_reason,
+                } = queue_behavior
+                {
+                    return ProviderAdmission::denied(ProviderAdmissionDenial {
+                        reason,
+                        terminal_reason,
+                        retry_after_ms: 0,
+                        reset_hint: "none".to_owned(),
+                        budget_state: "within_limit".to_owned(),
+                        queue_depth: active.provider_inflight + active.provider_waiting,
+                        queue_delay_ms: 0,
+                    });
+                }
+                if let Some(max) = limits.max_provider_concurrent_turns {
+                    let queued_ahead = reservation.is_none() && active.provider_waiting > 0;
+                    if active.provider_inflight >= max || queued_ahead {
+                        let max_queue_depth = limits.max_provider_queue_depth.unwrap_or(0);
+                        if reservation.is_none() {
+                            let queue_depth = active.provider_inflight + active.provider_waiting;
+                            let deny_busy = match queue_behavior {
+                                ProviderQueueBehavior::Wait => None,
+                                ProviderQueueBehavior::Deny {
+                                    reason,
+                                    terminal_reason,
+                                } => Some((reason, terminal_reason)),
+                            };
+                            if max == 0
+                                || active.provider_waiting >= max_queue_depth
+                                || deny_busy.is_some()
+                            {
+                                let (reason, terminal_reason, retry_after_ms) =
+                                    if let Some((reason, terminal_reason)) = deny_busy {
+                                        (reason, terminal_reason, 0)
+                                    } else {
+                                        (
+                                            if max_queue_depth == 0 {
+                                                "provider_queue_full"
+                                            } else {
+                                                "provider_queue_saturated"
+                                            },
+                                            TerminalSessionReason::ProviderRateLimited,
+                                            limits.provider_backoff_default_ms,
+                                        )
+                                    };
+                                return ProviderAdmission::denied(ProviderAdmissionDenial {
+                                    reason,
+                                    terminal_reason,
+                                    retry_after_ms,
+                                    reset_hint: "none".to_owned(),
+                                    budget_state: "within_limit".to_owned(),
+                                    queue_depth,
+                                    queue_delay_ms: 0,
+                                });
+                            }
+                            active.provider_waiting = active.provider_waiting.saturating_add(1);
+                            reserved_queue_depth = queue_depth;
+                            reservation = Some(ProviderQueueReservation::new(self.clone()));
+                        }
+                        self.provider_notify.clone().notified_owned()
+                    } else {
+                        let was_queued = reservation.is_some();
+                        if let Some(reservation) = reservation.take() {
+                            active.provider_waiting = active.provider_waiting.saturating_sub(1);
+                            reservation.disarm();
+                        }
+                        let queue_depth = if reserved_queue_depth > 0 {
+                            reserved_queue_depth
+                        } else {
+                            active.provider_inflight
+                        };
+                        active.provider_inflight = active.provider_inflight.saturating_add(1);
+                        return ProviderAdmission::admitted_with_delay(
+                            Some(VoiceLimitLease {
+                                state: self.clone(),
+                                kind: VoiceLimitKind::Provider,
+                                key: "global".to_owned(),
+                            }),
+                            queue_depth,
+                            if was_queued {
+                                elapsed_ms(queue_started_at)
+                            } else {
+                                0
+                            },
+                            "within_limit",
+                        );
+                    }
+                } else {
+                    let was_queued = reservation.is_some();
+                    if let Some(reservation) = reservation.take() {
+                        active.provider_waiting = active.provider_waiting.saturating_sub(1);
+                        reservation.disarm();
+                    }
+                    let queue_depth = if reserved_queue_depth > 0 {
+                        reserved_queue_depth
+                    } else {
+                        active.provider_inflight
+                    };
+                    active.provider_inflight = active.provider_inflight.saturating_add(1);
+                    return ProviderAdmission::admitted_with_delay(
+                        Some(VoiceLimitLease {
+                            state: self.clone(),
+                            kind: VoiceLimitKind::Provider,
+                            key: "global".to_owned(),
+                        }),
+                        queue_depth,
+                        if was_queued {
+                            elapsed_ms(queue_started_at)
+                        } else {
+                            0
+                        },
+                        "within_limit",
+                    );
+                }
+            };
+            notified.await;
+        }
+    }
+
+    pub(crate) fn provider_backoff_admission(
+        &self,
+        limits: &VoiceLimitConfig,
+    ) -> Option<ProviderAdmission> {
+        if !limits.provider_limiter_enabled {
+            return None;
+        }
+        let mut active = self.active.lock().expect("voice limit state lock poisoned");
+        let now = Instant::now();
+        if active
+            .provider_backoff
+            .as_ref()
+            .is_some_and(|backoff| backoff.until <= now)
+        {
+            active.provider_backoff = None;
+        }
+        active.provider_backoff.as_ref().map(|backoff| {
+            ProviderAdmission::denied(ProviderAdmissionDenial {
+                reason: "provider_backoff",
+                terminal_reason: backoff.terminal_reason,
+                retry_after_ms: backoff.retry_after_ms,
+                reset_hint: backoff.reset_hint.clone(),
+                budget_state: backoff.budget_state.clone(),
+                queue_depth: active.provider_inflight + active.provider_waiting,
+                queue_delay_ms: 0,
+            })
+        })
+    }
+
+    pub(crate) fn record_provider_failure(
+        &self,
+        limits: &VoiceLimitConfig,
+        failure: &BrainProviderFailure,
+    ) {
+        if !limits.provider_limiter_enabled || !provider_failure_backoff_eligible(failure) {
+            return;
+        }
+        let retry_after_ms = metadata_u64(&failure.metadata, "retry_after_ms")
+            .unwrap_or(limits.provider_backoff_default_ms)
+            .min(limits.provider_backoff_max_ms);
+        let reset_hint =
+            metadata_value(&failure.metadata, "reset_hint").unwrap_or_else(|| "none".to_owned());
+        let budget_state = metadata_value(&failure.metadata, "budget_state")
+            .unwrap_or_else(|| "unknown".to_owned());
+        self.record_provider_backoff(ProviderBackoffState {
+            until: Instant::now() + Duration::from_millis(retry_after_ms),
+            retry_after_ms,
+            reset_hint,
+            budget_state,
+            terminal_reason: failure.terminal_reason,
+        });
+    }
+
+    pub(crate) fn record_provider_terminal_failure(
+        &self,
+        limits: &VoiceLimitConfig,
+        terminal_reason: TerminalSessionReason,
+    ) {
+        if !limits.provider_limiter_enabled
+            || !matches!(
+                terminal_reason,
+                TerminalSessionReason::ProviderRateLimited
+                    | TerminalSessionReason::ProviderAuthFailed
+                    | TerminalSessionReason::ProviderTimeout
+            )
+        {
+            return;
+        }
+        let retry_after_ms = limits
+            .provider_backoff_default_ms
+            .min(limits.provider_backoff_max_ms);
+        self.record_provider_backoff(ProviderBackoffState {
+            until: Instant::now() + Duration::from_millis(retry_after_ms),
+            retry_after_ms,
+            reset_hint: "none".to_owned(),
+            budget_state: "unknown".to_owned(),
+            terminal_reason,
+        });
+    }
+
+    fn record_provider_backoff(&self, backoff: ProviderBackoffState) {
+        let now = Instant::now();
+        {
+            let mut active = self.active.lock().expect("voice limit state lock poisoned");
+            let keep_existing = active
+                .provider_backoff
+                .as_ref()
+                .is_some_and(|existing| existing.until > now && existing.until >= backoff.until);
+            if !keep_existing {
+                active.provider_backoff = Some(backoff);
+            }
+        }
+        self.provider_notify.notify_waiters();
+    }
+
     fn try_acquire(&self, kind: VoiceLimitKind, key: &str, max: usize) -> Option<VoiceLimitLease> {
         let mut active = self.active.lock().expect("voice limit state lock poisoned");
         let counts = match kind {
@@ -218,6 +527,7 @@ impl VoiceLimitState {
             VoiceLimitKind::FailureControlIdentity => &mut active.failure_control_identities,
             VoiceLimitKind::UserStudySet => &mut active.user_study_sets,
             VoiceLimitKind::Ip => &mut active.ips,
+            VoiceLimitKind::Provider => unreachable!("provider admission uses provider counter"),
         };
         let count = counts.entry(key.to_owned()).or_default();
         if *count >= max {
@@ -238,12 +548,29 @@ impl VoiceLimitState {
             VoiceLimitKind::FailureControlIdentity => &mut active.failure_control_identities,
             VoiceLimitKind::UserStudySet => &mut active.user_study_sets,
             VoiceLimitKind::Ip => &mut active.ips,
+            VoiceLimitKind::Provider => {
+                active.provider_inflight = active.provider_inflight.saturating_sub(1);
+                drop(active);
+                self.provider_notify.notify_one();
+                return;
+            }
         };
         if let Some(count) = counts.get_mut(key) {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 counts.remove(key);
             }
+        }
+    }
+
+    fn release_provider_queue_waiter(&self) {
+        let should_notify = {
+            let mut active = self.active.lock().expect("voice limit state lock poisoned");
+            active.provider_waiting = active.provider_waiting.saturating_sub(1);
+            active.provider_waiting > 0
+        };
+        if should_notify {
+            self.provider_notify.notify_one();
         }
     }
 }
@@ -256,6 +583,327 @@ impl Drop for VoiceLimitLease {
     fn drop(&mut self) {
         self.state.release(self.kind, &self.key);
     }
+}
+
+impl Drop for ProviderQueueReservation {
+    fn drop(&mut self) {
+        if !self.released {
+            self.state.release_provider_queue_waiter();
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProviderBackoffState {
+    until: Instant,
+    retry_after_ms: u64,
+    reset_hint: String,
+    budget_state: String,
+    terminal_reason: TerminalSessionReason,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProviderAdmission {
+    pub(crate) decision: ProviderAdmissionDecision,
+    pub(crate) lease: Option<VoiceLimitLease>,
+    pub(crate) queue_depth: usize,
+    pub(crate) queue_delay_ms: u64,
+    pub(crate) budget_state: String,
+}
+
+impl ProviderAdmission {
+    fn admitted(lease: Option<VoiceLimitLease>, queue_depth: usize, budget_state: &str) -> Self {
+        Self::admitted_with_delay(lease, queue_depth, 0, budget_state)
+    }
+
+    fn admitted_with_delay(
+        lease: Option<VoiceLimitLease>,
+        queue_depth: usize,
+        queue_delay_ms: u64,
+        budget_state: &str,
+    ) -> Self {
+        Self {
+            decision: ProviderAdmissionDecision::Admitted,
+            lease,
+            queue_depth,
+            queue_delay_ms,
+            budget_state: budget_state.to_owned(),
+        }
+    }
+
+    pub(crate) fn denied(denial: ProviderAdmissionDenial) -> Self {
+        Self {
+            queue_depth: denial.queue_depth,
+            queue_delay_ms: denial.queue_delay_ms,
+            budget_state: denial.budget_state.clone(),
+            decision: ProviderAdmissionDecision::Denied(denial),
+            lease: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ProviderAdmissionDecision {
+    Admitted,
+    Denied(ProviderAdmissionDenial),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderAdmissionDenial {
+    pub(crate) reason: &'static str,
+    pub(crate) terminal_reason: TerminalSessionReason,
+    pub(crate) retry_after_ms: u64,
+    pub(crate) reset_hint: String,
+    pub(crate) budget_state: String,
+    pub(crate) queue_depth: usize,
+    pub(crate) queue_delay_ms: u64,
+}
+
+fn metadata_value(metadata: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    metadata.split_whitespace().find_map(|part| {
+        part.strip_prefix(&prefix)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn metadata_u64(metadata: &str, key: &str) -> Option<u64> {
+    metadata_value(metadata, key).and_then(|value| value.parse().ok())
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider_rate_limit_failure(retry_after_ms: u64, reset_hint: &str) -> BrainProviderFailure {
+        BrainProviderFailure::new(agent_domain::BrainProviderFailureParts {
+            failure_class: "quota_rate_failure".to_owned(),
+            stage: "gemini".to_owned(),
+            terminal_reason: TerminalSessionReason::ProviderRateLimited,
+            retry_eligible: true,
+            latency_ms: 17,
+            provider: "gemini".to_owned(),
+            model: "gemini-3.5-flash".to_owned(),
+            metadata: format!(
+                "retry_after_ms={retry_after_ms} reset_hint={reset_hint} budget_state=within_limit"
+            ),
+        })
+    }
+
+    #[tokio::test]
+    async fn server_tool_stage_timeout_does_not_record_provider_backoff() {
+        for stage in ["tools", "recap"] {
+            let state = VoiceLimitState::default();
+            let limits = VoiceLimitConfig {
+                provider_backoff_default_ms: 1_000,
+                provider_backoff_max_ms: 30_000,
+                ..VoiceLimitConfig::default()
+            };
+            let failure = BrainProviderFailure::new(agent_domain::BrainProviderFailureParts {
+                failure_class: "timeout".to_owned(),
+                stage: stage.to_owned(),
+                terminal_reason: TerminalSessionReason::ProviderTimeout,
+                retry_eligible: true,
+                latency_ms: 45_000,
+                provider: "server".to_owned(),
+                model: "viva-tools".to_owned(),
+                metadata: "retry_after_ms=30000 reset_hint=none budget_state=unknown".to_owned(),
+            });
+
+            state.record_provider_failure(&limits, &failure);
+
+            let admission = state
+                .try_admit_provider_turn(&limits, ProviderQueueBehavior::Wait)
+                .await;
+            assert!(
+                matches!(admission.decision, ProviderAdmissionDecision::Admitted),
+                "server-owned {stage} timeout must not poison provider backoff"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_backoff_preserves_longer_active_window() {
+        let state = VoiceLimitState::default();
+        let limits = VoiceLimitConfig {
+            provider_backoff_default_ms: 1_000,
+            provider_backoff_max_ms: 30_000,
+            ..VoiceLimitConfig::default()
+        };
+
+        state.record_provider_failure(
+            &limits,
+            &provider_rate_limit_failure(30_000, "2030-01-01T00:00:00Z"),
+        );
+        state.record_provider_failure(
+            &limits,
+            &provider_rate_limit_failure(1_000, "2030-01-01T00:00:01Z"),
+        );
+
+        let admission = state
+            .try_admit_provider_turn(&limits, ProviderQueueBehavior::Wait)
+            .await;
+        let ProviderAdmissionDecision::Denied(denial) = admission.decision else {
+            panic!("active provider backoff should deny admission");
+        };
+        assert_eq!(denial.reason, "provider_backoff");
+        assert_eq!(denial.retry_after_ms, 30_000);
+        assert_eq!(denial.reset_hint, "2030-01-01T00:00:00Z");
+        assert_eq!(denial.budget_state, "within_limit");
+    }
+
+    #[tokio::test]
+    async fn provider_zero_concurrency_denies_without_waiting() {
+        let state = VoiceLimitState::default();
+        let limits = VoiceLimitConfig {
+            max_provider_concurrent_turns: Some(0),
+            max_provider_queue_depth: Some(1),
+            provider_backoff_default_ms: 1_000,
+            ..VoiceLimitConfig::default()
+        };
+
+        let admission = tokio::time::timeout(
+            Duration::from_millis(50),
+            state.try_admit_provider_turn(&limits, ProviderQueueBehavior::Wait),
+        )
+        .await
+        .expect("zero provider concurrency must deny instead of waiting forever");
+        let ProviderAdmissionDecision::Denied(denial) = admission.decision else {
+            panic!("zero provider concurrency should deny admission");
+        };
+        assert_eq!(denial.reason, "provider_queue_saturated");
+        assert_eq!(denial.queue_depth, 0);
+        assert_eq!(denial.retry_after_ms, 1_000);
+    }
+
+    #[tokio::test]
+    async fn provider_queue_waiter_state_blocks_fresh_caller() {
+        let state = VoiceLimitState::default();
+        let limits = VoiceLimitConfig {
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        };
+        {
+            let mut active = state
+                .active
+                .lock()
+                .expect("voice limit state lock poisoned");
+            active.provider_waiting = 1;
+        }
+
+        let fresh = state
+            .try_admit_provider_turn(&limits, ProviderQueueBehavior::Wait)
+            .await;
+        let ProviderAdmissionDecision::Denied(denial) = fresh.decision else {
+            panic!("fresh admission should not steal a queued waiter's provider slot");
+        };
+        assert_eq!(denial.reason, "provider_queue_saturated");
+        assert_eq!(denial.queue_depth, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_deny_behavior_rejects_before_spare_global_capacity() {
+        let state = VoiceLimitState::default();
+        let limits = VoiceLimitConfig::default();
+        let first = state
+            .try_admit_provider_turn(&limits, ProviderQueueBehavior::Wait)
+            .await;
+        assert!(matches!(
+            first.decision,
+            ProviderAdmissionDecision::Admitted
+        ));
+
+        let second = state
+            .try_admit_provider_turn(
+                &limits,
+                ProviderQueueBehavior::Deny {
+                    reason: "overlapping_provider_turn",
+                    terminal_reason: TerminalSessionReason::SlowClient,
+                },
+            )
+            .await;
+
+        let ProviderAdmissionDecision::Denied(denial) = second.decision else {
+            panic!("same-socket deny behavior must reject even when global capacity is spare");
+        };
+        assert_eq!(denial.reason, "overlapping_provider_turn");
+        assert_eq!(denial.terminal_reason, TerminalSessionReason::SlowClient);
+        assert_eq!(denial.queue_depth, 1);
+        assert_eq!(denial.retry_after_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn provider_cancelled_notified_waiter_wakes_next_waiter() {
+        let state = VoiceLimitState::default();
+        {
+            let mut active = state
+                .active
+                .lock()
+                .expect("voice limit state lock poisoned");
+            active.provider_waiting = 2;
+        }
+        let notified = state.provider_notify.clone().notified_owned();
+        let cancelled = ProviderQueueReservation::new(state.clone());
+
+        drop(cancelled);
+
+        tokio::time::timeout(Duration::from_millis(50), notified)
+            .await
+            .expect("cancelled queued waiter should notify the next waiter when capacity is open");
+        assert_eq!(
+            state
+                .active
+                .lock()
+                .expect("voice limit state lock poisoned")
+                .provider_waiting,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_cancelled_notified_waiter_wakes_next_waiter_with_nonzero_inflight() {
+        let state = VoiceLimitState::default();
+        {
+            let mut active = state
+                .active
+                .lock()
+                .expect("voice limit state lock poisoned");
+            active.provider_inflight = 1;
+            active.provider_waiting = 2;
+        }
+        let notified = state.provider_notify.clone().notified_owned();
+        let cancelled = ProviderQueueReservation::new(state.clone());
+
+        drop(cancelled);
+
+        tokio::time::timeout(Duration::from_millis(50), notified)
+            .await
+            .expect(
+                "cancelled queued waiter should notify the next waiter even with nonzero inflight",
+            );
+        let active = state
+            .active
+            .lock()
+            .expect("voice limit state lock poisoned");
+        assert_eq!(active.provider_inflight, 1);
+        assert_eq!(active.provider_waiting, 1);
+    }
+}
+
+fn provider_failure_backoff_eligible(failure: &BrainProviderFailure) -> bool {
+    matches!(
+        failure.terminal_reason,
+        TerminalSessionReason::ProviderRateLimited
+            | TerminalSessionReason::ProviderAuthFailed
+            | TerminalSessionReason::ProviderTimeout
+    ) && failure.provider != "server"
+        && !matches!(failure.stage.as_str(), "tools" | "recap" | "store")
 }
 
 pub fn build_router(state: AppState) -> Router {

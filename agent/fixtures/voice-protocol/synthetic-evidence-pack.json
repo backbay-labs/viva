@@ -51,6 +51,11 @@
       "detail": "response-1"
     },
     {
+      "kind": "provider_admission",
+      "voice_session_id": "voice-session-1",
+      "detail": "admission_decision=admitted queue_depth=0 queue_delay_ms=0 budget_state=within_limit"
+    },
+    {
       "kind": "answer_received",
       "voice_session_id": "voice-session-1",
       "detail": "text answer received"

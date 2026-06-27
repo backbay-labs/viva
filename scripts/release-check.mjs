@@ -24,6 +24,7 @@ import {
   assertProviderFailureObservabilityEvidence,
   providerFailureObservabilityEvidence,
 } from "./provider-failure-observability.mjs";
+import { providerLimiterReleaseEvidence } from "./provider-limiter-evidence.mjs";
 import {
   buildProviderReadinessMatrix,
   LIVE_PROVIDER_GATE_COMMAND_NAME,
@@ -57,6 +58,7 @@ const outputPath = path.join(artifactDir, "evidence.json");
 try {
   const failureControlPlan = buildFailureControlPlan();
   const failureControlEvidence = failureControlHarnessEvidence(failureControlPlan);
+  const providerLimiterEvidence = providerLimiterReleaseEvidence();
   if (failureControlPlan.enabled) {
     throw new Error("failure-control harness must be disabled for release evidence generation");
   }
@@ -69,6 +71,10 @@ try {
   await run("failure_control_harness_unit_tests", "node", [
     "--test",
     "scripts/failure-control-harness.test.mjs",
+  ]);
+  await run("provider_limiter_evidence_unit_tests", "node", [
+    "--test",
+    "scripts/provider-limiter-evidence.test.mjs",
   ]);
   await run("rollback_drain_criteria_unit_tests", "node", [
     "--test",
@@ -90,6 +96,16 @@ try {
     "-p",
     "agent-service",
     "fake_provider",
+    "--",
+    "--nocapture",
+  ]);
+  await run("provider_limiter_behavior_tests", "cargo", [
+    "test",
+    "--manifest-path",
+    "agent/Cargo.toml",
+    "-p",
+    "agent-service",
+    "websocket_provider_backoff_denies_next_answer_before_brain_input",
     "--",
     "--nocapture",
   ]);
@@ -146,6 +162,7 @@ try {
     failure_control_harness: failureControlEvidence,
     rollback_drain: rollbackDrain,
     provider_failure_observability: providerFailureObservability,
+    provider_limiter: providerLimiterEvidence,
     browser_e2e: browserResult,
     release_gate: buildReleaseGateEvidence({ browserResult, browserSkipShortcut, generatedAt }),
     artifact_audit: artifactAudit,

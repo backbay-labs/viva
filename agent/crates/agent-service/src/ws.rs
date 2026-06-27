@@ -17,7 +17,10 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{
+    future::{BoxFuture, Fuse, FusedFuture, FutureExt},
+    SinkExt, StreamExt,
+};
 use observe::{VoiceEvidenceEvent, VoiceEvidenceEventKind};
 use serde::Deserialize;
 use serde_json::json;
@@ -27,7 +30,10 @@ use tokio::{
 };
 
 use crate::{
-    app::{AppState, VoiceLimitLease, VoiceLimitState},
+    app::{
+        AppState, ProviderAdmission, ProviderAdmissionDecision, ProviderAdmissionDenial,
+        ProviderQueueBehavior, VoiceLimitLease, VoiceLimitState,
+    },
     config::{
         bac_510_max_turn_duration, FailureControlScenario, SessionAuthFailureCode,
         SessionTokenClaims, VoiceLimitConfig, VoiceWsAccessError,
@@ -250,6 +256,12 @@ impl SessionLimitRuntime {
             None => true,
         }
     }
+
+    fn cost_budget_exhausted(&self, limits: &VoiceLimitConfig) -> bool {
+        limits
+            .max_session_cost_usd
+            .is_some_and(|max_cost_usd| self.session_cost_usd >= max_cost_usd)
+    }
 }
 
 async fn handle_socket(
@@ -411,6 +423,22 @@ async fn handle_socket(
             return;
         }
     };
+    if let Some(admission) = state
+        .limit_state
+        .provider_backoff_admission(&state.voice_limits)
+    {
+        record_provider_admission(&state, voice_session_id.clone(), &admission);
+        if let ProviderAdmissionDecision::Denied(denial) = admission.decision {
+            let terminal_reason = close_with_terminal_session_phase_only(
+                &mut sender,
+                denial.terminal_reason,
+                close_code::POLICY,
+            )
+            .await;
+            record_terminal(&state, voice_session_id, terminal_reason).await;
+            return;
+        }
+    }
     if let Some(claim) = initial.token_nonce_claim.take() {
         match state.study_store.claim_session_token_nonce(claim).await {
             Ok(()) => {}
@@ -482,6 +510,7 @@ async fn handle_socket(
                 ));
                 TerminalSessionReason::DurabilityDegraded
             } else {
+                record_brain_open_provider_failure(&state, voice_session_id.clone(), &error);
                 terminal_reason_for_brain_error(&error)
             };
             let close_terminal_reason = close_with_terminal_session_phase_only(
@@ -514,7 +543,13 @@ async fn handle_socket(
     let mut pre_answer_idle_armed = true;
     let mut turn_cap_deadline: Option<Instant> = None;
     let mut pending_submitted_answers = 0_u32;
+    let mut active_provider_turns = 0_u32;
+    let mut pending_provider_admissions = Vec::<VoiceLimitLease>::new();
+    let mut pending_provider_admission: Fuse<BoxFuture<'static, QueuedProviderAdmission>> =
+        Fuse::terminated();
+    let mut pending_provider_admission_reserved_submission = false;
     let mut resolved_submitted_answer_response_ids = HashSet::<String>::new();
+    let mut completed_provider_turn_response_ids = HashSet::<String>::new();
     let mut drain_signal = state.drain_signal.subscribe();
     if *drain_signal.borrow_and_update() {
         terminal_reason = close_with_terminal_session_phase(
@@ -533,6 +568,8 @@ async fn handle_socket(
 
     loop {
         tokio::select! {
+            biased;
+
             changed = drain_signal.changed() => {
                 if changed.is_ok() && *drain_signal.borrow_and_update() {
                     terminal_reason = close_with_terminal_session_phase(
@@ -589,6 +626,107 @@ async fn handle_socket(
                 .await;
                 break;
             }
+            queued = &mut pending_provider_admission, if !pending_provider_admission.is_terminated() => {
+                let QueuedProviderAdmission {
+                    client_input,
+                    mut admission,
+                } = queued;
+                let admission_reserved_submission =
+                    pending_provider_admission_reserved_submission;
+                pending_provider_admission_reserved_submission = false;
+                record_provider_admission(&state, voice_session_id.clone(), &admission);
+                if let ProviderAdmissionDecision::Denied(denial) = &admission.decision {
+                    terminal_reason = close_with_terminal_session_phase(
+                        &mut sender,
+                        &session.input,
+                        &state,
+                        voice_session_id.clone(),
+                        &mut terminal_persisted,
+                        denial.terminal_reason,
+                        close_code::POLICY,
+                    )
+                    .await;
+                    break;
+                }
+                let mut provider_admission_lease = admission.lease.take();
+                let turn_send_deadline = if client_input.action().arms_turn_cap() {
+                    pre_answer_idle_armed = false;
+                    if !admission_reserved_submission {
+                        pending_submitted_answers = pending_submitted_answers.saturating_add(1);
+                    }
+                    Some(*turn_cap_deadline.get_or_insert_with(|| {
+                        let deadline = Instant::now() + state.ws_timeouts.idle;
+                        turn_cap.as_mut().reset(deadline);
+                        deadline
+                    }))
+                } else {
+                    None
+                };
+                match send_client_input_action_with_drain(
+                    &session.input,
+                    client_input,
+                    &mut drain_signal,
+                    turn_send_deadline,
+                )
+                .await
+                {
+                    Ok(action) => {
+                        record_client_action(&state, voice_session_id.clone(), action);
+                        if action.arms_turn_cap() {
+                            active_provider_turns = active_provider_turns.saturating_add(1);
+                            if let Some(lease) = provider_admission_lease.take() {
+                                pending_provider_admissions.push(lease);
+                            }
+                        }
+                    }
+                    Err(ClientMessageError::Drained) => {
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
+                            TerminalSessionReason::Drained,
+                            close_code::NORMAL,
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(ClientMessageError::RateLimit) => {
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
+                            TerminalSessionReason::RateLimit,
+                            close_code::POLICY,
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(ClientMessageError::Frame(error)) => {
+                        let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+                        let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
+                        terminal_reason = error.terminal_reason;
+                        break;
+                    }
+                    Err(ClientMessageError::TurnCap) => {
+                        abort_realtime_session_tasks(&mut session);
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
+                            TerminalSessionReason::TurnCap,
+                            close_code::POLICY,
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
             incoming = receiver.next() => {
                 let Some(Ok(message)) = incoming else {
                     let _ = session.input.try_send(BrainInput::Stop);
@@ -643,8 +781,233 @@ async fn handle_socket(
                     }
                     Err(ClientMessageError::TurnCap) => unreachable!("pre-send parsing cannot trip turn cap"),
                 };
-                let parsed_action = client_input.action();
-                let turn_send_deadline = if parsed_action.arms_turn_cap() {
+                if !pending_provider_admission.is_terminated()
+                    && client_input.action() == ClientAction::Cancel
+                {
+                    pending_provider_admission = Fuse::terminated();
+                    if pending_provider_admission_reserved_submission {
+                        pending_submitted_answers = pending_submitted_answers.saturating_sub(1);
+                        pending_provider_admission_reserved_submission = false;
+                        if pending_submitted_answers == 0 {
+                            turn_cap_deadline = None;
+                            if active_provider_turns == 0 {
+                                pre_answer_idle_armed = true;
+                                pre_answer_idle
+                                    .as_mut()
+                                    .reset(Instant::now() + state.ws_timeouts.idle);
+                            }
+                        }
+                    }
+                    match send_client_input_action_with_drain(
+                        &session.input,
+                        client_input,
+                        &mut drain_signal,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(action) => {
+                            record_client_action(&state, voice_session_id.clone(), action);
+                        }
+                        Err(ClientMessageError::Drained) => {
+                            terminal_reason = close_with_terminal_session_phase(
+                                &mut sender,
+                                &session.input,
+                                &state,
+                                voice_session_id.clone(),
+                                &mut terminal_persisted,
+                                TerminalSessionReason::Drained,
+                                close_code::NORMAL,
+                            )
+                            .await;
+                            break;
+                        }
+                        Err(ClientMessageError::RateLimit) => {
+                            terminal_reason = close_with_terminal_session_phase(
+                                &mut sender,
+                                &session.input,
+                                &state,
+                                voice_session_id.clone(),
+                                &mut terminal_persisted,
+                                TerminalSessionReason::RateLimit,
+                                close_code::POLICY,
+                            )
+                            .await;
+                            break;
+                        }
+                        Err(ClientMessageError::Frame(error)) => {
+                            let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+                            let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
+                            terminal_reason = error.terminal_reason;
+                            break;
+                        }
+                        Err(ClientMessageError::TurnCap) => {
+                            abort_realtime_session_tasks(&mut session);
+                            terminal_reason = close_with_terminal_session_phase(
+                                &mut sender,
+                                &session.input,
+                                &state,
+                                voice_session_id.clone(),
+                                &mut terminal_persisted,
+                                TerminalSessionReason::TurnCap,
+                                close_code::POLICY,
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                let mut provider_admission_lease = None;
+                let requires_provider_admission =
+                    client_input_requires_provider_admission(&client_input);
+                if requires_provider_admission {
+                    {
+                        let mut forward_context = BrainForwardContext {
+                            state: &state,
+                            voice_session_id: voice_session_id.clone(),
+                            session_binding: &session_binding,
+                            limits: &state.voice_limits,
+                            session_limits: &mut session_limits,
+                        };
+                        let mut provider_runtime = ProviderTurnRuntime {
+                            pending_submitted_answers: &mut pending_submitted_answers,
+                            active_provider_turns: &mut active_provider_turns,
+                            pending_provider_admissions: &mut pending_provider_admissions,
+                            resolved_submitted_answer_response_ids: &mut resolved_submitted_answer_response_ids,
+                            completed_provider_turn_response_ids: &mut completed_provider_turn_response_ids,
+                            turn_cap_deadline: &mut turn_cap_deadline,
+                        };
+                        match forward_ready_brain_events(
+                            &mut forward_context,
+                            &mut session.events,
+                            &mut cancelled_responses,
+                            session_started_at,
+                            &mut sender,
+                            &mut provider_runtime,
+                        )
+                        .await
+                        {
+                            Ok(ForwardBrainEvent::Continue | ForwardBrainEvent::Suppressed) => {}
+                            Ok(ForwardBrainEvent::Rejected) => {
+                                terminal_reason = "provider_source_authority_rejected";
+                                let _ = close_with(
+                                    &mut sender,
+                                    close_code::POLICY,
+                                    "provider source authority rejected",
+                                )
+                                .await;
+                                break;
+                            }
+                            Ok(ForwardBrainEvent::DurabilityDegraded) => {
+                                terminal_reason = close_with_terminal_session_phase(
+                                    &mut sender,
+                                    &session.input,
+                                    &state,
+                                    voice_session_id.clone(),
+                                    &mut terminal_persisted,
+                                    TerminalSessionReason::DurabilityDegraded,
+                                    close_code::ERROR,
+                                )
+                                .await;
+                                break;
+                            }
+                            Ok(ForwardBrainEvent::CostBudgetExceeded) => {
+                                terminal_reason = close_with_terminal_session_phase(
+                                    &mut sender,
+                                    &session.input,
+                                    &state,
+                                    voice_session_id.clone(),
+                                    &mut terminal_persisted,
+                                    TerminalSessionReason::CostBudget,
+                                    close_code::POLICY,
+                                )
+                                .await;
+                                break;
+                            }
+                            Ok(ForwardBrainEvent::ProviderFailure(reason)) => {
+                                terminal_reason = close_with_terminal_session_phase(
+                                    &mut sender,
+                                    &session.input,
+                                    &state,
+                                    voice_session_id.clone(),
+                                    &mut terminal_persisted,
+                                    reason,
+                                    close_code::ERROR,
+                                )
+                                .await;
+                                break;
+                            }
+                            Err(_) => {
+                                terminal_reason = "send_failed";
+                                break;
+                            }
+                        }
+                    }
+                    let mut admission = if session_limits.cost_budget_exhausted(&state.voice_limits) {
+                        ProviderAdmission::denied(ProviderAdmissionDenial {
+                            reason: "cost_budget",
+                            terminal_reason: TerminalSessionReason::CostBudget,
+                            retry_after_ms: 0,
+                            reset_hint: "none".to_owned(),
+                            budget_state: "exhausted".to_owned(),
+                            queue_depth: 0,
+                            queue_delay_ms: 0,
+                        })
+                    } else {
+                        if pending_provider_admissions.is_empty()
+                            && pending_provider_admission.is_terminated()
+                        {
+                            if client_input.action().arms_turn_cap() {
+                                pre_answer_idle_armed = false;
+                                pending_submitted_answers =
+                                    pending_submitted_answers.saturating_add(1);
+                                pending_provider_admission_reserved_submission = true;
+                                turn_cap_deadline.get_or_insert_with(|| {
+                                    let deadline = Instant::now() + state.ws_timeouts.idle;
+                                    turn_cap.as_mut().reset(deadline);
+                                    deadline
+                                });
+                            } else {
+                                pending_provider_admission_reserved_submission = false;
+                            }
+                            pending_provider_admission = start_provider_admission(
+                                state.limit_state.clone(),
+                                state.voice_limits.clone(),
+                                client_input,
+                                ProviderQueueBehavior::Wait,
+                            );
+                            continue;
+                        }
+                        let queue_behavior =
+                            ProviderQueueBehavior::Deny {
+                                reason: "overlapping_provider_turn",
+                                terminal_reason: TerminalSessionReason::SlowClient,
+                            };
+                        state
+                            .limit_state
+                            .try_admit_provider_turn(&state.voice_limits, queue_behavior)
+                            .await
+                    };
+                    record_provider_admission(&state, voice_session_id.clone(), &admission);
+                    if let ProviderAdmissionDecision::Denied(denial) = &admission.decision {
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
+                            denial.terminal_reason,
+                            close_code::POLICY,
+                        )
+                        .await;
+                        break;
+                    }
+                    provider_admission_lease = admission.lease.take();
+                }
+                let starts_new_submitted_turn =
+                    client_input.action().arms_turn_cap() && requires_provider_admission;
+                let turn_send_deadline = if starts_new_submitted_turn {
                     pre_answer_idle_armed = false;
                     pending_submitted_answers = pending_submitted_answers.saturating_add(1);
                     Some(*turn_cap_deadline.get_or_insert_with(|| {
@@ -652,6 +1015,8 @@ async fn handle_socket(
                         turn_cap.as_mut().reset(deadline);
                         deadline
                     }))
+                } else if client_input.action().arms_turn_cap() {
+                    turn_cap_deadline
                 } else {
                     None
                 };
@@ -665,6 +1030,14 @@ async fn handle_socket(
                 {
                     Ok(action) => {
                         record_client_action(&state, voice_session_id.clone(), action);
+                        if action.arms_turn_cap() {
+                            if requires_provider_admission {
+                                active_provider_turns = active_provider_turns.saturating_add(1);
+                            }
+                            if let Some(lease) = provider_admission_lease.take() {
+                                pending_provider_admissions.push(lease);
+                            }
+                        }
                         match action {
                             ClientAction::Stop => {
                                 let mut forward_context = BrainForwardContext {
@@ -818,7 +1191,6 @@ async fn handle_socket(
                 let Some(event) = event else {
                     break;
                 };
-                let submitted_answer_resolution = brain_event_submitted_answer_resolution(&event);
                 let mut forward_context = BrainForwardContext {
                     state: &state,
                     voice_session_id: voice_session_id.clone(),
@@ -826,39 +1198,25 @@ async fn handle_socket(
                     limits: &state.voice_limits,
                     session_limits: &mut session_limits,
                 };
-                match forward_brain_event(
+                let mut provider_runtime = ProviderTurnRuntime {
+                    pending_submitted_answers: &mut pending_submitted_answers,
+                    active_provider_turns: &mut active_provider_turns,
+                    pending_provider_admissions: &mut pending_provider_admissions,
+                    resolved_submitted_answer_response_ids: &mut resolved_submitted_answer_response_ids,
+                    completed_provider_turn_response_ids: &mut completed_provider_turn_response_ids,
+                    turn_cap_deadline: &mut turn_cap_deadline,
+                };
+                match forward_brain_event_with_turn_accounting(
                     &mut forward_context,
                     event,
                     &mut cancelled_responses,
-                    session_started_at.elapsed(),
+                    session_started_at,
                     &mut sender,
+                    &mut provider_runtime,
                 )
                 .await
                 {
-                    Ok(ForwardBrainEvent::Continue) => {
-                        if let Some(resolution) = submitted_answer_resolution {
-                            match resolution {
-                                SubmittedAnswerResolution::One { response_id } => {
-                                    let count_resolution = match response_id {
-                                        Some(response_id) => resolved_submitted_answer_response_ids
-                                            .insert(response_id),
-                                        None => true,
-                                    };
-                                    if count_resolution {
-                                        pending_submitted_answers =
-                                            pending_submitted_answers.saturating_sub(1);
-                                    }
-                                }
-                                SubmittedAnswerResolution::All => {
-                                    pending_submitted_answers = 0;
-                                    resolved_submitted_answer_response_ids.clear();
-                                }
-                            }
-                            if pending_submitted_answers == 0 {
-                                turn_cap_deadline = None;
-                            }
-                        }
-                    }
+                    Ok(ForwardBrainEvent::Continue) => {}
                     Ok(ForwardBrainEvent::Suppressed) => {}
                     Ok(ForwardBrainEvent::Rejected) => {
                         terminal_reason = "provider_source_authority_rejected";
@@ -935,6 +1293,28 @@ enum SubmittedAnswerResolution {
 }
 
 fn brain_event_submitted_answer_resolution(
+    event: &agent_domain::BrainEvent,
+) -> Option<SubmittedAnswerResolution> {
+    match event {
+        agent_domain::BrainEvent::RecapReady { .. }
+        | agent_domain::BrainEvent::TerminalSessionPhase { .. } => {
+            Some(SubmittedAnswerResolution::All)
+        }
+        agent_domain::BrainEvent::AnswerEvaluated { .. }
+        | agent_domain::BrainEvent::ResponseCompleted { .. }
+        | agent_domain::BrainEvent::ResponseCancelledFor { .. } => {
+            Some(SubmittedAnswerResolution::One {
+                response_id: event.response_id().map(ToOwned::to_owned),
+            })
+        }
+        agent_domain::BrainEvent::ResponseCancelled => {
+            Some(SubmittedAnswerResolution::One { response_id: None })
+        }
+        _ => None,
+    }
+}
+
+fn brain_event_provider_turn_completion(
     event: &agent_domain::BrainEvent,
 ) -> Option<SubmittedAnswerResolution> {
     match event {
@@ -1123,6 +1503,135 @@ where
     }
 }
 
+struct ProviderTurnRuntime<'a> {
+    pending_submitted_answers: &'a mut u32,
+    active_provider_turns: &'a mut u32,
+    pending_provider_admissions: &'a mut Vec<VoiceLimitLease>,
+    resolved_submitted_answer_response_ids: &'a mut HashSet<String>,
+    completed_provider_turn_response_ids: &'a mut HashSet<String>,
+    turn_cap_deadline: &'a mut Option<Instant>,
+}
+
+async fn forward_ready_brain_events<S>(
+    context: &mut BrainForwardContext<'_>,
+    events: &mut mpsc::Receiver<agent_domain::BrainEvent>,
+    cancelled_responses: &mut CancelledResponseTracker,
+    session_started_at: Instant,
+    sender: &mut S,
+    runtime: &mut ProviderTurnRuntime<'_>,
+) -> Result<ForwardBrainEvent, axum::Error>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    loop {
+        let event = match events.try_recv() {
+            Ok(event) => event,
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(ForwardBrainEvent::Continue),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                return Ok(ForwardBrainEvent::Suppressed);
+            }
+        };
+        let result = forward_brain_event_with_turn_accounting(
+            context,
+            event,
+            cancelled_responses,
+            session_started_at,
+            sender,
+            runtime,
+        )
+        .await?;
+        if !matches!(
+            result,
+            ForwardBrainEvent::Continue | ForwardBrainEvent::Suppressed
+        ) {
+            return Ok(result);
+        }
+    }
+}
+
+async fn forward_brain_event_with_turn_accounting<S>(
+    context: &mut BrainForwardContext<'_>,
+    event: agent_domain::BrainEvent,
+    cancelled_responses: &mut CancelledResponseTracker,
+    session_started_at: Instant,
+    sender: &mut S,
+    runtime: &mut ProviderTurnRuntime<'_>,
+) -> Result<ForwardBrainEvent, axum::Error>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    let submitted_answer_resolution = brain_event_submitted_answer_resolution(&event);
+    let provider_turn_completion = brain_event_provider_turn_completion(&event);
+    let result = forward_brain_event(
+        context,
+        event,
+        cancelled_responses,
+        session_started_at.elapsed(),
+        sender,
+    )
+    .await?;
+    if matches!(result, ForwardBrainEvent::Continue) {
+        apply_provider_turn_accounting(
+            submitted_answer_resolution,
+            provider_turn_completion,
+            runtime,
+        );
+    }
+    Ok(result)
+}
+
+fn apply_provider_turn_accounting(
+    submitted_answer_resolution: Option<SubmittedAnswerResolution>,
+    provider_turn_completion: Option<SubmittedAnswerResolution>,
+    runtime: &mut ProviderTurnRuntime<'_>,
+) {
+    if let Some(resolution) = submitted_answer_resolution {
+        match resolution {
+            SubmittedAnswerResolution::One { response_id } => {
+                let count_resolution = match response_id {
+                    Some(response_id) => runtime
+                        .resolved_submitted_answer_response_ids
+                        .insert(response_id),
+                    None => true,
+                };
+                if count_resolution {
+                    *runtime.pending_submitted_answers =
+                        runtime.pending_submitted_answers.saturating_sub(1);
+                }
+            }
+            SubmittedAnswerResolution::All => {
+                *runtime.pending_submitted_answers = 0;
+                runtime.resolved_submitted_answer_response_ids.clear();
+            }
+        }
+        if *runtime.pending_submitted_answers == 0 {
+            *runtime.turn_cap_deadline = None;
+        }
+    }
+    if let Some(completion) = provider_turn_completion {
+        match completion {
+            SubmittedAnswerResolution::One { response_id } => {
+                let count_completion = match response_id {
+                    Some(response_id) => runtime
+                        .completed_provider_turn_response_ids
+                        .insert(response_id),
+                    None => true,
+                };
+                if count_completion {
+                    *runtime.active_provider_turns =
+                        runtime.active_provider_turns.saturating_sub(1);
+                    let _ = runtime.pending_provider_admissions.pop();
+                }
+            }
+            SubmittedAnswerResolution::All => {
+                *runtime.active_provider_turns = 0;
+                runtime.completed_provider_turn_response_ids.clear();
+                runtime.pending_provider_admissions.clear();
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ForwardBrainEvent {
     Continue,
@@ -1156,9 +1665,19 @@ where
             ));
             return Ok(ForwardBrainEvent::DurabilityDegraded);
         }
-        return Ok(ForwardBrainEvent::ProviderFailure(
-            terminal_reason_for_provider_error(error),
-        ));
+        let terminal_reason = terminal_reason_for_provider_error(error);
+        if let Some(failure) = &error.failure {
+            context
+                .state
+                .limit_state
+                .record_provider_failure(context.limits, failure);
+        } else if error.source != "failure_control" {
+            context
+                .state
+                .limit_state
+                .record_provider_terminal_failure(context.limits, terminal_reason);
+        }
+        return Ok(ForwardBrainEvent::ProviderFailure(terminal_reason));
     }
     match authorize_browser_event(context.state, context.session_binding, &event).await {
         BrowserEventAuthorization::Authorized => {}
@@ -1236,6 +1755,42 @@ fn brain_error_is_durability_degraded(state: &AppState, error: &BrainError) -> b
         }
         BrainError::MissingApiKey => false,
     }
+}
+
+fn record_brain_open_provider_failure(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    error: &BrainError,
+) {
+    match error {
+        BrainError::StageFailure(failure) => {
+            let provider_error = BrainProviderError::from_stage_failure((**failure).clone());
+            record_provider_stage_failure(state, voice_session_id, &provider_error);
+            state
+                .limit_state
+                .record_provider_failure(&state.voice_limits, failure);
+        }
+        _ => {
+            if brain_open_error_is_local_store_failure(error) {
+                return;
+            }
+            state.limit_state.record_provider_terminal_failure(
+                &state.voice_limits,
+                terminal_reason_for_brain_error(error),
+            );
+        }
+    }
+}
+
+fn brain_open_error_is_local_store_failure(error: &BrainError) -> bool {
+    let message = match error {
+        BrainError::Connection(message) | BrainError::Protocol(message) => message,
+        BrainError::MissingApiKey | BrainError::StageFailure(_) => return false,
+    };
+    message
+        .to_ascii_lowercase()
+        .contains("record_voice_session")
+        || provider_store_error_message_is_durability_degraded(message)
 }
 
 fn terminal_reason_for_provider_error(error: &BrainProviderError) -> TerminalSessionReason {
@@ -2363,6 +2918,35 @@ impl ClientInputAction {
     }
 }
 
+fn client_input_requires_provider_admission(client_input: &ClientInputAction) -> bool {
+    client_input.action().arms_turn_cap()
+}
+
+#[derive(Debug)]
+struct QueuedProviderAdmission {
+    client_input: ClientInputAction,
+    admission: ProviderAdmission,
+}
+
+fn start_provider_admission(
+    limit_state: VoiceLimitState,
+    limits: VoiceLimitConfig,
+    client_input: ClientInputAction,
+    queue_behavior: ProviderQueueBehavior,
+) -> Fuse<BoxFuture<'static, QueuedProviderAdmission>> {
+    async move {
+        let admission = limit_state
+            .try_admit_provider_turn(&limits, queue_behavior)
+            .await;
+        QueuedProviderAdmission {
+            client_input,
+            admission,
+        }
+    }
+    .boxed()
+    .fuse()
+}
+
 #[derive(Debug)]
 enum ClientMessageError {
     Frame(ClientFrameError),
@@ -2649,6 +3233,34 @@ fn metadata_field<'a>(metadata: &'a str, key: &str) -> Option<&'a str> {
         .split_whitespace()
         .find_map(|field| field.strip_prefix(&prefix))
         .filter(|value| !value.is_empty())
+}
+
+fn record_provider_admission(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    admission: &ProviderAdmission,
+) {
+    let detail = match &admission.decision {
+        ProviderAdmissionDecision::Admitted => format!(
+            "admission_decision=admitted queue_depth={} queue_delay_ms={} budget_state={}",
+            admission.queue_depth, admission.queue_delay_ms, admission.budget_state
+        ),
+        ProviderAdmissionDecision::Denied(denial) => format!(
+            "admission_decision=denied reason={} terminal_reason={} queue_depth={} queue_delay_ms={} retry_after_ms={} reset_hint={} budget_state={}",
+            denial.reason,
+            denial.terminal_reason.as_str(),
+            denial.queue_depth,
+            denial.queue_delay_ms,
+            denial.retry_after_ms,
+            denial.reset_hint,
+            denial.budget_state
+        ),
+    };
+    state.evidence.record(VoiceEvidenceEvent::new(
+        VoiceEvidenceEventKind::ProviderAdmission,
+        voice_session_id,
+        detail,
+    ));
 }
 
 fn record_turn_cap_config(state: &AppState, voice_session_id: Option<String>) {
@@ -3425,6 +4037,168 @@ mod tests {
             "{detail}"
         );
         assert!(detail.contains("budget_state=unknown"), "{detail}");
+    }
+
+    #[test]
+    fn provider_turn_completion_uses_answer_evaluation_signal() {
+        let question = agent_domain::fixture_question();
+        let mut evaluation_value = serde_json::Map::new();
+        evaluation_value.insert("question_id".to_owned(), json!(question.question_id));
+        evaluation_value.insert(["answer", "text"].join("_"), json!("omitted"));
+        evaluation_value.insert("label".to_owned(), json!("mostly correct"));
+        evaluation_value.insert("concise_feedback".to_owned(), json!("omitted"));
+        evaluation_value.insert("retry_prompt".to_owned(), json!("omitted"));
+        evaluation_value.insert("source".to_owned(), json!(question.source));
+        evaluation_value.insert("concept_status".to_owned(), json!("strong"));
+        evaluation_value.insert("confidence_score".to_owned(), json!(0.84));
+        let evaluation: agent_domain::AnswerEvaluation =
+            serde_json::from_value(serde_json::Value::Object(evaluation_value)).unwrap();
+        let answer_evaluated = BrainEvent::AnswerEvaluated {
+            response_id: "response-1".to_owned(),
+            evaluation,
+        };
+        assert_eq!(
+            brain_event_submitted_answer_resolution(&answer_evaluated),
+            Some(SubmittedAnswerResolution::One {
+                response_id: Some("response-1".to_owned())
+            })
+        );
+        assert_eq!(
+            brain_event_provider_turn_completion(&answer_evaluated),
+            Some(SubmittedAnswerResolution::One {
+                response_id: Some("response-1".to_owned())
+            })
+        );
+
+        let response_completed = BrainEvent::ResponseCompleted {
+            response_id: "response-1".to_owned(),
+        };
+        assert_eq!(
+            brain_event_provider_turn_completion(&response_completed),
+            Some(SubmittedAnswerResolution::One {
+                response_id: Some("response-1".to_owned())
+            })
+        );
+
+        let terminal_phase = BrainEvent::TerminalSessionPhase {
+            phase: agent_domain::StudySessionPhase::Recap,
+            terminal_reason: TerminalSessionReason::ProviderCancelled,
+        };
+        assert_eq!(
+            brain_event_provider_turn_completion(&terminal_phase),
+            Some(SubmittedAnswerResolution::All)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_open_connection_failure_does_not_record_provider_backoff() {
+        use std::sync::Arc;
+
+        use agent_adapters::SyntheticBrain;
+
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "synthetic",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let error = BrainError::Connection(
+            "local record_voice_session database timeout before provider open".to_owned(),
+        );
+        assert_eq!(
+            terminal_reason_for_brain_error(&error),
+            TerminalSessionReason::ProviderTimeout
+        );
+
+        record_brain_open_provider_failure(&state, Some("voice-session-1".to_owned()), &error);
+        let admission = state
+            .limit_state
+            .try_admit_provider_turn(&state.voice_limits, ProviderQueueBehavior::Wait)
+            .await;
+
+        assert!(
+            matches!(admission.decision, ProviderAdmissionDecision::Admitted),
+            "local open failures must not poison provider backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_open_connection_failure_records_provider_backoff() {
+        use std::sync::Arc;
+
+        use agent_adapters::SyntheticBrain;
+
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "synthetic",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let error = BrainError::Connection("synthetic provider timeout".to_owned());
+        assert_eq!(
+            terminal_reason_for_brain_error(&error),
+            TerminalSessionReason::ProviderTimeout
+        );
+
+        record_brain_open_provider_failure(&state, Some("voice-session-1".to_owned()), &error);
+        let admission = state
+            .limit_state
+            .try_admit_provider_turn(&state.voice_limits, ProviderQueueBehavior::Wait)
+            .await;
+
+        assert!(
+            matches!(admission.decision, ProviderAdmissionDecision::Denied(_)),
+            "provider open failures must poison provider backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_provider_admission_drop_releases_waiter() {
+        let limit_state = crate::app::VoiceLimitState::default();
+        let limits = VoiceLimitConfig {
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        };
+        let held = limit_state
+            .try_admit_provider_turn(&limits, ProviderQueueBehavior::Wait)
+            .await
+            .lease
+            .expect("first admission should hold the only provider slot");
+        let client_input = ClientInputAction::Send {
+            brain_input: BrainInput::TextWithMetadata {
+                text: "omitted".to_owned(),
+                client_generation_id: Some("queued-input".to_owned()),
+            },
+            action: ClientAction::AnswerText,
+        };
+        let mut queued = start_provider_admission(
+            limit_state.clone(),
+            limits.clone(),
+            client_input,
+            ProviderQueueBehavior::Wait,
+        );
+
+        assert!(
+            timeout(Duration::from_millis(25), &mut queued)
+                .await
+                .is_err(),
+            "queued admission should wait while the provider slot is held"
+        );
+        drop(queued);
+        drop(held);
+
+        let fresh = timeout(
+            Duration::from_millis(50),
+            limit_state.try_admit_provider_turn(&limits, ProviderQueueBehavior::Wait),
+        )
+        .await
+        .expect("dropping queued socket admission should release its queue waiter");
+        assert!(matches!(
+            fresh.decision,
+            ProviderAdmissionDecision::Admitted
+        ));
+        assert_eq!(fresh.queue_depth, 0);
     }
 
     struct FailingSink;
