@@ -137,6 +137,14 @@ test("provider failure observability defines reusable sanitized log queries", ()
   assert.match(queriesById.get("stuck_checking").railway_query, /monitor\.stuck_checking_sessions/);
   assert.match(
     queriesById.get("release_gate_stale_evidence").railway_query,
+    /generated_at/,
+  );
+  assert.match(
+    queriesById.get("release_gate_stale_evidence").railway_query,
+    /release_gate\.browser_skip_shortcut/,
+  );
+  assert.doesNotMatch(
+    queriesById.get("release_gate_stale_evidence").railway_query,
     /production_release_gate\.evidence_age_seconds/,
   );
   assert.doesNotMatch(
@@ -266,7 +274,12 @@ test("reviewed BAC-525 queries name emitted log and evidence surfaces", () => {
   assert(
     queriesById
       .get("release_gate_stale_evidence")
-      .evidence_fields.includes("production_release_gate.evidence_age_seconds"),
+      .evidence_fields.includes("generated_at"),
+  );
+  assert(
+    queriesById
+      .get("release_gate_stale_evidence")
+      .evidence_fields.includes("release_gate.browser_skip_shortcut"),
   );
 });
 

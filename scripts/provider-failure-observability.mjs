@@ -348,12 +348,12 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "release_gate_stale_evidence",
     stage: "release_gate",
     railway_query:
-      'artifact:"viva.release_evidence.v1" (failure_class:"release_gate_stale_evidence" OR browser_e2e.skipped:true OR production_release_gate.evidence_age_seconds:">86400")',
+      'artifact:"viva.release_evidence.v1" (failure_class:"release_gate_stale_evidence" OR browser_e2e.skipped:true OR release_gate.browser_skip_shortcut:true OR generated_at:"<now-24h")',
     evidence_fields: [
       "stage",
       "deploy_sha",
       "generated_at",
-      "production_release_gate.evidence_age_seconds",
+      "release_gate.browser_skip_shortcut",
     ],
   }),
 ]);

@@ -115,6 +115,39 @@ test("production release gate rejects stale live-smoke evidence", () => {
   );
 });
 
+test("production release gate rejects future-dated live-smoke evidence", () => {
+  assert.throws(
+    () =>
+      finalizeReleaseEvidenceBundle({
+        evidence: completeEvidence({
+          live_smoke: completeLiveSmoke({ generated_at: "2026-06-25T00:45:00.000Z" }),
+        }),
+        env: productionEnv(),
+        now: new Date("2026-06-25T00:30:00.000Z"),
+      }),
+    /budget_capped_live_smoke/,
+  );
+});
+
+test("production release gate requires observed remote live-smoke cost cap", () => {
+  assert.throws(
+    () =>
+      finalizeReleaseEvidenceBundle({
+        evidence: completeEvidence({
+          live_smoke: completeLiveSmoke({
+            readiness: {
+              store: { durable: true },
+              voice_limits: { max_session_cost_usd: 0.5 },
+            },
+          }),
+        }),
+        env: productionEnv(),
+        now: new Date("2026-06-25T00:30:00.000Z"),
+      }),
+    /budget_capped_live_smoke/,
+  );
+});
+
 test("production release gate requires executed recovery results", () => {
   assert.throws(
     () =>
@@ -144,6 +177,56 @@ test("production release gate requires observed provider failure proof", () => {
         now: new Date("2026-06-25T00:30:00.000Z"),
       }),
     /provider_failure_recovery_proof/,
+  );
+});
+
+test("production release gate does not let provider-failure fixtures certify observations", () => {
+  assert.throws(
+    () =>
+      finalizeReleaseEvidenceBundle({
+        evidence: completeEvidence({
+          provider_failure_observability: completeProviderFailureObservability({
+            observations: [
+              { query_id: "token_refresh_failure", sanitized: true },
+              { query_id: "recap_failure", sanitized: true },
+            ],
+            fixture: {
+              events: [
+                { query_id: "provider_429", sanitized: true },
+                { query_id: "provider_timeout", sanitized: true },
+                { query_id: "release_gate_stale_evidence", sanitized: true },
+              ],
+            },
+          }),
+        }),
+        env: productionEnv(),
+        now: new Date("2026-06-25T00:30:00.000Z"),
+      }),
+    /provider_failure_recovery_proof/,
+  );
+});
+
+test("production release gate does not require a stale-gate incident observation", () => {
+  const evidence = finalizeReleaseEvidenceBundle({
+    evidence: completeEvidence({
+      provider_failure_observability: completeProviderFailureObservability({
+        observations: [
+          { query_id: "provider_429", sanitized: true },
+          { query_id: "provider_timeout", sanitized: true },
+          { query_id: "token_refresh_failure", sanitized: true },
+          { query_id: "recap_failure", sanitized: true },
+        ],
+      }),
+    }),
+    env: productionEnv(),
+    now: new Date("2026-06-25T00:30:00.000Z"),
+  });
+
+  assert.equal(evidence.production_release_gate.allowed, true);
+  assert.equal(
+    evidence.production_release_gate.provider_failure_recovery_proof.missing_observed_query_ids
+      .includes("release_gate_stale_evidence"),
+    false,
   );
 });
 
@@ -303,6 +386,9 @@ function completeLiveSmoke(overrides = {}) {
     provider: "cartesia_gemini",
     readiness: {
       store: { durable: true },
+      voice_limits: {
+        max_session_cost_usd: 0.25,
+      },
     },
     status: "passed",
     ...overrides,

@@ -21,6 +21,12 @@ const REQUIRED_PROVIDER_FAILURE_QUERIES = Object.freeze([
   "recap_failure",
   "release_gate_stale_evidence",
 ]);
+const REQUIRED_PROVIDER_FAILURE_OBSERVATIONS = Object.freeze([
+  "provider_429",
+  "provider_timeout",
+  "token_refresh_failure",
+  "recap_failure",
+]);
 
 const ACCEPTED_LIMITER_STATES = new Set(["enabled", "configured", "observed"]);
 export const FORBIDDEN_EVIDENCE_MARKERS = Object.freeze([
@@ -66,7 +72,7 @@ export function buildProductionReleaseGateEvidence({ evidence, env = process.env
   const observedAt = now instanceof Date ? now : new Date(now);
   const ageSeconds =
     generatedAt instanceof Date && !Number.isNaN(generatedAt.getTime())
-      ? Math.max(0, Math.floor((observedAt.getTime() - generatedAt.getTime()) / 1000))
+      ? Math.floor((observedAt.getTime() - generatedAt.getTime()) / 1000)
       : null;
   const maxAgeSeconds = positiveIntegerOrDefault(
     env.VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS,
@@ -266,11 +272,15 @@ function summarizeLiveSmoke(liveSmoke, { maxAgeSeconds = null, now = null } = {}
     max_audio_bytes: numberOrNull(caps.max_audio_bytes),
     max_session_cost_usd: numberOrNull(caps.max_session_cost_usd),
   };
+  const readinessVoiceLimit = numberOrNull(
+    liveSmoke?.readiness?.voice_limits?.max_session_cost_usd,
+  );
   const budgetCapped =
     positiveWithin(capSummary.max_duration_ms, 90_000) &&
     positiveWithin(capSummary.max_turns, 1) &&
     positiveWithin(capSummary.max_audio_bytes, 262_144) &&
     positiveWithin(capSummary.max_session_cost_usd, 0.25);
+  const remoteCostCapped = positiveWithin(readinessVoiceLimit, 0.25);
   const generatedAt = parseDate(liveSmoke?.generated_at);
   const observedAt = now instanceof Date ? now : parseDate(now);
   const ageSeconds =
@@ -278,7 +288,7 @@ function summarizeLiveSmoke(liveSmoke, { maxAgeSeconds = null, now = null } = {}
     observedAt instanceof Date &&
     !Number.isNaN(generatedAt.getTime()) &&
     !Number.isNaN(observedAt.getTime())
-      ? Math.max(0, Math.floor((observedAt.getTime() - generatedAt.getTime()) / 1000))
+      ? Math.floor((observedAt.getTime() - generatedAt.getTime()) / 1000)
       : null;
   const fresh =
     Number.isInteger(ageSeconds) &&
@@ -290,7 +300,8 @@ function summarizeLiveSmoke(liveSmoke, { maxAgeSeconds = null, now = null } = {}
     liveSmoke.enabled === true &&
     liveSmoke.status === "passed" &&
     liveSmoke.provider === "cartesia_gemini" &&
-    budgetCapped;
+    budgetCapped &&
+    remoteCostCapped;
   return {
     present: liveSmoke?.schema === "viva.live_provider_smoke.v1",
     generated_at: liveSmoke?.generated_at ?? null,
@@ -300,6 +311,10 @@ function summarizeLiveSmoke(liveSmoke, { maxAgeSeconds = null, now = null } = {}
     status: liveSmoke?.status ?? null,
     provider: liveSmoke?.provider ?? null,
     caps: capSummary,
+    readiness_voice_limits: {
+      max_session_cost_usd: readinessVoiceLimit,
+    },
+    remote_cost_capped: remoteCostCapped,
     durable_store_observed: liveSmoke?.readiness?.store?.durable === true,
     budget_capped: passedWithBudgetCaps,
     passed_budget_capped: passedWithBudgetCaps && fresh,
@@ -339,17 +354,16 @@ function summarizeProviderFailureProof(observability) {
     : [];
   const queryIdSet = new Set(queryIds);
   const missingQueryIds = REQUIRED_PROVIDER_FAILURE_QUERIES.filter((id) => !queryIdSet.has(id));
-  const observationRows = [
-    ...(Array.isArray(observability?.observations) ? observability.observations : []),
-    ...(Array.isArray(observability?.fixture?.events) ? observability.fixture.events : []),
-  ];
+  const observationRows = Array.isArray(observability?.observations)
+    ? observability.observations
+    : [];
   const observedQueryIds = new Set(
     observationRows
       .filter((observation) => observation?.sanitized === true)
       .map((observation) => observation.query_id ?? observation.id)
       .filter(Boolean),
   );
-  const missingObservedQueryIds = REQUIRED_PROVIDER_FAILURE_QUERIES.filter(
+  const missingObservedQueryIds = REQUIRED_PROVIDER_FAILURE_OBSERVATIONS.filter(
     (id) => !observedQueryIds.has(id),
   );
   return {
