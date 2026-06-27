@@ -217,7 +217,7 @@ export const ROLLBACK_TRIGGER_THRESHOLDS = Object.freeze([
     shared_alert_id: "bac525_stuck_checking_sessions",
   }),
   threshold({
-    failure_class: "recap_failure",
+    failure_class: "partial_stage_success",
     id: "recap_failure_rate_percent",
     metric: "recap_failure_rate_percent",
     metric_label: "recap failures as percent of recap attempts",

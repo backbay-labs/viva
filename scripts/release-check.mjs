@@ -17,6 +17,10 @@ import {
   buildFailureControlPlan,
   failureControlHarnessEvidence,
 } from "./failure-control-harness.mjs";
+import {
+  buildHostedE2eMatrixContract,
+  summarizeHostedE2eResult,
+} from "./hosted-e2e-matrix.mjs";
 import fixtureProviderFailureDashboard from "./fixtures/provider-failure-dashboard-samples.json" with {
   type: "json",
 };
@@ -30,7 +34,11 @@ import {
   LIVE_PROVIDER_GATE_COMMAND_NAME,
   PROVIDER_READINESS_TARGETS,
 } from "./provider-readiness-matrix.mjs";
-import { assertNoForbiddenEvidenceMarkers, auditTextArtifacts } from "./redaction-control.mjs";
+import {
+  finalizeReleaseEvidenceBundle,
+  FORBIDDEN_EVIDENCE_MARKERS,
+} from "./production-release-gate.mjs";
+import { auditTextArtifacts } from "./redaction-control.mjs";
 import {
   assertRollbackReleaseGate,
   buildRollbackReleaseEvidence,
@@ -56,6 +64,8 @@ await mkdir(artifactDir, { recursive: true });
 const outputPath = path.join(artifactDir, "evidence.json");
 
 try {
+  const generatedAt = new Date();
+  const generatedAtIso = generatedAt.toISOString();
   const failureControlPlan = buildFailureControlPlan();
   const failureControlEvidence = failureControlHarnessEvidence(failureControlPlan);
   const providerLimiterEvidence = providerLimiterReleaseEvidence();
@@ -75,6 +85,10 @@ try {
   await run("provider_limiter_evidence_unit_tests", "node", [
     "--test",
     "scripts/provider-limiter-evidence.test.mjs",
+  ]);
+  await run("production_release_gate_unit_tests", "node", [
+    "--test",
+    "scripts/production-release-gate.test.mjs",
   ]);
   await run("rollback_drain_criteria_unit_tests", "node", [
     "--test",
@@ -153,15 +167,21 @@ try {
     releaseEvidencePath: path.relative(root, outputPath),
   });
   assertProviderFailureObservabilityEvidence(providerFailureObservability);
+  const hostedE2eMatrix = buildHostedE2eMatrixContract({
+    generatedAt: generatedAtIso,
+    mode: process.env.VIVA_PRODUCTION_RELEASE === "1" ? "production" : "pr",
+    runId: process.env.VIVA_RELEASE_RUN_ID ?? null,
+  });
+  const liveSmokeEvidence = await readOptionalJson(liveSmokeEvidencePath());
   const fixtureHashes = await hashFixtureFiles(path.join(root, "agent/fixtures/voice-protocol"));
   const artifactAudit = await auditGeneratedArtifacts([
     artifactDir,
     path.join(root, "artifacts/e2e-browser"),
     path.join(root, "artifacts/e2e-browser-fake-provider"),
+    path.join(root, "artifacts/live-provider-smoke"),
   ]);
-  const generatedAt = new Date();
-  const evidence = {
-    generated_at: generatedAt.toISOString(),
+  const draftEvidence = {
+    generated_at: generatedAtIso,
     schema: "viva.release_evidence.v1",
     commands,
     release_claims: {
@@ -173,6 +193,8 @@ try {
     rollback_drain: rollbackDrain,
     provider_failure_observability: providerFailureObservability,
     provider_limiter: providerLimiterEvidence,
+    hosted_e2e_matrix: hostedE2eMatrix,
+    live_smoke: liveSmokeEvidence,
     browser_e2e: browserResult,
     release_gate: buildReleaseGateEvidence({ browserResult, browserSkipShortcut, generatedAt }),
     artifact_audit: artifactAudit,
@@ -218,9 +240,16 @@ try {
         },
       },
     },
+    sanitized: true,
   };
 
-  assertNoForbiddenEvidenceMarkers(evidence, { context: "release evidence" });
+  auditSanitizedEvidence(draftEvidence);
+  const evidence = finalizeReleaseEvidenceBundle({
+    evidence: draftEvidence,
+    env: process.env,
+    now: generatedAt,
+  });
+  auditSanitizedEvidence(evidence);
   await writeFile(outputPath, `${JSON.stringify(evidence, null, 2)}\n`);
   console.log(`Sanitized release evidence written to ${path.relative(root, outputPath)}`);
 } catch (error) {
@@ -275,7 +304,10 @@ async function readExistingBrowserResult() {
         result.durable_state_release_claimed === true || durableStateReleaseClaimed,
     });
     assertReleaseBrowserEvidence(evidence);
-    return evidence;
+    return {
+      ...evidence,
+      hosted_e2e: summarizeHostedE2eResult(result),
+    };
   } catch (error) {
     if (
       shouldSkipMissingBrowserResult(
@@ -288,6 +320,26 @@ async function readExistingBrowserResult() {
         skipped: true,
         reason: "VIVA_RELEASE_CHECK_SKIP_BROWSER=1 and no existing browser result was found",
       };
+    }
+    throw error;
+  }
+}
+
+function liveSmokeEvidencePath() {
+  return path.resolve(
+    root,
+    process.env.VIVA_RELEASE_LIVE_SMOKE_EVIDENCE_PATH ??
+      process.env.VIVA_LIVE_SMOKE_EVIDENCE_PATH ??
+      "artifacts/live-provider-smoke/evidence.json",
+  );
+}
+
+async function readOptionalJson(file) {
+  try {
+    return JSON.parse(await readFile(file, "utf8"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return null;
     }
     throw error;
   }
@@ -456,6 +508,28 @@ async function hashFixtureFiles(dir) {
     };
   }
   return hashes;
+}
+
+function auditSanitizedEvidence(evidence) {
+  const serialized = JSON.stringify(evidence);
+  const forbidden = [
+    ...FORBIDDEN_EVIDENCE_MARKERS,
+    "NADH donates high-energy electrons",
+    "received 4 PCM16 bytes",
+    "viva-release-check-cartesia-placeholder-key",
+    "viva-release-check-gemini-placeholder-key",
+  ];
+  for (const needle of forbidden) {
+    if (serialized.includes(needle)) {
+      throw new Error(`release evidence includes forbidden payload marker: ${needle}`);
+    }
+  }
+  for (const [name, value] of Object.entries(process.env)) {
+    if (!/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) continue;
+    if (value && value.length >= 8 && serialized.includes(value)) {
+      throw new Error(`release evidence includes secret value from ${name}`);
+    }
+  }
 }
 
 function buildReleaseBundleManifest(outputPath, commandRecords, browserResult) {
