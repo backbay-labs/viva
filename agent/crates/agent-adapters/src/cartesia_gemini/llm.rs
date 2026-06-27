@@ -18,7 +18,6 @@ use super::constants::{
 
 const TRUSTED_SOURCE_CONTEXT_FUNCTION: &str = "trusted_source_context";
 const DEFAULT_GEMINI_RETRY_AFTER_MS: u64 = 1_000;
-const GEMINI_ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ThinkingLevel {
@@ -286,7 +285,10 @@ fn sanitize_gemini_stream_error(error: BrainError) -> BrainError {
 
 fn sanitized_gemini_http_status(message: &str) -> Option<u16> {
     let normalized = message.to_ascii_lowercase();
-    [401_u16, 403_u16, 429_u16].into_iter().find(|status| {
+    (400_u16..500_u16).find(|status| {
+        if !preserved_gemini_protocol_status(*status) {
+            return false;
+        }
         let status = status.to_string();
         normalized.contains(&format!("status {status}"))
             || normalized.contains(&format!("status: {status}"))
@@ -294,8 +296,12 @@ fn sanitized_gemini_http_status(message: &str) -> Option<u16> {
     })
 }
 
+fn preserved_gemini_protocol_status(status: u16) -> bool {
+    (400..500).contains(&status) && status != 408
+}
+
 fn sanitized_gemini_http_status_error(status: u16) -> BrainError {
-    if matches!(status, 401 | 403) {
+    if preserved_gemini_protocol_status(status) {
         BrainError::Protocol(format!("Gemini stream request failed with status {status}"))
     } else {
         BrainError::Connection("Gemini stream request failed".to_owned())
@@ -340,10 +346,7 @@ async fn response_text(status: u16, response: reqwest::Response) -> Result<Strin
     if (200..300).contains(&status) {
         return response.text().await.map_err(|_| ());
     }
-    match timeout(GEMINI_ERROR_BODY_READ_TIMEOUT, response.text()).await {
-        Ok(Ok(body)) => Ok(body),
-        Ok(Err(_)) | Err(_) => Err(()),
-    }
+    Ok(String::new())
 }
 
 fn gemini_sse_response_from_http_parts(
@@ -1233,28 +1236,32 @@ data: [DONE]
     #[tokio::test]
     async fn streaming_transport_preserves_safe_http_status_failures() {
         let unsafe_marker = "UNSAFE_STATUS_MARKER";
-        let client = RecordingGeminiSseClient {
-            capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-            response: RecordingGeminiResponse::Error(format!(
-                "Gemini stream request failed with status 401 after {unsafe_marker}"
-            )),
-        };
+        for status in [401_u16, 403, 404, 429] {
+            let client = RecordingGeminiSseClient {
+                capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
+                response: RecordingGeminiResponse::Error(format!(
+                    "Gemini stream request failed with status {status} after {unsafe_marker}"
+                )),
+            };
 
-        let error = stream_gemini_with_client(
-            &client,
-            &GeminiConfig {
-                api_key: "local-fixture".to_owned(),
-                ..GeminiConfig::default()
-            },
-            json!({ "contents": [] }),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+            let error = stream_gemini_with_client(
+                &client,
+                &GeminiConfig {
+                    api_key: "local-fixture".to_owned(),
+                    ..GeminiConfig::default()
+                },
+                json!({ "contents": [] }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
 
-        assert!(error.contains("Gemini stream request failed with status 401"));
-        assert!(!error.contains(unsafe_marker));
-        assert!(!error.contains("local-fixture"));
+            assert!(error.contains(&format!(
+                "Gemini stream request failed with status {status}"
+            )));
+            assert!(!error.contains(unsafe_marker));
+            assert!(!error.contains("local-fixture"));
+        }
     }
 
     #[tokio::test]
@@ -1678,6 +1685,38 @@ data: [DONE]
         );
         assert!(!error.contains("503"));
         assert!(!error.contains("UNSAFE_503_BODY_MARKER"));
+        assert!(!error.contains("local-fixture"));
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_404_preserves_protocol_status_and_redacts_body() {
+        let client = RecordingGeminiSseClient {
+            capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
+            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+                status: 404,
+                body: r#"{"error":{"message":"UNSAFE_404_BODY_MARKER"}}"#.to_owned(),
+                retry_after: None,
+                reset_after: None,
+            }),
+        };
+
+        let error = stream_gemini_with_client(
+            &client,
+            &GeminiConfig {
+                api_key: "local-fixture".to_owned(),
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [] }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(
+            error,
+            "brain protocol error: Gemini stream request failed with status 404"
+        );
+        assert!(!error.contains("UNSAFE_404_BODY_MARKER"));
         assert!(!error.contains("local-fixture"));
     }
 

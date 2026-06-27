@@ -2301,9 +2301,9 @@ fn record_provider_stage_failure(
     ));
 }
 
-const PROVIDER_STAGE_FAILURE_DETAIL_MAX_CHARS: usize = 240;
+const PROVIDER_STAGE_FAILURE_DETAIL_MAX_CHARS: usize = 384;
 const PROVIDER_STAGE_FAILURE_DEPLOY_SHA_MAX_CHARS: usize = 8;
-const PROVIDER_STAGE_FAILURE_MODEL_MAX_CHARS: usize = 10;
+const PROVIDER_STAGE_FAILURE_MODEL_MAX_CHARS: usize = 32;
 const PROVIDER_STAGE_FAILURE_PROVIDER_MAX_CHARS: usize = 24;
 const PROVIDER_STAGE_FAILURE_METADATA_VALUE_MAX_CHARS: usize = 32;
 
@@ -2941,17 +2941,21 @@ mod tests {
         let events = state.evidence.snapshot();
         assert_eq!(events.len(), 1);
         let detail = &events[0].detail;
-        assert!(detail.len() <= 240);
+        assert!(detail.len() <= PROVIDER_STAGE_FAILURE_DETAIL_MAX_CHARS);
         assert!(detail.contains("failure_class=quota_rate_failure"));
         assert!(detail.contains("stage=gemini"));
         assert!(detail.contains("terminal_reason=provider_rate_limited"));
         assert!(detail.contains("provider=gemini"));
-        assert!(detail.contains("model=gemini-35-"));
+        assert!(detail.contains("model=gemini-35-flash"));
         assert!(detail.contains("latency_ms=123"));
         assert!(detail.contains("deploy_sha=abcdef12"));
         assert!(detail.contains("retry_after_ms=7000"));
         assert!(detail.contains("retry_after_source=retry_after_delta"));
-        assert!(detail.contains("reset_hint=2030-01-01T00:00:00Z"));
+        assert!(
+            detail.contains("reset_hint=2030-01-01T00:00:00Z"),
+            "{detail}"
+        );
+        assert!(detail.contains("budget_state=unknown"), "{detail}");
     }
 
     #[test]
@@ -2987,17 +2991,21 @@ mod tests {
         let events = state.evidence.snapshot();
         assert_eq!(events.len(), 1);
         let detail = &events[0].detail;
-        assert!(detail.len() <= 240);
+        assert!(detail.len() <= PROVIDER_STAGE_FAILURE_DETAIL_MAX_CHARS);
         assert!(detail.contains("failure_class=quota_rate_failure"));
         assert!(detail.contains("stage=gemini"));
         assert!(detail.contains("terminal_reason=provider_rate_limited"));
         assert!(detail.contains("provider=gemini"));
-        assert!(detail.contains("model=gemini-35-"));
+        assert!(detail.contains("model=gemini-35-flash-preview-long-san"));
         assert!(detail.contains("latency_ms=123"));
         assert!(detail.contains("deploy_sha=unknown"));
         assert!(detail.contains("retry_after_ms=7000"));
         assert!(detail.contains("retry_after_source=retry_after_delta"));
-        assert!(detail.contains("reset_hint=2030-01-01T00:00:00Z"));
+        assert!(
+            detail.contains("reset_hint=2030-01-01T00:00:00Z"),
+            "{detail}"
+        );
+        assert!(detail.contains("budget_state=unknown"), "{detail}");
     }
 
     struct FailingSink;

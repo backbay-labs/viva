@@ -9,6 +9,8 @@ const REDACTED_EVIDENCE_DETAIL: &str = "redacted_evidence_detail";
 const AUTH_FAILURE_TERMINAL_REASON: &str = concat!("invalid", "_session", "_token");
 const NONCE_STORE_UNAVAILABLE_TERMINAL_REASON: &str =
     concat!("session", "_token", "_nonce", "_store", "_unavailable");
+const DEFAULT_EVIDENCE_DETAIL_MAX_CHARS: usize = 240;
+const PROVIDER_STAGE_FAILURE_EVIDENCE_DETAIL_MAX_CHARS: usize = 384;
 const SAFE_EVIDENCE_DETAIL_LITERALS: &[&str] = &[
     AUTH_FAILURE_TERMINAL_REASON,
     NONCE_STORE_UNAVAILABLE_TERMINAL_REASON,
@@ -88,10 +90,11 @@ impl VoiceEvidenceEvent {
         voice_session_id: Option<String>,
         detail: impl Into<String>,
     ) -> Self {
+        let detail = sanitize_evidence_detail_for_kind(&kind, detail.into());
         Self {
             kind,
             voice_session_id,
-            detail: sanitize_evidence_detail(detail.into()),
+            detail,
         }
     }
 }
@@ -101,6 +104,10 @@ pub struct SanitizedEvidenceDetail(String);
 
 impl SanitizedEvidenceDetail {
     pub fn from_raw(detail: impl Into<String>) -> Self {
+        Self::from_raw_with_max(detail, DEFAULT_EVIDENCE_DETAIL_MAX_CHARS)
+    }
+
+    fn from_raw_with_max(detail: impl Into<String>, max_chars: usize) -> Self {
         let detail = detail.into();
         if SAFE_EVIDENCE_DETAIL_LITERALS.contains(&detail.as_str()) {
             return Self(detail);
@@ -118,7 +125,7 @@ impl SanitizedEvidenceDetail {
                             ' ' | '-' | '_' | ':' | '.' | '/' | '=' | ',' | ';' | '(' | ')'
                         )
                 })
-                .take(240)
+                .take(max_chars)
                 .collect(),
         )
     }
@@ -139,6 +146,16 @@ pub struct VoiceEvidenceStoreCounts {
 
 pub fn sanitize_evidence_detail(detail: String) -> String {
     SanitizedEvidenceDetail::from_raw(detail).into_string()
+}
+
+fn sanitize_evidence_detail_for_kind(kind: &VoiceEvidenceEventKind, detail: String) -> String {
+    let max_chars = match kind {
+        VoiceEvidenceEventKind::ProviderStageFailure => {
+            PROVIDER_STAGE_FAILURE_EVIDENCE_DETAIL_MAX_CHARS
+        }
+        _ => DEFAULT_EVIDENCE_DETAIL_MAX_CHARS,
+    };
+    SanitizedEvidenceDetail::from_raw_with_max(detail, max_chars).into_string()
 }
 
 fn contains_forbidden_evidence_detail_marker(detail: &str) -> bool {
