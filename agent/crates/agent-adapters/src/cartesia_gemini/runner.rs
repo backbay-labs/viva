@@ -518,6 +518,30 @@ where
                 self.transports.stream_gemini(&self.config, request).await?,
                 interrupt,
             );
+            {
+                let tool_call_names = gemini_function_call_names(&stream);
+                if !tool_call_names.is_empty() {
+                    if interrupt == FakeRuntimeInterrupt::CancelDuringGeminiToolCall {
+                        return Ok(response_prompt);
+                    }
+                    if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
+                        return Ok(response_prompt);
+                    }
+                    if pass_index + 1 >= MAX_GEMINI_TOOL_LOOP_PASSES {
+                        return Err(gemini_tool_loop_budget_error(
+                            tool_call_names[0],
+                            &self.config.gemini.model_id,
+                            gemini_started.elapsed(),
+                        ));
+                    }
+                    reserve_gemini_tool_batch(
+                        &mut executed_gemini_tool_stages,
+                        &tool_call_names,
+                        &self.config.gemini.model_id,
+                        gemini_started.elapsed(),
+                    )?;
+                }
+            }
             let mut saw_tool_call = false;
             for event in stream {
                 match event {
@@ -547,12 +571,6 @@ where
                         } else {
                             ToolProposal::new(name, args).with_call_id(id)
                         };
-                        reserve_gemini_tool_stage(
-                            &mut executed_gemini_tool_stages,
-                            proposal.name(),
-                            &self.config.gemini.model_id,
-                            gemini_started.elapsed(),
-                        )?;
                         if proposal.name() == "emit_manuscript_intent" {
                             let accepted = if let Some(intent) =
                                 parse_gemini_manuscript_intent(proposal.arguments())
@@ -1007,6 +1025,30 @@ fn reserve_gemini_tool_stage(
     Ok(())
 }
 
+fn reserve_gemini_tool_batch(
+    executed_gemini_tool_stages: &mut u32,
+    tool_names: &[&str],
+    model: &str,
+    latency: Duration,
+) -> Result<(), BrainError> {
+    let mut staged = *executed_gemini_tool_stages;
+    for tool_name in tool_names {
+        reserve_gemini_tool_stage(&mut staged, tool_name, model, latency)?;
+    }
+    *executed_gemini_tool_stages = staged;
+    Ok(())
+}
+
+fn gemini_function_call_names(stream: &[GeminiStreamEvent]) -> Vec<&str> {
+    stream
+        .iter()
+        .filter_map(|event| match event {
+            GeminiStreamEvent::FunctionCall { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn manuscript_intent_authorization_stage<F>(
     authorization: F,
     deadline: Duration,
@@ -1301,6 +1343,7 @@ fn duration_ms(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_domain::{SessionId, StudyMode};
 
     #[test]
     fn provider_classifier_maps_http_auth_statuses_to_auth_failure() {
@@ -1459,6 +1502,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gemini_tool_batches_preflight_budget_before_side_effects() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        store.record_voice_session(&session_config).await.unwrap();
+        let session = AuthorizedStudySession::from_config(&session_config).unwrap();
+        let question = store
+            .active_question("user-1", "biology-midterm")
+            .await
+            .unwrap()
+            .expect("seeded active question");
+        let executor = VivaToolExecutor::new(store.clone(), session.clone());
+        let runner = CartesiaGeminiRunner {
+            config: CartesiaGeminiConfig::default(),
+            transports: OverBudgetGeminiToolBatchTransports,
+            store: Some(store.clone()),
+        };
+        let mut events = Vec::new();
+        let mut usage = BrainUsage::default();
+
+        let error = runner
+            .run_gemini_tool_loop(GeminiToolLoopJob {
+                answer_text: "NADH donates electrons to the electron transport chain.",
+                cancelled: None,
+                emit_text_delta: true,
+                events: &mut events,
+                executor: &executor,
+                interrupt: FakeRuntimeInterrupt::None,
+                question: &question,
+                response_id: "response-over-budget",
+                session: &session,
+                usage: &mut usage,
+            })
+            .await
+            .unwrap_err();
+        let BrainError::StageFailure(failure) = error else {
+            panic!("over-budget Gemini tool batch should produce a stage failure");
+        };
+
+        assert_eq!(failure.failure_class, "malformed_stream");
+        assert_eq!(failure.stage, "gemini");
+        assert_eq!(
+            failure.terminal_reason,
+            TerminalSessionReason::ProviderMalformedStream
+        );
+        assert_eq!(
+            failure.metadata,
+            "tool=evaluate_spoken_answer error_kind=tool_loop_budget_exceeded"
+        );
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, BrainEvent::AnswerEvaluated { .. })));
+        assert_eq!(usage.source_grounded_correction_count, 0);
+        assert!(store.snapshot().answer_attempts.is_empty());
+    }
+
+    #[tokio::test]
     async fn manuscript_intent_authorization_uses_stage_deadline() {
         let error = manuscript_intent_authorization_stage(
             async {
@@ -1537,6 +1642,60 @@ mod tests {
             failure.terminal_reason,
             TerminalSessionReason::ProviderMalformedStream
         );
+    }
+
+    #[derive(Clone, Copy)]
+    struct OverBudgetGeminiToolBatchTransports;
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for OverBudgetGeminiToolBatchTransports {
+        async fn transcribe_audio(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _frame: &AudioFrame,
+        ) -> Result<RunnerTranscript, BrainError> {
+            unreachable!("test calls Gemini tool loop directly")
+        }
+
+        async fn stream_gemini(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _request: Value,
+        ) -> Result<Vec<GeminiStreamEvent>, BrainError> {
+            Ok((0..=MAX_GEMINI_EXECUTED_TOOL_STAGES)
+                .map(|index| {
+                    let args = json!({
+                        "study_set_id": "biology-midterm",
+                        "voice_session_id": "voice-session-1",
+                        "question_id": "q-oxidative-phosphorylation-nadh",
+                        "answer_text": "NADH donates electrons to the electron transport chain.",
+                    });
+                    GeminiStreamEvent::FunctionCall {
+                        id: format!("call-eval-{index}"),
+                        name: "evaluate_spoken_answer".to_owned(),
+                        args: args.clone(),
+                        part: json!({
+                            "functionCall": {
+                                "id": format!("call-eval-{index}"),
+                                "name": "evaluate_spoken_answer",
+                                "args": args,
+                            }
+                        }),
+                    }
+                })
+                .collect())
+        }
+
+        async fn synthesize_sonic(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _transcript: &str,
+            _interrupt: FakeRuntimeInterrupt,
+        ) -> Result<Vec<AudioFrame>, BrainError> {
+            unreachable!("test calls Gemini tool loop directly")
+        }
     }
 }
 
