@@ -38,3 +38,19 @@ fn evidence_detail_preserves_invalid_session_terminal_reason() {
 
     assert_eq!(event.detail, "invalid_session_token");
 }
+
+#[test]
+fn evidence_detail_keeps_default_event_cap() {
+    let detail = "a".repeat(300);
+    let event = VoiceEvidenceEvent::new(VoiceEvidenceEventKind::AnswerReceived, None, detail);
+
+    assert_eq!(event.detail.len(), 240);
+}
+
+#[test]
+fn provider_stage_failure_uses_extended_detail_cap() {
+    let detail = "a".repeat(300);
+    let event = VoiceEvidenceEvent::new(VoiceEvidenceEventKind::ProviderStageFailure, None, detail);
+
+    assert_eq!(event.detail.len(), 300);
+}

@@ -41,6 +41,10 @@ const REQUIRED_EVIDENCE_FIELDS = Object.freeze([
   "model",
   "deploy_sha",
   "latency_ms",
+  "retry_after_ms",
+  "retry_after_source",
+  "reset_hint",
+  "budget_state",
   "usage",
   "cost_usd",
   "token_refresh_outcome",
@@ -190,6 +194,21 @@ describe("BAC-510 learner loop contract", () => {
       "secret",
     ]) {
       expect(new RegExp(forbidden, "i").test(serialized)).toBe(false);
+    }
+  });
+
+  test("keeps provider rate limit learner copy retry-timed without provider internals", () => {
+    const providerRateLimit = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+      (state) => state.id === "provider_rate_limit",
+    );
+    expect(providerRateLimit?.terminal_reason).toBe("provider_rate_limited");
+
+    const copyText = Object.values(providerRateLimit?.copy ?? {}).join(" ");
+    expect(/retry/i.test(copyText)).toBe(true);
+    expect(/wait window/i.test(copyText)).toBe(true);
+    expect(/\b(provider|quota|429|gemini|cartesia)\b/i.test(copyText)).toBe(false);
+    for (const field of ["retry_after_ms", "retry_after_source", "reset_hint", "budget_state"]) {
+      expect(providerRateLimit?.operator_diagnostics).toContain(field);
     }
   });
 

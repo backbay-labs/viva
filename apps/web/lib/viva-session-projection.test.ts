@@ -599,8 +599,8 @@ describe("projectRuntimeCopy", () => {
       [
         "provider_rate_limited",
         "provider_rate_limited",
-        "Provider rate limited",
-        "Retry after quota resets",
+        "Retry window active",
+        "Retry when available",
       ],
       ["provider_timeout", "provider_timeout", "Provider timeout", "Retry agent"],
       [

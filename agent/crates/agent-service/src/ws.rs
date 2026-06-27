@@ -5,8 +5,8 @@ use std::{
 
 use agent_domain::{
     fixture_question, AudioFrame, BrainError, BrainEvent, BrainInput, BrainProviderError,
-    PortError, RealtimeSession, RealtimeSessionTaskGuard, SessionConfig, SessionTokenNonceClaim,
-    StudySessionPhase, TerminalSessionReason, VoiceUsageRecord,
+    BrainProviderFailure, PortError, RealtimeSession, RealtimeSessionTaskGuard, SessionConfig,
+    SessionTokenNonceClaim, StudySessionPhase, TerminalSessionReason, VoiceUsageRecord,
 };
 use axum::{
     extract::{
@@ -2297,18 +2297,114 @@ fn record_provider_stage_failure(
     state.evidence.record(VoiceEvidenceEvent::new(
         VoiceEvidenceEventKind::ProviderStageFailure,
         voice_session_id,
-        format!(
-            "failure_class={} stage={} terminal_reason={} retry_eligible={} latency_ms={} provider={} model={} metadata={}",
-            failure.failure_class,
-            failure.stage,
-            failure.terminal_reason.as_str(),
-            failure.retry_eligible,
-            failure.latency_ms,
-            failure.provider,
-            failure.model,
-            failure.metadata
-        ),
+        provider_stage_failure_detail(failure),
     ));
+}
+
+const PROVIDER_STAGE_FAILURE_DETAIL_MAX_CHARS: usize = 384;
+const PROVIDER_STAGE_FAILURE_DEPLOY_SHA_MAX_CHARS: usize = 8;
+const PROVIDER_STAGE_FAILURE_MODEL_MAX_CHARS: usize = 32;
+const PROVIDER_STAGE_FAILURE_PROVIDER_MAX_CHARS: usize = 24;
+const PROVIDER_STAGE_FAILURE_METADATA_VALUE_MAX_CHARS: usize = 32;
+
+fn provider_stage_failure_detail(failure: &BrainProviderFailure) -> String {
+    let retry_after_ms = metadata_field(&failure.metadata, "retry_after_ms");
+    let retry_after_source = metadata_field(&failure.metadata, "retry_after_source");
+    let reset_hint = metadata_field(&failure.metadata, "reset_hint");
+    let budget_state = metadata_field(&failure.metadata, "budget_state");
+    let deploy_sha = metadata_field(&failure.metadata, "deploy_sha")
+        .map(|value| bounded_evidence_value(value, PROVIDER_STAGE_FAILURE_DEPLOY_SHA_MAX_CHARS))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let mut fields = vec![
+        format!("failure_class={}", failure.failure_class),
+        format!("stage={}", failure.stage),
+        format!("terminal_reason={}", failure.terminal_reason.as_str()),
+        format!(
+            "provider={}",
+            bounded_evidence_value(&failure.provider, PROVIDER_STAGE_FAILURE_PROVIDER_MAX_CHARS)
+        ),
+        format!(
+            "model={}",
+            bounded_evidence_value(&failure.model, PROVIDER_STAGE_FAILURE_MODEL_MAX_CHARS)
+        ),
+        format!("latency_ms={}", failure.latency_ms),
+        format!("deploy_sha={deploy_sha}"),
+    ];
+    if provider_stage_failure_has_rate_metadata(
+        failure,
+        retry_after_ms,
+        retry_after_source,
+        reset_hint,
+        budget_state,
+    ) {
+        fields.extend([
+            format!("retry_after_ms={}", retry_after_ms.unwrap_or("unknown")),
+            format!(
+                "retry_after_source={}",
+                retry_after_source.unwrap_or("unknown")
+            ),
+            format!("reset_hint={}", reset_hint.unwrap_or("unknown")),
+            format!("budget_state={}", budget_state.unwrap_or("unknown")),
+        ]);
+    }
+    fields.extend(safe_provider_stage_metadata_fields(&failure.metadata));
+    bounded_evidence_detail(fields)
+}
+
+fn provider_stage_failure_has_rate_metadata(
+    failure: &BrainProviderFailure,
+    retry_after_ms: Option<&str>,
+    retry_after_source: Option<&str>,
+    reset_hint: Option<&str>,
+    budget_state: Option<&str>,
+) -> bool {
+    failure.failure_class == "quota_rate_failure"
+        || failure.terminal_reason.as_str() == "provider_rate_limited"
+        || retry_after_ms.is_some()
+        || retry_after_source.is_some()
+        || reset_hint.is_some()
+        || budget_state.is_some()
+}
+
+fn safe_provider_stage_metadata_fields(metadata: &str) -> Vec<String> {
+    ["tool", "error_kind"]
+        .into_iter()
+        .filter_map(|key| {
+            metadata_field(metadata, key).map(|value| {
+                format!(
+                    "{key}={}",
+                    bounded_evidence_value(value, PROVIDER_STAGE_FAILURE_METADATA_VALUE_MAX_CHARS)
+                )
+            })
+        })
+        .collect()
+}
+
+fn bounded_evidence_detail(fields: impl IntoIterator<Item = String>) -> String {
+    let mut detail = String::new();
+    for field in fields {
+        let separator_len = usize::from(!detail.is_empty());
+        if detail.len() + separator_len + field.len() > PROVIDER_STAGE_FAILURE_DETAIL_MAX_CHARS {
+            continue;
+        }
+        if !detail.is_empty() {
+            detail.push(' ');
+        }
+        detail.push_str(&field);
+    }
+    detail
+}
+
+fn bounded_evidence_value(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn metadata_field<'a>(metadata: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    metadata
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix(&prefix))
+        .filter(|value| !value.is_empty())
 }
 
 fn record_turn_cap_config(state: &AppState, voice_session_id: Option<String>) {
@@ -2808,11 +2904,108 @@ mod tests {
                 && event.detail.contains("stage=recap")
                 && event.detail.contains("terminal_reason=durability_degraded")
                 && event.detail.contains("latency_ms=37")
+                && event.detail.contains("tool=build_session_recap")
+                && event.detail.contains("error_kind=store")
         }));
         assert!(evidence.iter().any(|event| {
             event.kind == VoiceEvidenceEventKind::StoreCounts
                 && event.detail == "durability_degraded"
         }));
+    }
+
+    #[test]
+    fn provider_stage_failure_evidence_keeps_core_and_retry_metadata_before_truncation() {
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "synthetic",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+            BrainProviderFailureParts {
+                failure_class: "quota_rate_failure".to_owned(),
+                stage: "gemini".to_owned(),
+                terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                retry_eligible: true,
+                latency_ms: 123,
+                provider: "gemini".to_owned(),
+                model: "gemini-35-flash".to_owned(),
+                metadata:
+                    "http_status=429 retry_after_ms=7000 retry_after_source=retry_after_delta reset_hint=2030-01-01T00:00:00Z body_status=resource_exhausted budget_state=unknown deploy_sha=abcdef1234567890abcdef1234567890abcdef12"
+                        .to_owned(),
+            },
+        ));
+
+        record_provider_stage_failure(&state, Some("voice-session-1".to_owned()), &error);
+
+        let events = state.evidence.snapshot();
+        assert_eq!(events.len(), 1);
+        let detail = &events[0].detail;
+        assert!(detail.len() <= PROVIDER_STAGE_FAILURE_DETAIL_MAX_CHARS);
+        assert!(detail.contains("failure_class=quota_rate_failure"));
+        assert!(detail.contains("stage=gemini"));
+        assert!(detail.contains("terminal_reason=provider_rate_limited"));
+        assert!(detail.contains("provider=gemini"));
+        assert!(detail.contains("model=gemini-35-flash"));
+        assert!(detail.contains("latency_ms=123"));
+        assert!(detail.contains("deploy_sha=abcdef12"));
+        assert!(detail.contains("retry_after_ms=7000"));
+        assert!(detail.contains("retry_after_source=retry_after_delta"));
+        assert!(
+            detail.contains("reset_hint=2030-01-01T00:00:00Z"),
+            "{detail}"
+        );
+        assert!(detail.contains("budget_state=unknown"), "{detail}");
+    }
+
+    #[test]
+    fn provider_stage_failure_evidence_keeps_provider_model_with_long_metadata() {
+        use std::sync::Arc;
+
+        use agent_adapters::SyntheticBrain;
+
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "synthetic",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+            BrainProviderFailureParts {
+                failure_class: "quota_rate_failure".to_owned(),
+                stage: "gemini".to_owned(),
+                terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                retry_eligible: true,
+                latency_ms: 123,
+                provider: "gemini".to_owned(),
+                model: "gemini-35-flash-preview-long-sanitized-model-identifier-long-sanitized-model-identifier-long-tail"
+                    .to_owned(),
+                metadata:
+                    "http_status=429 retry_after_ms=7000 retry_after_source=retry_after_delta reset_hint=2030-01-01T00:00:00Z body_status=resource_exhausted budget_state=unknown deploy_sha=unknown"
+                        .to_owned(),
+            },
+        ));
+
+        record_provider_stage_failure(&state, Some("voice-session-1".to_owned()), &error);
+
+        let events = state.evidence.snapshot();
+        assert_eq!(events.len(), 1);
+        let detail = &events[0].detail;
+        assert!(detail.len() <= PROVIDER_STAGE_FAILURE_DETAIL_MAX_CHARS);
+        assert!(detail.contains("failure_class=quota_rate_failure"));
+        assert!(detail.contains("stage=gemini"));
+        assert!(detail.contains("terminal_reason=provider_rate_limited"));
+        assert!(detail.contains("provider=gemini"));
+        assert!(detail.contains("model=gemini-35-flash-preview-long-san"));
+        assert!(detail.contains("latency_ms=123"));
+        assert!(detail.contains("deploy_sha=unknown"));
+        assert!(detail.contains("retry_after_ms=7000"));
+        assert!(detail.contains("retry_after_source=retry_after_delta"));
+        assert!(
+            detail.contains("reset_hint=2030-01-01T00:00:00Z"),
+            "{detail}"
+        );
+        assert!(detail.contains("budget_state=unknown"), "{detail}");
     }
 
     struct FailingSink;
