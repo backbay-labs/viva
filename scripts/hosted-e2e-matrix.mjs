@@ -149,9 +149,8 @@ const failureControlScenarioIdSet = new Set(
   FAILURE_CONTROL_SCENARIO_ROWS.map((entry) => entry.control_scenario_id),
 );
 const FAILURE_CONTROL_SCENARIOS_REQUIRING_BROWSER_ACTION = new Set([
+  ...FAILURE_CONTROL_SCENARIOS.filter((entry) => entry.browser_control).map((entry) => entry.id),
   "double_submit_race",
-  "mic_denied",
-  "typed_fallback",
 ]);
 const hostedScenarioIdSet = new Set(HOSTED_E2E_SCENARIOS.map((entry) => entry.id));
 

@@ -69,6 +69,18 @@ function prRunnableFailureControlScenarios() {
   );
 }
 
+function explicitBrowserActionFailureControlScenarioIds() {
+  return FAILURE_CONTROL_SCENARIOS.filter((scenario) =>
+    failureControlScenarioRequiresExplicitBrowserAction(scenario.id),
+  ).map((scenario) => scenario.id);
+}
+
+function sessionAuthFailureControlScenarioIds() {
+  return FAILURE_CONTROL_SCENARIOS.filter((scenario) => scenario.stage === "session_auth").map(
+    (scenario) => scenario.id,
+  );
+}
+
 test("hosted monitor plan runs scheduled synthetic browser proof against hosted URLs", () => {
   const plan = buildHostedMonitorPlan(baseEnv);
 
@@ -366,11 +378,14 @@ test("hosted monitor PR mode expands the deterministic failure-control matrix", 
   assert.equal(plan.matrix.scenario_count, 3 + runnableFailureControlScenarios.length);
   assert.equal(plan.matrix.scenario_subset.selected, true);
   assert.equal(plan.matrix.scenario_subset.explicitly_configured, false);
-  assert.deepEqual(plan.matrix.scenario_subset.excluded_requires_browser_action, [
-    "double_submit_race",
-    "mic_denied",
-    "typed_fallback",
-  ]);
+  assert.deepEqual(
+    [...plan.matrix.scenario_subset.excluded_requires_browser_action].sort(),
+    explicitBrowserActionFailureControlScenarioIds().sort(),
+  );
+  assert.equal(
+    plan.runs.some((run) => sessionAuthFailureControlScenarioIds().includes(run.scenario_id)),
+    false,
+  );
   assert.deepEqual(
     plan.runs.map((run) => run.name),
     [
@@ -470,11 +485,10 @@ test("hosted monitor PR mode allows a smaller explicit failure-control scenario 
   assert.equal(plan.matrix.scenario_count, 5);
   assert.equal(plan.matrix.scenario_subset.selected, true);
   assert.equal(plan.matrix.scenario_subset.explicitly_configured, true);
-  assert.deepEqual(plan.matrix.scenario_subset.excluded_requires_browser_action, [
-    "double_submit_race",
-    "mic_denied",
-    "typed_fallback",
-  ]);
+  assert.deepEqual(
+    [...plan.matrix.scenario_subset.excluded_requires_browser_action].sort(),
+    explicitBrowserActionFailureControlScenarioIds().sort(),
+  );
   assert.deepEqual(
     plan.matrix.scenarios.map((scenario) => scenario.id),
     [
@@ -494,6 +508,19 @@ test("hosted monitor PR mode rejects failure-control scenarios needing explicit 
         ...baseEnv,
         VIVA_FAILURE_CONTROL_SECRET: "redacted-control-secret",
         VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS: "mic_denied",
+        VIVA_HOSTED_RUNNER_MODE: "pr",
+      }),
+    /require explicit browser actions/,
+  );
+});
+
+test("hosted monitor PR mode rejects session-auth failure-control scenarios", () => {
+  assert.throws(
+    () =>
+      buildHostedMonitorPlan({
+        ...baseEnv,
+        VIVA_FAILURE_CONTROL_SECRET: "redacted-control-secret",
+        VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS: sessionAuthFailureControlScenarioIds()[0],
         VIVA_HOSTED_RUNNER_MODE: "pr",
       }),
     /require explicit browser actions/,

@@ -36,6 +36,12 @@ function prRunnableFailureControlScenarios() {
   );
 }
 
+function sessionAuthFailureControlScenarioIds() {
+  return FAILURE_CONTROL_SCENARIOS.filter((scenario) => scenario.stage === "session_auth").map(
+    (scenario) => scenario.id,
+  );
+}
+
 test("hosted E2E matrix contract exposes BAC-510 fields and required scenarios", () => {
   const contract = buildHostedE2eMatrixContract({
     generatedAt: "2026-06-25T00:00:00.000Z",
@@ -133,6 +139,10 @@ test("hosted E2E matrix keeps future product slices contracted but not in defaul
 test("hosted PR profile expands to browser-runnable deterministic failure-control scenarios", () => {
   const expected = prRunnableFailureControlScenarios().map((scenario) => scenario.id).sort();
   assert.deepEqual(failureControlScenarioIdsForProfile({ profile: "full" }).sort(), expected);
+  for (const scenarioId of sessionAuthFailureControlScenarioIds()) {
+    assert.equal(failureControlScenarioRequiresExplicitBrowserAction(scenarioId), true);
+    assert.equal(expected.includes(scenarioId), false);
+  }
   assert.deepEqual(
     failureControlScenarioIdsForProfile({
       includeBrowserActionScenarios: true,
