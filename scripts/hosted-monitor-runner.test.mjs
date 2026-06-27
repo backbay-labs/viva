@@ -110,14 +110,8 @@ test("hosted monitor scheduled live opt-in runs bounded live smoke", () => {
   assert.equal(plan.runs[1].resultFileName, "evidence.json");
   assert.equal(plan.runs[1].env.VIVA_LIVE_PROVIDER_SMOKE, "1");
   assert.equal(plan.runs[1].env.VIVA_AGENT_PROVIDER, "cartesia_gemini");
-  assert.equal(
-    plan.runs[1].env.VIVA_LIVE_SMOKE_AGENT_HTTP_URL,
-    "https://live-agent.example.com",
-  );
-  assert.equal(
-    plan.runs[1].env.VIVA_LIVE_SMOKE_AGENT_WS_URL,
-    "wss://live-agent.example.com/ws",
-  );
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_AGENT_HTTP_URL, "https://live-agent.example.com");
+  assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_AGENT_WS_URL, "wss://live-agent.example.com/ws");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_ORIGIN, "https://live-web.example.com");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_DURATION_MS, "90000");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_MAX_TURNS, "1");

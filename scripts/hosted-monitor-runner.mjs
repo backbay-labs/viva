@@ -6,7 +6,6 @@ import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
-import { auditTextArtifacts } from "./redaction-control.mjs";
 import {
   buildHostedE2eMatrixContract,
   defaultMatrixProfile,
@@ -14,25 +13,12 @@ import {
   HOSTED_MONITOR_POLICY,
   summarizeHostedE2eResult,
 } from "./hosted-e2e-matrix.mjs";
+import { auditTextArtifacts } from "./redaction-control.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const hostedArtifactRoot = path.join(root, "artifacts/hosted-monitor");
 const defaultRunTimeoutMs = 10 * 60 * 1000;
 const defaultPublishTimeoutMs = 2 * 60 * 1000;
-const forbiddenArtifactMarkers = [
-  "pcm16_base64",
-  "answer_text",
-  "transcript_final",
-  "source_context",
-  "pasted_text",
-  "session_token",
-  "viva1.",
-  "session-secret",
-  "CARTESIA_API_KEY",
-  "GEMINI_API_KEY",
-  "Bearer ",
-  "bearer.",
-];
 const PR_BROWSER_SCENARIO_IDS = Object.freeze([
   "happy_path",
   "fake_provider_happy_path",
@@ -441,9 +427,7 @@ function scheduledLiveMonitorRun(target, livePolicy, runTimeoutMs, runId, liveCo
       VIVA_LIVE_SMOKE: "1",
       VIVA_LIVE_SMOKE_AGENT_HTTP_URL: target.agentHttpUrl,
       VIVA_LIVE_SMOKE_AGENT_WS_URL: target.agentWsUrl,
-      VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD: String(
-        livePolicy.max_cost_usd_per_run,
-      ),
+      VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD: String(livePolicy.max_cost_usd_per_run),
       VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: String(livePolicy.max_audio_bytes_per_run),
       VIVA_LIVE_SMOKE_MAX_DURATION_MS: String(livePolicy.max_duration_ms_per_run),
       VIVA_LIVE_SMOKE_MAX_TURNS: String(livePolicy.max_turns_per_run),
