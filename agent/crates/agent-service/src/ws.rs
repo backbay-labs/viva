@@ -5042,14 +5042,16 @@ mod tests {
             failure: None,
         };
 
-        assert!(record_brain_event(
-            &state,
-            Some("voice-session-1".to_owned()),
-            &event,
-            Duration::from_secs(1),
-        )
-        .await
-        .is_none());
+        assert!(matches!(
+            record_brain_event(
+                &state,
+                Some("voice-session-1".to_owned()),
+                &event,
+                Duration::from_secs(1),
+            )
+            .await,
+            BrainEventRecordResult::None
+        ));
         assert!(crate::protocol::ServerFrame::browser_event(event).is_none());
         let evidence = state.evidence.snapshot();
         assert_eq!(evidence.len(), 1);
@@ -5099,14 +5101,16 @@ mod tests {
             })),
         };
 
-        assert!(record_brain_event(
-            &state,
-            Some("voice-session-1".to_owned()),
-            &event,
-            Duration::from_secs(1),
-        )
-        .await
-        .is_none());
+        assert!(matches!(
+            record_brain_event(
+                &state,
+                Some("voice-session-1".to_owned()),
+                &event,
+                Duration::from_secs(1),
+            )
+            .await,
+            BrainEventRecordResult::None
+        ));
 
         let admission = state
             .limit_state

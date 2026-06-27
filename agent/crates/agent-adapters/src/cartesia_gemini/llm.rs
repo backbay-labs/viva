@@ -807,7 +807,7 @@ fn gemini_transport_failure_classification(
 }
 
 fn gemini_status_metadata(response: &GeminiSseResponse) -> String {
-    let retry_hint = retry_after_hint(response.retry_after.as_deref());
+    let retry_hint = retry_after_hint(response.retry_after.as_deref(), &response.body);
     format!(
         "http_status={} retry_after_ms={} retry_after_source={} body_status={} budget_state=unknown deploy_sha=unknown",
         response.status,

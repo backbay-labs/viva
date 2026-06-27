@@ -1251,6 +1251,7 @@ fn gemini_tool_loop_budget_error(tool_name: &str, model: &str, latency: Duration
     gemini_tool_stage_error(tool_name, model, latency, "tool_loop_budget_exceeded")
 }
 
+#[cfg(test)]
 fn gemini_stream_event_error(message: String, model: &str, latency: Duration) -> BrainError {
     provider_stage_error_from_brain_error(
         BrainError::Protocol(message),
@@ -1422,7 +1423,7 @@ fn duration_ms(duration: Duration) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+mod fallback_tests {
     use super::*;
     use agent_domain::{SessionId, StudyMode};
 
