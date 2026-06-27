@@ -1149,8 +1149,11 @@ function agentLibraryUrl(agentBaseUrl: string, userId: string): URL | null {
 }
 
 function sessionBootstrapTimeoutMs(): number {
-  return positiveInteger(
-    process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS,
+  return Math.min(
+    positiveInteger(
+      process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS,
+      DEFAULT_SESSION_BOOTSTRAP_TIMEOUT_MS,
+    ),
     DEFAULT_SESSION_BOOTSTRAP_TIMEOUT_MS,
   );
 }

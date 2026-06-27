@@ -53,6 +53,7 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
     forwardControlToken: !serverBearer.consumedControlToken,
     serverBearerToken: serverBearer.token,
   });
+  let response: Response;
   let timedOut = false;
   const controller = new AbortController();
   const timeoutId = setTimeout(
@@ -68,7 +69,7 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
       request.method === "POST"
         ? await requestTextWithAbort(request, controller.signal)
         : undefined;
-    const response = await fetch(upstream, {
+    response = await fetch(upstream, {
       body,
       cache: "no-store",
       headers,
@@ -77,9 +78,12 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
     });
     if (!response.ok && terminalReason) {
       if (isUpstreamValidationFailure(response.status)) {
+        if (isBrowserLibrarySnapshotRequest(request.method, path)) {
+          await cancelResponseBody(response);
+          return libraryPreLoopJsonError(502, "viva_library_pre_loop_unavailable", terminalReason);
+        }
         const preserved = await browserSafeLibraryResponse(response, path, {
           origin: vivaLibraryProxyOrigin(request),
-          snapshotFilter: serverBearer.snapshotFilter,
         });
         if (timedOut) {
           return libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason);
@@ -89,16 +93,26 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
       await cancelResponseBody(response);
       return libraryPreLoopJsonError(502, "viva_library_pre_loop_unavailable", terminalReason);
     }
-    const preserved = await browserSafeLibraryResponse(response, path, {
-      origin: vivaLibraryProxyOrigin(request),
-      snapshotFilter: serverBearer.snapshotFilter,
-    });
     if (timedOut) {
       return terminalReason
         ? libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason)
         : libraryProxyJsonError(504, "viva_library_proxy_timeout");
     }
-    return preserved;
+    if (isBrowserLibrarySnapshotRequest(request.method, path) && !response.ok) {
+      return vivaLibraryProxyJsonError(response.status, "viva_library_proxy_unavailable");
+    }
+    const responseHeaders = new Headers();
+    const contentType = response.headers.get("content-type");
+    if (contentType) responseHeaders.set("content-type", contentType);
+    responseHeaders.set("cache-control", "no-store");
+    const responseBody = await browserSafeLibraryResponseBody(response, path, contentType, {
+      origin: vivaLibraryProxyOrigin(request),
+      snapshotFilter: browserLibrarySnapshotFilter(request, path),
+    });
+    return new NextResponse(responseBody, {
+      headers: responseHeaders,
+      status: response.status,
+    });
   } catch {
     if (terminalReason) {
       return libraryPreLoopJsonError(
@@ -136,6 +150,17 @@ function libraryProxyJsonError(status: number, error: string): NextResponse {
   return NextResponse.json({ error }, { headers: noStoreHeaders(), status });
 }
 
+function libraryAccessDeniedJsonError(status: number, error: string): NextResponse {
+  return NextResponse.json(
+    {
+      error,
+      failure_class: "access_denied",
+      stage: "pre_loop",
+    },
+    { headers: noStoreHeaders(), status },
+  );
+}
+
 function isUpstreamValidationFailure(status: number): boolean {
   return status === 400 || status === 422;
 }
@@ -166,12 +191,29 @@ function libraryPreLoopTerminalReason(path: string[], method: string): string | 
   return null;
 }
 
+function isBrowserLibrarySnapshotRequest(method: string, path: string[]): boolean {
+  return method === "GET" && path.join("/") === "study-sets/library";
+}
+
+function browserLibrarySnapshotFilter(
+  request: NextRequest,
+  path: string[],
+): { allowedStudySetIds: Set<string>; userId: string } | undefined {
+  if (!isBrowserLibrarySnapshotRequest(request.method, path)) return undefined;
+  const userId = request.nextUrl.searchParams.get("user_id")?.trim();
+  const allowedStudySetIds = configuredAllowlist("VIVA_SESSION_ALLOWED_STUDY_SET_IDS");
+  if (!userId || !allowedStudySetIds) return undefined;
+  return { allowedStudySetIds, userId };
+}
+
 function vivaLibraryProxyTimeoutMs(path: string[], method: string): number {
+  const maxTimeout =
+    libraryPreLoopTerminalReason(path, method) === "pre_loop_upload_unavailable"
+      ? DEFAULT_LIBRARY_UPLOAD_PROXY_TIMEOUT_MS
+      : DEFAULT_LIBRARY_PROXY_TIMEOUT_MS;
   const value = Number.parseInt(process.env.VIVA_LIBRARY_PROXY_TIMEOUT_MS ?? "", 10);
-  if (Number.isFinite(value) && value > 0) return value;
-  return libraryPreLoopTerminalReason(path, method) === "pre_loop_upload_unavailable"
-    ? DEFAULT_LIBRARY_UPLOAD_PROXY_TIMEOUT_MS
-    : DEFAULT_LIBRARY_PROXY_TIMEOUT_MS;
+  if (Number.isFinite(value) && value > 0) return Math.min(value, maxTimeout);
+  return maxTimeout;
 }
 
 async function requestTextWithAbort(request: NextRequest, signal: AbortSignal): Promise<string> {
@@ -344,11 +386,7 @@ function serverBearerForBrowserLibraryRequest(
   if (!allowedUserIds.has(userId)) {
     return {
       ok: false,
-      response: libraryPreLoopJsonError(
-        403,
-        "viva_library_identity_not_allowed",
-        "pre_loop_ingestion_unavailable",
-      ),
+      response: libraryAccessDeniedJsonError(403, "viva_library_identity_not_allowed"),
     };
   }
   return { ok: true, snapshotFilter: { allowedStudySetIds, userId }, token };

@@ -736,6 +736,56 @@ describe("Viva library proxy", () => {
     }
   });
 
+  test("sanitizes bearer-backed browser snapshot validation failures", async () => {
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_AGENT_REST_BEARER_TOKEN = "server-rest-bearer";
+      process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({
+            authorization: "Bearer server-rest-bearer",
+            detail: "invalid browser library request at http://agent.test/study-sets/library",
+            session_token: "viva1.raw-upstream-token",
+          }),
+          { headers: { "content-type": "application/json" }, status: 400 },
+        )) as typeof fetch;
+
+      const request = {
+        headers: new Headers(),
+        method: "GET",
+        nextUrl: new URL(
+          "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-1",
+        ),
+      } as unknown as NextRequest;
+
+      const response = await GET(request, {
+        params: Promise.resolve({ path: ["study-sets", "library"] }),
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(502);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(body).toEqual({
+        error: "viva_library_pre_loop_unavailable",
+        failure_class: "pre_loop_unavailable",
+        stage: "pre_loop",
+        terminal_reason: "pre_loop_ingestion_unavailable",
+      });
+      expect(JSON.stringify(body)).not.toContain("server-rest-bearer");
+      expect(JSON.stringify(body)).not.toContain("agent.test");
+      expect(JSON.stringify(body)).not.toContain('"session_token"');
+      expect(JSON.stringify(body)).not.toContain("viva1.");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+    }
+  });
+
   test("fails browser library snapshots closed when the server REST bearer is missing", async () => {
     const calls: string[] = [];
     try {
@@ -816,6 +866,52 @@ describe("Viva library proxy", () => {
         stage: "pre_loop",
         terminal_reason: "pre_loop_ingestion_unavailable",
       });
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(calls).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+    }
+  });
+
+  test("classifies disallowed browser snapshot users as access denied", async () => {
+    const calls: string[] = [];
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_AGENT_REST_BEARER_TOKEN = "server-rest-bearer";
+      process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        calls.push(String(input));
+        return new Response(JSON.stringify({ study_sets: [], user_id: "user-2" }), {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        });
+      }) as typeof fetch;
+
+      const request = {
+        headers: new Headers(),
+        method: "GET",
+        nextUrl: new URL(
+          "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-2",
+        ),
+      } as unknown as NextRequest;
+
+      const response = await GET(request, {
+        params: Promise.resolve({ path: ["study-sets", "library"] }),
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(403);
+      expect(body).toEqual({
+        error: "viva_library_identity_not_allowed",
+        failure_class: "access_denied",
+        stage: "pre_loop",
+      });
+      expect(JSON.stringify(body)).not.toContain("pre_loop_ingestion_unavailable");
       expect(response.headers.get("cache-control")).toBe("no-store");
       expect(calls).toEqual([]);
     } finally {
@@ -1119,6 +1215,58 @@ describe("Viva library proxy", () => {
       globalThis.setTimeout = originalSetTimeout;
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_LIBRARY_PROXY_TIMEOUT_MS", originalProxyTimeout);
+    }
+  });
+
+  test("caps proxy timeout overrides to route contract maximums", async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const scheduledTimeouts: number[] = [];
+    try {
+      process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+      process.env.VIVA_AGENT_REST_BEARER_TOKEN = "server-rest-bearer";
+      process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+      process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      process.env.VIVA_LIBRARY_PROXY_TIMEOUT_MS = "60000";
+      globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+        scheduledTimeouts.push(Number(timeout));
+        return originalSetTimeout(handler, 0, ...args);
+      }) as typeof setTimeout;
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("raw upstream timeout with server-rest-bearer")),
+            { once: true },
+          );
+        });
+      }) as typeof fetch;
+
+      const uploadResponse = await POST(fileUploadRequest(), {
+        params: Promise.resolve({ path: ["study-sets", "files"] }),
+      });
+      const libraryRequest = {
+        headers: new Headers(),
+        method: "GET",
+        nextUrl: new URL(
+          "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-1",
+        ),
+      } as unknown as NextRequest;
+      const libraryResponse = await GET(libraryRequest, {
+        params: Promise.resolve({ path: ["study-sets", "library"] }),
+      });
+
+      expect(scheduledTimeouts).toContain(15_000);
+      expect(scheduledTimeouts).toContain(30_000);
+      expect(uploadResponse.status).toBe(504);
+      expect(libraryResponse.status).toBe(504);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.fetch = originalFetch;
+      restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
+      restoreEnv("VIVA_AGENT_REST_BEARER_TOKEN", originalRestBearer);
+      restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
+      restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
       restoreEnv("VIVA_LIBRARY_PROXY_TIMEOUT_MS", originalProxyTimeout);
     }
   });

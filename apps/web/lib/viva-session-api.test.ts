@@ -188,6 +188,48 @@ describe("Viva same-origin session API", () => {
     expect(JSON.stringify(body)).not.toContain("redacted-rest-bearer");
   });
 
+  test("start caps configured bootstrap timeout to the contract maximum", async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const scheduledTimeouts: number[] = [];
+    process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS = "60000";
+    globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      scheduledTimeouts.push(Number(timeout));
+      return originalSetTimeout(handler, 0, ...args);
+    }) as typeof setTimeout;
+    let observedSignal: AbortSignal | undefined;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      observedSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        observedSignal?.addEventListener(
+          "abort",
+          () => reject(new Error("raw upstream timeout with bearer redacted-rest-bearer")),
+          { once: true },
+        );
+      });
+    }) as typeof fetch;
+
+    try {
+      const response = await startSession(
+        sessionRequest("/api/viva-session/start", sessionStartPayload()),
+      );
+      const body = (await response.json()) as Record<string, unknown>;
+
+      expect(scheduledTimeouts).toContain(10_000);
+      expect(response.status).toBe(504);
+      expect(observedSignal?.aborted).toBe(true);
+      expect(body).toEqual({
+        error: "viva_session_agent_timeout",
+        failure_class: "session_bootstrap_unavailable",
+        stage: "pre_loop",
+        terminal_reason: "pre_loop_session_unavailable",
+        token_refresh_outcome: "failed",
+      });
+      expect(JSON.stringify(body)).not.toContain("redacted-rest-bearer");
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
+  });
+
   test("start keeps the bootstrap timeout active while reading the library body", async () => {
     process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS = "5";
     let observedSignal: AbortSignal | undefined;
