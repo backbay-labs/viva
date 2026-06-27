@@ -1,0 +1,17 @@
+FROM mcr.microsoft.com/playwright:v1.61.0-noble
+
+WORKDIR /app
+
+RUN curl -fsSL https://bun.sh/install | bash -s -- bun-v1.3.3
+ENV PATH="/root/.bun/bin:${PATH}"
+
+COPY package.json bun.lock turbo.json tsconfig.base.json biome.json ./
+COPY apps ./apps
+COPY packages ./packages
+COPY scripts ./scripts
+COPY docs ./docs
+COPY agent/fixtures ./agent/fixtures
+
+RUN bun install --frozen-lockfile
+
+CMD ["bun", "run", "hosted:monitor"]

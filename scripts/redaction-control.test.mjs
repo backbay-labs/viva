@@ -253,6 +253,87 @@ test("per-PR redaction check permits required auth source identifiers only in so
     }),
     true,
   );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      'const hostedRestBearerToken = process.env.VIVA_E2E_HOSTED_REST_BEARER_TOKEN?.trim() ?? "";',
+      {
+        file: "scripts/e2e-browser.mjs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      "      if (restBearerToken) headers.authorization = `Bearer $" + "{restBearerToken}`;",
+      {
+        file: "scripts/e2e-browser.mjs",
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      '    .replace(/#session_token=[^\\s"\'<>)]*/gi, "#redacted-session-fragment")',
+      {
+        file: "scripts/e2e-browser.mjs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("        session_token: session.sessionToken,", {
+      file: "scripts/e2e-browser.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("        !sessionPayload.session_token", {
+      file: "scripts/e2e-browser.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      "        session_bootstrap_token: action.session_bootstrap_token,",
+      {
+        file: "scripts/e2e-browser.mjs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('  url.password = "";', {
+      file: "scripts/e2e-browser.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      '    VIVA_E2E_HOSTED_REST_BEARER_TOKEN: requiredValue(env, "VIVA_HOSTED_REST_BEARER_TOKEN"),',
+      {
+        file: "scripts/hosted-monitor-runner.mjs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("  const kDate = hmac(`AWS4$" + "{secret}`, dateStamp);", {
+      file: "scripts/hosted-monitor-runner.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("  headers.authorization = `Bearer $" + "{rawToken}`;", {
+      file: "scripts/e2e-browser.mjs",
+    }),
+    true,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("  record({ session_token: session.sessionToken });", {
+      file: "scripts/e2e-browser.mjs",
+    }),
+    true,
+  );
   assert.throws(
     () =>
       assertNoForbiddenEvidenceMarkers({

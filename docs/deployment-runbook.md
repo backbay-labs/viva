@@ -367,6 +367,101 @@ and usage-event deltas only. It must not retain provider keys, raw audio,
 transcript content, answer content, prompts, full notes, raw provider responses,
 or source excerpts.
 
+## Hosted E2E Monitor Substrate
+
+BAC-530 uses a separate Railway cron service named `viva-hosted-monitor` as the
+off-GitHub execution substrate. It is not GitHub Actions and it does not consume
+blocked Actions minutes. The service builds from `Dockerfile.monitor`, reads
+Railway deployment config from the default-discoverable `railway.json`, and runs:
+
+```sh
+bun run hosted:monitor
+```
+
+`railway.json` is intentionally scoped to the `viva-hosted-monitor` service. Do
+not connect hosted web or hosted agent services to the repo root without a
+service-specific Railway config path, or they will inherit the monitor
+Dockerfile, cron schedule, and start command. `railway.json` configures a
+short-lived Railway cron service with
+`cronSchedule: "*/30 * * * *"` and `restartPolicyType: "NEVER"`. Railway cron
+jobs must exit when the task finishes; a still-active prior execution causes the
+next scheduled execution to be skipped. Keep the monitor as a task process, not a
+web server.
+
+Each execution writes and uploads a final sanitized `manifest.json`, including
+failed or timed-out browser legs, before returning a non-zero process status.
+Browser execution is bounded by `VIVA_HOSTED_RUN_TIMEOUT_MS`; durable evidence
+publication is separately bounded by `VIVA_HOSTED_PUBLISH_TIMEOUT_MS` so object
+storage stalls cannot pin the cron worker indefinitely.
+
+The scheduled production monitor uses:
+
+```sh
+VIVA_HOSTED_RUNNER_MODE=scheduled
+```
+
+It runs one hosted Playwright browser-story proof against hosted web + hosted
+agent, using a synthetic monitor identity, then publishes sanitized evidence to
+the object prefix `viva-hosted-monitor/scheduled/<run_id>/` in the durable
+artifact store.
+
+The PR-equivalent trigger uses the same service image with:
+
+```sh
+VIVA_HOSTED_RUNNER_MODE=pr
+```
+
+Run that mode from a Railway deployment or manual service run for the branch
+under review. It executes the hosted synthetic provider leg, hosted
+`fake_cartesia_gemini` provider leg, and the BAC-528 failure-control browser
+slice, including a deterministic provider-rate-limited terminal path. It
+publishes under `viva-hosted-monitor/pr/<run_id>/`.
+
+Required monitor variables:
+
+```sh
+VIVA_HOSTED_WEB_URL="https://viva-web.example.com"
+VIVA_HOSTED_AGENT_HTTP_URL="https://viva-agent.example.com"
+VIVA_HOSTED_AGENT_WS_URL="wss://viva-agent.example.com/ws"
+VIVA_E2E_AGENT_PROVIDER="synthetic"
+VIVA_HOSTED_REST_BEARER_TOKEN="<from the hosted agent REST auth secret store>"
+VIVA_HOSTED_FAKE_PROVIDER_WEB_URL="https://viva-fake-web.example.com"
+VIVA_HOSTED_FAKE_PROVIDER_AGENT_HTTP_URL="https://viva-fake-agent.example.com"
+VIVA_HOSTED_FAKE_PROVIDER_AGENT_WS_URL="wss://viva-fake-agent.example.com/ws"
+VIVA_HOSTED_FAILURE_CONTROL_WEB_URL="https://viva-failure-control-web.example.com"
+VIVA_HOSTED_FAILURE_CONTROL_AGENT_HTTP_URL="https://viva-failure-control-agent.example.com"
+VIVA_HOSTED_FAILURE_CONTROL_AGENT_WS_URL="wss://viva-failure-control-agent.example.com/ws"
+VIVA_HOSTED_SYNTHETIC_USER_ID="synthetic-monitor-user"
+VIVA_HOSTED_SYNTHETIC_STUDY_SET_ID="biology-midterm"
+VIVA_VOICE_SESSION_TOKEN_SECRET="<from the hosted agent secret store>"
+VIVA_FAILURE_CONTROL_SECRET="<from the hosted agent secret store for PR mode>"
+VIVA_HOSTED_ARTIFACT_BUCKET="<Railway object bucket name>"
+VIVA_HOSTED_ARTIFACT_ENDPOINT="<Railway object bucket endpoint>"
+VIVA_HOSTED_ARTIFACT_REGION="auto"
+VIVA_HOSTED_ARTIFACT_KEY_ID="<Railway object bucket access key id>"
+VIVA_HOSTED_ARTIFACT_SECRET_KEY="<Railway object bucket secret key>"
+```
+
+The hosted agent URL must point at a synthetic or fake monitor deployment whose
+provider matches `VIVA_E2E_AGENT_PROVIDER`; do not aim the scheduled monitor at a
+live learner tutor endpoint. The control secret and session signing secret must
+come from the deployment secret store and must match the hosted agent variables.
+The PR failure-control leg must use its own hosted web and agent target that is
+preconfigured with matching `VIVA_FAILURE_CONTROL_*` gates; the normal synthetic
+leg and failure-control leg must not share one hosted agent origin. The runner
+identity must be an allowlisted synthetic monitor identity, never a learner or
+real tester. Do not print secret values while checking variables; verify presence
+by key name and service configuration only.
+
+The hosted monitor evidence is safe to attach only after `manifest.json` reports
+`learner_identity_used: false`, each run reports `sanitized: true`, and the
+artifact upload summary reports the expected durable object prefix. The durable
+bundle intentionally publishes only text, JSON, and log artifacts; screenshots,
+traces, archives, HAR files, and other binary browser captures are local-only and
+must not be uploaded as hosted evidence. BAC-526 reads that object prefix as the
+hosted-browser evidence bundle; `/ready` alone, a local-only run, or
+`VIVA_RELEASE_CHECK_SKIP_BROWSER=1` is not production-ready evidence.
+
 ## Rollback And Drain
 
 The numeric rollback thresholds live in `scripts/rollback-drain-criteria.mjs`

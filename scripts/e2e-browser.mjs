@@ -23,11 +23,24 @@ const artifactDir = path.resolve(
   root,
   process.env.VIVA_E2E_ARTIFACT_DIR ?? "artifacts/e2e-browser",
 );
-const agentPort = await freePort();
-const webPort = await freePort();
-const agentUrl = `http://127.0.0.1:${agentPort}`;
-const webUrl = `http://127.0.0.1:${webPort}`;
-const wsUrl = `ws://127.0.0.1:${agentPort}/ws`;
+const hostedWebUrl = optionalHostedHttpUrl("VIVA_E2E_HOSTED_WEB_URL");
+const hostedAgentHttpUrl = optionalHostedHttpUrl("VIVA_E2E_HOSTED_AGENT_HTTP_URL");
+const hostedAgentWsUrl = optionalHostedWsUrl("VIVA_E2E_HOSTED_AGENT_WS_URL");
+const hostedMode = Boolean(hostedWebUrl || hostedAgentHttpUrl || hostedAgentWsUrl);
+if (hostedMode && !(hostedWebUrl && hostedAgentHttpUrl && hostedAgentWsUrl)) {
+  throw new Error(
+    "Hosted browser E2E requires VIVA_E2E_HOSTED_WEB_URL, VIVA_E2E_HOSTED_AGENT_HTTP_URL, and VIVA_E2E_HOSTED_AGENT_WS_URL together.",
+  );
+}
+const hostedRestBearerToken = process.env.VIVA_E2E_HOSTED_REST_BEARER_TOKEN?.trim() ?? "";
+if (hostedMode && !hostedRestBearerToken) {
+  throw new Error("Hosted browser E2E requires VIVA_E2E_HOSTED_REST_BEARER_TOKEN.");
+}
+const agentPort = hostedMode ? null : await freePort();
+const webPort = hostedMode ? null : await freePort();
+const agentUrl = hostedAgentHttpUrl ?? `http://127.0.0.1:${agentPort}`;
+const webUrl = hostedWebUrl ?? `http://127.0.0.1:${webPort}`;
+const wsUrl = hostedAgentWsUrl ?? `ws://127.0.0.1:${agentPort}/ws`;
 const agentProvider = process.env.VIVA_E2E_AGENT_PROVIDER ?? "synthetic";
 const failureControlEnv = buildE2EFailureControlEnv();
 const failureControlPlan = buildFailureControlPlan({
@@ -52,6 +65,10 @@ if (!allowedBrowserStoryProviders.has(agentProvider)) {
   );
 }
 const stopToRecap = process.env.VIVA_E2E_STOP_TO_RECAP === "1";
+const traceRequested = process.env.VIVA_E2E_TRACE === "1";
+if (hostedMode && traceRequested) {
+  throw new Error("Hosted browser E2E cannot retain Playwright traces.");
+}
 const validationRunId = `browser-story-${agentProvider}-${new Date()
   .toISOString()
   .replaceAll(/[:.]/g, "-")}`;
@@ -64,17 +81,20 @@ const children = [];
 const consoleErrors = [];
 const pageErrors = [];
 const serverEvents = [];
+const websocketUrls = [];
 let browser;
 let context;
 let page;
 let traceStarted = false;
 let traceArtifact = null;
 const storyFrames = [];
+let hostedSecondTabIdentity = null;
 let sessionUrlLifecycle = null;
 let sourceFolioVisible = false;
 let boundedSourceVisible = false;
 let correctionMarginaliaVisible = false;
 let writtenAnswerFallbackUsed = false;
+let hostedWebSocketVerified = false;
 let postAnswerSourceFolioVisible = false;
 let postAnswerBoundedSourceVisible = false;
 let secondTabSessionCap = null;
@@ -91,20 +111,22 @@ await rm(artifactDir, { recursive: true, force: true });
 await mkdir(artifactDir, { recursive: true });
 
 try {
-  const agent = spawnLogged(
-    "agent",
-    "cargo",
-    ["run", "--manifest-path", "agent/Cargo.toml", "-p", "agent-service"],
-    {
-      VIVA_AGENT_BIND_ADDR: `127.0.0.1:${agentPort}`,
-      VIVA_AGENT_PROVIDER: agentProvider,
-      VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan.enabled
-        ? failureControlEnv.VIVA_VOICE_SESSION_TOKEN_SECRET
-        : "",
-      VIVA_VOICE_WS_ALLOWED_ORIGINS: failureControlPlan.enabled ? webUrl : "",
-      ...failureControlEnv,
-    },
-  );
+  const agent = hostedMode
+    ? null
+    : spawnLogged(
+        "agent",
+        "cargo",
+        ["run", "--manifest-path", "agent/Cargo.toml", "-p", "agent-service"],
+        {
+          VIVA_AGENT_BIND_ADDR: `127.0.0.1:${agentPort}`,
+          VIVA_AGENT_PROVIDER: agentProvider,
+          VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan.enabled
+            ? failureControlEnv.VIVA_VOICE_SESSION_TOKEN_SECRET
+            : "",
+          VIVA_VOICE_WS_ALLOWED_ORIGINS: failureControlPlan.enabled ? webUrl : "",
+          ...failureControlEnv,
+        },
+      );
   const agentReadiness = await waitForHttpJson(
     `${agentUrl}/ready`,
     (json) => {
@@ -114,25 +136,37 @@ try {
     `${agentProvider} agent readiness`,
   );
 
-  const web = spawnLogged(
-    "web",
-    "bun",
-    ["run", "--cwd", "apps/web", "dev", "--", "--hostname", "127.0.0.1", "--port", String(webPort)],
-    {
-      NEXT_PUBLIC_VIVA_AGENT_WS_URL: wsUrl,
-      NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: agentUrl,
-      NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID: failureControlIdentity?.userId ?? "user-1",
-      NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID:
-        failureControlIdentity?.studySetId ?? "biology-midterm",
-      NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID: "voice-session-1",
-    },
-  );
+  const web = hostedMode
+    ? null
+    : spawnLogged(
+        "web",
+        "bun",
+        [
+          "run",
+          "--cwd",
+          "apps/web",
+          "dev",
+          "--",
+          "--hostname",
+          "127.0.0.1",
+          "--port",
+          String(webPort),
+        ],
+        {
+          NEXT_PUBLIC_VIVA_AGENT_WS_URL: wsUrl,
+          NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: agentUrl,
+          NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID: failureControlIdentity?.userId ?? "user-1",
+          NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID:
+            failureControlIdentity?.studySetId ?? "biology-midterm",
+          NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID: "voice-session-1",
+        },
+      );
   await waitForHttp(webUrl, 120_000, "Next.js app");
 
   browser = await launchChromium();
   context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   await context.grantPermissions(["microphone"], { origin: webUrl });
-  if (process.env.VIVA_E2E_TRACE === "1") {
+  if (traceRequested) {
     await context.tracing.start({ screenshots: false, snapshots: false, sources: false });
     traceStarted = true;
   }
@@ -144,6 +178,7 @@ try {
   });
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("websocket", (socket) => {
+    websocketUrls.push(socket.url());
     socket.on("framereceived", (frame) => recordServerFramePayload(frame.payload, serverEvents));
   });
 
@@ -169,7 +204,10 @@ try {
   });
   let manuscriptReady = false;
   if (failureControlPlan.enabled) {
-    const signedStartTarget = await fetchFailureControlStartTarget(page);
+    const signedStartTarget = await fetchSignedSessionStartTarget(
+      page,
+      failureControlStartIdentity(failureControlPlan),
+    );
     const scenarioStartTarget = failureControlSessionTargetForScenario(
       signedStartTarget,
       failureControlPlan.scenario,
@@ -180,13 +218,17 @@ try {
     if (scenarioStartTarget.preconsume_replay) {
       await consumeFailureControlReplayToken(page, signedStartTarget);
     }
-    await page.goto(`${webUrl}${scenarioStartTarget.target}`, { waitUntil: "domcontentloaded" });
+    await navigateToSessionTarget(page, scenarioStartTarget.target);
+  } else if (hostedMode) {
+    const identity = hostedSyntheticIdentity();
+    assertHostedSyntheticIdentity(identity);
+    hostedSecondTabIdentity = identity;
+    const signedStartTarget = await fetchSignedSessionStartTarget(page, identity);
+    await navigateToSessionTarget(page, signedStartTarget);
   } else {
     await startActionButton.click();
   }
-  await page.waitForURL((url) => url.toString().startsWith(`${webUrl}/session`), {
-    timeout: 20_000,
-  });
+  await waitForSessionUrl(page, 20_000);
   if (sessionTokenFailureScenario) {
     failureControlTerminalProof = await waitForFailureControlTerminal(
       serverEvents,
@@ -229,8 +271,18 @@ try {
       timeout: 20_000,
     });
     manuscriptReady = await isVisible(page.getByText(listeningText));
+    if (hostedMode) {
+      assertHostedWebSocketTarget(websocketUrls, wsUrl);
+      hostedWebSocketVerified = true;
+    }
     if (!failureControlPlan.enabled) {
-      secondTabSessionCap = await auditSecondTabSessionCap(context, page.url());
+      const secondTabTarget = hostedMode
+        ? await fetchSignedSessionStartTarget(
+            page,
+            hostedSecondTabIdentity ?? hostedSyntheticIdentity(),
+          )
+        : page.url();
+      secondTabSessionCap = await auditSecondTabSessionCap(context, secondTabTarget);
     }
     await page.screenshot({
       path: path.join(artifactDir, "session-ready.png"),
@@ -437,6 +489,14 @@ try {
     artifact_dir: path.relative(root, artifactDir),
     agent_provider: agentProvider,
     agent_url: agentUrl,
+    hosted_mode: hostedMode,
+    hosted_session_identity: hostedMode
+      ? {
+          study_set_id: hostedSyntheticIdentity().studySetId,
+          synthetic_user_id: hostedSyntheticIdentity().userId,
+        }
+      : null,
+    hosted_websocket_verified: hostedWebSocketVerified,
     store: summarizeStore(agentReadiness?.store),
     durable_state_release_claimed: durableStateReleaseClaimed,
     stop_to_recap: stopToRecap,
@@ -561,9 +621,12 @@ try {
   }
 
   console.log(JSON.stringify(result, null, 2));
-  web.stop();
-  agent.stop();
+  web?.stop();
+  agent?.stop();
 } catch (error) {
+  const sanitizedError = redactSensitiveDiagnostic(
+    error instanceof Error ? error.message : String(error),
+  );
   if (context && traceStarted) {
     await context.tracing.stop({ path: path.join(artifactDir, "trace.zip") }).catch(() => {});
     traceStarted = false;
@@ -577,21 +640,29 @@ try {
     path.join(artifactDir, "failure.json"),
     `${JSON.stringify(
       {
-        error: error instanceof Error ? error.message : String(error),
-        console_errors: consoleErrors,
-        page_errors: pageErrors,
+        error: sanitizedError,
+        console_errors: consoleErrors.map(redactSensitiveDiagnostic),
+        page_errors: pageErrors.map(redactSensitiveDiagnostic),
         artifact_dir: path.relative(root, artifactDir),
       },
       null,
       2,
     )}\n`,
   ).catch(() => {});
-  throw error;
+  throw new Error(sanitizedError);
 } finally {
   await browser?.close().catch(() => {});
   for (const child of children.reverse()) {
     child.stop();
   }
+}
+
+function redactSensitiveDiagnostic(value) {
+  return String(value)
+    .replace(/#session_token=[^\s"'<>)]*/gi, "#redacted-session-fragment")
+    .replace(/[?&]session_token=[^&\s"'<>)]*/gi, "?redacted_session_param=1")
+    .replace(/viva1\.[A-Za-z0-9._-]+/g, "redacted-viva-token")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer redacted");
 }
 
 async function capturePendingLocalPreview(targetPage) {
@@ -609,8 +680,7 @@ async function capturePendingLocalPreview(targetPage) {
   });
 }
 
-async function fetchFailureControlStartTarget(targetPage) {
-  const identity = failureControlStartIdentity(failureControlPlan);
+async function fetchSignedSessionStartTarget(targetPage, identity) {
   return targetPage.evaluate(async ({ userId, studySetId }) => {
     const libraryParams = new URLSearchParams({ user_id: userId });
     const response = await fetch(
@@ -620,23 +690,125 @@ async function fetchFailureControlStartTarget(targetPage) {
       },
     );
     if (!response.ok) {
-      throw new Error(`failure-control library token fetch failed with HTTP ${response.status}`);
+      throw new Error(`hosted library action fetch failed with HTTP ${response.status}`);
     }
     const snapshot = await response.json();
     const studySet = snapshot.study_sets?.find((entry) => entry.id === studySetId);
     const action = studySet?.actions?.start;
-    if (!studySet || !action?.session_id || !action?.session_token) {
-      throw new Error("failure-control library token fetch did not return a start token");
+    if (!studySet?.user_id || !action?.session_bootstrap_token) {
+      throw new Error("hosted library action fetch did not return a bootstrap capability");
+    }
+    const startResponse = await fetch("/api/viva-session/start", {
+      body: JSON.stringify({
+        session_bootstrap_token: action.session_bootstrap_token,
+        study_set_id: studySet.id,
+        user_id: studySet.user_id,
+      }),
+      cache: "no-store",
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    if (!startResponse.ok) {
+      throw new Error(`hosted session bootstrap failed with HTTP ${startResponse.status}`);
+    }
+    const sessionPayload = await startResponse.json();
+    if (
+      !sessionPayload?.session?.session_id ||
+      !sessionPayload.session.study_set_id ||
+      !sessionPayload.session.user_id ||
+      !sessionPayload.session_token
+    ) {
+      throw new Error("hosted session bootstrap did not return a signed session token");
     }
     const params = new URLSearchParams({
-      user_id: studySet.user_id,
-      study_set_id: studySet.id,
-      session_id: action.session_id,
+      user_id: sessionPayload.session.user_id,
+      study_set_id: sessionPayload.session.study_set_id,
+      session_id: sessionPayload.session.session_id,
     });
     return `/session?${params.toString()}#session_token=${encodeURIComponent(
-      action.session_token,
+      sessionPayload.session_token,
     )}`;
   }, identity);
+}
+
+async function navigateToSessionTarget(targetPage, target) {
+  const targetUrl = new URL(target, webUrl);
+  const webOrigin = new URL(webUrl).origin;
+  if (targetUrl.origin !== webOrigin) {
+    throw new Error("Hosted signed session target origin did not match configured web origin.");
+  }
+  try {
+    await targetPage.evaluate((href) => {
+      window.location.assign(href);
+    }, targetUrl.toString());
+  } catch (error) {
+    throw new Error(
+      `Hosted signed session navigation failed before load: ${redactSensitiveDiagnostic(
+        error instanceof Error ? error.message : String(error),
+      )}`,
+    );
+  }
+}
+
+async function waitForSessionUrl(targetPage, timeoutMs) {
+  const webOrigin = new URL(webUrl).origin;
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const current = new URL(targetPage.url());
+    if (current.origin === webOrigin && current.pathname === "/session") return;
+    await delay(100);
+  }
+  throw new Error("Timed out waiting for signed hosted session navigation.");
+}
+
+function hostedSyntheticIdentity() {
+  return {
+    studySetId:
+      process.env.VIVA_E2E_SYNTHETIC_STUDY_SET_ID?.trim() ||
+      process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID?.trim() ||
+      "biology-midterm",
+    userId:
+      process.env.VIVA_E2E_SYNTHETIC_USER_ID?.trim() ||
+      process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID?.trim() ||
+      "user-1",
+  };
+}
+
+function assertHostedSyntheticIdentity(identity) {
+  if (
+    !/(synthetic|monitor|test)/i.test(identity.userId) ||
+    /(learner|student)/i.test(identity.userId)
+  ) {
+    throw new Error("Hosted browser E2E requires a synthetic monitor user identity.");
+  }
+}
+
+function assertHostedWebSocketTarget(urls, expectedUrl) {
+  const expected = normalizeComparableWsUrl(expectedUrl);
+  const observed = urls.map(normalizeComparableWsUrl);
+  if (!observed.includes(expected)) {
+    throw new Error(
+      `Hosted browser E2E did not connect to configured agent WebSocket. Expected ${expected}; observed ${
+        observed.map(redactedWebSocketUrl).join(", ") || "none"
+      }`,
+    );
+  }
+}
+
+function normalizeComparableWsUrl(value) {
+  const url = new URL(value);
+  url.hash = "";
+  url.search = "";
+  return url.toString().replace(/\/$/g, "");
+}
+
+function redactedWebSocketUrl(value) {
+  const url = new URL(value);
+  url.username = "";
+  url.password = "";
+  url.search = "";
+  url.hash = "";
+  return url.toString().replace(/\/$/g, "");
 }
 
 async function consumeFailureControlReplayToken(targetPage, signedStartTarget) {
@@ -1155,7 +1327,7 @@ async function buildBrowserStoryManifest({ traceRetained }) {
       validation_run_id: validationRunId,
       artifact_dir: path.relative(root, artifactDir),
       browser: "playwright-chromium",
-      capture_mode: "loopback-local",
+      capture_mode: hostedMode ? "hosted" : "loopback-local",
       post_answer_source_folio_required: requirePostAnswerSourceFolio,
       stop_to_recap: stopToRecap,
     },
@@ -1178,16 +1350,14 @@ function summarizeStore(store) {
 async function writeAuditedBrowserStoryResult(baseResult) {
   const storyPath = path.join(artifactDir, "browser-story.json");
   const resultPath = path.join(artifactDir, "result.json");
-  if (baseResult.trace) {
-    await writeFile(storyPath, `${JSON.stringify(baseResult.browser_story, null, 2)}\n`);
-    await writeFile(resultPath, `${JSON.stringify(baseResult, null, 2)}\n`);
-    return baseResult;
-  }
   let result = baseResult;
   for (let pass = 0; pass < 2; pass += 1) {
     await writeFile(storyPath, `${JSON.stringify(result.browser_story, null, 2)}\n`);
     await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`);
-    const artifactAudit = await auditBrowserStoryArtifacts(artifactDir);
+    const artifactAudit =
+      result.browser_story.trace_retained && !hostedMode
+        ? skippedLocalTraceArtifactAudit()
+        : await auditBrowserStoryArtifacts(artifactDir);
     result = {
       ...result,
       browser_story: {
@@ -1199,6 +1369,14 @@ async function writeAuditedBrowserStoryResult(baseResult) {
   await writeFile(storyPath, `${JSON.stringify(result.browser_story, null, 2)}\n`);
   await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`);
   return result;
+}
+
+function skippedLocalTraceArtifactAudit() {
+  return {
+    forbidden_hits: 0,
+    scanned_files: 0,
+    skipped: "local_trace_retained",
+  };
 }
 
 async function launchChromium() {
@@ -1496,6 +1674,31 @@ async function auditBrowserStoryArtifacts(dir) {
     rootDir: root,
     zipMessage: (relative) => `Browser story artifact includes retained trace archive: ${relative}`,
   });
+}
+
+function optionalHostedHttpUrl(name) {
+  const value = process.env[name]?.trim();
+  if (!value) return null;
+  const url = new URL(value);
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error(`${name} must use http:// or https://`);
+  }
+  url.hash = "";
+  url.search = "";
+  url.pathname = url.pathname.replace(/\/+$/g, "");
+  return url.toString().replace(/\/$/g, "");
+}
+
+function optionalHostedWsUrl(name) {
+  const value = process.env[name]?.trim();
+  if (!value) return null;
+  const url = new URL(value);
+  if (!["ws:", "wss:"].includes(url.protocol)) {
+    throw new Error(`${name} must use ws:// or wss://`);
+  }
+  url.hash = "";
+  url.search = "";
+  return url.toString().replace(/\/$/g, "");
 }
 
 function delay(ms) {

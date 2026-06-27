@@ -120,6 +120,82 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     marker: "session_token_secret",
     patterns: Object.freeze([/session_token_secret: Some\("session-secret"\.to_owned\(\)\)/]),
   },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /\.replace\(\/Bearer\\s\+\[A-Za-z0-9\._~\+\/=-\]\+\/gi, "Bearer redacted"\)/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "hosted_rest_bearer_token",
+    patterns: Object.freeze([/process\.env\.VIVA_E2E_HOSTED_REST_BEARER_TOKEN/]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "password",
+    patterns: Object.freeze([/url\.password = ""/]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan\.enabled/,
+      /failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET/,
+      /\.replace\(\/#session_token=/,
+      /\.replace\(\/\[\?&\]session_token=/,
+      /#session_token=\$\{encodeURIComponent\(/,
+      /sessionPayload\.session_token/,
+      /^\s*session_token: session\.sessionToken,?$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "session_bootstrap_token",
+    patterns: Object.freeze([
+      /action\?\.session_bootstrap_token/,
+      /^\s*session_bootstrap_token: action\.session_bootstrap_token,?$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "viva_voice_session_token_secret",
+    patterns: Object.freeze([
+      /VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan\.enabled/,
+      /failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET/,
+    ]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
+    marker: "authorization",
+    patterns: Object.freeze([/authorization: `AWS4-HMAC-SHA256 Credential=/]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
+    marker: "secret",
+    patterns: Object.freeze([/hmac\(`AWS4\$\{secret\}`, dateStamp\)/]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
+    marker: "session_token",
+    patterns: Object.freeze([/VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
+    marker: "viva_voice_session_token_secret",
+    patterns: Object.freeze([/VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
+    marker: "viva_e2_e_hosted_rest_bearer_token",
+    patterns: Object.freeze([/VIVA_E2E_HOSTED_REST_BEARER_TOKEN: requiredValue/]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
+    marker: "viva_failure_control_secret",
+    patterns: Object.freeze([/VIVA_FAILURE_CONTROL_SECRET: requiredValue/]),
+  },
 ]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);
