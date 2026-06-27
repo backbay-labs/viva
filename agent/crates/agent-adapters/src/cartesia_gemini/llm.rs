@@ -373,6 +373,18 @@ where
             ));
         }
         let mut events = parse_gemini_sse_stream(&response.body);
+        if events.is_empty() {
+            if index > 0 {
+                return Err(gemini_attempt_failure(
+                    &attempt_events,
+                    gemini_empty_stream_stage_failure(attempt_config, started.elapsed()),
+                ));
+            }
+            return Err(gemini_attempt_failure(
+                &attempt_events,
+                BrainError::Protocol("Gemini stream returned no events".to_owned()),
+            ));
+        }
         if !attempt_events.is_empty() {
             attempt_events.append(&mut events);
             return Ok(attempt_events);
@@ -2568,6 +2580,51 @@ data: [DONE]
         assert_eq!(stage_failure.model, "gemini-25-flash");
         assert!(stage_failure.metadata.contains("error_kind=empty_stream"));
         assert!(!stage_failure.to_string().contains("fixture-redacted-input"));
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_rejects_fallback_streams_with_no_parsed_events() {
+        let client = SequencedGeminiSseClient {
+            captures: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(vec![
+                GeminiSseResponse {
+                    status: 429,
+                    body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
+                    retry_after: Some("1".to_owned()),
+                    reset_after: None,
+                },
+                GeminiSseResponse::ok("data: [DONE]\n\n".to_owned()),
+            ])),
+        };
+
+        let failure = stream_gemini_with_client_attempt_events(
+            &client,
+            &GeminiConfig {
+                api_key: "gemini-test-key".to_owned(),
+                model_id: "gemini-3.5-pro".to_owned(),
+                fallback_model_ids: vec!["gemini-2.5-flash".to_owned()],
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [{ "parts": [{ "text": "fixture-redacted-input" }] }] }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(failure.events.len(), 1);
+        assert_fallback_activation(
+            &failure.events[0],
+            "gemini-3.5-pro",
+            "gemini-2.5-flash",
+            "primary_429",
+            1_000,
+        );
+        let BrainError::StageFailure(stage_failure) = failure.error else {
+            panic!("expected no-parsed-events fallback stream to fail");
+        };
+        assert_eq!(stage_failure.failure_class, "malformed_stream");
+        assert_eq!(stage_failure.provider, "gemini");
+        assert_eq!(stage_failure.model, "gemini-25-flash");
+        assert!(stage_failure.metadata.contains("error_kind=empty_stream"));
     }
 
     #[tokio::test]

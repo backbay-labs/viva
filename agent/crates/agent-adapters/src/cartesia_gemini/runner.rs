@@ -704,7 +704,7 @@ where
                             "gemini",
                             "gemini",
                             &active_gemini.model_id,
-                            Duration::ZERO,
+                            gemini_started.elapsed(),
                         ))
                     }
                     GeminiStreamEvent::ModelPart { text: None, .. } => {}
@@ -2467,6 +2467,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gemini_tool_loop_budget_error_uses_active_fallback_model() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        store.record_voice_session(&session_config).await.unwrap();
+        let session = AuthorizedStudySession::from_config(&session_config).unwrap();
+        let executor = VivaToolExecutor::new(store.clone(), session.clone());
+        let question = select_next_question(&executor, &session).await.unwrap();
+        let runner = CartesiaGeminiRunner {
+            config: CartesiaGeminiConfig {
+                gemini: super::super::GeminiConfig {
+                    api_key: "gemini-test-key".to_owned(),
+                    model_id: "gemini-3.5-pro".to_owned(),
+                    fallback_model_ids: vec!["gemini-3.5-flash".to_owned()],
+                    ..super::super::GeminiConfig::default()
+                },
+                ..CartesiaGeminiConfig::default()
+            },
+            transports: FallbackToolLoopBudgetTransports::default(),
+            store: Some(store),
+        };
+        let mut events = Vec::new();
+        let mut usage = BrainUsage::default();
+
+        let error = runner
+            .run_gemini_tool_loop(GeminiToolLoopJob {
+                answer_text: "omitted",
+                cancelled: None,
+                emit_text_delta: false,
+                events: &mut events,
+                executor: &executor,
+                interrupt: FakeRuntimeInterrupt::None,
+                question: &question,
+                response_id: "response-1",
+                session: &session,
+                usage: &mut usage,
+            })
+            .await
+            .unwrap_err();
+
+        let BrainError::StageFailure(failure) = error else {
+            panic!("tool loop budget should produce a Gemini stage failure");
+        };
+        assert_eq!(failure.failure_class, "malformed_stream");
+        assert_eq!(failure.provider, "gemini");
+        assert_eq!(failure.model, "gemini-35-flash");
+        assert!(failure
+            .metadata
+            .contains("error_kind=tool_loop_budget_exceeded"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            BrainEvent::ProviderFallbackActivated {
+                from_model,
+                to_model,
+                ..
+            } if from_model == "gemini-3.5-pro" && to_model == "gemini-3.5-flash"
+        )));
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_error_events_use_elapsed_request_latency() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        store.record_voice_session(&session_config).await.unwrap();
+        let session = AuthorizedStudySession::from_config(&session_config).unwrap();
+        let executor = VivaToolExecutor::new(store.clone(), session.clone());
+        let question = select_next_question(&executor, &session).await.unwrap();
+        let runner = CartesiaGeminiRunner {
+            config: CartesiaGeminiConfig {
+                gemini: super::super::GeminiConfig {
+                    api_key: "gemini-test-key".to_owned(),
+                    model_id: "gemini-3.5-pro".to_owned(),
+                    ..super::super::GeminiConfig::default()
+                },
+                ..CartesiaGeminiConfig::default()
+            },
+            transports: GeminiStreamErrorTransports {
+                delay: Duration::from_millis(5),
+            },
+            store: Some(store),
+        };
+        let mut events = Vec::new();
+        let mut usage = BrainUsage::default();
+
+        let error = runner
+            .run_gemini_tool_loop(GeminiToolLoopJob {
+                answer_text: "omitted",
+                cancelled: None,
+                emit_text_delta: false,
+                events: &mut events,
+                executor: &executor,
+                interrupt: FakeRuntimeInterrupt::None,
+                question: &question,
+                response_id: "response-1",
+                session: &session,
+                usage: &mut usage,
+            })
+            .await
+            .unwrap_err();
+
+        let BrainError::StageFailure(failure) = error else {
+            panic!("Gemini stream errors should produce stage failures");
+        };
+        assert_eq!(failure.failure_class, "malformed_stream");
+        assert_eq!(failure.provider, "gemini");
+        assert_eq!(failure.model, "gemini-35-pro");
+        assert!(failure.latency_ms > 0);
+    }
+
+    #[tokio::test]
     async fn gemini_tool_loop_emits_fallback_activation_before_returning_failure() {
         let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
         let session_config = SessionConfig {
@@ -2617,6 +2738,16 @@ mod tests {
     #[derive(Clone)]
     struct FallbackFailureTransports;
 
+    #[derive(Clone, Default)]
+    struct FallbackToolLoopBudgetTransports {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[derive(Clone)]
+    struct GeminiStreamErrorTransports {
+        delay: Duration,
+    }
+
     #[async_trait]
     impl CartesiaGeminiTransports for FallbackContinuationCaptureTransports {
         async fn transcribe_audio(
@@ -2743,6 +2874,106 @@ mod tests {
                     },
                 ))),
             })
+        }
+
+        async fn synthesize_sonic(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _transcript: &str,
+            _interrupt: FakeRuntimeInterrupt,
+        ) -> Result<Vec<AudioFrame>, BrainError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for FallbackToolLoopBudgetTransports {
+        async fn transcribe_audio(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _frame: &AudioFrame,
+        ) -> Result<RunnerTranscript, BrainError> {
+            Ok(RunnerTranscript {
+                interim_text: String::new(),
+                final_text: "omitted".to_owned(),
+                confidence: Some(1.0),
+            })
+        }
+
+        async fn stream_gemini(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _request: Value,
+        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+            let mut calls = self.calls.lock().expect("calls lock poisoned");
+            *calls += 1;
+            let call_index = *calls;
+            drop(calls);
+
+            let tool_call = GeminiStreamEvent::FunctionCall {
+                id: format!("call-intent-{call_index}"),
+                name: "emit_manuscript_intent".to_owned(),
+                args: json!({}),
+                part: json!({
+                    "functionCall": {
+                        "id": format!("call-intent-{call_index}"),
+                        "name": "emit_manuscript_intent",
+                        "args": {},
+                    }
+                }),
+            };
+            if call_index == 1 {
+                Ok(vec![
+                    GeminiStreamEvent::FallbackActivated {
+                        from_model: "gemini-3.5-pro".to_owned(),
+                        to_model: "gemini-3.5-flash".to_owned(),
+                        reason: "primary_429".to_owned(),
+                        failure: None,
+                    },
+                    tool_call,
+                ])
+            } else {
+                Ok(vec![tool_call])
+            }
+        }
+
+        async fn synthesize_sonic(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _transcript: &str,
+            _interrupt: FakeRuntimeInterrupt,
+        ) -> Result<Vec<AudioFrame>, BrainError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for GeminiStreamErrorTransports {
+        async fn transcribe_audio(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _frame: &AudioFrame,
+        ) -> Result<RunnerTranscript, BrainError> {
+            Ok(RunnerTranscript {
+                interim_text: String::new(),
+                final_text: "omitted".to_owned(),
+                confidence: Some(1.0),
+            })
+        }
+
+        async fn stream_gemini(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _request: Value,
+        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+            tokio::time::sleep(self.delay).await;
+            Ok(vec![GeminiStreamEvent::Error(
+                "Gemini stream provider error".to_owned(),
+            )])
         }
 
         async fn synthesize_sonic(

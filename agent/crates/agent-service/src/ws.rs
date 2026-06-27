@@ -2447,6 +2447,7 @@ fn should_suppress_cancelled_response(
             }
             false
         }
+        agent_domain::BrainEvent::ProviderFallbackActivated { .. } => false,
         _ => event
             .response_id()
             .is_some_and(|response_id| cancelled_responses.response_ids.contains(response_id)),
@@ -5131,5 +5132,43 @@ mod tests {
             event.kind == VoiceEvidenceEventKind::ProviderFallback
                 && event.detail.contains("reason=primary_429")
         }));
+    }
+
+    #[test]
+    fn cancellation_suppression_keeps_internal_provider_fallback_activations() {
+        let mut tracker = CancelledResponseTracker::default();
+        let question = fixture_question();
+
+        assert!(!should_suppress_cancelled_response(
+            &mut tracker,
+            &agent_domain::BrainEvent::QuestionStarted {
+                response_id: "response-1".to_owned(),
+                question,
+            },
+        ));
+        assert!(!should_suppress_cancelled_response(
+            &mut tracker,
+            &agent_domain::BrainEvent::ResponseCancelledFor {
+                response_id: "response-1".to_owned(),
+            },
+        ));
+        assert!(!should_suppress_cancelled_response(
+            &mut tracker,
+            &agent_domain::BrainEvent::ProviderFallbackActivated {
+                response_id: "response-1".to_owned(),
+                provider: "gemini".to_owned(),
+                from_model: "gemini-3.5-pro".to_owned(),
+                to_model: "gemini-3.5-flash".to_owned(),
+                reason: "primary_429".to_owned(),
+                failure: None,
+            },
+        ));
+        assert!(should_suppress_cancelled_response(
+            &mut tracker,
+            &agent_domain::BrainEvent::ResponseTranscriptDelta {
+                response_id: "response-1".to_owned(),
+                text: "suppressed browser text".to_owned(),
+            },
+        ));
     }
 }
