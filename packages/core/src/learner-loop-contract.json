@@ -36,9 +36,11 @@
       "stage": "pre_loop",
       "resolution_kind": "recoverable",
       "submitted_answer_resolution": false,
-      "max_resolution_ms": 0,
+      "max_resolution_ms": 15000,
       "learner_safe": true,
       "authority": "pre_loop_service_event",
+      "failure_class": "pre_loop_unavailable",
+      "terminal_reason": "pre_loop_upload_unavailable",
       "sanitized_evidence": true,
       "runtime_copy_causes": [],
       "copy": {
@@ -50,7 +52,13 @@
         "primary_action_intent": "start_session",
         "status_label": "upload"
       },
-      "operator_diagnostics": ["stage", "deploy_sha", "latency_ms"]
+      "operator_diagnostics": [
+        "terminal_reason",
+        "failure_class",
+        "stage",
+        "deploy_sha",
+        "latency_ms"
+      ]
     },
     {
       "id": "pre_loop_ingestion",
@@ -58,10 +66,11 @@
       "stage": "pre_loop",
       "resolution_kind": "recoverable",
       "submitted_answer_resolution": false,
-      "max_resolution_ms": 0,
+      "max_resolution_ms": 30000,
       "learner_safe": true,
       "authority": "pre_loop_service_event",
       "failure_class": "pre_loop_unavailable",
+      "terminal_reason": "pre_loop_ingestion_unavailable",
       "sanitized_evidence": true,
       "runtime_copy_causes": ["ingestion_failed", "ingestion_pending"],
       "copy": {
@@ -73,7 +82,13 @@
         "primary_action_intent": "retry_agent",
         "status_label": "ingestion"
       },
-      "operator_diagnostics": ["failure_class", "stage", "deploy_sha", "latency_ms"]
+      "operator_diagnostics": [
+        "terminal_reason",
+        "failure_class",
+        "stage",
+        "deploy_sha",
+        "latency_ms"
+      ]
     },
     {
       "id": "pre_loop_session_creation",
@@ -81,10 +96,11 @@
       "stage": "pre_loop",
       "resolution_kind": "recoverable",
       "submitted_answer_resolution": false,
-      "max_resolution_ms": 0,
+      "max_resolution_ms": 10000,
       "learner_safe": true,
       "authority": "pre_loop_service_event",
       "failure_class": "session_bootstrap_unavailable",
+      "terminal_reason": "pre_loop_session_unavailable",
       "sanitized_evidence": true,
       "runtime_copy_causes": ["api_missing", "agent_offline"],
       "copy": {
@@ -96,7 +112,14 @@
         "primary_action_intent": "retry_agent",
         "status_label": "session bootstrap"
       },
-      "operator_diagnostics": ["failure_class", "stage", "provider", "deploy_sha", "latency_ms"]
+      "operator_diagnostics": [
+        "terminal_reason",
+        "failure_class",
+        "stage",
+        "provider",
+        "deploy_sha",
+        "latency_ms"
+      ]
     },
     {
       "id": "live_runtime_ready",

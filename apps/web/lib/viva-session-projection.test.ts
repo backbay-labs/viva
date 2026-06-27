@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type {
   AgentStudySetReadiness,
+  AgentTerminalSessionReason,
   AnswerEvaluation,
   Concept,
   SessionQuestion,
@@ -656,13 +657,15 @@ describe("projectRuntimeCopy", () => {
   test("keeps terminal runtime copy reconciled with the BAC-510 contract", () => {
     for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {
       if (!state.terminal_reason) continue;
+      if (state.stage === "pre_loop") continue;
+      const terminalReason = state.terminal_reason as AgentTerminalSessionReason;
 
       const copy = projectRuntimeCopy({
-        close: { code: 1011, reason: state.terminal_reason, wasClean: true },
+        close: { code: 1011, reason: terminalReason, wasClean: true },
         readiness: trustedReadiness,
         ready: ready("cartesia_gemini", { live_runtime: true }),
         status: "closed",
-        terminalReason: state.terminal_reason,
+        terminalReason,
       });
 
       expect(copy.capsuleLabel).toBe(state.copy.capsule_label);

@@ -111,6 +111,28 @@ describe("BAC-510 learner loop contract", () => {
     expect(authBootstrap?.max_resolution_ms).toBe(0);
   });
 
+  test("bounds pre-loop service states with sanitized terminal reasons", () => {
+    const preLoopStates = VIVA_LEARNER_LOOP_CONTRACT.states.filter(
+      (state) => state.stage === "pre_loop",
+    );
+
+    expect(preLoopStates.map((state) => state.id).sort()).toEqual([
+      "pre_loop_ingestion",
+      "pre_loop_session_creation",
+      "pre_loop_upload",
+    ]);
+    for (const state of preLoopStates) {
+      expect(state.submitted_answer_resolution).toBe(false);
+      expect(state.max_resolution_ms).toBeGreaterThan(0);
+      expect(state.max_resolution_ms).toBeLessThanOrEqual(VIVA_LEARNER_LOOP_MAX_TURN_MS);
+      expect(state.authority).toBe("pre_loop_service_event");
+      expect(/^pre_loop_/.test(state.terminal_reason ?? "")).toBe(true);
+      expect(state.operator_diagnostics).toContain("terminal_reason");
+      expect(state.operator_diagnostics).toContain("failure_class");
+      expect(state.operator_diagnostics).toContain("stage");
+    }
+  });
+
   test("every terminal learner state has a protocol terminal reason", () => {
     const terminalStates = VIVA_LEARNER_LOOP_CONTRACT.states.filter(
       (state) => state.resolution_kind === "terminal",

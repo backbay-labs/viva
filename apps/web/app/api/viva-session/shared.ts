@@ -4,6 +4,8 @@ import { type NextRequest, NextResponse } from "next/server";
 export type VivaSessionRouteFailureClass = {
   error: string;
   failure_class: string;
+  stage?: "pre_loop" | "session";
+  terminal_reason?: string;
   token_refresh_outcome: string;
 };
 
@@ -95,7 +97,10 @@ type VivaLibraryStudySet = {
     resume?: VivaLibraryAction;
     start?: VivaLibraryAction;
   };
+  concept_count?: number;
   id?: string;
+  ingestion_status?: "pending" | "processing" | "ready" | "failed" | "retry";
+  question_count?: number;
   user_id?: string;
 };
 
@@ -119,6 +124,9 @@ const SESSION_BOOTSTRAP_TOKEN_PREFIX = "viva-bootstrap1";
 const SESSION_BOOTSTRAP_TOKEN_PURPOSE = "viva_session_bootstrap";
 const LIBRARY_CONTROL_TOKEN_PREFIX = "viva-control1";
 const LIBRARY_CONTROL_TOKEN_PURPOSE = "viva_library_control";
+const DEFAULT_SESSION_BOOTSTRAP_TIMEOUT_MS = 10_000;
+const PRE_LOOP_INGESTION_TERMINAL_REASON = "pre_loop_ingestion_unavailable";
+const PRE_LOOP_SESSION_TERMINAL_REASON = "pre_loop_session_unavailable";
 export const VIVA_SESSION_AUTH_FAILURE_PROFILES = {
   access_denied: sessionAuthFailureProfile("access_denied", "terminal", false),
   expired: sessionAuthFailureProfile("expired", "recoverable", true),
@@ -482,7 +490,13 @@ async function mintSessionFromLibrary(input: {
   if (!agentBaseUrl || !bearerToken) {
     return {
       ok: false,
-      response: sessionJsonError(503, "viva_session_agent_unavailable", "failed"),
+      response: sessionPreLoopJsonError(
+        503,
+        "viva_session_agent_unavailable",
+        "failed",
+        "session_bootstrap_unavailable",
+        PRE_LOOP_SESSION_TERMINAL_REASON,
+      ),
     };
   }
 
@@ -490,36 +504,83 @@ async function mintSessionFromLibrary(input: {
   if (!upstream) {
     return {
       ok: false,
-      response: sessionJsonError(503, "viva_session_agent_unavailable", "failed"),
+      response: sessionPreLoopJsonError(
+        503,
+        "viva_session_agent_unavailable",
+        "failed",
+        "session_bootstrap_unavailable",
+        PRE_LOOP_SESSION_TERMINAL_REASON,
+      ),
     };
   }
-  let response: Response;
+  let timedOut = false;
+  let snapshot: VivaLibrarySnapshot;
+  const timeout = sessionBootstrapTimeoutMs();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeout);
   try {
-    response = await fetch(upstream, {
+    const response = await fetch(upstream, {
       cache: "no-store",
       headers: {
         authorization: `Bearer ${bearerToken}`,
         origin: input.origin,
       },
       method: "GET",
+      signal: controller.signal,
     });
+    if (!response.ok) {
+      return {
+        ok: false,
+        response: sessionPreLoopJsonError(
+          502,
+          "viva_session_agent_unavailable",
+          "failed",
+          "session_bootstrap_unavailable",
+          PRE_LOOP_SESSION_TERMINAL_REASON,
+        ),
+      };
+    }
+    snapshot = await readJson(response);
+    if (timedOut) {
+      return {
+        ok: false,
+        response: sessionPreLoopJsonError(
+          504,
+          "viva_session_agent_timeout",
+          "failed",
+          "session_bootstrap_unavailable",
+          PRE_LOOP_SESSION_TERMINAL_REASON,
+        ),
+      };
+    }
   } catch {
     return {
       ok: false,
-      response: sessionJsonError(502, "viva_session_agent_unavailable", "failed"),
+      response: sessionPreLoopJsonError(
+        timedOut ? 504 : 502,
+        timedOut ? "viva_session_agent_timeout" : "viva_session_agent_unavailable",
+        "failed",
+        "session_bootstrap_unavailable",
+        PRE_LOOP_SESSION_TERMINAL_REASON,
+      ),
     };
-  }
-  if (!response.ok) {
-    return {
-      ok: false,
-      response: sessionJsonError(502, "viva_session_agent_unavailable", "failed"),
-    };
+  } finally {
+    clearTimeout(timeoutId);
   }
 
-  const snapshot = await readJson(response);
   const studySet = snapshot.study_sets?.find(
     (entry) => entry.id === input.studySetId && entry.user_id === input.userId,
   );
+  const preLoopStudySetError = studySet ? preLoopStudySetUnavailableResponse(studySet) : null;
+  if (preLoopStudySetError) {
+    return {
+      ok: false,
+      response: preLoopStudySetError,
+    };
+  }
   const action = studySet?.actions?.[input.actionName];
   if (
     !studySet ||
@@ -530,9 +591,13 @@ async function mintSessionFromLibrary(input: {
   ) {
     return {
       ok: false,
-      response: sessionJsonError(409, "session_mint_unavailable", "unavailable", {
-        failure_class: "session_unavailable",
-      }),
+      response: sessionPreLoopJsonError(
+        409,
+        "session_mint_unavailable",
+        "unavailable",
+        "session_bootstrap_unavailable",
+        PRE_LOOP_SESSION_TERMINAL_REASON,
+      ),
     };
   }
   return {
@@ -546,6 +611,50 @@ async function mintSessionFromLibrary(input: {
       session_token: action.session_token,
     },
   };
+}
+
+function preLoopStudySetUnavailableResponse(
+  studySet: VivaLibraryStudySet,
+): NextResponse<VivaSessionRouteFailureClass> | null {
+  if (studySet.ingestion_status === "failed") {
+    return sessionPreLoopJsonError(
+      409,
+      "study_set_ingestion_failed",
+      "blocked",
+      "pre_loop_unavailable",
+      PRE_LOOP_INGESTION_TERMINAL_REASON,
+    );
+  }
+  if (
+    studySet.ingestion_status === "pending" ||
+    studySet.ingestion_status === "processing" ||
+    studySet.ingestion_status === "retry"
+  ) {
+    return sessionPreLoopJsonError(
+      409,
+      `study_set_ingestion_${studySet.ingestion_status}`,
+      "blocked",
+      "pre_loop_unavailable",
+      PRE_LOOP_INGESTION_TERMINAL_REASON,
+    );
+  }
+  if (
+    studySet.ingestion_status === "ready" &&
+    (nonPositiveCount(studySet.concept_count) || nonPositiveCount(studySet.question_count))
+  ) {
+    return sessionPreLoopJsonError(
+      409,
+      "study_set_empty",
+      "blocked",
+      "pre_loop_unavailable",
+      PRE_LOOP_INGESTION_TERMINAL_REASON,
+    );
+  }
+  return null;
+}
+
+function nonPositiveCount(value: number | undefined): boolean {
+  return typeof value === "number" && value <= 0;
 }
 
 async function readJson(response: Response): Promise<VivaLibrarySnapshot> {
@@ -657,6 +766,20 @@ function sessionAuthTerminalJsonError(
   });
 }
 
+function sessionPreLoopJsonError(
+  status: number,
+  error: string,
+  tokenRefreshOutcome: string,
+  failureClass: string,
+  terminalReason: string,
+): NextResponse<VivaSessionRouteFailureClass> {
+  return sessionJsonError(status, error, tokenRefreshOutcome, {
+    failure_class: failureClass,
+    stage: "pre_loop",
+    terminal_reason: terminalReason,
+  });
+}
+
 function sessionJson(
   body: VivaSessionRouteOutcome,
   status: number,
@@ -671,12 +794,18 @@ function sessionJsonError(
   status: number,
   error: string,
   tokenRefreshOutcome: string,
-  options: { failure_class?: string } = {},
+  options: {
+    failure_class?: string;
+    stage?: "pre_loop" | "session";
+    terminal_reason?: string;
+  } = {},
 ): NextResponse<VivaSessionRouteFailureClass> {
   return NextResponse.json(
     {
       error,
       failure_class: options.failure_class ?? "session_bootstrap_failed",
+      ...(options.stage ? { stage: options.stage } : {}),
+      ...(options.terminal_reason ? { terminal_reason: options.terminal_reason } : {}),
       token_refresh_outcome: tokenRefreshOutcome,
     },
     {
@@ -1017,6 +1146,16 @@ function agentLibraryUrl(agentBaseUrl: string, userId: string): URL | null {
   } catch {
     return null;
   }
+}
+
+function sessionBootstrapTimeoutMs(): number {
+  return Math.min(
+    positiveInteger(
+      process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS,
+      DEFAULT_SESSION_BOOTSTRAP_TIMEOUT_MS,
+    ),
+    DEFAULT_SESSION_BOOTSTRAP_TIMEOUT_MS,
+  );
 }
 
 function configuredAllowlist(envName: string): Set<string> | null {

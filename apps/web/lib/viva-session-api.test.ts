@@ -22,6 +22,7 @@ const originalEnv = {
   VIVA_AGENT_REST_BEARER_TOKEN: process.env.VIVA_AGENT_REST_BEARER_TOKEN,
   VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET: process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET,
   VIVA_SESSION_ALLOWED_STUDY_SET_IDS: process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS,
+  VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS: process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS,
   VIVA_SESSION_ALLOWED_USER_IDS: process.env.VIVA_SESSION_ALLOWED_USER_IDS,
   VIVA_SESSION_MINT_MAX_PER_MINUTE: process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE,
   VIVA_VOICE_SESSION_TOKEN_SECRET: process.env.VIVA_VOICE_SESSION_TOKEN_SECRET,
@@ -37,6 +38,7 @@ describe("Viva same-origin session API", () => {
     process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = "redacted-bootstrap-signing-secret";
     process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user";
     process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+    process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS = "10000";
     process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "20";
     process.env.VIVA_VOICE_SESSION_TOKEN_SECRET = "redacted-session-signing-secret";
   });
@@ -121,7 +123,9 @@ describe("Viva same-origin session API", () => {
     expect(response.status).toBe(503);
     expect(body).toEqual({
       error: "viva_session_agent_unavailable",
-      failure_class: "session_bootstrap_failed",
+      failure_class: "session_bootstrap_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_session_unavailable",
       token_refresh_outcome: "failed",
     });
     expect(calls).toEqual([]);
@@ -143,11 +147,116 @@ describe("Viva same-origin session API", () => {
     expect(response.status).toBe(503);
     expect(body).toEqual({
       error: "viva_session_agent_unavailable",
-      failure_class: "session_bootstrap_failed",
+      failure_class: "session_bootstrap_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_session_unavailable",
       token_refresh_outcome: "failed",
     });
     expect(JSON.stringify(body)).not.toContain("not a url");
     expect(calls).toEqual([]);
+  });
+
+  test("start times out hung session creation with a pre-loop terminal reason", async () => {
+    process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS = "5";
+    let observedSignal: AbortSignal | undefined;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      observedSignal = init?.signal ?? undefined;
+      if (!observedSignal) {
+        return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      }
+      return new Promise<Response>((_resolve, reject) => {
+        observedSignal?.addEventListener("abort", () => {
+          reject(new Error("raw upstream timeout with bearer redacted-rest-bearer"));
+        });
+      });
+    }) as typeof fetch;
+
+    const response = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(504);
+    expect(observedSignal?.aborted).toBe(true);
+    expect(body).toEqual({
+      error: "viva_session_agent_timeout",
+      failure_class: "session_bootstrap_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_session_unavailable",
+      token_refresh_outcome: "failed",
+    });
+    expect(JSON.stringify(body)).not.toContain("redacted-rest-bearer");
+  });
+
+  test("start caps configured bootstrap timeout to the contract maximum", async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const scheduledTimeouts: number[] = [];
+    process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS = "60000";
+    globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      scheduledTimeouts.push(Number(timeout));
+      return originalSetTimeout(handler, 0, ...args);
+    }) as typeof setTimeout;
+    let observedSignal: AbortSignal | undefined;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      observedSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        observedSignal?.addEventListener(
+          "abort",
+          () => reject(new Error("raw upstream timeout with bearer redacted-rest-bearer")),
+          { once: true },
+        );
+      });
+    }) as typeof fetch;
+
+    try {
+      const response = await startSession(
+        sessionRequest("/api/viva-session/start", sessionStartPayload()),
+      );
+      const body = (await response.json()) as Record<string, unknown>;
+
+      expect(scheduledTimeouts).toContain(10_000);
+      expect(response.status).toBe(504);
+      expect(observedSignal?.aborted).toBe(true);
+      expect(body).toEqual({
+        error: "viva_session_agent_timeout",
+        failure_class: "session_bootstrap_unavailable",
+        stage: "pre_loop",
+        terminal_reason: "pre_loop_session_unavailable",
+        token_refresh_outcome: "failed",
+      });
+      expect(JSON.stringify(body)).not.toContain("redacted-rest-bearer");
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
+  });
+
+  test("start keeps the bootstrap timeout active while reading the library body", async () => {
+    process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS = "5";
+    let observedSignal: AbortSignal | undefined;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      observedSignal = init?.signal ?? undefined;
+      return hangingJsonResponse(
+        observedSignal,
+        "raw stalled library body with bearer redacted-rest-bearer",
+      );
+    }) as typeof fetch;
+
+    const response = await Promise.race([
+      startSession(sessionRequest("/api/viva-session/start", sessionStartPayload())),
+      rejectAfter(100, "session bootstrap body read did not time out"),
+    ]);
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(504);
+    expect(observedSignal?.aborted).toBe(true);
+    expect(body).toEqual({
+      error: "viva_session_agent_timeout",
+      failure_class: "session_bootstrap_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_session_unavailable",
+      token_refresh_outcome: "failed",
+    });
+    expect(JSON.stringify(body)).not.toContain("redacted-rest-bearer");
   });
 
   test("start rejects cross-origin callers before contacting the agent", async () => {
@@ -362,6 +471,56 @@ describe("Viva same-origin session API", () => {
       failure_class: "rate_limit",
       token_refresh_outcome: "blocked",
     });
+  });
+
+  test("start enumerates failed and empty study sets before session creation", async () => {
+    const cases = [
+      {
+        snapshot: librarySnapshot({
+          conceptCount: 0,
+          ingestionStatus: "failed",
+          questionCount: 0,
+          startAvailable: false,
+          unavailableReason: "ingestion_failed",
+        }),
+        body: {
+          error: "study_set_ingestion_failed",
+          failure_class: "pre_loop_unavailable",
+          stage: "pre_loop",
+          terminal_reason: "pre_loop_ingestion_unavailable",
+          token_refresh_outcome: "blocked",
+        },
+      },
+      {
+        snapshot: librarySnapshot({
+          conceptCount: 0,
+          ingestionStatus: "ready",
+          questionCount: 0,
+          startAvailable: false,
+          unavailableReason: "empty_study_set",
+        }),
+        body: {
+          error: "study_set_empty",
+          failure_class: "pre_loop_unavailable",
+          stage: "pre_loop",
+          terminal_reason: "pre_loop_ingestion_unavailable",
+          token_refresh_outcome: "blocked",
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      globalThis.fetch = (async () => jsonResponse(200, testCase.snapshot)) as typeof fetch;
+
+      const response = await startSession(
+        sessionRequest("/api/viva-session/start", sessionStartPayload()),
+      );
+      const body = (await response.json()) as Record<string, unknown>;
+
+      expect(response.status).toBe(409);
+      expect(body).toEqual(testCase.body);
+      expect(JSON.stringify(body)).not.toContain("No usable source span");
+    }
   });
 
   test("refresh replaces an expired same-identity token and records the refresh outcome", async () => {
@@ -622,12 +781,47 @@ function jsonResponse(status: number, body: unknown): Response {
   });
 }
 
+function hangingJsonResponse(signal: AbortSignal | undefined, abortMessage: string): Response {
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            controller.error(new Error(abortMessage));
+          },
+          { once: true },
+        );
+      },
+    }),
+    {
+      headers: { "content-type": "application/json" },
+      status: 200,
+    },
+  );
+}
+
+async function rejectAfter(ms: number, message: string): Promise<never> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+  throw new Error(message);
+}
+
 function librarySnapshot({
+  conceptCount = 1,
+  ingestionStatus = "ready",
+  questionCount = 1,
   resumeToken,
+  startAvailable = true,
   startToken,
+  unavailableReason,
 }: {
+  conceptCount?: number;
+  ingestionStatus?: "pending" | "processing" | "ready" | "failed" | "retry";
+  questionCount?: number;
   resumeToken?: string;
+  startAvailable?: boolean;
   startToken?: string;
+  unavailableReason?: string;
 }) {
   return {
     privacy: {
@@ -652,19 +846,21 @@ function librarySnapshot({
                 session_token: resumeToken,
               }
             : { available: false, unavailable_reason: "no_open_session" },
-          start: {
-            available: true,
-            session_id: "server-session",
-            session_token: startToken ?? "viva1.redacted-default-token",
-          },
+          start: startAvailable
+            ? {
+                available: true,
+                session_id: "server-session",
+                session_token: startToken ?? "viva1.redacted-default-token",
+              }
+            : { available: false, unavailable_reason: unavailableReason ?? "unavailable" },
         },
-        concept_count: 1,
+        concept_count: conceptCount,
         course: "Biology 201",
         documents: [],
         id: "biology-midterm",
-        ingestion_error: null,
-        ingestion_status: "ready",
-        question_count: 1,
+        ingestion_error: ingestionStatus === "failed" ? "No usable source span" : null,
+        ingestion_status: ingestionStatus,
+        question_count: questionCount,
         server_owned: true,
         title: "Biology Midterm",
         user_id: "synthetic-user",
