@@ -285,6 +285,28 @@ test("hosted monitor scheduled live opt-in gates daily token budget", () => {
   assert.equal(lowRemaining.liveMonitor.tokens_today, 7000);
 });
 
+test("hosted monitor scheduled live opt-in honors failure-count quarantine state", () => {
+  const plan = buildHostedMonitorPlan({
+    ...baseEnv,
+    VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES: "2",
+    VIVA_HOSTED_LIVE_MONITOR_ENABLED: "1",
+    VIVA_HOSTED_LIVE_MONITOR_LAST_FAILURE_AT: "2026-06-23T19:10:00.000Z",
+    VIVA_HOSTED_LIVE_MONITOR_NOW: "2026-06-23T19:20:00.000Z",
+    VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY: "0",
+    VIVA_HOSTED_LIVE_MONITOR_STATE_DATE: "2026-06-23",
+    VIVA_HOSTED_LIVE_MONITOR_TOKENS_TODAY: "0",
+  });
+
+  assert.deepEqual(
+    plan.runs.map((run) => run.name),
+    ["scheduled_hosted_synthetic_monitor"],
+  );
+  assert.equal(plan.liveMonitor.skip_reason, "self_quarantined");
+  assert.equal(plan.liveMonitor.quarantine_source, "failure_count");
+  assert.equal(plan.liveMonitor.consecutive_failures, 2);
+  assert.equal(plan.liveMonitor.quarantined_until, "2026-06-24T01:10:00.000Z");
+});
+
 test("hosted monitor scheduled live opt-in requires remote cap evidence for runnable live targets", () => {
   assert.throws(
     () =>

@@ -839,7 +839,6 @@ function hostedSyntheticIdentity() {
 
 function defaultHostedScenarioId() {
   if (failureControlPlan.enabled) return failureControlPlan.scenario.id;
-  if (stopToRecap) return "deterministic_partial_recap";
   if (agentProvider === "fake_cartesia_gemini") return "fake_provider_happy_path";
   return "happy_path";
 }

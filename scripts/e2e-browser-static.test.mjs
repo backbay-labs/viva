@@ -74,6 +74,16 @@ function numericConstant(source, name) {
   return Number(match[1]);
 }
 
+test("hosted browser E2E does not infer partial recap mode from stop-to-recap", async () => {
+  const source = await readFile(E2E_BROWSER_PATH, "utf8");
+
+  assert.match(
+    source,
+    /const deterministicPartialRecapScenario = hostedScenarioId === "deterministic_partial_recap"/,
+  );
+  assert.doesNotMatch(source, /if \(stopToRecap\) return "deterministic_partial_recap"/);
+});
+
 test("hosted browser E2E records answer-resolution latency evidence", async () => {
   const source = await readFile(E2E_BROWSER_PATH, "utf8");
 

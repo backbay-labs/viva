@@ -367,6 +367,26 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
       skip_reason: "self_quarantined",
     };
   }
+  const failureCountQuarantinedUntil =
+    priorFailureState.consecutiveFailures >= quarantinePolicy.consecutive_failures &&
+    priorFailureState.lastFailureAt
+      ? new Date(
+          priorFailureState.lastFailureAt.getTime() +
+            quarantinePolicy.cooldown_seconds * 1000,
+        )
+      : null;
+  if (failureCountQuarantinedUntil && failureCountQuarantinedUntil.getTime() > now.getTime()) {
+    return {
+      ...priorFailureStateEvidence(priorFailureState),
+      enabled: true,
+      now: now.toISOString(),
+      quarantine_cooldown_seconds: quarantinePolicy.cooldown_seconds,
+      quarantine_source: "failure_count",
+      quarantined_until: failureCountQuarantinedUntil.toISOString(),
+      should_run: false,
+      skip_reason: "self_quarantined",
+    };
+  }
   if (runsToday >= livePolicy.max_runs_per_day) {
     return {
       ...priorFailureStateEvidence(priorFailureState),

@@ -419,13 +419,16 @@ VIVA_HOSTED_RUNNER_MODE=pr
 ```
 
 Run that mode from a Railway deployment or manual service run for the branch
-under review. It executes the hosted synthetic provider leg, hosted
-`fake_cartesia_gemini` provider leg, token-free session-history URL audit leg,
-deterministic partial-recap leg, and the BAC-528 deterministic failure-control
-browser matrix for provider 429, provider timeout, silent stall, provider auth
-failure, malformed stream, network disconnect, Sonic/TTS timeout, recap timeout,
-invalid/expired/replayed/malformed auth material, stale socket, double submit,
-mic denied, and typed fallback. The default PR profile is
+under review. It executes three baseline PR browser legs: hosted synthetic
+provider, hosted `fake_cartesia_gemini` provider, and token-free session-history
+URL audit. It also runs the BAC-528 deterministic failure-control scenarios that
+do not require explicit browser action: provider 429, provider timeout,
+silent stall, provider auth failure, malformed stream, network disconnect,
+Sonic/TTS timeout, recap timeout, invalid/expired/replayed/malformed auth
+material, and stale socket. The default PR profile does not run the deterministic partial-recap
+contract row or browser-action scenarios such as double submit, mic denied, and
+typed fallback. Those rows remain in the matrix contract until a runner
+explicitly opts into their required browser controls. The default PR profile is
 `VIVA_HOSTED_MATRIX_PROFILE=full` when the variable is unset in PR mode; to run
 a smaller operational subset during manual triage, set
 `VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS` to a comma separated list such as:
@@ -435,9 +438,9 @@ VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS="provider_rate_limited,provider_timeout
 ```
 
 The full PR manifest publishes under `viva-hosted-monitor/pr/<run_id>/` and
-records one sanitized `hosted_e2e` result summary per scenario. When
+records one sanitized `hosted_e2e` result summary per executed scenario. When
 `VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS` names a smaller subset, the published
-matrix is filtered to the four PR browser legs plus the selected
+matrix is filtered to the three baseline PR browser legs plus the selected
 failure-control rows and includes `scenario_subset` metadata, so consumers do
 not treat unexecuted failure controls as covered. The matrix contract also names
 future product slices for ingestion/pre-loop failure (`BAC-532`) and second-tab

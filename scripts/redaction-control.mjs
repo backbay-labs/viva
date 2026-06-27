@@ -193,15 +193,27 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "scripts/hosted-monitor-runner.mjs",
     marker: "secret",
-    patterns: Object.freeze([/hmac\(`AWS4\$\{secret\}`, dateStamp\)/]),
+    patterns: Object.freeze([
+      /hmac\(`AWS4\$\{secret\}`, dateStamp\)/,
+      /^\s*secret: requiredValue\(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"\),?$/,
+      /^function signedLiveMonitorSession\(\{ secret, sessionId, studySetId, userId \}\) \{$/,
+      /createHmac\("sha256", secret\)\.update\(payload\)\.digest\("base64url"\)/,
+    ]),
   },
   {
     file: "scripts/hosted-monitor-runner.mjs",
     marker: "session_token",
     patterns: Object.freeze([
       /VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/,
+      /^\s*secret: requiredValue\(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"\),?$/,
+      /^\s*\? \{ VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession \}$/,
       /^\s*VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession,?$/,
     ]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
+    marker: "viva1.",
+    patterns: Object.freeze([/^\s*const payload = `viva1\.\$\{claimsPart\}`;$/]),
   },
   {
     file: "scripts/hosted-monitor-runner.mjs",
@@ -212,13 +224,17 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     file: "scripts/hosted-monitor-runner.mjs",
     marker: "viva_live_smoke_session_token",
     patterns: Object.freeze([
+      /^\s*\? \{ VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession \}$/,
       /^\s*VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession,?$/,
     ]),
   },
   {
     file: "scripts/hosted-monitor-runner.mjs",
     marker: "viva_voice_session_token_secret",
-    patterns: Object.freeze([/VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/]),
+    patterns: Object.freeze([
+      /VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/,
+      /^\s*secret: requiredValue\(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"\),?$/,
+    ]),
   },
   {
     file: "scripts/hosted-monitor-runner.mjs",
