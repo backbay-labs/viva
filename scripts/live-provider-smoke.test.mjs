@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -10,6 +10,9 @@ import {
   runLiveProviderSmoke,
   summarizeServerFrame,
 } from "./live-provider-smoke.mjs";
+
+const LIVE_PROVIDER_SMOKE_PATH = "scripts/live-provider-smoke.mjs";
+const AGENT_CONTRACT_PATH = "packages/core/src/agent-contract.ts";
 
 test("live provider smoke is skipped unless explicitly enabled", () => {
   const config = buildLiveSmokeConfig({ env: {} });
@@ -65,11 +68,22 @@ test("enabled live provider smoke requires explicit caps and audio input", () =>
   );
 });
 
+test("live provider smoke uses the shared voice protocol version", async () => {
+  const [smokeSource, contractSource] = await Promise.all([
+    readFile(LIVE_PROVIDER_SMOKE_PATH, "utf8"),
+    readFile(AGENT_CONTRACT_PATH, "utf8"),
+  ]);
+  const smokeVersion = numericConstant(smokeSource, "PROTOCOL_VERSION");
+  const contractVersion = numericConstant(contractSource, "VIVA_VOICE_PROTOCOL_VERSION");
+
+  assert.equal(smokeVersion, contractVersion);
+});
+
 test("server frames summarize to safe counters without raw protocol payload", () => {
   const frames = [
     {
       type: "ready",
-      version: 3,
+      version: 4,
       sample_rate_hz: 24000,
       input_encoding: "pcm_s16le",
       brain: {
@@ -90,7 +104,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 3,
+      version: 4,
       event: {
         type: "transcript_final",
         response_id: "response-1",
@@ -100,7 +114,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 3,
+      version: 4,
       event: {
         type: "answer_evaluated",
         response_id: "response-1",
@@ -111,7 +125,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 3,
+      version: 4,
       event: {
         type: "source_reference",
         response_id: "response-1",
@@ -123,7 +137,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 3,
+      version: 4,
       event: {
         type: "audio_delta",
         response_id: "response-1",
@@ -134,7 +148,7 @@ test("server frames summarize to safe counters without raw protocol payload", ()
     },
     {
       type: "event",
-      version: 3,
+      version: 4,
       event: {
         type: "recap_ready",
         response_id: "response-1",
@@ -783,7 +797,7 @@ function accessDeniedReadinessBody() {
 function readyFrame() {
   return {
     type: "ready",
-    version: 3,
+    version: 4,
     sample_rate_hz: 24000,
     input_encoding: "pcm_s16le",
     brain: {
@@ -920,7 +934,7 @@ class MalformedStreamSocket extends FakeSocket {
       queueMicrotask(() => {
         this.message({
           type: "error",
-          version: 3,
+          version: 4,
           message: "provider raw payload with prompt text must not be retained",
         });
         this.close(1011, "provider stream failed");
@@ -942,7 +956,7 @@ class InvalidJsonSocket extends FakeSocket {
       }
     } else if (Buffer.isBuffer(data)) {
       queueMicrotask(() => {
-        this.rawMessage('{"type":"event","version":3,"event":');
+        this.rawMessage('{"type":"event","version":4,"event":');
         this.close(1011, "provider stream failed");
       });
     }
@@ -982,10 +996,16 @@ class TerminalReasonSocket extends FakeSocket {
 function eventFrame(type, event) {
   return {
     type: "event",
-    version: 3,
+    version: 4,
     event: {
       type,
       ...event,
     },
   };
+}
+
+function numericConstant(source, name) {
+  const match = source.match(new RegExp(`const ${name} = (\\d+)`));
+  assert(match, `missing numeric constant ${name}`);
+  return Number(match[1]);
 }
