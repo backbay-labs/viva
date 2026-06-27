@@ -11,3 +11,14 @@ test("release check runs the provider limiter behavior proof cited by the eviden
     /websocket_provider_backoff_denies_next_answer_before_brain_input/,
   );
 });
+
+test("release check imports executed hosted monitor matrix results before finalizing", () => {
+  assert.match(releaseCheck, /readHostedMonitorEvidence/);
+  assert.match(releaseCheck, /hostedMonitorMatrixResults/);
+  assert.match(releaseCheck, /results: hostedMonitorMatrixResults/);
+});
+
+test("release check restores shared structural redaction checks for evidence bundles", () => {
+  assert.match(releaseCheck, /assertNoForbiddenEvidenceMarkers/);
+  assert.match(releaseCheck, /assertNoForbiddenEvidenceMarkers\(evidence/);
+});
