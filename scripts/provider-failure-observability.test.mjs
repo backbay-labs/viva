@@ -55,6 +55,10 @@ test("provider failure observability defines reusable sanitized log queries", ()
   );
   assert.match(
     queriesById.get("startup_unavailable").railway_query,
+    /terminal_reason:"study_store_unavailable"/,
+  );
+  assert.match(
+    queriesById.get("startup_unavailable").railway_query,
     /failure_class:"session_bootstrap_unavailable"/,
   );
   assert.match(
@@ -65,7 +69,15 @@ test("provider failure observability defines reusable sanitized log queries", ()
     queriesById.get("token_refresh_failure").railway_query,
     /service:"web" event:"viva_session_route_failure"/,
   );
+  assert.match(
+    queriesById.get("token_refresh_failure").railway_query,
+    /service:"agent-service" event:"provider_failure_observed"/,
+  );
   assert.match(queriesById.get("token_refresh_failure").railway_query, /route:"refresh"/);
+  assert.match(
+    queriesById.get("token_refresh_failure").railway_query,
+    /signal:"session_auth_rejected"/,
+  );
   assert.match(
     queriesById.get("token_refresh_failure").railway_query,
     /token_refresh_outcome:"failed"/,
@@ -127,6 +139,14 @@ test("reviewed BAC-525 queries name emitted log and evidence surfaces", () => {
   assert(
     queriesById.get("token_refresh_failure").evidence_fields.includes("action"),
     "token refresh failure query must expose the action discriminator",
+  );
+  assert(
+    queriesById.get("token_refresh_failure").evidence_fields.includes("terminal_reason"),
+    "token refresh failure query must expose websocket terminal reasons",
+  );
+  assert(
+    queriesById.get("token_refresh_failure").evidence_fields.includes("signal"),
+    "token refresh failure query must expose websocket auth signals",
   );
   assert.match(
     queriesById.get("stuck_checking").railway_query,

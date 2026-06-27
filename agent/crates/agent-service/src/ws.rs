@@ -1364,11 +1364,13 @@ fn terminal_observability_classification(
             stage: "store",
             signal: "pending_evaluation",
         },
-        "study_set_access_denied" => TerminalObservabilityClassification {
-            failure_class: "pre_loop_unavailable",
-            stage: "pre_loop",
-            signal: "pre_loop_unavailable",
-        },
+        "study_set_access_denied" | "study_store_unavailable" => {
+            TerminalObservabilityClassification {
+                failure_class: "pre_loop_unavailable",
+                stage: "pre_loop",
+                signal: "pre_loop_unavailable",
+            }
+        }
         "first_frame_timeout"
         | "invalid_first_frame"
         | "closed_before_config"
@@ -2899,6 +2901,14 @@ mod tests {
         );
         assert_eq!(
             terminal_observability_classification("study_set_access_denied"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "pre_loop_unavailable",
+                stage: "pre_loop",
+                signal: "pre_loop_unavailable",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("study_store_unavailable"),
             Some(TerminalObservabilityClassification {
                 failure_class: "pre_loop_unavailable",
                 stage: "pre_loop",

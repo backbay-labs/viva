@@ -672,21 +672,30 @@ describe("Viva same-origin session API", () => {
       },
     ];
     const observed = [];
-    for (const input of cases) {
-      const response = await refreshSession(
-        sessionRequest("/api/viva-session/refresh", {
-          session_id: "server-session",
-          session_token: input.token,
-          study_set_id: "biology-midterm",
-          user_id: "synthetic-user",
-        }),
-      );
-      const body = (await response.json()) as VivaSessionRouteFailureClass;
-      observed.push({ body, status: response.status });
-      const serialized = JSON.stringify(body);
-      for (const fragment of input.forbiddenFragments) {
-        expect(serialized).not.toContain(fragment);
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (message?: unknown) => {
+      warnings.push(String(message));
+    };
+    try {
+      for (const input of cases) {
+        const response = await refreshSession(
+          sessionRequest("/api/viva-session/refresh", {
+            session_id: "server-session",
+            session_token: input.token,
+            study_set_id: "biology-midterm",
+            user_id: "synthetic-user",
+          }),
+        );
+        const body = (await response.json()) as VivaSessionRouteFailureClass;
+        observed.push({ body, status: response.status });
+        const serialized = JSON.stringify(body);
+        for (const fragment of input.forbiddenFragments) {
+          expect(serialized).not.toContain(fragment);
+        }
       }
+    } finally {
+      console.warn = originalWarn;
     }
 
     expect(observed).toEqual([
@@ -715,6 +724,20 @@ describe("Viva same-origin session API", () => {
         },
       },
     ]);
+    const logPayloads = warnings.map((entry) => JSON.parse(entry));
+    expect(logPayloads.map((entry) => entry.error)).toEqual([
+      "invalid_session_identity",
+      "invalid_session_token",
+      "invalid_session_token",
+    ]);
+    expect(logPayloads.map((entry) => entry.token_refresh_outcome)).toEqual([
+      "identity_mismatch",
+      "invalid_rejected",
+      "malformed_rejected",
+    ]);
+    expect(JSON.stringify(logPayloads)).not.toContain("mismatch-nonce");
+    expect(JSON.stringify(logPayloads)).not.toContain("invalid-signature-nonce");
+    expect(JSON.stringify(logPayloads)).not.toContain("not-a-viva-token");
     expect(calls).toEqual([]);
   });
 

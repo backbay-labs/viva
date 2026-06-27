@@ -16,6 +16,14 @@ type VivaSessionRouteLogContext = {
   route: VivaSessionRouteName;
 };
 
+type VivaSessionRouteLogOptions = {
+  action?: VivaSessionRouteAction | null;
+  logError?: string;
+  logFailureClass?: string;
+  logTokenRefreshOutcome?: string;
+  route?: VivaSessionRouteName;
+};
+
 export type VivaSessionRouteFailureLog = VivaSessionRouteFailureClass & {
   action: VivaSessionRouteAction | null;
   deploy_sha: string | null;
@@ -834,6 +842,9 @@ function sessionAuthTerminalJsonError(
   return sessionJsonError(401, "session_auth_terminal", "terminal", {
     ...logContext,
     failure_class: "session_auth_failure",
+    logError: terminalAuthLogError(operatorCode),
+    logFailureClass: "session_auth_failure",
+    logTokenRefreshOutcome: terminalAuthLogTokenRefreshOutcome(operatorCode),
   });
 }
 
@@ -870,6 +881,9 @@ function sessionJsonError(
   options: {
     action?: VivaSessionRouteAction | null;
     failure_class?: string;
+    logError?: string;
+    logFailureClass?: string;
+    logTokenRefreshOutcome?: string;
     route?: VivaSessionRouteName;
     stage?: "pre_loop" | "session";
     terminal_reason?: string;
@@ -882,7 +896,15 @@ function sessionJsonError(
     ...(options.terminal_reason ? { terminal_reason: options.terminal_reason } : {}),
     token_refresh_outcome: tokenRefreshOutcome,
   };
-  emitVivaSessionRouteFailureLog(body, status, options);
+  emitVivaSessionRouteFailureLog(
+    {
+      error: options.logError ?? body.error,
+      failure_class: options.logFailureClass ?? body.failure_class,
+      token_refresh_outcome: options.logTokenRefreshOutcome ?? body.token_refresh_outcome,
+    },
+    status,
+    options,
+  );
   return NextResponse.json(body, {
     headers: { "cache-control": "no-store" },
     status,
@@ -909,10 +931,33 @@ export function vivaSessionRouteFailureLogPayload(
 function emitVivaSessionRouteFailureLog(
   body: VivaSessionRouteFailureClass,
   status: number,
-  context: { action?: VivaSessionRouteAction | null; route?: VivaSessionRouteName },
+  context: VivaSessionRouteLogOptions,
 ) {
   const payload = vivaSessionRouteFailureLogPayload(body, status, context);
   console.warn(JSON.stringify(payload));
+}
+
+function terminalAuthLogError(operatorCode: Exclude<VivaSessionAuthFailureCode, "expired">) {
+  return operatorCode === "identity_mismatch"
+    ? "invalid_session_identity"
+    : "invalid_session_token";
+}
+
+function terminalAuthLogTokenRefreshOutcome(
+  operatorCode: Exclude<VivaSessionAuthFailureCode, "expired">,
+) {
+  switch (operatorCode) {
+    case "identity_mismatch":
+      return "identity_mismatch";
+    case "invalid_signature":
+      return "invalid_rejected";
+    case "malformed":
+      return "malformed_rejected";
+    case "replayed":
+      return "replayed_rejected";
+    case "access_denied":
+      return "access_denied";
+  }
 }
 
 function sessionFailureStage(failureClass: string): string {

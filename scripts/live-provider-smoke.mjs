@@ -12,6 +12,7 @@ import { assertNoForbiddenEvidenceMarkers } from "./redaction-control.mjs";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PROTOCOL_VERSION = 4;
 const LIVE_PROVIDER = "cartesia_gemini";
+const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEFAULT_AGENT_HTTP_URL = "http://127.0.0.1:4318";
 const DEFAULT_BOOTSTRAP_TEXT =
   "Live smoke study note: ATP synthase uses a proton gradient to produce ATP. State the mechanism in one concise sentence.";
@@ -39,13 +40,17 @@ const SAFE_EVENT_CODES = Object.freeze({
 });
 export function buildLiveSmokeConfig({ env = process.env, rootDir = root } = {}) {
   const artifactDir = liveSmokeArtifactDir(env, rootDir);
+  const deploySha = deploymentSha(env);
   const outputPath = liveSmokeOutputPath(env, rootDir);
   const enabled = liveSmokeEnabled(env);
+  const model = liveSmokeModel(env);
   const provider = LIVE_PROVIDER;
   if (!enabled) {
     return {
       artifactDir,
+      deploySha,
       enabled,
+      model,
       outputPath,
       provider,
     };
@@ -94,11 +99,13 @@ export function buildLiveSmokeConfig({ env = process.env, rootDir = root } = {})
     bearerToken: env.VIVA_VOICE_WS_BEARER_TOKEN?.trim() || null,
     bootstrapText: env.VIVA_LIVE_SMOKE_BOOTSTRAP_TEXT || DEFAULT_BOOTSTRAP_TEXT,
     caps,
+    deploySha,
     enabled,
     httpBaseUrl,
     liveMonitorConsecutiveFailures: optionalNonNegativeInteger(
       env.VIVA_LIVE_MONITOR_CONSECUTIVE_FAILURES,
     ),
+    model,
     origin: env.VIVA_LIVE_SMOKE_ORIGIN?.trim() || null,
     outputPath,
     provider,
@@ -238,6 +245,8 @@ export async function runLiveProviderSmoke({
     },
     monitor: liveMonitorEvidence({
       consecutiveFailures: config.liveMonitorConsecutiveFailures,
+      deploySha: config.deploySha,
+      model: config.model,
       status,
       terminalReason: websocket.terminal_reason,
     }),
@@ -713,8 +722,10 @@ function baseEvidence(config, now) {
   return {
     schema: "viva.live_provider_smoke.v1",
     generated_at: now().toISOString(),
+    deploy_sha: config.deploySha,
     enabled: true,
     failure_matrix: failureMatrixEvidence(),
+    model: config.model,
     provider: config.provider,
     caps: { ...config.caps },
     privacy: privacyEvidence(),
@@ -725,7 +736,9 @@ function skippedEvidence(config, now) {
   return {
     schema: "viva.live_provider_smoke.v1",
     generated_at: now().toISOString(),
+    deploy_sha: config.deploySha,
     enabled: false,
+    model: config.model,
     status: "skipped",
     provider: config.provider,
     terminal_reason: "explicit_opt_in_not_set",
@@ -745,13 +758,21 @@ function privacyEvidence() {
   };
 }
 
-export function liveMonitorEvidence({ consecutiveFailures, status, terminalReason }) {
+export function liveMonitorEvidence({
+  consecutiveFailures,
+  deploySha = "unknown",
+  model = DEFAULT_GEMINI_MODEL,
+  status,
+  terminalReason,
+}) {
   const failed = status === "failed";
   const stuckChecking = terminalReason === "recap_timeout";
   return {
+    deploy_sha: deploySha,
     failure_class: failed ? "live_monitor_failure" : null,
     live_monitor_attempt_count: 1,
     live_monitor_consecutive_failures: failed ? Math.max(1, consecutiveFailures) : 0,
+    model,
     sanitized: true,
     signal: failed ? "live_monitor_failure" : null,
     stage: "monitor",
@@ -763,6 +784,8 @@ export function liveMonitorEvidence({ consecutiveFailures, status, terminalReaso
 function failedMonitorEvidence(config, terminalReason) {
   return liveMonitorEvidence({
     consecutiveFailures: config.liveMonitorConsecutiveFailures,
+    deploySha: config.deploySha,
+    model: config.model,
     status: "failed",
     terminalReason,
   });
@@ -868,6 +891,28 @@ function optionalNonNegativeInteger(value) {
     throw new Error("invalid live monitor consecutive failure count");
   }
   return parsed;
+}
+
+function deploymentSha(env) {
+  for (const name of [
+    "RAILWAY_GIT_COMMIT_SHA",
+    "VERCEL_GIT_COMMIT_SHA",
+    "GITHUB_SHA",
+    "SOURCE_VERSION",
+  ]) {
+    const value = env[name]?.trim();
+    if (value) return value.slice(0, 64);
+  }
+  return "unknown";
+}
+
+function liveSmokeModel(env) {
+  return (
+    env.VIVA_LIVE_SMOKE_MODEL?.trim() ||
+    env.GEMINI_MODEL?.trim() ||
+    env.GEMINI_REALTIME_MODEL?.trim() ||
+    DEFAULT_GEMINI_MODEL
+  );
 }
 
 function requiredValue(env, name, message) {

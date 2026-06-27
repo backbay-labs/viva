@@ -20,6 +20,8 @@ test("live provider smoke is skipped unless explicitly enabled", () => {
 
   assert.equal(config.enabled, false);
   assert.equal(config.provider, "cartesia_gemini");
+  assert.equal(config.deploySha, "unknown");
+  assert.equal(config.model, "gemini-3.5-flash");
   assert.match(config.outputPath, /artifacts[/\\]live-provider-smoke[/\\]evidence\.json$/);
 });
 
@@ -274,6 +276,8 @@ test("live smoke evidence audit rejects secret values and raw payload markers", 
 test("live monitor stuck-checking evidence is reserved for recap timeouts", () => {
   const recapTimeout = liveMonitorEvidence({
     consecutiveFailures: 1,
+    deploySha: "deploy-sha-123",
+    model: "gemini-live-test",
     status: "failed",
     terminalReason: "recap_timeout",
   });
@@ -284,7 +288,11 @@ test("live monitor stuck-checking evidence is reserved for recap timeouts", () =
   });
 
   assert.equal(recapTimeout.stuck_checking_sessions, 1);
+  assert.equal(recapTimeout.deploy_sha, "deploy-sha-123");
+  assert.equal(recapTimeout.model, "gemini-live-test");
   assert.equal(turnCapExceeded.stuck_checking_sessions, 0);
+  assert.equal(turnCapExceeded.deploy_sha, "unknown");
+  assert.equal(turnCapExceeded.model, "gemini-3.5-flash");
 });
 
 test("runLiveProviderSmoke proves readiness, bootstrap, websocket events, and usage counts", async () => {
@@ -311,6 +319,8 @@ test("runLiveProviderSmoke proves readiness, bootstrap, websocket events, and us
         VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
         VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "https://agent.viva.test",
         VIVA_LIVE_SMOKE_ORIGIN: "https://app.viva.test",
+        GEMINI_MODEL: "gemini-live-test",
+        GITHUB_SHA: "release-sha-123",
       },
       fetchImpl: async (url, init = {}) => {
         fetchCalls.push({ url: String(url), init });
@@ -369,6 +379,10 @@ test("runLiveProviderSmoke proves readiness, bootstrap, websocket events, and us
       fetchCalls.find((call) => call.url.endsWith("/study-sets/paste")).init.headers.origin,
       "https://app.viva.test",
     );
+    assert.equal(evidence.deploy_sha, "release-sha-123");
+    assert.equal(evidence.model, "gemini-live-test");
+    assert.equal(evidence.monitor.deploy_sha, "release-sha-123");
+    assert.equal(evidence.monitor.model, "gemini-live-test");
 
     const sessionConfig = JSON.parse(socket.sent.find((entry) => typeof entry === "string"));
     assert.equal(sessionConfig.type, "session_config");

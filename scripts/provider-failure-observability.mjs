@@ -168,14 +168,18 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "session_auth_failure",
     stage: "session_auth",
     railway_query:
-      'service:"web" event:"viva_session_route_failure" route:"refresh" (token_refresh_outcome:"failed" OR failure_class:"session_auth_failure" OR error:"viva_session_refresh_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable" OR token_refresh_outcome:"invalid_rejected" OR token_refresh_outcome:"malformed_rejected" OR token_refresh_outcome:"identity_mismatch")',
+      '(service:"web" event:"viva_session_route_failure" route:"refresh" (token_refresh_outcome:"failed" OR failure_class:"session_auth_failure" OR error:"viva_session_refresh_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable" OR token_refresh_outcome:"invalid_rejected" OR token_refresh_outcome:"malformed_rejected" OR token_refresh_outcome:"identity_mismatch")) OR (service:"agent-service" event:"provider_failure_observed" failure_class:"session_auth_failure" stage:"session_auth" signal:"session_auth_rejected")',
     evidence_fields: [
       "action",
       "failure_class",
       "stage",
       "deploy_sha",
       "error",
+      "model",
+      "provider",
       "route",
+      "signal",
+      "terminal_reason",
       "token_refresh_outcome",
       "latency_ms",
     ],
@@ -186,7 +190,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "pre_loop_unavailable",
     stage: "startup",
     railway_query:
-      '(service:"agent-service" event:"provider_failure_observed" (failure_class:"pre_loop_unavailable" OR failure_class:"session_bootstrap_unavailable" OR terminal_reason:"pre_loop_unavailable" OR terminal_reason:"session_bootstrap_unavailable")) OR (service:"web" event:"viva_session_route_failure" (error:"viva_session_bootstrap_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable"))',
+      '(service:"agent-service" event:"provider_failure_observed" (failure_class:"pre_loop_unavailable" OR failure_class:"session_bootstrap_unavailable" OR terminal_reason:"study_set_access_denied" OR terminal_reason:"study_store_unavailable" OR terminal_reason:"pre_loop_unavailable" OR terminal_reason:"session_bootstrap_unavailable")) OR (service:"web" event:"viva_session_route_failure" (error:"viva_session_bootstrap_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable"))',
     evidence_fields: [
       "failure_class",
       "stage",
