@@ -16,8 +16,11 @@ import {
   ROLLBACK_TRIGGER_THRESHOLDS,
 } from "./rollback-drain-criteria.mjs";
 
+const providerFailureQueriesById = () =>
+  new Map(PROVIDER_FAILURE_LOG_QUERIES.map((entry) => [entry.id, entry]));
+
 test("provider failure observability defines reusable sanitized log queries", () => {
-  const queriesById = new Map(PROVIDER_FAILURE_LOG_QUERIES.map((entry) => [entry.id, entry]));
+  const queriesById = providerFailureQueriesById();
 
   for (const id of [
     "provider_429",
@@ -143,8 +146,45 @@ test("provider failure observability defines reusable sanitized log queries", ()
   }
 });
 
+test("token refresh query only counts blocked refreshes when rate limited", () => {
+  const railwayQuery = providerFailureQueriesById().get("token_refresh_failure").railway_query;
+
+  assert.equal((railwayQuery.match(/token_refresh_outcome:"blocked"/g) ?? []).length, 1);
+  assert.match(
+    railwayQuery,
+    /\(token_refresh_outcome:"blocked" \(failure_class:"rate_limit" OR error:"session_mint_rate_limited"\)\)/,
+  );
+  assert.doesNotMatch(railwayQuery, /token_refresh_outcome:"failed" OR token_refresh_outcome:"blocked"/);
+});
+
+test("startup query matches web start-route failures by emitted failure class", () => {
+  const railwayQuery = providerFailureQueriesById().get("startup_unavailable").railway_query;
+
+  assert.match(
+    railwayQuery,
+    /service:"web" event:"viva_session_route_failure" route:"start" \([^)]*failure_class:"pre_loop_unavailable"[^)]*failure_class:"session_bootstrap_unavailable"/,
+  );
+});
+
+test("durability query observes live-smoke readiness store artifacts", () => {
+  const durabilityQuery = providerFailureQueriesById().get("durability_degraded");
+
+  assert.match(durabilityQuery.railway_query, /artifact:"viva\.live_provider_smoke\.v1"/);
+  assert.match(durabilityQuery.railway_query, /terminal_reason:"readiness_store_unavailable"/);
+  for (const field of [
+    "terminal_reason",
+    "failure.terminal_reason",
+    "failure_stage",
+    "readiness.store.available",
+    "readiness.store.durable",
+    "readiness.store.nonce_replay_protection",
+  ]) {
+    assert(durabilityQuery.evidence_fields.includes(field), `missing evidence field ${field}`);
+  }
+});
+
 test("reviewed BAC-525 queries name emitted log and evidence surfaces", () => {
-  const queriesById = new Map(PROVIDER_FAILURE_LOG_QUERIES.map((entry) => [entry.id, entry]));
+  const queriesById = providerFailureQueriesById();
 
   for (const id of [
     "provider_429",

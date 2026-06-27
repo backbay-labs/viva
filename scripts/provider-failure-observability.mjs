@@ -160,7 +160,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "store",
     terminal_reason: "durability_degraded",
     railway_query:
-      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"durability_degraded" OR failure_class:"durability_degraded")',
+      '(service:"agent-service" event:"provider_failure_observed" (terminal_reason:"durability_degraded" OR failure_class:"durability_degraded")) OR (artifact:"viva.live_provider_smoke.v1" (failure_class:"durability_degraded" OR terminal_reason:"durability_degraded" OR terminal_reason:"readiness_store_unavailable" OR failure.failure_class:"durability_degraded" OR failure.terminal_reason:"durability_degraded" OR failure.terminal_reason:"readiness_store_unavailable"))',
     evidence_fields: [
       "terminal_reason",
       "failure_class",
@@ -168,6 +168,11 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
       "provider",
       "deploy_sha",
       "latency_ms",
+      "failure.terminal_reason",
+      "failure_stage",
+      "readiness.store.available",
+      "readiness.store.durable",
+      "readiness.store.nonce_replay_protection",
     ],
   }),
   query({
@@ -194,7 +199,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "session_auth_failure",
     stage: "session_auth",
     railway_query:
-      '(service:"web" event:"viva_session_route_failure" route:"refresh" (token_refresh_outcome:"failed" OR token_refresh_outcome:"blocked" OR failure_class:"session_auth_failure" OR failure_class:"rate_limit" OR error:"viva_session_refresh_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable" OR error:"session_mint_rate_limited" OR token_refresh_outcome:"invalid_rejected" OR token_refresh_outcome:"malformed_rejected" OR token_refresh_outcome:"identity_mismatch")) OR (service:"agent-service" event:"provider_failure_observed" failure_class:"session_auth_failure" stage:"session_auth" signal:"session_auth_rejected")',
+      '(service:"web" event:"viva_session_route_failure" route:"refresh" (token_refresh_outcome:"failed" OR (token_refresh_outcome:"blocked" (failure_class:"rate_limit" OR error:"session_mint_rate_limited")) OR failure_class:"session_auth_failure" OR failure_class:"rate_limit" OR error:"viva_session_refresh_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable" OR error:"session_mint_rate_limited" OR token_refresh_outcome:"invalid_rejected" OR token_refresh_outcome:"malformed_rejected" OR token_refresh_outcome:"identity_mismatch")) OR (service:"agent-service" event:"provider_failure_observed" failure_class:"session_auth_failure" stage:"session_auth" signal:"session_auth_rejected")',
     evidence_fields: [
       "action",
       "failure_class",
@@ -216,7 +221,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "pre_loop_unavailable",
     stage: "startup",
     railway_query:
-      '(service:"agent-service" event:"provider_failure_observed" (failure_class:"pre_loop_unavailable" OR failure_class:"session_bootstrap_unavailable" OR terminal_reason:"study_set_access_denied" OR terminal_reason:"study_store_unavailable" OR terminal_reason:"pre_loop_unavailable" OR terminal_reason:"session_bootstrap_unavailable")) OR (service:"web" event:"viva_session_route_failure" route:"start" (error:"viva_session_bootstrap_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable" OR error:"viva_session_identity_allowlist_unavailable"))',
+      '(service:"agent-service" event:"provider_failure_observed" (failure_class:"pre_loop_unavailable" OR failure_class:"session_bootstrap_unavailable" OR terminal_reason:"study_set_access_denied" OR terminal_reason:"study_store_unavailable" OR terminal_reason:"pre_loop_unavailable" OR terminal_reason:"session_bootstrap_unavailable")) OR (service:"web" event:"viva_session_route_failure" route:"start" (failure_class:"pre_loop_unavailable" OR failure_class:"session_bootstrap_unavailable" OR error:"viva_session_bootstrap_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable" OR error:"viva_session_identity_allowlist_unavailable"))',
     evidence_fields: [
       "failure_class",
       "stage",

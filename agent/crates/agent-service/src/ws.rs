@@ -1382,6 +1382,11 @@ fn terminal_observability_classification(
             stage: "recap",
             signal: "recap_failure",
         },
+        "tool_executor_failure" => TerminalObservabilityClassification {
+            failure_class: "tool_executor_failure",
+            stage: "tools",
+            signal: "tool_executor_failure",
+        },
         "pending_evaluation" => TerminalObservabilityClassification {
             failure_class: "pending_evaluation",
             stage: "store",
@@ -1394,25 +1399,23 @@ fn terminal_observability_classification(
                 signal: "pre_loop_unavailable",
             }
         }
-        "first_frame_timeout" | "invalid_first_frame" | "closed_before_config" => {
-            TerminalObservabilityClassification {
-                failure_class: "session_bootstrap_unavailable",
-                stage: "startup",
-                signal: "session_bootstrap_unavailable",
-            }
-        }
+        "first_frame_timeout" | "invalid_first_frame" => TerminalObservabilityClassification {
+            failure_class: "session_bootstrap_unavailable",
+            stage: "startup",
+            signal: "session_bootstrap_unavailable",
+        },
         "agent_input_closed" => TerminalObservabilityClassification {
             failure_class: "network_disconnect",
             stage: "transport",
             signal: "agent_input_closed",
         },
-        "invalid_session_identity" | "invalid_session_token" => {
-            TerminalObservabilityClassification {
-                failure_class: "session_auth_failure",
-                stage: "session_auth",
-                signal: "session_auth_rejected",
-            }
-        }
+        "invalid_session_identity"
+        | "invalid_session_token"
+        | "session_token_nonce_store_unavailable" => TerminalObservabilityClassification {
+            failure_class: "session_auth_failure",
+            stage: "session_auth",
+            signal: "session_auth_rejected",
+        },
         "durability_degraded" => TerminalObservabilityClassification {
             failure_class: "durability_degraded",
             stage: "store",
@@ -2937,6 +2940,16 @@ mod tests {
             })
         );
         assert_eq!(
+            terminal_observability_classification(
+                TerminalSessionReason::ToolExecutorFailure.as_str()
+            ),
+            Some(TerminalObservabilityClassification {
+                failure_class: "tool_executor_failure",
+                stage: "tools",
+                signal: "tool_executor_failure",
+            })
+        );
+        assert_eq!(
             terminal_observability_classification("turn_cap"),
             Some(TerminalObservabilityClassification {
                 failure_class: "turn_cap",
@@ -2985,12 +2998,24 @@ mod tests {
             })
         );
         assert_eq!(
+            terminal_observability_classification("session_token_nonce_store_unavailable"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "session_auth_failure",
+                stage: "session_auth",
+                signal: "session_auth_rejected",
+            })
+        );
+        assert_eq!(
             terminal_observability_classification("durability_degraded"),
             Some(TerminalObservabilityClassification {
                 failure_class: "durability_degraded",
                 stage: "store",
                 signal: "durability_degraded",
             })
+        );
+        assert_eq!(
+            terminal_observability_classification("closed_before_config"),
+            None
         );
         assert_eq!(terminal_observability_classification("completed"), None);
     }
