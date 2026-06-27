@@ -459,14 +459,7 @@ impl VoiceLimitState {
         limits: &VoiceLimitConfig,
         failure: &BrainProviderFailure,
     ) {
-        if !limits.provider_limiter_enabled
-            || !matches!(
-                failure.terminal_reason,
-                TerminalSessionReason::ProviderRateLimited
-                    | TerminalSessionReason::ProviderAuthFailed
-                    | TerminalSessionReason::ProviderTimeout
-            )
-        {
+        if !limits.provider_limiter_enabled || !provider_failure_backoff_eligible(failure) {
             return;
         }
         let retry_after_ms = metadata_u64(&failure.metadata, "retry_after_ms")
@@ -703,6 +696,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_tool_stage_timeout_does_not_record_provider_backoff() {
+        for stage in ["tools", "recap"] {
+            let state = VoiceLimitState::default();
+            let limits = VoiceLimitConfig {
+                provider_backoff_default_ms: 1_000,
+                provider_backoff_max_ms: 30_000,
+                ..VoiceLimitConfig::default()
+            };
+            let failure = BrainProviderFailure::new(agent_domain::BrainProviderFailureParts {
+                failure_class: "timeout".to_owned(),
+                stage: stage.to_owned(),
+                terminal_reason: TerminalSessionReason::ProviderTimeout,
+                retry_eligible: true,
+                latency_ms: 45_000,
+                provider: "server".to_owned(),
+                model: "viva-tools".to_owned(),
+                metadata: "retry_after_ms=30000 reset_hint=none budget_state=unknown".to_owned(),
+            });
+
+            state.record_provider_failure(&limits, &failure);
+
+            let admission = state
+                .try_admit_provider_turn(&limits, ProviderQueueBehavior::Wait)
+                .await;
+            assert!(
+                matches!(admission.decision, ProviderAdmissionDecision::Admitted),
+                "server-owned {stage} timeout must not poison provider backoff"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn provider_backoff_preserves_longer_active_window() {
         let state = VoiceLimitState::default();
         let limits = VoiceLimitConfig {
@@ -869,6 +894,16 @@ mod tests {
         assert_eq!(active.provider_inflight, 1);
         assert_eq!(active.provider_waiting, 1);
     }
+}
+
+fn provider_failure_backoff_eligible(failure: &BrainProviderFailure) -> bool {
+    matches!(
+        failure.terminal_reason,
+        TerminalSessionReason::ProviderRateLimited
+            | TerminalSessionReason::ProviderAuthFailed
+            | TerminalSessionReason::ProviderTimeout
+    ) && failure.provider != "server"
+        && !matches!(failure.stage.as_str(), "tools" | "recap" | "store")
 }
 
 pub fn build_router(state: AppState) -> Router {

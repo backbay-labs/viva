@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::HashSet,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -48,8 +48,6 @@ const TERMINAL_EVENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const RECONNECT_LEASE_GRACE: Duration = Duration::from_millis(250);
 const RECONNECT_LEASE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_ACTIVE_SESSIONS_PER_USER_STUDY_SET: usize = 1;
-const MAX_QUEUED_PROVIDER_CONTINUATION_FRAMES: usize = 32;
-const MAX_QUEUED_PROVIDER_CONTINUATION_BYTES: u64 = 1_048_576;
 
 pub async fn voice_ws(
     State(state): State<AppState>,
@@ -549,11 +547,7 @@ async fn handle_socket(
     let mut pending_provider_admissions = Vec::<VoiceLimitLease>::new();
     let mut pending_provider_admission: Fuse<BoxFuture<'static, QueuedProviderAdmission>> =
         Fuse::terminated();
-    let mut pending_provider_admission_accepts_audio_continuations = false;
     let mut pending_provider_admission_reserved_submission = false;
-    let mut active_provider_turn_accepts_audio_continuations = false;
-    let mut queued_provider_continuations = VecDeque::<ClientInputAction>::new();
-    let mut queued_provider_continuation_bytes = 0_u64;
     let mut resolved_submitted_answer_response_ids = HashSet::<String>::new();
     let mut completed_provider_turn_response_ids = HashSet::<String>::new();
     let mut drain_signal = state.drain_signal.subscribe();
@@ -572,7 +566,7 @@ async fn handle_socket(
         return;
     }
 
-    'socket_loop: loop {
+    loop {
         tokio::select! {
             biased;
 
@@ -637,7 +631,6 @@ async fn handle_socket(
                     client_input,
                     mut admission,
                 } = queued;
-                pending_provider_admission_accepts_audio_continuations = false;
                 let admission_reserved_submission =
                     pending_provider_admission_reserved_submission;
                 pending_provider_admission_reserved_submission = false;
@@ -655,8 +648,6 @@ async fn handle_socket(
                     .await;
                     break;
                 }
-                let accepts_audio_continuations =
-                    client_input_starts_audio_provider_turn(&client_input);
                 let mut provider_admission_lease = admission.lease.take();
                 let turn_send_deadline = if client_input.action().arms_turn_cap() {
                     pre_answer_idle_armed = false;
@@ -683,81 +674,8 @@ async fn handle_socket(
                         record_client_action(&state, voice_session_id.clone(), action);
                         if action.arms_turn_cap() {
                             active_provider_turns = active_provider_turns.saturating_add(1);
-                            active_provider_turn_accepts_audio_continuations =
-                                accepts_audio_continuations;
                             if let Some(lease) = provider_admission_lease.take() {
                                 pending_provider_admissions.push(lease);
-                            }
-                            queued_provider_continuation_bytes = 0;
-                            while let Some(continuation) = queued_provider_continuations.pop_front() {
-                                let continuation_turn_send_deadline =
-                                    if continuation.action().arms_turn_cap() {
-                                        turn_cap_deadline
-                                    } else {
-                                        None
-                                    };
-                                match send_client_input_action_with_drain(
-                                    &session.input,
-                                    continuation,
-                                    &mut drain_signal,
-                                    continuation_turn_send_deadline,
-                                )
-                                .await
-                                {
-                                    Ok(action) => {
-                                        record_client_action(
-                                            &state,
-                                            voice_session_id.clone(),
-                                            action,
-                                        );
-                                    }
-                                    Err(ClientMessageError::Drained) => {
-                                        terminal_reason = close_with_terminal_session_phase(
-                                            &mut sender,
-                                            &session.input,
-                                            &state,
-                                            voice_session_id.clone(),
-                                            &mut terminal_persisted,
-                                            TerminalSessionReason::Drained,
-                                            close_code::NORMAL,
-                                        )
-                                        .await;
-                                        break 'socket_loop;
-                                    }
-                                    Err(ClientMessageError::RateLimit) => {
-                                        terminal_reason = close_with_terminal_session_phase(
-                                            &mut sender,
-                                            &session.input,
-                                            &state,
-                                            voice_session_id.clone(),
-                                            &mut terminal_persisted,
-                                            TerminalSessionReason::RateLimit,
-                                            close_code::POLICY,
-                                        )
-                                        .await;
-                                        break 'socket_loop;
-                                    }
-                                    Err(ClientMessageError::Frame(error)) => {
-                                        let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
-                                        let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
-                                        terminal_reason = error.terminal_reason;
-                                        break 'socket_loop;
-                                    }
-                                    Err(ClientMessageError::TurnCap) => {
-                                        abort_realtime_session_tasks(&mut session);
-                                        terminal_reason = close_with_terminal_session_phase(
-                                            &mut sender,
-                                            &session.input,
-                                            &state,
-                                            voice_session_id.clone(),
-                                            &mut terminal_persisted,
-                                            TerminalSessionReason::TurnCap,
-                                            close_code::POLICY,
-                                        )
-                                        .await;
-                                        break 'socket_loop;
-                                    }
-                                }
                             }
                         }
                     }
@@ -867,16 +785,19 @@ async fn handle_socket(
                     && client_input.action() == ClientAction::Cancel
                 {
                     pending_provider_admission = Fuse::terminated();
-                    pending_provider_admission_accepts_audio_continuations = false;
                     if pending_provider_admission_reserved_submission {
                         pending_submitted_answers = pending_submitted_answers.saturating_sub(1);
                         pending_provider_admission_reserved_submission = false;
                         if pending_submitted_answers == 0 {
                             turn_cap_deadline = None;
+                            if active_provider_turns == 0 {
+                                pre_answer_idle_armed = true;
+                                pre_answer_idle
+                                    .as_mut()
+                                    .reset(Instant::now() + state.ws_timeouts.idle);
+                            }
                         }
                     }
-                    queued_provider_continuations.clear();
-                    queued_provider_continuation_bytes = 0;
                     match send_client_input_action_with_drain(
                         &session.input,
                         client_input,
@@ -937,39 +858,92 @@ async fn handle_socket(
                     }
                     continue;
                 }
-                if pending_provider_admission_accepts_audio_continuations
-                    && client_input_is_provider_continuation_audio(&client_input)
-                {
-                    let continuation_bytes = client_input_audio_bytes(&client_input).unwrap_or(0);
-                    if queued_provider_continuations.len()
-                        >= MAX_QUEUED_PROVIDER_CONTINUATION_FRAMES
-                        || queued_provider_continuation_bytes.saturating_add(continuation_bytes)
-                            > MAX_QUEUED_PROVIDER_CONTINUATION_BYTES
-                    {
-                        terminal_reason = close_with_terminal_session_phase(
-                            &mut sender,
-                            &session.input,
-                            &state,
-                            voice_session_id.clone(),
-                            &mut terminal_persisted,
-                            TerminalSessionReason::RateLimit,
-                            close_code::POLICY,
-                        )
-                        .await;
-                        break;
-                    }
-                    queued_provider_continuation_bytes = queued_provider_continuation_bytes
-                        .saturating_add(continuation_bytes);
-                    queued_provider_continuations.push_back(client_input);
-                    continue;
-                }
                 let mut provider_admission_lease = None;
-                let requires_provider_admission = client_input_requires_provider_admission(
-                    &client_input,
-                    active_provider_turns > 0 || !pending_provider_admissions.is_empty(),
-                    active_provider_turn_accepts_audio_continuations,
-                );
+                let requires_provider_admission =
+                    client_input_requires_provider_admission(&client_input);
                 if requires_provider_admission {
+                    {
+                        let mut forward_context = BrainForwardContext {
+                            state: &state,
+                            voice_session_id: voice_session_id.clone(),
+                            session_binding: &session_binding,
+                            limits: &state.voice_limits,
+                            session_limits: &mut session_limits,
+                        };
+                        let mut provider_runtime = ProviderTurnRuntime {
+                            pending_submitted_answers: &mut pending_submitted_answers,
+                            active_provider_turns: &mut active_provider_turns,
+                            pending_provider_admissions: &mut pending_provider_admissions,
+                            resolved_submitted_answer_response_ids: &mut resolved_submitted_answer_response_ids,
+                            completed_provider_turn_response_ids: &mut completed_provider_turn_response_ids,
+                            turn_cap_deadline: &mut turn_cap_deadline,
+                        };
+                        match forward_ready_brain_events(
+                            &mut forward_context,
+                            &mut session.events,
+                            &mut cancelled_responses,
+                            session_started_at,
+                            &mut sender,
+                            &mut provider_runtime,
+                        )
+                        .await
+                        {
+                            Ok(ForwardBrainEvent::Continue | ForwardBrainEvent::Suppressed) => {}
+                            Ok(ForwardBrainEvent::Rejected) => {
+                                terminal_reason = "provider_source_authority_rejected";
+                                let _ = close_with(
+                                    &mut sender,
+                                    close_code::POLICY,
+                                    "provider source authority rejected",
+                                )
+                                .await;
+                                break;
+                            }
+                            Ok(ForwardBrainEvent::DurabilityDegraded) => {
+                                terminal_reason = close_with_terminal_session_phase(
+                                    &mut sender,
+                                    &session.input,
+                                    &state,
+                                    voice_session_id.clone(),
+                                    &mut terminal_persisted,
+                                    TerminalSessionReason::DurabilityDegraded,
+                                    close_code::ERROR,
+                                )
+                                .await;
+                                break;
+                            }
+                            Ok(ForwardBrainEvent::CostBudgetExceeded) => {
+                                terminal_reason = close_with_terminal_session_phase(
+                                    &mut sender,
+                                    &session.input,
+                                    &state,
+                                    voice_session_id.clone(),
+                                    &mut terminal_persisted,
+                                    TerminalSessionReason::CostBudget,
+                                    close_code::POLICY,
+                                )
+                                .await;
+                                break;
+                            }
+                            Ok(ForwardBrainEvent::ProviderFailure(reason)) => {
+                                terminal_reason = close_with_terminal_session_phase(
+                                    &mut sender,
+                                    &session.input,
+                                    &state,
+                                    voice_session_id.clone(),
+                                    &mut terminal_persisted,
+                                    reason,
+                                    close_code::ERROR,
+                                )
+                                .await;
+                                break;
+                            }
+                            Err(_) => {
+                                terminal_reason = "send_failed";
+                                break;
+                            }
+                        }
+                    }
                     let mut admission = if session_limits.cost_budget_exhausted(&state.voice_limits) {
                         ProviderAdmission::denied(ProviderAdmissionDenial {
                             reason: "cost_budget",
@@ -997,8 +971,6 @@ async fn handle_socket(
                             } else {
                                 pending_provider_admission_reserved_submission = false;
                             }
-                            pending_provider_admission_accepts_audio_continuations =
-                                client_input_starts_audio_provider_turn(&client_input);
                             pending_provider_admission = start_provider_admission(
                                 state.limit_state.clone(),
                                 state.voice_limits.clone(),
@@ -1033,8 +1005,6 @@ async fn handle_socket(
                     }
                     provider_admission_lease = admission.lease.take();
                 }
-                let accepts_audio_continuations =
-                    client_input_starts_audio_provider_turn(&client_input);
                 let starts_new_submitted_turn =
                     client_input.action().arms_turn_cap() && requires_provider_admission;
                 let turn_send_deadline = if starts_new_submitted_turn {
@@ -1063,8 +1033,6 @@ async fn handle_socket(
                         if action.arms_turn_cap() {
                             if requires_provider_admission {
                                 active_provider_turns = active_provider_turns.saturating_add(1);
-                                active_provider_turn_accepts_audio_continuations =
-                                    accepts_audio_continuations;
                             }
                             if let Some(lease) = provider_admission_lease.take() {
                                 pending_provider_admissions.push(lease);
@@ -1223,8 +1191,6 @@ async fn handle_socket(
                 let Some(event) = event else {
                     break;
                 };
-                let submitted_answer_resolution = brain_event_submitted_answer_resolution(&event);
-                let provider_turn_completion = brain_event_provider_turn_completion(&event);
                 let mut forward_context = BrainForwardContext {
                     state: &state,
                     voice_session_id: voice_session_id.clone(),
@@ -1232,64 +1198,25 @@ async fn handle_socket(
                     limits: &state.voice_limits,
                     session_limits: &mut session_limits,
                 };
-                match forward_brain_event(
+                let mut provider_runtime = ProviderTurnRuntime {
+                    pending_submitted_answers: &mut pending_submitted_answers,
+                    active_provider_turns: &mut active_provider_turns,
+                    pending_provider_admissions: &mut pending_provider_admissions,
+                    resolved_submitted_answer_response_ids: &mut resolved_submitted_answer_response_ids,
+                    completed_provider_turn_response_ids: &mut completed_provider_turn_response_ids,
+                    turn_cap_deadline: &mut turn_cap_deadline,
+                };
+                match forward_brain_event_with_turn_accounting(
                     &mut forward_context,
                     event,
                     &mut cancelled_responses,
-                    session_started_at.elapsed(),
+                    session_started_at,
                     &mut sender,
+                    &mut provider_runtime,
                 )
                 .await
                 {
-                    Ok(ForwardBrainEvent::Continue) => {
-                        if let Some(resolution) = submitted_answer_resolution {
-                            match resolution {
-                                SubmittedAnswerResolution::One { response_id } => {
-                                    let count_resolution = match response_id {
-                                        Some(response_id) => resolved_submitted_answer_response_ids
-                                            .insert(response_id),
-                                        None => true,
-                                    };
-                                    if count_resolution {
-                                        pending_submitted_answers =
-                                            pending_submitted_answers.saturating_sub(1);
-                                    }
-                                }
-                                SubmittedAnswerResolution::All => {
-                                    pending_submitted_answers = 0;
-                                    resolved_submitted_answer_response_ids.clear();
-                                }
-                            }
-                            if pending_submitted_answers == 0 {
-                                turn_cap_deadline = None;
-                            }
-                        }
-                        if let Some(completion) = provider_turn_completion {
-                            match completion {
-                                SubmittedAnswerResolution::One { response_id } => {
-                                    let count_completion = match response_id {
-                                        Some(response_id) => completed_provider_turn_response_ids
-                                            .insert(response_id),
-                                        None => true,
-                                    };
-                                    if count_completion {
-                                        active_provider_turns =
-                                            active_provider_turns.saturating_sub(1);
-                                        let _ = pending_provider_admissions.pop();
-                                        if active_provider_turns == 0 {
-                                            active_provider_turn_accepts_audio_continuations = false;
-                                        }
-                                    }
-                                }
-                                SubmittedAnswerResolution::All => {
-                                    active_provider_turns = 0;
-                                    completed_provider_turn_response_ids.clear();
-                                    pending_provider_admissions.clear();
-                                    active_provider_turn_accepts_audio_continuations = false;
-                                }
-                            }
-                        }
-                    }
+                    Ok(ForwardBrainEvent::Continue) => {}
                     Ok(ForwardBrainEvent::Suppressed) => {}
                     Ok(ForwardBrainEvent::Rejected) => {
                         terminal_reason = "provider_source_authority_rejected";
@@ -1572,6 +1499,135 @@ where
             ForwardBrainEvent::Continue | ForwardBrainEvent::Suppressed
         ) {
             return Ok(result);
+        }
+    }
+}
+
+struct ProviderTurnRuntime<'a> {
+    pending_submitted_answers: &'a mut u32,
+    active_provider_turns: &'a mut u32,
+    pending_provider_admissions: &'a mut Vec<VoiceLimitLease>,
+    resolved_submitted_answer_response_ids: &'a mut HashSet<String>,
+    completed_provider_turn_response_ids: &'a mut HashSet<String>,
+    turn_cap_deadline: &'a mut Option<Instant>,
+}
+
+async fn forward_ready_brain_events<S>(
+    context: &mut BrainForwardContext<'_>,
+    events: &mut mpsc::Receiver<agent_domain::BrainEvent>,
+    cancelled_responses: &mut CancelledResponseTracker,
+    session_started_at: Instant,
+    sender: &mut S,
+    runtime: &mut ProviderTurnRuntime<'_>,
+) -> Result<ForwardBrainEvent, axum::Error>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    loop {
+        let event = match events.try_recv() {
+            Ok(event) => event,
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(ForwardBrainEvent::Continue),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                return Ok(ForwardBrainEvent::Suppressed);
+            }
+        };
+        let result = forward_brain_event_with_turn_accounting(
+            context,
+            event,
+            cancelled_responses,
+            session_started_at,
+            sender,
+            runtime,
+        )
+        .await?;
+        if !matches!(
+            result,
+            ForwardBrainEvent::Continue | ForwardBrainEvent::Suppressed
+        ) {
+            return Ok(result);
+        }
+    }
+}
+
+async fn forward_brain_event_with_turn_accounting<S>(
+    context: &mut BrainForwardContext<'_>,
+    event: agent_domain::BrainEvent,
+    cancelled_responses: &mut CancelledResponseTracker,
+    session_started_at: Instant,
+    sender: &mut S,
+    runtime: &mut ProviderTurnRuntime<'_>,
+) -> Result<ForwardBrainEvent, axum::Error>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    let submitted_answer_resolution = brain_event_submitted_answer_resolution(&event);
+    let provider_turn_completion = brain_event_provider_turn_completion(&event);
+    let result = forward_brain_event(
+        context,
+        event,
+        cancelled_responses,
+        session_started_at.elapsed(),
+        sender,
+    )
+    .await?;
+    if matches!(result, ForwardBrainEvent::Continue) {
+        apply_provider_turn_accounting(
+            submitted_answer_resolution,
+            provider_turn_completion,
+            runtime,
+        );
+    }
+    Ok(result)
+}
+
+fn apply_provider_turn_accounting(
+    submitted_answer_resolution: Option<SubmittedAnswerResolution>,
+    provider_turn_completion: Option<SubmittedAnswerResolution>,
+    runtime: &mut ProviderTurnRuntime<'_>,
+) {
+    if let Some(resolution) = submitted_answer_resolution {
+        match resolution {
+            SubmittedAnswerResolution::One { response_id } => {
+                let count_resolution = match response_id {
+                    Some(response_id) => runtime
+                        .resolved_submitted_answer_response_ids
+                        .insert(response_id),
+                    None => true,
+                };
+                if count_resolution {
+                    *runtime.pending_submitted_answers =
+                        runtime.pending_submitted_answers.saturating_sub(1);
+                }
+            }
+            SubmittedAnswerResolution::All => {
+                *runtime.pending_submitted_answers = 0;
+                runtime.resolved_submitted_answer_response_ids.clear();
+            }
+        }
+        if *runtime.pending_submitted_answers == 0 {
+            *runtime.turn_cap_deadline = None;
+        }
+    }
+    if let Some(completion) = provider_turn_completion {
+        match completion {
+            SubmittedAnswerResolution::One { response_id } => {
+                let count_completion = match response_id {
+                    Some(response_id) => runtime
+                        .completed_provider_turn_response_ids
+                        .insert(response_id),
+                    None => true,
+                };
+                if count_completion {
+                    *runtime.active_provider_turns =
+                        runtime.active_provider_turns.saturating_sub(1);
+                    let _ = runtime.pending_provider_admissions.pop();
+                }
+            }
+            SubmittedAnswerResolution::All => {
+                *runtime.active_provider_turns = 0;
+                runtime.completed_provider_turn_response_ids.clear();
+                runtime.pending_provider_admissions.clear();
+            }
         }
     }
 }
@@ -2862,56 +2918,8 @@ impl ClientInputAction {
     }
 }
 
-fn client_input_requires_provider_admission(
-    client_input: &ClientInputAction,
-    provider_turn_pending: bool,
-    provider_turn_accepts_audio_continuations: bool,
-) -> bool {
-    if !client_input.action().arms_turn_cap() {
-        return false;
-    }
-    if !provider_turn_pending {
-        return true;
-    }
-    !(provider_turn_accepts_audio_continuations
-        && client_input_is_provider_continuation_audio(client_input))
-}
-
-fn client_input_starts_audio_provider_turn(client_input: &ClientInputAction) -> bool {
-    matches!(
-        client_input,
-        ClientInputAction::Send {
-            brain_input: BrainInput::Audio(_),
-            action: ClientAction::Audio,
-        } | ClientInputAction::Send {
-            brain_input: BrainInput::AudioWithMetadata { .. },
-            action: ClientAction::Audio,
-        }
-    )
-}
-
-fn client_input_is_provider_continuation_audio(client_input: &ClientInputAction) -> bool {
-    matches!(
-        client_input,
-        ClientInputAction::Send {
-            brain_input: BrainInput::Audio(_),
-            action: ClientAction::Audio,
-        } | ClientInputAction::Send {
-            brain_input: BrainInput::AudioWithMetadata {
-                client_generation_id: None,
-                ..
-            },
-            action: ClientAction::Audio,
-        }
-    )
-}
-
-fn client_input_audio_bytes(client_input: &ClientInputAction) -> Option<u64> {
-    match client_input {
-        ClientInputAction::Send { brain_input, .. }
-        | ClientInputAction::TrySend { brain_input, .. } => brain_input_audio_bytes(brain_input),
-        ClientInputAction::Keepalive => None,
-    }
+fn client_input_requires_provider_admission(client_input: &ClientInputAction) -> bool {
+    client_input.action().arms_turn_cap()
 }
 
 #[derive(Debug)]

@@ -3639,6 +3639,116 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
 }
 
 #[tokio::test]
+async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let state = provider_limiter_test_state(
+        Arc::new(BlockingProviderProbeBrain {
+            text_inputs: text_inputs.clone(),
+        }),
+        "cartesia_gemini",
+        VoiceLimitConfig {
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        },
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(40),
+        session: Duration::from_secs(5),
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
+    first_socket
+        .send(WsMessage::Text(
+            provider_limiter_session_config(
+                "biology-midterm",
+                "voice-session-1",
+                "nonce-provider-limiter-biology",
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_server_frame(&mut first_socket).await,
+        ServerFrame::Event { event, .. }
+            if matches!(
+                event.as_ref(),
+                VivaServerEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                    terminal_reason: None,
+                }
+            )
+    ));
+    send_client_frame(
+        &mut first_socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "admission holder".to_owned(),
+            client_generation_id: Some("bac519-queue-cancel-idle-holder".to_owned()),
+        },
+    )
+    .await;
+    wait_until(Duration::from_secs(2), || {
+        text_inputs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
+    second_socket
+        .send(WsMessage::Text(
+            provider_limiter_session_config(
+                "chemistry-final",
+                "voice-session-2",
+                "nonce-provider-limiter-chemistry",
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    send_client_frame(
+        &mut second_socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "queued probe".to_owned(),
+            client_generation_id: Some("bac519-queue-cancel-idle-pending".to_owned()),
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    send_client_frame(
+        &mut second_socket,
+        &ClientFrame::Cancel {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+        },
+    )
+    .await;
+
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = read_server_frame(&mut second_socket).await;
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("cancelled queued first answer should re-arm pre-answer idle timeout");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
+    assert_close_code(&mut second_socket, CloseCode::Policy).await;
+    assert_eq!(text_inputs.load(Ordering::SeqCst), 1);
+
+    first_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut first_socket).await;
+}
+
+#[tokio::test]
 async fn websocket_provider_queue_arms_turn_cap_while_waiting_for_admission() {
     let text_inputs = Arc::new(AtomicUsize::new(0));
     let state = provider_limiter_test_state(
@@ -3751,7 +3861,7 @@ async fn websocket_provider_queue_arms_turn_cap_while_waiting_for_admission() {
 }
 
 #[tokio::test]
-async fn websocket_provider_queue_buffers_audio_continuation_until_admitted() {
+async fn websocket_provider_queue_rejects_audio_continuation_without_second_lease() {
     let text_inputs = Arc::new(AtomicUsize::new(0));
     let audio_inputs = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
     let state = provider_limiter_test_state(
@@ -3846,96 +3956,38 @@ async fn websocket_provider_queue_buffers_audio_continuation_until_admitted() {
         .send(WsMessage::Binary(vec![3_u8, 4].into()))
         .await
         .unwrap();
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            read_server_frame(&mut second_socket)
-        )
-        .await
-        .is_err(),
-        "queued audio continuation must not close the socket before admission"
-    );
-
-    first_socket.close(None).await.unwrap();
-    let _ = read_server_frames_until_close(&mut first_socket).await;
-    wait_until(Duration::from_secs(2), || {
-        audio_inputs.lock().unwrap().len() == 2
-    })
-    .await;
-    assert_eq!(
-        *audio_inputs.lock().unwrap(),
-        vec![vec![1_u8, 2], vec![3_u8, 4]]
-    );
-    tokio::time::timeout(Duration::from_secs(2), async {
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let frame = read_server_frame(&mut second_socket).await;
-            if matches!(
-                frame,
-                ServerFrame::Event { event, .. }
-                    if matches!(
-                        event.as_ref(),
-                        VivaServerEvent::SessionPhase {
-                            phase: agent_domain::StudySessionPhase::Feedback,
-                            terminal_reason: None,
-                        }
-                    )
-            ) {
-                break;
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::SlowClient) {
+                return frame;
             }
         }
     })
     .await
-    .expect("provider completion should release the queued audio turn");
-    let phantom_turn_cap = tokio::time::timeout(Duration::from_millis(240), async {
-        loop {
-            match second_socket.next().await.unwrap().unwrap() {
-                WsMessage::Text(text) => {
-                    let frame = serde_json::from_str::<ServerFrame>(&text).unwrap();
-                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
-                        return frame;
-                    }
-                }
-                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
-                other => panic!("unexpected close after queued audio completion: {other:?}"),
-            }
-        }
-    })
-    .await;
-    assert!(
-        phantom_turn_cap.is_err(),
-        "queued audio continuation frames left a phantom submitted turn armed"
-    );
+    .expect("queued audio continuation without a second lease should be denied");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::SlowClient);
+    assert_close_code(&mut second_socket, CloseCode::Policy).await;
+    assert!(audio_inputs.lock().unwrap().is_empty());
     assert!(evidence.snapshot().iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::ProviderAdmission
-            && event.detail.contains("admission_decision=admitted")
-            && event.detail.contains("queue_depth=1")
+            && event.detail.contains("admission_decision=denied")
+            && event.detail.contains("reason=overlapping_provider_turn")
+            && event.detail.contains("terminal_reason=slow_client")
     }));
-    send_client_frame(
-        &mut second_socket,
-        &ClientFrame::Text {
-            version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-after-audio-release".to_owned()),
-        },
-    )
-    .await;
-    wait_until(Duration::from_secs(2), || {
-        text_inputs.load(Ordering::SeqCst) == 2
-    })
-    .await;
 
-    second_socket.close(None).await.unwrap();
-    let _ = read_server_frames_until_close(&mut second_socket).await;
+    first_socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut first_socket).await;
 }
 
 #[tokio::test]
-async fn websocket_provider_queue_caps_buffered_audio_continuations() {
+async fn websocket_provider_active_audio_rejects_later_frame_without_second_lease() {
     let text_inputs = Arc::new(AtomicUsize::new(0));
     let audio_inputs = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
     let state = provider_limiter_test_state(
         Arc::new(QueuedAudioProviderProbeBrain {
             text_inputs: text_inputs.clone(),
-            audio_inputs,
+            audio_inputs: audio_inputs.clone(),
         }),
         "cartesia_gemini",
         VoiceLimitConfig {
@@ -3944,13 +3996,14 @@ async fn websocket_provider_queue_caps_buffered_audio_continuations() {
             ..VoiceLimitConfig::default()
         },
     );
+    let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
-    assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
-    first_socket
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "cartesia_gemini").await;
+    socket
         .send(WsMessage::Text(
             provider_limiter_session_config(
                 "biology-midterm",
@@ -3962,7 +4015,7 @@ async fn websocket_provider_queue_caps_buffered_audio_continuations() {
         .await
         .unwrap();
     assert!(matches!(
-        read_server_frame(&mut first_socket).await,
+        read_server_frame(&mut socket).await,
         ServerFrame::Event { event, .. }
             if matches!(
                 event.as_ref(),
@@ -3972,70 +4025,38 @@ async fn websocket_provider_queue_caps_buffered_audio_continuations() {
                 }
             )
     ));
-    send_client_frame(
-        &mut first_socket,
-        &ClientFrame::Text {
-            version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-buffer-holder".to_owned()),
-        },
-    )
-    .await;
-    wait_until(Duration::from_secs(2), || {
-        text_inputs.load(Ordering::SeqCst) == 1
-    })
-    .await;
-
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
-    assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
-    second_socket
-        .send(WsMessage::Text(
-            provider_limiter_session_config(
-                "chemistry-final",
-                "voice-session-2",
-                "nonce-provider-limiter-chemistry",
-            )
-            .into(),
-        ))
-        .await
-        .unwrap();
-    assert!(matches!(
-        read_server_frame(&mut second_socket).await,
-        ServerFrame::Event { event, .. }
-            if matches!(
-                event.as_ref(),
-                VivaServerEvent::SessionPhase {
-                    phase: agent_domain::StudySessionPhase::Ready,
-                    terminal_reason: None,
-                }
-            )
-    ));
-    second_socket
+    socket
         .send(WsMessage::Binary(vec![1_u8].into()))
         .await
         .unwrap();
-    for _ in 0..40 {
-        second_socket
-            .send(WsMessage::Binary(vec![2_u8].into()))
-            .await
-            .unwrap();
-    }
+    wait_until(Duration::from_secs(2), || {
+        audio_inputs.lock().unwrap().len() == 1
+    })
+    .await;
+    socket
+        .send(WsMessage::Binary(vec![2_u8].into()))
+        .await
+        .unwrap();
 
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let frame = read_server_frame(&mut second_socket).await;
-            if terminal_session_reason(&frame) == Some(TerminalSessionReason::RateLimit) {
+            let frame = read_server_frame(&mut socket).await;
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::SlowClient) {
                 return frame;
             }
         }
     })
     .await
-    .expect("queued audio continuation buffer should have a bounded cap");
-    assert_terminal_session_phase(terminal, TerminalSessionReason::RateLimit);
-    assert_close_code(&mut second_socket, CloseCode::Policy).await;
-
-    first_socket.close(None).await.unwrap();
-    let _ = read_server_frames_until_close(&mut first_socket).await;
+    .expect("active audio continuation without a second lease should be denied");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::SlowClient);
+    assert_close_code(&mut socket, CloseCode::Policy).await;
+    assert_eq!(*audio_inputs.lock().unwrap(), vec![vec![1_u8]]);
+    assert!(evidence.snapshot().iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::ProviderAdmission
+            && event.detail.contains("admission_decision=denied")
+            && event.detail.contains("reason=overlapping_provider_turn")
+            && event.detail.contains("terminal_reason=slow_client")
+    }));
 }
 
 #[tokio::test]
@@ -6902,6 +6923,7 @@ async fn websocket_provider_slot_prefers_queued_completion_before_same_socket_ov
         Arc::new(AnswerEvaluatedProviderProbeBrain {
             text_inputs: text_inputs.clone(),
             study_store: store.clone(),
+            usage_after_evaluation: None,
         }),
         "answer_evaluated_provider_probe",
         VoiceWsAccess::default(),
@@ -6962,25 +6984,171 @@ async fn websocket_provider_slot_prefers_queued_completion_before_same_socket_ov
 }
 
 #[tokio::test]
-async fn websocket_audio_continuations_do_not_leave_phantom_turn_cap() {
-    websocket_audio_continuations_do_not_leave_phantom_turn_cap_with_limits(
-        VoiceLimitConfig::default(),
+async fn websocket_provider_drains_queued_usage_before_next_admission() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let usage_gate = Arc::new(Notify::new());
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(AnswerEvaluatedProviderProbeBrain {
+            text_inputs: text_inputs.clone(),
+            study_store: store.clone(),
+            usage_after_evaluation: Some((
+                BrainUsage {
+                    text_output_tokens: 1,
+                    ..BrainUsage::default()
+                },
+                usage_gate.clone(),
+            )),
+        }),
+        "answer_evaluated_provider_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_provider_concurrent_turns: Some(1),
+        max_provider_queue_depth: Some(0),
+        max_session_cost_usd: Some(0.000_001),
+        ..VoiceLimitConfig::default()
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "answer_evaluated_provider_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "first provider turn".to_owned(),
+            client_generation_id: Some("bac519-queued-usage-release-1".to_owned()),
+        },
     )
     .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = read_server_frame(&mut socket).await;
+            if matches!(
+                &frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(event.as_ref(), VivaServerEvent::AnswerEvaluated { .. })
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("first answer evaluation should arrive");
+    assert_eq!(text_inputs.load(Ordering::SeqCst), 1);
+
+    usage_gate.notify_waiters();
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "second provider turn".to_owned(),
+            client_generation_id: Some("bac519-queued-usage-release-2".to_owned()),
+        },
+    )
+    .await;
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = read_server_frame(&mut socket).await;
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::CostBudget) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("queued usage should close the session before admitting another provider turn");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::CostBudget);
+    assert_close_code(&mut socket, CloseCode::Policy).await;
+    assert_eq!(text_inputs.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn websocket_audio_continuations_do_not_leave_phantom_turn_cap_when_limiter_disabled() {
-    websocket_audio_continuations_do_not_leave_phantom_turn_cap_with_limits(VoiceLimitConfig {
+async fn websocket_audio_continuation_requires_second_lease_when_limiter_enabled() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let audio_inputs = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let state = AppState::new(
+        Arc::new(QueuedAudioProviderProbeBrain {
+            text_inputs,
+            audio_inputs: audio_inputs.clone(),
+        }),
+        "cartesia_gemini",
+        VoiceWsAccess::default(),
+        1,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_millis(40),
+        session: Duration::from_secs(5),
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "cartesia_gemini").await;
+    socket
+        .send(WsMessage::Text(
+            format!(
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Binary(vec![1_u8, 2].into()))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        audio_inputs.lock().unwrap().len() == 1
+    })
+    .await;
+    socket
+        .send(WsMessage::Binary(vec![3_u8, 4].into()))
+        .await
+        .unwrap();
+
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = read_server_frame(&mut socket).await;
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::SlowClient) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("audio continuation without another provider lease should be denied");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::SlowClient);
+    assert_close_code(&mut socket, CloseCode::Policy).await;
+    assert_eq!(*audio_inputs.lock().unwrap(), vec![vec![1_u8, 2]]);
+}
+
+#[tokio::test]
+async fn websocket_audio_continuations_keep_turn_cap_when_limiter_disabled() {
+    websocket_audio_continuations_keep_turn_cap_with_limits(VoiceLimitConfig {
         provider_limiter_enabled: false,
         ..VoiceLimitConfig::default()
     })
     .await;
 }
 
-async fn websocket_audio_continuations_do_not_leave_phantom_turn_cap_with_limits(
-    voice_limits: VoiceLimitConfig,
-) {
+async fn websocket_audio_continuations_keep_turn_cap_with_limits(voice_limits: VoiceLimitConfig) {
     let text_inputs = Arc::new(AtomicUsize::new(0));
     let audio_inputs = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
     let state = AppState::new(
@@ -7044,7 +7212,7 @@ async fn websocket_audio_continuations_do_not_leave_phantom_turn_cap_with_limits
     .await
     .expect("audio provider completion should arrive");
 
-    let phantom_turn_cap = tokio::time::timeout(Duration::from_millis(90), async {
+    let terminal = tokio::time::timeout(Duration::from_millis(90), async {
         loop {
             match socket.next().await.unwrap().unwrap() {
                 WsMessage::Text(text) => {
@@ -7058,13 +7226,10 @@ async fn websocket_audio_continuations_do_not_leave_phantom_turn_cap_with_limits
             }
         }
     })
-    .await;
-    assert!(
-        phantom_turn_cap.is_err(),
-        "audio continuation frames left a phantom submitted turn armed"
-    );
-
-    socket.close(None).await.unwrap();
+    .await
+    .expect("accepted extra audio frames should keep the submitted-turn cap armed");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
+    assert_close_code(&mut socket, CloseCode::Policy).await;
 }
 
 #[tokio::test]
@@ -7462,7 +7627,7 @@ async fn websocket_turn_cap_is_not_postponed_by_provider_events() {
 }
 
 #[tokio::test]
-async fn websocket_turn_cap_is_not_postponed_by_extra_audio_frames() {
+async fn websocket_extra_audio_frame_without_second_lease_closes_slow_client() {
     let state = test_state(1).with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
@@ -7491,26 +7656,27 @@ async fn websocket_turn_cap_is_not_postponed_by_extra_audio_frames() {
         .await
         .unwrap();
 
-    let terminal = tokio::time::timeout(Duration::from_millis(30), async {
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             match socket.next().await.unwrap().unwrap() {
                 WsMessage::Text(text) => {
                     let frame = serde_json::from_str::<ServerFrame>(&text).unwrap();
-                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                    if terminal_session_reason(&frame) == Some(TerminalSessionReason::SlowClient) {
                         return frame;
                     }
                 }
                 WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
                 other => {
-                    panic!("expected terminal turn cap despite extra audio frames, got {other:?}")
+                    panic!("expected slow-client terminal for extra audio frame, got {other:?}")
                 }
             }
         }
     })
     .await
-    .expect("extra audio frames extended the submitted-answer cap");
+    .expect("extra audio frame without a second provider lease did not close");
 
-    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
+    assert_terminal_session_phase(terminal, TerminalSessionReason::SlowClient);
+    assert_close_code(&mut socket, CloseCode::Policy).await;
 }
 
 #[tokio::test]
@@ -7908,6 +8074,10 @@ async fn websocket_drain_interrupts_backpressured_provider_input() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+    })
+    .with_voice_limits(VoiceLimitConfig {
+        provider_limiter_enabled: false,
+        ..VoiceLimitConfig::default()
     });
     let drain = state.drain_signal.clone();
     let slots = state.session_slots.clone();
@@ -10090,6 +10260,7 @@ impl RealtimeBrain for GatedCompletionProviderProbeBrain {
 struct AnswerEvaluatedProviderProbeBrain {
     text_inputs: Arc<AtomicUsize>,
     study_store: Arc<dyn StudyMemoryStore>,
+    usage_after_evaluation: Option<(BrainUsage, Arc<Notify>)>,
 }
 
 #[async_trait::async_trait]
@@ -10130,6 +10301,7 @@ impl RealtimeBrain for AnswerEvaluatedProviderProbeBrain {
         let (event_tx, events) = mpsc::channel(8);
         let text_inputs = self.text_inputs.clone();
         let study_store = self.study_store.clone();
+        let usage_after_evaluation = self.usage_after_evaluation.clone();
         let task = tokio::spawn(async move {
             while let Some(input) = input_rx.recv().await {
                 if !matches!(
@@ -10170,6 +10342,10 @@ impl RealtimeBrain for AnswerEvaluatedProviderProbeBrain {
                         evaluation,
                     })
                     .await;
+                if let Some((usage, usage_gate)) = usage_after_evaluation.clone() {
+                    usage_gate.notified().await;
+                    let _ = event_tx.send(BrainEvent::Usage(usage)).await;
+                }
                 let _ = event_tx
                     .send(BrainEvent::ResponseCompleted { response_id })
                     .await;
