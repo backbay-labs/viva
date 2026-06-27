@@ -560,7 +560,12 @@ where
                     return Err(failure.error);
                 }
             };
-            let stream = fake_interrupt_gemini_stream(stream, interrupt);
+            let stream = drain_gemini_fallback_activations(
+                fake_interrupt_gemini_stream(stream, interrupt),
+                events,
+                &mut active_gemini,
+                response_id,
+            );
             {
                 let tool_call_names = gemini_function_call_names(&stream);
                 if !tool_call_names.is_empty() {
@@ -883,7 +888,6 @@ where
                 return Ok(());
             }
         }
-        completed.store(true, Ordering::SeqCst);
         if !send_fake_unless_cancelled(
             event_tx,
             BrainEvent::ResponseCompleted {
@@ -927,6 +931,7 @@ where
             cancelled,
         )
         .await;
+        completed.store(true, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -1120,6 +1125,37 @@ fn gemini_function_call_names(stream: &[GeminiStreamEvent]) -> Vec<&str> {
             _ => None,
         })
         .collect()
+}
+
+fn drain_gemini_fallback_activations(
+    stream: Vec<GeminiStreamEvent>,
+    events: &mut Vec<BrainEvent>,
+    active_gemini: &mut GeminiConfig,
+    response_id: &str,
+) -> Vec<GeminiStreamEvent> {
+    let mut deferred = Vec::with_capacity(stream.len());
+    for event in stream {
+        match event {
+            GeminiStreamEvent::FallbackActivated {
+                from_model,
+                to_model,
+                reason,
+                failure,
+            } => {
+                promote_active_gemini_fallback(active_gemini, &to_model);
+                events.push(BrainEvent::ProviderFallbackActivated {
+                    response_id: response_id.to_owned(),
+                    provider: "gemini".to_owned(),
+                    from_model,
+                    to_model,
+                    reason,
+                    failure,
+                });
+            }
+            event => deferred.push(event),
+        }
+    }
+    deferred
 }
 
 async fn manuscript_intent_authorization_stage<F>(
@@ -2487,7 +2523,7 @@ mod tests {
                 },
                 ..CartesiaGeminiConfig::default()
             },
-            transports: FallbackToolLoopBudgetTransports::default(),
+            transports: FallbackToolLoopBudgetTransports,
             store: Some(store),
         };
         let mut events = Vec::new();
@@ -2813,9 +2849,7 @@ mod tests {
     struct FallbackFailureTransports;
 
     #[derive(Clone, Default)]
-    struct FallbackToolLoopBudgetTransports {
-        calls: Arc<Mutex<u32>>,
-    }
+    struct FallbackToolLoopBudgetTransports;
 
     #[derive(Clone, Default)]
     struct FallbackContinuationFailureAfterToolTransports {
@@ -3068,36 +3102,27 @@ mod tests {
             _config: &CartesiaGeminiConfig,
             _request: Value,
         ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
-            let mut calls = self.calls.lock().expect("calls lock poisoned");
-            *calls += 1;
-            let call_index = *calls;
-            drop(calls);
-
-            let tool_call = GeminiStreamEvent::FunctionCall {
-                id: format!("call-intent-{call_index}"),
-                name: "emit_manuscript_intent".to_owned(),
-                args: json!({}),
-                part: json!({
-                    "functionCall": {
-                        "id": format!("call-intent-{call_index}"),
-                        "name": "emit_manuscript_intent",
-                        "args": {},
-                    }
-                }),
-            };
-            if call_index == 1 {
-                Ok(vec![
-                    GeminiStreamEvent::FallbackActivated {
-                        from_model: "gemini-3.5-pro".to_owned(),
-                        to_model: "gemini-3.5-flash".to_owned(),
-                        reason: "primary_429".to_owned(),
-                        failure: None,
-                    },
-                    tool_call,
-                ])
-            } else {
-                Ok(vec![tool_call])
-            }
+            let mut stream = vec![GeminiStreamEvent::FallbackActivated {
+                from_model: "gemini-3.5-pro".to_owned(),
+                to_model: "gemini-3.5-flash".to_owned(),
+                reason: "primary_429".to_owned(),
+                failure: None,
+            }];
+            stream.extend((0..=MAX_GEMINI_EXECUTED_TOOL_STAGES).map(|index| {
+                GeminiStreamEvent::FunctionCall {
+                    id: format!("call-intent-{index}"),
+                    name: "emit_manuscript_intent".to_owned(),
+                    args: json!({}),
+                    part: json!({
+                        "functionCall": {
+                            "id": format!("call-intent-{index}"),
+                            "name": "emit_manuscript_intent",
+                            "args": {},
+                        }
+                    }),
+                }
+            }));
+            Ok(stream)
         }
 
         async fn synthesize_sonic(
