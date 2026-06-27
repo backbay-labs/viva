@@ -104,6 +104,18 @@ test("provider failure observability defines reusable sanitized log queries", ()
     queriesById.get("token_refresh_failure").railway_query,
     /token_refresh_outcome:"failed"/,
   );
+  assert.match(
+    queriesById.get("token_refresh_failure").railway_query,
+    /token_refresh_outcome:"blocked"/,
+  );
+  assert.match(
+    queriesById.get("token_refresh_failure").railway_query,
+    /failure_class:"rate_limit"/,
+  );
+  assert.match(
+    queriesById.get("token_refresh_failure").railway_query,
+    /error:"session_mint_rate_limited"/,
+  );
   assert.doesNotMatch(
     queriesById.get("token_refresh_failure").railway_query,
     /failure_class:"auth_material_failure"/,

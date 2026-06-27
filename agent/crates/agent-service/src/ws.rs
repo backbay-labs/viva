@@ -1026,6 +1026,11 @@ fn terminal_reason_overrides_send_failure(terminal_reason: TerminalSessionReason
             | TerminalSessionReason::ProviderCancelled
             | TerminalSessionReason::PartialStageSuccess
             | TerminalSessionReason::DurabilityDegraded
+            | TerminalSessionReason::Drained
+            | TerminalSessionReason::RateLimit
+            | TerminalSessionReason::SessionCap
+            | TerminalSessionReason::SlowClient
+            | TerminalSessionReason::TurnCap
             | TerminalSessionReason::Rollback
     )
 }
@@ -1527,6 +1532,20 @@ fn emit_pending_evaluation_observability_log(
 }
 
 fn observability_model(provider: &str) -> String {
+    observability_model_with(provider, |name| std::env::var(name).ok())
+}
+
+fn observability_model_with(provider: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    if provider == "cartesia_gemini" {
+        for name in ["GEMINI_MODEL", "GEMINI_REALTIME_MODEL"] {
+            if let Some(value) = lookup(name) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.chars().take(128).collect();
+                }
+            }
+        }
+    }
     format!("{provider}-viva")
 }
 
@@ -2975,8 +2994,33 @@ mod tests {
     #[test]
     fn terminal_observability_model_uses_provider_suffix() {
         assert_eq!(
-            observability_model("cartesia_gemini"),
+            observability_model_with("cartesia_gemini", |_| None),
             "cartesia_gemini-viva"
+        );
+    }
+
+    #[test]
+    fn terminal_observability_model_uses_configured_cartesia_gemini_model() {
+        assert_eq!(
+            observability_model_with("cartesia_gemini", |name| match name {
+                "GEMINI_MODEL" => Some(" gemini-live-primary ".to_owned()),
+                "GEMINI_REALTIME_MODEL" => Some("gemini-live-secondary".to_owned()),
+                _ => None,
+            }),
+            "gemini-live-primary"
+        );
+        assert_eq!(
+            observability_model_with("cartesia_gemini", |name| match name {
+                "GEMINI_REALTIME_MODEL" => Some("gemini-live-secondary".to_owned()),
+                _ => None,
+            }),
+            "gemini-live-secondary"
+        );
+        assert_eq!(
+            observability_model_with("synthetic", |name| {
+                (name == "GEMINI_MODEL").then(|| "ignored".to_owned())
+            }),
+            "synthetic-viva"
         );
     }
 
@@ -3616,7 +3660,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_session_phase_close_reports_send_failed_when_writer_fails() {
+    async fn terminal_session_phase_close_preserves_deploy_drain_when_writer_fails() {
         let (input, mut received) = mpsc::channel(1);
         let mut sender = FailingSink;
         let state = AppState::new(
@@ -3638,7 +3682,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(reason, "send_failed");
+        assert_eq!(reason, "drained");
         assert!(terminal_persisted);
         assert!(matches!(received.recv().await.unwrap(), BrainInput::Stop));
     }
@@ -3692,7 +3736,35 @@ mod tests {
                 TerminalSessionReason::Drained,
                 "send_failed"
             ),
-            "send_failed"
+            "drained"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::RateLimit,
+                "send_failed"
+            ),
+            "rate_limit"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::TurnCap,
+                "send_failed"
+            ),
+            "turn_cap"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::SessionCap,
+                "send_failed"
+            ),
+            "session_cap"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::SlowClient,
+                "send_failed"
+            ),
+            "slow_client"
         );
     }
 
