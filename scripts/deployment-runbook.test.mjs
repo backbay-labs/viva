@@ -120,6 +120,7 @@ test("deployment runbook covers the beta operating path and stop rules", async (
     "VIVA_E2E_FAILURE_CONTROL_SCENARIO",
     "failure_control_harness disabled state",
     "rollback_drain criteria",
+    "provider_failure_observability dashboard criteria",
     "VIVA_LIVE_PROVIDER_SMOKE",
     "VIVA_CARTESIA_GEMINI_LIVE_RUNTIME",
     "VIVA_LIVE_SMOKE_AUDIO_FILE",

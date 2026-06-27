@@ -378,6 +378,13 @@ pub trait StudyMemoryStore: Send + Sync {
         StudyStoreWriteCounts::default()
     }
 
+    async fn pending_answer_attempts_for_session(
+        &self,
+        _voice_session_id: &str,
+    ) -> Result<usize, PortError> {
+        Ok(0)
+    }
+
     async fn record_voice_session(&self, _config: &SessionConfig) -> Result<(), PortError> {
         Ok(())
     }

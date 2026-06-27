@@ -234,7 +234,7 @@ export const ROLLBACK_TRIGGER_THRESHOLDS = Object.freeze([
     shared_alert_id: "bac525_recap_failure_rate_percent",
   }),
   threshold({
-    failure_class: "auth_material_failure",
+    failure_class: "session_auth_failure",
     id: "token_refresh_failure_rate_percent",
     metric: "token_refresh_failure_rate_percent",
     metric_label: "session token refresh failures as percent of refresh attempts",

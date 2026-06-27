@@ -17,6 +17,13 @@ import {
   buildFailureControlPlan,
   failureControlHarnessEvidence,
 } from "./failure-control-harness.mjs";
+import fixtureProviderFailureDashboard from "./fixtures/provider-failure-dashboard-samples.json" with {
+  type: "json",
+};
+import {
+  assertProviderFailureObservabilityEvidence,
+  providerFailureObservabilityEvidence,
+} from "./provider-failure-observability.mjs";
 import {
   buildProviderReadinessMatrix,
   LIVE_PROVIDER_GATE_COMMAND_NAME,
@@ -45,6 +52,7 @@ const durableStateReleaseClaimed = process.env.VIVA_RELEASE_DURABLE_STATE_CLAIME
 
 await rm(artifactDir, { recursive: true, force: true });
 await mkdir(artifactDir, { recursive: true });
+const outputPath = path.join(artifactDir, "evidence.json");
 
 try {
   const failureControlPlan = buildFailureControlPlan();
@@ -67,6 +75,10 @@ try {
     "scripts/rollback-drain-criteria.test.mjs",
   ]);
   await runRollbackDrainProofCommands();
+  await run("provider_failure_observability_unit_tests", "node", [
+    "--test",
+    "scripts/provider-failure-observability.test.mjs",
+  ]);
   await run("provider_gate_tests", "cargo", [
     "test",
     "--manifest-path",
@@ -95,10 +107,10 @@ try {
     "agent-service",
   ]);
   await run("direct_websocket_replay", "bun", ["run", "agent:replay:ws"]);
-  const browserResult =
-    process.env.VIVA_RELEASE_CHECK_SKIP_BROWSER === "1"
-      ? await readExistingBrowserResult()
-      : await runBrowserE2E();
+  const browserSkipShortcut = process.env.VIVA_RELEASE_CHECK_SKIP_BROWSER === "1";
+  const browserResult = browserSkipShortcut
+    ? await readExistingBrowserResult()
+    : await runBrowserE2E();
   const releaseDurableStateClaimed = releaseDurableStateClaim(
     browserResult,
     durableStateReleaseClaimed,
@@ -106,15 +118,20 @@ try {
   const providerReadiness = await collectProviderReadiness();
   const rollbackDrain = buildRollbackReleaseEvidence();
   assertRollbackReleaseGate(rollbackDrain);
+  const providerFailureObservability = providerFailureObservabilityEvidence({
+    fixture: fixtureProviderFailureDashboard,
+    releaseEvidencePath: path.relative(root, outputPath),
+  });
+  assertProviderFailureObservabilityEvidence(providerFailureObservability);
   const fixtureHashes = await hashFixtureFiles(path.join(root, "agent/fixtures/voice-protocol"));
   const artifactAudit = await auditGeneratedArtifacts([
     artifactDir,
     path.join(root, "artifacts/e2e-browser"),
     path.join(root, "artifacts/e2e-browser-fake-provider"),
   ]);
-  const outputPath = path.join(artifactDir, "evidence.json");
+  const generatedAt = new Date();
   const evidence = {
-    generated_at: new Date().toISOString(),
+    generated_at: generatedAt.toISOString(),
     schema: "viva.release_evidence.v1",
     commands,
     release_claims: {
@@ -124,7 +141,9 @@ try {
     provider_readiness: providerReadiness,
     failure_control_harness: failureControlEvidence,
     rollback_drain: rollbackDrain,
+    provider_failure_observability: providerFailureObservability,
     browser_e2e: browserResult,
+    release_gate: buildReleaseGateEvidence({ browserResult, browserSkipShortcut, generatedAt }),
     artifact_audit: artifactAudit,
     release_bundle: buildReleaseBundleManifest(outputPath, commands, browserResult),
     privacy: {
@@ -423,6 +442,32 @@ function buildReleaseBundleManifest(outputPath, commandRecords, browserResult) {
     // biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions expands this literal.
     workflow_artifact_name: "viva-release-evidence-${{ github.sha }}",
   };
+}
+
+function buildReleaseGateEvidence({ browserResult, browserSkipShortcut, generatedAt }) {
+  const browserSkipShortcutObserved = browserSkipShortcut || browserResult?.skipped === true;
+  return {
+    browser_skip_shortcut: browserSkipShortcutObserved,
+    deploy_sha: releaseDeploySha(),
+    failure_class: browserSkipShortcutObserved ? "release_gate_stale_evidence" : null,
+    generated_at: generatedAt.toISOString(),
+    max_age_seconds: 86_400,
+    sanitized: true,
+    stage: "release_gate",
+  };
+}
+
+function releaseDeploySha() {
+  for (const name of [
+    "RAILWAY_GIT_COMMIT_SHA",
+    "VERCEL_GIT_COMMIT_SHA",
+    "GITHUB_SHA",
+    "SOURCE_VERSION",
+  ]) {
+    const value = process.env[name]?.trim();
+    if (value) return value.slice(0, 64);
+  }
+  return null;
 }
 
 async function auditGeneratedArtifacts(dirs) {

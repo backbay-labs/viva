@@ -7,6 +7,7 @@ import {
   VIVA_SESSION_AUTH_FAILURE_PROFILES,
   type VivaSessionRouteFailureClass,
   type VivaSessionRouteOutcome,
+  vivaSessionRouteFailureLogPayload,
 } from "../app/api/viva-session/shared";
 import { POST as startSession } from "../app/api/viva-session/start/route";
 
@@ -16,8 +17,10 @@ const { afterEach, beforeEach, describe, expect, test } = bunTest as typeof bunT
 };
 
 const originalFetch = globalThis.fetch;
+const originalConsoleWarn = console.warn;
 const originalEnv = {
   NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL,
+  VERCEL_GIT_COMMIT_SHA: process.env.VERCEL_GIT_COMMIT_SHA,
   VIVA_AGENT_HTTP_URL: process.env.VIVA_AGENT_HTTP_URL,
   VIVA_AGENT_REST_BEARER_TOKEN: process.env.VIVA_AGENT_REST_BEARER_TOKEN,
   VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET: process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET,
@@ -31,6 +34,7 @@ const originalEnv = {
 
 describe("Viva same-origin session API", () => {
   beforeEach(() => {
+    console.warn = () => {};
     resetVivaSessionMintRateLimitsForTests();
     process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
     process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
@@ -44,6 +48,7 @@ describe("Viva same-origin session API", () => {
   });
 
   afterEach(() => {
+    console.warn = originalConsoleWarn;
     globalThis.fetch = originalFetch;
     resetVivaSessionMintRateLimitsForTests();
     for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
@@ -395,7 +400,7 @@ describe("Viva same-origin session API", () => {
     expect(response.status).toBe(401);
     expect(body).toEqual({
       error: "session_auth_terminal",
-      failure_class: "session_auth_terminal",
+      failure_class: "session_auth_failure",
       token_refresh_outcome: "terminal",
     });
     expect(/access_denied|other-user|biology-midterm/.test(JSON.stringify(body))).toBe(false);
@@ -667,21 +672,30 @@ describe("Viva same-origin session API", () => {
       },
     ];
     const observed = [];
-    for (const input of cases) {
-      const response = await refreshSession(
-        sessionRequest("/api/viva-session/refresh", {
-          session_id: "server-session",
-          session_token: input.token,
-          study_set_id: "biology-midterm",
-          user_id: "synthetic-user",
-        }),
-      );
-      const body = (await response.json()) as VivaSessionRouteFailureClass;
-      observed.push({ body, status: response.status });
-      const serialized = JSON.stringify(body);
-      for (const fragment of input.forbiddenFragments) {
-        expect(serialized).not.toContain(fragment);
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (message?: unknown) => {
+      warnings.push(String(message));
+    };
+    try {
+      for (const input of cases) {
+        const response = await refreshSession(
+          sessionRequest("/api/viva-session/refresh", {
+            session_id: "server-session",
+            session_token: input.token,
+            study_set_id: "biology-midterm",
+            user_id: "synthetic-user",
+          }),
+        );
+        const body = (await response.json()) as VivaSessionRouteFailureClass;
+        observed.push({ body, status: response.status });
+        const serialized = JSON.stringify(body);
+        for (const fragment of input.forbiddenFragments) {
+          expect(serialized).not.toContain(fragment);
+        }
       }
+    } finally {
+      console.warn = originalWarn;
     }
 
     expect(observed).toEqual([
@@ -689,7 +703,7 @@ describe("Viva same-origin session API", () => {
         status: 401,
         body: {
           error: "session_auth_terminal",
-          failure_class: "session_auth_terminal",
+          failure_class: "session_auth_failure",
           token_refresh_outcome: "terminal",
         },
       },
@@ -697,7 +711,7 @@ describe("Viva same-origin session API", () => {
         status: 401,
         body: {
           error: "session_auth_terminal",
-          failure_class: "session_auth_terminal",
+          failure_class: "session_auth_failure",
           token_refresh_outcome: "terminal",
         },
       },
@@ -705,12 +719,53 @@ describe("Viva same-origin session API", () => {
         status: 401,
         body: {
           error: "session_auth_terminal",
-          failure_class: "session_auth_terminal",
+          failure_class: "session_auth_failure",
           token_refresh_outcome: "terminal",
         },
       },
     ]);
+    const logPayloads = warnings.map((entry) => JSON.parse(entry));
+    expect(logPayloads.map((entry) => entry.error)).toEqual([
+      "invalid_session_identity",
+      "invalid_session_token",
+      "invalid_session_token",
+    ]);
+    expect(logPayloads.map((entry) => entry.token_refresh_outcome)).toEqual([
+      "identity_mismatch",
+      "invalid_rejected",
+      "malformed_rejected",
+    ]);
+    expect(JSON.stringify(logPayloads)).not.toContain("mismatch-nonce");
+    expect(JSON.stringify(logPayloads)).not.toContain("invalid-signature-nonce");
+    expect(JSON.stringify(logPayloads)).not.toContain("not-a-viva-token");
     expect(calls).toEqual([]);
+  });
+
+  test("session route failures expose sanitized log fields for provider dashboards", () => {
+    process.env.VERCEL_GIT_COMMIT_SHA = "abc123";
+
+    expect(
+      vivaSessionRouteFailureLogPayload(
+        {
+          error: "invalid_session_token",
+          failure_class: "session_auth_failure",
+          token_refresh_outcome: "invalid_rejected",
+        },
+        401,
+        { action: "refresh", route: "refresh" },
+      ),
+    ).toEqual({
+      action: "refresh",
+      deploy_sha: "abc123",
+      error: "invalid_session_token",
+      event: "viva_session_route_failure",
+      failure_class: "session_auth_failure",
+      route: "refresh",
+      service: "web",
+      stage: "session_auth",
+      status: 401,
+      token_refresh_outcome: "invalid_rejected",
+    });
   });
 });
 

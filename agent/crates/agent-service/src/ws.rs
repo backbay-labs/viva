@@ -527,7 +527,7 @@ async fn handle_socket(
             close_code::NORMAL,
         )
         .await;
-        record_terminal_evidence(&state, voice_session_id, terminal_reason);
+        record_terminal_evidence(&state, voice_session_id, terminal_reason).await;
         return;
     }
 
@@ -918,7 +918,7 @@ async fn handle_socket(
         }
     }
     if terminal_persisted {
-        record_terminal_evidence(&state, voice_session_id, terminal_reason);
+        record_terminal_evidence(&state, voice_session_id, terminal_reason).await;
     } else {
         record_terminal(&state, voice_session_id, terminal_reason).await;
     }
@@ -976,7 +976,7 @@ where
         .await
         .is_err()
     {
-        return "send_failed";
+        return terminal_label_after_terminal_phase_close(terminal_reason, "send_failed");
     }
     let close_code = terminal_close_code(terminal_reason, close_code);
     let _ = close_with(sender, close_code, terminal_reason.close_reason()).await;
@@ -1005,11 +1005,35 @@ fn terminal_label_after_terminal_phase_close(
     terminal_reason: TerminalSessionReason,
     close_terminal_reason: &'static str,
 ) -> &'static str {
-    if terminal_reason == TerminalSessionReason::DurabilityDegraded {
+    if close_terminal_reason == "send_failed"
+        && terminal_reason_overrides_send_failure(terminal_reason)
+    {
         terminal_reason.as_str()
     } else {
         close_terminal_reason
     }
+}
+
+fn terminal_reason_overrides_send_failure(terminal_reason: TerminalSessionReason) -> bool {
+    matches!(
+        terminal_reason,
+        TerminalSessionReason::CostBudget
+            | TerminalSessionReason::ProviderAuthFailed
+            | TerminalSessionReason::ProviderRateLimited
+            | TerminalSessionReason::ProviderTimeout
+            | TerminalSessionReason::ProviderMalformedStream
+            | TerminalSessionReason::ProviderNetworkDisconnect
+            | TerminalSessionReason::ProviderCancelled
+            | TerminalSessionReason::PartialStageSuccess
+            | TerminalSessionReason::DurabilityDegraded
+            | TerminalSessionReason::Drained
+            | TerminalSessionReason::RateLimit
+            | TerminalSessionReason::SessionCap
+            | TerminalSessionReason::SlowClient
+            | TerminalSessionReason::ToolExecutorFailure
+            | TerminalSessionReason::TurnCap
+            | TerminalSessionReason::Rollback
+    )
 }
 
 async fn close_with_client_stop<S>(
@@ -1311,6 +1335,226 @@ fn terminal_reason_for_provider_message(message: &str) -> TerminalSessionReason 
         return TerminalSessionReason::ProviderMalformedStream;
     }
     TerminalSessionReason::ProviderNetworkDisconnect
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TerminalObservabilityClassification {
+    failure_class: &'static str,
+    stage: &'static str,
+    signal: &'static str,
+}
+
+fn terminal_observability_classification(
+    reason: &str,
+) -> Option<TerminalObservabilityClassification> {
+    let classification = match reason {
+        "provider_rate_limited" => TerminalObservabilityClassification {
+            failure_class: "quota_rate_failure",
+            stage: "provider",
+            signal: "gemini_http_429",
+        },
+        "provider_auth_failed" => TerminalObservabilityClassification {
+            failure_class: "provider_auth_failure",
+            stage: "provider_auth",
+            signal: "provider_auth_failed",
+        },
+        "provider_timeout" => TerminalObservabilityClassification {
+            failure_class: "timeout",
+            stage: "websocket",
+            signal: "provider_timeout",
+        },
+        "provider_malformed_stream" => TerminalObservabilityClassification {
+            failure_class: "malformed_stream",
+            stage: "websocket",
+            signal: "provider_malformed_stream",
+        },
+        "provider_network_disconnect" => TerminalObservabilityClassification {
+            failure_class: "network_disconnect",
+            stage: "transport",
+            signal: "provider_network_disconnect",
+        },
+        "provider_cancelled" => TerminalObservabilityClassification {
+            failure_class: "cancellation",
+            stage: "provider",
+            signal: "provider_cancelled",
+        },
+        "partial_stage_success" => TerminalObservabilityClassification {
+            failure_class: "partial_stage_success",
+            stage: "recap",
+            signal: "recap_failure",
+        },
+        "tool_executor_failure" => TerminalObservabilityClassification {
+            failure_class: "tool_executor_failure",
+            stage: "tools",
+            signal: "tool_executor_failure",
+        },
+        "pending_evaluation" => TerminalObservabilityClassification {
+            failure_class: "pending_evaluation",
+            stage: "store",
+            signal: "pending_evaluation",
+        },
+        "study_set_access_denied" | "study_store_unavailable" => {
+            TerminalObservabilityClassification {
+                failure_class: "pre_loop_unavailable",
+                stage: "pre_loop",
+                signal: "pre_loop_unavailable",
+            }
+        }
+        "first_frame_timeout" | "invalid_first_frame" => TerminalObservabilityClassification {
+            failure_class: "session_bootstrap_unavailable",
+            stage: "startup",
+            signal: "session_bootstrap_unavailable",
+        },
+        "agent_input_closed" => TerminalObservabilityClassification {
+            failure_class: "network_disconnect",
+            stage: "transport",
+            signal: "agent_input_closed",
+        },
+        "invalid_session_identity"
+        | "invalid_session_token"
+        | "session_token_nonce_store_unavailable" => TerminalObservabilityClassification {
+            failure_class: "session_auth_failure",
+            stage: "session_auth",
+            signal: "session_auth_rejected",
+        },
+        "durability_degraded" => TerminalObservabilityClassification {
+            failure_class: "durability_degraded",
+            stage: "store",
+            signal: "durability_degraded",
+        },
+        "cost_budget" => TerminalObservabilityClassification {
+            failure_class: "cost_budget",
+            stage: "provider",
+            signal: "cost_budget_exhausted",
+        },
+        "rate_limit" => TerminalObservabilityClassification {
+            failure_class: "local_rate_limit",
+            stage: "session",
+            signal: "local_rate_limit",
+        },
+        "turn_cap" => TerminalObservabilityClassification {
+            failure_class: "turn_cap",
+            stage: "session",
+            signal: "turn_cap",
+        },
+        "session_cap" => TerminalObservabilityClassification {
+            failure_class: "session_cap",
+            stage: "session",
+            signal: "session_cap",
+        },
+        "slow_client" => TerminalObservabilityClassification {
+            failure_class: "slow_client",
+            stage: "session",
+            signal: "slow_client",
+        },
+        "drained" => TerminalObservabilityClassification {
+            failure_class: "deploy_drain",
+            stage: "deployment",
+            signal: "deploy_drain",
+        },
+        "rollback" => TerminalObservabilityClassification {
+            failure_class: "rollback",
+            stage: "rollback",
+            signal: "rollback_required",
+        },
+        _ => return None,
+    };
+    Some(classification)
+}
+
+fn deployment_sha() -> String {
+    for name in [
+        "RAILWAY_GIT_COMMIT_SHA",
+        "VERCEL_GIT_COMMIT_SHA",
+        "GITHUB_SHA",
+        "SOURCE_VERSION",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.chars().take(64).collect();
+            }
+        }
+    }
+    "unknown".to_owned()
+}
+
+fn emit_terminal_observability_log(state: &AppState, reason: &str) {
+    let Some(classification) = terminal_observability_classification(reason) else {
+        return;
+    };
+    let deploy_sha = deployment_sha();
+    let model = observability_model(&state.provider);
+    tracing::warn!(
+        event = "provider_failure_observed",
+        failure_class = classification.failure_class,
+        stage = classification.stage,
+        provider = %state.provider,
+        model = %model,
+        deploy_sha = %deploy_sha,
+        terminal_reason = reason,
+        signal = classification.signal,
+        latency_ms = "unknown",
+        latency_bucket = "unknown",
+        usage = "unknown",
+        usage_bucket = "unknown",
+        cost_usd = "unknown",
+        cost_bucket = "unknown",
+        "viva provider failure observed"
+    );
+}
+
+fn emit_pending_evaluation_observability_log(
+    state: &AppState,
+    _terminal_reason: &str,
+    pending_answer_attempts: usize,
+) {
+    if pending_answer_attempts == 0 {
+        return;
+    }
+    let deploy_sha = deployment_sha();
+    let model = observability_model(&state.provider);
+    tracing::warn!(
+        event = "provider_failure_observed",
+        failure_class = "pending_evaluation",
+        stage = "store",
+        provider = %state.provider,
+        model = %model,
+        deploy_sha = %deploy_sha,
+        terminal_reason = pending_evaluation_terminal_reason(),
+        signal = "pending_evaluation",
+        evaluation_state = "pending",
+        pending_answer_attempts,
+        latency_ms = "unknown",
+        latency_bucket = "unknown",
+        usage = "unknown",
+        usage_bucket = "unknown",
+        cost_usd = "unknown",
+        cost_bucket = "unknown",
+        "viva pending evaluation observed"
+    );
+}
+
+fn pending_evaluation_terminal_reason() -> &'static str {
+    "pending_evaluation"
+}
+
+fn observability_model(provider: &str) -> String {
+    observability_model_with(provider, |name| std::env::var(name).ok())
+}
+
+fn observability_model_with(provider: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    if provider == "cartesia_gemini" {
+        for name in ["GEMINI_MODEL", "GEMINI_REALTIME_MODEL"] {
+            if let Some(value) = lookup(name) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.chars().take(128).collect();
+                }
+            }
+        }
+    }
+    format!("{provider}-viva")
 }
 
 async fn open_failure_control_session(
@@ -2519,7 +2763,7 @@ async fn record_terminal(state: &AppState, voice_session_id: Option<String>, rea
             ));
         }
     }
-    record_terminal_evidence(state, voice_session_id, terminal_reason);
+    record_terminal_evidence(state, voice_session_id, terminal_reason).await;
 }
 
 async fn persist_terminal_session_reason(
@@ -2590,8 +2834,32 @@ fn terminal_close_code(reason: TerminalSessionReason, close_code: u16) -> u16 {
     }
 }
 
-fn record_terminal_evidence(state: &AppState, voice_session_id: Option<String>, reason: &str) {
+async fn record_terminal_evidence(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    reason: &str,
+) {
+    let pending_answer_attempts = if let Some(session_id) = voice_session_id.as_deref() {
+        match state
+            .study_store
+            .pending_answer_attempts_for_session(session_id)
+            .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                state.evidence.record(VoiceEvidenceEvent::new(
+                    VoiceEvidenceEventKind::StoreCounts,
+                    voice_session_id.clone(),
+                    format!("pending_answer_attempts_failed: {error}"),
+                ));
+                0
+            }
+        }
+    } else {
+        0
+    };
     let counts = state.study_store.write_counts();
+    emit_pending_evaluation_observability_log(state, reason, pending_answer_attempts);
     state.evidence.record(VoiceEvidenceEvent::new(
         VoiceEvidenceEventKind::StoreCounts,
         voice_session_id.clone(),
@@ -2609,6 +2877,7 @@ fn record_terminal_evidence(state: &AppState, voice_session_id: Option<String>, 
         voice_session_id.clone(),
         reason,
     ));
+    emit_terminal_observability_log(state, reason);
     state.evidence.record(VoiceEvidenceEvent::new(
         VoiceEvidenceEventKind::Close,
         voice_session_id,
@@ -2739,6 +3008,156 @@ mod tests {
             "fake-provider-store",
             "postgres adapter error: closed voice session cannot be reopened"
         ));
+    }
+
+    #[test]
+    fn terminal_observability_classifier_emits_query_backing_fields() {
+        assert_eq!(
+            terminal_observability_classification("provider_rate_limited"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "quota_rate_failure",
+                stage: "provider",
+                signal: "gemini_http_429",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("provider_auth_failed"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "provider_auth_failure",
+                stage: "provider_auth",
+                signal: "provider_auth_failed",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("provider_cancelled"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "cancellation",
+                stage: "provider",
+                signal: "provider_cancelled",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification(
+                TerminalSessionReason::ToolExecutorFailure.as_str()
+            ),
+            Some(TerminalObservabilityClassification {
+                failure_class: "tool_executor_failure",
+                stage: "tools",
+                signal: "tool_executor_failure",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("turn_cap"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "turn_cap",
+                stage: "session",
+                signal: "turn_cap",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("study_set_access_denied"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "pre_loop_unavailable",
+                stage: "pre_loop",
+                signal: "pre_loop_unavailable",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("study_store_unavailable"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "pre_loop_unavailable",
+                stage: "pre_loop",
+                signal: "pre_loop_unavailable",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("first_frame_timeout"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "session_bootstrap_unavailable",
+                stage: "startup",
+                signal: "session_bootstrap_unavailable",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("agent_input_closed"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "network_disconnect",
+                stage: "transport",
+                signal: "agent_input_closed",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("invalid_session_token"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "session_auth_failure",
+                stage: "session_auth",
+                signal: "session_auth_rejected",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("session_token_nonce_store_unavailable"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "session_auth_failure",
+                stage: "session_auth",
+                signal: "session_auth_rejected",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("durability_degraded"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "durability_degraded",
+                stage: "store",
+                signal: "durability_degraded",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("closed_before_config"),
+            None
+        );
+        assert_eq!(terminal_observability_classification("completed"), None);
+    }
+
+    #[test]
+    fn pending_evaluation_observability_uses_dedicated_terminal_reason() {
+        assert_eq!(pending_evaluation_terminal_reason(), "pending_evaluation");
+        assert_ne!(
+            pending_evaluation_terminal_reason(),
+            "provider_rate_limited"
+        );
+        assert_ne!(pending_evaluation_terminal_reason(), "provider_timeout");
+    }
+
+    #[test]
+    fn terminal_observability_model_uses_provider_suffix() {
+        assert_eq!(
+            observability_model_with("cartesia_gemini", |_| None),
+            "cartesia_gemini-viva"
+        );
+    }
+
+    #[test]
+    fn terminal_observability_model_uses_configured_cartesia_gemini_model() {
+        assert_eq!(
+            observability_model_with("cartesia_gemini", |name| match name {
+                "GEMINI_MODEL" => Some(" gemini-live-primary ".to_owned()),
+                "GEMINI_REALTIME_MODEL" => Some("gemini-live-secondary".to_owned()),
+                _ => None,
+            }),
+            "gemini-live-primary"
+        );
+        assert_eq!(
+            observability_model_with("cartesia_gemini", |name| match name {
+                "GEMINI_REALTIME_MODEL" => Some("gemini-live-secondary".to_owned()),
+                _ => None,
+            }),
+            "gemini-live-secondary"
+        );
+        assert_eq!(
+            observability_model_with("synthetic", |name| {
+                (name == "GEMINI_MODEL").then(|| "ignored".to_owned())
+            }),
+            "synthetic-viva"
+        );
     }
 
     #[test]
@@ -3474,7 +3893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_session_phase_close_reports_send_failed_when_writer_fails() {
+    async fn terminal_session_phase_close_preserves_deploy_drain_when_writer_fails() {
         let (input, mut received) = mpsc::channel(1);
         let mut sender = FailingSink;
         let state = AppState::new(
@@ -3496,7 +3915,35 @@ mod tests {
         )
         .await;
 
-        assert_eq!(reason, "send_failed");
+        assert_eq!(reason, "drained");
+        assert!(terminal_persisted);
+        assert!(matches!(received.recv().await.unwrap(), BrainInput::Stop));
+    }
+
+    #[tokio::test]
+    async fn terminal_session_phase_close_preserves_provider_reason_when_writer_fails() {
+        let (input, mut received) = mpsc::channel(1);
+        let mut sender = FailingSink;
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "synthetic",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let mut terminal_persisted = false;
+
+        let reason = close_with_terminal_session_phase(
+            &mut sender,
+            &input,
+            &state,
+            None,
+            &mut terminal_persisted,
+            TerminalSessionReason::ProviderRateLimited,
+            close_code::ERROR,
+        )
+        .await;
+
+        assert_eq!(reason, "provider_rate_limited");
         assert!(terminal_persisted);
         assert!(matches!(received.recv().await.unwrap(), BrainInput::Stop));
     }
@@ -3512,10 +3959,52 @@ mod tests {
         );
         assert_eq!(
             terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::ProviderRateLimited,
+                "send_failed",
+            ),
+            "provider_rate_limited"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
                 TerminalSessionReason::Drained,
                 "send_failed"
             ),
-            "send_failed"
+            "drained"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::RateLimit,
+                "send_failed"
+            ),
+            "rate_limit"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::TurnCap,
+                "send_failed"
+            ),
+            "turn_cap"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::SessionCap,
+                "send_failed"
+            ),
+            "session_cap"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::SlowClient,
+                "send_failed"
+            ),
+            "slow_client"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::ToolExecutorFailure,
+                "send_failed",
+            ),
+            "tool_executor_failure"
         );
     }
 
