@@ -22,8 +22,8 @@ import {
 import { seedStudySets } from "./index";
 
 describe("Viva voice agent contract", () => {
-  test("uses protocol v3 because ready frames carry required provider/store nonce readiness", () => {
-    expect(VIVA_VOICE_PROTOCOL_VERSION).toBe(3);
+  test("uses protocol v4 because terminal reasons include tool executor failures", () => {
+    expect(VIVA_VOICE_PROTOCOL_VERSION).toBe(4);
     expect(() =>
       parseVivaServerFrame({
         type: "ready",

@@ -2,7 +2,7 @@
   "client": [
     {
       "type": "session_config",
-      "version": 3,
+      "version": 4,
       "session": {
         "session_id": "voice-session-1",
         "user_id": "user-1",
@@ -24,24 +24,24 @@
     },
     {
       "type": "audio",
-      "version": 3,
+      "version": 4,
       "frame": {
         "pcm16_base64": "AQIDBA=="
       }
     },
     {
       "type": "cancel",
-      "version": 3
+      "version": 4
     },
     {
       "type": "stop",
-      "version": 3
+      "version": 4
     }
   ],
   "server": [
     {
       "type": "ready",
-      "version": 3,
+      "version": 4,
       "sample_rate_hz": 24000,
       "input_encoding": "pcm_s16le",
       "brain": {
@@ -62,7 +62,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "session_phase",
         "phase": "ready"
@@ -70,7 +70,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "question_started",
         "response_id": "response-1",
@@ -97,7 +97,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "session_phase",
         "phase": "listening"
@@ -105,7 +105,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "transcript_delta",
         "response_id": "response-1",
@@ -114,7 +114,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "transcript_final",
         "response_id": "response-1",
@@ -124,7 +124,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "session_phase",
         "phase": "thinking"
@@ -132,7 +132,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "answer_evaluated",
         "response_id": "response-1",
@@ -157,7 +157,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "manuscript_intent",
         "response_id": "response-1",
@@ -172,7 +172,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "source_reference",
         "response_id": "response-1",
@@ -188,7 +188,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "concept_status",
         "response_id": "response-1",
@@ -198,7 +198,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "audio_delta",
         "response_id": "response-1",
@@ -209,7 +209,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "session_phase",
         "phase": "feedback"
@@ -217,7 +217,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "session_phase",
         "phase": "correction"
@@ -225,7 +225,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "recap_ready",
         "response_id": "response-1",
@@ -257,7 +257,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "session_phase",
         "phase": "recap"
@@ -265,7 +265,7 @@
     },
     {
       "type": "event",
-      "version": 3,
+      "version": 4,
       "event": {
         "type": "cancellation",
         "response_id": "response-2"

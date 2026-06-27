@@ -16,7 +16,7 @@ use agent_domain::{
     AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
     AnswerEvaluation, AudioFrame, AuthorizedStudySession, BrainError, BrainEvent, BrainInput,
     BrainProviderFailure, BrainProviderFailureParts, BrainUsage, ConceptStatus, ManuscriptEmphasis,
-    ManuscriptEntityKind, ManuscriptIntent, ManuscriptRegister, RealtimeSession,
+    ManuscriptEntityKind, ManuscriptIntent, ManuscriptRegister, PortError, RealtimeSession,
     RealtimeSessionTaskGuard, SessionConfig, StudyMemoryStore, StudyQuestion, StudySessionPhase,
     StudySessionRecap, StudySourceReference, TerminalSessionReason, ToolExecutionError,
     ToolProposal, ToolResult, VivaToolExecutor,
@@ -518,7 +518,6 @@ where
                 interrupt,
             );
             let mut saw_tool_call = false;
-            let mut last_tool_call: Option<(String, Duration)> = None;
             for event in stream {
                 match event {
                     GeminiStreamEvent::FunctionCall { id, name, args, .. } => {
@@ -528,6 +527,13 @@ where
                         }
                         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
                             return Ok(response_prompt);
+                        }
+                        if pass_index + 1 >= MAX_GEMINI_TOOL_LOOP_PASSES {
+                            return Err(gemini_tool_loop_budget_error(
+                                &name,
+                                &self.config.gemini.model_id,
+                                gemini_started.elapsed(),
+                            ));
                         }
                         let proposal = if name == "evaluate_spoken_answer" {
                             ToolProposal::evaluate_spoken_answer(
@@ -546,8 +552,6 @@ where
                             &self.config.gemini.model_id,
                             gemini_started.elapsed(),
                         )?;
-                        last_tool_call =
-                            Some((proposal.name().to_owned(), gemini_started.elapsed()));
                         if proposal.name() == "emit_manuscript_intent" {
                             let accepted = if let Some(intent) =
                                 parse_gemini_manuscript_intent(proposal.arguments())
@@ -631,15 +635,6 @@ where
             }
             if !saw_tool_call {
                 break;
-            }
-            if pass_index + 1 >= MAX_GEMINI_TOOL_LOOP_PASSES {
-                let (tool_name, latency) = last_tool_call
-                    .unwrap_or_else(|| ("unrecognized_tool".to_owned(), gemini_started.elapsed()));
-                return Err(gemini_tool_loop_budget_error(
-                    &tool_name,
-                    &self.config.gemini.model_id,
-                    latency,
-                ));
             }
         }
 
@@ -1063,7 +1058,20 @@ fn tool_execution_stage_error(
     error: &ToolExecutionError,
     gemini_model: Option<&str>,
 ) -> BrainError {
-    if let (ToolExecutionError::InvalidArguments(_), Some(model)) = (error, gemini_model) {
+    if let ToolExecutionError::Store(port_error) = error {
+        if port_error_is_durability_degraded(port_error) {
+            return tool_stage_error(
+                tool_name,
+                "durability_degraded",
+                "store",
+                TerminalSessionReason::DurabilityDegraded,
+                true,
+                latency,
+                "durability_degraded",
+            );
+        }
+    }
+    if let (Some(model), true) = (gemini_model, gemini_controlled_tool_error(error)) {
         return gemini_tool_stage_error(
             tool_name,
             model,
@@ -1080,6 +1088,30 @@ fn tool_execution_stage_error(
         latency,
         tool_execution_error_kind(error),
     )
+}
+
+fn gemini_controlled_tool_error(error: &ToolExecutionError) -> bool {
+    matches!(
+        error,
+        ToolExecutionError::InvalidArguments(_) | ToolExecutionError::Unavailable(_)
+    )
+}
+
+fn port_error_is_durability_degraded(error: &PortError) -> bool {
+    match error {
+        PortError::Adapter { reason, .. } => {
+            let normalized = reason.to_ascii_lowercase();
+            normalized.contains("durable store")
+                || normalized.contains("store unavailable")
+                || normalized.contains("database unavailable")
+                || normalized.contains("postgres unavailable")
+                || normalized.contains("connection")
+                || normalized.contains("pool")
+                || normalized.contains("timed out")
+                || normalized.contains("timeout")
+        }
+        PortError::Unavailable { .. } => false,
+    }
 }
 
 fn gemini_tool_stage_error(
@@ -1313,6 +1345,69 @@ mod tests {
         assert_eq!(failure.latency_ms, 42);
         assert!(failure.metadata.contains("tool=unrecognized_tool"));
         assert!(failure.metadata.contains("error_kind=invalid_arguments"));
+    }
+
+    #[test]
+    fn unavailable_gemini_tool_targets_classify_as_malformed_provider_stream() {
+        let error = tool_execution_stage_error(
+            "retrieve_source_reference",
+            "tool_executor_failure",
+            "tools",
+            Duration::from_millis(17),
+            &ToolExecutionError::Unavailable("source is unavailable".to_owned()),
+            Some("gemini-test-model"),
+        );
+        let BrainError::StageFailure(failure) = error else {
+            panic!("unavailable Gemini tool targets should produce a stage failure");
+        };
+
+        assert_eq!(failure.failure_class, "malformed_stream");
+        assert_eq!(failure.stage, "gemini");
+        assert_eq!(failure.provider, "gemini");
+        assert_eq!(failure.model, "gemini-test-model");
+        assert_eq!(
+            failure.terminal_reason,
+            TerminalSessionReason::ProviderMalformedStream
+        );
+        assert!(failure.retry_eligible);
+        assert_eq!(failure.latency_ms, 17);
+        assert_eq!(
+            failure.metadata,
+            "tool=retrieve_source_reference error_kind=unavailable"
+        );
+    }
+
+    #[test]
+    fn durable_tool_store_errors_classify_as_durability_degraded() {
+        let error = tool_execution_stage_error(
+            "mark_concept_status",
+            "tool_executor_failure",
+            "tools",
+            Duration::from_millis(29),
+            &ToolExecutionError::Store(PortError::adapter(
+                "postgres",
+                "durable store write failed",
+            )),
+            Some("gemini-test-model"),
+        );
+        let BrainError::StageFailure(failure) = error else {
+            panic!("durable tool store errors should produce a stage failure");
+        };
+
+        assert_eq!(failure.failure_class, "durability_degraded");
+        assert_eq!(failure.stage, "store");
+        assert_eq!(
+            failure.terminal_reason,
+            TerminalSessionReason::DurabilityDegraded
+        );
+        assert!(failure.retry_eligible);
+        assert_eq!(failure.latency_ms, 29);
+        assert_eq!(failure.provider, "server");
+        assert_eq!(failure.model, "viva-tools");
+        assert_eq!(
+            failure.metadata,
+            "tool=mark_concept_status error_kind=durability_degraded"
+        );
     }
 
     #[test]
