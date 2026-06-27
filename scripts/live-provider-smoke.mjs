@@ -791,6 +791,31 @@ export function liveMonitorEvidence({
   };
 }
 
+export function configurationFailureEvidence({ env = process.env, now = () => new Date() } = {}) {
+  const failure = liveProviderFailureForSmokeReason("configuration_error");
+  const config = {
+    deploySha: deploymentSha(env),
+    liveMonitorConsecutiveFailures: safeLiveMonitorConsecutiveFailures(env),
+    model: liveSmokeModel(env),
+  };
+  return {
+    schema: "viva.live_provider_smoke.v1",
+    generated_at: now().toISOString(),
+    deploy_sha: config.deploySha,
+    enabled: liveSmokeEnabled(env),
+    failure_matrix: failureMatrixEvidence(),
+    failure_stage: "configuration",
+    failure,
+    failure_class: failure.failure_class,
+    model: config.model,
+    monitor: failedMonitorEvidence(config, "configuration_error"),
+    provider: LIVE_PROVIDER,
+    status: "failed",
+    terminal_reason: "configuration_error",
+    privacy: privacyEvidence(),
+  };
+}
+
 function failedMonitorEvidence(config, terminalReason) {
   return liveMonitorEvidence({
     consecutiveFailures: config.liveMonitorConsecutiveFailures,
@@ -903,18 +928,26 @@ function optionalNonNegativeInteger(value) {
   return parsed;
 }
 
+function safeLiveMonitorConsecutiveFailures(env) {
+  try {
+    return optionalNonNegativeInteger(env.VIVA_LIVE_MONITOR_CONSECUTIVE_FAILURES);
+  } catch {
+    return 0;
+  }
+}
+
 async function previousLiveMonitorConsecutiveFailures(config, readFileImpl) {
   let previousArtifactFailures = 0;
   try {
     const raw = await readFileImpl(config.outputPath, "utf8");
-    previousArtifactFailures = liveMonitorConsecutiveFailuresFromEvidence(JSON.parse(raw));
+    previousArtifactFailures = liveMonitorConsecutiveFailuresFromEvidence(JSON.parse(raw), config);
   } catch {
     previousArtifactFailures = 0;
   }
   return Math.max(config.liveMonitorConsecutiveFailures, previousArtifactFailures);
 }
 
-function liveMonitorConsecutiveFailuresFromEvidence(evidence) {
+function liveMonitorConsecutiveFailuresFromEvidence(evidence, currentConfig = null) {
   if (
     evidence?.schema !== "viva.live_provider_smoke.v1" ||
     evidence.status !== "failed" ||
@@ -922,6 +955,13 @@ function liveMonitorConsecutiveFailuresFromEvidence(evidence) {
     typeof evidence.monitor !== "object"
   ) {
     return 0;
+  }
+  if (currentConfig) {
+    const priorDeploySha = evidence.monitor.deploy_sha ?? evidence.deploy_sha ?? null;
+    const priorModel = evidence.monitor.model ?? evidence.model ?? null;
+    if (priorDeploySha !== currentConfig.deploySha || priorModel !== currentConfig.model) {
+      return 0;
+    }
   }
   const count = evidence.monitor.live_monitor_consecutive_failures;
   return Number.isSafeInteger(count) && count >= 0 ? count : 0;
@@ -1051,17 +1091,7 @@ async function main() {
   try {
     evidence = await runLiveProviderSmoke();
   } catch {
-    evidence = {
-      schema: "viva.live_provider_smoke.v1",
-      generated_at: new Date().toISOString(),
-      enabled: liveSmokeEnabled(process.env),
-      status: "failed",
-      provider: LIVE_PROVIDER,
-      failure_stage: "configuration",
-      failure: liveProviderFailureForSmokeReason("configuration_error"),
-      terminal_reason: "configuration_error",
-      privacy: privacyEvidence(),
-    };
+    evidence = configurationFailureEvidence();
   }
   auditLiveSmokeEvidence(evidence, process.env);
   await writeEvidence(outputPath, evidence);

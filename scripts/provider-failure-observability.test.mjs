@@ -43,6 +43,11 @@ test("provider failure observability defines reusable sanitized log queries", ()
   }
 
   assert.match(queriesById.get("provider_429").railway_query, /gemini_http_429/);
+  assert.match(
+    queriesById.get("provider_auth_failure").railway_query,
+    /artifact:"viva\.live_provider_smoke\.v1"/,
+  );
+  assert.match(queriesById.get("provider_auth_failure").railway_query, /configuration_error/);
   assert.match(queriesById.get("cost_budget").railway_query, /failure_class:"cost_budget"/);
   assert.match(
     queriesById.get("watchdog_expiry").railway_query,
@@ -64,6 +69,15 @@ test("provider failure observability defines reusable sanitized log queries", ()
   assert.match(
     queriesById.get("live_monitor_failure").railway_query,
     /monitor\.live_monitor_consecutive_failures/,
+  );
+  assert.match(queriesById.get("live_monitor_failure").railway_query, /configuration_error/);
+  assert.match(
+    queriesById.get("rollback_observed").railway_query,
+    /artifact:"viva\.release_evidence\.v1"/,
+  );
+  assert.match(
+    queriesById.get("rollback_observed").railway_query,
+    /rollback_drain\.production_release_gate\.reason/,
   );
   assert.match(
     queriesById.get("token_refresh_failure").railway_query,
@@ -120,7 +134,6 @@ test("reviewed BAC-525 queries name emitted log and evidence surfaces", () => {
     "provider_cancellation",
     "deploy_drain",
     "watchdog_expiry",
-    "rollback_observed",
     "startup_unavailable",
   ]) {
     assert.match(
@@ -161,6 +174,24 @@ test("reviewed BAC-525 queries name emitted log and evidence surfaces", () => {
   assert.match(
     queriesById.get("live_monitor_failure").railway_query,
     /artifact:"viva.live_provider_smoke.v1"/,
+  );
+  assert(
+    queriesById.get("live_monitor_failure").evidence_fields.includes("monitor.terminal_reason"),
+    "live monitor failure query must expose monitor terminal reasons",
+  );
+  assert.match(
+    queriesById.get("rollback_observed").railway_query,
+    /artifact:"viva.release_evidence.v1"/,
+  );
+  assert.match(
+    queriesById.get("rollback_observed").railway_query,
+    /artifact:"viva.rollback_release_gate.v1"/,
+  );
+  assert(
+    queriesById
+      .get("rollback_observed")
+      .evidence_fields.includes("rollback_drain.owner_decision.decision"),
+    "rollback observed query must expose release-evidence owner decisions",
   );
   assert(
     queriesById

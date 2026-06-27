@@ -69,8 +69,16 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "provider_auth",
     terminal_reason: "provider_auth_failed",
     railway_query:
-      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"provider_auth_failed" OR failure_class:"provider_auth_failure")',
-    evidence_fields: ["failure_class", "stage", "provider", "model", "deploy_sha", "latency_ms"],
+      '(service:"agent-service" event:"provider_failure_observed" (terminal_reason:"provider_auth_failed" OR failure_class:"provider_auth_failure")) OR (artifact:"viva.live_provider_smoke.v1" (failure_class:"provider_auth_failure" OR terminal_reason:"configuration_error" OR terminal_reason:"readiness_not_live_selectable" OR monitor.terminal_reason:"configuration_error" OR monitor.terminal_reason:"readiness_not_live_selectable"))',
+    evidence_fields: [
+      "failure_class",
+      "stage",
+      "provider",
+      "model",
+      "deploy_sha",
+      "latency_ms",
+      "monitor.terminal_reason",
+    ],
   }),
   query({
     id: "provider_timeout",
@@ -279,7 +287,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "live_monitor_failure",
     stage: "monitor",
     railway_query:
-      'artifact:"viva.live_provider_smoke.v1" (failure_class:"live_monitor_failure" OR monitor.live_monitor_consecutive_failures:">=2" OR monitor.signal:"live_monitor_failure")',
+      'artifact:"viva.live_provider_smoke.v1" (failure_class:"live_monitor_failure" OR monitor.live_monitor_consecutive_failures:">=2" OR monitor.signal:"live_monitor_failure" OR monitor.terminal_reason:"configuration_error")',
     evidence_fields: [
       "failure_class",
       "stage",
@@ -289,6 +297,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
       "latency_ms",
       "monitor.live_monitor_attempt_count",
       "monitor.live_monitor_consecutive_failures",
+      "monitor.terminal_reason",
     ],
   }),
   query({
@@ -298,8 +307,17 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     stage: "rollback",
     terminal_reason: "rollback",
     railway_query:
-      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"rollback" OR failure_class:"rollback" OR signal:"rollback_required")',
-    evidence_fields: ["terminal_reason", "failure_class", "stage", "deploy_sha", "latency_ms"],
+      '(artifact:"viva.release_evidence.v1" (rollback_drain.schema:"viva.rollback_release_gate.v1" OR rollback_drain.owner_decision.decision:"rollback" OR rollback_drain.production_release_gate.reason:"production_release_missing_required_rollback_evidence_or_owner_proceed_decision")) OR (artifact:"viva.rollback_release_gate.v1" (owner_decision.decision:"rollback" OR production_release_gate.reason:"production_release_missing_required_rollback_evidence_or_owner_proceed_decision"))',
+    evidence_fields: [
+      "terminal_reason",
+      "failure_class",
+      "stage",
+      "deploy_sha",
+      "latency_ms",
+      "rollback_drain.owner_decision.decision",
+      "rollback_drain.production_release_gate.reason",
+      "production_release_gate.reason",
+    ],
   }),
   query({
     id: "release_gate_stale_evidence",
@@ -713,6 +731,9 @@ export function learnerLoopFailureClasses() {
 function queryCoversFailureClass(queryEntry, failureClass) {
   const railwayQuery = queryEntry.railway_query;
   if (railwayQuery.includes(`failure_class:"${failureClass}"`)) return true;
+  if (failureClass === "rollback" && railwayQuery.includes('owner_decision.decision:"rollback"')) {
+    return true;
+  }
   return learnerLoopTerminalReasonsForFailureClass(failureClass).some((reason) =>
     railwayQuery.includes(`terminal_reason:"${reason}"`),
   );
