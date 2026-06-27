@@ -892,6 +892,56 @@ async fn fake_runtime_replays_provider_shaped_pipeline_without_live_selection() 
 }
 
 #[tokio::test]
+async fn fake_runtime_session_completes_after_correction_phase() {
+    let (store, session_config) = fixture_store_and_session().await;
+    let runtime = FakeCartesiaGeminiRuntime::new(store);
+    let mut session = runtime.open(session_config).await.unwrap();
+
+    assert!(matches!(
+        next_event(&mut session).await,
+        BrainEvent::SessionPhase {
+            phase: agent_domain::StudySessionPhase::Ready
+        }
+    ));
+    assert!(matches!(
+        next_event(&mut session).await,
+        BrainEvent::QuestionStarted { response_id, .. } if response_id == "response-1"
+    ));
+    session
+        .input
+        .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+            1_u8, 2, 3, 4,
+        ])))
+        .await
+        .unwrap();
+
+    let mut saw_correction = false;
+    for _ in 0..20 {
+        match next_event(&mut session).await {
+            BrainEvent::SessionPhase {
+                phase: agent_domain::StudySessionPhase::Correction,
+            } => {
+                saw_correction = true;
+            }
+            BrainEvent::ResponseCompleted { response_id } => {
+                assert_eq!(response_id, "response-1");
+                assert!(
+                    saw_correction,
+                    "fake provider must not complete before correction finishes"
+                );
+                return;
+            }
+            BrainEvent::RecapReady { .. } => {
+                panic!("fake provider emitted recap before response completion");
+            }
+            _ => {}
+        }
+    }
+
+    panic!("fake provider did not emit response completion");
+}
+
+#[tokio::test]
 async fn fake_runtime_reports_tool_source_failure_as_stage_failure() {
     let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let session = fixture_session_config();

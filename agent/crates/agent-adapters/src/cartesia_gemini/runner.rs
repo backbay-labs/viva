@@ -324,6 +324,15 @@ where
                 frame,
             });
         }
+        events.push(BrainEvent::SessionPhase {
+            phase: StudySessionPhase::Feedback,
+        });
+        events.push(BrainEvent::SessionPhase {
+            phase: StudySessionPhase::Correction,
+        });
+        events.push(BrainEvent::ResponseCompleted {
+            response_id: response_id.clone(),
+        });
 
         Ok(FakeRuntimeReport {
             events,
@@ -450,6 +459,7 @@ where
         if let Err(error) = self
             .emit_deterministic_study_tool_events(StudyToolEventJob {
                 cancelled: &job.cancelled,
+                completed: &job.completed,
                 event_tx: &job.event_tx,
                 executor: &job.executor,
                 question: &job.question,
@@ -461,9 +471,7 @@ where
             .await
         {
             emit_fake_provider_error(&job.event_tx, error).await;
-            return;
         }
-        job.completed.store(true, Ordering::SeqCst);
     }
 
     async fn transcript_for_input(
@@ -689,6 +697,7 @@ where
     ) -> Result<(), BrainError> {
         let StudyToolEventJob {
             cancelled,
+            completed,
             event_tx,
             executor,
             question,
@@ -814,13 +823,24 @@ where
                 return Ok(());
             }
         }
-
         for phase in [StudySessionPhase::Feedback, StudySessionPhase::Correction] {
             if !send_fake_unless_cancelled(event_tx, BrainEvent::SessionPhase { phase }, cancelled)
                 .await
             {
                 return Ok(());
             }
+        }
+        completed.store(true, Ordering::SeqCst);
+        if !send_fake_unless_cancelled(
+            event_tx,
+            BrainEvent::ResponseCompleted {
+                response_id: response_id.to_owned(),
+            },
+            cancelled,
+        )
+        .await
+        {
+            return Ok(());
         }
 
         let recap = execute_tool_stage(
@@ -1808,6 +1828,7 @@ struct StudyToolEventJob<'a> {
     question: &'a StudyQuestion,
     response_id: &'a str,
     cancelled: &'a AtomicBool,
+    completed: &'a AtomicBool,
     usage: BrainUsage,
     response_prompt: &'a str,
 }

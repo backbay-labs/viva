@@ -404,7 +404,7 @@ describe("Viva agent browser client", () => {
 
   test("reducer treats recap_ready as terminal without a trailing session_phase", () => {
     let state = initialVivaAgentSessionState();
-    for (const frame of fullSessionFixture.server.slice(0, 17).map(parseVivaServerFrame)) {
+    for (const frame of fullSessionFixture.server.slice(0, 18).map(parseVivaServerFrame)) {
       state = vivaAgentReducer(state, frame);
     }
 
@@ -420,6 +420,42 @@ describe("Viva agent browser client", () => {
 
     expect(afterStalePhase.phase).toBe("recap");
     expect(afterStalePhase.recap?.voice_session_id).toBe("voice-session-1");
+  });
+
+  test("reducer suppresses stale recap_ready for a superseded response", () => {
+    const state = {
+      ...initialVivaAgentSessionState(),
+      activeResponseId: "response-b",
+      phase: "thinking" as const,
+      pendingSubmission: { generationId: "response-b-generation", kind: "audio" as const },
+    };
+    const afterStaleRecap = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "recap_ready",
+          response_id: "response-a",
+          recap: {
+            voice_session_id: "voice-session-1",
+            headline: "Stale recap",
+            summary: "Old answer recap",
+            strong_concepts: [],
+            shaky_concepts: [],
+            missed_concepts: [],
+            review_later: [],
+            next_action: "Keep working on the current answer.",
+            source_moments: [],
+          },
+        },
+      }),
+    );
+
+    expect(afterStaleRecap.recap).toBeUndefined();
+    expect(afterStaleRecap.phase).toBe("thinking");
+    expect(afterStaleRecap.activeResponseId).toBe("response-b");
+    expect(afterStaleRecap.staleEvents).toBe(state.staleEvents + 1);
   });
 
   const sourceFixture = (sourceId: string, excerpt: string): AgentStudySourceReference => ({

@@ -620,7 +620,7 @@ export function vivaAgentReducer(
     responseId &&
     event.type !== "question_started" &&
     event.type !== "cancellation" &&
-    event.type !== "recap_ready" &&
+    (event.type !== "recap_ready" || state.pendingSubmission) &&
     state.activeResponseId &&
     state.activeResponseId !== responseId
   ) {

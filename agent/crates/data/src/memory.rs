@@ -2715,18 +2715,6 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 ));
             }
         }
-        let persisted = PersistedSessionRecap::from(recap);
-        if !state.recaps.iter().any(|record| {
-            record.user_id == user_id
-                && record.study_set_id == study_set_id
-                && record.voice_session_id == voice_session_id
-                && record.recap == persisted
-        }) {
-            return Err(PortError::adapter(
-                "memory",
-                "recap event does not match persisted session recap",
-            ));
-        }
         let authorization = event_authorization_record(
             user_id,
             study_set_id,
@@ -2948,6 +2936,9 @@ impl StudyMemoryStore for InMemoryStudyStore {
             .inner
             .write()
             .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        if state.event_authorizations.contains(&authorization) {
+            return Ok(status);
+        }
         if let Some(concept) = state
             .concepts
             .get_mut(&concept_key(study_set_id, concept_id))
@@ -2985,11 +2976,13 @@ impl StudyMemoryStore for InMemoryStudyStore {
         };
         let result = serde_json::to_value(&record)
             .map_err(|error| PortError::adapter("memory", error.to_string()))?;
-        self.inner
+        let mut state = self
+            .inner
             .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?
-            .review_items
-            .push(record);
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        if !state.review_items.contains(&record) {
+            state.review_items.push(record);
+        }
         Ok(result)
     }
 
@@ -4482,6 +4475,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authorizes_recap_event_from_recorded_write_after_later_recap_replacement() {
+        let store = seeded_store();
+        record_fixture_session(&store).await;
+
+        let first_recap = StudySessionRecap {
+            voice_session_id: "voice-session-1".to_owned(),
+            headline: "First recap".to_owned(),
+            summary: "Initial recap.".to_owned(),
+            strong_concepts: vec!["NADH".to_owned()],
+            shaky_concepts: vec![],
+            missed_concepts: vec![],
+            review_later: vec!["ATP synthase".to_owned()],
+            next_action: "Review oxidative phosphorylation.".to_owned(),
+            source_moments: vec![RecapSourceMoment {
+                text: "NADH source".to_owned(),
+                source: fixture_source_reference(),
+                status: ConceptStatus::Strong,
+            }],
+        };
+        let second_recap = StudySessionRecap {
+            voice_session_id: "voice-session-1".to_owned(),
+            headline: "Second recap".to_owned(),
+            summary: "Replacement recap.".to_owned(),
+            strong_concepts: vec!["ATP synthase".to_owned()],
+            shaky_concepts: vec!["NADH".to_owned()],
+            missed_concepts: vec![],
+            review_later: vec![],
+            next_action: "Compare electron transport steps.".to_owned(),
+            source_moments: vec![RecapSourceMoment {
+                text: "ATP synthase source".to_owned(),
+                source: fixture_source_reference(),
+                status: ConceptStatus::Shaky,
+            }],
+        };
+
+        store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-a",
+                first_recap.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-b",
+                second_recap.clone(),
+            )
+            .await
+            .unwrap();
+
+        store
+            .authorize_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-a",
+                &first_recap,
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .authorize_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-b",
+                &first_recap,
+            )
+            .await
+            .is_err());
+        store
+            .authorize_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-b",
+                &second_recap,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn authorizes_concept_event_from_recorded_write_after_later_status_change() {
         let store = seeded_store();
         record_fixture_session(&store).await;
@@ -4799,6 +4881,77 @@ mod tests {
             )
             .await
             .unwrap();
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.answer_attempts.len(), 1);
+        assert_eq!(snapshot.concept_statuses.len(), 1);
+        assert_eq!(snapshot.review_items.len(), 1);
+        assert_eq!(snapshot.recaps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn server_tool_executor_replay_keeps_store_counts_exact() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+        let executor = VivaToolExecutor::new(
+            store.clone(),
+            AuthorizedStudySession {
+                user_id: "user-1".to_owned(),
+                study_set_id: "biology-midterm".to_owned(),
+                voice_session_id: "voice-session-1".to_owned(),
+                mode: StudyMode::Quiz,
+                active_concepts: vec![
+                    "oxidative-phosphorylation".to_owned(),
+                    "atp-synthase".to_owned(),
+                ],
+            },
+        );
+
+        for _ in 0..2 {
+            executor
+                .execute(
+                    "response-1",
+                    ToolProposal::evaluate_spoken_answer(
+                        "biology-midterm",
+                        "voice-session-1",
+                        "q-oxidative-phosphorylation-nadh",
+                        "NADH donates electrons.",
+                    ),
+                )
+                .await
+                .unwrap();
+            executor
+                .execute(
+                    "response-1",
+                    ToolProposal::mark_concept_status(
+                        "biology-midterm",
+                        "voice-session-1",
+                        "oxidative-phosphorylation",
+                        "strong",
+                    ),
+                )
+                .await
+                .unwrap();
+            executor
+                .execute(
+                    "response-1",
+                    ToolProposal::schedule_review_item(
+                        "biology-midterm",
+                        "voice-session-1",
+                        "atp-synthase",
+                        "shaky",
+                    ),
+                )
+                .await
+                .unwrap();
+            executor
+                .execute(
+                    "response-0",
+                    ToolProposal::build_session_recap("biology-midterm", "voice-session-1"),
+                )
+                .await
+                .unwrap();
+        }
 
         let snapshot = store.snapshot();
         assert_eq!(snapshot.answer_attempts.len(), 1);

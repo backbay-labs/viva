@@ -109,6 +109,16 @@ try {
     "--",
     "--nocapture",
   ]);
+  await run("provider_gate_tests", "cargo", [
+    "test",
+    "--manifest-path",
+    "agent/Cargo.toml",
+    "-p",
+    "agent-service",
+    "fake_provider",
+    "--",
+    "--nocapture",
+  ]);
   await run(LIVE_PROVIDER_GATE_COMMAND_NAME, "cargo", [
     "test",
     "--manifest-path",
@@ -187,6 +197,7 @@ try {
           "nonce rows",
           "answer-attempt envelopes",
           "usage rows",
+          "concept-status events",
           "recaps",
           "review items",
         ],

@@ -346,9 +346,9 @@ impl ServerFrame {
             | BrainEvent::ResponseCancelled
             | BrainEvent::ResponseCancelledFor { .. }
             | BrainEvent::ResponseStarted { .. }
-            | BrainEvent::ResponseTextStarted { .. }
-            | BrainEvent::ResponseCompleted { .. } => Some(Self::event(event)),
+            | BrainEvent::ResponseTextStarted { .. } => Some(Self::event(event)),
             BrainEvent::Usage(_)
+            | BrainEvent::ResponseCompleted { .. }
             | BrainEvent::ResponseToolProposal { .. }
             | BrainEvent::Transcript(_)
             | BrainEvent::SpeechIntent(_) => None,
@@ -489,6 +489,10 @@ mod tests {
             })
             .is_none()
         );
+        assert!(ServerFrame::browser_event(BrainEvent::ResponseCompleted {
+            response_id: "response-1".to_owned()
+        })
+        .is_none());
     }
 
     #[test]
@@ -601,7 +605,10 @@ mod tests {
             push_next_browser_frame(&mut actual, &mut session).await;
         }
 
-        assert_eq!(actual, fixture.server);
+        assert_eq!(
+            actual,
+            without_websocket_post_release_completion_markers(&fixture.server)
+        );
         let snapshot = store.snapshot();
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.answer_attempts.len(), 1);
@@ -647,7 +654,10 @@ mod tests {
             .expect("sends cancel");
         push_next_browser_frame(&mut actual, &mut session).await;
 
-        assert_eq!(actual, fixture.server);
+        assert_eq!(
+            actual,
+            without_websocket_post_release_completion_markers(&fixture.server)
+        );
         let snapshot = store.snapshot();
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.answer_attempts.len(), 1);
@@ -723,5 +733,38 @@ mod tests {
                 return;
             }
         }
+    }
+
+    fn without_websocket_post_release_completion_markers(
+        frames: &[ServerFrame],
+    ) -> Vec<ServerFrame> {
+        let mut filtered = Vec::with_capacity(frames.len());
+        let mut previous_was_correction = false;
+        for frame in frames {
+            if previous_was_correction
+                && server_frame_is_session_phase(frame, StudySessionPhase::Feedback)
+            {
+                previous_was_correction = false;
+                continue;
+            }
+            previous_was_correction =
+                server_frame_is_session_phase(frame, StudySessionPhase::Correction);
+            filtered.push(frame.clone());
+        }
+        filtered
+    }
+
+    fn server_frame_is_session_phase(frame: &ServerFrame, expected: StudySessionPhase) -> bool {
+        matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::SessionPhase {
+                        phase,
+                        terminal_reason: None,
+                    } if *phase == expected
+                )
+        )
     }
 }

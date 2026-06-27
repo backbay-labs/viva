@@ -50,6 +50,18 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0011_answer_attempt_envelopes.sql",
         include_str!("../../../migrations/0011_answer_attempt_envelopes.sql"),
     ),
+    (
+        "0012_review_items_atomic_replay_guard.sql",
+        include_str!("../../../migrations/0012_review_items_atomic_replay_guard.sql"),
+    ),
+    (
+        "0013_recap_and_concept_status_atomic_replay_guard.sql",
+        include_str!("../../../migrations/0013_recap_and_concept_status_atomic_replay_guard.sql"),
+    ),
+    (
+        "0014_session_recaps_one_row_per_session.sql",
+        include_str!("../../../migrations/0014_session_recaps_one_row_per_session.sql"),
+    ),
 ];
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
@@ -268,9 +280,10 @@ mod tests {
     use crate::PostgresStudyStore;
     use agent_domain::{
         fixture_question, fixture_source_reference, ConceptStatus, SessionConfig, SessionId,
-        SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudySessionRecap, ToolProposal,
-        VivaToolExecutor, VoiceUsageRecord,
+        SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudySessionRecap,
+        StudyStoreWriteCounts, ToolProposal, VivaToolExecutor, VoiceUsageRecord,
     };
+    use serde::Deserialize;
     use std::sync::Arc;
 
     #[test]
@@ -305,6 +318,33 @@ mod tests {
     }
 
     #[test]
+    fn migrations_define_atomic_review_item_replay_guard() {
+        let sql = migration_sql();
+        assert!(sql.contains("DELETE FROM review_items duplicate"));
+        assert!(sql.contains("AND duplicate.id > kept.id"));
+        assert!(sql.contains("review_items_voice_session_concept_due_scheduled_idx"));
+        assert!(sql.contains(
+            "ON review_items (user_id, study_set_id, voice_session_id, concept_id, due_at)"
+        ));
+        assert!(sql.contains("WHERE status = 'scheduled' AND voice_session_id IS NOT NULL"));
+    }
+
+    #[test]
+    fn migrations_define_atomic_recap_and_concept_status_replay_guards() {
+        let sql = migration_sql();
+        assert!(sql.contains("session_recaps_voice_session_payload_idx"));
+        assert!(sql.contains(
+            "ON session_recaps (user_id, study_set_id, voice_session_id, strong_concepts, shaky_concepts, missed_concepts, review_later, source_span_ids)"
+        ));
+        assert!(sql.contains("session_recaps_voice_session_unique_idx"));
+        assert!(sql.contains("ON session_recaps (user_id, study_set_id, voice_session_id)"));
+        assert!(sql.contains("concept_status_events"));
+        assert!(sql.contains(
+            "PRIMARY KEY (user_id, study_set_id, voice_session_id, response_id, concept_id, payload_sha256)"
+        ));
+    }
+
+    #[test]
     fn migration_include_list_matches_directory_order() {
         let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../migrations")
@@ -329,6 +369,27 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(include_names, directory_names);
+    }
+
+    #[test]
+    fn count_truth_table_fixture_covers_retry_cancel_watchdog_and_double_submit() {
+        let table = count_truth_table();
+        assert_eq!(table.schema, "viva.store_count_truth_table.v1");
+        let scenarios = table
+            .scenarios
+            .iter()
+            .map(|scenario| scenario.scenario.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scenarios,
+            vec![
+                "happy",
+                "retry_after_429",
+                "cancel_mid_work",
+                "watchdog_expiry",
+                "double_submit"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -626,6 +687,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optional_postgres_count_truth_table_stays_exact_under_replayed_provider_writes_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+
+        let expected = expected_count_delta("happy");
+        let store = Arc::new(crate::PostgresStudyStore::new(pool.clone()));
+        let session_id = Uuid::new_v4().to_string();
+        let baseline_writes = store.write_counts();
+        let baseline_rows = db_row_counts(&pool).await;
+
+        record_count_table_session(store.as_ref(), &session_id).await;
+        let executor = count_table_executor(store.clone(), &session_id);
+        replay_counted_provider_turn(&executor, &session_id).await;
+        replay_counted_provider_turn(&executor, &session_id).await;
+        store
+            .record_voice_usage(VoiceUsageRecord {
+                voice_session_id: Some(session_id),
+                provider: "synthetic".to_owned(),
+                model: "synthetic-viva".to_owned(),
+                duration_seconds: 1,
+                text_input_tokens: 20,
+                text_output_tokens: 10,
+                audio_input_tokens: 0,
+                audio_output_tokens: 0,
+                cost_estimate_usd: 0.00002,
+                first_audio_latency_ms: None,
+                answer_eval_latency_ms: Some(1),
+                source_retrieval_latency_ms: None,
+                source_grounded_correction_count: 1,
+            })
+            .await
+            .expect("records usage");
+
+        assert_eq!(
+            count_delta_from_writes(store.write_counts(), baseline_writes, 1),
+            expected
+        );
+        assert_eq!(
+            count_delta_from_rows(db_row_counts(&pool).await, baseline_rows, expected),
+            expected
+        );
+    }
+
+    #[tokio::test]
     async fn optional_postgres_session_token_nonce_claims_reject_replay_when_database_url_is_set() {
         let Some(pool) = optional_postgres_pool().await else {
             return;
@@ -742,6 +853,346 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optional_postgres_schedule_review_item_concurrent_replay_is_atomic_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        record_fixture_session(&store).await;
+
+        let before = store.write_counts();
+        let first = store.schedule_review_item(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "atp-synthase",
+            "2026-06-22T09:00:00Z",
+        );
+        let second = store.schedule_review_item(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "atp-synthase",
+            "2026-06-22T09:00:00Z",
+        );
+        let (first, second) = tokio::join!(first, second);
+        first.expect("first replay schedules review item");
+        second.expect("second replay observes atomic duplicate guard");
+
+        let after = store.write_counts();
+        assert_eq!(after.review_items - before.review_items, 1);
+        let row_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM review_items
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND voice_session_id = $3
+               AND concept_id = $4
+               AND due_at = $5::timestamptz
+               AND status = 'scheduled'",
+        )
+        .bind("user-1")
+        .bind(fixture_uuid("biology-midterm").expect("study set fixture UUID"))
+        .bind(fixture_uuid("voice-session-1").expect("voice session fixture UUID"))
+        .bind(parse_uuid("77777777-7777-4777-8777-777777777777").expect("concept fixture UUID"))
+        .bind("2026-06-22T09:00:00Z")
+        .fetch_one(&pool)
+        .await
+        .expect("review item row count query succeeds");
+        assert_eq!(row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn optional_postgres_record_recap_concurrent_replay_is_atomic_when_database_url_is_set() {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let first_store = PostgresStudyStore::new(pool.clone());
+        let second_store = PostgresStudyStore::new(pool.clone());
+        record_fixture_session(&first_store).await;
+        let recap = fixture_recap();
+
+        let first = first_store.record_recap(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "response-recap",
+            recap.clone(),
+        );
+        let second = second_store.record_recap(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "response-recap",
+            recap,
+        );
+        let (first, second) = tokio::join!(first, second);
+        first.expect("first replay records recap");
+        second.expect("second replay observes atomic duplicate guard");
+
+        assert_eq!(
+            first_store.write_counts().recaps + second_store.write_counts().recaps,
+            1
+        );
+        let row_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM session_recaps
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND voice_session_id = $3",
+        )
+        .bind("user-1")
+        .bind(fixture_uuid("biology-midterm").expect("study set fixture UUID"))
+        .bind(fixture_uuid("voice-session-1").expect("voice session fixture UUID"))
+        .fetch_one(&pool)
+        .await
+        .expect("recap row count query succeeds");
+        assert_eq!(row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn optional_postgres_record_recap_replaces_session_payload_without_incrementing_count_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&store, &session_id).await;
+        let mut first = fixture_recap();
+        first.voice_session_id.clone_from(&session_id);
+        let mut replacement = first.clone();
+        replacement.strong_concepts.push("ATP synthase".to_owned());
+        replacement.shaky_concepts.clear();
+
+        store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                "response-recap-a",
+                first,
+            )
+            .await
+            .expect("first recap records");
+        store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                "response-recap-b",
+                replacement,
+            )
+            .await
+            .expect("second recap replaces session row");
+
+        assert_eq!(store.write_counts().recaps, 1);
+        let row_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM session_recaps
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND voice_session_id = $3",
+        )
+        .bind("user-1")
+        .bind(fixture_uuid("biology-midterm").expect("study set fixture UUID"))
+        .bind(parse_uuid(&session_id).expect("voice session UUID"))
+        .fetch_one(&pool)
+        .await
+        .expect("recap row count query succeeds");
+        assert_eq!(row_count, 1);
+        let strong_concepts = sqlx::query_scalar::<_, Vec<String>>(
+            "SELECT strong_concepts
+             FROM session_recaps
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND voice_session_id = $3",
+        )
+        .bind("user-1")
+        .bind(fixture_uuid("biology-midterm").expect("study set fixture UUID"))
+        .bind(parse_uuid(&session_id).expect("voice session UUID"))
+        .fetch_one(&pool)
+        .await
+        .expect("recap strong concepts query succeeds");
+        assert_eq!(
+            strong_concepts,
+            vec!["NADH".to_owned(), "ATP synthase".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_postgres_session_recap_backfill_dedupes_existing_session_rows_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations_until(&pool, "0014_session_recaps_one_row_per_session.sql")
+            .await
+            .expect("pre-0014 migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&store, &session_id).await;
+        let study_set_uuid = fixture_uuid("biology-midterm").expect("study set fixture UUID");
+        let voice_session_uuid = parse_uuid(&session_id).expect("voice session UUID");
+        let source_uuid = fixture_uuid("src-lecture-5-slide-18").expect("source span fixture UUID");
+
+        for (strong, shaky, offset_seconds) in [
+            (
+                vec!["NADH".to_owned()],
+                vec!["ATP synthase".to_owned()],
+                0_i64,
+            ),
+            (
+                vec!["NADH".to_owned(), "ATP synthase".to_owned()],
+                Vec::new(),
+                1_i64,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO session_recaps (
+                    id,
+                    user_id,
+                    study_set_id,
+                    voice_session_id,
+                    strong_concepts,
+                    shaky_concepts,
+                    missed_concepts,
+                    review_later,
+                    source_span_ids,
+                    created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, '{}', $7, $8, NOW() + ($9 || ' seconds')::interval)",
+            )
+            .bind(Uuid::new_v4())
+            .bind("user-1")
+            .bind(study_set_uuid)
+            .bind(voice_session_uuid)
+            .bind(strong)
+            .bind(shaky)
+            .bind(vec!["ATP synthase".to_owned()])
+            .bind(vec![source_uuid])
+            .bind(offset_seconds.to_string())
+            .execute(&pool)
+            .await
+            .expect("pre-0014 duplicate session recap row inserts");
+        }
+        assert_eq!(session_recap_rows_for_session(&pool, &session_id).await, 2);
+
+        apply_migration_sql(&pool, "0014_session_recaps_one_row_per_session.sql")
+            .await
+            .expect("0014 migration applies");
+
+        assert_eq!(session_recap_rows_for_session(&pool, &session_id).await, 1);
+        let unique_index_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM pg_indexes
+                WHERE schemaname = 'public'
+                  AND tablename = 'session_recaps'
+                  AND indexname = 'session_recaps_voice_session_unique_idx'
+            )",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("unique recap index existence query succeeds");
+        assert!(unique_index_exists);
+        let duplicate_insert = sqlx::query(
+            "INSERT INTO session_recaps (
+                id,
+                user_id,
+                study_set_id,
+                voice_session_id,
+                strong_concepts,
+                shaky_concepts,
+                missed_concepts,
+                review_later,
+                source_span_ids
+            )
+            VALUES ($1, $2, $3, $4, $5, '{}', '{}', '{}', $6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind("user-1")
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .bind(vec!["replacement".to_owned()])
+        .bind(vec![source_uuid])
+        .execute(&pool)
+        .await;
+        assert!(
+            duplicate_insert.is_err(),
+            "0014 unique index must block a second recap row for the same session"
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_postgres_record_concept_status_concurrent_replay_is_atomic_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let first_store = PostgresStudyStore::new(pool.clone());
+        let second_store = PostgresStudyStore::new(pool.clone());
+        record_fixture_session(&first_store).await;
+
+        let first = first_store.record_concept_status(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "response-concept-status",
+            "oxidative-phosphorylation",
+            ConceptStatus::Strong,
+        );
+        let second = second_store.record_concept_status(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "response-concept-status",
+            "oxidative-phosphorylation",
+            ConceptStatus::Strong,
+        );
+        let (first, second) = tokio::join!(first, second);
+        first.expect("first replay records concept status");
+        second.expect("second replay observes atomic duplicate guard");
+
+        assert_eq!(
+            first_store.write_counts().concept_statuses
+                + second_store.write_counts().concept_statuses,
+            1
+        );
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT status
+             FROM concepts
+             WHERE study_set_id = $1 AND public_id = $2",
+        )
+        .bind(fixture_uuid("biology-midterm").expect("study set fixture UUID"))
+        .bind("oxidative-phosphorylation")
+        .fetch_one(&pool)
+        .await
+        .expect("concept status query succeeds");
+        assert_eq!(status, "strong");
+    }
+
+    #[tokio::test]
     async fn optional_postgres_privacy_deletes_purge_usage_and_preserve_deleted_sessions_when_database_url_is_set(
     ) {
         let Some(pool) = optional_postgres_pool().await else {
@@ -797,6 +1248,21 @@ mod tests {
             session_token_nonce_rows(&pool, &session_delete_nonce).await,
             1
         );
+        store
+            .record_concept_status(
+                "user-1",
+                "biology-midterm",
+                session_id,
+                "response-session-delete",
+                "nadh",
+                ConceptStatus::Strong,
+            )
+            .await
+            .expect("records concept status event for session deletion proof");
+        assert_eq!(
+            concept_status_event_rows_for_session(&pool, session_id).await,
+            1
+        );
 
         store
             .delete_session_history("user-1", "biology-midterm", session_id)
@@ -805,6 +1271,10 @@ mod tests {
         assert_eq!(usage_rows_for_session(&pool, session_id).await, 0);
         assert_eq!(
             session_token_nonce_rows(&pool, &session_delete_nonce).await,
+            0
+        );
+        assert_eq!(
+            concept_status_event_rows_for_session(&pool, session_id).await,
             0
         );
         store
@@ -883,6 +1353,21 @@ mod tests {
             session_token_nonce_rows(&pool, &study_delete_nonce).await,
             1
         );
+        store
+            .record_concept_status(
+                "user-1",
+                "biology-midterm",
+                study_delete_session_id,
+                "response-study-delete",
+                "atp-synthase",
+                ConceptStatus::Shaky,
+            )
+            .await
+            .expect("records concept status event for study set deletion proof");
+        assert_eq!(
+            concept_status_event_rows_for_session(&pool, study_delete_session_id).await,
+            1
+        );
 
         store
             .delete_study_set("user-1", "biology-midterm")
@@ -894,6 +1379,10 @@ mod tests {
         );
         assert_eq!(
             session_token_nonce_rows(&pool, &study_delete_nonce).await,
+            0
+        );
+        assert_eq!(
+            concept_status_event_rows_for_session(&pool, study_delete_session_id).await,
             0
         );
         store
@@ -935,6 +1424,28 @@ mod tests {
         )
     }
 
+    async fn run_migrations_until(
+        pool: &sqlx::PgPool,
+        stop_before_name: &str,
+    ) -> Result<(), sqlx::Error> {
+        for (name, _) in MIGRATIONS {
+            if *name == stop_before_name {
+                break;
+            }
+            apply_migration_sql(pool, name).await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_migration_sql(pool: &sqlx::PgPool, name: &str) -> Result<(), sqlx::Error> {
+        let sql = MIGRATIONS
+            .iter()
+            .find_map(|(migration_name, sql)| (*migration_name == name).then_some(*sql))
+            .unwrap_or_else(|| panic!("missing migration {name}"));
+        sqlx::raw_sql(sql).execute(pool).await?;
+        Ok(())
+    }
+
     async fn record_fixture_session(store: &dyn StudyMemoryStore) {
         store
             .record_voice_session(&SessionConfig {
@@ -946,6 +1457,120 @@ mod tests {
             })
             .await
             .expect("records fixture session");
+    }
+
+    async fn record_count_table_session(store: &dyn StudyMemoryStore, session_id: &str) {
+        store
+            .record_voice_session(&SessionConfig {
+                session_id: Some(SessionId::new(session_id)),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .expect("records count-table fixture session");
+    }
+
+    fn fixture_recap() -> StudySessionRecap {
+        StudySessionRecap {
+            voice_session_id: "voice-session-1".to_owned(),
+            headline: "Done".to_owned(),
+            summary: "Recap".to_owned(),
+            strong_concepts: vec!["NADH".to_owned()],
+            shaky_concepts: vec!["ATP synthase".to_owned()],
+            missed_concepts: vec![],
+            review_later: vec!["ATP synthase".to_owned()],
+            next_action: "Review tomorrow".to_owned(),
+            source_moments: vec![agent_domain::RecapSourceMoment {
+                text: "NADH donates electrons.".to_owned(),
+                source: fixture_source_reference(),
+                status: ConceptStatus::Strong,
+            }],
+        }
+    }
+
+    fn count_table_executor(
+        store: Arc<crate::PostgresStudyStore>,
+        session_id: &str,
+    ) -> VivaToolExecutor {
+        VivaToolExecutor::new(
+            store,
+            agent_domain::AuthorizedStudySession {
+                user_id: "user-1".to_owned(),
+                study_set_id: "biology-midterm".to_owned(),
+                voice_session_id: session_id.to_owned(),
+                mode: StudyMode::Quiz,
+                active_concepts: vec![
+                    "oxidative-phosphorylation".to_owned(),
+                    "atp-synthase".to_owned(),
+                ],
+            },
+        )
+    }
+
+    async fn replay_counted_provider_turn(executor: &VivaToolExecutor, session_id: &str) {
+        executor
+            .execute(
+                "response-count-table-question",
+                ToolProposal::select_next_question("biology-midterm", session_id, "quiz"),
+            )
+            .await
+            .expect("selects seeded question");
+        executor
+            .execute(
+                "response-count-table-answer",
+                ToolProposal::evaluate_spoken_answer(
+                    "biology-midterm",
+                    session_id,
+                    "q-oxidative-phosphorylation-nadh",
+                    "NADH donates electrons.",
+                ),
+            )
+            .await
+            .expect("records answer");
+        executor
+            .execute(
+                "response-count-table-answer",
+                ToolProposal::retrieve_source_reference(
+                    "biology-midterm",
+                    session_id,
+                    "src-lecture-5-slide-18",
+                ),
+            )
+            .await
+            .expect("retrieves source");
+        executor
+            .execute(
+                "response-count-table-answer",
+                ToolProposal::mark_concept_status(
+                    "biology-midterm",
+                    session_id,
+                    "oxidative-phosphorylation",
+                    "strong",
+                ),
+            )
+            .await
+            .expect("records concept status");
+        executor
+            .execute(
+                "response-count-table-answer",
+                ToolProposal::schedule_review_item(
+                    "biology-midterm",
+                    session_id,
+                    "atp-synthase",
+                    "shaky",
+                ),
+            )
+            .await
+            .expect("schedules review");
+        executor
+            .execute(
+                "response-count-table-recap",
+                ToolProposal::build_session_recap("biology-midterm", session_id),
+            )
+            .await
+            .expect("records recap");
     }
 
     async fn set_question_active(pool: &sqlx::PgPool, active: bool) {
@@ -1015,6 +1640,78 @@ mod tests {
         voice_usage_events: i64,
     }
 
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+    struct ExactCountDelta {
+        sessions: usize,
+        answer_attempts: usize,
+        concept_statuses: usize,
+        review_items: usize,
+        recaps: usize,
+        usage_events: usize,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct CountTruthTable {
+        schema: String,
+        scenarios: Vec<CountTruthScenario>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct CountTruthScenario {
+        scenario: String,
+        expected_delta: ExactCountDelta,
+    }
+
+    fn count_truth_table() -> CountTruthTable {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/voice-protocol/count-truth-table.json"
+        ))
+        .expect("count truth table fixture is valid JSON")
+    }
+
+    fn expected_count_delta(scenario: &str) -> ExactCountDelta {
+        count_truth_table()
+            .scenarios
+            .into_iter()
+            .find(|row| row.scenario == scenario)
+            .unwrap_or_else(|| panic!("missing count truth table scenario {scenario}"))
+            .expected_delta
+    }
+
+    fn count_delta_from_writes(
+        after: StudyStoreWriteCounts,
+        before: StudyStoreWriteCounts,
+        usage_events: usize,
+    ) -> ExactCountDelta {
+        ExactCountDelta {
+            sessions: after.sessions - before.sessions,
+            answer_attempts: after.answer_attempts - before.answer_attempts,
+            concept_statuses: after.concept_statuses - before.concept_statuses,
+            review_items: after.review_items - before.review_items,
+            recaps: after.recaps - before.recaps,
+            usage_events,
+        }
+    }
+
+    fn count_delta_from_rows(
+        after: DbRowCounts,
+        before: DbRowCounts,
+        expected: ExactCountDelta,
+    ) -> ExactCountDelta {
+        ExactCountDelta {
+            sessions: row_delta(after.voice_sessions, before.voice_sessions),
+            answer_attempts: row_delta(after.answer_attempts, before.answer_attempts),
+            concept_statuses: expected.concept_statuses,
+            review_items: row_delta(after.review_items, before.review_items),
+            recaps: row_delta(after.session_recaps, before.session_recaps),
+            usage_events: row_delta(after.voice_usage_events, before.voice_usage_events),
+        }
+    }
+
+    fn row_delta(after: i64, before: i64) -> usize {
+        usize::try_from(after - before).expect("row count delta is non-negative")
+    }
+
     async fn db_row_counts(pool: &sqlx::PgPool) -> DbRowCounts {
         DbRowCounts {
             voice_sessions: count_rows(pool, "voice_sessions").await,
@@ -1041,6 +1738,33 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("session token nonce row count query succeeds")
+    }
+
+    async fn concept_status_event_rows_for_session(
+        pool: &sqlx::PgPool,
+        voice_session_id: &str,
+    ) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM concept_status_events
+             WHERE voice_session_id = $1",
+        )
+        .bind(fixture_uuid(voice_session_id).expect("voice session fixture UUID"))
+        .fetch_one(pool)
+        .await
+        .expect("concept status event row count query succeeds")
+    }
+
+    async fn session_recap_rows_for_session(pool: &sqlx::PgPool, voice_session_id: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM session_recaps
+             WHERE voice_session_id = $1",
+        )
+        .bind(parse_uuid(voice_session_id).expect("session id is a UUID"))
+        .fetch_one(pool)
+        .await
+        .expect("session recap row count query succeeds")
     }
 
     async fn count_rows(pool: &sqlx::PgPool, table: &str) -> i64 {

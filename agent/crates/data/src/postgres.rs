@@ -458,41 +458,6 @@ impl PostgresStudyStore {
         .map_err(pg_error)
     }
 
-    async fn recap_was_recorded(
-        &self,
-        user_id: &str,
-        study_set_uuid: Uuid,
-        voice_session_uuid: Uuid,
-        recap: &StudySessionRecap,
-        source_span_ids: &[Uuid],
-    ) -> Result<bool, PortError> {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM session_recaps
-                WHERE user_id = $1
-                  AND study_set_id = $2
-                  AND voice_session_id = $3
-                  AND strong_concepts = $4
-                  AND shaky_concepts = $5
-                  AND missed_concepts = $6
-                  AND review_later = $7
-                  AND source_span_ids = $8
-             )",
-        )
-        .bind(user_id)
-        .bind(study_set_uuid)
-        .bind(voice_session_uuid)
-        .bind(&recap.strong_concepts)
-        .bind(&recap.shaky_concepts)
-        .bind(&recap.missed_concepts)
-        .bind(&recap.review_later)
-        .bind(source_span_ids)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(pg_error)
-    }
-
     async fn concept_uuid_for(
         &self,
         study_set_uuid: Uuid,
@@ -1255,6 +1220,15 @@ impl StudyMemoryStore for PostgresStudyStore {
         .await
         .map_err(pg_error)?;
         sqlx::query(
+            "DELETE FROM concept_status_events
+             WHERE user_id = $1 AND study_set_id = $2",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        sqlx::query(
             "DELETE FROM review_items
              WHERE user_id = $1 AND study_set_id = $2",
         )
@@ -1357,6 +1331,16 @@ impl StudyMemoryStore for PostgresStudyStore {
         .map_err(pg_error)?;
         sqlx::query(
             "DELETE FROM session_recaps
+             WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        sqlx::query(
+            "DELETE FROM concept_status_events
              WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3",
         )
         .bind(user_id)
@@ -1708,7 +1692,6 @@ impl StudyMemoryStore for PostgresStudyStore {
         let voice_session_uuid = Self::uuid_for(voice_session_id)?;
         self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
             .await?;
-        let mut source_span_ids = Vec::new();
         for moment in &recap.source_moments {
             let canonical = self
                 .source_reference(user_id, study_set_id, &moment.source.source_id)
@@ -1726,22 +1709,6 @@ impl StudyMemoryStore for PostgresStudyStore {
                     "recap source tuple does not match deterministic retrieval",
                 ));
             }
-            source_span_ids.push(Self::uuid_for(&moment.source.source_id)?);
-        }
-        if !self
-            .recap_was_recorded(
-                user_id,
-                study_set_uuid,
-                voice_session_uuid,
-                recap,
-                &source_span_ids,
-            )
-            .await?
-        {
-            return Err(PortError::adapter(
-                "postgres",
-                "recap event does not match persisted session recap",
-            ));
         }
         if !self.has_event_authorization(
             user_id,
@@ -2076,6 +2043,49 @@ impl StudyMemoryStore for PostgresStudyStore {
         let concept_uuid = self.concept_uuid_for(study_set_uuid, concept_id).await?;
         self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
             .await?;
+        let payload = ConceptStatusEventPayload {
+            concept_id,
+            status: &status,
+        };
+        let payload_digest =
+            payload_sha256(EventAuthorizationKind::ConceptStatus, response_id, &payload)?;
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        let event_insert = sqlx::query(
+            "INSERT INTO concept_status_events (
+                 user_id,
+                 study_set_id,
+                 voice_session_id,
+                 response_id,
+                 concept_id,
+                 payload_sha256,
+                 status
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (user_id, study_set_id, voice_session_id, response_id, concept_id, payload_sha256)
+             DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .bind(response_id)
+        .bind(concept_uuid)
+        .bind(&payload_digest)
+        .bind(concept_status_str(&status))
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        if event_insert.rows_affected() == 0 {
+            tx.commit().await.map_err(pg_error)?;
+            self.record_event_authorization(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                EventAuthorizationKind::ConceptStatus,
+                &payload,
+            )?;
+            return Ok(status);
+        }
         let result = sqlx::query(
             "UPDATE concepts SET status = $1, updated_at = NOW()
              WHERE id = $2
@@ -2089,21 +2099,19 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(concept_uuid)
         .bind(study_set_uuid)
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(pg_error)?;
         if result.rows_affected() == 0 {
+            tx.rollback().await.map_err(pg_error)?;
             return Err(PortError::unavailable(
                 "postgres",
                 concept_id,
                 "concept is not available for this study set",
             ));
         }
+        tx.commit().await.map_err(pg_error)?;
         self.increment_count(WriteCountKind::ConceptStatus)?;
-        let payload = ConceptStatusEventPayload {
-            concept_id,
-            status: &status,
-        };
         self.record_event_authorization(
             user_id,
             study_set_id,
@@ -2130,12 +2138,10 @@ impl StudyMemoryStore for PostgresStudyStore {
             .await?;
         let result = sqlx::query(
             "INSERT INTO review_items (id, user_id, study_set_id, concept_id, due_at, reason, status, voice_session_id)
-             SELECT $1, $2, $3, $4, $5::timestamptz, 'voice_session', 'scheduled', $6
-             WHERE EXISTS (
-                 SELECT 1 FROM concepts c
-                 JOIN study_sets s ON s.id = c.study_set_id
-                 WHERE c.id = $4 AND c.study_set_id = $3 AND s.user_id = $2
-             )",
+             VALUES ($1, $2, $3, $4, $5::timestamptz, 'voice_session', 'scheduled', $6)
+             ON CONFLICT (user_id, study_set_id, voice_session_id, concept_id, due_at)
+             WHERE status = 'scheduled' AND voice_session_id IS NOT NULL
+             DO NOTHING",
         )
         .bind(Uuid::new_v4())
         .bind(user_id)
@@ -2147,11 +2153,9 @@ impl StudyMemoryStore for PostgresStudyStore {
         .await
         .map_err(pg_error)?;
         if result.rows_affected() == 0 {
-            return Err(PortError::unavailable(
-                "postgres",
-                concept_id,
-                "concept is not available for this study set",
-            ));
+            return Ok(
+                json!({ "concept_id": concept_id, "due_at": due_at, "status": "scheduled" }),
+            );
         }
         self.increment_count(WriteCountKind::ReviewItem)?;
         Ok(json!({ "concept_id": concept_id, "due_at": due_at, "status": "scheduled" }))
@@ -2195,11 +2199,68 @@ impl StudyMemoryStore for PostgresStudyStore {
             }
             source_span_ids.push(Self::uuid_for(&moment.source.source_id)?);
         }
-        sqlx::query(
-            "INSERT INTO session_recaps (id, user_id, study_set_id, voice_session_id, strong_concepts, shaky_concepts, missed_concepts, review_later, source_span_ids)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        let recap_insert_id = Uuid::new_v4();
+        let inserted = sqlx::query_scalar::<_, bool>(
+            "WITH input (
+                 id,
+                 user_id,
+                 study_set_id,
+                 voice_session_id,
+                 strong_concepts,
+                 shaky_concepts,
+                 missed_concepts,
+                 review_later,
+                 source_span_ids
+             ) AS (
+                 VALUES ($1::uuid, $2::text, $3::uuid, $4::uuid, $5::text[], $6::text[], $7::text[], $8::text[], $9::uuid[])
+             ),
+             inserted AS (
+                 INSERT INTO session_recaps (
+                     id,
+                     user_id,
+                     study_set_id,
+                     voice_session_id,
+                     strong_concepts,
+                     shaky_concepts,
+                     missed_concepts,
+                     review_later,
+                     source_span_ids
+                 )
+                 SELECT
+                     id,
+                     user_id,
+                     study_set_id,
+                     voice_session_id,
+                     strong_concepts,
+                     shaky_concepts,
+                     missed_concepts,
+                     review_later,
+                     source_span_ids
+                 FROM input
+                 ON CONFLICT (user_id, study_set_id, voice_session_id) DO NOTHING
+                 RETURNING TRUE AS inserted
+             ),
+             updated AS (
+                 UPDATE session_recaps existing
+                 SET strong_concepts = input.strong_concepts,
+                     shaky_concepts = input.shaky_concepts,
+                     missed_concepts = input.missed_concepts,
+                     review_later = input.review_later,
+                     source_span_ids = input.source_span_ids
+                 FROM input
+                 WHERE existing.user_id = input.user_id
+                   AND existing.study_set_id = input.study_set_id
+                   AND existing.voice_session_id = input.voice_session_id
+                   AND NOT EXISTS (SELECT 1 FROM inserted)
+                 RETURNING FALSE AS inserted
+             )
+             SELECT COALESCE(
+                 (SELECT inserted FROM inserted),
+                 (SELECT inserted FROM updated),
+                 FALSE
+             )",
         )
-        .bind(Uuid::new_v4())
+        .bind(recap_insert_id)
         .bind(user_id)
         .bind(study_set_uuid)
         .bind(voice_session_uuid)
@@ -2208,10 +2269,12 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(&recap.missed_concepts)
         .bind(&recap.review_later)
         .bind(&source_span_ids)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(pg_error)?;
-        self.increment_count(WriteCountKind::Recap)?;
+        if inserted {
+            self.increment_count(WriteCountKind::Recap)?;
+        }
         self.record_event_authorization(
             user_id,
             study_set_id,
