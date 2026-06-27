@@ -171,7 +171,6 @@ export const HOSTED_MONITOR_POLICY = Object.freeze({
     max_cost_usd_per_day: 0.5,
     max_tokens_per_run: 4_096,
     max_tokens_per_day: 8_192,
-    budget_bucket: "viva-monitor-live-smoke",
     separate_from_learner_traffic: true,
   },
   self_quarantine: {

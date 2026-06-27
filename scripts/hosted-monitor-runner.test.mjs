@@ -94,6 +94,7 @@ test("hosted monitor scheduled live opt-in runs bounded live smoke", () => {
     VIVA_HOSTED_LIVE_MONITOR_AGENT_HTTP_URL: "https://live-agent.example.com/",
     VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD: "0.10",
     VIVA_HOSTED_LIVE_MONITOR_AGENT_WS_URL: "wss://live-agent.example.com/ws",
+    VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES: "1",
     VIVA_HOSTED_LIVE_MONITOR_ENABLED: "1",
     VIVA_HOSTED_LIVE_MONITOR_REST_BEARER_TOKEN: "redacted-live-rest-bearer",
     VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY: "1",
@@ -121,11 +122,33 @@ test("hosted monitor scheduled live opt-in runs bounded live smoke", () => {
   assert.equal(plan.runs[1].env.VIVA_VOICE_WS_BEARER_TOKEN, "redacted-live-rest-bearer");
   assert.equal(plan.runs[1].env.VIVA_VOICE_WS_MAX_SESSION_COST_USD, "0.1");
   assert.equal(plan.runs[1].env.VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD, "0.1");
-  assert.equal(plan.runs[1].env.VIVA_HOSTED_LIVE_MONITOR_BUDGET_BUCKET, "viva-monitor-live-smoke");
+  assert.equal(plan.runs[1].env.VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES, "1");
+  assert.equal(plan.runs[1].env.VIVA_HOSTED_LIVE_MONITOR_BUDGET_BUCKET, undefined);
   assert.equal(plan.runs[1].timeoutMs, 120000);
   assert.equal(plan.liveMonitor.should_run, true);
   assert.equal(plan.liveMonitor.runs_today, 1);
   assert.equal(plan.liveMonitor.tokens_today, 2048);
+  assert.equal(plan.liveMonitor.consecutive_failures, 1);
+  assert.equal("budget_bucket" in plan.matrix.monitor_policy.live_monitor, false);
+
+  const summary = summarizeHostedRun(
+    plan.runs[1],
+    "/tmp/run",
+    "/tmp/run/live-smoke",
+    { exit_code: 0, sanitized: true, status: "passed" },
+    {
+      schema: "viva.live_provider_smoke.v1",
+      status: "failed",
+      provider: "cartesia_gemini",
+      terminal_reason: "provider_rate_limited",
+      failure: { failure_class: "quota_rate_failure" },
+      caps: { max_session_cost_usd: 0.1 },
+      privacy: { raw_audio_retained: false },
+    },
+    "/tmp",
+  );
+  assert.equal(summary.live_smoke.self_quarantine.triggered, true);
+  assert.equal(summary.live_smoke.self_quarantine.consecutive_failures, 2);
 });
 
 test("hosted monitor scheduled live opt-in gates cadence and daily budget before scheduling", () => {

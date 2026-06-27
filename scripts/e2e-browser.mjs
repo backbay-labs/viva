@@ -504,21 +504,26 @@ try {
     ...(!failureControlPlan.enabled && !stopToRecap && requirePostAnswerSourceFolio
       ? ["post-answer-source-folio.png"]
       : []),
-    ...(secondTabSessionCapProof ? ["second-tab-session-cap.png"] : []),
+    ...(secondTabSessionCap ? ["second-tab-session-cap.png"] : []),
     ...(failureControlPlan.enabled
       ? ["failure-control-terminal.png"]
       : ["connected-terminal-fold.png"]),
   ];
+  const deterministicPartialRecapTerminalProof =
+    deterministicPartialRecapScenario && recapPayloadVisible
+      ? terminalProofFromServerEvents(serverEvents, {
+          failureClass: "partial_stage_success",
+          scenarioId: hostedScenarioId,
+          stage: "websocket",
+          terminalReason: "partial_stage_success",
+        })
+      : null;
+  const terminalProof = failureControlTerminalProof ?? deterministicPartialRecapTerminalProof;
   const terminalReason =
-    failureControlTerminalProof?.terminal_reason ??
-    (deterministicPartialRecapScenario && recapPayloadVisible
-      ? "partial_stage_success"
-      : recapPayloadVisible
-        ? "completed"
-        : null);
+    terminalProof?.terminal_reason ?? (recapPayloadVisible ? "completed" : null);
   const hostedEvidenceStage = hostedEvidenceStageForScenario({
-    deterministicPartialRecap: deterministicPartialRecapScenario,
-    failureControlStage: failureControlTerminalProof?.stage ?? null,
+    deterministicPartialRecap: Boolean(deterministicPartialRecapTerminalProof),
+    failureControlStage: terminalProof?.stage ?? null,
     recapVisible: recapPayloadVisible,
     scenarioId: hostedScenarioId,
   });
@@ -554,6 +559,7 @@ try {
     post_answer_protocol_response_id: postAnswerProtocolProof.responseId,
     second_tab_session_cap_observed: secondTabSessionCap?.terminal_reason === "session_cap",
     second_tab_session_cap: secondTabSessionCap,
+    deterministic_partial_recap_terminal: deterministicPartialRecapTerminalProof,
     failure_control_harness: failureControlEvidence,
     failure_control_terminal: failureControlTerminalProof,
     written_answer_fallback_used: writtenAnswerFallbackUsed,
@@ -564,9 +570,7 @@ try {
       controlMode: failureControlPlan.enabled ? "failure_control" : "none",
       deployIds: hostedDeployIds(),
       deploySha: hostedDeploySha(),
-      failureClass:
-        failureControlTerminalProof?.failure_class ??
-        (deterministicPartialRecapScenario && recapPayloadVisible ? "partial_stage_success" : null),
+      failureClass: terminalProof?.failure_class ?? null,
       hostedMode,
       postgresDurability: hostedPostgresDurability(),
       provider: agentProvider,
@@ -1625,6 +1629,25 @@ function recordServerFramePayload(payload, events) {
 
 function isSessionAuthErrorMessage(message) {
   return message === "invalid session token" || message === "session auth failed";
+}
+
+function terminalProofFromServerEvents(
+  events,
+  { failureClass, scenarioId, stage, terminalReason },
+) {
+  const eventIndex = events.findIndex(
+    (event) => event.type === "session_phase" && event.terminalReason === terminalReason,
+  );
+  if (eventIndex < 0) return null;
+  return {
+    scenario_id: scenarioId,
+    failure_class: failureClass,
+    stage,
+    terminal_reason: terminalReason,
+    event_index: eventIndex,
+    validation_run_id: validationRunId,
+    sanitized: true,
+  };
 }
 
 async function waitForFailureControlTerminal(events, plan, timeoutMs) {

@@ -35,6 +35,19 @@ test("hosted browser E2E records only actually verified websocket and session-ca
     source,
     /secondTabSessionCap = await auditSecondTabSessionCap\(context, secondTabTarget\)/,
   );
+  assert.match(source, /\.\.\.\(secondTabSessionCap \? \["second-tab-session-cap\.png"\] : \[\]\)/);
+  assert.doesNotMatch(source, /secondTabSessionCapProof/);
+});
+
+test("hosted browser E2E does not infer partial recap evidence from visible recap alone", async () => {
+  const source = await readFile(E2E_BROWSER_PATH, "utf8");
+
+  assert.match(source, /terminalProofFromServerEvents\(serverEvents/);
+  assert.match(source, /const terminalReason =\s*terminalProof\?\.terminal_reason/);
+  assert.doesNotMatch(
+    source,
+    /deterministicPartialRecapScenario && recapPayloadVisible\s*\?\s*"partial_stage_success"/,
+  );
 });
 
 test("hosted browser E2E uses the shared voice protocol version", async () => {

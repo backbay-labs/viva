@@ -150,6 +150,7 @@ export function buildHostedMonitorPlan(env = process.env) {
             runTimeoutMs,
             runId,
             liveMonitorConfig,
+            liveMonitorDecision,
           ),
         ]
       : []),
@@ -347,9 +348,15 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
           "VIVA_HOSTED_LIVE_MONITOR_TOKENS_TODAY",
         )
       : 0;
+  const consecutiveFailures = optionalNonNegativeInteger(
+    env.VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES,
+    "VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES",
+    0,
+  );
   const quarantinedUntil = optionalDateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_QUARANTINED_UNTIL");
   if (quarantinedUntil && quarantinedUntil.getTime() > now.getTime()) {
     return {
+      consecutive_failures: consecutiveFailures,
       enabled: true,
       now: now.toISOString(),
       quarantined_until: quarantinedUntil.toISOString(),
@@ -359,6 +366,7 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
   }
   if (runsToday >= livePolicy.max_runs_per_day) {
     return {
+      consecutive_failures: consecutiveFailures,
       enabled: true,
       now: now.toISOString(),
       runs_today: runsToday,
@@ -368,6 +376,7 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
   }
   if (tokensToday >= livePolicy.max_tokens_per_day) {
     return {
+      consecutive_failures: consecutiveFailures,
       enabled: true,
       max_tokens_per_day: livePolicy.max_tokens_per_day,
       now: now.toISOString(),
@@ -381,6 +390,7 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
     const elapsedSeconds = Math.floor((now.getTime() - lastRunAt.getTime()) / 1000);
     if (elapsedSeconds < livePolicy.min_cadence_seconds) {
       return {
+        consecutive_failures: consecutiveFailures,
         enabled: true,
         last_run_at: lastRunAt.toISOString(),
         min_cadence_seconds: livePolicy.min_cadence_seconds,
@@ -392,6 +402,7 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
     }
   }
   return {
+    consecutive_failures: consecutiveFailures,
     enabled: true,
     max_runs_per_day: livePolicy.max_runs_per_day,
     min_cadence_seconds: livePolicy.min_cadence_seconds,
@@ -436,7 +447,14 @@ function hostedLiveMonitorConfigFromEnv(env, livePolicy) {
   };
 }
 
-function scheduledLiveMonitorRun(target, livePolicy, runTimeoutMs, runId, liveConfig) {
+function scheduledLiveMonitorRun(
+  target,
+  livePolicy,
+  runTimeoutMs,
+  runId,
+  liveConfig,
+  liveMonitorDecision,
+) {
   const timeoutMs = Math.min(runTimeoutMs, livePolicy.max_duration_ms_per_run + 30_000);
   return {
     name: "scheduled_hosted_live_smoke",
@@ -445,7 +463,9 @@ function scheduledLiveMonitorRun(target, livePolicy, runTimeoutMs, runId, liveCo
     resultFileName: "evidence.json",
     env: {
       VIVA_AGENT_PROVIDER: "cartesia_gemini",
-      VIVA_HOSTED_LIVE_MONITOR_BUDGET_BUCKET: livePolicy.budget_bucket,
+      VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES: String(
+        liveMonitorDecision.consecutive_failures ?? 0,
+      ),
       VIVA_HOSTED_RUN_ID: runId,
       VIVA_LIVE_PROVIDER_SMOKE: "1",
       VIVA_LIVE_SMOKE: "1",
