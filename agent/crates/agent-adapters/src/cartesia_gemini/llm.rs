@@ -4,6 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, RETRY_AFTER};
 use serde_json::{json, Value};
 use tokio::time::timeout;
@@ -18,6 +19,7 @@ use super::constants::{
 
 const TRUSTED_SOURCE_CONTEXT_FUNCTION: &str = "trusted_source_context";
 const DEFAULT_GEMINI_RETRY_AFTER_MS: u64 = 1_000;
+const MAX_GEMINI_ERROR_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ThinkingLevel {
@@ -346,7 +348,23 @@ async fn response_text(status: u16, response: reqwest::Response) -> Result<Strin
     if (200..300).contains(&status) {
         return response.text().await.map_err(|_| ());
     }
-    Ok(String::new())
+    bounded_response_text(response, MAX_GEMINI_ERROR_BODY_BYTES).await
+}
+
+async fn bounded_response_text(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<String, ()> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ())?;
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|_| ())
 }
 
 fn gemini_sse_response_from_http_parts(
@@ -1035,6 +1053,7 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use axum::{http::StatusCode, routing::post, Router};
     use serde_json::json;
 
     use agent_domain::BrainError;
@@ -1435,6 +1454,110 @@ data: [DONE]
         assert!(failure.metadata.contains("body_status=resource_exhausted"));
         assert!(!failure.metadata.contains("RetryInfo"));
         assert!(!failure.metadata.contains("retryDelay"));
+    }
+
+    #[tokio::test]
+    async fn reqwest_stream_transport_429_reads_body_retry_info_when_header_missing() {
+        let raw_body = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"30s"}],"message":"UNSAFE_REQWEST_429_BODY_MARKER"}}"#;
+        let app = Router::new().fallback(post(move || async move {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("content-type", "application/json")],
+                raw_body,
+            )
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local Gemini test server");
+        let base_url = format!("http://{}/v1beta/models", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve local Gemini test response");
+        });
+
+        let error = stream_gemini_http(
+            &GeminiConfig {
+                api_key: "local-fixture".to_owned(),
+                model_id: "gemini-3.5-flash".to_owned(),
+                base_url,
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [] }),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        let BrainError::StageFailure(failure) = error else {
+            panic!("expected Gemini 429 stage failure");
+        };
+        assert!(failure.metadata.contains("http_status=429"));
+        assert!(failure.metadata.contains("retry_after_ms=30000"));
+        assert!(failure
+            .metadata
+            .contains("retry_after_source=body_retry_info"));
+        assert!(failure.metadata.contains("body_status=resource_exhausted"));
+        assert!(!failure.metadata.contains("UNSAFE_REQWEST_429_BODY_MARKER"));
+        assert!(!failure
+            .to_string()
+            .contains("UNSAFE_REQWEST_429_BODY_MARKER"));
+    }
+
+    #[tokio::test]
+    async fn reqwest_stream_transport_429_caps_error_body_and_preserves_headers() {
+        let app = Router::new().fallback(post(|| async move {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    ("content-type", "application/json"),
+                    ("retry-after", "5"),
+                    ("x-ratelimit-reset", "30"),
+                ],
+                format!(
+                    r#"{{"error":{{"code":429,"status":"RESOURCE_EXHAUSTED","message":"{}"}}}}"#,
+                    "UNSAFE_OVERSIZED_429_BODY_MARKER".repeat(512)
+                ),
+            )
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local Gemini oversized-body test server");
+        let base_url = format!("http://{}/v1beta/models", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve local Gemini oversized-body test response");
+        });
+
+        let error = stream_gemini_http(
+            &GeminiConfig {
+                api_key: "local-fixture".to_owned(),
+                base_url,
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [] }),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        let BrainError::StageFailure(failure) = error else {
+            panic!("expected Gemini 429 stage failure");
+        };
+        assert!(failure.metadata.contains("http_status=429"));
+        assert!(failure.metadata.contains("retry_after_ms=5000"));
+        assert!(failure
+            .metadata
+            .contains("retry_after_source=retry_after_delta"));
+        assert!(failure.metadata.contains("reset_hint=relative_ms=30000"));
+        assert!(failure.metadata.contains("body_status=unknown"));
+        assert!(!failure
+            .metadata
+            .contains("UNSAFE_OVERSIZED_429_BODY_MARKER"));
+        assert!(!failure
+            .to_string()
+            .contains("UNSAFE_OVERSIZED_429_BODY_MARKER"));
     }
 
     #[tokio::test]
