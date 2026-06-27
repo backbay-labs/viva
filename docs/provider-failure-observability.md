@@ -10,8 +10,10 @@ failure class, and redaction assertions.
 
 The alert thresholds for provider 429s, provider timeouts, provider auth
 failures, stuck checking, recap failures, token refresh failures, and live
-monitor failures are imported from `scripts/rollback-drain-criteria.mjs`. Do not
-copy those numbers into a second dashboard table.
+monitor failures are imported from `scripts/rollback-drain-criteria.mjs`. Tool
+executor failures, durability failures, malformed streams, network disconnects,
+cost-budget failures, and stale release evidence use local BAC-525 alert entries.
+Do not copy shared rollback numbers into a second dashboard table.
 
 Dashboard rows group by:
 

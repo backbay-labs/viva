@@ -24,7 +24,7 @@ type VivaSessionRouteLogOptions = {
   route?: VivaSessionRouteName;
 };
 
-export type VivaSessionRouteFailureLog = VivaSessionRouteFailureClass & {
+export type VivaSessionRouteFailureLog = Omit<VivaSessionRouteFailureClass, "stage"> & {
   action: VivaSessionRouteAction | null;
   deploy_sha: string | null;
   event: "viva_session_route_failure";

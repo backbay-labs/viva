@@ -27,6 +27,7 @@ test("provider failure observability defines reusable sanitized log queries", ()
     "malformed_stream",
     "network_disconnect",
     "durability_degraded",
+    "tool_executor_failure",
     "token_refresh_failure",
     "startup_unavailable",
     "recap_failure",
@@ -69,6 +70,10 @@ test("provider failure observability defines reusable sanitized log queries", ()
   assert.match(
     queriesById.get("startup_unavailable").railway_query,
     /viva_session_identity_allowlist_unavailable/,
+  );
+  assert.match(
+    queriesById.get("tool_executor_failure").railway_query,
+    /failure_class:"tool_executor_failure"/,
   );
   assert.match(
     queriesById.get("live_monitor_failure").railway_query,
@@ -149,6 +154,7 @@ test("reviewed BAC-525 queries name emitted log and evidence surfaces", () => {
     "malformed_stream",
     "network_disconnect",
     "durability_degraded",
+    "tool_executor_failure",
     "recap_failure",
     "pending_evaluation",
     "provider_cancellation",
