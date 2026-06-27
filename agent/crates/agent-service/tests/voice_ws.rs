@@ -3815,6 +3815,7 @@ async fn websocket_runtime_store_error_event_emits_durability_degraded_terminal_
             events: vec![BrainEvent::Error(BrainProviderError {
                 source: "synthetic-memory".to_owned(),
                 message: "postgres adapter error: durable store write failed".to_owned(),
+                failure: None,
             })],
         }),
         "event_probe",

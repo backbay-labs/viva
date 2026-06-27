@@ -1207,6 +1207,9 @@ fn brain_error_is_durability_degraded(state: &AppState, error: &BrainError) -> b
         BrainError::Connection(message) | BrainError::Protocol(message) => {
             provider_store_error_message_is_durability_degraded(message)
         }
+        BrainError::StageFailure(failure) => {
+            failure.terminal_reason == TerminalSessionReason::DurabilityDegraded
+        }
         BrainError::MissingApiKey => false,
     }
 }
