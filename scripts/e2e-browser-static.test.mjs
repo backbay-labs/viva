@@ -66,3 +66,15 @@ function numericConstant(source, name) {
   assert(match, `missing numeric constant ${name}`);
   return Number(match[1]);
 }
+
+test("hosted browser E2E records answer-resolution latency evidence", async () => {
+  const source = await readFile(E2E_BROWSER_PATH, "utf8");
+
+  assert.match(source, /const answerResolutionStartedAt = Date\.now\(\)/);
+  assert.match(
+    source,
+    /waitForPostAnswerProtocolProof\(\s*serverEvents,\s*25_000,\s*answerResolutionStartedAt/s,
+  );
+  assert.match(source, /latencyMs: postAnswerProtocolProof\.latencyMs/);
+  assert.match(source, /latencyMs:\s*null/);
+});

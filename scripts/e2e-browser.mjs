@@ -110,6 +110,7 @@ let postAnswerProtocolProof = {
   conceptId: null,
   conceptStatus: null,
   conceptStatusEventSeen: false,
+  latencyMs: null,
   responseId: null,
   sourceReferenceEventSeen: false,
 };
@@ -326,6 +327,7 @@ try {
     if (stopToRecap) {
       await page.getByRole("button", { name: "End session" }).click();
     } else {
+      const answerResolutionStartedAt = Date.now();
       await page.getByRole("button", { name: /check it/i }).click();
       writtenAnswerFallbackUsed = await submitWrittenAnswerIfFallbackOpens(page);
       if (failureControlPlan.enabled) {
@@ -346,7 +348,11 @@ try {
           checks: ["terminal_reason", "sanitized_failure_control", "same_session_recovery_path"],
         });
       } else {
-        postAnswerProtocolProof = await waitForPostAnswerProtocolProof(serverEvents, 25_000);
+        postAnswerProtocolProof = await waitForPostAnswerProtocolProof(
+          serverEvents,
+          25_000,
+          answerResolutionStartedAt,
+        );
         if (requireCorrectionMarginalia) {
           await page.getByText("Marginalia", { exact: true }).waitFor({
             state: "visible",
@@ -572,6 +578,7 @@ try {
       deploySha: hostedDeploySha(),
       failureClass: terminalProof?.failure_class ?? null,
       hostedMode,
+      latencyMs: postAnswerProtocolProof.latencyMs,
       postgresDurability: hostedPostgresDurability(),
       provider: agentProvider,
       recapSuccess: recapPayloadVisible,
@@ -1714,10 +1721,10 @@ async function waitForFailureControlTerminal(events, plan, timeoutMs) {
   );
 }
 
-async function waitForPostAnswerProtocolProof(events, timeoutMs) {
+async function waitForPostAnswerProtocolProof(events, timeoutMs, answerResolutionStartedAt = null) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const proof = postAnswerProtocolProofFromEvents(events);
+    const proof = postAnswerProtocolProofFromEvents(events, answerResolutionStartedAt);
     if (proof.sourceReferenceEventSeen && proof.conceptStatusEventSeen) return proof;
     await delay(100);
   }
@@ -1727,7 +1734,7 @@ async function waitForPostAnswerProtocolProof(events, timeoutMs) {
   );
 }
 
-function postAnswerProtocolProofFromEvents(events) {
+function postAnswerProtocolProofFromEvents(events, answerResolutionStartedAt = null) {
   for (let answerIndex = events.length - 1; answerIndex >= 0; answerIndex -= 1) {
     const answerEvent = events[answerIndex];
     if (answerEvent.type !== "answer_evaluated" || !answerEvent.responseId) continue;
@@ -1749,6 +1756,10 @@ function postAnswerProtocolProofFromEvents(events) {
       conceptId: conceptEvent?.conceptId ?? null,
       conceptStatus: conceptEvent?.conceptStatus ?? null,
       conceptStatusEventSeen: Boolean(conceptEvent),
+      latencyMs:
+        Number.isFinite(answerResolutionStartedAt) && answerResolutionStartedAt > 0
+          ? Math.max(0, Date.now() - answerResolutionStartedAt)
+          : null,
       responseId: answerEvent.responseId,
       sourceReferenceEventSeen: Boolean(sourceEvent),
     };
@@ -1757,6 +1768,7 @@ function postAnswerProtocolProofFromEvents(events) {
     conceptId: null,
     conceptStatus: null,
     conceptStatusEventSeen: false,
+    latencyMs: null,
     responseId: null,
     sourceReferenceEventSeen: false,
   };

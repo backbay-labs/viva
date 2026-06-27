@@ -6,6 +6,7 @@ import {
   buildHostedBrowserEvidence,
   buildHostedE2eMatrixContract,
   failureControlScenarioIdsForProfile,
+  failureControlScenarioRequiresExplicitBrowserAction,
   HOSTED_E2E_MATRIX_SCHEMA,
   HOSTED_E2E_MONITOR_POLICY_SCHEMA,
   HOSTED_E2E_RESULT_SCHEMA,
@@ -28,6 +29,12 @@ const FORBIDDEN_MARKERS = Object.freeze([
   "GEMINI_API_KEY",
   "Bearer ",
 ]);
+
+function prRunnableFailureControlScenarios() {
+  return FAILURE_CONTROL_SCENARIOS.filter(
+    (scenario) => !failureControlScenarioRequiresExplicitBrowserAction(scenario.id),
+  );
+}
 
 test("hosted E2E matrix contract exposes BAC-510 fields and required scenarios", () => {
   const contract = buildHostedE2eMatrixContract({
@@ -80,6 +87,20 @@ test("hosted E2E matrix contract exposes BAC-510 fields and required scenarios",
   }
 });
 
+test("hosted token-free session history coverage does not claim unobserved BFCache restore", () => {
+  const contract = buildHostedE2eMatrixContract({
+    generatedAt: "2026-06-25T00:00:00.000Z",
+    mode: "pr",
+    runId: "run-1",
+  });
+  const scenario = contract.scenarios.find((entry) => entry.id === "token_free_session_history");
+
+  assert(scenario);
+  assert(scenario.coverage.includes("back_forward_recovery"));
+  assert(scenario.coverage.includes("refresh_recovery"));
+  assert.equal(scenario.coverage.includes("bfcache_restore"), false);
+});
+
 test("hosted E2E matrix keeps future product slices contracted but not in default runs", () => {
   const contractRows = scenariosForProfile("contract");
   const fullRows = scenariosForProfile("full", "pr");
@@ -92,9 +113,16 @@ test("hosted E2E matrix keeps future product slices contracted but not in defaul
   assert.equal(fullIds.has("multi_tab_second_session"), false);
 });
 
-test("hosted PR profile expands to every deterministic failure-control scenario", () => {
-  const expected = FAILURE_CONTROL_SCENARIOS.map((scenario) => scenario.id).sort();
+test("hosted PR profile expands to browser-runnable deterministic failure-control scenarios", () => {
+  const expected = prRunnableFailureControlScenarios().map((scenario) => scenario.id).sort();
   assert.deepEqual(failureControlScenarioIdsForProfile({ profile: "full" }).sort(), expected);
+  assert.deepEqual(
+    failureControlScenarioIdsForProfile({
+      includeBrowserActionScenarios: true,
+      profile: "full",
+    }).sort(),
+    FAILURE_CONTROL_SCENARIOS.map((scenario) => scenario.id).sort(),
+  );
   assert.deepEqual(
     failureControlScenarioIdsForProfile({
       configuredValue: "provider_rate_limited,provider_timeout,provider_rate_limited",
@@ -105,6 +133,10 @@ test("hosted PR profile expands to every deterministic failure-control scenario"
   assert.throws(
     () => failureControlScenarioIdsForProfile({ configuredValue: "unknown_scenario" }),
     /unknown hosted failure-control matrix scenario/,
+  );
+  assert.throws(
+    () => failureControlScenarioIdsForProfile({ configuredValue: "mic_denied" }),
+    /require explicit browser actions/,
   );
   assert.throws(
     () => failureControlScenarioIdsForProfile({ profile: "typo" }),
@@ -221,6 +253,7 @@ test("hosted browser evidence records required production fields without forbidd
     deploySha: "abc123hostedsha",
     failureClass: "quota_rate_failure",
     hostedMode: true,
+    latencyMs: 1234,
     postgresDurability: "durable",
     provider: "synthetic",
     recapSuccess: false,
@@ -244,6 +277,7 @@ test("hosted browser evidence records required production fields without forbidd
   assert.equal(evidence.failure_class, "quota_rate_failure");
   assert.equal(evidence.terminal_reason, "provider_rate_limited");
   assert.equal(evidence.stage, "gemini");
+  assert.equal(evidence.latency_ms, 1234);
   assert.equal(evidence.recap_success, false);
   assert.equal(evidence.usage.redacted, true);
   assert.equal(evidence.sanitized, true);

@@ -60,7 +60,7 @@ export function buildHostedMonitorPlan(env = process.env) {
       : [];
   const explicitFailureControlSubset =
     mode === "pr" && hasExplicitFailureControlScenarioSubset(env);
-  const matrixScenarioIds = explicitFailureControlSubset
+  const matrixScenarioIds = mode === "pr"
     ? [...PR_BROWSER_SCENARIO_IDS, ...failureControlScenarioIds]
     : null;
   const matrix = buildHostedE2eMatrixContract({
@@ -68,11 +68,16 @@ export function buildHostedMonitorPlan(env = process.env) {
     profile: matrixProfile,
     runId,
     scenarioIds: matrixScenarioIds,
-    scenarioSubset: explicitFailureControlSubset
+    scenarioSubset: mode === "pr"
       ? {
           selected: true,
+          explicitly_configured: explicitFailureControlSubset,
           configured_env: "VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS",
           scenario_ids: matrixScenarioIds,
+          excluded_requires_browser_action: failureControlScenarioIdsForProfile({
+            includeBrowserActionScenarios: true,
+            profile: matrixProfile,
+          }).filter((scenarioId) => !failureControlScenarioIds.includes(scenarioId)),
         }
       : null,
   });
@@ -353,10 +358,16 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
     "VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES",
     0,
   );
+  const priorFailureState = liveMonitorPriorFailureState(
+    env,
+    now,
+    quarantinePolicy,
+    consecutiveFailures,
+  );
   const quarantinedUntil = optionalDateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_QUARANTINED_UNTIL");
   if (quarantinedUntil && quarantinedUntil.getTime() > now.getTime()) {
     return {
-      consecutive_failures: consecutiveFailures,
+      ...priorFailureStateEvidence(priorFailureState),
       enabled: true,
       now: now.toISOString(),
       quarantined_until: quarantinedUntil.toISOString(),
@@ -366,7 +377,7 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
   }
   if (runsToday >= livePolicy.max_runs_per_day) {
     return {
-      consecutive_failures: consecutiveFailures,
+      ...priorFailureStateEvidence(priorFailureState),
       enabled: true,
       now: now.toISOString(),
       runs_today: runsToday,
@@ -376,7 +387,7 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
   }
   if (tokensToday >= livePolicy.max_tokens_per_day) {
     return {
-      consecutive_failures: consecutiveFailures,
+      ...priorFailureStateEvidence(priorFailureState),
       enabled: true,
       max_tokens_per_day: livePolicy.max_tokens_per_day,
       now: now.toISOString(),
@@ -385,12 +396,25 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
       tokens_today: tokensToday,
     };
   }
+  if (tokensToday + livePolicy.max_tokens_per_run > livePolicy.max_tokens_per_day) {
+    return {
+      ...priorFailureStateEvidence(priorFailureState),
+      enabled: true,
+      max_tokens_per_day: livePolicy.max_tokens_per_day,
+      max_tokens_per_run: livePolicy.max_tokens_per_run,
+      now: now.toISOString(),
+      should_run: false,
+      skip_reason: "daily_token_budget_remaining_too_low",
+      token_budget_remaining: Math.max(0, livePolicy.max_tokens_per_day - tokensToday),
+      tokens_today: tokensToday,
+    };
+  }
   const lastRunAt = optionalDateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_LAST_RUN_AT");
   if (lastRunAt) {
     const elapsedSeconds = Math.floor((now.getTime() - lastRunAt.getTime()) / 1000);
     if (elapsedSeconds < livePolicy.min_cadence_seconds) {
       return {
-        consecutive_failures: consecutiveFailures,
+        ...priorFailureStateEvidence(priorFailureState),
         enabled: true,
         last_run_at: lastRunAt.toISOString(),
         min_cadence_seconds: livePolicy.min_cadence_seconds,
@@ -402,7 +426,7 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
     }
   }
   return {
-    consecutive_failures: consecutiveFailures,
+    ...priorFailureStateEvidence(priorFailureState),
     enabled: true,
     max_runs_per_day: livePolicy.max_runs_per_day,
     min_cadence_seconds: livePolicy.min_cadence_seconds,
@@ -455,7 +479,7 @@ function scheduledLiveMonitorRun(
   liveConfig,
   liveMonitorDecision,
 ) {
-  const timeoutMs = Math.min(runTimeoutMs, livePolicy.max_duration_ms_per_run + 30_000);
+  const timeoutMs = Math.min(runTimeoutMs, livePolicy.max_duration_ms_per_run);
   return {
     name: "scheduled_hosted_live_smoke",
     scenario_id: "live_provider_smoke",
@@ -466,6 +490,9 @@ function scheduledLiveMonitorRun(
       VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES: String(
         liveMonitorDecision.consecutive_failures ?? 0,
       ),
+      ...(liveMonitorDecision.last_failure_at
+        ? { VIVA_HOSTED_LIVE_MONITOR_LAST_FAILURE_AT: liveMonitorDecision.last_failure_at }
+        : {}),
       VIVA_HOSTED_RUN_ID: runId,
       VIVA_LIVE_PROVIDER_SMOKE: "1",
       VIVA_LIVE_SMOKE: "1",
@@ -677,17 +704,30 @@ function liveMonitorSelfQuarantine(result, env = {}) {
   const failureClass = result?.failure?.failure_class ?? result?.failure_class ?? null;
   const currentFailure =
     terminalReason === policy.terminal_reason || failureClass === policy.failure_class;
-  const priorConsecutiveFailures = optionalNonNegativeInteger(
+  const observedAt =
+    optionalDateValue(result?.generated_at) ??
+    optionalDateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_NOW") ??
+    new Date();
+  const configuredConsecutiveFailures = optionalNonNegativeInteger(
     env.VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES,
     "VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES",
     0,
   );
-  const consecutiveFailures = currentFailure ? priorConsecutiveFailures + 1 : 0;
+  const priorFailureState = liveMonitorPriorFailureState(
+    env,
+    observedAt,
+    policy,
+    configuredConsecutiveFailures,
+  );
+  const consecutiveFailures = currentFailure ? priorFailureState.consecutiveFailures + 1 : 0;
   const triggered = currentFailure && consecutiveFailures >= policy.consecutive_failures;
   return {
     triggered,
     consecutive_failures: consecutiveFailures,
     current_failure: currentFailure,
+    prior_failure_stale: priorFailureState.stale,
+    last_failure_at: priorFailureState.lastFailureAt?.toISOString() ?? null,
+    seconds_since_last_failure: priorFailureState.secondsSinceLastFailure,
     required_consecutive_failures: policy.consecutive_failures,
     terminal_reason: currentFailure ? terminalReason : null,
     failure_class: currentFailure ? failureClass : null,
@@ -1027,6 +1067,52 @@ function optionalDateFromEnv(env, name) {
   const value = env[name];
   if (value === undefined || value === null || String(value).trim() === "") return null;
   return dateFromEnv(env, name, null);
+}
+
+function optionalDateValue(value) {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const parsed = new Date(String(value));
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function liveMonitorPriorFailureState(env, now, policy, configuredConsecutiveFailures) {
+  if (configuredConsecutiveFailures <= 0) {
+    return {
+      consecutiveFailures: 0,
+      lastFailureAt: null,
+      secondsSinceLastFailure: null,
+      stale: false,
+    };
+  }
+  const lastFailureAt = optionalDateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_LAST_FAILURE_AT");
+  if (!lastFailureAt) {
+    return {
+      consecutiveFailures: 0,
+      lastFailureAt: null,
+      secondsSinceLastFailure: null,
+      stale: true,
+    };
+  }
+  const secondsSinceLastFailure = Math.max(
+    0,
+    Math.floor((now.getTime() - lastFailureAt.getTime()) / 1000),
+  );
+  const stale = secondsSinceLastFailure > policy.observation_window_seconds;
+  return {
+    consecutiveFailures: stale ? 0 : configuredConsecutiveFailures,
+    lastFailureAt,
+    secondsSinceLastFailure,
+    stale,
+  };
+}
+
+function priorFailureStateEvidence(state) {
+  return {
+    consecutive_failures: state.consecutiveFailures,
+    last_failure_at: state.lastFailureAt?.toISOString() ?? null,
+    prior_failure_stale: state.stale,
+    seconds_since_last_failure: state.secondsSinceLastFailure,
+  };
 }
 
 function sanitizeRunId(value) {

@@ -70,7 +70,6 @@ const BASELINE_SCENARIOS = Object.freeze([
     recap_success_expected: true,
     coverage: [
       "back_forward_recovery",
-      "bfcache_restore",
       "refresh_recovery",
       "visible_url_canonicalized",
     ],
@@ -149,6 +148,11 @@ export const HOSTED_E2E_SCENARIOS = Object.freeze([
 const failureControlScenarioIdSet = new Set(
   FAILURE_CONTROL_SCENARIO_ROWS.map((entry) => entry.control_scenario_id),
 );
+const FAILURE_CONTROL_SCENARIOS_REQUIRING_BROWSER_ACTION = new Set([
+  "double_submit_race",
+  "mic_denied",
+  "typed_fallback",
+]);
 const hostedScenarioIdSet = new Set(HOSTED_E2E_SCENARIOS.map((entry) => entry.id));
 
 export const HOSTED_MONITOR_POLICY = Object.freeze({
@@ -258,6 +262,7 @@ function scenariosForProfileInternal(profile, mode = "pr", { scenarioIds = null 
 
 export function failureControlScenarioIdsForProfile({
   configuredValue = "",
+  includeBrowserActionScenarios = false,
   profile = "full",
 } = {}) {
   const configured = configuredValue
@@ -277,7 +282,21 @@ export function failureControlScenarioIdsForProfile({
       throw new Error(`unknown hosted failure-control matrix scenario ${id}`);
     }
   }
-  return uniqueIds;
+  const requiringBrowserAction = uniqueIds.filter((id) =>
+    failureControlScenarioRequiresExplicitBrowserAction(id),
+  );
+  if (configured.length > 0 && requiringBrowserAction.length > 0) {
+    throw new Error(
+      `hosted failure-control PR scenarios require explicit browser actions before they can run: ${requiringBrowserAction.join(",")}`,
+    );
+  }
+  return includeBrowserActionScenarios
+    ? uniqueIds
+    : uniqueIds.filter((id) => !failureControlScenarioRequiresExplicitBrowserAction(id));
+}
+
+export function failureControlScenarioRequiresExplicitBrowserAction(scenarioId) {
+  return FAILURE_CONTROL_SCENARIOS_REQUIRING_BROWSER_ACTION.has(scenarioId);
 }
 
 export function buildHostedBrowserEvidence({
