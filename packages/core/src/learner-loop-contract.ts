@@ -86,7 +86,12 @@ export type LearnerLoopCopy = {
   marginalia_text: string;
   next_action_label: string;
   primary_action_label: string;
-  primary_action_intent: "disabled" | "retry_agent" | "start_session" | "submit_turn";
+  primary_action_intent:
+    | "disabled"
+    | "refresh_session"
+    | "retry_agent"
+    | "start_session"
+    | "submit_turn";
   status_label: string;
 };
 

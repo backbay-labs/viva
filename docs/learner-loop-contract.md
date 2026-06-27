@@ -5,6 +5,11 @@ Source of truth: `packages/core/src/learner-loop-contract.json`.
 This document is only an index for humans. Do not add a second state table here; update the
 JSON contract and its tests instead.
 
+BAC-523 exposes the checked-in learner/operator copy surface through
+`packages/core/src/learner-recovery-copy.ts`. That projection is derived from the JSON contract
+so every BAC-510 state keeps one learner copy/action mapping and one separate operator diagnostic
+mapping.
+
 ## BAC-510 rules
 
 - A submitted answer must resolve to exactly one learner-safe state within
