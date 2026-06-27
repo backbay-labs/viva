@@ -507,11 +507,12 @@ where
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
                 return Ok(response_prompt);
             }
-            let request = gemini_request(
-                &self.config.gemini,
-                conversation.snapshot(),
-                &self.config.tools,
-            );
+            let tools = if pass_index + 1 >= MAX_GEMINI_TOOL_LOOP_PASSES {
+                &[] as &[Value]
+            } else {
+                &self.config.tools
+            };
+            let request = gemini_request(&self.config.gemini, conversation.snapshot(), tools);
             let gemini_started = Instant::now();
             let stream = fake_interrupt_gemini_stream(
                 self.transports.stream_gemini(&self.config, request).await?,
@@ -1746,11 +1747,6 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         _config: &CartesiaGeminiConfig,
         request: Value,
     ) -> Result<Vec<GeminiStreamEvent>, BrainError> {
-        if request.get("tools").is_none() {
-            return Err(BrainError::Protocol(
-                "fake Gemini request omitted Viva tools".to_owned(),
-            ));
-        }
         let has_function_response =
             request["contents"]
                 .as_array()
@@ -1764,10 +1760,20 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
                         .any(|part| part.get("functionResponse").is_some())
                 });
         if has_function_response {
+            if request.get("tools").is_some() {
+                return Err(BrainError::Protocol(
+                    "fake Gemini final request advertised Viva tools".to_owned(),
+                ));
+            }
             Ok(parse_gemini_sse_line(
                 r#"data: {"candidates":[{"content":{"parts":[{"text":"Good. Now connect the proton gradient to ATP synthase."}]}}],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":2}}"#,
             ))
         } else {
+            if request.get("tools").is_none() {
+                return Err(BrainError::Protocol(
+                    "fake Gemini request omitted Viva tools".to_owned(),
+                ));
+            }
             let answer_text = first_user_text(&request)
                 .unwrap_or_else(|| FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT.to_owned());
             let args = json!({

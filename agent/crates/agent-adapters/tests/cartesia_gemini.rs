@@ -5,7 +5,7 @@ use agent_adapters::cartesia_gemini::{
 };
 use agent_domain::{
     viva_max_submitted_answer_resolution, AnswerAttemptEnvelope, AnswerEvaluation, AudioFrame,
-    AuthorizedStudySession, BrainError, BrainEvent, BrainInput, ConceptStatus, ManuscriptEmphasis,
+    AuthorizedStudySession, BrainEvent, BrainInput, ConceptStatus, ManuscriptEmphasis,
     ManuscriptEntityKind, ManuscriptIntent, ManuscriptRegister, PortError, RealtimeBrain,
     RealtimeSession, SessionConfig, SessionId, StudyMemoryStore, StudyMode, StudyQuestion,
     StudySessionRecap, StudySourceReference, StudyStoreCapabilities, StudyStoreWriteCounts,
@@ -998,34 +998,27 @@ async fn fake_runtime_reports_recap_failure_with_tool_executor_failure_class() {
 }
 
 #[tokio::test]
-async fn fake_runtime_fails_when_gemini_requests_tool_on_final_loop_pass() {
+async fn fake_runtime_omits_tools_on_final_gemini_pass() {
     let (store, session) = fixture_store_and_session().await;
     let runtime = FakeCartesiaGeminiRuntime::new(store);
 
-    let error = runtime
-        .replay_audio_turn_with_interrupt(
-            session,
-            AudioFrame::from_pcm16_bytes(vec![1_u8, 2, 3, 4]),
-            FakeRuntimeInterrupt::GeminiToolCallOnFinalPass,
-        )
+    let events = runtime
+        .replay_audio_turn(session, AudioFrame::from_pcm16_bytes(vec![1_u8, 2, 3, 4]))
         .await
-        .unwrap_err();
-    let BrainError::StageFailure(failure) = error else {
-        panic!("final-pass Gemini tool call should produce a stage failure");
-    };
+        .expect("final Gemini pass should complete without advertising tools");
 
-    assert_eq!(failure.failure_class, "malformed_stream");
-    assert_eq!(failure.stage, "gemini");
-    assert_eq!(
-        failure.terminal_reason,
-        TerminalSessionReason::ProviderMalformedStream
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, BrainEvent::AnswerEvaluated { .. })),
+        "first Gemini pass should still execute the answer-evaluation tool"
     );
-    assert!(failure.retry_eligible);
-    assert_eq!(failure.provider, "gemini");
-    assert!(failure.metadata.contains("tool=emit_manuscript_intent"));
-    assert!(failure
-        .metadata
-        .contains("error_kind=tool_loop_budget_exceeded"));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, BrainEvent::ResponseTranscriptDelta { text, .. } if text.contains("proton gradient"))),
+        "final Gemini pass should return text after function responses"
+    );
 }
 
 #[tokio::test]
