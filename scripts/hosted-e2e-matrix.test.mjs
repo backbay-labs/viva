@@ -87,6 +87,23 @@ test("hosted E2E matrix contract exposes BAC-510 fields and required scenarios",
   }
 });
 
+test("hosted scheduled matrix contract validates its scheduled scenario set", () => {
+  const contract = buildHostedE2eMatrixContract({
+    generatedAt: "2026-06-25T00:00:00.000Z",
+    mode: "scheduled",
+    runId: "scheduled-run-1",
+  });
+
+  assert.equal(contract.mode, "scheduled");
+  assert.equal(contract.profile, "scheduled");
+  assert.equal(contract.scenario_subset, undefined);
+  assert.deepEqual(
+    contract.scenarios.map((scenario) => scenario.id),
+    ["happy_path"],
+  );
+  assert.doesNotThrow(() => assertHostedE2eMatrixContract(contract));
+});
+
 test("hosted token-free session history coverage does not claim unobserved BFCache restore", () => {
   const contract = buildHostedE2eMatrixContract({
     generatedAt: "2026-06-25T00:00:00.000Z",

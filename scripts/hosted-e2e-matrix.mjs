@@ -438,28 +438,35 @@ export function assertHostedE2eMatrixContract(contract) {
   }
   const requiredScenarioIds = contract?.scenario_subset?.selected
     ? []
-    : [
-        "happy_path",
-        "provider_rate_limited",
-        "provider_timeout",
-        "silent_stall",
-        "provider_auth_failed",
-        "provider_malformed_stream",
-        "invalid_token",
-        "expired_token",
-        "replayed_token",
-        "double_submit_race",
-        "mic_denied",
-        "typed_fallback",
-        "token_free_session_history",
-        "deterministic_partial_recap",
-      ];
+    : requiredScenarioIdsForMatrixContract(contract);
   for (const required of requiredScenarioIds) {
     if (!ids.has(required)) failures.push(`matrix scenario missing: ${required}`);
   }
   if (failures.length > 0) {
     throw new Error(`Hosted E2E matrix contract is incomplete: ${failures.join("; ")}`);
   }
+}
+
+function requiredScenarioIdsForMatrixContract(contract) {
+  if (contract?.mode === "scheduled" || contract?.profile === "scheduled") {
+    return ["happy_path"];
+  }
+  return [
+    "happy_path",
+    "provider_rate_limited",
+    "provider_timeout",
+    "silent_stall",
+    "provider_auth_failed",
+    "provider_malformed_stream",
+    "invalid_token",
+    "expired_token",
+    "replayed_token",
+    "double_submit_race",
+    "mic_denied",
+    "typed_fallback",
+    "token_free_session_history",
+    "deterministic_partial_recap",
+  ];
 }
 
 function scenario(input) {

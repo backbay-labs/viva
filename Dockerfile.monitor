@@ -13,6 +13,6 @@ COPY docs ./docs
 COPY agent/fixtures ./agent/fixtures
 
 RUN bun install --frozen-lockfile
-RUN mkdir -p /app/evidence && node -e "const fs=require('node:fs'); const sampleRate=16000; const seconds=1; const data=Buffer.alloc(sampleRate*seconds*2); for (let i=0; i<sampleRate*seconds; i += 1) { const sample=Math.round(Math.sin((2*Math.PI*440*i)/sampleRate)*12000); data.writeInt16LE(sample, i*2); } fs.writeFileSync('/app/evidence/live-smoke-answer.pcm', data);"
+RUN mkdir -p /app/evidence && node -e "const fs=require('node:fs'); const sampleRate=24000; const seconds=1; const data=Buffer.alloc(sampleRate*seconds*2); for (let i=0; i<sampleRate*seconds; i += 1) { const sample=Math.round(Math.sin((2*Math.PI*440*i)/sampleRate)*12000); data.writeInt16LE(sample, i*2); } fs.writeFileSync('/app/evidence/live-smoke-answer.pcm', data);"
 
 CMD ["bun", "run", "hosted:monitor"]

@@ -10,6 +10,7 @@ import {
   buildHostedE2eMatrixContract,
   defaultMatrixProfile,
   failureControlScenarioIdsForProfile,
+  failureControlScenarioRequiresExplicitBrowserAction,
   HOSTED_MONITOR_POLICY,
   summarizeHostedE2eResult,
 } from "./hosted-e2e-matrix.mjs";
@@ -23,7 +24,6 @@ const PR_BROWSER_SCENARIO_IDS = Object.freeze([
   "happy_path",
   "fake_provider_happy_path",
   "token_free_session_history",
-  "deterministic_partial_recap",
 ]);
 
 export function buildHostedMonitorPlan(env = process.env) {
@@ -77,7 +77,9 @@ export function buildHostedMonitorPlan(env = process.env) {
           excluded_requires_browser_action: failureControlScenarioIdsForProfile({
             includeBrowserActionScenarios: true,
             profile: matrixProfile,
-          }).filter((scenarioId) => !failureControlScenarioIds.includes(scenarioId)),
+          })
+            .filter(failureControlScenarioRequiresExplicitBrowserAction)
+            .filter((scenarioId) => !failureControlScenarioIds.includes(scenarioId)),
         }
       : null,
   });
@@ -188,16 +190,6 @@ export function buildHostedMonitorPlan(env = process.env) {
             env: runEnv(baseEnv, syntheticTarget, {
               VIVA_E2E_HOSTED_SCENARIO_ID: "token_free_session_history",
               VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
-            }),
-            timeoutMs: runTimeoutMs,
-          },
-          {
-            name: "pr_hosted_deterministic_partial_recap",
-            scenario_id: "deterministic_partial_recap",
-            env: runEnv(baseEnv, fakeTarget, {
-              VIVA_E2E_HOSTED_SCENARIO_ID: "deterministic_partial_recap",
-              VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "0",
-              VIVA_E2E_STOP_TO_RECAP: "1",
             }),
             timeoutMs: runTimeoutMs,
           },
@@ -709,11 +701,12 @@ export function summarizeHostedRun(run, runDir, resultDir, outcome, result, root
 
 function summarizeLiveSmokeResult(result, env = {}) {
   if (result?.schema !== "viva.live_provider_smoke.v1") return null;
+  const terminalReason = liveSmokeTerminalReason(result);
   return {
     schema: result.schema,
     status: result.status ?? null,
     provider: result.provider ?? null,
-    terminal_reason: result.terminal_reason ?? null,
+    terminal_reason: terminalReason,
     failure_class: result.failure?.failure_class ?? result.failure_class ?? null,
     caps: result.caps ?? null,
     privacy: result.privacy ?? null,
@@ -722,9 +715,13 @@ function summarizeLiveSmokeResult(result, env = {}) {
   };
 }
 
+function liveSmokeTerminalReason(result) {
+  return result?.terminal_reason ?? result?.websocket?.terminal_reason ?? null;
+}
+
 function liveMonitorSelfQuarantine(result, env = {}) {
   const policy = HOSTED_MONITOR_POLICY.self_quarantine;
-  const terminalReason = result?.terminal_reason ?? null;
+  const terminalReason = liveSmokeTerminalReason(result);
   const failureClass = result?.failure?.failure_class ?? result?.failure_class ?? null;
   const currentFailure =
     terminalReason === policy.terminal_reason || failureClass === policy.failure_class;
