@@ -128,6 +128,13 @@ export async function runLiveProviderSmoke({
     return evidence;
   }
 
+  const monitorConfig = {
+    ...config,
+    liveMonitorConsecutiveFailures: await previousLiveMonitorConsecutiveFailures(
+      config,
+      readFileImpl,
+    ),
+  };
   const base = baseEvidence(config, now);
   let readiness;
   try {
@@ -141,7 +148,7 @@ export async function runLiveProviderSmoke({
       failure_stage: "readiness",
       failure,
       failure_class: failure.failure_class,
-      monitor: failedMonitorEvidence(config, terminalReason),
+      monitor: failedMonitorEvidence(monitorConfig, terminalReason),
       readiness: readinessUnavailable(),
       terminal_reason: terminalReason,
     };
@@ -158,7 +165,7 @@ export async function runLiveProviderSmoke({
       failure_stage: "readiness",
       failure,
       failure_class: failure.failure_class,
-      monitor: failedMonitorEvidence(config, terminalReason),
+      monitor: failedMonitorEvidence(monitorConfig, terminalReason),
       readiness,
       terminal_reason: terminalReason,
     };
@@ -181,7 +188,7 @@ export async function runLiveProviderSmoke({
       failure_stage: "audio_input",
       failure,
       failure_class: failure.failure_class,
-      monitor: failedMonitorEvidence(config, terminalReason),
+      monitor: failedMonitorEvidence(monitorConfig, terminalReason),
       readiness,
       terminal_reason: terminalReason,
     };
@@ -201,7 +208,7 @@ export async function runLiveProviderSmoke({
       failure_stage: "bootstrap",
       failure,
       failure_class: failure.failure_class,
-      monitor: failedMonitorEvidence(config, terminalReason),
+      monitor: failedMonitorEvidence(monitorConfig, terminalReason),
       readiness,
       terminal_reason: terminalReason,
     };
@@ -244,7 +251,7 @@ export async function runLiveProviderSmoke({
       required_events: requiredEvents,
     },
     monitor: liveMonitorEvidence({
-      consecutiveFailures: config.liveMonitorConsecutiveFailures,
+      consecutiveFailures: monitorConfig.liveMonitorConsecutiveFailures,
       deploySha: config.deploySha,
       model: config.model,
       status,
@@ -767,11 +774,14 @@ export function liveMonitorEvidence({
 }) {
   const failed = status === "failed";
   const stuckChecking = terminalReason === "recap_timeout";
+  const priorConsecutiveFailures = Number.isSafeInteger(consecutiveFailures)
+    ? consecutiveFailures
+    : 0;
   return {
     deploy_sha: deploySha,
     failure_class: failed ? "live_monitor_failure" : null,
     live_monitor_attempt_count: 1,
-    live_monitor_consecutive_failures: failed ? Math.max(1, consecutiveFailures) : 0,
+    live_monitor_consecutive_failures: failed ? priorConsecutiveFailures + 1 : 0,
     model,
     sanitized: true,
     signal: failed ? "live_monitor_failure" : null,
@@ -891,6 +901,30 @@ function optionalNonNegativeInteger(value) {
     throw new Error("invalid live monitor consecutive failure count");
   }
   return parsed;
+}
+
+async function previousLiveMonitorConsecutiveFailures(config, readFileImpl) {
+  let previousArtifactFailures = 0;
+  try {
+    const raw = await readFileImpl(config.outputPath, "utf8");
+    previousArtifactFailures = liveMonitorConsecutiveFailuresFromEvidence(JSON.parse(raw));
+  } catch {
+    previousArtifactFailures = 0;
+  }
+  return Math.max(config.liveMonitorConsecutiveFailures, previousArtifactFailures);
+}
+
+function liveMonitorConsecutiveFailuresFromEvidence(evidence) {
+  if (
+    evidence?.schema !== "viva.live_provider_smoke.v1" ||
+    evidence.status !== "failed" ||
+    evidence.monitor === null ||
+    typeof evidence.monitor !== "object"
+  ) {
+    return 0;
+  }
+  const count = evidence.monitor.live_monitor_consecutive_failures;
+  return Number.isSafeInteger(count) && count >= 0 ? count : 0;
 }
 
 function deploymentSha(env) {

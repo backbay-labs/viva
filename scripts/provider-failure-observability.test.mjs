@@ -90,6 +90,8 @@ test("provider failure observability defines reusable sanitized log queries", ()
     queriesById.get("startup_unavailable").railway_query,
     /service:"web" event:"viva_session_route_failure"/,
   );
+  assert.match(queriesById.get("startup_unavailable").railway_query, /route:"start"/);
+  assert.doesNotMatch(queriesById.get("startup_unavailable").railway_query, /route:"refresh"/);
   assert.match(queriesById.get("stuck_checking").railway_query, /monitor\.stuck_checking_sessions/);
   assert.match(
     queriesById.get("release_gate_stale_evidence").railway_query,
@@ -135,6 +137,10 @@ test("reviewed BAC-525 queries name emitted log and evidence surfaces", () => {
   assert(
     queriesById.get("token_refresh_failure").evidence_fields.includes("route"),
     "token refresh failure query must expose the route discriminator",
+  );
+  assert(
+    queriesById.get("startup_unavailable").evidence_fields.includes("route"),
+    "startup unavailable query must expose the route discriminator",
   );
   assert(
     queriesById.get("token_refresh_failure").evidence_fields.includes("action"),

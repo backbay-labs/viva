@@ -976,7 +976,7 @@ where
         .await
         .is_err()
     {
-        return "send_failed";
+        return terminal_label_after_terminal_phase_close(terminal_reason, "send_failed");
     }
     let close_code = terminal_close_code(terminal_reason, close_code);
     let _ = close_with(sender, close_code, terminal_reason.close_reason()).await;
@@ -1005,11 +1005,29 @@ fn terminal_label_after_terminal_phase_close(
     terminal_reason: TerminalSessionReason,
     close_terminal_reason: &'static str,
 ) -> &'static str {
-    if terminal_reason == TerminalSessionReason::DurabilityDegraded {
+    if close_terminal_reason == "send_failed"
+        && terminal_reason_overrides_send_failure(terminal_reason)
+    {
         terminal_reason.as_str()
     } else {
         close_terminal_reason
     }
+}
+
+fn terminal_reason_overrides_send_failure(terminal_reason: TerminalSessionReason) -> bool {
+    matches!(
+        terminal_reason,
+        TerminalSessionReason::CostBudget
+            | TerminalSessionReason::ProviderAuthFailed
+            | TerminalSessionReason::ProviderRateLimited
+            | TerminalSessionReason::ProviderTimeout
+            | TerminalSessionReason::ProviderMalformedStream
+            | TerminalSessionReason::ProviderNetworkDisconnect
+            | TerminalSessionReason::ProviderCancelled
+            | TerminalSessionReason::PartialStageSuccess
+            | TerminalSessionReason::DurabilityDegraded
+            | TerminalSessionReason::Rollback
+    )
 }
 
 async fn close_with_client_stop<S>(
@@ -1371,13 +1389,17 @@ fn terminal_observability_classification(
                 signal: "pre_loop_unavailable",
             }
         }
-        "first_frame_timeout"
-        | "invalid_first_frame"
-        | "closed_before_config"
-        | "agent_input_closed" => TerminalObservabilityClassification {
-            failure_class: "session_bootstrap_unavailable",
-            stage: "startup",
-            signal: "session_bootstrap_unavailable",
+        "first_frame_timeout" | "invalid_first_frame" | "closed_before_config" => {
+            TerminalObservabilityClassification {
+                failure_class: "session_bootstrap_unavailable",
+                stage: "startup",
+                signal: "session_bootstrap_unavailable",
+            }
+        }
+        "agent_input_closed" => TerminalObservabilityClassification {
+            failure_class: "network_disconnect",
+            stage: "transport",
+            signal: "agent_input_closed",
         },
         "invalid_session_identity" | "invalid_session_token" => {
             TerminalObservabilityClassification {
@@ -2924,6 +2946,14 @@ mod tests {
             })
         );
         assert_eq!(
+            terminal_observability_classification("agent_input_closed"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "network_disconnect",
+                stage: "transport",
+                signal: "agent_input_closed",
+            })
+        );
+        assert_eq!(
             terminal_observability_classification("invalid_session_token"),
             Some(TerminalObservabilityClassification {
                 failure_class: "session_auth_failure",
@@ -3613,6 +3643,34 @@ mod tests {
         assert!(matches!(received.recv().await.unwrap(), BrainInput::Stop));
     }
 
+    #[tokio::test]
+    async fn terminal_session_phase_close_preserves_provider_reason_when_writer_fails() {
+        let (input, mut received) = mpsc::channel(1);
+        let mut sender = FailingSink;
+        let state = AppState::new(
+            Arc::new(SyntheticBrain::default()),
+            "synthetic",
+            crate::VoiceWsAccess::default(),
+            1,
+        );
+        let mut terminal_persisted = false;
+
+        let reason = close_with_terminal_session_phase(
+            &mut sender,
+            &input,
+            &state,
+            None,
+            &mut terminal_persisted,
+            TerminalSessionReason::ProviderRateLimited,
+            close_code::ERROR,
+        )
+        .await;
+
+        assert_eq!(reason, "provider_rate_limited");
+        assert!(terminal_persisted);
+        assert!(matches!(received.recv().await.unwrap(), BrainInput::Stop));
+    }
+
     #[test]
     fn terminal_phase_close_preserves_durability_label_after_send_failure() {
         assert_eq!(
@@ -3621,6 +3679,13 @@ mod tests {
                 "send_failed",
             ),
             "durability_degraded"
+        );
+        assert_eq!(
+            terminal_label_after_terminal_phase_close(
+                TerminalSessionReason::ProviderRateLimited,
+                "send_failed",
+            ),
+            "provider_rate_limited"
         );
         assert_eq!(
             terminal_label_after_terminal_phase_close(

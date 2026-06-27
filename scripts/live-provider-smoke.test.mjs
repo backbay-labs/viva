@@ -288,9 +288,11 @@ test("live monitor stuck-checking evidence is reserved for recap timeouts", () =
   });
 
   assert.equal(recapTimeout.stuck_checking_sessions, 1);
+  assert.equal(recapTimeout.live_monitor_consecutive_failures, 2);
   assert.equal(recapTimeout.deploy_sha, "deploy-sha-123");
   assert.equal(recapTimeout.model, "gemini-live-test");
   assert.equal(turnCapExceeded.stuck_checking_sessions, 0);
+  assert.equal(turnCapExceeded.live_monitor_consecutive_failures, 2);
   assert.equal(turnCapExceeded.deploy_sha, "unknown");
   assert.equal(turnCapExceeded.model, "gemini-3.5-flash");
 });
@@ -749,8 +751,56 @@ test("runLiveProviderSmoke maps runtime rate terminal phases to quota-rate failu
     assert.equal(evidence.failure.terminal_reason, "provider_rate_limited");
     assert.equal(evidence.monitor.failure_class, "live_monitor_failure");
     assert.equal(evidence.monitor.live_monitor_attempt_count, 1);
-    assert.equal(evidence.monitor.live_monitor_consecutive_failures, 2);
+    assert.equal(evidence.monitor.live_monitor_consecutive_failures, 3);
     assert.equal(evidence.monitor.signal, "live_monitor_failure");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("runLiveProviderSmoke increments previous persisted live-monitor failures", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "viva-live-smoke-prior-"));
+  const audioPath = path.join(tempDir, "answer.pcm");
+  const evidencePath = path.join(tempDir, "evidence.json");
+  await writeFile(audioPath, Buffer.from([1, 2, 3, 4]));
+  await writeFile(
+    evidencePath,
+    `${JSON.stringify({
+      schema: "viva.live_provider_smoke.v1",
+      status: "failed",
+      monitor: {
+        live_monitor_consecutive_failures: 2,
+      },
+    })}\n`,
+  );
+
+  try {
+    const evidence = await runLiveProviderSmoke({
+      env: {
+        VIVA_LIVE_PROVIDER_SMOKE: "1",
+        CARTESIA_API_KEY: "cartesia-secret-value",
+        GEMINI_API_KEY: "gemini-secret-value",
+        CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+        GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
+        VIVA_LIVE_SMOKE_AUDIO_FILE: audioPath,
+        VIVA_LIVE_SMOKE_EVIDENCE_PATH: evidencePath,
+        VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
+        VIVA_LIVE_SMOKE_MAX_TURNS: "1",
+        VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
+        VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
+        VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "https://agent.viva.test",
+      },
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/health/brain")) {
+          return jsonResponse(503, brainHealth({ liveRuntime: false, selectable: false }));
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      },
+      now: () => new Date("2026-06-18T00:00:00.000Z"),
+    });
+
+    assert.equal(evidence.status, "failed");
+    assert.equal(evidence.monitor.live_monitor_consecutive_failures, 3);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

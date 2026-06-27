@@ -190,13 +190,14 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "pre_loop_unavailable",
     stage: "startup",
     railway_query:
-      '(service:"agent-service" event:"provider_failure_observed" (failure_class:"pre_loop_unavailable" OR failure_class:"session_bootstrap_unavailable" OR terminal_reason:"study_set_access_denied" OR terminal_reason:"study_store_unavailable" OR terminal_reason:"pre_loop_unavailable" OR terminal_reason:"session_bootstrap_unavailable")) OR (service:"web" event:"viva_session_route_failure" (error:"viva_session_bootstrap_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable"))',
+      '(service:"agent-service" event:"provider_failure_observed" (failure_class:"pre_loop_unavailable" OR failure_class:"session_bootstrap_unavailable" OR terminal_reason:"study_set_access_denied" OR terminal_reason:"study_store_unavailable" OR terminal_reason:"pre_loop_unavailable" OR terminal_reason:"session_bootstrap_unavailable")) OR (service:"web" event:"viva_session_route_failure" route:"start" (error:"viva_session_bootstrap_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable"))',
     evidence_fields: [
       "failure_class",
       "stage",
       "deploy_sha",
       "error",
       "latency_ms",
+      "route",
       "terminal_reason",
     ],
   }),
