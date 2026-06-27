@@ -254,6 +254,48 @@ test("per-PR redaction check permits required auth source identifiers only in so
     true,
   );
   assert.equal(
+    addedLineViolatesRedactionAudit("        BrainError::MissingApiKey => (", {
+      file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('            api_key: "gemini-test-key".to_owned(),', {
+      file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("                    api_key: Some(request.api_key),", {
+      file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('                    api_key: "gemini-test-key".to_owned(),', {
+      file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('                answer_text: "omitted",', {
+      file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('                    "answer_text": "omitted",', {
+      file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('                answer_text: "raw learner answer",', {
+      file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
+    }),
+    true,
+  );
+  assert.equal(
     addedLineViolatesRedactionAudit("if config.ws_access.session_token_secret.is_none() {", {
       file: "agent/crates/agent-service/src/config.rs",
     }),

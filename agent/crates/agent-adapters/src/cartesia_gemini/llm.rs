@@ -647,6 +647,7 @@ fn gemini_status_stage_failure(
     let terminal_reason = match response.status {
         401 | 403 => TerminalSessionReason::ProviderAuthFailed,
         408 | 504 => TerminalSessionReason::ProviderTimeout,
+        500..=599 => TerminalSessionReason::ProviderNetworkDisconnect,
         _ => TerminalSessionReason::ProviderMalformedStream,
     };
     BrainError::StageFailure(Box::new(BrainProviderFailure::new(
@@ -669,6 +670,7 @@ fn gemini_status_failure_class(reason: TerminalSessionReason) -> &'static str {
     match reason {
         TerminalSessionReason::ProviderAuthFailed => "provider_auth_failure",
         TerminalSessionReason::ProviderTimeout => "timeout",
+        TerminalSessionReason::ProviderNetworkDisconnect => "network_disconnect",
         _ => "malformed_stream",
     }
 }
@@ -1916,7 +1918,7 @@ data: [DONE]
                 .expect("serve local Gemini test response");
         });
 
-        let error = stream_gemini_http(
+        let error = stream_gemini_http_with_attempt_events(
             &GeminiConfig {
                 api_key: "local-fixture".to_owned(),
                 model_id: "gemini-3.5-flash".to_owned(),
@@ -1926,7 +1928,8 @@ data: [DONE]
             json!({ "contents": [] }),
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .error;
         server.abort();
 
         let BrainError::StageFailure(failure) = error else {
@@ -1970,7 +1973,7 @@ data: [DONE]
                 .expect("serve local Gemini oversized-body test response");
         });
 
-        let error = stream_gemini_http(
+        let error = stream_gemini_http_with_attempt_events(
             &GeminiConfig {
                 api_key: "local-fixture".to_owned(),
                 base_url,
@@ -1979,7 +1982,8 @@ data: [DONE]
             json!({ "contents": [] }),
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .error;
         server.abort();
 
         let BrainError::StageFailure(failure) = error else {
@@ -2480,7 +2484,11 @@ data: [DONE]
         let BrainError::StageFailure(failure) = error else {
             panic!("expected Gemini fallback stage failure");
         };
-        assert_eq!(failure.failure_class, "malformed_stream");
+        assert_eq!(failure.failure_class, "network_disconnect");
+        assert_eq!(
+            failure.terminal_reason,
+            TerminalSessionReason::ProviderNetworkDisconnect
+        );
         assert_eq!(failure.provider, "gemini");
         assert_eq!(failure.model, "gemini-25-flash");
         assert!(failure.metadata.contains("http_status=503"));
@@ -2532,6 +2540,11 @@ data: [DONE]
         let BrainError::StageFailure(stage_failure) = failure.error else {
             panic!("expected Gemini fallback stage failure");
         };
+        assert_eq!(stage_failure.failure_class, "network_disconnect");
+        assert_eq!(
+            stage_failure.terminal_reason,
+            TerminalSessionReason::ProviderNetworkDisconnect
+        );
         assert_eq!(stage_failure.model, "gemini-25-flash");
         assert!(!stage_failure.to_string().contains("fixture-redacted-input"));
     }

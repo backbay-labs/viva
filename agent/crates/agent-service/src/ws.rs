@@ -3376,15 +3376,10 @@ async fn record_brain_event(
         from_model,
         to_model,
         reason,
-        failure,
+        failure: _,
         ..
     } = event
     {
-        if let Some(failure) = failure {
-            state
-                .limit_state
-                .record_provider_failure(&state.voice_limits, failure);
-        }
         state.evidence.record(VoiceEvidenceEvent::new(
             VoiceEvidenceEventKind::ProviderFallback,
             voice_session_id,
@@ -5068,7 +5063,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_fallback_activation_rate_limit_feeds_provider_backoff() {
+    async fn provider_fallback_activation_rate_limit_does_not_feed_provider_backoff() {
         use std::sync::Arc;
 
         use agent_adapters::SyntheticBrain;
@@ -5117,17 +5112,9 @@ mod tests {
             .limit_state
             .try_admit_provider_turn(&state.voice_limits, ProviderQueueBehavior::Wait)
             .await;
-        let ProviderAdmissionDecision::Denied(denial) = admission.decision else {
-            panic!("fallback 429 should install provider backoff");
+        let ProviderAdmissionDecision::Admitted = admission.decision else {
+            panic!("successful fallback activation must not install provider-wide backoff");
         };
-        assert_eq!(denial.reason, "provider_backoff");
-        assert_eq!(
-            denial.terminal_reason,
-            TerminalSessionReason::ProviderRateLimited
-        );
-        assert_eq!(denial.retry_after_ms, 750);
-        assert_eq!(denial.reset_hint, "2030-01-01T00:00:00Z");
-        assert_eq!(denial.budget_state, "within_limit");
         assert!(state.evidence.snapshot().iter().any(|event| {
             event.kind == VoiceEvidenceEventKind::ProviderFallback
                 && event.detail.contains("reason=primary_429")
