@@ -369,6 +369,14 @@ async fn ready_and_brain_health_routes_report_configured_synthetic_provider() {
             ["max_session_cost_usd"],
         0.25
     );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&brain_body).unwrap()["usage"]["events"],
+        0
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&brain_body).unwrap()["usage"]["total_tokens"],
+        0
+    );
 }
 
 #[tokio::test]

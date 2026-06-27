@@ -504,6 +504,7 @@ try {
     ...(!failureControlPlan.enabled && !stopToRecap && requirePostAnswerSourceFolio
       ? ["post-answer-source-folio.png"]
       : []),
+    ...(secondTabSessionCapProof ? ["second-tab-session-cap.png"] : []),
     ...(failureControlPlan.enabled
       ? ["failure-control-terminal.png"]
       : ["connected-terminal-fold.png"]),

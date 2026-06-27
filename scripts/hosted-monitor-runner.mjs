@@ -241,10 +241,16 @@ export function buildHostedMonitorPlan(env = process.env) {
 
 function matrixProfileForMode(env, mode) {
   const profile = (env.VIVA_HOSTED_MATRIX_PROFILE || defaultMatrixProfile(mode)).trim();
+  if (!["contract", "full", "pr", "scheduled"].includes(profile)) {
+    throw new Error(`unsupported hosted E2E matrix profile ${profile}`);
+  }
   if (mode === "scheduled" && profile !== "scheduled") {
     throw new Error(
       "scheduled hosted monitor requires VIVA_HOSTED_MATRIX_PROFILE=scheduled or unset",
     );
+  }
+  if (mode === "pr" && !["full", "pr"].includes(profile)) {
+    throw new Error("PR hosted monitor requires VIVA_HOSTED_MATRIX_PROFILE=full, pr, or unset");
   }
   return profile;
 }
@@ -334,6 +340,13 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
           "VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY",
         )
       : 0;
+  const tokensToday =
+    stateDate === today
+      ? nonNegativeInteger(
+          env.VIVA_HOSTED_LIVE_MONITOR_TOKENS_TODAY,
+          "VIVA_HOSTED_LIVE_MONITOR_TOKENS_TODAY",
+        )
+      : 0;
   const quarantinedUntil = optionalDateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_QUARANTINED_UNTIL");
   if (quarantinedUntil && quarantinedUntil.getTime() > now.getTime()) {
     return {
@@ -351,6 +364,16 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
       runs_today: runsToday,
       should_run: false,
       skip_reason: "daily_budget_exhausted",
+    };
+  }
+  if (tokensToday >= livePolicy.max_tokens_per_day) {
+    return {
+      enabled: true,
+      max_tokens_per_day: livePolicy.max_tokens_per_day,
+      now: now.toISOString(),
+      should_run: false,
+      skip_reason: "daily_token_budget_exhausted",
+      tokens_today: tokensToday,
     };
   }
   const lastRunAt = optionalDateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_LAST_RUN_AT");
@@ -376,6 +399,7 @@ function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
     quarantine_cooldown_seconds: quarantinePolicy.cooldown_seconds,
     runs_today: runsToday,
     should_run: true,
+    tokens_today: tokensToday,
   };
 }
 
@@ -427,13 +451,16 @@ function scheduledLiveMonitorRun(target, livePolicy, runTimeoutMs, runId, liveCo
       VIVA_LIVE_SMOKE: "1",
       VIVA_LIVE_SMOKE_AGENT_HTTP_URL: target.agentHttpUrl,
       VIVA_LIVE_SMOKE_AGENT_WS_URL: target.agentWsUrl,
-      VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD: String(livePolicy.max_cost_usd_per_run),
+      VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD: String(
+        liveConfig.remoteMaxSessionCostUsd,
+      ),
       VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: String(livePolicy.max_audio_bytes_per_run),
       VIVA_LIVE_SMOKE_MAX_DURATION_MS: String(livePolicy.max_duration_ms_per_run),
+      VIVA_LIVE_SMOKE_MAX_TOKENS: String(livePolicy.max_tokens_per_run),
       VIVA_LIVE_SMOKE_MAX_TURNS: String(livePolicy.max_turns_per_run),
       VIVA_LIVE_SMOKE_ORIGIN: target.webUrl,
       VIVA_VOICE_WS_BEARER_TOKEN: liveConfig.bearerToken,
-      VIVA_VOICE_WS_MAX_SESSION_COST_USD: String(livePolicy.max_cost_usd_per_run),
+      VIVA_VOICE_WS_MAX_SESSION_COST_USD: String(liveConfig.remoteMaxSessionCostUsd),
     },
     timeoutMs,
   };
@@ -602,14 +629,14 @@ export function summarizeHostedRun(run, runDir, resultDir, outcome, result, root
         }
       : null,
     hosted_e2e: summarizeHostedE2eResult(result),
-    live_smoke: summarizeLiveSmokeResult(result),
+    live_smoke: summarizeLiveSmokeResult(result, run.env ?? {}),
     manuscript_ready: result?.manuscript_ready === true,
     page_error_count: Array.isArray(result?.page_errors) ? result.page_errors.length : 0,
     sanitized: true,
   };
 }
 
-function summarizeLiveSmokeResult(result) {
+function summarizeLiveSmokeResult(result, env = {}) {
   if (result?.schema !== "viva.live_provider_smoke.v1") return null;
   return {
     schema: result.schema,
@@ -619,21 +646,31 @@ function summarizeLiveSmokeResult(result) {
     failure_class: result.failure?.failure_class ?? result.failure_class ?? null,
     caps: result.caps ?? null,
     privacy: result.privacy ?? null,
-    self_quarantine: liveMonitorSelfQuarantine(result),
+    self_quarantine: liveMonitorSelfQuarantine(result, env),
     sanitized: true,
   };
 }
 
-function liveMonitorSelfQuarantine(result) {
+function liveMonitorSelfQuarantine(result, env = {}) {
   const policy = HOSTED_MONITOR_POLICY.self_quarantine;
   const terminalReason = result?.terminal_reason ?? null;
   const failureClass = result?.failure?.failure_class ?? result?.failure_class ?? null;
-  const triggered =
+  const currentFailure =
     terminalReason === policy.terminal_reason || failureClass === policy.failure_class;
+  const priorConsecutiveFailures = optionalNonNegativeInteger(
+    env.VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES,
+    "VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES",
+    0,
+  );
+  const consecutiveFailures = currentFailure ? priorConsecutiveFailures + 1 : 0;
+  const triggered = currentFailure && consecutiveFailures >= policy.consecutive_failures;
   return {
     triggered,
-    terminal_reason: triggered ? terminalReason : null,
-    failure_class: triggered ? failureClass : null,
+    consecutive_failures: consecutiveFailures,
+    current_failure: currentFailure,
+    required_consecutive_failures: policy.consecutive_failures,
+    terminal_reason: currentFailure ? terminalReason : null,
+    failure_class: currentFailure ? failureClass : null,
     cooldown_seconds: policy.cooldown_seconds,
     observation_window_seconds: policy.observation_window_seconds,
   };
@@ -941,6 +978,11 @@ function nonNegativeInteger(value, name) {
     throw new Error(`${name} must be a non-negative integer`);
   }
   return parsed;
+}
+
+function optionalNonNegativeInteger(value, name, fallback = null) {
+  if (value === undefined || value === null || String(value).trim() === "") return fallback;
+  return nonNegativeInteger(value, name);
 }
 
 function positiveNumber(value, name) {

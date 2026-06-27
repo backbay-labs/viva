@@ -178,6 +178,15 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   },
   {
     file: "scripts/hosted-monitor-runner.mjs",
+    marker: "bearer_token",
+    patterns: Object.freeze([
+      /^\s*const bearerToken = \($/,
+      /^\s*if \(!bearerToken\) \{$/,
+      /^\s*bearerToken,?$/,
+    ]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
     marker: "authorization",
     patterns: Object.freeze([/authorization: `AWS4-HMAC-SHA256 Credential=/]),
   },
@@ -193,6 +202,11 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   },
   {
     file: "scripts/hosted-monitor-runner.mjs",
+    marker: "viva_voice_ws_bearer_token",
+    patterns: Object.freeze([/^\s*VIVA_VOICE_WS_BEARER_TOKEN: liveConfig\.bearerToken,?$/]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
     marker: "viva_voice_session_token_secret",
     patterns: Object.freeze([/VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/]),
   },
@@ -205,6 +219,40 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     file: "scripts/hosted-monitor-runner.mjs",
     marker: "viva_failure_control_secret",
     patterns: Object.freeze([/VIVA_FAILURE_CONTROL_SECRET: requiredValue/]),
+  },
+  {
+    file: "scripts/hosted-e2e-matrix.mjs",
+    marker: "invalid_token",
+    patterns: Object.freeze([
+      /^\s*"invalid_token",?$/,
+      /^\s*invalid_token: \["invalid_auth_material"\],?$/,
+    ]),
+  },
+  {
+    file: "scripts/hosted-e2e-matrix.mjs",
+    marker: "expired_token",
+    patterns: Object.freeze([
+      /^\s*"expired_token",?$/,
+      /^\s*expired_token: \["expired_auth_material"\],?$/,
+    ]),
+  },
+  {
+    file: "scripts/hosted-e2e-matrix.mjs",
+    marker: "replayed_token",
+    patterns: Object.freeze([
+      /^\s*"replayed_token",?$/,
+      /^\s*replayed_token: \["replayed_auth_material"\],?$/,
+    ]),
+  },
+  {
+    file: "scripts/hosted-e2e-matrix.mjs",
+    marker: "malformed_token",
+    patterns: Object.freeze([/^\s*malformed_token: \["malformed_auth_material"\],?$/]),
+  },
+  {
+    file: "scripts/hosted-e2e-matrix.mjs",
+    marker: "password",
+    patterns: Object.freeze([/url\.password = ""/]),
   },
 ]);
 

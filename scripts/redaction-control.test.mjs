@@ -335,6 +335,48 @@ test("per-PR redaction check permits required auth source identifiers only in so
     false,
   );
   assert.equal(
+    addedLineViolatesRedactionAudit("    bearerToken,", {
+      file: "scripts/hosted-monitor-runner.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("  const bearerToken = (", {
+      file: "scripts/hosted-monitor-runner.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("  if (!bearerToken) {", {
+      file: "scripts/hosted-monitor-runner.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("      VIVA_VOICE_WS_BEARER_TOKEN: liveConfig.bearerToken,", {
+      file: "scripts/hosted-monitor-runner.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('      "invalid_token",', {
+      file: "scripts/hosted-e2e-matrix.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('    malformed_token: ["malformed_auth_material"],', {
+      file: "scripts/hosted-e2e-matrix.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('  url.password = "";', {
+      file: "scripts/hosted-e2e-matrix.mjs",
+    }),
+    false,
+  );
+  assert.equal(
     addedLineViolatesRedactionAudit("  const kDate = hmac(`AWS4$" + "{secret}`, dateStamp);", {
       file: "scripts/hosted-monitor-runner.mjs",
     }),

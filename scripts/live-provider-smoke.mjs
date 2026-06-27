@@ -76,6 +76,7 @@ export function buildLiveSmokeConfig({ env = process.env, rootDir = root } = {})
     max_turns: requiredPositiveInteger(env, "VIVA_LIVE_SMOKE_MAX_TURNS"),
     max_session_cost_usd: requiredPositiveNumber(env, "VIVA_VOICE_WS_MAX_SESSION_COST_USD"),
     max_audio_bytes: requiredPositiveInteger(env, "VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES"),
+    max_tokens: optionalPositiveInteger(env, "VIVA_LIVE_SMOKE_MAX_TOKENS"),
   };
   const audioFile = requiredValue(
     env,
@@ -238,9 +239,9 @@ export async function runLiveProviderSmoke({
     config,
     createWebSocket,
   });
-  const usageAfter = await collectUsageCount(config, fetchImpl).catch(() => null);
+  const usageAfter = await collectUsageSnapshot(config, fetchImpl).catch(() => null);
   const requiredEvents = requiredEventSummary(websocket.event_counts);
-  const status =
+  const websocketStatus =
     websocket.opened &&
     websocket.ready_frame_observed &&
     Object.values(requiredEvents).every(Boolean) &&
@@ -248,15 +249,25 @@ export async function runLiveProviderSmoke({
     websocket.terminal_reason === "recap_observed"
       ? "passed"
       : "failed";
-  const failure =
-    status === "failed"
-      ? liveProviderFailureForSmokeReason(websocket.terminal_reason ?? "websocket_failed")
-      : null;
+  const usage = usageEvidence(readiness.usage, usageAfter, config);
+  const tokenBudgetExceeded =
+    websocketStatus === "passed" && tokenUsageCapFailure(readiness.usage, usageAfter, config);
+  const status = tokenBudgetExceeded ? "failed" : websocketStatus;
+  const terminalReason = tokenBudgetExceeded
+    ? "cost_budget"
+    : (websocket.terminal_reason ?? "websocket_failed");
+  const failure = status === "failed" ? liveProviderFailureForSmokeReason(terminalReason) : null;
   const evidence = {
     ...base,
     status,
-    ...(status === "failed" ? { failure_stage: "websocket" } : {}),
-    ...(failure ? { failure, failure_class: failure.failure_class } : {}),
+    ...(failure
+      ? {
+          failure,
+          failure_class: failure.failure_class,
+          failure_stage: tokenBudgetExceeded ? "usage" : "websocket",
+          terminal_reason: terminalReason,
+        }
+      : {}),
     readiness,
     bootstrap: {
       server_study_created: bootstrap.serverStudyCreated,
@@ -271,17 +282,9 @@ export async function runLiveProviderSmoke({
       deploySha: config.deploySha,
       model: config.model,
       status,
-      terminalReason: websocket.terminal_reason,
+      terminalReason,
     }),
-    usage: {
-      events_before: readiness.usage_events,
-      events_after: usageAfter,
-      events_delta:
-        Number.isInteger(readiness.usage_events) && Number.isInteger(usageAfter)
-          ? Math.max(0, usageAfter - readiness.usage_events)
-          : null,
-      cost_budget_usd: config.caps.max_session_cost_usd,
-    },
+    usage,
   };
   auditLiveSmokeEvidence(evidence, env);
   return evidence;
@@ -373,15 +376,15 @@ async function collectReadiness(config, fetchImpl) {
         healthStoreFields.nonce_replay_protection === true &&
         readyStoreFields.nonce_replay_protection === true,
     },
-    usage_events: integerOrNull(health.body?.usage?.events),
+    usage: usageSnapshotFromBody(health.body?.usage),
   };
 }
 
-async function collectUsageCount(config, fetchImpl) {
+async function collectUsageSnapshot(config, fetchImpl) {
   const health = await fetchJson(fetchImpl, `${config.httpBaseUrl}/health/brain`, {
     headers: restHeaders(config, false),
   });
-  return integerOrNull(health.body?.usage?.events);
+  return usageSnapshotFromBody(health.body?.usage);
 }
 
 function readinessPasses(readiness) {
@@ -912,8 +915,49 @@ function readinessUnavailable() {
       durable: false,
       nonce_replay_protection: false,
     },
-    usage_events: null,
+    usage: {
+      events: null,
+      total_tokens: null,
+    },
   };
+}
+
+function usageSnapshotFromBody(usage) {
+  return {
+    events: integerOrNull(usage?.events),
+    total_tokens: integerOrNull(usage?.total_tokens),
+  };
+}
+
+function usageEvidence(before, after, config) {
+  const eventsBefore = before?.events ?? null;
+  const eventsAfter = after?.events ?? null;
+  const tokensBefore = before?.total_tokens ?? null;
+  const tokensAfter = after?.total_tokens ?? null;
+  return {
+    events_before: eventsBefore,
+    events_after: eventsAfter,
+    events_delta:
+      Number.isInteger(eventsBefore) && Number.isInteger(eventsAfter)
+        ? Math.max(0, eventsAfter - eventsBefore)
+        : null,
+    tokens_before: tokensBefore,
+    tokens_after: tokensAfter,
+    tokens_delta:
+      Number.isInteger(tokensBefore) && Number.isInteger(tokensAfter)
+        ? Math.max(0, tokensAfter - tokensBefore)
+        : null,
+    max_tokens: config.caps.max_tokens,
+    cost_budget_usd: config.caps.max_session_cost_usd,
+  };
+}
+
+function tokenUsageCapFailure(before, after, config) {
+  if (config.caps.max_tokens == null) return false;
+  const tokensBefore = before?.total_tokens;
+  const tokensAfter = after?.total_tokens;
+  if (!Number.isInteger(tokensBefore) || !Number.isInteger(tokensAfter)) return true;
+  return Math.max(0, tokensAfter - tokensBefore) > config.caps.max_tokens;
 }
 
 function summarizeBrain(brain) {
@@ -996,6 +1040,19 @@ function optionalPositiveNumber(env, name) {
   if (!value) return null;
   const parsed = Number.parseFloat(value);
   if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`invalid live smoke cap ${name}`);
+  }
+  return parsed;
+}
+
+function optionalPositiveInteger(env, name) {
+  const value = env[name]?.trim();
+  if (!value) return null;
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`invalid live smoke cap ${name}`);
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
     throw new Error(`invalid live smoke cap ${name}`);
   }
   return parsed;
