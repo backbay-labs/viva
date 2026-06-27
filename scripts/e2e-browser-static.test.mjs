@@ -23,6 +23,17 @@ test("hosted browser E2E keeps the REST bearer out of browser JavaScript", async
   assert.doesNotMatch(source, /\{ \.\.\.identity, restBearerToken: hostedRestBearerToken \}/);
 });
 
+test("hosted browser E2E authenticates the Node-side agent readiness probe", async () => {
+  const source = await readFile(E2E_BROWSER_PATH, "utf8");
+
+  assert.match(source, /authenticatedHostedFetchOptions\(hostedRestBearerToken\)/);
+  assert.match(source, /headers\.set\("Authorization", \["Bearer", bearerToken\]\.join\(" "\)\)/);
+  assert.match(
+    source,
+    /waitForHttpJson\(\s*`\$\{agentUrl\}\/ready`,[\s\S]*hostedAgentReadinessFetchOptions/,
+  );
+});
+
 test("hosted browser E2E records only actually verified websocket and session-cap proof", async () => {
   const source = await readFile(E2E_BROWSER_PATH, "utf8");
 

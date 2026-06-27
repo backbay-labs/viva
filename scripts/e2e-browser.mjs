@@ -46,6 +46,9 @@ const webPort = hostedMode ? null : await freePort();
 const agentUrl = hostedAgentHttpUrl ?? `http://127.0.0.1:${agentPort}`;
 const webUrl = hostedWebUrl ?? `http://127.0.0.1:${webPort}`;
 const wsUrl = hostedAgentWsUrl ?? `ws://127.0.0.1:${agentPort}/ws`;
+const hostedAgentReadinessFetchOptions = hostedMode
+  ? authenticatedHostedFetchOptions(hostedRestBearerToken)
+  : undefined;
 const agentProvider = process.env.VIVA_E2E_AGENT_PROVIDER ?? "synthetic";
 const failureControlEnv = buildE2EFailureControlEnv();
 const failureControlPlan = buildFailureControlPlan({
@@ -143,6 +146,7 @@ try {
     },
     120_000,
     `${agentProvider} agent readiness`,
+    hostedAgentReadinessFetchOptions,
   );
 
   const web = hostedMode
@@ -1539,7 +1543,13 @@ async function waitForHttp(url, timeoutMs, label) {
   await waitForHttpJson(url, () => true, timeoutMs, label);
 }
 
-async function waitForHttpJson(url, predicate, timeoutMs, label) {
+function authenticatedHostedFetchOptions(bearerToken) {
+  const headers = new Headers();
+  headers.set("Authorization", ["Bearer", bearerToken].join(" "));
+  return { headers };
+}
+
+async function waitForHttpJson(url, predicate, timeoutMs, label, fetchOptions) {
   const started = Date.now();
   let lastError;
   while (Date.now() - started < timeoutMs) {
@@ -1548,7 +1558,7 @@ async function waitForHttpJson(url, predicate, timeoutMs, label) {
       throw new Error(`${label} dependency exited early with ${earlyExit.exitCode}`);
     }
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, fetchOptions);
       const text = await response.text();
       let json;
       try {
