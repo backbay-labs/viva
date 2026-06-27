@@ -1502,7 +1502,7 @@ fn emit_terminal_observability_log(state: &AppState, reason: &str) {
 
 fn emit_pending_evaluation_observability_log(
     state: &AppState,
-    terminal_reason: &str,
+    _terminal_reason: &str,
     pending_answer_attempts: usize,
 ) {
     if pending_answer_attempts == 0 {
@@ -1517,7 +1517,7 @@ fn emit_pending_evaluation_observability_log(
         provider = %state.provider,
         model = %model,
         deploy_sha = %deploy_sha,
-        terminal_reason = terminal_reason,
+        terminal_reason = pending_evaluation_terminal_reason(),
         signal = "pending_evaluation",
         evaluation_state = "pending",
         pending_answer_attempts,
@@ -1529,6 +1529,10 @@ fn emit_pending_evaluation_observability_log(
         cost_bucket = "unknown",
         "viva pending evaluation observed"
     );
+}
+
+fn pending_evaluation_terminal_reason() -> &'static str {
+    "pending_evaluation"
 }
 
 fn observability_model(provider: &str) -> String {
@@ -2989,6 +2993,16 @@ mod tests {
             })
         );
         assert_eq!(terminal_observability_classification("completed"), None);
+    }
+
+    #[test]
+    fn pending_evaluation_observability_uses_dedicated_terminal_reason() {
+        assert_eq!(pending_evaluation_terminal_reason(), "pending_evaluation");
+        assert_ne!(
+            pending_evaluation_terminal_reason(),
+            "provider_rate_limited"
+        );
+        assert_ne!(pending_evaluation_terminal_reason(), "provider_timeout");
     }
 
     #[test]
