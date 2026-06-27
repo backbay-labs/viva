@@ -108,6 +108,14 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     patterns: Object.freeze([/BrainError::MissingApiKey => false/]),
   },
   {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
+    marker: "api_key",
+    patterns: Object.freeze([
+      /api_key: "local-fixture"\.to_owned\(\),/,
+      /assert_eq!\(capture\.api_key\.as_deref\(\), Some\("local-fixture"\)\);/,
+    ]),
+  },
+  {
     file: "agent/crates/agent-service/src/config.rs",
     marker: "session_token",
     patterns: Object.freeze([

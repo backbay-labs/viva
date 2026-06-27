@@ -2301,26 +2301,46 @@ fn record_provider_stage_failure(
     ));
 }
 
+const PROVIDER_STAGE_FAILURE_DETAIL_MAX_CHARS: usize = 240;
+
 fn provider_stage_failure_detail(failure: &BrainProviderFailure) -> String {
     let retry_after_ms = metadata_field(&failure.metadata, "retry_after_ms");
     let retry_after_source = metadata_field(&failure.metadata, "retry_after_source");
     let reset_hint = metadata_field(&failure.metadata, "reset_hint");
     let budget_state = metadata_field(&failure.metadata, "budget_state");
     let deploy_sha = metadata_field(&failure.metadata, "deploy_sha");
-    format!(
-        "failure_class={} stage={} terminal_reason={} retry_after_ms={} retry_after_source={} reset_hint={} budget_state={} deploy_sha={} latency_ms={} provider={} model={}",
-        failure.failure_class,
-        failure.stage,
-        failure.terminal_reason.as_str(),
-        retry_after_ms.unwrap_or("unknown"),
-        retry_after_source.unwrap_or("unknown"),
-        reset_hint.unwrap_or("unknown"),
-        budget_state.unwrap_or("unknown"),
-        deploy_sha.unwrap_or("unknown"),
-        failure.latency_ms,
-        bounded_evidence_value(&failure.provider, 24),
-        bounded_evidence_value(&failure.model, 24)
-    )
+    let fields = [
+        format!("failure_class={}", failure.failure_class),
+        format!("stage={}", failure.stage),
+        format!("terminal_reason={}", failure.terminal_reason.as_str()),
+        format!("provider={}", bounded_evidence_value(&failure.provider, 24)),
+        format!("model={}", bounded_evidence_value(&failure.model, 24)),
+        format!("latency_ms={}", failure.latency_ms),
+        format!("deploy_sha={}", deploy_sha.unwrap_or("unknown")),
+        format!("retry_after_ms={}", retry_after_ms.unwrap_or("unknown")),
+        format!(
+            "retry_after_source={}",
+            retry_after_source.unwrap_or("unknown")
+        ),
+        format!("reset_hint={}", reset_hint.unwrap_or("unknown")),
+        format!("budget_state={}", budget_state.unwrap_or("unknown")),
+    ];
+    bounded_evidence_detail(fields)
+}
+
+fn bounded_evidence_detail(fields: impl IntoIterator<Item = String>) -> String {
+    let mut detail = String::new();
+    for field in fields {
+        let separator_len = usize::from(!detail.is_empty());
+        if detail.len() + separator_len + field.len() > PROVIDER_STAGE_FAILURE_DETAIL_MAX_CHARS {
+            continue;
+        }
+        if !detail.is_empty() {
+            detail.push(' ');
+        }
+        detail.push_str(&field);
+    }
+    detail
 }
 
 fn bounded_evidence_value(value: &str, max_chars: usize) -> String {
@@ -2840,7 +2860,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_stage_failure_evidence_keeps_retry_reset_metadata_before_truncation() {
+    fn provider_stage_failure_evidence_keeps_core_and_retry_metadata_before_truncation() {
         let state = AppState::new(
             Arc::new(SyntheticBrain::default()),
             "synthetic",
@@ -2867,18 +2887,21 @@ mod tests {
         let events = state.evidence.snapshot();
         assert_eq!(events.len(), 1);
         let detail = &events[0].detail;
+        assert!(detail.len() <= 240);
         assert!(detail.contains("failure_class=quota_rate_failure"));
         assert!(detail.contains("stage=gemini"));
         assert!(detail.contains("terminal_reason=provider_rate_limited"));
+        assert!(detail.contains("provider=gemini"));
+        assert!(detail.contains("model=gemini-35-flash"));
+        assert!(detail.contains("latency_ms=123"));
+        assert!(detail.contains("deploy_sha=unknown"));
         assert!(detail.contains("retry_after_ms=7000"));
         assert!(detail.contains("retry_after_source=retry_after_delta"));
-        assert!(detail.contains("reset_hint=2030-01-01T00:00:00Z"));
         assert!(detail.contains("budget_state=unknown"));
-        assert!(detail.contains("deploy_sha=unknown"));
     }
 
     #[test]
-    fn provider_stage_failure_evidence_keeps_retry_reset_with_long_model() {
+    fn provider_stage_failure_evidence_keeps_provider_model_with_long_metadata() {
         use std::sync::Arc;
 
         use agent_adapters::SyntheticBrain;
@@ -2911,12 +2934,15 @@ mod tests {
         assert_eq!(events.len(), 1);
         let detail = &events[0].detail;
         assert!(detail.len() <= 240);
+        assert!(detail.contains("failure_class=quota_rate_failure"));
+        assert!(detail.contains("stage=gemini"));
         assert!(detail.contains("terminal_reason=provider_rate_limited"));
+        assert!(detail.contains("provider=gemini"));
+        assert!(detail.contains("model=gemini-35-flash-preview-"));
+        assert!(detail.contains("latency_ms=123"));
+        assert!(detail.contains("deploy_sha=unknown"));
         assert!(detail.contains("retry_after_ms=7000"));
         assert!(detail.contains("retry_after_source=retry_after_delta"));
-        assert!(detail.contains("reset_hint=2030-01-01T00:00:00Z"));
-        assert!(detail.contains("budget_state=unknown"));
-        assert!(detail.contains("deploy_sha=unknown"));
     }
 
     struct FailingSink;
