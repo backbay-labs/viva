@@ -382,6 +382,8 @@ test("runLiveProviderSmoke proves readiness, bootstrap, websocket events, and us
         VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
         VIVA_LIVE_SMOKE_MAX_TURNS: "1",
         VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
+        VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD: "0.25",
+        VIVA_LIVE_SMOKE_MAX_TOKENS: "4096",
         VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
         VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "https://agent.viva.test",
         VIVA_LIVE_SMOKE_ORIGIN: "https://app.viva.test",
@@ -391,7 +393,13 @@ test("runLiveProviderSmoke proves readiness, bootstrap, websocket events, and us
       fetchImpl: async (url, init = {}) => {
         fetchCalls.push({ url: String(url), init });
         if (String(url).endsWith("/health/brain")) {
-          return jsonResponse(200, brainHealth({ usageEvents: fetchCalls.length > 2 ? 8 : 7 }));
+          return jsonResponse(
+            200,
+            brainHealth({
+              totalTokens: fetchCalls.length > 2 ? 1060 : 1000,
+              usageEvents: fetchCalls.length > 2 ? 8 : 7,
+            }),
+          );
         }
         if (String(url).endsWith("/ready")) {
           return jsonResponse(200, readyBody());
@@ -422,6 +430,7 @@ test("runLiveProviderSmoke proves readiness, bootstrap, websocket events, and us
 
     assert.equal(evidence.status, "passed");
     assert.equal(evidence.readiness.ready, true);
+    assert.equal(evidence.readiness.voice_limits.max_session_cost_usd, 0.25);
     assert.equal(evidence.bootstrap.server_study_created, true);
     assert.equal(evidence.bootstrap.signed_session_attached, true);
     assert.equal(evidence.websocket.event_counts.question, 1);
@@ -435,6 +444,10 @@ test("runLiveProviderSmoke proves readiness, bootstrap, websocket events, and us
     assert.equal(evidence.usage.events_before, 7);
     assert.equal(evidence.usage.events_after, 8);
     assert.equal(evidence.usage.events_delta, 1);
+    assert.equal(evidence.usage.tokens_before, 1000);
+    assert.equal(evidence.usage.tokens_after, 1060);
+    assert.equal(evidence.usage.tokens_delta, 60);
+    assert.equal(evidence.usage.max_tokens, 4096);
     assert.equal(createdSockets[0].url, "wss://agent.viva.test/ws");
     assert.deepEqual(createdSockets[0].protocols, [
       "viva-voice",
@@ -469,6 +482,121 @@ test("runLiveProviderSmoke proves readiness, bootstrap, websocket events, and us
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+});
+
+test("runLiveProviderSmoke fails closed when usage exceeds the configured token cap", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "viva-live-smoke-token-cap-"));
+  const audioPath = path.join(tempDir, "answer.pcm");
+  await writeFile(audioPath, Buffer.from([1, 2, 3, 4]));
+  const socket = new FakeSocket();
+  let healthCalls = 0;
+
+  try {
+    const evidence = await runLiveProviderSmoke({
+      env: {
+        VIVA_LIVE_PROVIDER_SMOKE: "1",
+        CARTESIA_API_KEY: "cartesia-secret-value",
+        GEMINI_API_KEY: "gemini-secret-value",
+        CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+        GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
+        VIVA_LIVE_SMOKE_AUDIO_FILE: audioPath,
+        VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
+        VIVA_LIVE_SMOKE_MAX_TOKENS: "4",
+        VIVA_LIVE_SMOKE_MAX_TURNS: "1",
+        VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
+        VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
+        VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "https://agent.viva.test",
+      },
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/health/brain")) {
+          healthCalls += 1;
+          return jsonResponse(
+            200,
+            brainHealth({
+              totalTokens: healthCalls > 1 ? 1005 : 1000,
+              usageEvents: healthCalls > 1 ? 8 : 7,
+            }),
+          );
+        }
+        if (String(url).endsWith("/ready")) {
+          return jsonResponse(200, readyBody());
+        }
+        if (String(url).endsWith("/study-sets/paste")) {
+          return jsonResponse(201, {
+            study_set: {
+              id: "server-study-set",
+              user_id: "user-1",
+              ingestion_status: "ready",
+            },
+            session_id: "server-session",
+            session_token: "viva1.server-token-secret",
+          });
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      },
+      createWebSocket: () => {
+        queueMicrotask(() => {
+          socket.open();
+          socket.message(readyFrame());
+        });
+        return socket;
+      },
+      now: () => new Date("2026-06-18T00:00:00.000Z"),
+    });
+
+    assert.equal(evidence.status, "failed");
+    assert.equal(evidence.failure_stage, "usage");
+    assert.equal(evidence.terminal_reason, "cost_budget");
+    assert.equal(evidence.failure.failure_class, "quota_rate_failure");
+    assert.equal(evidence.usage.tokens_before, 1000);
+    assert.equal(evidence.usage.tokens_after, 1005);
+    assert.equal(evidence.usage.tokens_delta, 5);
+    assert.equal(evidence.usage.max_tokens, 4);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("runLiveProviderSmoke rejects live targets without the expected remote cost cap", async () => {
+  let socketOpened = false;
+
+  const evidence = await runLiveProviderSmoke({
+    env: {
+      VIVA_LIVE_PROVIDER_SMOKE: "1",
+      CARTESIA_API_KEY: "cartesia-secret-value",
+      GEMINI_API_KEY: "gemini-secret-value",
+      CARTESIA_ZERO_DATA_RETENTION_ENABLED: "1",
+      GEMINI_ZERO_DATA_RETENTION_APPROVED: "1",
+      VIVA_LIVE_SMOKE_AUDIO_FILE: "/tmp/not-read-before-cost-cap.pcm",
+      VIVA_LIVE_SMOKE_MAX_DURATION_MS: "60000",
+      VIVA_LIVE_SMOKE_MAX_TURNS: "1",
+      VIVA_VOICE_WS_MAX_SESSION_COST_USD: "0.25",
+      VIVA_LIVE_SMOKE_EXPECTED_REMOTE_MAX_SESSION_COST_USD: "0.25",
+      VIVA_LIVE_SMOKE_MAX_AUDIO_BYTES: "4096",
+      VIVA_LIVE_SMOKE_AGENT_HTTP_URL: "http://127.0.0.1:4318",
+    },
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/health/brain")) {
+        return jsonResponse(200, brainHealth({ maxSessionCostUsd: 0.5 }));
+      }
+      if (String(url).endsWith("/ready")) {
+        return jsonResponse(200, readyBody({ maxSessionCostUsd: 0.5 }));
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    },
+    createWebSocket: () => {
+      socketOpened = true;
+      throw new Error("must not open socket before remote cost cap is verified");
+    },
+    now: () => new Date("2026-06-18T00:00:00.000Z"),
+  });
+
+  assert.equal(evidence.status, "failed");
+  assert.equal(evidence.failure_stage, "readiness");
+  assert.equal(evidence.terminal_reason, "cost_budget");
+  assert.equal(evidence.failure.failure_class, "quota_rate_failure");
+  assert.equal(evidence.readiness.voice_limits.max_session_cost_usd, 0.5);
+  assert.equal(socketOpened, false);
 });
 
 test("runLiveProviderSmoke fails closed when the live provider is not selectable", async () => {
@@ -947,6 +1075,7 @@ function jsonResponse(status, body) {
 }
 
 function readyBody({
+  maxSessionCostUsd = 0.25,
   ready = true,
   selectable = true,
   liveRuntime = true,
@@ -959,6 +1088,9 @@ function readyBody({
       configured: true,
       selectable,
       live_runtime: liveRuntime,
+    },
+    voice_limits: {
+      max_session_cost_usd: maxSessionCostUsd,
     },
     store: {
       backend: "postgres",
@@ -973,6 +1105,8 @@ function readyBody({
 }
 
 function brainHealth({
+  maxSessionCostUsd = 0.25,
+  totalTokens = 1000,
   usageEvents = 7,
   selectable = true,
   liveRuntime = true,
@@ -987,6 +1121,9 @@ function brainHealth({
       selectable,
       live_runtime: liveRuntime,
     },
+    voice_limits: {
+      max_session_cost_usd: maxSessionCostUsd,
+    },
     store: {
       backend: "postgres",
       available: true,
@@ -998,6 +1135,7 @@ function brainHealth({
     },
     usage: {
       events: usageEvents,
+      total_tokens: totalTokens,
     },
   };
 }

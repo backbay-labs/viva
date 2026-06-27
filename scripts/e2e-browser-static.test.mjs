@@ -23,6 +23,17 @@ test("hosted browser E2E keeps the REST bearer out of browser JavaScript", async
   assert.doesNotMatch(source, /\{ \.\.\.identity, restBearerToken: hostedRestBearerToken \}/);
 });
 
+test("hosted browser E2E authenticates the Node-side agent readiness probe", async () => {
+  const source = await readFile(E2E_BROWSER_PATH, "utf8");
+
+  assert.match(source, /authenticatedHostedFetchOptions\(hostedRestBearerToken\)/);
+  assert.match(source, /headers\.set\("Authorization", \["Bearer", bearerToken\]\.join\(" "\)\)/);
+  assert.match(
+    source,
+    /waitForHttpJson\(\s*`\$\{agentUrl\}\/ready`,[\s\S]*hostedAgentReadinessFetchOptions/,
+  );
+});
+
 test("hosted browser E2E records only actually verified websocket and session-cap proof", async () => {
   const source = await readFile(E2E_BROWSER_PATH, "utf8");
 
@@ -34,6 +45,26 @@ test("hosted browser E2E records only actually verified websocket and session-ca
   assert.match(
     source,
     /secondTabSessionCap = await auditSecondTabSessionCap\(context, secondTabTarget\)/,
+  );
+  assert.match(source, /\.\.\.\(secondTabSessionCap \? \["second-tab-session-cap\.png"\] : \[\]\)/);
+  assert.doesNotMatch(source, /secondTabSessionCapProof/);
+});
+
+test("hosted browser E2E does not infer partial recap evidence from visible recap alone", async () => {
+  const source = await readFile(E2E_BROWSER_PATH, "utf8");
+
+  assert.match(source, /terminalProofFromServerEvents\(serverEvents/);
+  assert.match(
+    source,
+    /deterministicPartialRecapScenario \? null : recapPayloadVisible \? "completed" : null/,
+  );
+  assert.match(
+    source,
+    /Deterministic partial recap scenario did not observe partial_stage_success terminal proof/,
+  );
+  assert.doesNotMatch(
+    source,
+    /deterministicPartialRecapScenario && recapPayloadVisible\s*\?\s*"partial_stage_success"/,
   );
 });
 
@@ -53,3 +84,26 @@ function numericConstant(source, name) {
   assert(match, `missing numeric constant ${name}`);
   return Number(match[1]);
 }
+
+test("hosted browser E2E does not infer partial recap mode from stop-to-recap", async () => {
+  const source = await readFile(E2E_BROWSER_PATH, "utf8");
+
+  assert.match(
+    source,
+    /const deterministicPartialRecapScenario = hostedScenarioId === "deterministic_partial_recap"/,
+  );
+  assert.doesNotMatch(source, /if \(stopToRecap\) return "deterministic_partial_recap"/);
+});
+
+test("hosted browser E2E records answer-resolution latency evidence", async () => {
+  const source = await readFile(E2E_BROWSER_PATH, "utf8");
+
+  assert.match(source, /const answerResolutionStartedAt = Date\.now\(\)/);
+  assert.match(
+    source,
+    /waitForPostAnswerProtocolProof\(\s*serverEvents,\s*HOSTED_MAX_SUBMITTED_ANSWER_RESOLUTION_MS,\s*answerResolutionStartedAt/s,
+  );
+  assert.match(source, /HOSTED_MAX_SUBMITTED_ANSWER_RESOLUTION_MS/);
+  assert.match(source, /latencyMs: postAnswerProtocolProof\.latencyMs/);
+  assert.match(source, /latencyMs:\s*null/);
+});

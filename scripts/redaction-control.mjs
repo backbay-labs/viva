@@ -178,23 +178,63 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   },
   {
     file: "scripts/hosted-monitor-runner.mjs",
+    marker: "bearer_token",
+    patterns: Object.freeze([
+      /^\s*const bearerToken = \($/,
+      /^\s*if \(!bearerToken\) \{$/,
+      /^\s*bearerToken,?$/,
+    ]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
     marker: "authorization",
     patterns: Object.freeze([/authorization: `AWS4-HMAC-SHA256 Credential=/]),
   },
   {
     file: "scripts/hosted-monitor-runner.mjs",
     marker: "secret",
-    patterns: Object.freeze([/hmac\(`AWS4\$\{secret\}`, dateStamp\)/]),
+    patterns: Object.freeze([
+      /hmac\(`AWS4\$\{secret\}`, dateStamp\)/,
+      /^\s*secret: requiredValue\(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"\),?$/,
+      /^function signedLiveMonitorSession\(\{ secret, sessionId, studySetId, userId \}\) \{$/,
+      /createHmac\("sha256", secret\)\.update\(payload\)\.digest\("base64url"\)/,
+    ]),
   },
   {
     file: "scripts/hosted-monitor-runner.mjs",
     marker: "session_token",
-    patterns: Object.freeze([/VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/]),
+    patterns: Object.freeze([
+      /VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/,
+      /^\s*secret: requiredValue\(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"\),?$/,
+      /^\s*\? \{ VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession \}$/,
+      /^\s*VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession,?$/,
+    ]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
+    marker: "viva1.",
+    patterns: Object.freeze([/^\s*const payload = `viva1\.\$\{claimsPart\}`;$/]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
+    marker: "viva_voice_ws_bearer_token",
+    patterns: Object.freeze([/^\s*VIVA_VOICE_WS_BEARER_TOKEN: liveConfig\.bearerToken,?$/]),
+  },
+  {
+    file: "scripts/hosted-monitor-runner.mjs",
+    marker: "viva_live_smoke_session_token",
+    patterns: Object.freeze([
+      /^\s*\? \{ VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession \}$/,
+      /^\s*VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession,?$/,
+    ]),
   },
   {
     file: "scripts/hosted-monitor-runner.mjs",
     marker: "viva_voice_session_token_secret",
-    patterns: Object.freeze([/VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/]),
+    patterns: Object.freeze([
+      /VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/,
+      /^\s*secret: requiredValue\(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"\),?$/,
+    ]),
   },
   {
     file: "scripts/hosted-monitor-runner.mjs",
@@ -205,6 +245,40 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     file: "scripts/hosted-monitor-runner.mjs",
     marker: "viva_failure_control_secret",
     patterns: Object.freeze([/VIVA_FAILURE_CONTROL_SECRET: requiredValue/]),
+  },
+  {
+    file: "scripts/hosted-e2e-matrix.mjs",
+    marker: "invalid_token",
+    patterns: Object.freeze([
+      /^\s*"invalid_token",?$/,
+      /^\s*invalid_token: \["invalid_auth_material"\],?$/,
+    ]),
+  },
+  {
+    file: "scripts/hosted-e2e-matrix.mjs",
+    marker: "expired_token",
+    patterns: Object.freeze([
+      /^\s*"expired_token",?$/,
+      /^\s*expired_token: \["expired_auth_material"\],?$/,
+    ]),
+  },
+  {
+    file: "scripts/hosted-e2e-matrix.mjs",
+    marker: "replayed_token",
+    patterns: Object.freeze([
+      /^\s*"replayed_token",?$/,
+      /^\s*replayed_token: \["replayed_auth_material"\],?$/,
+    ]),
+  },
+  {
+    file: "scripts/hosted-e2e-matrix.mjs",
+    marker: "malformed_token",
+    patterns: Object.freeze([/^\s*malformed_token: \["malformed_auth_material"\],?$/]),
+  },
+  {
+    file: "scripts/hosted-e2e-matrix.mjs",
+    marker: "password",
+    patterns: Object.freeze([/url\.password = ""/]),
   },
 ]);
 

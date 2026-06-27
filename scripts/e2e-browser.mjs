@@ -16,6 +16,12 @@ import {
   isFailureControlSessionTokenScenario,
   parseFailureControlSessionTarget,
 } from "./failure-control-harness.mjs";
+import {
+  buildHostedBrowserEvidence,
+  HOSTED_MAX_SUBMITTED_ANSWER_RESOLUTION_MS,
+  hostedEvidenceStageForScenario,
+  withHostedEvidenceAudit,
+} from "./hosted-e2e-matrix.mjs";
 import { auditTextArtifacts } from "./redaction-control.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -41,6 +47,9 @@ const webPort = hostedMode ? null : await freePort();
 const agentUrl = hostedAgentHttpUrl ?? `http://127.0.0.1:${agentPort}`;
 const webUrl = hostedWebUrl ?? `http://127.0.0.1:${webPort}`;
 const wsUrl = hostedAgentWsUrl ?? `ws://127.0.0.1:${agentPort}/ws`;
+const hostedAgentReadinessFetchOptions = hostedMode
+  ? authenticatedHostedFetchOptions(hostedRestBearerToken)
+  : undefined;
 const agentProvider = process.env.VIVA_E2E_AGENT_PROVIDER ?? "synthetic";
 const failureControlEnv = buildE2EFailureControlEnv();
 const failureControlPlan = buildFailureControlPlan({
@@ -65,6 +74,9 @@ if (!allowedBrowserStoryProviders.has(agentProvider)) {
   );
 }
 const stopToRecap = process.env.VIVA_E2E_STOP_TO_RECAP === "1";
+const hostedScenarioId =
+  process.env.VIVA_E2E_HOSTED_SCENARIO_ID?.trim() || defaultHostedScenarioId();
+const deterministicPartialRecapScenario = hostedScenarioId === "deterministic_partial_recap";
 const traceRequested = process.env.VIVA_E2E_TRACE === "1";
 if (hostedMode && traceRequested) {
   throw new Error("Hosted browser E2E cannot retain Playwright traces.");
@@ -102,6 +114,7 @@ let postAnswerProtocolProof = {
   conceptId: null,
   conceptStatus: null,
   conceptStatusEventSeen: false,
+  latencyMs: null,
   responseId: null,
   sourceReferenceEventSeen: false,
 };
@@ -134,6 +147,7 @@ try {
     },
     120_000,
     `${agentProvider} agent readiness`,
+    hostedAgentReadinessFetchOptions,
   );
 
   const web = hostedMode
@@ -318,6 +332,7 @@ try {
     if (stopToRecap) {
       await page.getByRole("button", { name: "End session" }).click();
     } else {
+      const answerResolutionStartedAt = Date.now();
       await page.getByRole("button", { name: /check it/i }).click();
       writtenAnswerFallbackUsed = await submitWrittenAnswerIfFallbackOpens(page);
       if (failureControlPlan.enabled) {
@@ -338,7 +353,11 @@ try {
           checks: ["terminal_reason", "sanitized_failure_control", "same_session_recovery_path"],
         });
       } else {
-        postAnswerProtocolProof = await waitForPostAnswerProtocolProof(serverEvents, 25_000);
+        postAnswerProtocolProof = await waitForPostAnswerProtocolProof(
+          serverEvents,
+          HOSTED_MAX_SUBMITTED_ANSWER_RESOLUTION_MS,
+          answerResolutionStartedAt,
+        );
         if (requireCorrectionMarginalia) {
           await page.getByText("Marginalia", { exact: true }).waitFor({
             state: "visible",
@@ -445,15 +464,18 @@ try {
     nextSessionRecommendationVisible =
       (await isVisible(page.getByText("Next session", { exact: false }).first())) &&
       (await isVisible(page.getByText("core FSRS", { exact: false }).first()));
+    const recapConceptProofVisible =
+      stopToRecap ||
+      (Boolean(postAnswerProtocolProof.conceptId) &&
+        (await isVisible(
+          page
+            .getByText(conceptLabelText(postAnswerProtocolProof.conceptId), { exact: true })
+            .first(),
+        )));
     recapPayloadVisible =
       (await isVisible(page.getByText("Closing fold / Recap ready").first())) &&
       (await isVisible(page.getByText(recapSummaryText, { exact: false }).first())) &&
-      Boolean(postAnswerProtocolProof.conceptId) &&
-      (await isVisible(
-        page
-          .getByText(conceptLabelText(postAnswerProtocolProof.conceptId), { exact: true })
-          .first(),
-      )) &&
+      recapConceptProofVisible &&
       (await isVisible(page.getByText("Conductor next action", { exact: false }).first()));
   }
   const shareVisible = await isVisible(page.getByRole("button", { name: "Share" }));
@@ -484,6 +506,38 @@ try {
 
   const browserStory = await buildBrowserStoryManifest({
     traceRetained: Boolean(traceArtifact),
+  });
+  const screenshots = [
+    "pending-local-preview.png",
+    "server-ready-study-set.png",
+    ...(!sessionTokenFailureScenario ? ["session-ready.png", "source-folio.png"] : []),
+    ...(correctionMarginaliaVisible ? ["correction-marginalia.png"] : []),
+    ...(!failureControlPlan.enabled && !stopToRecap && requirePostAnswerSourceFolio
+      ? ["post-answer-source-folio.png"]
+      : []),
+    ...(secondTabSessionCap ? ["second-tab-session-cap.png"] : []),
+    ...(failureControlPlan.enabled
+      ? ["failure-control-terminal.png"]
+      : ["connected-terminal-fold.png"]),
+  ];
+  const deterministicPartialRecapTerminalProof =
+    deterministicPartialRecapScenario && recapPayloadVisible
+      ? terminalProofFromServerEvents(serverEvents, {
+          failureClass: "partial_stage_success",
+          scenarioId: hostedScenarioId,
+          stage: "websocket",
+          terminalReason: "partial_stage_success",
+        })
+      : null;
+  const terminalProof = failureControlTerminalProof ?? deterministicPartialRecapTerminalProof;
+  const terminalReason =
+    terminalProof?.terminal_reason ??
+    (deterministicPartialRecapScenario ? null : recapPayloadVisible ? "completed" : null);
+  const hostedEvidenceStage = hostedEvidenceStageForScenario({
+    deterministicPartialRecap: Boolean(deterministicPartialRecapTerminalProof),
+    failureControlStage: terminalProof?.stage ?? null,
+    recapVisible: recapPayloadVisible,
+    scenarioId: hostedScenarioId,
   });
   let result = {
     artifact_dir: path.relative(root, artifactDir),
@@ -517,28 +571,38 @@ try {
     post_answer_protocol_response_id: postAnswerProtocolProof.responseId,
     second_tab_session_cap_observed: secondTabSessionCap?.terminal_reason === "session_cap",
     second_tab_session_cap: secondTabSessionCap,
+    deterministic_partial_recap_terminal: deterministicPartialRecapTerminalProof,
     failure_control_harness: failureControlEvidence,
     failure_control_terminal: failureControlTerminalProof,
     written_answer_fallback_used: writtenAnswerFallbackUsed,
     local_only_actions_hidden: !shareVisible && !localScheduleVisible,
     session_url_lifecycle: sessionUrlLifecycle,
+    hosted_e2e: buildHostedBrowserEvidence({
+      agentUrl,
+      controlMode: failureControlPlan.enabled ? "failure_control" : "none",
+      deployIds: hostedDeployIds(),
+      deploySha: hostedDeploySha(),
+      failureClass: terminalProof?.failure_class ?? null,
+      hostedMode,
+      latencyMs: postAnswerProtocolProof.latencyMs,
+      postgresDurability: hostedPostgresDurability(),
+      provider: agentProvider,
+      recapSuccess: recapPayloadVisible,
+      runId: process.env.VIVA_HOSTED_RUN_ID?.trim() || null,
+      scenarioId: hostedScenarioId,
+      screenshots,
+      stage: hostedEvidenceStage,
+      terminalReason,
+      tokenRefreshOutcome:
+        sessionUrlLifecycle?.passed === true ? "canonicalized_visible_url" : "not_observed",
+      trace: traceArtifact,
+      webUrl,
+    }),
     browser_story: browserStory,
     browser_story_artifact: "browser-story.json",
     console_errors: consoleErrors,
     page_errors: pageErrors,
-    screenshots: [
-      "pending-local-preview.png",
-      "server-ready-study-set.png",
-      ...(!sessionTokenFailureScenario ? ["session-ready.png", "source-folio.png"] : []),
-      ...(secondTabSessionCap ? ["second-tab-session-cap.png"] : []),
-      ...(correctionMarginaliaVisible ? ["correction-marginalia.png"] : []),
-      ...(!failureControlPlan.enabled && !stopToRecap && requirePostAnswerSourceFolio
-        ? ["post-answer-source-folio.png"]
-        : []),
-      ...(failureControlPlan.enabled
-        ? ["failure-control-terminal.png"]
-        : ["connected-terminal-fold.png"]),
-    ],
+    screenshots,
     trace: traceArtifact,
   };
   result = await writeAuditedBrowserStoryResult(result);
@@ -562,6 +626,10 @@ try {
     if (!sessionTokenFailureScenario && failureControlTerminalProof?.stage_verified !== true) {
       throw new Error("Failure-control provider scenario did not prove the scenario stage marker.");
     }
+  } else if (deterministicPartialRecapScenario && !deterministicPartialRecapTerminalProof) {
+    throw new Error(
+      "Deterministic partial recap scenario did not observe partial_stage_success terminal proof.",
+    );
   } else {
     if (!recapPayloadVisible)
       throw new Error("Connected fake-provider session did not render the recap_ready payload.");
@@ -772,6 +840,39 @@ function hostedSyntheticIdentity() {
       process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID?.trim() ||
       "user-1",
   };
+}
+
+function defaultHostedScenarioId() {
+  if (failureControlPlan.enabled) return failureControlPlan.scenario.id;
+  if (agentProvider === "fake_cartesia_gemini") return "fake_provider_happy_path";
+  return "happy_path";
+}
+
+function hostedDeployIds() {
+  return {
+    agent:
+      process.env.VIVA_E2E_AGENT_DEPLOY_ID?.trim() ||
+      process.env.VIVA_HOSTED_AGENT_DEPLOY_ID?.trim() ||
+      null,
+    web:
+      process.env.VIVA_E2E_WEB_DEPLOY_ID?.trim() ||
+      process.env.VIVA_HOSTED_WEB_DEPLOY_ID?.trim() ||
+      null,
+  };
+}
+
+function hostedDeploySha() {
+  return (
+    process.env.VIVA_E2E_DEPLOY_SHA?.trim() ||
+    process.env.VIVA_HOSTED_DEPLOY_SHA?.trim() ||
+    process.env.GITHUB_SHA?.trim() ||
+    null
+  );
+}
+
+function hostedPostgresDurability() {
+  if (process.env.VIVA_E2E_POSTGRES_DURABLE === "1") return "durable";
+  return hostedMode ? "hosted_not_asserted" : "loopback_not_asserted";
 }
 
 function assertHostedSyntheticIdentity(identity) {
@@ -1358,13 +1459,16 @@ async function writeAuditedBrowserStoryResult(baseResult) {
       result.browser_story.trace_retained && !hostedMode
         ? skippedLocalTraceArtifactAudit()
         : await auditBrowserStoryArtifacts(artifactDir);
-    result = {
-      ...result,
-      browser_story: {
-        ...result.browser_story,
-        artifact_audit: artifactAudit,
+    result = withHostedEvidenceAudit(
+      {
+        ...result,
+        browser_story: {
+          ...result.browser_story,
+          artifact_audit: artifactAudit,
+        },
       },
-    };
+      artifactAudit,
+    );
   }
   await writeFile(storyPath, `${JSON.stringify(result.browser_story, null, 2)}\n`);
   await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`);
@@ -1440,7 +1544,13 @@ async function waitForHttp(url, timeoutMs, label) {
   await waitForHttpJson(url, () => true, timeoutMs, label);
 }
 
-async function waitForHttpJson(url, predicate, timeoutMs, label) {
+function authenticatedHostedFetchOptions(bearerToken) {
+  const headers = new Headers();
+  headers.set("Authorization", ["Bearer", bearerToken].join(" "));
+  return { headers };
+}
+
+async function waitForHttpJson(url, predicate, timeoutMs, label, fetchOptions) {
   const started = Date.now();
   let lastError;
   while (Date.now() - started < timeoutMs) {
@@ -1449,7 +1559,7 @@ async function waitForHttpJson(url, predicate, timeoutMs, label) {
       throw new Error(`${label} dependency exited early with ${earlyExit.exitCode}`);
     }
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, fetchOptions);
       const text = await response.text();
       let json;
       try {
@@ -1543,6 +1653,25 @@ function isSessionAuthErrorMessage(message) {
   return message === "invalid session token" || message === "session auth failed";
 }
 
+function terminalProofFromServerEvents(
+  events,
+  { failureClass, scenarioId, stage, terminalReason },
+) {
+  const eventIndex = events.findIndex(
+    (event) => event.type === "session_phase" && event.terminalReason === terminalReason,
+  );
+  if (eventIndex < 0) return null;
+  return {
+    scenario_id: scenarioId,
+    failure_class: failureClass,
+    stage,
+    terminal_reason: terminalReason,
+    event_index: eventIndex,
+    validation_run_id: validationRunId,
+    sanitized: true,
+  };
+}
+
 async function waitForFailureControlTerminal(events, plan, timeoutMs) {
   const expectedTerminalReason = plan.scenario.terminal_reason;
   const scenarioMarker = failureControlScenarioMarker(plan.scenario);
@@ -1607,10 +1736,10 @@ async function waitForFailureControlTerminal(events, plan, timeoutMs) {
   );
 }
 
-async function waitForPostAnswerProtocolProof(events, timeoutMs) {
+async function waitForPostAnswerProtocolProof(events, timeoutMs, answerResolutionStartedAt = null) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const proof = postAnswerProtocolProofFromEvents(events);
+    const proof = postAnswerProtocolProofFromEvents(events, answerResolutionStartedAt);
     if (proof.sourceReferenceEventSeen && proof.conceptStatusEventSeen) return proof;
     await delay(100);
   }
@@ -1620,7 +1749,7 @@ async function waitForPostAnswerProtocolProof(events, timeoutMs) {
   );
 }
 
-function postAnswerProtocolProofFromEvents(events) {
+function postAnswerProtocolProofFromEvents(events, answerResolutionStartedAt = null) {
   for (let answerIndex = events.length - 1; answerIndex >= 0; answerIndex -= 1) {
     const answerEvent = events[answerIndex];
     if (answerEvent.type !== "answer_evaluated" || !answerEvent.responseId) continue;
@@ -1642,6 +1771,10 @@ function postAnswerProtocolProofFromEvents(events) {
       conceptId: conceptEvent?.conceptId ?? null,
       conceptStatus: conceptEvent?.conceptStatus ?? null,
       conceptStatusEventSeen: Boolean(conceptEvent),
+      latencyMs:
+        Number.isFinite(answerResolutionStartedAt) && answerResolutionStartedAt > 0
+          ? Math.max(0, Date.now() - answerResolutionStartedAt)
+          : null,
       responseId: answerEvent.responseId,
       sourceReferenceEventSeen: Boolean(sourceEvent),
     };
@@ -1650,6 +1783,7 @@ function postAnswerProtocolProofFromEvents(events) {
     conceptId: null,
     conceptStatus: null,
     conceptStatusEventSeen: false,
+    latencyMs: null,
     responseId: null,
     sourceReferenceEventSeen: false,
   };

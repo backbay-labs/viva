@@ -335,10 +335,109 @@ test("per-PR redaction check permits required auth source identifiers only in so
     false,
   );
   assert.equal(
+    addedLineViolatesRedactionAudit("    bearerToken,", {
+      file: "scripts/hosted-monitor-runner.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("  const bearerToken = (", {
+      file: "scripts/hosted-monitor-runner.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("  if (!bearerToken) {", {
+      file: "scripts/hosted-monitor-runner.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("      VIVA_VOICE_WS_BEARER_TOKEN: liveConfig.bearerToken,", {
+      file: "scripts/hosted-monitor-runner.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      "      VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig.session.signedSession,",
+      {
+        file: "scripts/hosted-monitor-runner.mjs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      "        ? { VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig.session.signedSession }",
+      {
+        file: "scripts/hosted-monitor-runner.mjs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('      "invalid_token",', {
+      file: "scripts/hosted-e2e-matrix.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('    malformed_token: ["malformed_auth_material"],', {
+      file: "scripts/hosted-e2e-matrix.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit('  url.password = "";', {
+      file: "scripts/hosted-e2e-matrix.mjs",
+    }),
+    false,
+  );
+  assert.equal(
     addedLineViolatesRedactionAudit("  const kDate = hmac(`AWS4$" + "{secret}`, dateStamp);", {
       file: "scripts/hosted-monitor-runner.mjs",
     }),
     false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      '      secret: requiredValue(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"),',
+      {
+        file: "scripts/hosted-monitor-runner.mjs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      "function signedLiveMonitorSession({ secret, sessionId, studySetId, userId }) {",
+      {
+        file: "scripts/hosted-monitor-runner.mjs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("  const payload = `viva1.${claimsPart}`;", {
+      file: "scripts/hosted-monitor-runner.mjs",
+    }),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      '  const signature = createHmac("sha256", secret).update(payload).digest("base64url");',
+      {
+        file: "scripts/hosted-monitor-runner.mjs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit("  evidence.session_token = liveConfig.session.signedSession;", {
+      file: "scripts/hosted-monitor-runner.mjs",
+    }),
+    true,
   );
   assert.equal(
     addedLineViolatesRedactionAudit("  headers.authorization = `Bearer $" + "{rawToken}`;", {

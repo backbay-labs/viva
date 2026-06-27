@@ -414,6 +414,34 @@ impl VoiceUsageRecorder {
             .expect("usage recorder lock poisoned")
             .clone()
     }
+
+    pub fn summary(&self) -> serde_json::Value {
+        let events = self.events.read().expect("usage recorder lock poisoned");
+        let mut text_input_tokens = 0_u64;
+        let mut text_output_tokens = 0_u64;
+        let mut audio_input_tokens = 0_u64;
+        let mut audio_output_tokens = 0_u64;
+        let mut cost_estimate_usd = 0.0_f64;
+        for event in events.iter() {
+            text_input_tokens = text_input_tokens.saturating_add(event.text_input_tokens);
+            text_output_tokens = text_output_tokens.saturating_add(event.text_output_tokens);
+            audio_input_tokens = audio_input_tokens.saturating_add(event.audio_input_tokens);
+            audio_output_tokens = audio_output_tokens.saturating_add(event.audio_output_tokens);
+            cost_estimate_usd += event.cost_estimate_usd;
+        }
+        json!({
+            "events": events.len(),
+            "text_input_tokens": text_input_tokens,
+            "text_output_tokens": text_output_tokens,
+            "audio_input_tokens": audio_input_tokens,
+            "audio_output_tokens": audio_output_tokens,
+            "total_tokens": text_input_tokens
+                .saturating_add(text_output_tokens)
+                .saturating_add(audio_input_tokens)
+                .saturating_add(audio_output_tokens),
+            "cost_estimate_usd": cost_estimate_usd,
+        })
+    }
 }
 
 async fn root() -> Json<serde_json::Value> {
@@ -495,6 +523,9 @@ async fn ready(
                 "selectable": brain.selectable,
                 "live_runtime": brain.live_runtime,
             },
+            "voice_limits": {
+                "max_session_cost_usd": state.voice_limits.max_session_cost_usd,
+            },
             "store": {
                 "backend": store.backend.as_str(),
                 "available": store.available,
@@ -549,6 +580,9 @@ async fn brain_health(
                 "selectable": brain.selectable,
                 "live_runtime": brain.live_runtime,
             },
+            "voice_limits": {
+                "max_session_cost_usd": state.voice_limits.max_session_cost_usd,
+            },
             "store": {
                 "backend": store.backend.as_str(),
                 "available": store.available,
@@ -565,9 +599,7 @@ async fn brain_health(
                     "recaps": writes.recaps,
                 },
             },
-            "usage": {
-                "events": state.usage.snapshot().len(),
-            },
+            "usage": state.usage.summary(),
             "status": if ready {
                 "configured"
             } else {

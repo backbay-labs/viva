@@ -79,6 +79,10 @@ try {
     "--test",
     "scripts/provider-failure-observability.test.mjs",
   ]);
+  await run("hosted_e2e_matrix_unit_tests", "node", [
+    "--test",
+    "scripts/hosted-e2e-matrix.test.mjs",
+  ]);
   await run("provider_gate_tests", "cargo", [
     "test",
     "--manifest-path",
