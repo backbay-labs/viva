@@ -149,6 +149,8 @@ pub enum VivaServerEvent {
     RecapReady {
         response_id: String,
         recap: StudySessionRecap,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partial_reason: Option<TerminalSessionReason>,
     },
     AudioDelta {
         response_id: String,
@@ -226,9 +228,11 @@ impl From<BrainEvent> for VivaServerEvent {
                 response_id,
                 intent,
             },
-            BrainEvent::RecapReady { response_id, recap } => {
-                Self::RecapReady { response_id, recap }
-            }
+            BrainEvent::RecapReady { response_id, recap } => Self::RecapReady {
+                response_id,
+                recap,
+                partial_reason: None,
+            },
             BrainEvent::AudioDelta { response_id, frame }
             | BrainEvent::ResponseAudio { response_id, frame } => {
                 Self::AudioDelta { response_id, frame }

@@ -59,6 +59,14 @@ pub struct StudyStoreWriteCounts {
     pub recaps: usize,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StudySessionDurableCounts {
+    pub answer_attempts: usize,
+    pub concept_statuses: usize,
+    pub review_items: usize,
+    pub prior_recaps: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnswerCaptureMode {
@@ -387,6 +395,25 @@ pub trait StudyMemoryStore: Send + Sync {
 
     async fn record_voice_session(&self, _config: &SessionConfig) -> Result<(), PortError> {
         Ok(())
+    }
+
+    async fn study_session_durable_counts(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+    ) -> Result<StudySessionDurableCounts, PortError> {
+        Ok(StudySessionDurableCounts::default())
+    }
+
+    async fn answer_attempt_was_recorded(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        _response_id: &str,
+    ) -> Result<bool, PortError> {
+        Ok(false)
     }
 
     async fn claim_session_token_nonce(

@@ -29,9 +29,9 @@ pub use ports::{
     CreateFileStudySet, CreatePasteStudySet, LibraryNextReviewSummary, LibrarySessionRecapSummary,
     LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
     SessionStore, SessionTokenNonceClaim, StudyConceptSummary, StudyDocumentSummary,
-    StudyLibrarySnapshot, StudyMemoryStore, StudySetIngestionRecord, StudySetIngestionStatus,
-    StudySetSummary, StudySourceSpanSummary, StudyStoreBackend, StudyStoreCapabilities,
-    StudyStoreWriteCounts, ToolIssuer, VoiceUsageRecord,
+    StudyLibrarySnapshot, StudyMemoryStore, StudySessionDurableCounts, StudySetIngestionRecord,
+    StudySetIngestionStatus, StudySetSummary, StudySourceSpanSummary, StudyStoreBackend,
+    StudyStoreCapabilities, StudyStoreWriteCounts, ToolIssuer, VoiceUsageRecord,
 };
 pub use study::{
     fixture_question, fixture_source_reference, AnswerEvaluation, RecapSourceMoment, StudyQuestion,

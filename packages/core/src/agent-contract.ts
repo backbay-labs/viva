@@ -229,7 +229,12 @@ export type VivaServerEvent =
       status: AgentConceptStatus;
     }
   | { type: "manuscript_intent"; response_id: string; intent: ManuscriptIntent }
-  | { type: "recap_ready"; response_id: string; recap: AgentStudySessionRecap }
+  | {
+      type: "recap_ready";
+      response_id: string;
+      recap: AgentStudySessionRecap;
+      partial_reason?: AgentTerminalSessionReason;
+    }
   | { type: "audio_delta"; response_id: string; frame: AgentAudioFrame }
   | { type: "cancellation"; response_id?: string | null }
   | { type: "structured_error"; source: string; message: string };
@@ -351,6 +356,9 @@ export function parseVivaServerEvent(value: unknown): VivaServerEvent {
       };
     case "recap_ready":
       requireString(event.response_id, "response_id");
+      if ("partial_reason" in event && event.partial_reason !== undefined) {
+        requireTerminalSessionReason(event.partial_reason);
+      }
       parseStudySessionRecap(event.recap);
       return event as VivaServerEvent;
     case "audio_delta":

@@ -10,6 +10,7 @@ use std::{
 
 use agent_adapters::{cartesia_gemini::FakeCartesiaGeminiRuntime, SyntheticBrain};
 use agent_domain::{
+    AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
     AnswerEvaluation, AudioFrame, BrainError, BrainEvent, BrainInput, BrainProviderError,
     BrainProviderFailure, BrainProviderFailureParts, BrainUsage, ConceptStatus, PortError,
     RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard,
@@ -2890,6 +2891,278 @@ async fn websocket_failure_control_provider_error_does_not_backoff_normal_sessio
     })
     .await;
     normal_socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_provider_rate_limit_after_answer_emits_deterministic_partial_recap() {
+    let Some((frames, evidence, store)) =
+        run_partial_recap_provider_failure_probe(TerminalSessionReason::ProviderRateLimited, false)
+            .await
+    else {
+        return;
+    };
+    let (recap_index, recap, partial_reason) = frames
+        .iter()
+        .enumerate()
+        .find_map(|(index, frame)| match frame {
+            ServerFrame::Event { event, .. } => match event.as_ref() {
+                VivaServerEvent::RecapReady {
+                    recap,
+                    partial_reason,
+                    ..
+                } => Some((index, recap, *partial_reason)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("partial recap frame");
+    let terminal_index = frames
+        .iter()
+        .position(|frame| {
+            terminal_session_reason(frame) == Some(TerminalSessionReason::ProviderRateLimited)
+        })
+        .expect("provider-rate terminal phase");
+
+    assert!(
+        recap_index < terminal_index,
+        "partial recap must be visible before the terminal provider phase"
+    );
+    assert_eq!(
+        partial_reason,
+        Some(TerminalSessionReason::ProviderRateLimited)
+    );
+    assert_eq!(
+        recap.voice_session_id,
+        "00000000-0000-0000-0000-000000000001"
+    );
+    assert_eq!(recap.headline, "Partial recap: your answer was preserved.");
+    assert!(recap
+        .summary
+        .contains("terminal_reason=provider_rate_limited"));
+    assert!(recap.summary.contains("answer_attempts=1"));
+    assert!(recap.summary.contains("source_id=src-lecture-5-slide-18"));
+    assert!(recap.source_moments.is_empty());
+    assert!(recap.next_action.contains("Retry this question"));
+
+    let recap_json = serde_json::to_string(recap).expect("serialize recap");
+    assert!(!recap_json.contains("raw learner answer"));
+    assert!(!recap_json.contains(&agent_domain::fixture_source_reference().excerpt));
+    let counts = store.write_counts();
+    assert_eq!(counts.answer_attempts, 1);
+    assert_eq!(counts.recaps, 1);
+    assert!(evidence.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::PartialRecap
+            && event
+                .detail
+                .contains("terminal_reason=provider_rate_limited")
+            && event.detail.contains("answer_attempts=1")
+            && event.detail.contains("source_id=src-lecture-5-slide-18")
+    }));
+}
+
+#[tokio::test]
+async fn websocket_provider_timeout_after_partial_stage_success_records_partial_recap_evidence() {
+    let Some((frames, evidence, store)) =
+        run_partial_recap_provider_failure_probe(TerminalSessionReason::ProviderTimeout, true)
+            .await
+    else {
+        return;
+    };
+    let recap = frames
+        .iter()
+        .find_map(|frame| match frame {
+            ServerFrame::Event { event, .. } => match event.as_ref() {
+                VivaServerEvent::RecapReady {
+                    recap,
+                    partial_reason,
+                    ..
+                } if *partial_reason == Some(TerminalSessionReason::ProviderTimeout) => Some(recap),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("partial recap frame");
+
+    assert!(recap.summary.contains("terminal_reason=provider_timeout"));
+    assert!(recap.summary.contains("concept_statuses=1"));
+    assert!(recap.source_moments.is_empty());
+    let counts = store.write_counts();
+    assert_eq!(counts.answer_attempts, 1);
+    assert_eq!(counts.concept_statuses, 1);
+    assert_eq!(counts.recaps, 1);
+    assert!(evidence.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::PartialRecap
+            && event.detail.contains("terminal_reason=provider_timeout")
+            && event.detail.contains("concept_statuses=1")
+    }));
+}
+
+#[tokio::test]
+async fn websocket_provider_failure_after_cancelled_turn_skips_partial_recap() {
+    let Some((frames, evidence, store)) =
+        run_partial_recap_provider_failure_probe_cancelled(TerminalSessionReason::ProviderTimeout)
+            .await
+    else {
+        return;
+    };
+
+    assert!(!frames.iter().any(|frame| {
+        matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::RecapReady {
+                        partial_reason: Some(TerminalSessionReason::ProviderTimeout),
+                        ..
+                    }
+                )
+        )
+    }));
+    assert!(frames.iter().any(|frame| {
+        terminal_session_reason(frame) == Some(TerminalSessionReason::ProviderTimeout)
+    }));
+    let counts = store.write_counts();
+    assert_eq!(counts.answer_attempts, 1);
+    assert_eq!(counts.recaps, 0);
+    assert!(evidence.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::PartialRecap
+            && event.detail.contains("reason=no_durable_response_id")
+    }));
+}
+
+#[tokio::test]
+async fn websocket_provider_failure_requires_current_response_answer_attempt() {
+    let Some((frames, evidence, store)) =
+        run_partial_recap_provider_failure_probe_with_prior_attempt_only(
+            TerminalSessionReason::ProviderRateLimited,
+        )
+        .await
+    else {
+        return;
+    };
+
+    assert!(!frames.iter().any(|frame| {
+        matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::RecapReady {
+                        partial_reason: Some(TerminalSessionReason::ProviderRateLimited),
+                        ..
+                    }
+                )
+        )
+    }));
+    assert!(frames.iter().any(|frame| {
+        terminal_session_reason(frame) == Some(TerminalSessionReason::ProviderRateLimited)
+    }));
+    let counts = store.write_counts();
+    assert_eq!(counts.answer_attempts, 1);
+    assert_eq!(counts.recaps, 0);
+    assert!(evidence.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::PartialRecap
+            && event
+                .detail
+                .contains("reason=response_answer_attempt_missing")
+            && event
+                .detail
+                .contains("response_id=response-partial-provider-failure")
+    }));
+}
+
+#[tokio::test]
+async fn websocket_stop_drain_provider_failure_emits_deterministic_partial_recap() {
+    let Some((frames, evidence, store)) =
+        run_partial_recap_provider_failure_probe_after_stop(TerminalSessionReason::ProviderTimeout)
+            .await
+    else {
+        return;
+    };
+    let recap_index = frames
+        .iter()
+        .position(|frame| {
+            matches!(
+                frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(
+                        event.as_ref(),
+                        VivaServerEvent::RecapReady {
+                            partial_reason: Some(TerminalSessionReason::ProviderTimeout),
+                            ..
+                        }
+                    )
+            )
+        })
+        .expect("partial recap frame");
+    let terminal_index = frames
+        .iter()
+        .position(|frame| {
+            terminal_session_reason(frame) == Some(TerminalSessionReason::ProviderTimeout)
+        })
+        .expect("provider-timeout terminal phase");
+
+    assert!(
+        recap_index < terminal_index,
+        "stop-drain partial recap must be visible before the terminal provider phase"
+    );
+    let counts = store.write_counts();
+    assert_eq!(counts.answer_attempts, 1);
+    assert_eq!(counts.recaps, 1);
+    assert!(evidence.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::PartialRecap
+            && event.detail.contains("terminal_reason=provider_timeout")
+            && event.detail.contains("answer_attempts=1")
+    }));
+}
+
+#[tokio::test]
+async fn websocket_stop_drain_provider_failure_does_not_replace_existing_recap() {
+    let Some((frames, evidence, store)) =
+        run_partial_recap_provider_failure_probe_after_stop_with_existing_recap(
+            TerminalSessionReason::ProviderTimeout,
+        )
+        .await
+    else {
+        return;
+    };
+    let recap_frames = frames
+        .iter()
+        .filter(|frame| {
+            matches!(
+                frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(event.as_ref(), VivaServerEvent::RecapReady { .. })
+            )
+        })
+        .count();
+
+    assert_eq!(recap_frames, 1);
+    assert!(frames.iter().any(|frame| {
+        matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::RecapReady {
+                        partial_reason: None,
+                        ..
+                    }
+                )
+        )
+    }));
+    assert!(frames.iter().any(|frame| {
+        terminal_session_reason(frame) == Some(TerminalSessionReason::ProviderTimeout)
+    }));
+    let counts = store.write_counts();
+    assert_eq!(counts.answer_attempts, 1);
+    assert_eq!(counts.recaps, 1);
+    assert!(evidence.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::PartialRecap
+            && event.detail.contains("reason=prior_recap_exists")
+            && event.detail.contains("prior_recaps=1")
+    }));
 }
 
 #[tokio::test]
@@ -9063,6 +9336,205 @@ async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
     assert!(condition(), "condition was not met before timeout");
 }
 
+async fn run_partial_recap_provider_failure_probe(
+    terminal_reason: TerminalSessionReason,
+    record_concept_status: bool,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
+    run_partial_recap_provider_failure_probe_with_stop(
+        terminal_reason,
+        record_concept_status,
+        false,
+    )
+    .await
+}
+
+async fn run_partial_recap_provider_failure_probe_after_stop(
+    terminal_reason: TerminalSessionReason,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
+    run_partial_recap_provider_failure_probe_with_stop(terminal_reason, false, true).await
+}
+
+async fn run_partial_recap_provider_failure_probe_after_stop_with_existing_recap(
+    terminal_reason: TerminalSessionReason,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
+    run_partial_recap_provider_failure_probe_with_options(terminal_reason, false, true, true).await
+}
+
+async fn run_partial_recap_provider_failure_probe_cancelled(
+    terminal_reason: TerminalSessionReason,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
+    run_partial_recap_provider_failure_probe_with_extended_options(
+        terminal_reason,
+        false,
+        false,
+        false,
+        true,
+        false,
+        true,
+    )
+    .await
+}
+
+async fn run_partial_recap_provider_failure_probe_with_prior_attempt_only(
+    terminal_reason: TerminalSessionReason,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
+    run_partial_recap_provider_failure_probe_with_extended_options(
+        terminal_reason,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+    )
+    .await
+}
+
+async fn run_partial_recap_provider_failure_probe_with_stop(
+    terminal_reason: TerminalSessionReason,
+    record_concept_status: bool,
+    failure_after_stop: bool,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
+    run_partial_recap_provider_failure_probe_with_options(
+        terminal_reason,
+        record_concept_status,
+        failure_after_stop,
+        false,
+    )
+    .await
+}
+
+async fn run_partial_recap_provider_failure_probe_with_options(
+    terminal_reason: TerminalSessionReason,
+    record_concept_status: bool,
+    failure_after_stop: bool,
+    recap_before_failure: bool,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
+    run_partial_recap_provider_failure_probe_with_extended_options(
+        terminal_reason,
+        record_concept_status,
+        failure_after_stop,
+        recap_before_failure,
+        true,
+        false,
+        false,
+    )
+    .await
+}
+
+async fn run_partial_recap_provider_failure_probe_with_extended_options(
+    terminal_reason: TerminalSessionReason,
+    record_concept_status: bool,
+    failure_after_stop: bool,
+    recap_before_failure: bool,
+    record_current_answer_attempt: bool,
+    record_prior_answer_attempt: bool,
+    cancel_before_failure: bool,
+) -> Option<(
+    Vec<ServerFrame>,
+    Vec<observe::VoiceEvidenceEvent>,
+    Arc<data::InMemoryStudyStore>,
+)> {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(PartialRecapProviderFailureProbeBrain {
+            study_store: store.clone(),
+            terminal_reason,
+            record_concept_status,
+            failure_after_stop,
+            recap_before_failure,
+            record_current_answer_attempt,
+            record_prior_answer_attempt,
+            cancel_before_failure,
+        }),
+        "partial_recap_probe",
+        VoiceWsAccess::default(),
+        1,
+        store.clone(),
+    );
+    let evidence = state.evidence.clone();
+    let url = spawn_server(state).await?;
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_ready_provider(&mut socket, "partial_recap_probe").await;
+    socket
+        .send(WsMessage::Text(
+            format!(
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut frames = Vec::new();
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        let saw_question = matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        );
+        frames.push(frame);
+        if saw_question {
+            break;
+        }
+    }
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Text {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            text: "raw learner answer should not be persisted or recapped".to_owned(),
+            client_generation_id: Some("bac522-partial-recap".to_owned()),
+        },
+    )
+    .await;
+    if failure_after_stop {
+        wait_until(Duration::from_secs(2), || {
+            store.write_counts().answer_attempts == 1
+        })
+        .await;
+        send_client_frame(
+            &mut socket,
+            &ClientFrame::Stop {
+                version: VIVA_VOICE_PROTOCOL_VERSION,
+            },
+        )
+        .await;
+    }
+    frames.extend(read_server_frames_until_close(&mut socket).await);
+    Some((frames, evidence.snapshot(), store))
+}
+
 struct CapabilityProbeBrain {
     capabilities: RealtimeBrainCapabilities,
 }
@@ -9588,6 +10060,239 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         }
         drop(event);
         Err(PortError::adapter("postgres", "durable store write failed"))
+    }
+}
+
+struct PartialRecapProviderFailureProbeBrain {
+    study_store: Arc<dyn StudyMemoryStore>,
+    terminal_reason: TerminalSessionReason,
+    record_concept_status: bool,
+    failure_after_stop: bool,
+    recap_before_failure: bool,
+    record_current_answer_attempt: bool,
+    record_prior_answer_attempt: bool,
+    cancel_before_failure: bool,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "partial_recap_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(&self, config: SessionConfig) -> Result<RealtimeSession, BrainError> {
+        self.study_store
+            .record_voice_session(&config)
+            .await
+            .map_err(|error| BrainError::Connection(error.to_string()))?;
+        let user_id = config
+            .user_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .to_owned();
+        let study_set_id = config
+            .study_set_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .to_owned();
+        let voice_session_id = config
+            .session_id
+            .as_deref()
+            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .to_owned();
+        let study_store = self.study_store.clone();
+        let terminal_reason = self.terminal_reason;
+        let record_concept_status = self.record_concept_status;
+        let failure_after_stop = self.failure_after_stop;
+        let recap_before_failure = self.recap_before_failure;
+        let record_current_answer_attempt = self.record_current_answer_attempt;
+        let record_prior_answer_attempt = self.record_prior_answer_attempt;
+        let cancel_before_failure = self.cancel_before_failure;
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let question = agent_domain::fixture_question();
+            let response_id = "response-partial-provider-failure";
+            let _ = event_tx
+                .send(BrainEvent::QuestionStarted {
+                    response_id: response_id.to_owned(),
+                    question: question.clone(),
+                })
+                .await;
+            while let Some(input) = input_rx.recv().await {
+                let (char_count, client_generation_id) = match input {
+                    BrainInput::Text(text) => (Some(text.chars().count() as u64), None),
+                    BrainInput::TextWithMetadata {
+                        text,
+                        client_generation_id,
+                    } => (Some(text.chars().count() as u64), client_generation_id),
+                    BrainInput::Audio(frame) => (Some(frame.pcm16_bytes().len() as u64), None),
+                    BrainInput::AudioWithMetadata {
+                        frame,
+                        client_generation_id,
+                    } => (Some(frame.pcm16_bytes().len() as u64), client_generation_id),
+                    BrainInput::Stop => break,
+                    _ => continue,
+                };
+                if record_current_answer_attempt {
+                    let _ = study_store
+                        .record_answer_attempt_envelope(
+                            &user_id,
+                            &study_set_id,
+                            &voice_session_id,
+                            AnswerAttemptEnvelope {
+                                response_id: response_id.to_owned(),
+                                question_id: question.question_id.clone(),
+                                submission_sequence: 1,
+                                idempotency_key: format!(
+                                    "{voice_session_id}:{}:1",
+                                    question.question_id
+                                ),
+                                capture_mode: AnswerCaptureMode::Typed,
+                                byte_count: None,
+                                char_count,
+                                duration_ms: None,
+                                client_generation_id: client_generation_id.clone(),
+                                locale: Some("en-US".to_owned()),
+                                capture_status: AnswerCaptureStatus::Accepted,
+                                content_policy: AnswerContentPolicy::None,
+                                answer_digest_hmac: None,
+                                transcript_status: None,
+                                transcript_confidence_bucket: None,
+                                pre_provider_state: "accepted_before_provider".to_owned(),
+                            },
+                        )
+                        .await;
+                }
+                if record_prior_answer_attempt {
+                    let _ = study_store
+                        .record_answer_attempt_envelope(
+                            &user_id,
+                            &study_set_id,
+                            &voice_session_id,
+                            AnswerAttemptEnvelope {
+                                response_id: "response-prior-provider-failure".to_owned(),
+                                question_id: question.question_id.clone(),
+                                submission_sequence: 1,
+                                idempotency_key: format!(
+                                    "{voice_session_id}:{}:prior",
+                                    question.question_id
+                                ),
+                                capture_mode: AnswerCaptureMode::Typed,
+                                byte_count: None,
+                                char_count,
+                                duration_ms: None,
+                                client_generation_id,
+                                locale: Some("en-US".to_owned()),
+                                capture_status: AnswerCaptureStatus::Accepted,
+                                content_policy: AnswerContentPolicy::None,
+                                answer_digest_hmac: None,
+                                transcript_status: None,
+                                transcript_confidence_bucket: None,
+                                pre_provider_state: "accepted_before_provider".to_owned(),
+                            },
+                        )
+                        .await;
+                }
+                if record_concept_status {
+                    let _ = study_store
+                        .record_concept_status(
+                            &user_id,
+                            &study_set_id,
+                            &voice_session_id,
+                            response_id,
+                            "nadh",
+                            ConceptStatus::Review,
+                        )
+                        .await;
+                    let _ = event_tx
+                        .send(BrainEvent::ConceptStatus {
+                            response_id: response_id.to_owned(),
+                            concept_id: "nadh".to_owned(),
+                            status: ConceptStatus::Review,
+                        })
+                        .await;
+                }
+                if failure_after_stop {
+                    while let Some(input) = input_rx.recv().await {
+                        if matches!(input, BrainInput::Stop) {
+                            break;
+                        }
+                    }
+                }
+                if recap_before_failure {
+                    let recap = StudySessionRecap {
+                        voice_session_id: voice_session_id.clone(),
+                        headline: "Full recap".to_owned(),
+                        summary: "Durable model recap already exists.".to_owned(),
+                        strong_concepts: vec!["NADH".to_owned()],
+                        shaky_concepts: vec![],
+                        missed_concepts: vec![],
+                        review_later: vec!["ATP synthase".to_owned()],
+                        next_action: "Continue".to_owned(),
+                        source_moments: vec![],
+                    };
+                    let response_id = "response-normal-recap";
+                    let _ = study_store
+                        .record_recap(
+                            &user_id,
+                            &study_set_id,
+                            &voice_session_id,
+                            response_id,
+                            recap.clone(),
+                        )
+                        .await;
+                    let _ = event_tx
+                        .send(BrainEvent::RecapReady {
+                            response_id: response_id.to_owned(),
+                            recap,
+                        })
+                        .await;
+                }
+                if cancel_before_failure {
+                    let _ = event_tx
+                        .send(BrainEvent::ResponseCancelledFor {
+                            response_id: response_id.to_owned(),
+                        })
+                        .await;
+                }
+                let failure_class = match terminal_reason {
+                    TerminalSessionReason::ProviderRateLimited => "quota_rate_failure",
+                    TerminalSessionReason::ProviderTimeout => "provider_timeout",
+                    TerminalSessionReason::ProviderAuthFailed => "provider_auth_failed",
+                    TerminalSessionReason::ProviderMalformedStream => "malformed_stream",
+                    TerminalSessionReason::ProviderNetworkDisconnect => "network_disconnect",
+                    _ => "provider_failure",
+                };
+                let failure = BrainProviderFailure::new(BrainProviderFailureParts {
+                    failure_class: failure_class.to_owned(),
+                    stage: "gemini".to_owned(),
+                    terminal_reason,
+                    retry_eligible: true,
+                    latency_ms: 29,
+                    provider: "gemini".to_owned(),
+                    model: "gemini-3.5-flash".to_owned(),
+                    metadata: "http_status=429 retry_after_ms=250 deploy_sha=test-sha".to_owned(),
+                });
+                let _ = event_tx
+                    .send(BrainEvent::Error(BrainProviderError::from_stage_failure(
+                        failure,
+                    )))
+                    .await;
+                break;
+            }
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
     }
 }
 
