@@ -26,6 +26,7 @@ test("provider failure observability defines reusable sanitized log queries", ()
     "cost_budget",
     "malformed_stream",
     "network_disconnect",
+    "durability_degraded",
     "token_refresh_failure",
     "startup_unavailable",
     "recap_failure",
@@ -69,6 +70,10 @@ test("provider failure observability defines reusable sanitized log queries", ()
     queriesById.get("token_refresh_failure").railway_query,
     /token_refresh_outcome:"failed"/,
   );
+  assert.doesNotMatch(
+    queriesById.get("token_refresh_failure").railway_query,
+    /failure_class:"auth_material_failure"/,
+  );
   assert.match(
     queriesById.get("startup_unavailable").railway_query,
     /service:"web" event:"viva_session_route_failure"/,
@@ -95,12 +100,14 @@ test("reviewed BAC-525 queries name emitted log and evidence surfaces", () => {
     "cost_budget",
     "malformed_stream",
     "network_disconnect",
+    "durability_degraded",
     "recap_failure",
     "pending_evaluation",
     "provider_cancellation",
     "deploy_drain",
     "watchdog_expiry",
     "rollback_observed",
+    "startup_unavailable",
   ]) {
     assert.match(
       queriesById.get(id).railway_query,
@@ -181,6 +188,15 @@ test("release check exposes stale-evidence inputs without storing write-time age
   const releaseCheck = await readFile("scripts/release-check.mjs", "utf8");
 
   assert.match(releaseCheck, /release_gate: buildReleaseGateEvidence/);
+  assert.match(
+    releaseCheck,
+    /const browserSkipShortcut = process\.env\.VIVA_RELEASE_CHECK_SKIP_BROWSER === "1"/,
+  );
+  assert.match(
+    releaseCheck,
+    /buildReleaseGateEvidence\(\{ browserResult, browserSkipShortcut, generatedAt \}\)/,
+  );
+  assert.match(releaseCheck, /browserSkipShortcut \|\| browserResult\?\.skipped === true/);
   assert.match(releaseCheck, /deploy_sha: releaseDeploySha\(\)/);
   for (const name of [
     "RAILWAY_GIT_COMMIT_SHA",
@@ -193,6 +209,19 @@ test("release check exposes stale-evidence inputs without storing write-time age
   assert.match(releaseCheck, /max_age_seconds/);
   assert.doesNotMatch(releaseCheck, /evidence_age_seconds/);
   assert.match(releaseCheck, /browser_skip_shortcut/);
+});
+
+test("runtime emitters expose BAC-510 startup and refresh auth failure classes", async () => {
+  const agentWs = await readFile("agent/crates/agent-service/src/ws.rs", "utf8");
+  const webSessionRoute = await readFile("apps/web/app/api/viva-session/shared.ts", "utf8");
+
+  assert.match(agentWs, /failure_class: "pre_loop_unavailable"/);
+  assert.match(agentWs, /failure_class: "session_bootstrap_unavailable"/);
+  assert.match(agentWs, /failure_class: "session_auth_failure"/);
+  assert.match(agentWs, /event = "provider_failure_observed"/);
+  assert.match(webSessionRoute, /sessionAuthTerminalJsonError\(authFailureCodeForTokenReason/);
+  assert.match(webSessionRoute, /sessionAuthTerminalJsonError\("identity_mismatch"/);
+  assert.match(webSessionRoute, /failure_class: "session_auth_failure"/);
 });
 
 test("provider alerts reuse BAC-527 rollback thresholds without copying numbers", () => {

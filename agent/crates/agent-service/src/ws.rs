@@ -6,7 +6,7 @@ use std::{
 use agent_domain::{
     fixture_question, AudioFrame, BrainError, BrainEvent, BrainInput, BrainProviderError,
     PortError, RealtimeSession, RealtimeSessionTaskGuard, SessionConfig, SessionTokenNonceClaim,
-    StudySessionPhase, StudyStoreWriteCounts, TerminalSessionReason, VoiceUsageRecord,
+    StudySessionPhase, TerminalSessionReason, VoiceUsageRecord,
 };
 use axum::{
     extract::{
@@ -1364,6 +1364,31 @@ fn terminal_observability_classification(
             stage: "store",
             signal: "pending_evaluation",
         },
+        "study_set_access_denied" => TerminalObservabilityClassification {
+            failure_class: "pre_loop_unavailable",
+            stage: "pre_loop",
+            signal: "pre_loop_unavailable",
+        },
+        "first_frame_timeout"
+        | "invalid_first_frame"
+        | "closed_before_config"
+        | "agent_input_closed" => TerminalObservabilityClassification {
+            failure_class: "session_bootstrap_unavailable",
+            stage: "startup",
+            signal: "session_bootstrap_unavailable",
+        },
+        "invalid_session_identity" | "invalid_session_token" => {
+            TerminalObservabilityClassification {
+                failure_class: "session_auth_failure",
+                stage: "session_auth",
+                signal: "session_auth_rejected",
+            }
+        }
+        "durability_degraded" => TerminalObservabilityClassification {
+            failure_class: "durability_degraded",
+            stage: "store",
+            signal: "durability_degraded",
+        },
         "cost_budget" => TerminalObservabilityClassification {
             failure_class: "cost_budget",
             stage: "provider",
@@ -2662,7 +2687,11 @@ fn terminal_close_code(reason: TerminalSessionReason, close_code: u16) -> u16 {
     }
 }
 
-async fn record_terminal_evidence(state: &AppState, voice_session_id: Option<String>, reason: &str) {
+async fn record_terminal_evidence(
+    state: &AppState,
+    voice_session_id: Option<String>,
+    reason: &str,
+) {
     let pending_answer_attempts = if let Some(session_id) = voice_session_id.as_deref() {
         match state
             .study_store
@@ -2866,6 +2895,38 @@ mod tests {
                 failure_class: "turn_cap",
                 stage: "session",
                 signal: "turn_cap",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("study_set_access_denied"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "pre_loop_unavailable",
+                stage: "pre_loop",
+                signal: "pre_loop_unavailable",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("first_frame_timeout"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "session_bootstrap_unavailable",
+                stage: "startup",
+                signal: "session_bootstrap_unavailable",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("invalid_session_token"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "session_auth_failure",
+                stage: "session_auth",
+                signal: "session_auth_rejected",
+            })
+        );
+        assert_eq!(
+            terminal_observability_classification("durability_degraded"),
+            Some(TerminalObservabilityClassification {
+                failure_class: "durability_degraded",
+                stage: "store",
+                signal: "durability_degraded",
             })
         );
         assert_eq!(terminal_observability_classification("completed"), None);

@@ -400,7 +400,7 @@ describe("Viva same-origin session API", () => {
     expect(response.status).toBe(401);
     expect(body).toEqual({
       error: "session_auth_terminal",
-      failure_class: "session_auth_terminal",
+      failure_class: "session_auth_failure",
       token_refresh_outcome: "terminal",
     });
     expect(/access_denied|other-user|biology-midterm/.test(JSON.stringify(body))).toBe(false);
@@ -694,7 +694,7 @@ describe("Viva same-origin session API", () => {
         status: 401,
         body: {
           error: "session_auth_terminal",
-          failure_class: "session_auth_terminal",
+          failure_class: "session_auth_failure",
           token_refresh_outcome: "terminal",
         },
       },
@@ -702,7 +702,7 @@ describe("Viva same-origin session API", () => {
         status: 401,
         body: {
           error: "session_auth_terminal",
-          failure_class: "session_auth_terminal",
+          failure_class: "session_auth_failure",
           token_refresh_outcome: "terminal",
         },
       },
@@ -710,7 +710,7 @@ describe("Viva same-origin session API", () => {
         status: 401,
         body: {
           error: "session_auth_terminal",
-          failure_class: "session_auth_terminal",
+          failure_class: "session_auth_failure",
           token_refresh_outcome: "terminal",
         },
       },
@@ -725,7 +725,7 @@ describe("Viva same-origin session API", () => {
       vivaSessionRouteFailureLogPayload(
         {
           error: "invalid_session_token",
-          failure_class: "auth_material_failure",
+          failure_class: "session_auth_failure",
           token_refresh_outcome: "invalid_rejected",
         },
         401,
@@ -736,7 +736,7 @@ describe("Viva same-origin session API", () => {
       deploy_sha: "abc123",
       error: "invalid_session_token",
       event: "viva_session_route_failure",
-      failure_class: "auth_material_failure",
+      failure_class: "session_auth_failure",
       route: "refresh",
       service: "web",
       stage: "session_auth",

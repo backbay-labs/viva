@@ -833,7 +833,7 @@ function sessionAuthTerminalJsonError(
   }
   return sessionJsonError(401, "session_auth_terminal", "terminal", {
     ...logContext,
-    failure_class: "session_auth_terminal",
+    failure_class: "session_auth_failure",
   });
 }
 
@@ -918,6 +918,7 @@ function emitVivaSessionRouteFailureLog(
 function sessionFailureStage(failureClass: string): string {
   if (
     failureClass === "session_auth_terminal" ||
+    failureClass === "session_auth_failure" ||
     failureClass === "auth_material_failure" ||
     failureClass === "identity_mismatch" ||
     failureClass === "malformed_token"

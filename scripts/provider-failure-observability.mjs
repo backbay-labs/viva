@@ -146,12 +146,29 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     ],
   }),
   query({
+    id: "durability_degraded",
+    title: "Durable store degraded terminal sessions",
+    failure_class: "durability_degraded",
+    stage: "store",
+    terminal_reason: "durability_degraded",
+    railway_query:
+      'service:"agent-service" event:"provider_failure_observed" (terminal_reason:"durability_degraded" OR failure_class:"durability_degraded")',
+    evidence_fields: [
+      "terminal_reason",
+      "failure_class",
+      "stage",
+      "provider",
+      "deploy_sha",
+      "latency_ms",
+    ],
+  }),
+  query({
     id: "token_refresh_failure",
     title: "Signed-session token refresh failures",
     failure_class: "session_auth_failure",
     stage: "session_auth",
     railway_query:
-      'service:"web" event:"viva_session_route_failure" route:"refresh" (token_refresh_outcome:"failed" OR failure_class:"session_auth_failure" OR failure_class:"auth_material_failure" OR error:"viva_session_refresh_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable" OR token_refresh_outcome:"invalid_rejected" OR token_refresh_outcome:"malformed_rejected" OR token_refresh_outcome:"identity_mismatch")',
+      'service:"web" event:"viva_session_route_failure" route:"refresh" (token_refresh_outcome:"failed" OR failure_class:"session_auth_failure" OR error:"viva_session_refresh_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable" OR token_refresh_outcome:"invalid_rejected" OR token_refresh_outcome:"malformed_rejected" OR token_refresh_outcome:"identity_mismatch")',
     evidence_fields: [
       "action",
       "failure_class",
@@ -169,7 +186,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "pre_loop_unavailable",
     stage: "startup",
     railway_query:
-      '(service:"agent-service" (failure_class:"pre_loop_unavailable" OR failure_class:"session_bootstrap_unavailable" OR terminal_reason:"pre_loop_unavailable" OR terminal_reason:"session_bootstrap_unavailable")) OR (service:"web" event:"viva_session_route_failure" (error:"viva_session_bootstrap_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable"))',
+      '(service:"agent-service" event:"provider_failure_observed" (failure_class:"pre_loop_unavailable" OR failure_class:"session_bootstrap_unavailable" OR terminal_reason:"pre_loop_unavailable" OR terminal_reason:"session_bootstrap_unavailable")) OR (service:"web" event:"viva_session_route_failure" (error:"viva_session_bootstrap_unavailable" OR error:"viva_session_agent_unavailable" OR error:"session_mint_unavailable"))',
     evidence_fields: [
       "failure_class",
       "stage",
@@ -407,6 +424,18 @@ export const PROVIDER_FAILURE_ALERTS = Object.freeze([
     query_id: "network_disconnect",
   }),
   alert({
+    id: "bac525_durability_degraded_count",
+    failure_class: "durability_degraded",
+    stage: "store",
+    metric: "durability_degraded_terminal_count",
+    value: 1,
+    unit: "count",
+    window_seconds: 600,
+    sustained_seconds: 60,
+    severity: "release_blocking",
+    query_id: "durability_degraded",
+  }),
+  alert({
     id: "bac525_watchdog_expiry_count",
     failure_class: "turn_cap",
     stage: "session",
@@ -480,6 +509,7 @@ export const FAILURE_CLASS_COVERAGE = Object.freeze([
   coverage("timeout", "bac525_provider_timeout_rate_percent"),
   coverage("malformed_stream", "bac525_malformed_stream_count"),
   coverage("network_disconnect", "bac525_network_disconnect_count"),
+  coverage("durability_degraded", "bac525_durability_degraded_count"),
   coverage("slow_client", "bac525_watchdog_expiry_count"),
   coverage("cancellation", null, {
     query_id: "provider_cancellation",

@@ -107,10 +107,10 @@ try {
     "agent-service",
   ]);
   await run("direct_websocket_replay", "bun", ["run", "agent:replay:ws"]);
-  const browserResult =
-    process.env.VIVA_RELEASE_CHECK_SKIP_BROWSER === "1"
-      ? await readExistingBrowserResult()
-      : await runBrowserE2E();
+  const browserSkipShortcut = process.env.VIVA_RELEASE_CHECK_SKIP_BROWSER === "1";
+  const browserResult = browserSkipShortcut
+    ? await readExistingBrowserResult()
+    : await runBrowserE2E();
   const releaseDurableStateClaimed = releaseDurableStateClaim(
     browserResult,
     durableStateReleaseClaimed,
@@ -143,7 +143,7 @@ try {
     rollback_drain: rollbackDrain,
     provider_failure_observability: providerFailureObservability,
     browser_e2e: browserResult,
-    release_gate: buildReleaseGateEvidence({ browserResult, generatedAt }),
+    release_gate: buildReleaseGateEvidence({ browserResult, browserSkipShortcut, generatedAt }),
     artifact_audit: artifactAudit,
     release_bundle: buildReleaseBundleManifest(outputPath, commands, browserResult),
     privacy: {
@@ -444,12 +444,12 @@ function buildReleaseBundleManifest(outputPath, commandRecords, browserResult) {
   };
 }
 
-function buildReleaseGateEvidence({ browserResult, generatedAt }) {
-  const browserSkipShortcut = browserResult?.skipped === true;
+function buildReleaseGateEvidence({ browserResult, browserSkipShortcut, generatedAt }) {
+  const browserSkipShortcutObserved = browserSkipShortcut || browserResult?.skipped === true;
   return {
-    browser_skip_shortcut: browserSkipShortcut,
+    browser_skip_shortcut: browserSkipShortcutObserved,
     deploy_sha: releaseDeploySha(),
-    failure_class: browserSkipShortcut ? "release_gate_stale_evidence" : null,
+    failure_class: browserSkipShortcutObserved ? "release_gate_stale_evidence" : null,
     generated_at: generatedAt.toISOString(),
     max_age_seconds: 86_400,
     sanitized: true,
