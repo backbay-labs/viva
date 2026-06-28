@@ -139,6 +139,10 @@ test("provider failure observability defines reusable sanitized log queries", ()
     queriesById.get("release_gate_stale_evidence").railway_query,
     /generated_at/,
   );
+  assert.doesNotMatch(
+    queriesById.get("release_gate_stale_evidence").railway_query,
+    /<now-24h/,
+  );
   assert.match(
     queriesById.get("release_gate_stale_evidence").railway_query,
     /release_gate\.browser_skip_shortcut/,

@@ -348,7 +348,7 @@ export const PROVIDER_FAILURE_LOG_QUERIES = Object.freeze([
     failure_class: "release_gate_stale_evidence",
     stage: "release_gate",
     railway_query:
-      'artifact:"viva.release_evidence.v1" (failure_class:"release_gate_stale_evidence" OR browser_e2e.skipped:true OR release_gate.browser_skip_shortcut:true OR generated_at:"<now-24h")',
+      'artifact:"viva.release_evidence.v1" generated_at (failure_class:"release_gate_stale_evidence" OR browser_e2e.skipped:true OR release_gate.browser_skip_shortcut:true OR release_gate.stage:"release_gate")',
     evidence_fields: [
       "stage",
       "deploy_sha",
@@ -603,6 +603,7 @@ export const FAILURE_CLASS_COVERAGE = Object.freeze([
 
 export function providerFailureObservabilityEvidence({
   fixture = null,
+  observations = [],
   releaseEvidencePath = "artifacts/release-check/evidence.json",
 } = {}) {
   const evidence = {
@@ -633,6 +634,7 @@ export function providerFailureObservabilityEvidence({
     alerts: PROVIDER_FAILURE_ALERTS.map((entry) => cloneJson(entry)),
     coverage: FAILURE_CLASS_COVERAGE.map((entry) => cloneJson(entry)),
     fixture: fixture ? cloneJson(fixture) : null,
+    observations: Array.isArray(observations) ? cloneJson(observations) : [],
     redaction: {
       raw_audio_indexed: false,
       transcript_text_indexed: false,

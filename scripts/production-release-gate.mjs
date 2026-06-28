@@ -4,7 +4,7 @@ export const PRODUCTION_RELEASE_GATE_SCHEMA = "viva.production_release_gate.v1";
 export const RELEASE_BUNDLE_INTEGRITY_SCHEMA = "viva.release_bundle_integrity.v1";
 export const DEFAULT_MAX_EVIDENCE_AGE_SECONDS = 24 * 60 * 60;
 
-const REQUIRED_RECOVERY_SCENARIOS = Object.freeze([
+export const REQUIRED_RECOVERY_SCENARIOS = Object.freeze([
   "provider_rate_limited",
   "provider_timeout",
   "invalid_token",
@@ -21,7 +21,7 @@ const REQUIRED_PROVIDER_FAILURE_QUERIES = Object.freeze([
   "recap_failure",
   "release_gate_stale_evidence",
 ]);
-const REQUIRED_PROVIDER_FAILURE_OBSERVATIONS = Object.freeze([
+export const REQUIRED_PROVIDER_FAILURE_OBSERVATIONS = Object.freeze([
   "provider_429",
   "provider_timeout",
   "token_refresh_failure",
