@@ -37,11 +37,18 @@ import {
 import {
   finalizeReleaseEvidenceBundle,
   FORBIDDEN_EVIDENCE_MARKERS,
+  REQUIRED_PROVIDER_FAILURE_OBSERVATIONS,
+  REQUIRED_RECOVERY_SCENARIOS,
 } from "./production-release-gate.mjs";
 import {
   assertNoForbiddenEvidenceMarkers,
   auditTextArtifacts,
 } from "./redaction-control.mjs";
+import {
+  matrixResultsFromHostedMonitorEvidence,
+  readHostedMonitorEvidence,
+  readProviderFailureObservations,
+} from "./release-evidence-imports.mjs";
 import {
   assertRollbackReleaseGate,
   buildRollbackReleaseEvidence,
@@ -69,6 +76,7 @@ const outputPath = path.join(artifactDir, "evidence.json");
 try {
   const generatedAt = new Date();
   const generatedAtIso = generatedAt.toISOString();
+  const productionRequested = process.env.VIVA_PRODUCTION_RELEASE === "1";
   const failureControlPlan = buildFailureControlPlan();
   const failureControlEvidence = failureControlHarnessEvidence(failureControlPlan);
   const providerLimiterEvidence = providerLimiterReleaseEvidence();
@@ -165,18 +173,37 @@ try {
   const providerReadiness = await collectProviderReadiness();
   const rollbackDrain = buildRollbackReleaseEvidence();
   assertRollbackReleaseGate(rollbackDrain);
+  const providerFailureObservations = await readProviderFailureObservations({
+    env: process.env,
+    now: generatedAt,
+    productionRequested,
+    requiredQueryIds: REQUIRED_PROVIDER_FAILURE_OBSERVATIONS,
+    root,
+  });
   const providerFailureObservability = providerFailureObservabilityEvidence({
     fixture: fixtureProviderFailureDashboard,
+    observations: providerFailureObservations,
     releaseEvidencePath: path.relative(root, outputPath),
   });
   assertProviderFailureObservabilityEvidence(providerFailureObservability);
-  const hostedMonitorEvidence = await readHostedMonitorEvidence();
+  const hostedMonitorEvidence = await readHostedMonitorEvidence({
+    env: process.env,
+    mode: productionRequested ? "production" : "pr",
+    now: generatedAt,
+    productionRequested,
+    root,
+  });
   const hostedMonitorMatrixResults =
-    matrixResultsFromHostedMonitorEvidence(hostedMonitorEvidence);
+    matrixResultsFromHostedMonitorEvidence(hostedMonitorEvidence, {
+      env: process.env,
+      now: generatedAt,
+      productionRequested,
+      requiredScenarioIds: REQUIRED_RECOVERY_SCENARIOS,
+    });
   const hostedE2eMatrix = {
     ...buildHostedE2eMatrixContract({
       generatedAt: generatedAtIso,
-      mode: process.env.VIVA_PRODUCTION_RELEASE === "1" ? "production" : "pr",
+      mode: productionRequested ? "production" : "pr",
       runId: process.env.VIVA_RELEASE_RUN_ID ?? null,
     }),
     results: hostedMonitorMatrixResults,
@@ -341,45 +368,6 @@ function liveSmokeEvidencePath() {
       process.env.VIVA_LIVE_SMOKE_EVIDENCE_PATH ??
       "artifacts/live-provider-smoke/evidence.json",
   );
-}
-
-function hostedMonitorEvidencePath() {
-  return path.resolve(
-    root,
-    process.env.VIVA_RELEASE_HOSTED_MONITOR_MANIFEST_PATH ??
-      process.env.VIVA_HOSTED_MONITOR_MANIFEST_PATH ??
-      "artifacts/hosted-monitor/manifest.json",
-  );
-}
-
-async function readHostedMonitorEvidence() {
-  return readOptionalJson(hostedMonitorEvidencePath());
-}
-
-function matrixResultsFromHostedMonitorEvidence(manifest) {
-  if (manifest === null) return [];
-  if (manifest?.schema !== "viva.hosted_monitor_run.v1") {
-    throw new Error("hosted monitor manifest schema is invalid");
-  }
-  const runs = Array.isArray(manifest.runs) ? manifest.runs : [];
-  return runs
-    .filter(
-      (run) =>
-        run?.status === "passed" &&
-        run.sanitized === true &&
-        typeof run.scenario_id === "string" &&
-        run.scenario_id.length > 0,
-    )
-    .map((run) => ({
-      scenario_id: run.scenario_id,
-      status: "passed",
-      runner: run.runner ?? null,
-      artifact_dir: run.artifact_dir ?? null,
-      terminal_reason: run.hosted_e2e?.terminal_reason ?? null,
-      failure_class: run.hosted_e2e?.failure_class ?? null,
-      recap_success: run.hosted_e2e?.recap_success === true,
-      sanitized: true,
-    }));
 }
 
 async function readOptionalJson(file) {
