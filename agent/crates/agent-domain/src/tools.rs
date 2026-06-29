@@ -1,10 +1,37 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{
-    ids::{CallId, ToolName},
-    StudySourceReference,
-};
+use crate::ids::{CallId, ToolName};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrectionChallengeReason {
+    CitationMismatch,
+    LowConfidenceSource,
+    ConflictingSource,
+    LearnerDispute,
+}
+
+impl CorrectionChallengeReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CitationMismatch => "citation_mismatch",
+            Self::LowConfidenceSource => "low_confidence_source",
+            Self::ConflictingSource => "conflicting_source",
+            Self::LearnerDispute => "learner_dispute",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "citation_mismatch" => Some(Self::CitationMismatch),
+            "low_confidence_source" => Some(Self::LowConfidenceSource),
+            "conflicting_source" => Some(Self::ConflictingSource),
+            "learner_dispute" => Some(Self::LearnerDispute),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ToolProposal {
@@ -103,23 +130,18 @@ impl ToolProposal {
     pub fn challenge_correction(
         study_set_id: impl Into<String>,
         voice_session_id: impl Into<String>,
-        source: &StudySourceReference,
+        source_id: impl Into<String>,
         correction_id: impl Into<String>,
-        challenge_text: impl Into<String>,
+        reason: CorrectionChallengeReason,
     ) -> Self {
         Self::new(
             "challenge_correction",
             json!({
                 "study_set_id": study_set_id.into(),
                 "voice_session_id": voice_session_id.into(),
-                "source_id": &source.source_id,
-                "document_id": &source.document_id,
-                "span": &source.span,
-                "excerpt": &source.excerpt,
-                "confidence": &source.confidence,
-                "retrieval_reason": &source.retrieval_reason,
                 "correction_id": correction_id.into(),
-                "challenge_text": challenge_text.into(),
+                "source_id": source_id.into(),
+                "reason": reason.as_str(),
             }),
         )
     }

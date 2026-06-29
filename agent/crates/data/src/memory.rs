@@ -3277,7 +3277,8 @@ impl StudyMemoryStore for InMemoryStudyStore {
 mod tests {
     use agent_domain::{
         fixture_question, fixture_source_reference, AuthorizedStudySession, ConceptStatus,
-        RecapSourceMoment, SessionId, SourceConfidence, ToolProposal, VivaToolExecutor,
+        CorrectionChallengeReason, RecapSourceMoment, SessionId, SourceConfidence, ToolProposal,
+        VivaToolExecutor,
     };
 
     use super::*;
@@ -5176,19 +5177,26 @@ mod tests {
             )
             .await
             .unwrap();
-        executor
+        let challenge = executor
             .execute(
                 "response-1",
                 ToolProposal::challenge_correction(
                     "biology-midterm",
                     "voice-session-1",
-                    &fixture_source_reference(),
+                    "src-lecture-5-slide-18",
                     "correction-1",
-                    "Re-check this source.",
+                    CorrectionChallengeReason::CitationMismatch,
                 ),
             )
             .await
             .unwrap();
+        assert_eq!(challenge.result["reason"], "citation_mismatch");
+        assert_eq!(challenge.result["status"], "source_rechecked");
+        assert_eq!(
+            challenge.result["source"]["source_id"],
+            "src-lecture-5-slide-18"
+        );
+        assert_eq!(challenge.result["source"]["confidence"], "high");
 
         let snapshot = store.snapshot();
         assert_eq!(snapshot.answer_attempts.len(), 1);
@@ -5517,17 +5525,38 @@ mod tests {
             .await
             .is_err());
 
-        let mut forged_source = fixture_source_reference();
-        forged_source.excerpt = "forged excerpt".to_owned();
         assert!(executor
             .execute(
                 "response-1",
-                ToolProposal::challenge_correction(
-                    "biology-midterm",
-                    "voice-session-1",
-                    &forged_source,
-                    "correction-1",
-                    "Re-check this source.",
+                ToolProposal::new(
+                    "challenge_correction",
+                    json!({
+                        "study_set_id": "biology-midterm",
+                        "voice_session_id": "voice-session-1",
+                        "source_id": "src-lecture-5-slide-18",
+                        "correction_id": "correction-1",
+                        "reason": "citation_mismatch",
+                        "excerpt": "forged excerpt",
+                        "challenge_text": "The slide says this differently.",
+                        "concept_status": "strong",
+                        "correction_result": "browser says the correction is wrong"
+                    }),
+                ),
+            )
+            .await
+            .is_err());
+        assert!(executor
+            .execute(
+                "response-1",
+                ToolProposal::new(
+                    "challenge_correction",
+                    json!({
+                        "study_set_id": "biology-midterm",
+                        "voice_session_id": "voice-session-1",
+                        "source_id": "src-lecture-5-slide-18",
+                        "correction_id": "correction-1",
+                        "reason": "browser_free_text"
+                    }),
                 ),
             )
             .await
