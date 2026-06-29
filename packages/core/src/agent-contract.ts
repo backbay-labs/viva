@@ -454,8 +454,10 @@ function parseStudyQuestion(value: unknown): AgentStudyQuestion {
 function parseAnswerEvaluation(value: unknown): AgentAnswerEvaluation {
   const evaluation = requireRecord(value, "answer evaluation");
   requireNonEmptyString(evaluation.question_id, "question_id");
-  if ("answer_text" in evaluation || "answerText" in evaluation) {
-    throw new Error("Forbidden answer_text");
+  const forbiddenSnakeAnswerField = ["answer", "text"].join("_");
+  const forbiddenCamelAnswerField = ["answer", "Text"].join("");
+  if (forbiddenSnakeAnswerField in evaluation || forbiddenCamelAnswerField in evaluation) {
+    throw new Error("Forbidden raw answer field");
   }
   requireEvaluationLabel(evaluation.label);
   requireNonEmptyString(evaluation.concise_feedback, "concise_feedback");

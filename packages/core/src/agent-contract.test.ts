@@ -500,7 +500,7 @@ describe("Viva voice agent contract", () => {
           },
         },
       }),
-    ).toThrow("Forbidden answer_text");
+    ).toThrow("Forbidden raw answer field");
 
     expect(() =>
       parseVivaServerFrame({

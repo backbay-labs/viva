@@ -511,6 +511,32 @@ describe("Viva agent browser client", () => {
     expect(next.staleEvents).toBe(1);
   });
 
+  test("reducer does not match pending generation id prefixes", () => {
+    const state = {
+      ...initialVivaAgentSessionState(),
+      activeResponseId: "response-1",
+      phase: "thinking" as const,
+      pendingSubmission: { generationId: "session_bootstrap-1", kind: "audio" as const },
+    };
+    const next = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "transcript_final",
+          response_id: "response-2-generation-session_bootstrap-10",
+          text: "wrong pending answer",
+          confidence: 0.95,
+        },
+      }),
+    );
+
+    expect(next.activeResponseId).toBe("response-1");
+    expect(next.finalTranscript).toBeUndefined();
+    expect(next.staleEvents).toBe(1);
+  });
+
   const sourceFixture = (sourceId: string, excerpt: string): AgentStudySourceReference => ({
     source_id: sourceId,
     document_id: "lec-5",

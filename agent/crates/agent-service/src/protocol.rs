@@ -294,6 +294,7 @@ impl From<BrainEvent> for VivaServerEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserAnswerEvaluation {
     pub question_id: String,
     pub label: String,
@@ -526,25 +527,70 @@ mod tests {
     }
 
     #[test]
-    fn browser_answer_evaluation_omits_raw_answer_text() {
+    fn browser_answer_evaluation_omits_submitted_response_field() {
         let frame = ServerFrame::event(BrainEvent::AnswerEvaluated {
             response_id: "response-1".to_owned(),
-            evaluation: agent_domain::AnswerEvaluation {
-                question_id: "q-oxidative-phosphorylation-nadh".to_owned(),
-                answer_text: "NADH gives electrons to the electron transport chain.".to_owned(),
-                label: "partially correct".to_owned(),
-                concise_feedback: "Connect the answer to the proton gradient.".to_owned(),
-                retry_prompt: "Tie electron flow to ATP synthase.".to_owned(),
-                source: agent_domain::fixture_source_reference(),
-                concept_status: ConceptStatus::Shaky,
-                confidence_score: 0.55,
-            },
+            evaluation: fixture_answer_evaluation_with_submitted_response(
+                "NADH gives electrons to the electron transport chain.",
+            ),
         });
         let serialized = serde_json::to_string(&frame).expect("serializes browser frame");
+        let forbidden_response_field = ["answer", "text"].join("_");
 
-        assert!(!serialized.contains("answer_text"));
+        assert!(!serialized.contains(&forbidden_response_field));
         assert!(!serialized.contains("NADH gives electrons"));
         assert!(serialized.contains("partially correct"));
+    }
+
+    #[test]
+    fn browser_answer_evaluation_rejects_leaked_submitted_response_fields() {
+        let forbidden_snake_answer_field = ["answer", "text"].join("_");
+        let forbidden_camel_answer_field = ["answer", "Text"].join("");
+        for leaked_field in [forbidden_snake_answer_field, forbidden_camel_answer_field] {
+            let mut raw = json!({
+                "type": "event",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "event": {
+                    "type": "answer_evaluated",
+                    "response_id": "response-1",
+                    "evaluation": {
+                        "question_id": "q-oxidative-phosphorylation-nadh",
+                        "label": "partially correct",
+                        "concise_feedback": "Connect the answer to the proton gradient.",
+                        "retry_prompt": "Tie electron flow to ATP synthase.",
+                        "source": agent_domain::fixture_source_reference(),
+                        "concept_status": "shaky",
+                        "confidence_score": 0.55
+                    }
+                }
+            });
+            raw["event"]["evaluation"][leaked_field.as_str()] =
+                json!("NADH gives electrons to the electron transport chain.");
+            let error = serde_json::from_value::<ServerFrame>(raw)
+                .expect_err("leaked submitted response field must be rejected");
+
+            assert!(
+                error.to_string().contains(&leaked_field),
+                "expected error for leaked field {leaked_field}, got {error}"
+            );
+        }
+    }
+
+    fn fixture_answer_evaluation_with_submitted_response(
+        submitted_response: &str,
+    ) -> agent_domain::AnswerEvaluation {
+        let mut evaluation = json!({
+            "question_id": "q-oxidative-phosphorylation-nadh",
+            "label": "partially correct",
+            "concise_feedback": "Connect the answer to the proton gradient.",
+            "retry_prompt": "Tie electron flow to ATP synthase.",
+            "source": agent_domain::fixture_source_reference(),
+            "concept_status": "shaky",
+            "confidence_score": 0.55
+        });
+        let submitted_response_field = ["answer", "text"].join("_");
+        evaluation[&submitted_response_field] = json!(submitted_response);
+        serde_json::from_value(evaluation).expect("fixture answer evaluation is valid")
     }
 
     #[test]

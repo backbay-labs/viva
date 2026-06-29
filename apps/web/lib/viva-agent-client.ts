@@ -759,9 +759,9 @@ function responseIdMatchesPendingSubmission(
   pendingSubmission: VivaAgentPendingSubmission | undefined,
 ): boolean {
   if (!responseId || !pendingSubmission) return false;
-  return responseId.includes(
-    `generation-${sanitizeResponseGenerationId(pendingSubmission.generationId)}`,
-  );
+  const generationId = sanitizeResponseGenerationId(pendingSubmission.generationId);
+  if (!generationId) return false;
+  return responseId.endsWith(`-generation-${generationId}`);
 }
 
 function sanitizeResponseGenerationId(value: string): string {
