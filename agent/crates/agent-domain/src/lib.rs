@@ -34,8 +34,10 @@ pub use ports::{
     StudyStoreCapabilities, StudyStoreWriteCounts, ToolIssuer, VoiceUsageRecord,
 };
 pub use study::{
-    fixture_question, fixture_source_reference, AnswerEvaluation, RecapSourceMoment, StudyQuestion,
-    StudySessionPhase, StudySessionRecap, StudySourceReference, TerminalSessionReason,
+    answer_retry_eligible, fixture_question, fixture_source_reference,
+    is_repairable_evaluation_label, one_shot_retry_prompt, AnswerEvaluation, RecapSourceMoment,
+    StudyQuestion, StudySessionPhase, StudySessionRecap, StudySourceReference,
+    TerminalSessionReason,
 };
 pub use tool_executor::{AuthorizedStudySession, ToolExecutionError, VivaToolExecutor};
 pub use tools::{ToolPlan, ToolProposal, ToolResult};

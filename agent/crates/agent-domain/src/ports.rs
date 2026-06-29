@@ -416,6 +416,16 @@ pub trait StudyMemoryStore: Send + Sync {
         Ok(false)
     }
 
+    async fn retry_prompt_was_spent_before_response(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        _response_id: &str,
+    ) -> Result<bool, PortError> {
+        Ok(false)
+    }
+
     async fn claim_session_token_nonce(
         &self,
         claim: SessionTokenNonceClaim,
@@ -545,6 +555,17 @@ pub trait StudyMemoryStore: Send + Sync {
             response_id,
             "answer evaluation authorization is not implemented by this store",
         ))
+    }
+
+    async fn mark_answer_evaluation_delivered(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        _response_id: &str,
+        _evaluation: &AnswerEvaluation,
+    ) -> Result<(), PortError> {
+        Ok(())
     }
 
     async fn authorize_source_reference(

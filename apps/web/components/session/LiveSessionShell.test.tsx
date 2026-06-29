@@ -316,6 +316,7 @@ describe("LiveSessionShell scene intent wiring", () => {
       />,
     );
     expect(guided).toContain("correction__retry-cue");
+    expect(guided).toContain("Try again");
     expect(guided).toContain(
       "Now connect that electron flow to ATP synthase in one precise sentence.",
     );
@@ -336,6 +337,7 @@ describe("LiveSessionShell scene intent wiring", () => {
       />,
     );
     expect(bare).not.toContain("correction__retry-cue");
+    expect(bare).not.toContain("Try again");
   });
 
   test("keeps the bloom at a constant floor in text mode", () => {

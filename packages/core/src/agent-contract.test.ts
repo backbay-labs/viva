@@ -374,6 +374,38 @@ describe("Viva voice agent contract", () => {
     ).toBe(true);
   });
 
+  test("accepts an empty retry prompt after the one-shot repair round is spent", () => {
+    const frame = parseVivaServerFrame({
+      type: "event",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      event: {
+        type: "answer_evaluated",
+        response_id: "response-2",
+        evaluation: {
+          question_id: "q-1",
+          label: "wrong",
+          concise_feedback: "Feedback.",
+          retry_prompt: "",
+          source: {
+            source_id: "src-1",
+            document_id: "doc-1",
+            span: "slide:1",
+            excerpt: "Excerpt.",
+            confidence: "high",
+            retrieval_reason: "server retrieval",
+          },
+          concept_status: "missed",
+          confidence_score: 0.31,
+        },
+      },
+    });
+
+    if (frame.type !== "event" || frame.event.type !== "answer_evaluated") {
+      throw new Error("Expected answer event");
+    }
+    expect(frame.event.evaluation.retry_prompt).toBe("");
+  });
+
   test("parses shared fake Cartesia/Gemini study session fixture", () => {
     const serverFrames = fakeSessionFixture.server.map(parseVivaServerFrame);
     const clientFrames = fakeSessionFixture.client.map(parseVivaClientFrame);

@@ -141,6 +141,25 @@ pub fn is_known_evaluation_label(label: &str) -> bool {
     )
 }
 
+pub fn is_repairable_evaluation_label(label: &str) -> bool {
+    matches!(
+        label,
+        "partially correct" | "vague" | "wrong" | "off-topic" | "insufficient evidence"
+    )
+}
+
+pub fn one_shot_retry_prompt(label: &str, submission_sequence: u32, follow_up: &str) -> String {
+    if submission_sequence == 1 && is_repairable_evaluation_label(label) {
+        follow_up.trim().to_owned()
+    } else {
+        String::new()
+    }
+}
+
+pub fn answer_retry_eligible(evaluation: &AnswerEvaluation) -> bool {
+    is_repairable_evaluation_label(&evaluation.label) && !evaluation.retry_prompt.trim().is_empty()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RecapSourceMoment {
     pub text: String,

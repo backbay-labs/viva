@@ -106,12 +106,29 @@ impl VivaToolExecutor {
         let concept_status =
             concept_status_for_terms(matched_terms.len(), question.expected_terms.len());
         let concise_feedback = feedback_for_terms(&question, &matched_terms);
+        let label = label_for_status(&concept_status);
+        let submission_sequence = if self
+            .store
+            .retry_prompt_was_spent_before_response(
+                &self.session.user_id,
+                &self.session.study_set_id,
+                &self.session.voice_session_id,
+                response_id,
+            )
+            .await?
+        {
+            2
+        } else {
+            1
+        };
+        let retry_prompt =
+            crate::one_shot_retry_prompt(label, submission_sequence, &question.follow_up);
         let evaluation = crate::AnswerEvaluation {
             question_id,
             answer_text,
-            label: label_for_status(&concept_status).to_owned(),
+            label: label.to_owned(),
             concise_feedback,
-            retry_prompt: question.follow_up,
+            retry_prompt,
             source: question.source,
             concept_status,
             confidence_score: confidence_for_terms(

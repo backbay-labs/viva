@@ -62,6 +62,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0014_session_recaps_one_row_per_session.sql",
         include_str!("../../../migrations/0014_session_recaps_one_row_per_session.sql"),
     ),
+    (
+        "0015_answer_attempt_misconception_fingerprint.sql",
+        include_str!("../../../migrations/0015_answer_attempt_misconception_fingerprint.sql"),
+    ),
 ];
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
@@ -303,6 +307,10 @@ mod tests {
         assert!(sql.contains("answer_content_policy TEXT NOT NULL DEFAULT 'none'"));
         assert!(sql.contains("ALTER COLUMN evaluation_label DROP NOT NULL"));
         assert!(sql.contains("answer_attempts_voice_session_response_id_idx"));
+        assert!(sql.contains("misconception_fingerprint JSONB"));
+        assert!(sql.contains("retry_prompt_delivered BOOLEAN NOT NULL DEFAULT FALSE"));
+        assert!(sql.contains("retry_prompt_delivered = TRUE"));
+        assert!(sql.contains("answer_attempts_misconception_fingerprint_idx"));
         assert!(!sql.contains("answer_text TEXT"));
         assert!(!sql.contains("evaluation JSONB"));
         assert!(sql.contains("CREATE TABLE voice_usage_events"));

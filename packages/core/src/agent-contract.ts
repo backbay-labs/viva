@@ -471,7 +471,7 @@ function parseAnswerEvaluation(value: unknown): AgentAnswerEvaluation {
   requireNonEmptyString(evaluation.question_id, "question_id");
   requireEvaluationLabel(evaluation.label);
   requireNonEmptyString(evaluation.concise_feedback, "concise_feedback");
-  requireNonEmptyString(evaluation.retry_prompt, "retry_prompt");
+  requireString(evaluation.retry_prompt, "retry_prompt");
   const source = parseStudySourceReference(evaluation.source);
   requireConceptStatus(evaluation.concept_status);
   if (

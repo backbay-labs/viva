@@ -7,9 +7,10 @@ mod postgres;
 
 pub use memory::{
     AnswerAttemptRecord, ConceptRecord, ConceptStatusRecord, FixtureIdTranslation,
-    InMemoryStudyState, InMemoryStudyStore, PersistedAnswerEvaluation, PersistedRecapSourceMoment,
-    PersistedSessionRecap, PersistedSourceReference, RecapRecord, ReviewItemRecord,
-    SourceSpanRecord, StudyDocumentRecord, StudyQuestionRecord, StudySetRecord, VoiceSessionRecord,
+    InMemoryStudyState, InMemoryStudyStore, PersistedAnswerEvaluation,
+    PersistedMisconceptionFingerprint, PersistedRecapSourceMoment, PersistedSessionRecap,
+    PersistedSourceReference, RecapRecord, ReviewItemRecord, SourceSpanRecord, StudyDocumentRecord,
+    StudyQuestionRecord, StudySetRecord, VoiceSessionRecord,
 };
 pub use migrations::{
     assert_schema_has_no_raw_payload_columns, migration_sql, run_migrations, seed_postgres_fixture,

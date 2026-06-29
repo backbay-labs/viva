@@ -2024,10 +2024,47 @@ where
             }
         }
     }
+    let delivered_retry_prompt = match &event {
+        agent_domain::BrainEvent::AnswerEvaluated {
+            response_id,
+            evaluation,
+        } if agent_domain::answer_retry_eligible(evaluation) => {
+            Some((response_id.clone(), evaluation.clone()))
+        }
+        _ => None,
+    };
     let Some(frame) = ServerFrame::browser_event(event) else {
         return Ok(ForwardBrainEvent::Continue);
     };
     send_json(sender, &frame).await?;
+    if let Some((response_id, evaluation)) = delivered_retry_prompt {
+        if let Err(error) = context
+            .state
+            .study_store
+            .mark_answer_evaluation_delivered(
+                &context.session_binding.user_id,
+                &context.session_binding.study_set_id,
+                &context.session_binding.session_id,
+                &response_id,
+                &evaluation,
+            )
+            .await
+        {
+            if store_write_error_is_durability_degraded(context.state, &error) {
+                context.state.evidence.record(VoiceEvidenceEvent::new(
+                    VoiceEvidenceEventKind::StoreCounts,
+                    context.voice_session_id.clone(),
+                    "answer_evaluation_delivery_failed: durability_degraded",
+                ));
+                return Ok(ForwardBrainEvent::DurabilityDegraded);
+            }
+            context.state.evidence.record(VoiceEvidenceEvent::new(
+                VoiceEvidenceEventKind::StoreCounts,
+                context.voice_session_id.clone(),
+                format!("answer_evaluation_delivery_failed: {error}"),
+            ));
+        }
+    }
     Ok(ForwardBrainEvent::Continue)
 }
 
