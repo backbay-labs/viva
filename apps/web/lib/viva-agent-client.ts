@@ -141,6 +141,7 @@ export type VivaAgentGeneration = {
 export type VivaAgentPendingSubmission = {
   generationId: string;
   kind: "audio" | "text";
+  acceptedResponseId?: string;
 };
 
 export type VivaAgentAudioOutput = {
@@ -616,6 +617,7 @@ export function vivaAgentReducer(
   const responseMatchesPendingSubmission = responseIdMatchesPendingSubmission(
     responseId,
     state.pendingSubmission,
+    state.activeResponseId,
   );
   if (responseId && state.cancelledResponseIds.includes(responseId)) {
     return { ...state, staleEvents: state.staleEvents + 1 };
@@ -631,7 +633,7 @@ export function vivaAgentReducer(
   ) {
     return { ...state, staleEvents: state.staleEvents + 1 };
   }
-  if (responseMatchesPendingSubmission && responseId) {
+  if (responseMatchesPendingSubmission && responseId && state.activeResponseId !== responseId) {
     state = adoptPendingResponse(state, responseId);
   }
 
@@ -757,11 +759,21 @@ export function vivaAgentReducer(
 function responseIdMatchesPendingSubmission(
   responseId: string | undefined,
   pendingSubmission: VivaAgentPendingSubmission | undefined,
+  activeResponseId: string | undefined,
 ): boolean {
   if (!responseId || !pendingSubmission) return false;
+  if (pendingSubmission.acceptedResponseId) {
+    return responseId === pendingSubmission.acceptedResponseId;
+  }
+  if (activeResponseId && responseId === activeResponseId) return false;
   const generationId = sanitizeResponseGenerationId(pendingSubmission.generationId);
   if (!generationId) return false;
-  return responseId.endsWith(`-generation-${generationId}`);
+  if (!responseId.endsWith(`-generation-${generationId}`)) return false;
+  if (!activeResponseId) return true;
+  const responseTurn = responseTurnNumber(responseId);
+  const activeTurn = responseTurnNumber(activeResponseId);
+  if (responseTurn === undefined || activeTurn === undefined) return false;
+  return responseTurn > activeTurn;
 }
 
 function adoptPendingResponse(
@@ -772,6 +784,9 @@ function adoptPendingResponse(
   return {
     ...state,
     activeResponseId: responseId,
+    pendingSubmission: state.pendingSubmission
+      ? { ...state.pendingSubmission, acceptedResponseId: responseId }
+      : state.pendingSubmission,
     transcript: "",
     finalTranscript: undefined,
     transcriptConfidence: undefined,
@@ -787,6 +802,13 @@ function adoptPendingResponse(
       ? state.audio.filter((output) => output.responseId !== previousResponseId)
       : state.audio,
   };
+}
+
+function responseTurnNumber(responseId: string): number | undefined {
+  const match = /^response-(\d+)(?:-|$)/.exec(responseId);
+  if (!match) return undefined;
+  const turn = Number.parseInt(match[1], 10);
+  return Number.isSafeInteger(turn) ? turn : undefined;
 }
 
 function sanitizeResponseGenerationId(value: string): string {

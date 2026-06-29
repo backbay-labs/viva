@@ -530,6 +530,11 @@ describe("Viva agent browser client", () => {
     );
 
     expect(next.activeResponseId).toBe("response-2-generation-session_bootstrap-1");
+    expect(next.pendingSubmission).toEqual({
+      generationId: "session_bootstrap-1",
+      kind: "audio",
+      acceptedResponseId: "response-2-generation-session_bootstrap-1",
+    });
     expect(next.finalTranscript).toBe("second attempt answer");
     expect(next.evaluation).toBeUndefined();
     expect(next.currentSource).toBeUndefined();
@@ -538,6 +543,47 @@ describe("Viva agent browser client", () => {
     expect(next.manuscriptIntents).toEqual([]);
     expect(next.audio).toEqual([]);
     expect(next.staleEvents).toBe(0);
+
+    const afterSameResponseIntent = vivaAgentReducer(
+      next,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "manuscript_intent",
+          response_id: "response-2-generation-session_bootstrap-1",
+          intent: { type: "scene_intent", register: "reflecting", emphasis: "quiet" },
+        },
+      }),
+    );
+
+    expect(afterSameResponseIntent.finalTranscript).toBe("second attempt answer");
+    expect(afterSameResponseIntent.manuscriptIntents).toEqual([
+      {
+        responseId: "response-2-generation-session_bootstrap-1",
+        intent: { type: "scene_intent", register: "reflecting", emphasis: "quiet" },
+      },
+    ]);
+
+    const afterOldSameGenerationEvent = vivaAgentReducer(
+      afterSameResponseIntent,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "transcript_delta",
+          response_id: "response-1-generation-session_bootstrap-1",
+          text: "old response should stay stale",
+        },
+      }),
+    );
+
+    expect(afterOldSameGenerationEvent.activeResponseId).toBe(
+      "response-2-generation-session_bootstrap-1",
+    );
+    expect(afterOldSameGenerationEvent.finalTranscript).toBe("second attempt answer");
+    expect(afterOldSameGenerationEvent.transcript).toBe("second attempt answer");
+    expect(afterOldSameGenerationEvent.staleEvents).toBe(1);
   });
 
   test("reducer still rejects nonmatching response ids while a submission is pending", () => {
