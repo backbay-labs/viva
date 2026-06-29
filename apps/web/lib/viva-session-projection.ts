@@ -71,12 +71,23 @@ export type VoiceTurnNudge = {
   text: string;
 };
 
+export type VoiceCaptureStatus = "heard" | "silence_hold" | "captured" | "checking";
+
+export type VoiceCaptureTrustState = {
+  state: VoiceCaptureStatus;
+  label: string;
+  text: string;
+  ephemeralText?: string;
+  repair?: VoiceTurnNudge;
+};
+
 export type VoiceTurnTakingState = {
   phase: VoiceTurnPhase;
   label: string;
   headline: string;
   detail: string;
   captions: VoiceTurnCaption[];
+  capture?: VoiceCaptureTrustState;
   nudge?: VoiceTurnNudge;
   interruptAcknowledged: boolean;
   ariaStatus: string;
@@ -1086,6 +1097,7 @@ function terminalReasonWithoutRecap(derived: VivaAgentDerivedState): boolean {
 }
 
 export function projectTurnTakingState(input: {
+  finalTranscript?: string;
   hasPendingAudio?: boolean;
   interruptAcknowledged?: boolean;
   playbackSpeaking?: boolean;
@@ -1093,6 +1105,8 @@ export function projectTurnTakingState(input: {
   runtime?: RuntimeCopy;
   state: SessionState;
   textAnswerFallbackActive?: boolean;
+  transcript?: string;
+  transcriptConfidence?: number;
 }): VoiceTurnTakingState {
   const captions = turnCaptions(input.question);
   const speaking = Boolean(input.hasPendingAudio || input.playbackSpeaking);
@@ -1108,10 +1122,19 @@ export function projectTurnTakingState(input: {
     interruptAcknowledged,
     textAnswerFallbackActive: base.phase === "listening" && input.textAnswerFallbackActive,
   });
+  const capture = turnCaptureTrustState({
+    finalTranscript: input.finalTranscript,
+    phase: base.phase,
+    textAnswerFallbackActive: Boolean(input.textAnswerFallbackActive),
+    transcript: input.transcript,
+    transcriptConfidence: input.transcriptConfidence,
+  });
   const ariaStatus = compactSentences([
     base.label,
     base.headline,
     base.detail,
+    capture ? `${capture.label}: ${capture.text}` : undefined,
+    capture?.repair ? `${capture.repair.label}: ${capture.repair.text}` : undefined,
     nudge ? `${nudge.label}: ${nudge.text}` : undefined,
     captions.length > 0
       ? `Captions available: ${captions.map((caption) => caption.label).join(", ")}`
@@ -1122,9 +1145,81 @@ export function projectTurnTakingState(input: {
     ...base,
     ariaStatus,
     captions,
+    capture,
     interruptAcknowledged,
     nudge,
   };
+}
+
+function turnCaptureTrustState(input: {
+  finalTranscript?: string;
+  phase: VoiceTurnPhase;
+  textAnswerFallbackActive: boolean;
+  transcript?: string;
+  transcriptConfidence?: number;
+}): VoiceCaptureTrustState | undefined {
+  if (
+    input.phase !== "listening" &&
+    input.phase !== "thinking" &&
+    input.phase !== "feedback"
+  ) {
+    return undefined;
+  }
+
+  const heardText = boundedEphemeralHearing(input.finalTranscript ?? input.transcript);
+  const repair = transcriptionWasUncertain(input.transcriptConfidence)
+    ? {
+        label: "Mishearing repair",
+        text: "Heard with low confidence; correct it in the margin if needed.",
+      }
+    : undefined;
+
+  if (input.phase === "thinking") {
+    return {
+      ephemeralText: heardText,
+      label: "Checking",
+      repair,
+      state: "checking",
+      text: heardText ? "Captured; checking the source now." : "Checking the bounded source.",
+    };
+  }
+
+  if (input.finalTranscript?.trim()) {
+    return {
+      ephemeralText: heardText,
+      label: "Captured",
+      repair,
+      state: "captured",
+      text: "Answer captured for this turn only.",
+    };
+  }
+
+  if (input.transcript?.trim()) {
+    return {
+      ephemeralText: heardText,
+      label: "Heard",
+      state: "heard",
+      text: "Speech is being captured for this turn.",
+    };
+  }
+
+  if (input.phase === "listening") {
+    return {
+      label: input.textAnswerFallbackActive ? "Silence hold" : "Listening hold",
+      state: "silence_hold",
+      text: input.textAnswerFallbackActive
+        ? "No speech was captured; write or try speaking again."
+        : "Waiting for speech before the turn is submitted.",
+    };
+  }
+
+  return undefined;
+}
+
+function boundedEphemeralHearing(value: string | undefined): string | undefined {
+  const normalized = value?.replace(/\s+/g, " ").trim();
+  if (!normalized) return undefined;
+  return normalized.length > 96 ? `${normalized.slice(0, 93)}...` : normalized;
 }
 
 function turnBaseState(input: {

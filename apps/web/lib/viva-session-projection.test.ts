@@ -864,6 +864,52 @@ describe("projectTurnTakingState", () => {
     expect(interrupted.interruptAcknowledged).toBe(true);
   });
 
+  test("projects explicit voice capture trust states without transcript UI copy", () => {
+    const silence = projectTurnTakingState({
+      question: liveQuestion,
+      state: "listening",
+    });
+    const heard = projectTurnTakingState({
+      question: liveQuestion,
+      state: "listening",
+      transcript: "NADH donates electrons",
+    });
+    const captured = projectTurnTakingState({
+      finalTranscript: "NADH donates electrons to the electron transport chain",
+      question: liveQuestion,
+      state: "listening",
+      transcriptConfidence: 0.42,
+    });
+    const checking = projectTurnTakingState({
+      finalTranscript: "NADH donates electrons to the electron transport chain",
+      question: liveQuestion,
+      state: "thinking",
+      transcriptConfidence: 0.42,
+    });
+
+    expect(silence.capture?.state).toBe("silence_hold");
+    expect(heard.capture?.state).toBe("heard");
+    expect(heard.capture?.ephemeralText).toBe("NADH donates electrons");
+    expect(captured.capture?.state).toBe("captured");
+    expect(captured.capture?.repair?.label).toBe("Mishearing repair");
+    expect(checking.capture?.state).toBe("checking");
+    expect(checking.capture?.text).toContain("Captured");
+    for (const turn of [silence, heard, captured, checking]) {
+      expect(/raw|transcript|pcm16|secret/i.test(turn.ariaStatus)).toBe(false);
+    }
+  });
+
+  test("bounds ephemeral heard text so capture status cannot become a transcript surface", () => {
+    const turn = projectTurnTakingState({
+      finalTranscript: "NADH ".repeat(40),
+      question: liveQuestion,
+      state: "thinking",
+    });
+
+    expect(turn.capture?.ephemeralText?.length).toBeLessThanOrEqual(96);
+    expect(turn.capture?.ephemeralText?.endsWith("...")).toBe(true);
+  });
+
   test("clears stale barge-in and no-speech nudges after leaving listening", () => {
     const turn = projectTurnTakingState({
       interruptAcknowledged: true,

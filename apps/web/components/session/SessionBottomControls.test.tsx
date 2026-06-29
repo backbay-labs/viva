@@ -31,23 +31,12 @@ describe("SessionBottomControls", () => {
     expect(calls).toEqual(["sources"]);
   });
 
-  test("the transcript control discloses the finalized transcript record", () => {
-    const markup = renderToStaticMarkup(
-      <SessionBottomControls
-        onEndSession={() => {}}
-        transcript="NADH donates electrons to the electron transport chain."
-      />,
-    );
-
-    expect(markup).toContain("<details");
-    expect(markup).toContain("Transcript");
-    expect(markup).toContain("NADH donates electrons to the electron transport chain.");
-  });
-
-  test("the transcript control shows an honest empty state before any turn is finalized", () => {
+  test("does not render a transcript drawer; heard text stays in the turn panel", () => {
     const markup = renderToStaticMarkup(<SessionBottomControls onEndSession={() => {}} />);
 
-    expect(markup).toContain("session-controls__empty");
+    expect(markup).not.toContain("<details");
+    expect(markup).not.toContain("Transcript");
+    expect(markup).not.toContain("Session transcript");
     expect(markup).not.toContain("NADH donates electrons");
   });
 });

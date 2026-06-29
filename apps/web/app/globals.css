@@ -3516,13 +3516,56 @@ button {
 }
 
 .turn-taking__nudge span,
-.turn-captions__line span {
+.turn-captions__line span,
+.capture-trust__status span,
+.capture-trust__repair span {
   flex: none;
   color: var(--viva-ochre);
   font-weight: 700;
 }
 
+.capture-trust {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 0.32rem;
+  min-width: 0;
+  padding: 0.54rem 0.62rem;
+  border: 1px solid rgba(120, 94, 170, 0.18);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.54);
+}
+
+.capture-trust[data-state="checking"] {
+  border-color: rgba(193, 134, 74, 0.2);
+  background: rgba(255, 248, 235, 0.66);
+}
+
+.capture-trust__status,
+.capture-trust__repair,
+.capture-trust__heard {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 0.78rem;
+  line-height: 1.38;
+  overflow-wrap: anywhere;
+}
+
+.capture-trust__status,
+.capture-trust__repair {
+  display: flex;
+  gap: 0.46rem;
+  color: var(--viva-ink-soft);
+}
+
+.capture-trust__heard {
+  max-height: 3.8rem;
+  overflow: hidden;
+  color: var(--viva-ink);
+  font-weight: 650;
+}
+
 .turn-captions {
+  grid-column: 1 / -1;
   display: grid;
   align-content: center;
   gap: 0.36rem;
