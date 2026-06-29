@@ -3565,6 +3565,7 @@ button {
 }
 
 .turn-captions {
+  grid-column: 1 / -1;
   display: grid;
   align-content: center;
   gap: 0.36rem;
