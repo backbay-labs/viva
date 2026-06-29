@@ -632,7 +632,7 @@ export function vivaAgentReducer(
     return { ...state, staleEvents: state.staleEvents + 1 };
   }
   if (responseMatchesPendingSubmission && responseId) {
-    state = { ...state, activeResponseId: responseId };
+    state = adoptPendingResponse(state, responseId);
   }
 
   switch (event.type) {
@@ -762,6 +762,31 @@ function responseIdMatchesPendingSubmission(
   const generationId = sanitizeResponseGenerationId(pendingSubmission.generationId);
   if (!generationId) return false;
   return responseId.endsWith(`-generation-${generationId}`);
+}
+
+function adoptPendingResponse(
+  state: VivaAgentSessionState,
+  responseId: string,
+): VivaAgentSessionState {
+  const previousResponseId = state.activeResponseId;
+  return {
+    ...state,
+    activeResponseId: responseId,
+    transcript: "",
+    finalTranscript: undefined,
+    transcriptConfidence: undefined,
+    evaluation: undefined,
+    currentSource: undefined,
+    sources: [],
+    currentConceptStatus: undefined,
+    recap: undefined,
+    manuscriptIntents: previousResponseId
+      ? state.manuscriptIntents.filter((intent) => intent.responseId !== previousResponseId)
+      : state.manuscriptIntents,
+    audio: previousResponseId
+      ? state.audio.filter((output) => output.responseId !== previousResponseId)
+      : state.audio,
+  };
 }
 
 function sanitizeResponseGenerationId(value: string): string {

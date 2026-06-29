@@ -87,6 +87,16 @@ export type AgentAnswerEvaluation = {
   confidence_score: number;
 };
 
+const allowedAnswerEvaluationFields = new Set([
+  "question_id",
+  "label",
+  "concise_feedback",
+  "retry_prompt",
+  "source",
+  "concept_status",
+  "confidence_score",
+]);
+
 export type AgentEvaluationLabel =
   | "strong"
   | "mostly correct"
@@ -453,16 +463,16 @@ function parseStudyQuestion(value: unknown): AgentStudyQuestion {
 
 function parseAnswerEvaluation(value: unknown): AgentAnswerEvaluation {
   const evaluation = requireRecord(value, "answer evaluation");
-  requireNonEmptyString(evaluation.question_id, "question_id");
-  const forbiddenSnakeAnswerField = ["answer", "text"].join("_");
-  const forbiddenCamelAnswerField = ["answer", "Text"].join("");
-  if (forbiddenSnakeAnswerField in evaluation || forbiddenCamelAnswerField in evaluation) {
-    throw new Error("Forbidden raw answer field");
+  for (const key of Object.keys(evaluation)) {
+    if (!allowedAnswerEvaluationFields.has(key)) {
+      throw new Error("Unknown answer evaluation field");
+    }
   }
+  requireNonEmptyString(evaluation.question_id, "question_id");
   requireEvaluationLabel(evaluation.label);
   requireNonEmptyString(evaluation.concise_feedback, "concise_feedback");
   requireNonEmptyString(evaluation.retry_prompt, "retry_prompt");
-  parseStudySourceReference(evaluation.source);
+  const source = parseStudySourceReference(evaluation.source);
   requireConceptStatus(evaluation.concept_status);
   if (
     typeof evaluation.confidence_score !== "number" ||
@@ -472,7 +482,15 @@ function parseAnswerEvaluation(value: unknown): AgentAnswerEvaluation {
   ) {
     throw new Error("Invalid confidence_score");
   }
-  return evaluation as AgentAnswerEvaluation;
+  return {
+    question_id: evaluation.question_id,
+    label: evaluation.label,
+    concise_feedback: evaluation.concise_feedback,
+    retry_prompt: evaluation.retry_prompt,
+    source,
+    concept_status: evaluation.concept_status,
+    confidence_score: evaluation.confidence_score,
+  } as AgentAnswerEvaluation;
 }
 
 function parseStudySessionRecap(value: unknown): AgentStudySessionRecap {

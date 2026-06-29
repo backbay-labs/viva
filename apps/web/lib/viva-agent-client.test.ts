@@ -485,6 +485,61 @@ describe("Viva agent browser client", () => {
     expect(next.staleEvents).toBe(0);
   });
 
+  test("reducer clears prior turn artifacts when adopting a pending retry response", () => {
+    const source = sourceFixture("src-prior", "Prior source excerpt.");
+    const state = {
+      ...initialVivaAgentSessionState(),
+      activeResponseId: "response-1",
+      phase: "thinking" as const,
+      pendingSubmission: { generationId: "session_bootstrap-1", kind: "audio" as const },
+      transcript: "prior partial",
+      finalTranscript: "prior final",
+      transcriptConfidence: 0.95,
+      evaluation: {
+        question_id: "q-1",
+        label: "partially correct" as const,
+        concise_feedback: "Prior feedback",
+        retry_prompt: "Try again.",
+        source,
+        concept_status: "shaky" as const,
+        confidence_score: 0.55,
+      },
+      currentSource: source,
+      sources: [source],
+      currentConceptStatus: "shaky" as const,
+      manuscriptIntents: [
+        {
+          responseId: "response-1",
+          intent: { type: "scene_intent", register: "examining", emphasis: "measured" },
+        },
+      ],
+      audio: [{ responseId: "response-1", frame: { pcm16_base64: "AQIDBA==" } }],
+    };
+    const next = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "transcript_final",
+          response_id: "response-2-generation-session_bootstrap-1",
+          text: "second attempt answer",
+          confidence: null,
+        },
+      }),
+    );
+
+    expect(next.activeResponseId).toBe("response-2-generation-session_bootstrap-1");
+    expect(next.finalTranscript).toBe("second attempt answer");
+    expect(next.evaluation).toBeUndefined();
+    expect(next.currentSource).toBeUndefined();
+    expect(next.sources).toEqual([]);
+    expect(next.currentConceptStatus).toBeUndefined();
+    expect(next.manuscriptIntents).toEqual([]);
+    expect(next.audio).toEqual([]);
+    expect(next.staleEvents).toBe(0);
+  });
+
   test("reducer still rejects nonmatching response ids while a submission is pending", () => {
     const state = {
       ...initialVivaAgentSessionState(),

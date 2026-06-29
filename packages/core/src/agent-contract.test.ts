@@ -500,7 +500,35 @@ describe("Viva voice agent contract", () => {
           },
         },
       }),
-    ).toThrow("Forbidden raw answer field");
+    ).toThrow("Unknown answer evaluation field");
+
+    expect(() =>
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "answer_evaluated",
+          response_id: "response-1",
+          evaluation: {
+            question_id: "q-1",
+            raw_answer_text: "raw learner answer must stay out of browser evaluations",
+            label: "mostly correct",
+            concise_feedback: "Feedback.",
+            retry_prompt: "Try again.",
+            source: {
+              source_id: "src-1",
+              document_id: "doc-1",
+              span: "slide:1",
+              excerpt: "Excerpt.",
+              confidence: "high",
+              retrieval_reason: "server retrieval",
+            },
+            concept_status: "strong",
+            confidence_score: 0.9,
+          },
+        },
+      }),
+    ).toThrow("Unknown answer evaluation field");
 
     expect(() =>
       parseVivaServerFrame({
