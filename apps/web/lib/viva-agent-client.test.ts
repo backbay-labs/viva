@@ -458,6 +458,59 @@ describe("Viva agent browser client", () => {
     expect(afterStaleRecap.staleEvents).toBe(state.staleEvents + 1);
   });
 
+  test("reducer accepts a pending second attempt when response id carries the submission generation", () => {
+    const state = {
+      ...initialVivaAgentSessionState(),
+      activeResponseId: "response-1",
+      phase: "thinking" as const,
+      pendingSubmission: { generationId: "session_bootstrap-1", kind: "audio" as const },
+    };
+    const next = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "transcript_final",
+          response_id: "response-2-generation-session_bootstrap-1",
+          text: "second attempt answer",
+          confidence: null,
+        },
+      }),
+    );
+
+    expect(next.activeResponseId).toBe("response-2-generation-session_bootstrap-1");
+    expect(next.finalTranscript).toBe("second attempt answer");
+    expect(next.transcriptConfidence).toBeUndefined();
+    expect(next.staleEvents).toBe(0);
+  });
+
+  test("reducer still rejects nonmatching response ids while a submission is pending", () => {
+    const state = {
+      ...initialVivaAgentSessionState(),
+      activeResponseId: "response-1",
+      phase: "thinking" as const,
+      pendingSubmission: { generationId: "session_bootstrap-1", kind: "audio" as const },
+    };
+    const next = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "transcript_final",
+          response_id: "response-2-generation-other",
+          text: "wrong pending answer",
+          confidence: 0.95,
+        },
+      }),
+    );
+
+    expect(next.activeResponseId).toBe("response-1");
+    expect(next.finalTranscript).toBeUndefined();
+    expect(next.staleEvents).toBe(1);
+  });
+
   const sourceFixture = (sourceId: string, excerpt: string): AgentStudySourceReference => ({
     source_id: sourceId,
     document_id: "lec-5",
@@ -1067,7 +1120,8 @@ describe("Viva agent browser client", () => {
       frame: { pcm16_base64: "AQIDBA==" },
     });
     expect(state.finalTranscript).toBe("NADH donates electrons to the electron transport chain.");
-    expect(state.evaluation?.answer_text).toBe(
+    expect(JSON.stringify(state.evaluation)).not.toContain("answer_text");
+    expect(JSON.stringify(state.evaluation)).not.toContain(
       "NADH donates electrons to the electron transport chain.",
     );
     expect(state.sources[0]?.source_id).toBe("src-lecture-5-slide-18");
@@ -1149,7 +1203,6 @@ describe("Viva agent browser client", () => {
           response_id: "response-1",
           evaluation: {
             question_id: "q-oxidative-phosphorylation-nadh",
-            answer_text: "stale answer",
             label: "mostly correct",
             concise_feedback: "stale feedback",
             retry_prompt: "stale retry",

@@ -613,6 +613,10 @@ export function vivaAgentReducer(
 
   const event = frame.event;
   const responseId = responseIdForEvent(event);
+  const responseMatchesPendingSubmission = responseIdMatchesPendingSubmission(
+    responseId,
+    state.pendingSubmission,
+  );
   if (responseId && state.cancelledResponseIds.includes(responseId)) {
     return { ...state, staleEvents: state.staleEvents + 1 };
   }
@@ -622,9 +626,13 @@ export function vivaAgentReducer(
     event.type !== "cancellation" &&
     (event.type !== "recap_ready" || state.pendingSubmission) &&
     state.activeResponseId &&
-    state.activeResponseId !== responseId
+    state.activeResponseId !== responseId &&
+    !responseMatchesPendingSubmission
   ) {
     return { ...state, staleEvents: state.staleEvents + 1 };
+  }
+  if (responseMatchesPendingSubmission && responseId) {
+    state = { ...state, activeResponseId: responseId };
   }
 
   switch (event.type) {
@@ -744,6 +752,23 @@ export function vivaAgentReducer(
     default:
       return state;
   }
+}
+
+function responseIdMatchesPendingSubmission(
+  responseId: string | undefined,
+  pendingSubmission: VivaAgentPendingSubmission | undefined,
+): boolean {
+  if (!responseId || !pendingSubmission) return false;
+  return responseId.includes(
+    `generation-${sanitizeResponseGenerationId(pendingSubmission.generationId)}`,
+  );
+}
+
+function sanitizeResponseGenerationId(value: string): string {
+  return Array.from(value)
+    .map((character) => (/^[a-zA-Z0-9_-]$/.test(character) ? character : "-"))
+    .join("")
+    .slice(0, 96);
 }
 
 function pendingSubmissionForSessionPhase(

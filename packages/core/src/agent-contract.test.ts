@@ -22,8 +22,8 @@ import {
 import { seedStudySets } from "./index";
 
 describe("Viva voice agent contract", () => {
-  test("uses protocol v4 because terminal reasons include tool executor failures", () => {
-    expect(VIVA_VOICE_PROTOCOL_VERSION).toBe(4);
+  test("uses protocol v5 because browser evaluations no longer expose raw answer text", () => {
+    expect(VIVA_VOICE_PROTOCOL_VERSION).toBe(5);
     expect(() =>
       parseVivaServerFrame({
         type: "ready",
@@ -483,7 +483,34 @@ describe("Viva voice agent contract", () => {
           response_id: "response-1",
           evaluation: {
             question_id: "q-1",
-            answer_text: "answer",
+            answer_text: "raw learner answer must stay out of browser evaluations",
+            label: "mostly correct",
+            concise_feedback: "Feedback.",
+            retry_prompt: "Try again.",
+            source: {
+              source_id: "src-1",
+              document_id: "doc-1",
+              span: "slide:1",
+              excerpt: "Excerpt.",
+              confidence: "high",
+              retrieval_reason: "server retrieval",
+            },
+            concept_status: "strong",
+            confidence_score: 0.9,
+          },
+        },
+      }),
+    ).toThrow("Forbidden answer_text");
+
+    expect(() =>
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "answer_evaluated",
+          response_id: "response-1",
+          evaluation: {
+            question_id: "q-1",
             label: "pretty good",
             concise_feedback: "Feedback.",
             retry_prompt: "Try again.",
@@ -511,7 +538,6 @@ describe("Viva voice agent contract", () => {
           response_id: "response-1",
           evaluation: {
             question_id: "q-1",
-            answer_text: "answer",
             label: "mostly correct",
             concise_feedback: "Feedback.",
             retry_prompt: "Try again.",

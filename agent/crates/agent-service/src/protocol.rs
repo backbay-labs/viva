@@ -6,7 +6,7 @@ use agent_domain::{
 };
 use serde::{Deserialize, Serialize};
 
-pub const VIVA_VOICE_PROTOCOL_VERSION: u32 = 4;
+pub const VIVA_VOICE_PROTOCOL_VERSION: u32 = 5;
 pub const VIVA_VOICE_SAMPLE_RATE_HZ: u32 = 24_000;
 pub const VIVA_VOICE_INPUT_ENCODING: &str = "pcm_s16le";
 pub const VIVA_VOICE_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
@@ -131,7 +131,7 @@ pub enum VivaServerEvent {
     },
     AnswerEvaluated {
         response_id: String,
-        evaluation: AnswerEvaluation,
+        evaluation: BrowserAnswerEvaluation,
     },
     SourceReference {
         response_id: String,
@@ -203,7 +203,7 @@ impl From<BrainEvent> for VivaServerEvent {
                 evaluation,
             } => Self::AnswerEvaluated {
                 response_id,
-                evaluation,
+                evaluation: BrowserAnswerEvaluation::from(evaluation),
             },
             BrainEvent::SourceReference {
                 response_id,
@@ -289,6 +289,31 @@ impl From<BrainEvent> for VivaServerEvent {
                 source: "agent-service".to_owned(),
                 message: "unsupported brain event".to_owned(),
             },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BrowserAnswerEvaluation {
+    pub question_id: String,
+    pub label: String,
+    pub concise_feedback: String,
+    pub retry_prompt: String,
+    pub source: StudySourceReference,
+    pub concept_status: ConceptStatus,
+    pub confidence_score: f32,
+}
+
+impl From<AnswerEvaluation> for BrowserAnswerEvaluation {
+    fn from(evaluation: AnswerEvaluation) -> Self {
+        Self {
+            question_id: evaluation.question_id,
+            label: evaluation.label,
+            concise_feedback: evaluation.concise_feedback,
+            retry_prompt: evaluation.retry_prompt,
+            source: evaluation.source,
+            concept_status: evaluation.concept_status,
+            confidence_score: evaluation.confidence_score,
         }
     }
 }
@@ -498,6 +523,28 @@ mod tests {
             response_id: "response-1".to_owned()
         })
         .is_none());
+    }
+
+    #[test]
+    fn browser_answer_evaluation_omits_raw_answer_text() {
+        let frame = ServerFrame::event(BrainEvent::AnswerEvaluated {
+            response_id: "response-1".to_owned(),
+            evaluation: agent_domain::AnswerEvaluation {
+                question_id: "q-oxidative-phosphorylation-nadh".to_owned(),
+                answer_text: "NADH gives electrons to the electron transport chain.".to_owned(),
+                label: "partially correct".to_owned(),
+                concise_feedback: "Connect the answer to the proton gradient.".to_owned(),
+                retry_prompt: "Tie electron flow to ATP synthase.".to_owned(),
+                source: agent_domain::fixture_source_reference(),
+                concept_status: ConceptStatus::Shaky,
+                confidence_score: 0.55,
+            },
+        });
+        let serialized = serde_json::to_string(&frame).expect("serializes browser frame");
+
+        assert!(!serialized.contains("answer_text"));
+        assert!(!serialized.contains("NADH gives electrons"));
+        assert!(serialized.contains("partially correct"));
     }
 
     #[test]

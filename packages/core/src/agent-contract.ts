@@ -1,4 +1,4 @@
-export const VIVA_VOICE_PROTOCOL_VERSION = 4;
+export const VIVA_VOICE_PROTOCOL_VERSION = 5;
 export const VIVA_VOICE_SAMPLE_RATE_HZ = 24_000;
 export const VIVA_VOICE_INPUT_ENCODING = "pcm_s16le";
 export const VIVA_VOICE_MAX_TEXT_FRAME_BYTES = 64 * 1024;
@@ -79,7 +79,6 @@ export type AgentStudyQuestion = {
 
 export type AgentAnswerEvaluation = {
   question_id: string;
-  answer_text: string;
   label: AgentEvaluationLabel;
   concise_feedback: string;
   retry_prompt: string;
@@ -455,7 +454,9 @@ function parseStudyQuestion(value: unknown): AgentStudyQuestion {
 function parseAnswerEvaluation(value: unknown): AgentAnswerEvaluation {
   const evaluation = requireRecord(value, "answer evaluation");
   requireNonEmptyString(evaluation.question_id, "question_id");
-  requireString(evaluation.answer_text, "answer_text");
+  if ("answer_text" in evaluation || "answerText" in evaluation) {
+    throw new Error("Forbidden answer_text");
+  }
   requireEvaluationLabel(evaluation.label);
   requireNonEmptyString(evaluation.concise_feedback, "concise_feedback");
   requireNonEmptyString(evaluation.retry_prompt, "retry_prompt");

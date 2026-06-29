@@ -2,7 +2,7 @@
   "client": [
     {
       "type": "session_config",
-      "version": 4,
+      "version": 5,
       "session": {
         "session_id": "voice-session-1",
         "user_id": "user-1",
@@ -19,29 +19,33 @@
             "retrieval_reason": "seeded next-question context"
           }
         ],
-        "active_concepts": ["oxidative-phosphorylation", "nadh", "atp-synthase"]
+        "active_concepts": [
+          "oxidative-phosphorylation",
+          "nadh",
+          "atp-synthase"
+        ]
       }
     },
     {
       "type": "audio",
-      "version": 4,
+      "version": 5,
       "frame": {
         "pcm16_base64": "AQIDBA=="
       }
     },
     {
       "type": "cancel",
-      "version": 4
+      "version": 5
     },
     {
       "type": "stop",
-      "version": 4
+      "version": 5
     }
   ],
   "server": [
     {
       "type": "ready",
-      "version": 4,
+      "version": 5,
       "sample_rate_hz": 24000,
       "input_encoding": "pcm_s16le",
       "brain": {
@@ -62,7 +66,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "ready"
@@ -70,7 +74,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "question_started",
         "response_id": "response-1",
@@ -97,7 +101,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "listening"
@@ -105,7 +109,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "transcript_delta",
         "response_id": "response-1",
@@ -114,7 +118,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "transcript_final",
         "response_id": "response-1",
@@ -124,7 +128,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "thinking"
@@ -132,13 +136,12 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "answer_evaluated",
         "response_id": "response-1",
         "evaluation": {
           "question_id": "q-oxidative-phosphorylation-nadh",
-          "answer_text": "NADH donates electrons to the electron transport chain.",
           "label": "vague",
           "concise_feedback": "Add the source-backed terms electron donor, proton gradient before moving on.",
           "retry_prompt": "Now connect that electron flow to ATP synthase in one precise sentence.",
@@ -157,7 +160,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "manuscript_intent",
         "response_id": "response-1",
@@ -172,7 +175,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "source_reference",
         "response_id": "response-1",
@@ -188,7 +191,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "concept_status",
         "response_id": "response-1",
@@ -198,7 +201,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "audio_delta",
         "response_id": "response-1",
@@ -209,7 +212,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "feedback"
@@ -217,7 +220,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "correction"
@@ -225,7 +228,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "recap_ready",
         "response_id": "response-1",
@@ -233,10 +236,19 @@
           "voice_session_id": "voice-session-1",
           "headline": "Explain the role of NADH in oxidative phosphorylation. is ready for another pass.",
           "summary": "The session stayed grounded to the server-owned source span. Review the missed terms before the next call.",
-          "strong_concepts": ["electron donor", "electron transport chain"],
-          "shaky_concepts": ["proton gradient", "ATP synthase"],
+          "strong_concepts": [
+            "electron donor",
+            "electron transport chain"
+          ],
+          "shaky_concepts": [
+            "proton gradient",
+            "ATP synthase"
+          ],
           "missed_concepts": [],
-          "review_later": ["proton gradient", "ATP synthase"],
+          "review_later": [
+            "proton gradient",
+            "ATP synthase"
+          ],
           "next_action": "Schedule a short source-backed review tomorrow.",
           "source_moments": [
             {
@@ -257,7 +269,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "recap"
@@ -265,7 +277,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "cancellation",
         "response_id": "response-2"
