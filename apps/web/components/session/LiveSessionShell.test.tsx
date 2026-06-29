@@ -491,6 +491,16 @@ describe("LiveSessionShell scene intent wiring", () => {
         { kind: "question", label: "Question", text: "Explain the role of NADH." },
         { kind: "feedback", label: "Feedback", text: "Connect NADH to the proton gradient." },
       ],
+      capture: {
+        ephemeralText: "NADH donates electrons",
+        label: "Captured",
+        repair: {
+          label: "Mishearing repair",
+          text: "Heard with low confidence; correct it in the margin if needed.",
+        },
+        state: "captured",
+        text: "Answer captured for this turn only.",
+      },
       detail: "Feedback audio is playing while the captions stay visible.",
       headline: "Viva is speaking.",
       interruptAcknowledged: false,
@@ -529,6 +539,10 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).not.toContain('role="status"');
     expect(markup).toContain('aria-live="polite"');
     expect(markup).toContain("Viva is speaking.");
+    expect(markup).toContain('aria-label="Voice capture trust"');
+    expect(markup).toContain('data-state="captured"');
+    expect(markup).toContain("NADH donates electrons");
+    expect(markup).toContain("Mishearing repair");
     expect(markup).toContain('aria-label="Spoken captions"');
     expect(markup).toContain("Question");
     expect(markup).toContain("Feedback");

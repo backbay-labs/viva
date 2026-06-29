@@ -758,6 +758,7 @@ export function LiveSessionPage() {
   const turnTaking = useMemo(
     () =>
       projectTurnTakingState({
+        finalTranscript: agent.derived.finalTranscript,
         hasPendingAudio: agent.agentState.audio.length > 0,
         interruptAcknowledged,
         playbackSpeaking,
@@ -765,9 +766,14 @@ export function LiveSessionPage() {
         runtime,
         state: effectiveState,
         textAnswerFallbackActive: shouldShowNoSpeechNudge({ textAnswerState, textRetryOpen }),
+        transcript: agent.derived.transcript,
+        transcriptConfidence: agent.derived.transcriptConfidence,
       }),
     [
       agent.agentState.audio.length,
+      agent.derived.finalTranscript,
+      agent.derived.transcript,
+      agent.derived.transcriptConfidence,
       effectiveState,
       interruptAcknowledged,
       playbackSpeaking,
@@ -857,7 +863,6 @@ export function LiveSessionPage() {
       scene={scene}
       sourceFolio={sourceFolio}
       state={effectiveState}
-      transcript={agent.derived.transcript}
       textAnswer={textAnswerState}
       turnTaking={turnTaking}
     />

@@ -35,7 +35,6 @@ export function LiveSessionShell({
   recap,
   reviewPlan,
   turnTaking,
-  transcript,
   contextLabel,
   clockLabel,
   generationId,
@@ -71,7 +70,6 @@ export function LiveSessionShell({
   recap?: SessionRecap;
   reviewPlan?: ReviewScheduleItem[];
   turnTaking?: VoiceTurnTakingState;
-  transcript?: string;
   contextLabel: string;
   clockLabel?: string;
   generationId?: string;
@@ -150,7 +148,6 @@ export function LiveSessionShell({
             <SessionBottomControls
               onEndSession={onEndSession}
               onShowSources={onShowSource}
-              transcript={transcript}
             />
           </div>
 
@@ -195,6 +192,27 @@ function TurnTakingPanel({ turnTaking }: { turnTaking: VoiceTurnTakingState }) {
           <span>{turnTaking.nudge.label}</span>
           {turnTaking.nudge.text}
         </p>
+      ) : null}
+      {turnTaking.capture ? (
+        <section
+          aria-label="Voice capture trust"
+          className="capture-trust"
+          data-state={turnTaking.capture.state}
+        >
+          <p className="capture-trust__status">
+            <span>{turnTaking.capture.label}</span>
+            {turnTaking.capture.text}
+          </p>
+          {turnTaking.capture.ephemeralText ? (
+            <p className="capture-trust__heard">{turnTaking.capture.ephemeralText}</p>
+          ) : null}
+          {turnTaking.capture.repair ? (
+            <p className="capture-trust__repair">
+              <span>{turnTaking.capture.repair.label}</span>
+              {turnTaking.capture.repair.text}
+            </p>
+          ) : null}
+        </section>
       ) : null}
       {turnTaking.captions.length > 0 ? (
         <section aria-label="Spoken captions" className="turn-captions">
