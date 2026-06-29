@@ -20,7 +20,9 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
-    memory::{generate_file_study_set, generate_paste_study_set},
+    memory::{
+        generate_file_study_set, generate_paste_study_set, persisted_misconception_fingerprint,
+    },
     InMemoryStudyStore,
 };
 
@@ -429,6 +431,11 @@ impl PostgresStudyStore {
         evaluation: &AnswerEvaluation,
     ) -> Result<bool, PortError> {
         let source_span_uuid = Self::uuid_for(&evaluation.source.source_id)?;
+        let retry_eligible = agent_domain::answer_retry_eligible(evaluation);
+        let misconception_fingerprint = persisted_misconception_fingerprint(evaluation)
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| PortError::adapter("postgres", error.to_string()))?;
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(
                 SELECT 1
@@ -443,6 +450,8 @@ impl PostgresStudyStore {
                   AND aa.concept_status = $7
                   AND ABS(aa.confidence_score - $8) <= 0.000001
                   AND aa.source_span_id = $9
+                  AND aa.retry_eligible IS NOT DISTINCT FROM $10
+                  AND aa.misconception_fingerprint IS NOT DISTINCT FROM $11
              )",
         )
         .bind(voice_session_uuid)
@@ -454,6 +463,8 @@ impl PostgresStudyStore {
         .bind(concept_status_str(&evaluation.concept_status))
         .bind(f64::from(evaluation.confidence_score))
         .bind(source_span_uuid)
+        .bind(retry_eligible)
+        .bind(misconception_fingerprint)
         .fetch_one(&self.pool)
         .await
         .map_err(pg_error)
@@ -1955,20 +1966,29 @@ impl StudyMemoryStore for PostgresStudyStore {
         self.ensure_active_question(study_set_uuid, &evaluation.question_id)
             .await?;
         let source_span_uuid = Self::uuid_for(&evaluation.source.source_id)?;
+        let retry_eligible = agent_domain::answer_retry_eligible(&evaluation);
+        let misconception_fingerprint = persisted_misconception_fingerprint(&evaluation)
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| PortError::adapter("postgres", error.to_string()))?;
         let updated = sqlx::query(
             "UPDATE answer_attempts
              SET evaluation_label = $1,
                  concept_status = $2,
                  confidence_score = $3,
-                 source_span_id = $4
-             WHERE voice_session_id = $5
-               AND response_id = $6
-               AND question_id = $7",
+                 source_span_id = $4,
+                 retry_eligible = $5,
+                 misconception_fingerprint = $6
+             WHERE voice_session_id = $7
+               AND response_id = $8
+               AND question_id = $9",
         )
         .bind(&evaluation.label)
         .bind(concept_status_str(&evaluation.concept_status))
         .bind(f64::from(evaluation.confidence_score))
         .bind(source_span_uuid)
+        .bind(retry_eligible)
+        .bind(&misconception_fingerprint)
         .bind(voice_session_uuid)
         .bind(response_id)
         .bind(&evaluation.question_id)
@@ -2008,9 +2028,11 @@ impl StudyMemoryStore for PostgresStudyStore {
                     evaluation_label,
                     concept_status,
                     confidence_score,
-                    source_span_id
+                    source_span_id,
+                    retry_eligible,
+                    misconception_fingerprint
                  )
-                 VALUES ($1, $2, $3, $4, 1, $5, 'typed', 'accepted', 'none', 'evaluation_only_compat', $6, $7, $8, $9)",
+                 VALUES ($1, $2, $3, $4, 1, $5, 'typed', 'accepted', 'none', 'evaluation_only_compat', $6, $7, $8, $9, $10, $11)",
             )
             .bind(Uuid::new_v4())
             .bind(voice_session_uuid)
@@ -2024,6 +2046,8 @@ impl StudyMemoryStore for PostgresStudyStore {
             .bind(concept_status_str(&evaluation.concept_status))
             .bind(f64::from(evaluation.confidence_score))
             .bind(source_span_uuid)
+            .bind(retry_eligible)
+            .bind(&misconception_fingerprint)
             .execute(&self.pool)
             .await
             .map_err(pg_error)?;
@@ -2043,6 +2067,8 @@ impl StudyMemoryStore for PostgresStudyStore {
             "evaluation_label": evaluation.label,
             "concept_status": concept_status_str(&evaluation.concept_status),
             "source_id": evaluation.source.source_id,
+            "retry_eligible": retry_eligible,
+            "misconception_fingerprint": misconception_fingerprint,
         }))
     }
 

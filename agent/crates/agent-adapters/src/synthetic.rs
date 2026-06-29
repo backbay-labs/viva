@@ -8,12 +8,12 @@ use std::time::Duration;
 use tokio::{sync::mpsc, task::AbortHandle, time::sleep};
 
 use agent_domain::{
-    fixture_question, AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus,
-    AnswerContentPolicy, AnswerEvaluation, BrainError, BrainEvent, BrainInput, BrainProviderError,
-    BrainUsage, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent,
-    ManuscriptRegister, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession,
-    RealtimeSessionTaskGuard, RecapSourceMoment, SessionConfig, StudyMemoryStore, StudyQuestion,
-    StudySessionPhase, StudySessionRecap,
+    fixture_question, one_shot_retry_prompt, AnswerAttemptEnvelope, AnswerCaptureMode,
+    AnswerCaptureStatus, AnswerContentPolicy, AnswerEvaluation, BrainError, BrainEvent, BrainInput,
+    BrainProviderError, BrainUsage, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind,
+    ManuscriptIntent, ManuscriptRegister, RealtimeBrain, RealtimeBrainCapabilities,
+    RealtimeSession, RealtimeSessionTaskGuard, RecapSourceMoment, SessionConfig, StudyMemoryStore,
+    StudyQuestion, StudySessionPhase, StudySessionRecap,
 };
 
 /// One step in the synthetic evaluation rotation. Deterministic, offline, no
@@ -556,7 +556,11 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
         answer_text: job.answer_input.text.clone(),
         label: answer_spec.label.to_owned(),
         concise_feedback: answer_spec.feedback.to_owned(),
-        retry_prompt: job.question.follow_up.clone(),
+        retry_prompt: one_shot_retry_prompt(
+            answer_spec.label,
+            job.turn.try_into().unwrap_or(u32::MAX),
+            &job.question.follow_up,
+        ),
         source: source.clone(),
         concept_status: answer_spec.status.clone(),
         confidence_score: answer_spec.eval_confidence,
@@ -865,6 +869,30 @@ mod tests {
         }
     }
 
+    async fn drain_answer_until_completed(
+        session: &mut RealtimeSession,
+        expected_response_id: &str,
+    ) -> AnswerEvaluation {
+        let mut evaluation = None;
+        loop {
+            match next_event(session).await {
+                BrainEvent::AnswerEvaluated {
+                    response_id,
+                    evaluation: answer_evaluation,
+                } => {
+                    assert_eq!(response_id, expected_response_id);
+                    evaluation = Some(answer_evaluation);
+                }
+                BrainEvent::ResponseCompleted { response_id } => {
+                    assert_eq!(response_id, expected_response_id);
+                    return evaluation.expect("answer evaluation arrives before completion");
+                }
+                BrainEvent::Error(error) => panic!("synthetic answer failed: {error:?}"),
+                _ => {}
+            }
+        }
+    }
+
     #[tokio::test]
     async fn emits_deterministic_product_study_flow_and_cancel_id() {
         let brain = SyntheticBrain::default();
@@ -1125,6 +1153,86 @@ mod tests {
                 .as_deref(),
             Some("bfcache_restore-3"),
         );
+    }
+
+    #[tokio::test]
+    async fn spends_repair_prompt_once_and_persists_sanitized_fingerprint() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let brain = SyntheticBrain::with_study_store(store.clone());
+        let mut session = brain
+            .open(SessionConfig {
+                session_id: Some(SessionId::new("voice-session-1")),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+
+        let _ = next_event(&mut session).await;
+        let _ = next_event(&mut session).await;
+
+        session
+            .input
+            .send(BrainInput::Text("first incomplete attempt".to_owned()))
+            .await
+            .unwrap();
+        let first = drain_answer_until_completed(&mut session, "response-1").await;
+        assert_eq!(first.label, "partially correct");
+        assert_eq!(first.retry_prompt, fixture_question().follow_up);
+
+        session
+            .input
+            .send(BrainInput::Text("second attempt".to_owned()))
+            .await
+            .unwrap();
+        let second = drain_answer_until_completed(&mut session, "response-2").await;
+        assert_eq!(second.label, "mostly correct");
+        assert!(second.retry_prompt.is_empty());
+
+        session
+            .input
+            .send(BrainInput::Text("third wrong attempt".to_owned()))
+            .await
+            .unwrap();
+        let third = drain_answer_until_completed(&mut session, "response-3").await;
+        assert_eq!(third.label, "wrong");
+        assert!(third.retry_prompt.is_empty());
+
+        let snapshot = store.snapshot();
+        let first_record = snapshot
+            .answer_attempts
+            .iter()
+            .find(|record| record.response_id == "response-1")
+            .expect("first answer attempt is persisted");
+        let first_persisted = first_record
+            .evaluation
+            .as_ref()
+            .expect("first evaluation is persisted");
+        assert!(first_persisted.retry_eligible);
+        assert_eq!(
+            first_persisted
+                .misconception_fingerprint
+                .as_ref()
+                .map(|fingerprint| fingerprint.repair_round),
+            Some(1),
+        );
+
+        let third_record = snapshot
+            .answer_attempts
+            .iter()
+            .find(|record| record.response_id == "response-3")
+            .expect("third answer attempt is persisted");
+        let third_persisted = third_record
+            .evaluation
+            .as_ref()
+            .expect("third evaluation is persisted");
+        assert!(!third_persisted.retry_eligible);
+        assert!(third_persisted.misconception_fingerprint.is_none());
+        let persisted = serde_json::to_string(&snapshot.answer_attempts).unwrap();
+        assert!(!persisted.contains("first incomplete attempt"));
+        assert!(!persisted.contains("third wrong attempt"));
     }
 
     #[tokio::test]

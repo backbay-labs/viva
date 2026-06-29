@@ -205,6 +205,54 @@ impl From<&StudySourceReference> for PersistedSourceReference {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PersistedMisconceptionFingerprint {
+    pub schema: String,
+    pub digest: String,
+    pub label: String,
+    pub concept_status: String,
+    pub repair_round: u8,
+}
+
+pub(crate) fn persisted_misconception_fingerprint(
+    evaluation: &AnswerEvaluation,
+) -> Option<PersistedMisconceptionFingerprint> {
+    if !agent_domain::answer_retry_eligible(evaluation) {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"viva.misconception_fingerprint.v1");
+    hasher.update([0]);
+    hasher.update(evaluation.question_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(evaluation.label.as_bytes());
+    hasher.update([0]);
+    hasher.update(concept_status_slug(&evaluation.concept_status).as_bytes());
+    hasher.update([0]);
+    hasher.update(evaluation.source.source_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    Some(PersistedMisconceptionFingerprint {
+        schema: "viva.misconception_fingerprint.v1".to_owned(),
+        digest: format!("sha256:{encoded}"),
+        label: evaluation.label.clone(),
+        concept_status: concept_status_slug(&evaluation.concept_status).to_owned(),
+        repair_round: 1,
+    })
+}
+
+fn concept_status_slug(status: &ConceptStatus) -> &'static str {
+    match status {
+        ConceptStatus::Strong => "strong",
+        ConceptStatus::Shaky => "shaky",
+        ConceptStatus::Missed => "missed",
+        ConceptStatus::Review => "review",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PersistedAnswerEvaluation {
     pub question_id: String,
@@ -212,6 +260,8 @@ pub struct PersistedAnswerEvaluation {
     pub concept_status: ConceptStatus,
     pub confidence_score: f32,
     pub source: PersistedSourceReference,
+    pub retry_eligible: bool,
+    pub misconception_fingerprint: Option<PersistedMisconceptionFingerprint>,
 }
 
 impl From<&AnswerEvaluation> for PersistedAnswerEvaluation {
@@ -222,6 +272,8 @@ impl From<&AnswerEvaluation> for PersistedAnswerEvaluation {
             concept_status: evaluation.concept_status.clone(),
             confidence_score: evaluation.confidence_score,
             source: PersistedSourceReference::from(&evaluation.source),
+            retry_eligible: agent_domain::answer_retry_eligible(evaluation),
+            misconception_fingerprint: persisted_misconception_fingerprint(evaluation),
         }
     }
 }
@@ -3188,6 +3240,8 @@ mod tests {
                 concept_status: ConceptStatus::Strong,
                 confidence_score: 0.84,
                 source: PersistedSourceReference::from(&fixture_source_reference()),
+                retry_eligible: false,
+                misconception_fingerprint: None,
             }),
             ..pending_attempt_record(voice_session_id, response_id)
         }

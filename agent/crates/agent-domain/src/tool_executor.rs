@@ -106,12 +106,18 @@ impl VivaToolExecutor {
         let concept_status =
             concept_status_for_terms(matched_terms.len(), question.expected_terms.len());
         let concise_feedback = feedback_for_terms(&question, &matched_terms);
+        let label = label_for_status(&concept_status);
+        let retry_prompt = crate::one_shot_retry_prompt(
+            label,
+            submission_sequence_from_response_id(response_id),
+            &question.follow_up,
+        );
         let evaluation = crate::AnswerEvaluation {
             question_id,
             answer_text,
-            label: label_for_status(&concept_status).to_owned(),
+            label: label.to_owned(),
             concise_feedback,
-            retry_prompt: question.follow_up,
+            retry_prompt,
             source: question.source,
             concept_status,
             confidence_score: confidence_for_terms(
@@ -334,6 +340,17 @@ fn label_for_status(status: &ConceptStatus) -> &'static str {
         ConceptStatus::Review => "vague",
         ConceptStatus::Missed => "insufficient evidence",
     }
+}
+
+fn submission_sequence_from_response_id(response_id: &str) -> u32 {
+    let Some(suffix) = response_id.strip_prefix("response-") else {
+        return 1;
+    };
+    let digits = suffix
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().unwrap_or(1)
 }
 
 fn storage_due_at_for_status(status: &ConceptStatus) -> &'static str {
