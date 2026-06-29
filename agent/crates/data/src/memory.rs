@@ -329,6 +329,7 @@ pub struct AnswerAttemptRecord {
     pub response_id: String,
     pub envelope: PersistedAnswerAttemptEnvelope,
     pub evaluation: Option<PersistedAnswerEvaluation>,
+    pub retry_prompt_delivered: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2051,11 +2052,12 @@ impl StudyMemoryStore for InMemoryStudyStore {
         }))
     }
 
-    async fn retry_prompt_was_spent(
+    async fn retry_prompt_was_spent_before_response(
         &self,
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
     ) -> Result<bool, PortError> {
         let state = self
             .inner
@@ -2065,6 +2067,8 @@ impl StudyMemoryStore for InMemoryStudyStore {
             attempt.user_id == user_id
                 && attempt.study_set_id == study_set_id
                 && attempt.voice_session_id == voice_session_id
+                && attempt.response_id != response_id
+                && attempt.retry_prompt_delivered
                 && attempt
                     .evaluation
                     .as_ref()
@@ -2678,6 +2682,62 @@ impl StudyMemoryStore for InMemoryStudyStore {
         Ok(())
     }
 
+    async fn mark_answer_evaluation_delivered(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: &AnswerEvaluation,
+    ) -> Result<(), PortError> {
+        if !agent_domain::answer_retry_eligible(evaluation) {
+            return Ok(());
+        }
+        evaluation
+            .validate_fail_closed()
+            .map_err(|reason| PortError::adapter("memory", reason))?;
+        let persisted = PersistedAnswerEvaluation::from(evaluation);
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        {
+            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+            let canonical_source = Self::active_question_source_locked(
+                study_set,
+                &state,
+                user_id,
+                &evaluation.question_id,
+            )?;
+            if canonical_source != evaluation.source {
+                return Err(PortError::adapter(
+                    "memory",
+                    "answer evaluation source tuple does not match active question source",
+                ));
+            }
+        }
+        let Some(record) = state.answer_attempts.iter_mut().find(|record| {
+            record.user_id == user_id
+                && record.study_set_id == study_set_id
+                && record.voice_session_id == voice_session_id
+                && record.response_id == response_id
+        }) else {
+            return Err(PortError::adapter(
+                "memory",
+                "answer evaluation delivery does not match persisted answer attempt",
+            ));
+        };
+        if record.evaluation.as_ref() != Some(&persisted) {
+            return Err(PortError::adapter(
+                "memory",
+                "answer evaluation delivery does not match persisted evaluation",
+            ));
+        }
+        record.retry_prompt_delivered = true;
+        Ok(())
+    }
+
     async fn authorize_source_reference(
         &self,
         user_id: &str,
@@ -2902,6 +2962,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             response_id: envelope.response_id.clone(),
             envelope: persisted,
             evaluation: None,
+            retry_prompt_delivered: false,
         };
         let result = serde_json::to_value(&record)
             .map_err(|error| PortError::adapter("memory", error.to_string()))?;
@@ -3010,6 +3071,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
                     pre_provider_state: "evaluation_only_compat".to_owned(),
                 },
                 evaluation: Some(persisted_evaluation),
+                retry_prompt_delivered: false,
             };
             let result = serde_json::to_value(&record)
                 .map_err(|error| PortError::adapter("memory", error.to_string()))?;
@@ -3249,6 +3311,7 @@ mod tests {
                 pre_provider_state: "submitted".to_owned(),
             },
             evaluation: None,
+            retry_prompt_delivered: false,
         }
     }
 
@@ -3291,6 +3354,10 @@ mod tests {
             transcript_confidence_bucket: None,
             pre_provider_state: "captured_before_provider".to_owned(),
         }
+    }
+
+    fn evaluation_from_result(result: &Value) -> AnswerEvaluation {
+        serde_json::from_value(result["evaluation"].clone()).unwrap()
     }
 
     async fn record_fixture_session(store: &InMemoryStudyStore) {
@@ -5178,6 +5245,44 @@ mod tests {
             first.result["evaluation"]["retry_prompt"],
             question.follow_up
         );
+        let first_evaluation_payload = evaluation_from_result(&first.result);
+        store
+            .authorize_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                &first_evaluation_payload,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_answer_evaluation_delivered(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                &first_evaluation_payload,
+            )
+            .await
+            .unwrap();
+
+        let replay = executor
+            .execute(
+                "response-1",
+                ToolProposal::evaluate_spoken_answer(
+                    "biology-midterm",
+                    "voice-session-1",
+                    &question.question_id,
+                    "I remember NADH but not the mechanism.",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replay.result["evaluation"]["retry_prompt"],
+            question.follow_up
+        );
 
         executor
             .record_answer_attempt_envelope(answer_attempt_envelope(
@@ -5224,7 +5329,7 @@ mod tests {
         let store = Arc::new(seeded_store());
         record_fixture_session(&store).await;
         let executor = VivaToolExecutor::new(
-            store,
+            store.clone(),
             AuthorizedStudySession {
                 user_id: "user-1".to_owned(),
                 study_set_id: "biology-midterm".to_owned(),
@@ -5251,6 +5356,17 @@ mod tests {
             first.result["evaluation"]["retry_prompt"],
             question.follow_up
         );
+        let first_evaluation_payload = evaluation_from_result(&first.result);
+        store
+            .authorize_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-compat-1",
+                &first_evaluation_payload,
+            )
+            .await
+            .unwrap();
 
         let second = executor
             .execute(
@@ -5264,7 +5380,45 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(second.result["evaluation"]["retry_prompt"], "");
+        assert_eq!(
+            second.result["evaluation"]["retry_prompt"],
+            question.follow_up
+        );
+        let second_evaluation_payload = evaluation_from_result(&second.result);
+        store
+            .authorize_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-compat-2",
+                &second_evaluation_payload,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_answer_evaluation_delivered(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-compat-2",
+                &second_evaluation_payload,
+            )
+            .await
+            .unwrap();
+
+        let third = executor
+            .execute(
+                "response-compat-3",
+                ToolProposal::evaluate_spoken_answer(
+                    "biology-midterm",
+                    "voice-session-1",
+                    &question.question_id,
+                    "Still missing the mechanism after delivery.",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(third.result["evaluation"]["retry_prompt"], "");
     }
 
     #[tokio::test]

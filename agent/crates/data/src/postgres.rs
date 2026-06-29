@@ -619,11 +619,12 @@ impl StudyMemoryStore for PostgresStudyStore {
         .map_err(pg_error)
     }
 
-    async fn retry_prompt_was_spent(
+    async fn retry_prompt_was_spent_before_response(
         &self,
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
     ) -> Result<bool, PortError> {
         let study_set_uuid = Self::uuid_for(study_set_id)?;
         let voice_session_uuid = Self::uuid_for(voice_session_id)?;
@@ -635,12 +636,15 @@ impl StudyMemoryStore for PostgresStudyStore {
                 WHERE sessions.user_id = $1
                   AND sessions.study_set_id = $2
                   AND attempts.voice_session_id = $3
+                  AND attempts.response_id <> $4
                   AND attempts.retry_eligible = TRUE
+                  AND attempts.retry_prompt_delivered = TRUE
              )",
         )
         .bind(user_id)
         .bind(study_set_uuid)
         .bind(voice_session_uuid)
+        .bind(response_id)
         .fetch_one(&self.pool)
         .await
         .map_err(pg_error)
@@ -1650,6 +1654,83 @@ impl StudyMemoryStore for PostgresStudyStore {
             return Err(PortError::adapter(
                 "postgres",
                 "answer evaluation event does not match authorized browser payload",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn mark_answer_evaluation_delivered(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: &AnswerEvaluation,
+    ) -> Result<(), PortError> {
+        if !agent_domain::answer_retry_eligible(evaluation) {
+            return Ok(());
+        }
+        evaluation
+            .validate_fail_closed()
+            .map_err(|reason| PortError::adapter("postgres", reason))?;
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
+            .await?;
+        let canonical = self
+            .active_question_source(user_id, study_set_id, &evaluation.question_id)
+            .await?;
+        if canonical != evaluation.source {
+            return Err(PortError::adapter(
+                "postgres",
+                "answer evaluation source tuple does not match active question source",
+            ));
+        }
+        if !self
+            .answer_evaluation_was_recorded(
+                user_id,
+                study_set_uuid,
+                voice_session_uuid,
+                response_id,
+                evaluation,
+            )
+            .await?
+        {
+            return Err(PortError::adapter(
+                "postgres",
+                "answer evaluation delivery does not match persisted answer attempt",
+            ));
+        }
+        if !self.has_event_authorization(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::AnswerEvaluation,
+            evaluation,
+        )? {
+            return Err(PortError::adapter(
+                "postgres",
+                "answer evaluation delivery does not match authorized browser payload",
+            ));
+        }
+        let result = sqlx::query(
+            "UPDATE answer_attempts
+             SET retry_prompt_delivered = TRUE
+             WHERE voice_session_id = $1
+               AND response_id = $2
+               AND question_id = $3",
+        )
+        .bind(voice_session_uuid)
+        .bind(response_id)
+        .bind(&evaluation.question_id)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_error)?;
+        if result.rows_affected() == 0 {
+            return Err(PortError::adapter(
+                "postgres",
+                "answer evaluation delivery did not update persisted answer attempt",
             ));
         }
         Ok(())

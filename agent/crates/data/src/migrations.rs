@@ -308,6 +308,8 @@ mod tests {
         assert!(sql.contains("ALTER COLUMN evaluation_label DROP NOT NULL"));
         assert!(sql.contains("answer_attempts_voice_session_response_id_idx"));
         assert!(sql.contains("misconception_fingerprint JSONB"));
+        assert!(sql.contains("retry_prompt_delivered BOOLEAN NOT NULL DEFAULT FALSE"));
+        assert!(sql.contains("retry_prompt_delivered = TRUE"));
         assert!(sql.contains("answer_attempts_misconception_fingerprint_idx"));
         assert!(!sql.contains("answer_text TEXT"));
         assert!(!sql.contains("evaluation JSONB"));

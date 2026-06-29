@@ -109,10 +109,11 @@ impl VivaToolExecutor {
         let label = label_for_status(&concept_status);
         let submission_sequence = if self
             .store
-            .retry_prompt_was_spent(
+            .retry_prompt_was_spent_before_response(
                 &self.session.user_id,
                 &self.session.study_set_id,
                 &self.session.voice_session_id,
+                response_id,
             )
             .await?
         {

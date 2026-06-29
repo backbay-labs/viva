@@ -553,10 +553,11 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
     let source = job.question.source.clone();
     let retry_prompt_was_spent = if let Some(store) = &job.study_store {
         match store
-            .retry_prompt_was_spent(
+            .retry_prompt_was_spent_before_response(
                 &job.spec.user_id,
                 &job.spec.study_set_id,
                 &job.spec.voice_session_id,
+                &job.response_id,
             )
             .await
         {
@@ -1200,6 +1201,26 @@ mod tests {
         let first = drain_answer_until_completed(&mut session, "response-1").await;
         assert_eq!(first.label, "partially correct");
         assert_eq!(first.retry_prompt, fixture_question().follow_up);
+        store
+            .authorize_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                &first,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_answer_evaluation_delivered(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                &first,
+            )
+            .await
+            .unwrap();
 
         session
             .input

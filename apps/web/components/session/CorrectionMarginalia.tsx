@@ -28,6 +28,7 @@ export function CorrectionMarginalia({
       : family === "caveat"
         ? "I can’t confirm that from your notes."
         : "Almost.";
+  const canRetry = Boolean(question.retryPrompt?.trim());
 
   return (
     <div className="correction" data-family={family}>
@@ -49,19 +50,21 @@ export function CorrectionMarginalia({
         <SourceChip label={question.sourceRef} />
         <StatusChip label={question.status} />
       </div>
-      {question.retryPrompt ? (
+      {canRetry ? (
         <p className="correction__retry-cue">
           <span className="correction__retry-label">Try it this way</span>
           {question.retryPrompt}
         </p>
       ) : null}
       <div className="correction__actions">
-        <SessionActionButton
-          label="Try again"
-          leading={<Icon color="var(--viva-paper)" name="refresh" size={15} strokeWidth={1.7} />}
-          onClick={onTryAgain}
-          variant="primary"
-        />
+        {canRetry ? (
+          <SessionActionButton
+            label="Try again"
+            leading={<Icon color="var(--viva-paper)" name="refresh" size={15} strokeWidth={1.7} />}
+            onClick={onTryAgain}
+            variant="primary"
+          />
+        ) : null}
         <SessionActionButton
           label="Show source"
           leading={<Icon color="var(--viva-amethyst)" name="book" size={15} strokeWidth={1.6} />}
