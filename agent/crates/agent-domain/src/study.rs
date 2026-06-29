@@ -98,6 +98,22 @@ pub struct StudyQuestion {
     pub source: StudySourceReference,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OralRouteStrategy {
+    PreExamInterleave,
+    ActiveConceptPriority,
+    SourceOrder,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OralRoutePlan {
+    pub route_id: String,
+    pub strategy: OralRouteStrategy,
+    pub target_concept_id: String,
+    pub next_action: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AnswerEvaluation {
     pub question_id: String,

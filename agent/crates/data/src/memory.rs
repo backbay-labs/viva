@@ -5122,6 +5122,18 @@ mod tests {
             question.result["question"]["source"]["source_id"],
             "src-lecture-5-slide-18"
         );
+        assert_eq!(
+            question.result["oral_route"]["strategy"],
+            "active_concept_priority"
+        );
+        assert_eq!(
+            question.result["oral_route"]["target_concept_id"],
+            "atp-synthase"
+        );
+        assert_eq!(
+            question.result["oral_route"]["next_action"],
+            "Ask one oral drill on ATP synthase."
+        );
 
         executor
             .execute(
@@ -5330,6 +5342,98 @@ mod tests {
         assert!(first_evaluation.retry_eligible);
         assert!(!second_evaluation.retry_eligible);
         assert!(second_evaluation.misconception_fingerprint.is_none());
+    }
+
+    #[tokio::test]
+    async fn select_next_question_returns_one_pre_exam_oral_route() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+        let executor = VivaToolExecutor::new(
+            store,
+            AuthorizedStudySession {
+                user_id: "user-1".to_owned(),
+                study_set_id: "biology-midterm".to_owned(),
+                voice_session_id: "voice-session-1".to_owned(),
+                mode: StudyMode::Cram,
+                active_concepts: vec!["electron-donor".to_owned()],
+            },
+        );
+
+        let selected = executor
+            .execute(
+                "response-0",
+                ToolProposal::select_next_question("biology-midterm", "voice-session-1", "cram"),
+            )
+            .await
+            .unwrap();
+        let route = &selected.result["oral_route"];
+        assert_eq!(route["strategy"], "pre_exam_interleave");
+        assert_eq!(
+            route["route_id"],
+            "oral-route:q-oxidative-phosphorylation-nadh:electron-transport-chain"
+        );
+        assert_eq!(route["target_concept_id"], "electron-transport-chain");
+        assert_eq!(
+            route["next_action"],
+            "Ask one pre-exam oral drill on electron transport chain."
+        );
+        let serialized = serde_json::to_string(&route).unwrap();
+        for forbidden in ["dashboard", "planner", "lms", "flashcard"] {
+            assert!(!serialized.to_ascii_lowercase().contains(forbidden));
+        }
+
+        assert!(executor
+            .execute(
+                "response-0",
+                ToolProposal::select_next_question("biology-midterm", "voice-session-1", "quiz"),
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn select_next_question_falls_back_for_non_ascii_oral_route_targets() {
+        let store = Arc::new(seeded_store());
+        let mut question = fixture_question();
+        question.expected_terms = vec!["膜電位".to_owned()];
+        store.upsert_question(StudyQuestionRecord {
+            study_set_id: "biology-midterm".to_owned(),
+            question,
+            active: true,
+        });
+        record_fixture_session(&store).await;
+        let executor = VivaToolExecutor::new(
+            store,
+            AuthorizedStudySession {
+                user_id: "user-1".to_owned(),
+                study_set_id: "biology-midterm".to_owned(),
+                voice_session_id: "voice-session-1".to_owned(),
+                mode: StudyMode::Quiz,
+                active_concepts: vec![],
+            },
+        );
+
+        let selected = executor
+            .execute(
+                "response-0",
+                ToolProposal::select_next_question("biology-midterm", "voice-session-1", "quiz"),
+            )
+            .await
+            .unwrap();
+        let route = &selected.result["oral_route"];
+        let target = route["target_concept_id"]
+            .as_str()
+            .expect("route has target concept id");
+        assert!(target.starts_with("concept-"));
+        assert!(target.len() > "concept-".len());
+        assert!(route["route_id"]
+            .as_str()
+            .expect("route has route id")
+            .ends_with(target));
+        assert!(!route["route_id"]
+            .as_str()
+            .expect("route has route id")
+            .ends_with(':'));
     }
 
     #[tokio::test]
