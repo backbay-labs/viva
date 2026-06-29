@@ -400,6 +400,7 @@ fn oral_route_for_question(
     session: &AuthorizedStudySession,
     question: &StudyQuestion,
 ) -> OralRoutePlan {
+    let is_pre_exam = matches!(&session.mode, StudyMode::Cram | StudyMode::Mock);
     let expected_terms = question
         .expected_terms
         .iter()
@@ -411,11 +412,7 @@ fn oral_route_for_question(
             .find(|(term_id, _)| term_id == &normalize_concept_id(concept_id))
             .map(|(_, label)| (concept_id.clone(), (*label).to_owned()))
     });
-    let fallback_index = if matches!(session.mode, StudyMode::Cram | StudyMode::Mock) {
-        1
-    } else {
-        0
-    };
+    let fallback_index = if is_pre_exam { 1 } else { 0 };
     let fallback = question
         .expected_terms
         .get(fallback_index)
@@ -427,8 +424,12 @@ fn oral_route_for_question(
                 "this source question".to_owned(),
             )
         });
-    let (target_concept_id, target_label) = active_match.unwrap_or(fallback);
-    let strategy = if matches!(session.mode, StudyMode::Cram | StudyMode::Mock) {
+    let (target_concept_id, target_label) = if is_pre_exam {
+        fallback
+    } else {
+        active_match.unwrap_or(fallback)
+    };
+    let strategy = if is_pre_exam {
         OralRouteStrategy::PreExamInterleave
     } else if session
         .active_concepts
@@ -468,11 +469,25 @@ fn concept_id_from_label(label: &str) -> String {
             }
         })
         .collect::<String>();
-    normalized
+    let slug = normalized
         .split('-')
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
-        .join("-")
+        .join("-");
+    if slug.is_empty() {
+        format!("concept-{:08x}", stable_label_hash(label))
+    } else {
+        slug
+    }
+}
+
+fn stable_label_hash(label: &str) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in label.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 fn normalize_concept_id(concept_id: &str) -> String {

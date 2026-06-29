@@ -5355,7 +5355,7 @@ mod tests {
                 study_set_id: "biology-midterm".to_owned(),
                 voice_session_id: "voice-session-1".to_owned(),
                 mode: StudyMode::Cram,
-                active_concepts: vec!["oxidative-phosphorylation".to_owned()],
+                active_concepts: vec!["electron-donor".to_owned()],
             },
         );
 
@@ -5389,6 +5389,51 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn select_next_question_falls_back_for_non_ascii_oral_route_targets() {
+        let store = Arc::new(seeded_store());
+        let mut question = fixture_question();
+        question.expected_terms = vec!["膜電位".to_owned()];
+        store.upsert_question(StudyQuestionRecord {
+            study_set_id: "biology-midterm".to_owned(),
+            question,
+            active: true,
+        });
+        record_fixture_session(&store).await;
+        let executor = VivaToolExecutor::new(
+            store,
+            AuthorizedStudySession {
+                user_id: "user-1".to_owned(),
+                study_set_id: "biology-midterm".to_owned(),
+                voice_session_id: "voice-session-1".to_owned(),
+                mode: StudyMode::Quiz,
+                active_concepts: vec![],
+            },
+        );
+
+        let selected = executor
+            .execute(
+                "response-0",
+                ToolProposal::select_next_question("biology-midterm", "voice-session-1", "quiz"),
+            )
+            .await
+            .unwrap();
+        let route = &selected.result["oral_route"];
+        let target = route["target_concept_id"]
+            .as_str()
+            .expect("route has target concept id");
+        assert!(target.starts_with("concept-"));
+        assert!(target.len() > "concept-".len());
+        assert!(route["route_id"]
+            .as_str()
+            .expect("route has route id")
+            .ends_with(target));
+        assert!(!route["route_id"]
+            .as_str()
+            .expect("route has route id")
+            .ends_with(':'));
     }
 
     #[tokio::test]
