@@ -1,5 +1,5 @@
 use agent_domain::{
-    fixture_source_reference, AudioFrame, BrainEvent, SessionConfig, SourceConfidence,
+    AudioFrame, BrainEvent, CorrectionChallengeReason, SessionConfig, SourceConfidence,
     SourceContext, StudyMode, ToolProposal,
 };
 use serde_json::json;
@@ -31,24 +31,24 @@ fn protocol_fixtures_preserve_source_grounded_shapes() {
 }
 
 #[test]
-fn challenge_correction_carries_full_source_tuple() {
-    let source = fixture_source_reference();
+fn challenge_correction_carries_only_ids_and_reason() {
     let proposal = ToolProposal::challenge_correction(
         "biology-midterm",
         "voice-session-1",
-        &source,
+        "src-lecture-5-slide-18",
         "correction-1",
-        "The slide says this differently.",
+        CorrectionChallengeReason::CitationMismatch,
     );
 
     assert_eq!(proposal.arguments()["source_id"], "src-lecture-5-slide-18");
-    assert_eq!(proposal.arguments()["document_id"], "lec-5");
-    assert_eq!(proposal.arguments()["span"], "slide:18");
-    assert_eq!(proposal.arguments()["confidence"], "high");
-    assert_eq!(
-        proposal.arguments()["retrieval_reason"],
-        "server fixture source for oxidative phosphorylation"
-    );
+    assert_eq!(proposal.arguments()["correction_id"], "correction-1");
+    assert_eq!(proposal.arguments()["reason"], "citation_mismatch");
+    assert!(proposal.arguments().get("document_id").is_none());
+    assert!(proposal.arguments().get("span").is_none());
+    assert!(proposal.arguments().get("excerpt").is_none());
+    assert!(proposal.arguments().get("confidence").is_none());
+    assert!(proposal.arguments().get("retrieval_reason").is_none());
+    assert!(proposal.arguments().get("challenge_text").is_none());
 }
 
 #[test]

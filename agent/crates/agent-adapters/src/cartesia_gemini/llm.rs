@@ -1407,22 +1407,20 @@ pub fn viva_tool_declarations() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "challenge_correction",
-            "description": "Challenge or re-check a correction against source-grounded course material.",
+            "description": "Request a server-owned correction recheck by IDs and a bounded reason enum. Do not provide source tuples, challenge prose, concept truth, or correction results.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "study_set_id": { "type": "string" },
                     "voice_session_id": { "type": "string" },
                     "source_id": { "type": "string" },
-                    "document_id": { "type": "string" },
-                    "span": { "type": "string" },
-                    "excerpt": { "type": "string" },
-                    "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
-                    "retrieval_reason": { "type": "string" },
                     "correction_id": { "type": "string" },
-                    "challenge_text": { "type": "string" }
+                    "reason": {
+                        "type": "string",
+                        "enum": ["citation_mismatch", "low_confidence_source", "conflicting_source", "learner_dispute"]
+                    }
                 },
-                "required": ["study_set_id", "voice_session_id", "source_id", "document_id", "span", "excerpt", "confidence", "retrieval_reason", "correction_id", "challenge_text"],
+                "required": ["study_set_id", "voice_session_id", "source_id", "correction_id", "reason"],
                 "additionalProperties": false
             }
         }),
@@ -1537,6 +1535,53 @@ mod tests {
             request["toolConfig"]["functionCallingConfig"]["mode"],
             "AUTO"
         );
+    }
+
+    #[test]
+    fn challenge_correction_schema_uses_ids_and_reason_only() {
+        let tools = viva_tool_declarations();
+        let declaration = tools
+            .iter()
+            .find(|tool| tool["name"] == "challenge_correction")
+            .expect("challenge_correction tool is declared");
+        let properties = declaration["parameters"]["properties"]
+            .as_object()
+            .expect("challenge_correction properties are an object");
+
+        assert_eq!(
+            declaration["parameters"]["required"],
+            json!([
+                "study_set_id",
+                "voice_session_id",
+                "source_id",
+                "correction_id",
+                "reason"
+            ])
+        );
+        assert_eq!(
+            properties["reason"]["enum"],
+            json!([
+                "citation_mismatch",
+                "low_confidence_source",
+                "conflicting_source",
+                "learner_dispute"
+            ])
+        );
+        for forbidden in [
+            "document_id",
+            "span",
+            "excerpt",
+            "confidence",
+            "retrieval_reason",
+            "challenge_text",
+            "concept_status",
+            "correction_result",
+        ] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "{forbidden} must stay server-owned"
+            );
+        }
     }
 
     #[test]

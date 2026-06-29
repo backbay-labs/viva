@@ -3,9 +3,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::{
-    AnswerAttemptEnvelope, ConceptStatus, PortError, RecapSourceMoment, SessionConfig,
-    StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap, StudySourceReference,
-    ToolProposal, ToolResult,
+    AnswerAttemptEnvelope, ConceptStatus, CorrectionChallengeReason, PortError, RecapSourceMoment,
+    SessionConfig, StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap,
+    StudySourceReference, ToolProposal, ToolResult,
 };
 
 #[derive(Clone)]
@@ -227,17 +227,24 @@ impl VivaToolExecutor {
         &self,
         proposal: &ToolProposal,
     ) -> Result<Value, ToolExecutionError> {
+        ensure_only_args(
+            proposal.arguments(),
+            &[
+                "study_set_id",
+                "voice_session_id",
+                "source_id",
+                "correction_id",
+                "reason",
+            ],
+            "challenge_correction",
+        )?;
         let source_id = string_arg(proposal.arguments(), "source_id")?;
         let correction_id = string_arg(proposal.arguments(), "correction_id")?;
+        let reason = challenge_reason_arg(proposal.arguments(), "reason")?;
         let source = self.canonical_source(&source_id).await?;
-        let provided = source_from_args(proposal.arguments())?;
-        if provided != source {
-            return Err(ToolExecutionError::InvalidArguments(
-                "challenge source tuple does not match deterministic retrieval".to_owned(),
-            ));
-        }
         Ok(json!({
             "correction_id": correction_id,
+            "reason": reason.as_str(),
             "status": "source_rechecked",
             "source": source,
         }))
@@ -331,6 +338,38 @@ fn string_arg(args: &Value, name: &str) -> Result<String, ToolExecutionError> {
         .ok_or_else(|| ToolExecutionError::InvalidArguments(format!("missing `{name}`")))
 }
 
+fn challenge_reason_arg(
+    args: &Value,
+    name: &str,
+) -> Result<CorrectionChallengeReason, ToolExecutionError> {
+    let reason = string_arg(args, name)?;
+    CorrectionChallengeReason::parse(&reason).ok_or_else(|| {
+        ToolExecutionError::InvalidArguments(format!(
+            "invalid challenge_correction reason `{reason}`"
+        ))
+    })
+}
+
+fn ensure_only_args(
+    args: &Value,
+    allowed: &[&str],
+    tool_name: &str,
+) -> Result<(), ToolExecutionError> {
+    let Some(object) = args.as_object() else {
+        return Err(ToolExecutionError::InvalidArguments(format!(
+            "{tool_name} arguments must be an object"
+        )));
+    };
+    for key in object.keys() {
+        if !allowed.iter().any(|allowed_key| allowed_key == key) {
+            return Err(ToolExecutionError::InvalidArguments(format!(
+                "`{key}` is not an authoritative {tool_name} argument"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn concept_status_for_terms(matched: usize, expected: usize) -> ConceptStatus {
     if expected == 0 || matched == 0 {
         return ConceptStatus::Missed;
@@ -398,27 +437,6 @@ fn concept_status_arg(args: &Value, name: &str) -> Result<ConceptStatus, ToolExe
             "unknown concept status `{other}`"
         ))),
     }
-}
-
-fn source_from_args(args: &Value) -> Result<StudySourceReference, ToolExecutionError> {
-    let confidence = match string_arg(args, "confidence")?.as_str() {
-        "high" => crate::SourceConfidence::High,
-        "medium" => crate::SourceConfidence::Medium,
-        "low" => crate::SourceConfidence::Low,
-        other => {
-            return Err(ToolExecutionError::InvalidArguments(format!(
-                "unknown source confidence `{other}`"
-            )));
-        }
-    };
-    Ok(StudySourceReference {
-        source_id: string_arg(args, "source_id")?,
-        document_id: string_arg(args, "document_id")?,
-        span: string_arg(args, "span")?,
-        excerpt: string_arg(args, "excerpt")?,
-        confidence,
-        retrieval_reason: string_arg(args, "retrieval_reason")?,
-    })
 }
 
 fn required<'a>(value: Option<&'a str>, label: &str) -> Result<&'a str, ToolExecutionError> {

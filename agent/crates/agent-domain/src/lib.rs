@@ -40,7 +40,7 @@ pub use study::{
     TerminalSessionReason,
 };
 pub use tool_executor::{AuthorizedStudySession, ToolExecutionError, VivaToolExecutor};
-pub use tools::{ToolPlan, ToolProposal, ToolResult};
+pub use tools::{CorrectionChallengeReason, ToolPlan, ToolProposal, ToolResult};
 
 const BAC_510_LEARNER_LOOP_CONTRACT_JSON: &str =
     include_str!("../../../../packages/core/src/learner-loop-contract.json");
