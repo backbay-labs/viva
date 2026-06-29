@@ -107,11 +107,20 @@ impl VivaToolExecutor {
             concept_status_for_terms(matched_terms.len(), question.expected_terms.len());
         let concise_feedback = feedback_for_terms(&question, &matched_terms);
         let label = label_for_status(&concept_status);
-        let retry_prompt = crate::one_shot_retry_prompt(
-            label,
-            submission_sequence_from_response_id(response_id),
-            &question.follow_up,
-        );
+        let submission_sequence = self
+            .store
+            .study_session_durable_counts(
+                &self.session.user_id,
+                &self.session.study_set_id,
+                &self.session.voice_session_id,
+            )
+            .await?
+            .answer_attempts
+            .max(1)
+            .try_into()
+            .unwrap_or(u32::MAX);
+        let retry_prompt =
+            crate::one_shot_retry_prompt(label, submission_sequence, &question.follow_up);
         let evaluation = crate::AnswerEvaluation {
             question_id,
             answer_text,
@@ -340,17 +349,6 @@ fn label_for_status(status: &ConceptStatus) -> &'static str {
         ConceptStatus::Review => "vague",
         ConceptStatus::Missed => "insufficient evidence",
     }
-}
-
-fn submission_sequence_from_response_id(response_id: &str) -> u32 {
-    let Some(suffix) = response_id.strip_prefix("response-") else {
-        return 1;
-    };
-    let digits = suffix
-        .chars()
-        .take_while(|character| character.is_ascii_digit())
-        .collect::<String>();
-    digits.parse().unwrap_or(1)
 }
 
 fn storage_due_at_for_status(status: &ConceptStatus) -> &'static str {

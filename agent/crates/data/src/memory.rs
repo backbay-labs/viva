@@ -3247,6 +3247,31 @@ mod tests {
         }
     }
 
+    fn answer_attempt_envelope(
+        response_id: &str,
+        question_id: &str,
+        client_generation_id: Option<&str>,
+    ) -> AnswerAttemptEnvelope {
+        AnswerAttemptEnvelope {
+            response_id: response_id.to_owned(),
+            question_id: question_id.to_owned(),
+            submission_sequence: 1,
+            idempotency_key: format!("voice-session-1:{question_id}:1:{response_id}"),
+            capture_mode: AnswerCaptureMode::Typed,
+            byte_count: Some(24),
+            char_count: Some(24),
+            duration_ms: Some(1200),
+            client_generation_id: client_generation_id.map(ToOwned::to_owned),
+            locale: None,
+            capture_status: AnswerCaptureStatus::Accepted,
+            content_policy: AnswerContentPolicy::None,
+            answer_digest_hmac: None,
+            transcript_status: None,
+            transcript_confidence_bucket: None,
+            pre_provider_state: "captured_before_provider".to_owned(),
+        }
+    }
+
     async fn record_fixture_session(store: &InMemoryStudyStore) {
         store
             .record_voice_session(&SessionConfig {
@@ -5082,6 +5107,87 @@ mod tests {
         assert_eq!(snapshot.concept_statuses.len(), 1);
         assert_eq!(snapshot.review_items.len(), 1);
         assert_eq!(snapshot.recaps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_executor_spends_retry_prompt_using_durable_attempt_history() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+        let executor = VivaToolExecutor::new(
+            store.clone(),
+            AuthorizedStudySession {
+                user_id: "user-1".to_owned(),
+                study_set_id: "biology-midterm".to_owned(),
+                voice_session_id: "voice-session-1".to_owned(),
+                mode: StudyMode::Quiz,
+                active_concepts: vec![],
+            },
+        );
+        let question = fixture_question();
+
+        executor
+            .record_answer_attempt_envelope(answer_attempt_envelope(
+                "response-1",
+                &question.question_id,
+                None,
+            ))
+            .await
+            .unwrap();
+        let first = executor
+            .execute(
+                "response-1",
+                ToolProposal::evaluate_spoken_answer(
+                    "biology-midterm",
+                    "voice-session-1",
+                    &question.question_id,
+                    "I remember NADH but not the mechanism.",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.result["evaluation"]["retry_prompt"],
+            question.follow_up
+        );
+
+        executor
+            .record_answer_attempt_envelope(answer_attempt_envelope(
+                "response-1-generation-reconnect",
+                &question.question_id,
+                Some("reconnect"),
+            ))
+            .await
+            .unwrap();
+        let second = executor
+            .execute(
+                "response-1-generation-reconnect",
+                ToolProposal::evaluate_spoken_answer(
+                    "biology-midterm",
+                    "voice-session-1",
+                    &question.question_id,
+                    "Still wrong after reconnect.",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.result["evaluation"]["retry_prompt"], "");
+
+        let snapshot = store.snapshot();
+        let first_evaluation = snapshot
+            .answer_attempts
+            .iter()
+            .find(|attempt| attempt.response_id == "response-1")
+            .and_then(|attempt| attempt.evaluation.as_ref())
+            .expect("first evaluation persists");
+        let second_evaluation = snapshot
+            .answer_attempts
+            .iter()
+            .find(|attempt| attempt.response_id == "response-1-generation-reconnect")
+            .and_then(|attempt| attempt.evaluation.as_ref())
+            .expect("second evaluation persists");
+        assert!(first_evaluation.retry_eligible);
+        assert!(!second_evaluation.retry_eligible);
+        assert!(second_evaluation.misconception_fingerprint.is_none());
     }
 
     #[tokio::test]
