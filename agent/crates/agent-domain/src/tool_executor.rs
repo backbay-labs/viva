@@ -107,18 +107,19 @@ impl VivaToolExecutor {
             concept_status_for_terms(matched_terms.len(), question.expected_terms.len());
         let concise_feedback = feedback_for_terms(&question, &matched_terms);
         let label = label_for_status(&concept_status);
-        let submission_sequence = self
+        let submission_sequence = if self
             .store
-            .study_session_durable_counts(
+            .retry_prompt_was_spent(
                 &self.session.user_id,
                 &self.session.study_set_id,
                 &self.session.voice_session_id,
             )
             .await?
-            .answer_attempts
-            .max(1)
-            .try_into()
-            .unwrap_or(u32::MAX);
+        {
+            2
+        } else {
+            1
+        };
         let retry_prompt =
             crate::one_shot_retry_prompt(label, submission_sequence, &question.follow_up);
         let evaluation = crate::AnswerEvaluation {

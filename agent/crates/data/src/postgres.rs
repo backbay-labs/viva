@@ -619,6 +619,33 @@ impl StudyMemoryStore for PostgresStudyStore {
         .map_err(pg_error)
     }
 
+    async fn retry_prompt_was_spent(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<bool, PortError> {
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM answer_attempts attempts
+                JOIN voice_sessions sessions ON sessions.id = attempts.voice_session_id
+                WHERE sessions.user_id = $1
+                  AND sessions.study_set_id = $2
+                  AND attempts.voice_session_id = $3
+                  AND attempts.retry_eligible = TRUE
+             )",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(pg_error)
+    }
+
     async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
         let session_id = required(config.session_id.as_deref(), "session_id")?;
         let user_id = required(config.user_id.as_deref(), "user_id")?;

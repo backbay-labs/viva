@@ -416,6 +416,15 @@ pub trait StudyMemoryStore: Send + Sync {
         Ok(false)
     }
 
+    async fn retry_prompt_was_spent(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+    ) -> Result<bool, PortError> {
+        Ok(false)
+    }
+
     async fn claim_session_token_nonce(
         &self,
         claim: SessionTokenNonceClaim,

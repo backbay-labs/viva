@@ -2051,6 +2051,27 @@ impl StudyMemoryStore for InMemoryStudyStore {
         }))
     }
 
+    async fn retry_prompt_was_spent(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<bool, PortError> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        Ok(state.answer_attempts.iter().any(|attempt| {
+            attempt.user_id == user_id
+                && attempt.study_set_id == study_set_id
+                && attempt.voice_session_id == voice_session_id
+                && attempt
+                    .evaluation
+                    .as_ref()
+                    .is_some_and(|evaluation| evaluation.retry_eligible)
+        }))
+    }
+
     async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
         let user_id = required_user_id(config)?;
         let study_set_id = required_study_set_id(config)?;
@@ -5127,6 +5148,14 @@ mod tests {
 
         executor
             .record_answer_attempt_envelope(answer_attempt_envelope(
+                "response-provider-failed",
+                &question.question_id,
+                Some("failed-capture"),
+            ))
+            .await
+            .unwrap();
+        executor
+            .record_answer_attempt_envelope(answer_attempt_envelope(
                 "response-1",
                 &question.question_id,
                 None,
@@ -5188,6 +5217,54 @@ mod tests {
         assert!(first_evaluation.retry_eligible);
         assert!(!second_evaluation.retry_eligible);
         assert!(second_evaluation.misconception_fingerprint.is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_executor_spends_retry_prompt_for_evaluation_only_compat_attempts() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+        let executor = VivaToolExecutor::new(
+            store,
+            AuthorizedStudySession {
+                user_id: "user-1".to_owned(),
+                study_set_id: "biology-midterm".to_owned(),
+                voice_session_id: "voice-session-1".to_owned(),
+                mode: StudyMode::Quiz,
+                active_concepts: vec![],
+            },
+        );
+        let question = fixture_question();
+
+        let first = executor
+            .execute(
+                "response-compat-1",
+                ToolProposal::evaluate_spoken_answer(
+                    "biology-midterm",
+                    "voice-session-1",
+                    &question.question_id,
+                    "I remember NADH but not the mechanism.",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.result["evaluation"]["retry_prompt"],
+            question.follow_up
+        );
+
+        let second = executor
+            .execute(
+                "response-compat-2",
+                ToolProposal::evaluate_spoken_answer(
+                    "biology-midterm",
+                    "voice-session-1",
+                    &question.question_id,
+                    "Still missing the mechanism.",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.result["evaluation"]["retry_prompt"], "");
     }
 
     #[tokio::test]

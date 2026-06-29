@@ -551,6 +551,25 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
     // The examiner takes a beat to cross-reference the sources.
     sleep(Duration::from_millis(850)).await;
     let source = job.question.source.clone();
+    let retry_prompt_was_spent = if let Some(store) = &job.study_store {
+        match store
+            .retry_prompt_was_spent(
+                &job.spec.user_id,
+                &job.spec.study_set_id,
+                &job.spec.voice_session_id,
+            )
+            .await
+        {
+            Ok(spent) => spent,
+            Err(error) => {
+                emit_store_error(event_tx, error.to_string()).await;
+                return;
+            }
+        }
+    } else {
+        job.turn > 1
+    };
+    let repair_round = if retry_prompt_was_spent { 2 } else { 1 };
     let evaluation = AnswerEvaluation {
         question_id: job.question.question_id.clone(),
         answer_text: job.answer_input.text.clone(),
@@ -558,7 +577,7 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
         concise_feedback: answer_spec.feedback.to_owned(),
         retry_prompt: one_shot_retry_prompt(
             answer_spec.label,
-            job.turn.try_into().unwrap_or(u32::MAX),
+            repair_round,
             &job.question.follow_up,
         ),
         source: source.clone(),
@@ -1200,6 +1219,32 @@ mod tests {
         assert_eq!(third.label, "wrong");
         assert!(third.retry_prompt.is_empty());
 
+        drop(session);
+        let mut reconnected = brain
+            .open(SessionConfig {
+                session_id: Some(SessionId::new("voice-session-1")),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                client_generation_id: Some("reconnect".to_owned()),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+        let _ = next_event(&mut reconnected).await;
+        let _ = next_event(&mut reconnected).await;
+        reconnected
+            .input
+            .send(BrainInput::Text(
+                "reconnected incomplete attempt".to_owned(),
+            ))
+            .await
+            .unwrap();
+        let reconnected_evaluation =
+            drain_answer_until_completed(&mut reconnected, "response-1-generation-reconnect").await;
+        assert_eq!(reconnected_evaluation.label, "partially correct");
+        assert!(reconnected_evaluation.retry_prompt.is_empty());
+
         let snapshot = store.snapshot();
         let first_record = snapshot
             .answer_attempts
@@ -1230,9 +1275,22 @@ mod tests {
             .expect("third evaluation is persisted");
         assert!(!third_persisted.retry_eligible);
         assert!(third_persisted.misconception_fingerprint.is_none());
+        let reconnected_record = snapshot
+            .answer_attempts
+            .iter()
+            .find(|record| record.response_id == "response-1-generation-reconnect")
+            .expect("reconnected answer attempt is persisted");
+        assert!(
+            !reconnected_record
+                .evaluation
+                .as_ref()
+                .expect("reconnected evaluation is persisted")
+                .retry_eligible
+        );
         let persisted = serde_json::to_string(&snapshot.answer_attempts).unwrap();
         assert!(!persisted.contains("first incomplete attempt"));
         assert!(!persisted.contains("third wrong attempt"));
+        assert!(!persisted.contains("reconnected incomplete attempt"));
     }
 
     #[tokio::test]
