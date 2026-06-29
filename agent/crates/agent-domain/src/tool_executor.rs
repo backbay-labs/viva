@@ -3,9 +3,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::{
-    AnswerAttemptEnvelope, ConceptStatus, CorrectionChallengeReason, PortError, RecapSourceMoment,
-    SessionConfig, StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap,
-    StudySourceReference, ToolProposal, ToolResult,
+    AnswerAttemptEnvelope, ConceptStatus, CorrectionChallengeReason, OralRoutePlan,
+    OralRouteStrategy, PortError, RecapSourceMoment, SessionConfig, StudyMemoryStore, StudyMode,
+    StudyQuestion, StudySessionRecap, StudySourceReference, ToolProposal, ToolResult,
 };
 
 #[derive(Clone)]
@@ -47,7 +47,7 @@ impl VivaToolExecutor {
     ) -> Result<ToolResult, ToolExecutionError> {
         bind_study_set_and_session(&proposal, &self.session)?;
         let result = match proposal.name() {
-            "select_next_question" => self.select_next_question().await?,
+            "select_next_question" => self.select_next_question(&proposal).await?,
             "evaluate_spoken_answer" => self.evaluate_spoken_answer(response_id, &proposal).await?,
             "retrieve_source_reference" => self.retrieve_source_reference(&proposal).await?,
             "mark_concept_status" => self.mark_concept_status(response_id, &proposal).await?,
@@ -78,9 +78,23 @@ impl VivaToolExecutor {
             .map_err(ToolExecutionError::from)
     }
 
-    async fn select_next_question(&self) -> Result<Value, ToolExecutionError> {
+    async fn select_next_question(
+        &self,
+        proposal: &ToolProposal,
+    ) -> Result<Value, ToolExecutionError> {
+        let requested_mode = study_mode_arg(proposal.arguments(), "mode")?;
+        if requested_mode != self.session.mode {
+            return Err(ToolExecutionError::InvalidArguments(
+                "question route mode does not match the authorized session".to_owned(),
+            ));
+        }
         let question = self.active_question().await?;
-        Ok(json!({ "question": question, "mode": self.session.mode.as_str() }))
+        let oral_route = oral_route_for_question(&self.session, &question);
+        Ok(json!({
+            "question": question,
+            "mode": self.session.mode.as_str(),
+            "oral_route": oral_route
+        }))
     }
 
     async fn evaluate_spoken_answer(
@@ -350,6 +364,18 @@ fn challenge_reason_arg(
     })
 }
 
+fn study_mode_arg(args: &Value, name: &str) -> Result<StudyMode, ToolExecutionError> {
+    match string_arg(args, name)?.as_str() {
+        "quiz" => Ok(StudyMode::Quiz),
+        "teach" => Ok(StudyMode::Teach),
+        "mock" => Ok(StudyMode::Mock),
+        "cram" => Ok(StudyMode::Cram),
+        other => Err(ToolExecutionError::InvalidArguments(format!(
+            "unknown study mode `{other}`"
+        ))),
+    }
+}
+
 fn ensure_only_args(
     args: &Value,
     allowed: &[&str],
@@ -368,6 +394,89 @@ fn ensure_only_args(
         }
     }
     Ok(())
+}
+
+fn oral_route_for_question(
+    session: &AuthorizedStudySession,
+    question: &StudyQuestion,
+) -> OralRoutePlan {
+    let expected_terms = question
+        .expected_terms
+        .iter()
+        .map(|term| (concept_id_from_label(term), term.as_str()))
+        .collect::<Vec<_>>();
+    let active_match = session.active_concepts.iter().find_map(|concept_id| {
+        expected_terms
+            .iter()
+            .find(|(term_id, _)| term_id == &normalize_concept_id(concept_id))
+            .map(|(_, label)| (concept_id.clone(), (*label).to_owned()))
+    });
+    let fallback_index = if matches!(session.mode, StudyMode::Cram | StudyMode::Mock) {
+        1
+    } else {
+        0
+    };
+    let fallback = question
+        .expected_terms
+        .get(fallback_index)
+        .or_else(|| question.expected_terms.first())
+        .map(|label| (concept_id_from_label(label), label.clone()))
+        .unwrap_or_else(|| {
+            (
+                concept_id_from_label(&question.question_id),
+                "this source question".to_owned(),
+            )
+        });
+    let (target_concept_id, target_label) = active_match.unwrap_or(fallback);
+    let strategy = if matches!(session.mode, StudyMode::Cram | StudyMode::Mock) {
+        OralRouteStrategy::PreExamInterleave
+    } else if session
+        .active_concepts
+        .iter()
+        .any(|concept_id| normalize_concept_id(concept_id) == target_concept_id)
+    {
+        OralRouteStrategy::ActiveConceptPriority
+    } else {
+        OralRouteStrategy::SourceOrder
+    };
+    let next_action = match strategy {
+        OralRouteStrategy::PreExamInterleave => {
+            format!("Ask one pre-exam oral drill on {target_label}.")
+        }
+        OralRouteStrategy::ActiveConceptPriority => {
+            format!("Ask one oral drill on {target_label}.")
+        }
+        OralRouteStrategy::SourceOrder => "Ask the next source-grounded oral question.".to_owned(),
+    };
+
+    OralRoutePlan {
+        route_id: format!("oral-route:{}:{target_concept_id}", question.question_id),
+        strategy,
+        target_concept_id,
+        next_action,
+    }
+}
+
+fn concept_id_from_label(label: &str) -> String {
+    let normalized = label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    normalized
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn normalize_concept_id(concept_id: &str) -> String {
+    concept_id_from_label(concept_id)
 }
 
 fn concept_status_for_terms(matched: usize, expected: usize) -> ConceptStatus {

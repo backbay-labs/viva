@@ -1288,7 +1288,7 @@ pub fn viva_tool_declarations() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "select_next_question",
-            "description": "Select the next source-grounded oral exam question.",
+            "description": "Select one next source-grounded oral drill/question from the server-owned route policy. Return one spoken turn, not a planner, dashboard, LMS task, or flashcard set.",
             "parameters": {
                 "type": "object",
                 "properties": {

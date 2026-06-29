@@ -35,9 +35,9 @@ pub use ports::{
 };
 pub use study::{
     answer_retry_eligible, fixture_question, fixture_source_reference,
-    is_repairable_evaluation_label, one_shot_retry_prompt, AnswerEvaluation, RecapSourceMoment,
-    StudyQuestion, StudySessionPhase, StudySessionRecap, StudySourceReference,
-    TerminalSessionReason,
+    is_repairable_evaluation_label, one_shot_retry_prompt, AnswerEvaluation, OralRoutePlan,
+    OralRouteStrategy, RecapSourceMoment, StudyQuestion, StudySessionPhase, StudySessionRecap,
+    StudySourceReference, TerminalSessionReason,
 };
 pub use tool_executor::{AuthorizedStudySession, ToolExecutionError, VivaToolExecutor};
 pub use tools::{CorrectionChallengeReason, ToolPlan, ToolProposal, ToolResult};
