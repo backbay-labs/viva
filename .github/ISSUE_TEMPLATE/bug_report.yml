@@ -1,0 +1,91 @@
+name: Bug report
+description: Something in Viva behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. If this is a **security** issue, please stop and follow
+        [SECURITY.md](https://github.com/backbay-labs/viva/blob/main/SECURITY.md) instead;
+        do not file it publicly.
+
+        Please do not paste real provider keys, bearer tokens, session-token secrets, or a
+        student's course material into this issue.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what did you get instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. bun run dev:agent
+        2. bun run dev:web
+        3. Open /session and ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Agent provider
+      description: Which runtime were you on?
+      options:
+        - synthetic (default)
+        - fake_cartesia_gemini
+        - cartesia_gemini (live)
+        - Not applicable / unsure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Web app (apps/web)
+        - Agent service / WebSocket (agent-service)
+        - Study brain (agent-domain)
+        - Provider adapters (agent-adapters)
+        - Storage (data)
+        - Scheduling / contract (packages/core)
+        - Build, CI, or tooling
+        - Docs
+        - Unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or error output
+      description: Redact anything sensitive. This is rendered as a code block.
+      render: shell
+
+  - type: input
+    id: version
+    attributes:
+      label: Commit or version
+      placeholder: "git rev-parse --short HEAD"
+
+  - type: input
+    id: env
+    attributes:
+      label: OS and toolchain
+      placeholder: "macOS 15.4, Bun 1.3.3, Rust 1.94.1"
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I ran `bun run validate` and included any relevant failure output
+        - label: I searched existing issues for a duplicate
+        - label: This issue contains no secrets and no student course material
+          required: true

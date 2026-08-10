@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 260" width="440" height="260" role="img" aria-label="Viva: study by talking, not rereading">
+  <title>Viva</title>
+  <defs>
+    <radialGradient id="orbM" cx="38%" cy="32%" r="72%">
+      <stop offset="0%" stop-color="#c3b2dd"/>
+      <stop offset="45%" stop-color="#a98fce"/>
+      <stop offset="100%" stop-color="#7a5ba6"/>
+    </radialGradient>
+    <radialGradient id="haloM" cx="50%" cy="50%" r="50%">
+      <stop offset="55%" stop-color="#7a5ba6" stop-opacity="0"/>
+      <stop offset="82%" stop-color="#7a5ba6" stop-opacity="0.13"/>
+      <stop offset="100%" stop-color="#7a5ba6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="vignetteM" cx="50%" cy="32%" r="80%">
+      <stop offset="0%" stop-color="#faf7f1"/>
+      <stop offset="70%" stop-color="#f4efe6"/>
+      <stop offset="100%" stop-color="#efe8dc"/>
+    </radialGradient>
+    <clipPath id="frameM"><rect width="440" height="260"/></clipPath>
+  </defs>
+
+  <rect width="440" height="260" fill="url(#vignetteM)"/>
+
+  <g clip-path="url(#frameM)" fill="none" stroke="#7a5ba6" stroke-width="1">
+    <circle cx="220" cy="80" r="62"  opacity="0.16"/>
+    <circle cx="220" cy="80" r="96"  opacity="0.11"/>
+    <circle cx="220" cy="80" r="136" opacity="0.075"/>
+    <circle cx="220" cy="80" r="182" opacity="0.045"/>
+  </g>
+
+  <circle cx="220" cy="80" r="48" fill="url(#haloM)"/>
+  <circle cx="220" cy="80" r="20" fill="url(#orbM)"/>
+  <circle cx="220" cy="80" r="20" fill="none" stroke="#553b78" stroke-width="0.75" opacity="0.35"/>
+  <ellipse cx="213.5" cy="73.5" rx="6.5" ry="4.8" fill="#fdfbf6" opacity="0.42"/>
+
+  <text x="220" y="184" text-anchor="middle"
+        font-family="Cormorant, Cormorant Garamond, Georgia, 'Times New Roman', serif"
+        font-size="82" font-weight="500" letter-spacing="4" fill="#553b78">Viva</text>
+
+  <g stroke="#7a5ba6" stroke-width="1" opacity="0.4">
+    <line x1="140" y1="208" x2="205" y2="208"/>
+    <line x1="235" y1="208" x2="300" y2="208"/>
+  </g>
+  <circle cx="220" cy="208" r="2.2" fill="#bd9a55"/>
+
+  <text x="220" y="236" text-anchor="middle"
+        font-family="'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif"
+        font-size="11.5" letter-spacing="2.6" fill="#5d5670">STUDY BY TALKING, NOT REREADING</text>
+</svg>

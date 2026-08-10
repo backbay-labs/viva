@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600" width="960" height="600" role="img" aria-label="Viva architecture: a Next.js web client talks over a WebSocket to a Rust agent service, which drives a pure domain core, pluggable provider adapters, and an in-memory or Postgres store">
+  <title>Viva architecture</title>
+  <defs>
+    <linearGradient id="boxFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fdfbf6"/>
+      <stop offset="100%" stop-color="#faf7f1"/>
+    </linearGradient>
+    <g id="dnArrow"><path d="M -5.5 -6 L 0 6 L 5.5 -6 L 0 -3 Z" fill="#7a5ba6" opacity="0.8"/></g>
+  </defs>
+
+  <style>
+    .boxTitle { font-family: Cormorant, 'Cormorant Garamond', Georgia, serif; font-size: 23px; font-weight: 600; fill: #2c2536; }
+    .boxSub   { font-family: 'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif; font-size: 10.5px; fill: #938aa4; }
+    .chipTx   { font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; font-size: 10px; fill: #553b78; }
+    .noteTx   { font-family: 'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif; font-size: 10.5px; fill: #5d5670; }
+    .chip     { fill: #efe7f6; stroke: #c3b2dd; stroke-width: 1; }
+  </style>
+
+  <rect width="960" height="600" fill="#f4efe6"/>
+
+  <!-- apps/web -->
+  <rect x="32" y="34" width="628" height="96" rx="18" fill="url(#boxFill)" stroke="#c3b2dd" stroke-width="1.25"/>
+  <text x="52" y="64" class="boxTitle">apps/web</text>
+  <text x="640" y="63" text-anchor="end" class="boxSub">Next.js · React · the session surface</text>
+  <g>
+    <rect x="52"  y="86" width="116" height="26" rx="9" class="chip"/><text x="110" y="103" text-anchor="middle" class="chipTx">LiveSessionShell</text>
+    <rect x="180" y="86" width="86"  height="26" rx="9" class="chip"/><text x="223" y="103" text-anchor="middle" class="chipTx">SourceFolio</text>
+    <rect x="278" y="86" width="110" height="26" rx="9" class="chip"/><text x="333" y="103" text-anchor="middle" class="chipTx">MarginaliaPanel</text>
+    <rect x="400" y="86" width="116" height="26" rx="9" class="chip"/><text x="458" y="103" text-anchor="middle" class="chipTx">VoiceTraceCanvas</text>
+  </g>
+
+  <!-- packages sidebar -->
+  <rect x="690" y="34" width="238" height="96" rx="18" fill="url(#boxFill)" stroke="#c3b2dd" stroke-width="1.25"/>
+  <text x="710" y="60" class="boxTitle" font-size="21">packages</text>
+  <g>
+    <rect x="710" y="72" width="62" height="24" rx="8" class="chip"/><text x="741" y="88" text-anchor="middle" class="chipTx">core</text>
+    <rect x="782" y="72" width="72" height="24" rx="8" class="chip"/><text x="818" y="88" text-anchor="middle" class="chipTx">ui-web</text>
+    <rect x="710" y="102" width="72" height="24" rx="8" class="chip"/><text x="746" y="118" text-anchor="middle" class="chipTx">tokens</text>
+    <text x="792" y="118" class="boxSub">FSRS · contract</text>
+  </g>
+  <line x1="660" y1="82" x2="690" y2="82" stroke="#c3b2dd" stroke-width="1.25" stroke-dasharray="3 4"/>
+
+  <!-- WebSocket boundary -->
+  <line x1="32" y1="152" x2="928" y2="152" stroke="#7a5ba6" stroke-width="1.4" stroke-dasharray="2 8" stroke-linecap="round" opacity="0.55"/>
+  <rect x="292" y="139" width="376" height="27" rx="13" fill="#f4efe6" stroke="#a98fce" stroke-width="1.1"/>
+  <text x="480" y="157" text-anchor="middle" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="10.5" fill="#553b78">WebSocket /ws · protocol v4 · signed session token</text>
+  <use href="#dnArrow" transform="translate(160 152)"/>
+  <use href="#dnArrow" transform="translate(800 152)"/>
+
+  <!-- agent-service -->
+  <rect x="32" y="180" width="628" height="86" rx="18" fill="url(#boxFill)" stroke="#c3b2dd" stroke-width="1.25"/>
+  <text x="52" y="210" class="boxTitle">agent-service</text>
+  <text x="640" y="209" text-anchor="end" class="boxSub">Rust · the only component that speaks to the network</text>
+  <g>
+    <rect x="52"  y="228" width="56" height="26" rx="9" class="chip"/><text x="80"  y="245" text-anchor="middle" class="chipTx">ws.rs</text>
+    <rect x="120" y="228" width="86" height="26" rx="9" class="chip"/><text x="163" y="245" text-anchor="middle" class="chipTx">protocol.rs</text>
+    <rect x="218" y="228" width="76" height="26" rx="9" class="chip"/><text x="256" y="245" text-anchor="middle" class="chipTx">config.rs</text>
+    <rect x="306" y="228" width="62" height="26" rx="9" class="chip"/><text x="337" y="245" text-anchor="middle" class="chipTx">app.rs</text>
+    <text x="386" y="245" class="noteTx">fail-closed on non-loopback binds</text>
+  </g>
+
+  <use href="#dnArrow" transform="translate(346 278)"/>
+
+  <!-- agent-domain -->
+  <rect x="32" y="292" width="628" height="86" rx="18" fill="#fdfbf6" stroke="#7a5ba6" stroke-width="2"/>
+  <text x="52" y="322" class="boxTitle">agent-domain</text>
+  <text x="520" y="321" text-anchor="end" class="boxSub">the study brain: pure, deterministic, no I/O</text>
+  <rect x="536" y="306" width="106" height="22" rx="11" fill="#e9eee4" stroke="#7f9277" stroke-width="1"/>
+  <text x="589" y="321" text-anchor="middle" font-family="'Hanken Grotesk', Helvetica, sans-serif" font-size="9.5" font-weight="600" fill="#4f6247">purity-gated</text>
+  <g>
+    <rect x="52"  y="340" width="56" height="26" rx="9" class="chip"/><text x="80"  y="357" text-anchor="middle" class="chipTx">brain</text>
+    <rect x="120" y="340" width="76" height="26" rx="9" class="chip"/><text x="158" y="357" text-anchor="middle" class="chipTx">tools ×7</text>
+    <rect x="208" y="340" width="56" height="26" rx="9" class="chip"/><text x="236" y="357" text-anchor="middle" class="chipTx">ports</text>
+    <rect x="276" y="340" width="56" height="26" rx="9" class="chip"/><text x="304" y="357" text-anchor="middle" class="chipTx">study</text>
+    <text x="640" y="357" text-anchor="end" class="noteTx">select · evaluate · ground · correct · mark · schedule · recap</text>
+  </g>
+
+  <use href="#dnArrow" transform="translate(346 390)"/>
+
+  <!-- agent-adapters -->
+  <rect x="32" y="404" width="628" height="86" rx="18" fill="url(#boxFill)" stroke="#c3b2dd" stroke-width="1.25"/>
+  <text x="52" y="434" class="boxTitle">agent-adapters</text>
+  <text x="640" y="433" text-anchor="end" class="boxSub">swappable realtime runtimes behind one port</text>
+  <g>
+    <rect x="52"  y="452" width="86"  height="26" rx="9" fill="#e9eee4" stroke="#7f9277" stroke-width="1.25"/>
+    <text x="95"  y="469" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-size="10" fill="#4f6247">synthetic</text>
+    <text x="146" y="469" class="boxSub" fill="#7f9277">default</text>
+
+    <rect x="196" y="452" width="140" height="26" rx="9" class="chip"/>
+    <text x="266" y="469" text-anchor="middle" class="chipTx">fake_cartesia_gemini</text>
+
+    <rect x="348" y="452" width="112" height="26" rx="9" fill="#f3ebd8" stroke="#bd9a55" stroke-width="1.25"/>
+    <text x="404" y="469" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-size="10" fill="#8a6b2e">cartesia_gemini</text>
+    <text x="468" y="469" class="boxSub" fill="#c1864a">credential-gated</text>
+  </g>
+
+  <!-- data -->
+  <rect x="690" y="292" width="238" height="86" rx="18" fill="url(#boxFill)" stroke="#c3b2dd" stroke-width="1.25"/>
+  <text x="710" y="320" class="boxTitle" font-size="21">data</text>
+  <g>
+    <rect x="710" y="332" width="86" height="24" rx="8" fill="#e9eee4" stroke="#7f9277" stroke-width="1"/>
+    <text x="753" y="348" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-size="10" fill="#4f6247">in-memory</text>
+    <rect x="806" y="332" width="76" height="24" rx="8" class="chip"/>
+    <text x="844" y="348" text-anchor="middle" class="chipTx">postgres</text>
+    <text x="710" y="368" class="boxSub">opt-in durability</text>
+  </g>
+  <line x1="660" y1="335" x2="690" y2="335" stroke="#c3b2dd" stroke-width="1.25" stroke-dasharray="3 4"/>
+
+  <!-- observe -->
+  <rect x="690" y="404" width="238" height="86" rx="18" fill="url(#boxFill)" stroke="#c3b2dd" stroke-width="1.25"/>
+  <text x="710" y="432" class="boxTitle" font-size="21">observe</text>
+  <text x="710" y="454" class="noteTx">structured evidence: stage, provider,</text>
+  <text x="710" y="470" class="noteTx">latency, cost, never learner content</text>
+  <line x1="660" y1="447" x2="690" y2="447" stroke="#c3b2dd" stroke-width="1.25" stroke-dasharray="3 4"/>
+
+  <use href="#dnArrow" transform="translate(346 504)"/>
+
+  <!-- providers -->
+  <rect x="32" y="520" width="628" height="56" rx="18" fill="none" stroke="#b6adc1" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="52" y="546" class="boxTitle" font-size="20" fill="#5d5670">providers</text>
+  <g>
+    <rect x="182" y="536" width="112" height="24" rx="8" fill="#faf7f1" stroke="#c3b2dd" stroke-width="1"/>
+    <text x="238" y="552" text-anchor="middle" class="chipTx">Cartesia STT/TTS</text>
+    <rect x="306" y="536" width="70" height="24" rx="8" fill="#faf7f1" stroke="#c3b2dd" stroke-width="1"/>
+    <text x="341" y="552" text-anchor="middle" class="chipTx">Gemini</text>
+    <text x="640" y="552" text-anchor="end" class="noteTx">real keys + an explicit transport gate</text>
+  </g>
+
+  <text x="928" y="552" text-anchor="end" class="boxSub">no keys required to run Viva locally</text>
+</svg>

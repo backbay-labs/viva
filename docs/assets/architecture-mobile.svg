@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 648" width="440" height="648" role="img" aria-label="Viva architecture: a Next.js web client talks over a WebSocket to a Rust agent service, which drives a pure domain core, pluggable provider adapters, and an in-memory or Postgres store">
+  <title>Viva architecture</title>
+  <defs>
+    <linearGradient id="boxFillM" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fdfbf6"/>
+      <stop offset="100%" stop-color="#faf7f1"/>
+    </linearGradient>
+    <g id="dnArrowM"><path d="M -5 -5.5 L 0 5.5 L 5 -5.5 L 0 -2.5 Z" fill="#7a5ba6" opacity="0.8"/></g>
+  </defs>
+
+  <style>
+    .bt { font-family: Cormorant, 'Cormorant Garamond', Georgia, serif; font-size: 20px; font-weight: 600; fill: #2c2536; }
+    .bs { font-family: 'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif; font-size: 9.5px; fill: #938aa4; }
+    .ct { font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; font-size: 9.5px; fill: #553b78; }
+    .nt { font-family: 'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif; font-size: 9.5px; fill: #5d5670; }
+    .cp { fill: #efe7f6; stroke: #c3b2dd; stroke-width: 1; }
+  </style>
+
+  <rect width="440" height="648" fill="#f4efe6"/>
+
+  <rect x="24" y="24" width="392" height="70" rx="15" fill="url(#boxFillM)" stroke="#c3b2dd" stroke-width="1.25"/>
+  <text x="42" y="50" class="bt">apps/web</text>
+  <text x="398" y="49" text-anchor="end" class="bs">Next.js · the session surface</text>
+  <rect x="42"  y="60" width="104" height="22" rx="8" class="cp"/><text x="94"  y="75" text-anchor="middle" class="ct">LiveSessionShell</text>
+  <rect x="154" y="60" width="78"  height="22" rx="8" class="cp"/><text x="193" y="75" text-anchor="middle" class="ct">SourceFolio</text>
+  <rect x="240" y="60" width="100" height="22" rx="8" class="cp"/><text x="290" y="75" text-anchor="middle" class="ct">MarginaliaPanel</text>
+
+  <rect x="24" y="104" width="392" height="52" rx="15" fill="url(#boxFillM)" stroke="#c3b2dd" stroke-width="1.25"/>
+  <text x="42" y="128" class="bt" font-size="18">packages</text>
+  <rect x="150" y="114" width="54" height="22" rx="8" class="cp"/><text x="177" y="129" text-anchor="middle" class="ct">core</text>
+  <rect x="212" y="114" width="62" height="22" rx="8" class="cp"/><text x="243" y="129" text-anchor="middle" class="ct">ui-web</text>
+  <rect x="282" y="114" width="62" height="22" rx="8" class="cp"/><text x="313" y="129" text-anchor="middle" class="ct">tokens</text>
+  <text x="42" y="147" class="bs">FSRS scheduling · learner-loop contract · design tokens</text>
+
+  <line x1="24" y1="176" x2="416" y2="176" stroke="#7a5ba6" stroke-width="1.4" stroke-dasharray="2 8" stroke-linecap="round" opacity="0.55"/>
+  <rect x="86" y="164" width="268" height="25" rx="12" fill="#f4efe6" stroke="#a98fce" stroke-width="1.1"/>
+  <text x="220" y="181" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-size="9.5" fill="#553b78">WebSocket /ws · protocol v4 · signed token</text>
+
+  <rect x="24" y="202" width="392" height="66" rx="15" fill="url(#boxFillM)" stroke="#c3b2dd" stroke-width="1.25"/>
+  <text x="42" y="228" class="bt">agent-service</text>
+  <text x="398" y="227" text-anchor="end" class="bs">Rust · the only network surface</text>
+  <rect x="42"  y="238" width="50" height="22" rx="8" class="cp"/><text x="67"  y="253" text-anchor="middle" class="ct">ws.rs</text>
+  <rect x="100" y="238" width="78" height="22" rx="8" class="cp"/><text x="139" y="253" text-anchor="middle" class="ct">protocol.rs</text>
+  <rect x="186" y="238" width="68" height="22" rx="8" class="cp"/><text x="220" y="253" text-anchor="middle" class="ct">config.rs</text>
+  <text x="264" y="253" class="nt">fail-closed binds</text>
+
+  <use href="#dnArrowM" transform="translate(220 280)"/>
+
+  <rect x="24" y="292" width="392" height="70" rx="15" fill="#fdfbf6" stroke="#7a5ba6" stroke-width="2"/>
+  <text x="42" y="318" class="bt">agent-domain</text>
+  <rect x="300" y="304" width="88" height="20" rx="10" fill="#e9eee4" stroke="#7f9277" stroke-width="1"/>
+  <text x="344" y="318" text-anchor="middle" font-family="'Hanken Grotesk', Helvetica, sans-serif" font-size="9" font-weight="600" fill="#4f6247">purity-gated</text>
+  <rect x="42"  y="330" width="50" height="22" rx="8" class="cp"/><text x="67"  y="345" text-anchor="middle" class="ct">brain</text>
+  <rect x="100" y="330" width="66" height="22" rx="8" class="cp"/><text x="133" y="345" text-anchor="middle" class="ct">tools ×7</text>
+  <rect x="174" y="330" width="50" height="22" rx="8" class="cp"/><text x="199" y="345" text-anchor="middle" class="ct">ports</text>
+  <rect x="232" y="330" width="50" height="22" rx="8" class="cp"/><text x="257" y="345" text-anchor="middle" class="ct">study</text>
+  <text x="292" y="345" class="nt">pure, no I/O</text>
+
+  <use href="#dnArrowM" transform="translate(220 374)"/>
+
+  <rect x="24" y="386" width="392" height="80" rx="15" fill="url(#boxFillM)" stroke="#c3b2dd" stroke-width="1.25"/>
+  <text x="42" y="412" class="bt">agent-adapters</text>
+  <text x="398" y="411" text-anchor="end" class="bs">one port, swappable runtimes</text>
+  <rect x="42"  y="424" width="78"  height="22" rx="8" fill="#e9eee4" stroke="#7f9277" stroke-width="1.25"/>
+  <text x="81"  y="439" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-size="9.5" fill="#4f6247">synthetic</text>
+  <text x="126" y="439" class="bs" fill="#7f9277">default</text>
+  <rect x="180" y="424" width="128" height="22" rx="8" class="cp"/>
+  <text x="244" y="439" text-anchor="middle" class="ct">fake_cartesia_gemini</text>
+  <rect x="42"  y="452" width="102" height="22" rx="8" fill="#f3ebd8" stroke="#bd9a55" stroke-width="1.25"/>
+  <text x="93"  y="467" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-size="9.5" fill="#8a6b2e">cartesia_gemini</text>
+  <text x="152" y="467" class="bs" fill="#c1864a">credential-gated</text>
+
+  <rect x="24" y="484" width="190" height="62" rx="15" fill="url(#boxFillM)" stroke="#c3b2dd" stroke-width="1.25"/>
+  <text x="42" y="508" class="bt" font-size="18">data</text>
+  <rect x="42"  y="516" width="72" height="21" rx="8" fill="#e9eee4" stroke="#7f9277" stroke-width="1"/>
+  <text x="78"  y="530" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-size="9" fill="#4f6247">in-memory</text>
+  <rect x="120" y="516" width="66" height="21" rx="8" class="cp"/>
+  <text x="153" y="530" text-anchor="middle" class="ct" font-size="9">postgres</text>
+
+  <rect x="226" y="484" width="190" height="62" rx="15" fill="url(#boxFillM)" stroke="#c3b2dd" stroke-width="1.25"/>
+  <text x="244" y="508" class="bt" font-size="18">observe</text>
+  <text x="244" y="524" class="nt">stage · provider · latency</text>
+  <text x="244" y="537" class="nt">never learner content</text>
+
+  <use href="#dnArrowM" transform="translate(220 558)"/>
+
+  <rect x="24" y="570" width="392" height="54" rx="15" fill="none" stroke="#b6adc1" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="42" y="594" class="bt" font-size="18" fill="#5d5670">providers</text>
+  <rect x="152" y="580" width="100" height="21" rx="8" fill="#faf7f1" stroke="#c3b2dd" stroke-width="1"/>
+  <text x="202" y="594" text-anchor="middle" class="ct" font-size="9">Cartesia STT/TTS</text>
+  <rect x="262" y="580" width="62" height="21" rx="8" fill="#faf7f1" stroke="#c3b2dd" stroke-width="1"/>
+  <text x="293" y="594" text-anchor="middle" class="ct" font-size="9">Gemini</text>
+  <text x="42" y="615" class="bs">no keys required to run Viva locally</text>
+</svg>

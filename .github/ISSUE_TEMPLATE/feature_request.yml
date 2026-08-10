@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose a change to how Viva studies with someone
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Viva is deliberately narrow: an oral exam room, not a study platform. Proposals that
+        sharpen the ten-minute call fit more readily than proposals that widen the surface area.
+        Either can be argued, so make the case.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is the problem
+      description: Describe the studying situation that goes badly today. Lead with the student, not the feature.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What should happen instead
+    validations:
+      required: true
+
+  - type: dropdown
+    id: loop-stage
+    attributes:
+      label: Where in the loop does this land
+      options:
+        - Upload: getting material in
+        - Extract: finding testable concepts
+        - Recall: the live voice session
+        - Correct: grounding and corrections
+        - Master: concept status and mastery
+        - Return: scheduling and recaps
+        - Outside the loop / infrastructure
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including doing nothing. What makes those worse?
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      options:
+        - label: This can work without requiring a provider key on the default path
+        - label: This does not require learner content in logs or diagnostics
+        - label: I am willing to help implement it

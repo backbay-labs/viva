@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 520" width="900" height="520" role="img" aria-label="The Viva learner loop: upload materials, extract testable concepts, recall them out loud, get corrected against the source, mark mastery, and have weak concepts returned by spaced repetition">
+  <title>The learner loop</title>
+  <defs>
+    <linearGradient id="cardFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fdfbf6"/>
+      <stop offset="100%" stop-color="#faf7f1"/>
+    </linearGradient>
+    <radialGradient id="loopGround" cx="50%" cy="50%" r="72%">
+      <stop offset="0%" stop-color="#faf7f1"/>
+      <stop offset="72%" stop-color="#f4efe6"/>
+      <stop offset="100%" stop-color="#efe8dc"/>
+    </radialGradient>
+    <g id="arrowGlyph">
+      <path d="M -7 -5.5 L 6 0 L -7 5.5 L -4 0 Z" fill="#7a5ba6" opacity="0.85"/>
+    </g>
+  </defs>
+
+  <rect width="900" height="520" fill="url(#loopGround)"/>
+
+  <ellipse cx="450" cy="258" rx="292" ry="168"
+           fill="none" stroke="#7a5ba6" stroke-width="1.5"
+           stroke-dasharray="2 9" stroke-linecap="round" opacity="0.5"/>
+
+  <use href="#arrowGlyph" transform="translate(596 112.5) rotate(18.4)"/>
+  <use href="#arrowGlyph" transform="translate(742 258) rotate(90)"/>
+  <use href="#arrowGlyph" transform="translate(596 403.5) rotate(161.6)"/>
+  <use href="#arrowGlyph" transform="translate(304 403.5) rotate(198.4)"/>
+  <use href="#arrowGlyph" transform="translate(158 258) rotate(270)"/>
+  <use href="#arrowGlyph" transform="translate(304 112.5) rotate(-18.4)"/>
+
+  <g font-family="Cormorant, Cormorant Garamond, Georgia, 'Times New Roman', serif" text-anchor="middle">
+    <text x="450" y="248" font-size="27" font-style="italic" fill="#b6adc1">“I reviewed it.”</text>
+    <line x1="366" y1="240" x2="534" y2="240" stroke="#b6adc1" stroke-width="1.1"/>
+    <text x="450" y="292" font-size="30" font-style="italic" fill="#553b78">“I can explain it.”</text>
+  </g>
+
+  <!-- 1 Upload -->
+  <g transform="translate(357 59)">
+    <rect width="186" height="62" rx="16" fill="url(#cardFill)" stroke="#c3b2dd" stroke-width="1.25"/>
+    <circle cx="25" cy="31" r="13" fill="#efe7f6" stroke="#a98fce" stroke-width="1"/>
+    <text x="25" y="35.5" text-anchor="middle" font-family="'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#553b78">1</text>
+    <text x="47" y="27" font-family="Cormorant, Georgia, serif" font-size="22" font-weight="600" fill="#2c2536">Upload</text>
+    <text x="47" y="44" font-family="'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif" font-size="10.5" fill="#5d5670">notes, slides, PDFs</text>
+  </g>
+
+  <!-- 2 Extract -->
+  <g transform="translate(610 143)">
+    <rect width="186" height="62" rx="16" fill="url(#cardFill)" stroke="#c3b2dd" stroke-width="1.25"/>
+    <circle cx="25" cy="31" r="13" fill="#efe7f6" stroke="#a98fce" stroke-width="1"/>
+    <text x="25" y="35.5" text-anchor="middle" font-family="'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#553b78">2</text>
+    <text x="47" y="27" font-family="Cormorant, Georgia, serif" font-size="22" font-weight="600" fill="#2c2536">Extract</text>
+    <text x="47" y="44" font-family="'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif" font-size="10.5" fill="#5d5670">testable concepts</text>
+  </g>
+
+  <!-- 3 Recall -->
+  <g transform="translate(610 311)">
+    <rect width="186" height="62" rx="16" fill="url(#cardFill)" stroke="#a98fce" stroke-width="1.5"/>
+    <circle cx="25" cy="31" r="13" fill="#7a5ba6"/>
+    <text x="25" y="35.5" text-anchor="middle" font-family="'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#faf7f1">3</text>
+    <text x="47" y="27" font-family="Cormorant, Georgia, serif" font-size="22" font-weight="600" fill="#2c2536">Recall</text>
+    <text x="47" y="44" font-family="'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif" font-size="10.5" fill="#5d5670">out loud, from memory</text>
+  </g>
+
+  <!-- 4 Correct -->
+  <g transform="translate(357 395)">
+    <rect width="186" height="62" rx="16" fill="url(#cardFill)" stroke="#c3b2dd" stroke-width="1.25"/>
+    <circle cx="25" cy="31" r="13" fill="#f3ebd8" stroke="#bd9a55" stroke-width="1"/>
+    <text x="25" y="35.5" text-anchor="middle" font-family="'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#8a6b2e">4</text>
+    <text x="47" y="27" font-family="Cormorant, Georgia, serif" font-size="22" font-weight="600" fill="#2c2536">Correct</text>
+    <text x="47" y="44" font-family="'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif" font-size="10.5" fill="#5d5670">cited to the source</text>
+  </g>
+
+  <!-- 5 Master -->
+  <g transform="translate(104 311)">
+    <rect width="186" height="62" rx="16" fill="url(#cardFill)" stroke="#c3b2dd" stroke-width="1.25"/>
+    <circle cx="25" cy="31" r="13" fill="#e9eee4" stroke="#7f9277" stroke-width="1"/>
+    <text x="25" y="35.5" text-anchor="middle" font-family="'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#4f6247">5</text>
+    <text x="47" y="27" font-family="Cormorant, Georgia, serif" font-size="22" font-weight="600" fill="#2c2536">Master</text>
+    <text x="47" y="44" font-family="'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif" font-size="10.5" fill="#5d5670">known · shaky · missed</text>
+  </g>
+
+  <!-- 6 Return -->
+  <g transform="translate(104 143)">
+    <rect width="186" height="62" rx="16" fill="url(#cardFill)" stroke="#c3b2dd" stroke-width="1.25"/>
+    <circle cx="25" cy="31" r="13" fill="#efe7f6" stroke="#a98fce" stroke-width="1"/>
+    <text x="25" y="35.5" text-anchor="middle" font-family="'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#553b78">6</text>
+    <text x="47" y="27" font-family="Cormorant, Georgia, serif" font-size="22" font-weight="600" fill="#2c2536">Return</text>
+    <text x="47" y="44" font-family="'Hanken Grotesk', 'Avenir Next', Helvetica, Arial, sans-serif" font-size="10.5" fill="#5d5670">FSRS brings it back</text>
+  </g>
+</svg>
