@@ -2,7 +2,7 @@
   "client": [
     {
       "type": "session_config",
-      "version": 4,
+      "version": 5,
       "session": {
         "session_id": "voice-session-1",
         "user_id": "user-1",
@@ -19,27 +19,31 @@
             "retrieval_reason": "seeded next-question context"
           }
         ],
-        "active_concepts": ["oxidative-phosphorylation", "nadh", "atp-synthase"]
+        "active_concepts": [
+          "oxidative-phosphorylation",
+          "nadh",
+          "atp-synthase"
+        ]
       }
     },
     {
       "type": "text",
-      "version": 4,
+      "version": 5,
       "text": "NADH gives electrons to the electron transport chain."
     },
     {
       "type": "cancel",
-      "version": 4
+      "version": 5
     },
     {
       "type": "stop",
-      "version": 4
+      "version": 5
     }
   ],
   "server": [
     {
       "type": "ready",
-      "version": 4,
+      "version": 5,
       "sample_rate_hz": 24000,
       "input_encoding": "pcm_s16le",
       "brain": {
@@ -60,7 +64,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "ready"
@@ -68,7 +72,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "question_started",
         "response_id": "response-1",
@@ -95,7 +99,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "listening"
@@ -103,7 +107,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "transcript_delta",
         "response_id": "response-1",
@@ -112,7 +116,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "transcript_final",
         "response_id": "response-1",
@@ -122,7 +126,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "thinking"
@@ -130,7 +134,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "manuscript_intent",
         "response_id": "response-1",
@@ -143,13 +147,12 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "answer_evaluated",
         "response_id": "response-1",
         "evaluation": {
           "question_id": "q-oxidative-phosphorylation-nadh",
-          "answer_text": "NADH gives electrons to the electron transport chain.",
           "label": "partially correct",
           "concise_feedback": "You named ATP, but skipped the proton-gradient mechanism that drives ATP synthase.",
           "retry_prompt": "Now connect that electron flow to ATP synthase in one precise sentence.",
@@ -168,7 +171,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "source_reference",
         "response_id": "response-1",
@@ -184,7 +187,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "manuscript_intent",
         "response_id": "response-1",
@@ -199,7 +202,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "concept_status",
         "response_id": "response-1",
@@ -209,7 +212,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "manuscript_intent",
         "response_id": "response-1",
@@ -224,7 +227,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "feedback"
@@ -232,7 +235,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "correction"
@@ -240,7 +243,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "cancellation",
         "response_id": "response-2"
@@ -248,7 +251,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "recap_ready",
         "response_id": "response-0",
@@ -256,10 +259,17 @@
           "voice_session_id": "voice-session-1",
           "headline": "Oxidative phosphorylation is getting stronger.",
           "summary": "You named NADH as the electron donor in biology-midterm. Next, make the proton-gradient-to-ATP-synthase link explicit.",
-          "strong_concepts": ["NADH", "electron transport chain"],
-          "shaky_concepts": ["proton gradient"],
+          "strong_concepts": [
+            "NADH",
+            "electron transport chain"
+          ],
+          "shaky_concepts": [
+            "proton gradient"
+          ],
           "missed_concepts": [],
-          "review_later": ["ATP synthase"],
+          "review_later": [
+            "ATP synthase"
+          ],
           "next_action": "Schedule a short review of ATP synthase tomorrow.",
           "source_moments": [
             {
@@ -280,7 +290,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "recap"

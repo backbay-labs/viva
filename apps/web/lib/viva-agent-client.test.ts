@@ -458,6 +458,186 @@ describe("Viva agent browser client", () => {
     expect(afterStaleRecap.staleEvents).toBe(state.staleEvents + 1);
   });
 
+  test("reducer accepts a pending second attempt when response id carries the submission generation", () => {
+    const state = {
+      ...initialVivaAgentSessionState(),
+      activeResponseId: "response-1",
+      phase: "thinking" as const,
+      pendingSubmission: { generationId: "session_bootstrap-1", kind: "audio" as const },
+    };
+    const next = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "transcript_final",
+          response_id: "response-2-generation-session_bootstrap-1",
+          text: "second attempt answer",
+          confidence: null,
+        },
+      }),
+    );
+
+    expect(next.activeResponseId).toBe("response-2-generation-session_bootstrap-1");
+    expect(next.finalTranscript).toBe("second attempt answer");
+    expect(next.transcriptConfidence).toBeUndefined();
+    expect(next.staleEvents).toBe(0);
+  });
+
+  test("reducer clears prior turn artifacts when adopting a pending retry response", () => {
+    const source = sourceFixture("src-prior", "Prior source excerpt.");
+    const state = {
+      ...initialVivaAgentSessionState(),
+      activeResponseId: "response-1",
+      phase: "thinking" as const,
+      pendingSubmission: { generationId: "session_bootstrap-1", kind: "audio" as const },
+      transcript: "prior partial",
+      finalTranscript: "prior final",
+      transcriptConfidence: 0.95,
+      evaluation: {
+        question_id: "q-1",
+        label: "partially correct" as const,
+        concise_feedback: "Prior feedback",
+        retry_prompt: "Try again.",
+        source,
+        concept_status: "shaky" as const,
+        confidence_score: 0.55,
+      },
+      currentSource: source,
+      sources: [source],
+      currentConceptStatus: "shaky" as const,
+      manuscriptIntents: [
+        {
+          responseId: "response-1",
+          intent: { type: "scene_intent", register: "examining", emphasis: "measured" },
+        },
+      ],
+      audio: [{ responseId: "response-1", frame: { pcm16_base64: "AQIDBA==" } }],
+    };
+    const next = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "transcript_final",
+          response_id: "response-2-generation-session_bootstrap-1",
+          text: "second attempt answer",
+          confidence: null,
+        },
+      }),
+    );
+
+    expect(next.activeResponseId).toBe("response-2-generation-session_bootstrap-1");
+    expect(next.pendingSubmission).toEqual({
+      generationId: "session_bootstrap-1",
+      kind: "audio",
+      acceptedResponseId: "response-2-generation-session_bootstrap-1",
+    });
+    expect(next.finalTranscript).toBe("second attempt answer");
+    expect(next.evaluation).toBeUndefined();
+    expect(next.currentSource).toBeUndefined();
+    expect(next.sources).toEqual([]);
+    expect(next.currentConceptStatus).toBeUndefined();
+    expect(next.manuscriptIntents).toEqual([]);
+    expect(next.audio).toEqual([]);
+    expect(next.staleEvents).toBe(0);
+
+    const afterSameResponseIntent = vivaAgentReducer(
+      next,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "manuscript_intent",
+          response_id: "response-2-generation-session_bootstrap-1",
+          intent: { type: "scene_intent", register: "reflecting", emphasis: "quiet" },
+        },
+      }),
+    );
+
+    expect(afterSameResponseIntent.finalTranscript).toBe("second attempt answer");
+    expect(afterSameResponseIntent.manuscriptIntents).toEqual([
+      {
+        responseId: "response-2-generation-session_bootstrap-1",
+        intent: { type: "scene_intent", register: "reflecting", emphasis: "quiet" },
+      },
+    ]);
+
+    const afterOldSameGenerationEvent = vivaAgentReducer(
+      afterSameResponseIntent,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "transcript_delta",
+          response_id: "response-1-generation-session_bootstrap-1",
+          text: "old response should stay stale",
+        },
+      }),
+    );
+
+    expect(afterOldSameGenerationEvent.activeResponseId).toBe(
+      "response-2-generation-session_bootstrap-1",
+    );
+    expect(afterOldSameGenerationEvent.finalTranscript).toBe("second attempt answer");
+    expect(afterOldSameGenerationEvent.transcript).toBe("second attempt answer");
+    expect(afterOldSameGenerationEvent.staleEvents).toBe(1);
+  });
+
+  test("reducer still rejects nonmatching response ids while a submission is pending", () => {
+    const state = {
+      ...initialVivaAgentSessionState(),
+      activeResponseId: "response-1",
+      phase: "thinking" as const,
+      pendingSubmission: { generationId: "session_bootstrap-1", kind: "audio" as const },
+    };
+    const next = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "transcript_final",
+          response_id: "response-2-generation-other",
+          text: "wrong pending answer",
+          confidence: 0.95,
+        },
+      }),
+    );
+
+    expect(next.activeResponseId).toBe("response-1");
+    expect(next.finalTranscript).toBeUndefined();
+    expect(next.staleEvents).toBe(1);
+  });
+
+  test("reducer does not match pending generation id prefixes", () => {
+    const state = {
+      ...initialVivaAgentSessionState(),
+      activeResponseId: "response-1",
+      phase: "thinking" as const,
+      pendingSubmission: { generationId: "session_bootstrap-1", kind: "audio" as const },
+    };
+    const next = vivaAgentReducer(
+      state,
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "transcript_final",
+          response_id: "response-2-generation-session_bootstrap-10",
+          text: "wrong pending answer",
+          confidence: 0.95,
+        },
+      }),
+    );
+
+    expect(next.activeResponseId).toBe("response-1");
+    expect(next.finalTranscript).toBeUndefined();
+    expect(next.staleEvents).toBe(1);
+  });
+
   const sourceFixture = (sourceId: string, excerpt: string): AgentStudySourceReference => ({
     source_id: sourceId,
     document_id: "lec-5",
@@ -1067,7 +1247,8 @@ describe("Viva agent browser client", () => {
       frame: { pcm16_base64: "AQIDBA==" },
     });
     expect(state.finalTranscript).toBe("NADH donates electrons to the electron transport chain.");
-    expect(state.evaluation?.answer_text).toBe(
+    expect(JSON.stringify(state.evaluation)).not.toContain("answer_text");
+    expect(JSON.stringify(state.evaluation)).not.toContain(
       "NADH donates electrons to the electron transport chain.",
     );
     expect(state.sources[0]?.source_id).toBe("src-lecture-5-slide-18");
@@ -1149,7 +1330,6 @@ describe("Viva agent browser client", () => {
           response_id: "response-1",
           evaluation: {
             question_id: "q-oxidative-phosphorylation-nadh",
-            answer_text: "stale answer",
             label: "mostly correct",
             concise_feedback: "stale feedback",
             retry_prompt: "stale retry",

@@ -141,6 +141,7 @@ export type VivaAgentGeneration = {
 export type VivaAgentPendingSubmission = {
   generationId: string;
   kind: "audio" | "text";
+  acceptedResponseId?: string;
 };
 
 export type VivaAgentAudioOutput = {
@@ -613,6 +614,11 @@ export function vivaAgentReducer(
 
   const event = frame.event;
   const responseId = responseIdForEvent(event);
+  const responseMatchesPendingSubmission = responseIdMatchesPendingSubmission(
+    responseId,
+    state.pendingSubmission,
+    state.activeResponseId,
+  );
   if (responseId && state.cancelledResponseIds.includes(responseId)) {
     return { ...state, staleEvents: state.staleEvents + 1 };
   }
@@ -622,9 +628,13 @@ export function vivaAgentReducer(
     event.type !== "cancellation" &&
     (event.type !== "recap_ready" || state.pendingSubmission) &&
     state.activeResponseId &&
-    state.activeResponseId !== responseId
+    state.activeResponseId !== responseId &&
+    !responseMatchesPendingSubmission
   ) {
     return { ...state, staleEvents: state.staleEvents + 1 };
+  }
+  if (responseMatchesPendingSubmission && responseId && state.activeResponseId !== responseId) {
+    state = adoptPendingResponse(state, responseId);
   }
 
   switch (event.type) {
@@ -744,6 +754,68 @@ export function vivaAgentReducer(
     default:
       return state;
   }
+}
+
+function responseIdMatchesPendingSubmission(
+  responseId: string | undefined,
+  pendingSubmission: VivaAgentPendingSubmission | undefined,
+  activeResponseId: string | undefined,
+): boolean {
+  if (!responseId || !pendingSubmission) return false;
+  if (pendingSubmission.acceptedResponseId) {
+    return responseId === pendingSubmission.acceptedResponseId;
+  }
+  if (activeResponseId && responseId === activeResponseId) return false;
+  const generationId = sanitizeResponseGenerationId(pendingSubmission.generationId);
+  if (!generationId) return false;
+  if (!responseId.endsWith(`-generation-${generationId}`)) return false;
+  if (!activeResponseId) return true;
+  const responseTurn = responseTurnNumber(responseId);
+  const activeTurn = responseTurnNumber(activeResponseId);
+  if (responseTurn === undefined || activeTurn === undefined) return false;
+  return responseTurn > activeTurn;
+}
+
+function adoptPendingResponse(
+  state: VivaAgentSessionState,
+  responseId: string,
+): VivaAgentSessionState {
+  const previousResponseId = state.activeResponseId;
+  return {
+    ...state,
+    activeResponseId: responseId,
+    pendingSubmission: state.pendingSubmission
+      ? { ...state.pendingSubmission, acceptedResponseId: responseId }
+      : state.pendingSubmission,
+    transcript: "",
+    finalTranscript: undefined,
+    transcriptConfidence: undefined,
+    evaluation: undefined,
+    currentSource: undefined,
+    sources: [],
+    currentConceptStatus: undefined,
+    recap: undefined,
+    manuscriptIntents: previousResponseId
+      ? state.manuscriptIntents.filter((intent) => intent.responseId !== previousResponseId)
+      : state.manuscriptIntents,
+    audio: previousResponseId
+      ? state.audio.filter((output) => output.responseId !== previousResponseId)
+      : state.audio,
+  };
+}
+
+function responseTurnNumber(responseId: string): number | undefined {
+  const match = /^response-(\d+)(?:-|$)/.exec(responseId);
+  if (!match) return undefined;
+  const turn = Number.parseInt(match[1], 10);
+  return Number.isSafeInteger(turn) ? turn : undefined;
+}
+
+function sanitizeResponseGenerationId(value: string): string {
+  return Array.from(value)
+    .map((character) => (/^[a-zA-Z0-9_-]$/.test(character) ? character : "-"))
+    .join("")
+    .slice(0, 96);
 }
 
 function pendingSubmissionForSessionPhase(

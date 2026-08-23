@@ -1,4 +1,4 @@
-export const VIVA_VOICE_PROTOCOL_VERSION = 4;
+export const VIVA_VOICE_PROTOCOL_VERSION = 5;
 export const VIVA_VOICE_SAMPLE_RATE_HZ = 24_000;
 export const VIVA_VOICE_INPUT_ENCODING = "pcm_s16le";
 export const VIVA_VOICE_MAX_TEXT_FRAME_BYTES = 64 * 1024;
@@ -79,7 +79,6 @@ export type AgentStudyQuestion = {
 
 export type AgentAnswerEvaluation = {
   question_id: string;
-  answer_text: string;
   label: AgentEvaluationLabel;
   concise_feedback: string;
   retry_prompt: string;
@@ -87,6 +86,16 @@ export type AgentAnswerEvaluation = {
   concept_status: AgentConceptStatus;
   confidence_score: number;
 };
+
+const allowedAnswerEvaluationFields = new Set([
+  "question_id",
+  "label",
+  "concise_feedback",
+  "retry_prompt",
+  "source",
+  "concept_status",
+  "confidence_score",
+]);
 
 export type AgentEvaluationLabel =
   | "strong"
@@ -454,12 +463,16 @@ function parseStudyQuestion(value: unknown): AgentStudyQuestion {
 
 function parseAnswerEvaluation(value: unknown): AgentAnswerEvaluation {
   const evaluation = requireRecord(value, "answer evaluation");
+  for (const key of Object.keys(evaluation)) {
+    if (!allowedAnswerEvaluationFields.has(key)) {
+      throw new Error("Unknown answer evaluation field");
+    }
+  }
   requireNonEmptyString(evaluation.question_id, "question_id");
-  requireString(evaluation.answer_text, "answer_text");
   requireEvaluationLabel(evaluation.label);
   requireNonEmptyString(evaluation.concise_feedback, "concise_feedback");
   requireNonEmptyString(evaluation.retry_prompt, "retry_prompt");
-  parseStudySourceReference(evaluation.source);
+  const source = parseStudySourceReference(evaluation.source);
   requireConceptStatus(evaluation.concept_status);
   if (
     typeof evaluation.confidence_score !== "number" ||
@@ -469,7 +482,15 @@ function parseAnswerEvaluation(value: unknown): AgentAnswerEvaluation {
   ) {
     throw new Error("Invalid confidence_score");
   }
-  return evaluation as AgentAnswerEvaluation;
+  return {
+    question_id: evaluation.question_id,
+    label: evaluation.label,
+    concise_feedback: evaluation.concise_feedback,
+    retry_prompt: evaluation.retry_prompt,
+    source,
+    concept_status: evaluation.concept_status,
+    confidence_score: evaluation.confidence_score,
+  } as AgentAnswerEvaluation;
 }
 
 function parseStudySessionRecap(value: unknown): AgentStudySessionRecap {

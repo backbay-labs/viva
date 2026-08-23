@@ -124,40 +124,44 @@ where
             let mut active_response: Option<ActiveRunnerResponse> = None;
             while let Some(input) = input_rx.recv().await {
                 let runner_turn = match input {
-                    BrainInput::Audio(frame) => Some((
-                        RunnerInput::Audio {
+                    BrainInput::Audio(frame) => {
+                        let runner_input = RunnerInput::Audio {
                             frame,
                             client_generation_id: None,
-                        },
-                        Some(0.91_f32),
-                    )),
+                        };
+                        let confidence = default_transcript_confidence(&runner_input);
+                        Some((runner_input, confidence))
+                    }
                     BrainInput::AudioWithMetadata {
                         frame,
                         client_generation_id,
-                    } => Some((
-                        RunnerInput::Audio {
+                    } => {
+                        let runner_input = RunnerInput::Audio {
                             frame,
                             client_generation_id,
-                        },
-                        Some(0.91_f32),
-                    )),
-                    BrainInput::Text(text) => Some((
-                        RunnerInput::Text {
+                        };
+                        let confidence = default_transcript_confidence(&runner_input);
+                        Some((runner_input, confidence))
+                    }
+                    BrainInput::Text(text) => {
+                        let runner_input = RunnerInput::Text {
                             text,
                             client_generation_id: None,
-                        },
-                        Some(1.0_f32),
-                    )),
+                        };
+                        let confidence = default_transcript_confidence(&runner_input);
+                        Some((runner_input, confidence))
+                    }
                     BrainInput::TextWithMetadata {
                         text,
                         client_generation_id,
-                    } => Some((
-                        RunnerInput::Text {
+                    } => {
+                        let runner_input = RunnerInput::Text {
                             text,
                             client_generation_id,
-                        },
-                        Some(1.0_f32),
-                    )),
+                        };
+                        let confidence = default_transcript_confidence(&runner_input);
+                        Some((runner_input, confidence))
+                    }
                     BrainInput::CancelResponse => {
                         let response_id = match active_response
                             .take()
@@ -960,6 +964,13 @@ impl RunnerInput {
                 ..
             } => client_generation_id.as_deref(),
         }
+    }
+}
+
+fn default_transcript_confidence(input: &RunnerInput) -> Option<f32> {
+    match input {
+        RunnerInput::Audio { .. } => None,
+        RunnerInput::Text { .. } => Some(1.0),
     }
 }
 
@@ -2361,6 +2372,21 @@ mod tests {
     use std::sync::Mutex;
 
     use agent_domain::{SessionId, StudyMode};
+
+    #[test]
+    fn audio_turns_do_not_invent_transcript_confidence() {
+        let audio = RunnerInput::Audio {
+            frame: AudioFrame::from_pcm16_bytes(vec![1, 2, 3, 4]),
+            client_generation_id: None,
+        };
+        let text = RunnerInput::Text {
+            text: "Typed answers bypass STT.".to_owned(),
+            client_generation_id: None,
+        };
+
+        assert_eq!(default_transcript_confidence(&audio), None);
+        assert_eq!(default_transcript_confidence(&text), Some(1.0));
+    }
 
     #[tokio::test]
     async fn gemini_tool_loop_keeps_fallback_model_for_tool_continuations() {
