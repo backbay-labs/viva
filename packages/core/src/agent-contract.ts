@@ -1,8 +1,15 @@
-export const VIVA_VOICE_PROTOCOL_VERSION = 4;
+export const VIVA_VOICE_PROTOCOL_VERSION = 5 as const;
 export const VIVA_VOICE_SAMPLE_RATE_HZ = 24_000;
 export const VIVA_VOICE_INPUT_ENCODING = "pcm_s16le";
 export const VIVA_VOICE_MAX_TEXT_FRAME_BYTES = 64 * 1024;
 export const VIVA_VOICE_MAX_BINARY_FRAME_BYTES = 256 * 1024;
+
+/** Alias of the existing 24 kHz voice constant; one literal source. */
+export const VIVA_AUDIO_SAMPLE_RATE_HZ = VIVA_VOICE_SAMPLE_RATE_HZ;
+export const VIVA_AUDIO_MAX_CHUNK_SAMPLES = 4_096 as const;
+export const VIVA_AUDIO_MAX_CHUNK_BYTES = 8_192 as const;
+export const VIVA_AUDIO_MAX_TURN_SAMPLES = 1_080_000 as const;
+export const VIVA_AUDIO_MAX_TURN_BYTES = 2_160_000 as const;
 
 export type AgentStudyMode = "quiz" | "teach" | "mock" | "cram";
 export type AgentConceptStatus = "strong" | "shaky" | "missed" | "review";
@@ -160,6 +167,31 @@ type VivaClientGenerationMetadata = {
   client_generation_id?: string;
 };
 
+export type AgentAudioChunkFrame = {
+  type: "audio_chunk";
+  version: 5;
+  client_generation_id: string;
+  turn_id: string;
+  sequence: number;
+  frame: { pcm16_base64: string };
+};
+
+export type AgentAudioEndFrame = {
+  type: "audio_end";
+  version: 5;
+  client_generation_id: string;
+  turn_id: string;
+  final_sequence: number;
+};
+
+export type AgentAudioTurnAcceptedFrame = {
+  type: "audio_turn_accepted";
+  version: 5;
+  client_generation_id: string;
+  turn_id: string;
+  final_sequence: number;
+};
+
 export type VivaClientFrame =
   | ({
       type: "session_config";
@@ -167,17 +199,18 @@ export type VivaClientFrame =
       session: AgentSessionConfig;
       session_token?: string;
     } & VivaClientGenerationMetadata)
-  | ({
-      type: "audio";
-      version: typeof VIVA_VOICE_PROTOCOL_VERSION;
-      frame: AgentAudioFrame;
-    } & VivaClientGenerationMetadata)
+  | AgentAudioChunkFrame
+  | AgentAudioEndFrame
   | ({
       type: "text";
       version: typeof VIVA_VOICE_PROTOCOL_VERSION;
       text: string;
     } & VivaClientGenerationMetadata)
-  | ({ type: "cancel"; version: typeof VIVA_VOICE_PROTOCOL_VERSION } & VivaClientGenerationMetadata)
+  | ({
+      type: "cancel";
+      version: typeof VIVA_VOICE_PROTOCOL_VERSION;
+      turn_id?: string;
+    } & VivaClientGenerationMetadata)
   | ({ type: "stop"; version: typeof VIVA_VOICE_PROTOCOL_VERSION } & VivaClientGenerationMetadata);
 
 export type VivaReadyFrame = {
@@ -241,18 +274,37 @@ export type VivaServerEvent =
 
 export type VivaServerFrame =
   | VivaReadyFrame
+  | AgentAudioTurnAcceptedFrame
   | { type: "event"; version: typeof VIVA_VOICE_PROTOCOL_VERSION; event: VivaServerEvent }
   | { type: "error"; version: typeof VIVA_VOICE_PROTOCOL_VERSION; message: string };
 
-export function audioClientFrame(
-  pcm16Base64: string,
-  clientGenerationId?: string,
-): VivaClientFrame {
+export function audioChunkClientFrame(
+  input: Readonly<{
+    clientGenerationId: string;
+    turnId: string;
+    sequence: number;
+    pcm16Base64: string;
+  }>,
+): AgentAudioChunkFrame {
   return {
-    ...(clientGenerationId ? { client_generation_id: clientGenerationId } : {}),
-    type: "audio",
+    type: "audio_chunk",
     version: VIVA_VOICE_PROTOCOL_VERSION,
-    frame: { pcm16_base64: pcm16Base64 },
+    client_generation_id: input.clientGenerationId,
+    turn_id: input.turnId,
+    sequence: input.sequence,
+    frame: { pcm16_base64: input.pcm16Base64 },
+  };
+}
+
+export function audioEndClientFrame(
+  input: Readonly<{ clientGenerationId: string; turnId: string; finalSequence: number }>,
+): AgentAudioEndFrame {
+  return {
+    type: "audio_end",
+    version: VIVA_VOICE_PROTOCOL_VERSION,
+    client_generation_id: input.clientGenerationId,
+    turn_id: input.turnId,
+    final_sequence: input.finalSequence,
   };
 }
 
@@ -290,6 +342,13 @@ export function parseVivaServerFrame(value: unknown): VivaServerFrame {
     parseBrainReadiness(frame.brain);
     parseStoreReadiness(frame.store);
     return frame as VivaReadyFrame;
+  }
+
+  if (type === "audio_turn_accepted") {
+    requireNonEmptyString(frame.client_generation_id, "client_generation_id");
+    requireNonEmptyString(frame.turn_id, "turn_id");
+    requireSequenceNumber(frame.final_sequence, "final_sequence");
+    return frame as VivaServerFrame;
   }
 
   if (type === "event") {
@@ -398,10 +457,16 @@ export function parseVivaClientFrame(value: unknown): VivaClientFrame {
         requireNonEmptyString(frame.session_token, "session_token");
       }
       return frame as VivaClientFrame;
-    case "audio":
-      {
-        parseAudioFrame(frame.frame);
-      }
+    case "audio_chunk":
+      requireNonEmptyString(frame.client_generation_id, "client_generation_id");
+      requireNonEmptyString(frame.turn_id, "turn_id");
+      requireSequenceNumber(frame.sequence, "sequence");
+      parseAudioChunkPayload(frame.frame);
+      return frame as VivaClientFrame;
+    case "audio_end":
+      requireNonEmptyString(frame.client_generation_id, "client_generation_id");
+      requireNonEmptyString(frame.turn_id, "turn_id");
+      requireSequenceNumber(frame.final_sequence, "final_sequence");
       return frame as VivaClientFrame;
     case "text":
       if (typeof frame.text !== "string") {
@@ -411,11 +476,45 @@ export function parseVivaClientFrame(value: unknown): VivaClientFrame {
     case "tool_result":
       throw new Error("Browser tool_result frames are not accepted");
     case "cancel":
+      if ("turn_id" in frame && frame.turn_id !== undefined) {
+        requireNonEmptyString(frame.turn_id, "turn_id");
+        requireNonEmptyString(frame.client_generation_id, "client_generation_id");
+      }
+      return frame as VivaClientFrame;
     case "stop":
       return frame as VivaClientFrame;
     default:
       throw new Error("Unknown Viva voice client frame");
   }
+}
+
+/**
+ * Sequence numbers start at 0, are contiguous, and cannot be reused. Fractional,
+ * negative, and unsafe integers fail closed before any allocation.
+ */
+function requireSequenceNumber(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Invalid ${label}`);
+  }
+  return value;
+}
+
+function parseAudioChunkPayload(value: unknown): AgentAudioFrame {
+  const frame = requireRecord(value, "audio chunk");
+  const encoded = requireNonEmptyString(frame.pcm16_base64, "pcm16_base64");
+  let byteLength: number;
+  try {
+    byteLength = atob(encoded).length;
+  } catch {
+    throw new Error("Invalid pcm16_base64");
+  }
+  if (byteLength === 0 || byteLength % 2 !== 0) {
+    throw new Error("Invalid pcm16_base64");
+  }
+  if (byteLength > VIVA_AUDIO_MAX_CHUNK_BYTES) {
+    throw new Error("Audio chunk exceeds maximum size");
+  }
+  return frame as AgentAudioFrame;
 }
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {

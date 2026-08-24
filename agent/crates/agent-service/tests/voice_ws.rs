@@ -1994,8 +1994,11 @@ async fn shared_audio_fixture_matches_client_frame_contract() {
     assert_eq!(
         serde_json::to_value(audio).unwrap(),
         serde_json::json!({
-            "type": "audio",
+            "type": "audio_chunk",
             "version": VIVA_VOICE_PROTOCOL_VERSION,
+            "client_generation_id": "1",
+            "turn_id": "turn-1",
+            "sequence": 0,
             "frame": { "pcm16_base64": "AQIDBA==" }
         })
     );
@@ -2181,13 +2184,15 @@ async fn real_websocket_replays_fake_cartesia_gemini_fixture_and_evidence_pack()
     for _ in 0..2 {
         actual.push(read_server_frame(&mut socket).await);
     }
+    // The bounded chunk is retained locally; only the explicit end admits a turn.
     send_client_frame(&mut socket, &fixture.client[1]).await;
-    for _ in 0..13 {
+    send_client_frame(&mut socket, &fixture.client[2]).await;
+    for _ in 0..14 {
         actual.push(read_server_frame(&mut socket).await);
     }
-    send_client_frame(&mut socket, &fixture.client[2]).await;
-    actual.push(read_server_frame(&mut socket).await);
     send_client_frame(&mut socket, &fixture.client[3]).await;
+    actual.push(read_server_frame(&mut socket).await);
+    send_client_frame(&mut socket, &fixture.client[4]).await;
     wait_for_socket_close(&mut socket).await;
 
     assert_eq!(
@@ -2198,6 +2203,14 @@ async fn real_websocket_replays_fake_cartesia_gemini_fixture_and_evidence_pack()
         "../../../fixtures/voice-protocol/fake-cartesia-gemini-evidence-pack.json"
     ))
     .unwrap();
+    assert_eq!(
+        expected_pack["client_frame_count"].as_u64(),
+        Some(fixture.client.len() as u64)
+    );
+    assert_eq!(
+        expected_pack["server_frame_count"].as_u64(),
+        Some(fixture.server.len() as u64)
+    );
     let snapshot = store.snapshot();
     let session = snapshot.sessions.first().expect("session is recorded");
     assert_eq!(session.status, "closed");
@@ -3972,6 +3985,8 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
         &mut second_socket,
         &ClientFrame::Cancel {
             version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: None,
+            turn_id: None,
         },
     )
     .await;
@@ -4085,6 +4100,8 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
         &mut second_socket,
         &ClientFrame::Cancel {
             version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: None,
+            turn_id: None,
         },
     )
     .await;
@@ -8972,6 +8989,395 @@ async fn websocket_rejects_authorized_payload_replayed_under_wrong_response_id()
     assert!(evidence.snapshot().iter().all(|event| {
         event.kind != VoiceEvidenceEventKind::EvaluationEmitted || event.detail != "response-2"
     }));
+}
+
+const STREAMED_AUDIO_GENERATION: &str = "streamed-generation-1";
+/// One production capture callback: 20 ms of mono `pcm_s16le` at 24 kHz.
+const STREAMED_AUDIO_CHUNK_BYTES: usize = 960;
+const STREAMED_AUDIO_CHUNKS_PER_SECOND: u32 = 50;
+const STREAMED_AUDIO_MAX_CHUNK_BYTES: usize = 8_192;
+const STREAMED_AUDIO_MAX_TURN_BYTES: usize = 2_160_000;
+/// Every streamed chunk carries this byte, so `q6ur` is the base64 fingerprint a
+/// sanitized protocol error must never echo back to the browser.
+const STREAMED_AUDIO_PCM_BYTE: u8 = 0xAB;
+const STREAMED_AUDIO_PCM_BASE64_PREFIX: &str = "q6ur";
+
+fn streamed_audio_chunk_json(turn_id: &str, sequence: u32, pcm16: &[u8]) -> String {
+    serde_json::json!({
+        "type": "audio_chunk",
+        "version": VIVA_VOICE_PROTOCOL_VERSION,
+        "client_generation_id": STREAMED_AUDIO_GENERATION,
+        "turn_id": turn_id,
+        "sequence": sequence,
+        "frame": { "pcm16_base64": STANDARD.encode(pcm16) },
+    })
+    .to_string()
+}
+
+fn streamed_audio_chunk_of(turn_id: &str, sequence: u32, bytes: usize) -> String {
+    streamed_audio_chunk_json(turn_id, sequence, &vec![STREAMED_AUDIO_PCM_BYTE; bytes])
+}
+
+fn streamed_audio_end_json(turn_id: &str, final_sequence: u32) -> String {
+    serde_json::json!({
+        "type": "audio_end",
+        "version": VIVA_VOICE_PROTOCOL_VERSION,
+        "client_generation_id": STREAMED_AUDIO_GENERATION,
+        "turn_id": turn_id,
+        "final_sequence": final_sequence,
+    })
+    .to_string()
+}
+
+fn streamed_audio_cancel_json(turn_id: &str) -> String {
+    serde_json::json!({
+        "type": "cancel",
+        "version": VIVA_VOICE_PROTOCOL_VERSION,
+        "client_generation_id": STREAMED_AUDIO_GENERATION,
+        "turn_id": turn_id,
+    })
+    .to_string()
+}
+
+async fn open_streamed_audio_session(state: AppState) -> Option<TestWebSocket> {
+    let url = spawn_server(state).await?;
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            format!(
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    // session_phase ready, then the first question.
+    for _ in 0..2 {
+        read_server_frame(&mut socket).await;
+    }
+    Some(socket)
+}
+
+async fn send_streamed_audio_chunks(socket: &mut TestWebSocket, turn_id: &str, chunks: u32) {
+    let pcm16 = vec![STREAMED_AUDIO_PCM_BYTE; STREAMED_AUDIO_CHUNK_BYTES];
+    for sequence in 0..chunks {
+        socket
+            .send(WsMessage::Text(
+                streamed_audio_chunk_json(turn_id, sequence, &pcm16).into(),
+            ))
+            .await
+            .unwrap();
+    }
+}
+
+async fn assert_no_server_frame(socket: &mut TestWebSocket, within: Duration) {
+    assert!(
+        tokio::time::timeout(within, socket.next()).await.is_err(),
+        "the server must stay silent and open"
+    );
+}
+
+async fn read_server_text(socket: &mut TestWebSocket) -> String {
+    match tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    {
+        WsMessage::Text(text) => text.as_str().to_owned(),
+        other => panic!("expected text server frame, got {other:?}"),
+    }
+}
+
+async fn read_server_frames_until_session_phase(
+    socket: &mut TestWebSocket,
+    expected: agent_domain::StudySessionPhase,
+) -> Vec<ServerFrame> {
+    let mut frames = Vec::new();
+    loop {
+        let frame = read_server_frame(socket).await;
+        let reached = matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::SessionPhase { phase, terminal_reason: None }
+                        if *phase == expected
+                )
+        );
+        frames.push(frame);
+        if reached {
+            return frames;
+        }
+    }
+}
+
+fn count_events(frames: &[ServerFrame], kind: BrowserEventKind) -> usize {
+    frames
+        .iter()
+        .filter(|frame| match frame {
+            ServerFrame::Event { event, .. } => kind.matches(event.as_ref()),
+            _ => false,
+        })
+        .count()
+}
+
+async fn assert_streamed_audio_turn_admits_one_provider_turn(seconds: u32) {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let Some(mut socket) =
+        open_streamed_audio_session(test_state_with_store(1, store.clone())).await
+    else {
+        return;
+    };
+    let turn_id = format!("turn-{seconds}s");
+    let chunks = seconds * STREAMED_AUDIO_CHUNKS_PER_SECOND;
+    let final_sequence = chunks - 1;
+
+    send_streamed_audio_chunks(&mut socket, &turn_id, chunks).await;
+    assert_no_server_frame(&mut socket, Duration::from_millis(200)).await;
+
+    socket
+        .send(WsMessage::Text(
+            streamed_audio_end_json(&turn_id, final_sequence).into(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::AudioTurnAccepted {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: STREAMED_AUDIO_GENERATION.to_owned(),
+            turn_id: turn_id.clone(),
+            final_sequence,
+        }
+    );
+
+    let frames = read_server_frames_until_session_phase(
+        &mut socket,
+        agent_domain::StudySessionPhase::Correction,
+    )
+    .await;
+    let raw_bytes = u64::from(seconds) * 48_000;
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::TranscriptFinal { text, .. }
+                        if text == &format!("received {raw_bytes} PCM16 bytes")
+                )
+        )),
+        "the synthetic provider must transcribe exactly one assembled {seconds}s turn"
+    );
+    assert_eq!(count_events(&frames, BrowserEventKind::AnswerEvaluated), 1);
+    assert_eq!(count_events(&frames, BrowserEventKind::ConceptStatus), 1);
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| matches!(frame, ServerFrame::AudioTurnAccepted { .. }))
+            .count(),
+        0,
+        "exactly one acceptance frame per completed turn"
+    );
+    assert_eq!(store.snapshot().answer_attempts.len(), 1);
+    assert_no_server_frame(&mut socket, Duration::from_millis(150)).await;
+}
+
+#[tokio::test]
+async fn streamed_audio_turns_complete_a_two_second_turn() {
+    assert_streamed_audio_turn_admits_one_provider_turn(2).await;
+}
+
+#[tokio::test]
+async fn streamed_audio_turns_complete_a_ten_second_turn() {
+    assert_streamed_audio_turn_admits_one_provider_turn(10).await;
+}
+
+#[tokio::test]
+async fn streamed_audio_turns_complete_a_forty_five_second_turn() {
+    assert_streamed_audio_turn_admits_one_provider_turn(45).await;
+}
+
+async fn assert_streamed_audio_protocol_error(
+    client_frames: Vec<String>,
+    expected_message: &str,
+    expected_close: CloseCode,
+) {
+    let Some(mut socket) = open_streamed_audio_session(test_state(1)).await else {
+        return;
+    };
+    for text in client_frames {
+        socket.send(WsMessage::Text(text.into())).await.unwrap();
+    }
+
+    let raw = read_server_text(&mut socket).await;
+    assert!(
+        !raw.contains(STREAMED_AUDIO_PCM_BASE64_PREFIX) && !raw.contains("pcm16"),
+        "protocol errors must not echo base64 or PCM data"
+    );
+    assert_eq!(
+        serde_json::from_str::<ServerFrame>(&raw).unwrap(),
+        ServerFrame::error(expected_message)
+    );
+    assert_close_code(&mut socket, expected_close).await;
+}
+
+#[tokio::test]
+async fn streamed_audio_turns_reject_invalid_sequences_and_identities() {
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        (
+            "duplicate sequence",
+            vec![
+                streamed_audio_chunk_of("turn-a", 0, STREAMED_AUDIO_CHUNK_BYTES),
+                streamed_audio_chunk_of("turn-a", 0, STREAMED_AUDIO_CHUNK_BYTES),
+            ],
+        ),
+        (
+            "sequence gap",
+            vec![
+                streamed_audio_chunk_of("turn-a", 0, STREAMED_AUDIO_CHUNK_BYTES),
+                streamed_audio_chunk_of("turn-a", 2, STREAMED_AUDIO_CHUNK_BYTES),
+            ],
+        ),
+        (
+            "out of order sequence",
+            vec![
+                streamed_audio_chunk_of("turn-a", 0, STREAMED_AUDIO_CHUNK_BYTES),
+                streamed_audio_chunk_of("turn-a", 1, STREAMED_AUDIO_CHUNK_BYTES),
+                streamed_audio_chunk_of("turn-a", 1, STREAMED_AUDIO_CHUNK_BYTES),
+            ],
+        ),
+        (
+            "second turn while the first is active",
+            vec![
+                streamed_audio_chunk_of("turn-a", 0, STREAMED_AUDIO_CHUNK_BYTES),
+                streamed_audio_chunk_of("turn-b", 0, STREAMED_AUDIO_CHUNK_BYTES),
+            ],
+        ),
+        (
+            "mismatched turn on end",
+            vec![
+                streamed_audio_chunk_of("turn-a", 0, STREAMED_AUDIO_CHUNK_BYTES),
+                streamed_audio_end_json("turn-b", 0),
+            ],
+        ),
+        (
+            "final sequence that was never accepted",
+            vec![
+                streamed_audio_chunk_of("turn-a", 0, STREAMED_AUDIO_CHUNK_BYTES),
+                streamed_audio_end_json("turn-a", 1),
+            ],
+        ),
+        ("empty chunk", vec![streamed_audio_chunk_of("turn-a", 0, 0)]),
+        ("odd chunk", vec![streamed_audio_chunk_of("turn-a", 0, 1)]),
+        (
+            "mismatched scoped cancel",
+            vec![
+                streamed_audio_chunk_of("turn-a", 0, STREAMED_AUDIO_CHUNK_BYTES),
+                streamed_audio_cancel_json("turn-b"),
+            ],
+        ),
+    ];
+
+    for (label, frames) in cases {
+        println!("streamed audio negative case: {label}");
+        assert_streamed_audio_protocol_error(frames, "invalid audio frame", CloseCode::Protocol)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn streamed_audio_turns_reject_an_oversized_chunk() {
+    assert_streamed_audio_protocol_error(
+        vec![streamed_audio_chunk_of(
+            "turn-a",
+            0,
+            STREAMED_AUDIO_MAX_CHUNK_BYTES + 2,
+        )],
+        "audio chunk exceeds maximum size",
+        CloseCode::Size,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn streamed_audio_turns_reject_an_over_limit_tail() {
+    let full_chunks = STREAMED_AUDIO_MAX_TURN_BYTES / STREAMED_AUDIO_MAX_CHUNK_BYTES;
+    let tail = STREAMED_AUDIO_MAX_TURN_BYTES - full_chunks * STREAMED_AUDIO_MAX_CHUNK_BYTES;
+    let mut frames: Vec<String> = (0..full_chunks)
+        .map(|sequence| {
+            streamed_audio_chunk_of("turn-a", sequence as u32, STREAMED_AUDIO_MAX_CHUNK_BYTES)
+        })
+        .collect();
+    frames.push(streamed_audio_chunk_of("turn-a", full_chunks as u32, tail));
+    frames.push(streamed_audio_chunk_of("turn-a", full_chunks as u32 + 1, 2));
+
+    assert_streamed_audio_protocol_error(
+        frames,
+        "audio turn exceeds maximum size",
+        CloseCode::Size,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn streamed_audio_turns_cancel_halfway_creates_no_provider_work() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let Some(mut socket) =
+        open_streamed_audio_session(test_state_with_store(1, store.clone())).await
+    else {
+        return;
+    };
+
+    send_streamed_audio_chunks(&mut socket, "turn-cancelled", 1_125).await;
+    socket
+        .send(WsMessage::Text(
+            streamed_audio_cancel_json("turn-cancelled").into(),
+        ))
+        .await
+        .unwrap();
+
+    assert_no_server_frame(&mut socket, Duration::from_millis(400)).await;
+    assert!(store.snapshot().answer_attempts.is_empty());
+    assert!(store.snapshot().concept_statuses.is_empty());
+
+    // The connection stays usable: a fresh bounded turn still completes exactly once.
+    send_streamed_audio_chunks(&mut socket, "turn-after-cancel", 100).await;
+    socket
+        .send(WsMessage::Text(
+            streamed_audio_end_json("turn-after-cancel", 99).into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::AudioTurnAccepted {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: STREAMED_AUDIO_GENERATION.to_owned(),
+            turn_id: "turn-after-cancel".to_owned(),
+            final_sequence: 99,
+        }
+    );
+    let frames = read_server_frames_until_session_phase(
+        &mut socket,
+        agent_domain::StudySessionPhase::Correction,
+    )
+    .await;
+    assert_eq!(count_events(&frames, BrowserEventKind::AnswerEvaluated), 1);
+    assert!(frames.iter().any(|frame| matches!(
+        frame,
+        ServerFrame::Event { event, .. }
+            if matches!(
+                event.as_ref(),
+                VivaServerEvent::TranscriptFinal { text, .. }
+                    if text == "received 96000 PCM16 bytes"
+            )
+    )));
 }
 
 #[derive(Clone, Copy)]

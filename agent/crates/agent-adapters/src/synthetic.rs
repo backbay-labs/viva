@@ -1165,4 +1165,52 @@ mod tests {
         assert_eq!(snapshot.review_items.len(), 0);
         assert_eq!(snapshot.recaps.len(), 0);
     }
+
+    /// The WebSocket assembler admits one `BrainInput` per completed browser turn,
+    /// so thousands of bounded chunks still produce exactly one evaluated turn.
+    #[tokio::test]
+    async fn one_assembled_forty_five_second_turn_produces_one_evaluated_turn() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let brain = SyntheticBrain::with_study_store(store.clone());
+        let mut session = brain
+            .open(SessionConfig {
+                session_id: Some(SessionId::new("voice-session-1")),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+        let _ = next_event(&mut session).await;
+        let _ = next_event(&mut session).await;
+
+        // 45 seconds of mono pcm_s16le at 24 kHz: 2,250 bounded 20 ms chunks.
+        session
+            .input
+            .send(BrainInput::AudioWithMetadata {
+                frame: agent_domain::AudioFrame::from_pcm16_bytes(vec![0_u8; 2_160_000]),
+                client_generation_id: Some("generation-1".to_owned()),
+            })
+            .await
+            .unwrap();
+
+        let mut transcripts = Vec::new();
+        let mut evaluations = 0_u32;
+        for _ in 0..24 {
+            match timeout(Duration::from_secs(2), session.events.recv()).await {
+                Ok(Some(BrainEvent::TranscriptFinal { text, .. })) => transcripts.push(text),
+                Ok(Some(BrainEvent::AnswerEvaluated { .. })) => {
+                    evaluations += 1;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert_eq!(transcripts, vec!["received 2160000 PCM16 bytes".to_owned()]);
+        assert_eq!(evaluations, 1);
+        assert_eq!(store.snapshot().answer_attempts.len(), 1);
+    }
 }

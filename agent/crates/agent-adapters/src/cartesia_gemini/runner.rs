@@ -3172,4 +3172,115 @@ mod tests {
             Ok(Vec::new())
         }
     }
+
+    #[derive(Clone, Default)]
+    struct AssembledTurnCardinalityTransports {
+        transcribed_bytes: Arc<Mutex<Vec<usize>>>,
+        gemini_calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for AssembledTurnCardinalityTransports {
+        async fn transcribe_audio(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            frame: &AudioFrame,
+        ) -> Result<RunnerTranscript, BrainError> {
+            self.transcribed_bytes
+                .lock()
+                .expect("transcribed bytes lock poisoned")
+                .push(frame.pcm16_bytes().len());
+            Ok(RunnerTranscript {
+                interim_text: String::new(),
+                final_text: "one assembled browser turn".to_owned(),
+                confidence: Some(0.9),
+            })
+        }
+
+        async fn stream_gemini(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _request: Value,
+        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+            *self
+                .gemini_calls
+                .lock()
+                .expect("gemini calls lock poisoned") += 1;
+            Ok(vec![GeminiStreamEvent::ModelPart {
+                text: Some("one provider turn".to_owned()),
+                part: json!({ "text": "one provider turn" }),
+            }])
+        }
+
+        async fn synthesize_sonic(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _transcript: &str,
+            _interrupt: FakeRuntimeInterrupt,
+        ) -> Result<Vec<AudioFrame>, BrainError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The assembler hands the runner one `AudioFrame` per completed browser turn,
+    /// no matter how many bounded chunks the browser streamed to build it.
+    #[tokio::test]
+    async fn completed_forty_five_second_turn_transcribes_once_for_one_provider_turn() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        let transports = AssembledTurnCardinalityTransports::default();
+        let runner = CartesiaGeminiRunner {
+            config: CartesiaGeminiConfig::default(),
+            transports: transports.clone(),
+            store: Some(store),
+        };
+        let mut session = runner.open(session_config).await.expect("runner opens");
+
+        // 45 seconds of mono pcm_s16le at 24 kHz, assembled from 2,250 bounded chunks.
+        let assembled = AudioFrame::from_pcm16_bytes(vec![0_u8; 2_160_000]);
+        session
+            .input
+            .send(BrainInput::AudioWithMetadata {
+                frame: assembled,
+                client_generation_id: Some("generation-1".to_owned()),
+            })
+            .await
+            .expect("sends one assembled turn");
+
+        let mut transcripts = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(250), session.events.recv()).await {
+                Ok(Some(BrainEvent::TranscriptFinal { text, .. })) => transcripts.push(text),
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        assert_eq!(transcripts, vec!["one assembled browser turn".to_owned()]);
+        assert_eq!(
+            transports
+                .transcribed_bytes
+                .lock()
+                .expect("transcribed bytes lock poisoned")
+                .as_slice(),
+            [2_160_000]
+        );
+        assert_eq!(
+            *transports
+                .gemini_calls
+                .lock()
+                .expect("gemini calls lock poisoned"),
+            1
+        );
+    }
 }
