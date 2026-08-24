@@ -3,6 +3,7 @@ import {
   base64ToPcm16LeBytes,
   chunkPcm16LeBytes,
   createBrowserVivaAudioCaptureSource,
+  createStreamingFloat32Resampler,
   float32ToPcm16Base64Frames,
   float32ToPcm16Base64FramesAtSampleRate,
   float32ToPcm16LeBytes,
@@ -293,6 +294,159 @@ describe("Viva audio capture helpers", () => {
 
     expect(error instanceof VivaAudioWorkletUnavailableError).toBe(true);
     expect(contextFactory.instances[0]?.closed).toBe(true);
+  });
+});
+
+/**
+ * CRIT-AUDIO-01: one resampler instance per capture lifecycle. The AudioWorklet
+ * hands the page irregular block sizes; resampling each block from scratch resets
+ * phase at every boundary and drifts the emitted 24 kHz sample count away from
+ * `duration * 24_000`. These specs pin phase continuity and the exact counts at
+ * both browser capture rates.
+ */
+describe("streaming Float32 resampler", () => {
+  const TARGET_RATE_HZ = 24_000;
+  const SOURCE_RATES_HZ = [44_100, 48_000] as const;
+  const TURN_SECONDS = [2, 10, 45] as const;
+  // Deliberately irregular AudioWorklet callback sizes: sub-sample, prime-ish,
+  // power-of-two, and oversized blocks, so no block boundary lands on a whole
+  // resampling period.
+  const IRREGULAR_CALLBACK_BLOCKS = [1, 127, 128, 511, 7, 2048, 333] as const;
+
+  const toneCache = new Map<string, Float32Array>();
+
+  function toneSamples(sourceRateHz: number, seconds: number): Float32Array {
+    const key = `${sourceRateHz}:${seconds}`;
+    const cached = toneCache.get(key);
+    if (cached) return cached;
+    const total = Math.round(sourceRateHz * seconds);
+    const samples = new Float32Array(total);
+    for (let index = 0; index < total; index += 1) {
+      samples[index] = Math.sin((2 * Math.PI * 440 * index) / sourceRateHz);
+    }
+    toneCache.set(key, samples);
+    return samples;
+  }
+
+  function concatFloat32(blocks: readonly Float32Array[]): Float32Array {
+    let total = 0;
+    for (const block of blocks) total += block.length;
+    const merged = new Float32Array(total);
+    let offset = 0;
+    for (const block of blocks) {
+      merged.set(block, offset);
+      offset += block.length;
+    }
+    return merged;
+  }
+
+  function firstMismatchIndex(left: Float32Array, right: Float32Array): number {
+    const shared = Math.min(left.length, right.length);
+    for (let index = 0; index < shared; index += 1) {
+      if (left[index] !== right[index]) return index;
+    }
+    return left.length === right.length ? -1 : shared;
+  }
+
+  function pushInOneBlock(sourceRateHz: number, seconds: number): Float32Array {
+    return createStreamingFloat32Resampler(sourceRateHz, TARGET_RATE_HZ).push(
+      toneSamples(sourceRateHz, seconds),
+    );
+  }
+
+  function streamInIrregularBlocks(sourceRateHz: number, seconds: number): Float32Array {
+    const source = toneSamples(sourceRateHz, seconds);
+    const resampler = createStreamingFloat32Resampler(sourceRateHz, TARGET_RATE_HZ);
+    const blocks: Float32Array[] = [];
+    let offset = 0;
+    let callback = 0;
+    while (offset < source.length) {
+      const requested = IRREGULAR_CALLBACK_BLOCKS[callback % IRREGULAR_CALLBACK_BLOCKS.length];
+      const size = Math.min(requested, source.length - offset);
+      blocks.push(resampler.push(source.subarray(offset, offset + size)));
+      offset += size;
+      callback += 1;
+    }
+    return concatFloat32(blocks);
+  }
+
+  test("emits exactly duration * 24_000 samples for 2/10/45 second turns at 44.1 and 48 kHz", () => {
+    for (const sourceRate of SOURCE_RATES_HZ) {
+      for (const seconds of TURN_SECONDS) {
+        expect(streamInIrregularBlocks(sourceRate, seconds).length).toBe(seconds * 24_000);
+        expect(pushInOneBlock(sourceRate, seconds).length).toBe(seconds * 24_000);
+      }
+    }
+  });
+
+  test("keeps irregular callback blocks phase-continuous with a single whole-turn push", () => {
+    for (const sourceRate of SOURCE_RATES_HZ) {
+      for (const seconds of TURN_SECONDS) {
+        const streamed = streamInIrregularBlocks(sourceRate, seconds);
+        const whole = pushInOneBlock(sourceRate, seconds);
+        expect(streamed.length).toBe(whole.length);
+        expect(firstMismatchIndex(streamed, whole)).toBe(-1);
+      }
+    }
+  });
+
+  test("reset restarts a capture generation and is never valid between callbacks", () => {
+    const source = toneSamples(44_100, 2);
+    const resampler = createStreamingFloat32Resampler(44_100, TARGET_RATE_HZ);
+
+    const firstGeneration = resampler.push(source);
+    resampler.reset();
+    const secondGeneration = resampler.push(source);
+
+    expect(secondGeneration.length).toBe(firstGeneration.length);
+    expect(firstMismatchIndex(secondGeneration, firstGeneration)).toBe(-1);
+
+    const perCallbackReset = createStreamingFloat32Resampler(44_100, TARGET_RATE_HZ);
+    const blocks: Float32Array[] = [];
+    for (let offset = 0; offset < source.length; offset += 1_000) {
+      perCallbackReset.reset();
+      blocks.push(
+        perCallbackReset.push(source.subarray(offset, Math.min(offset + 1_000, source.length))),
+      );
+    }
+
+    expect(concatFloat32(blocks).length).not.toBe(firstGeneration.length);
+  });
+
+  test("rejects non-positive sample rates before allocating", () => {
+    expect(() => createStreamingFloat32Resampler(0, TARGET_RATE_HZ)).toThrow(
+      "sourceSampleRateHz must be a positive finite number",
+    );
+    expect(() => createStreamingFloat32Resampler(48_000, Number.NaN)).toThrow(
+      "targetSampleRateHz must be a positive finite number",
+    );
+  });
+
+  test("streaming capture reuses one resampler across every worklet callback", () => {
+    const source = new FakeAudioCaptureSource(48_000);
+    const emitted: number[] = [];
+    const capture = startVivaPcm16StreamingCapture({
+      frameDurationMs: 1 / 24,
+      onFrame: (frame) => emitted.push(...frame.pcm16Bytes),
+      source,
+    });
+
+    const tone = toneSamples(48_000, 0.01);
+    let offset = 0;
+    for (const size of [1, 127, 128, 224]) {
+      source.push(tone.slice(offset, offset + size));
+      offset += size;
+    }
+    capture.end();
+
+    const expected = float32ToPcm16LeBytes(
+      createStreamingFloat32Resampler(48_000, VIVA_AUDIO_SAMPLE_RATE_HZ).push(
+        tone.subarray(0, offset),
+      ),
+    );
+
+    expect(emitted.length).toBe(expected.length);
+    expect(emitted).toEqual(Array.from(expected));
   });
 });
 

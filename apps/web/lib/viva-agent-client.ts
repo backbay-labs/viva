@@ -1,6 +1,7 @@
 import {
   type AgentAnswerEvaluation,
   type AgentAudioFrame,
+  type AgentAudioTurnAcceptedFrame,
   type AgentBrainReadiness,
   type AgentConceptStatus,
   type AgentSessionConfig,
@@ -10,21 +11,33 @@ import {
   type AgentStudySessionRecap,
   type AgentStudySourceReference,
   type AgentTerminalSessionReason,
-  audioClientFrame,
+  audioChunkClientFrame,
+  audioEndClientFrame,
   type ManuscriptIntent,
   type PasteIngestionResponse,
   parseVivaServerFrame,
   type StudySet,
   sessionConfigFrame,
   studySetFromPasteIngestionResponse,
+  VIVA_AUDIO_MAX_CHUNK_BYTES,
+  VIVA_AUDIO_MAX_TURN_BYTES,
+  VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
   VIVA_VOICE_PROTOCOL_VERSION,
   type VivaClientFrame,
   type VivaReadyFrame,
   type VivaServerEvent,
   type VivaServerFrame,
 } from "@viva/core";
+import { pcm16LeBytesToBase64 } from "./viva-audio-capture";
 import type { VivaLibraryExport, VivaLibrarySnapshot } from "./viva-library";
 import { isRedactedVivaLogValue, redactForVivaLog } from "./viva-redaction";
+
+/**
+ * Retention high-water mark for the browser send queue. Once the socket has this
+ * many bytes buffered, further chunks stay in the bounded turn ledger instead of
+ * being serialized; it deliberately equals the unchanged 64 KiB text-frame cap.
+ */
+export const VIVA_AUDIO_SEND_BUFFER_HIGH_WATER_BYTES = VIVA_VOICE_MAX_TEXT_FRAME_BYTES;
 
 export type VivaAgentClientOptions = {
   url?: string;
@@ -148,6 +161,63 @@ export type VivaAgentAudioOutput = {
   frame: AgentAudioFrame;
 };
 
+export type VivaClientSendError = Readonly<{
+  code: "socket_closed" | "audio_turn_limit" | "audio_queue_limit";
+  message: string;
+}>;
+
+export type VivaAudioSendResult =
+  | Readonly<{
+      status: "sent";
+      acceptedThroughSequence: number;
+    }>
+  | Readonly<{
+      status: "pending";
+      acceptedThroughSequence: number | null;
+      retainedFromSequence: number;
+    }>
+  | Readonly<{
+      status: "socket_closed";
+      acceptedThroughSequence: number | null;
+      retainedFromSequence: number;
+      retryable: true;
+      error: VivaClientSendError;
+    }>;
+
+export type VivaAudioChunkInput = Readonly<{
+  turnId: string;
+  sequence: number;
+  pcm16Bytes: Uint8Array;
+}>;
+
+export type VivaAudioTurnAcceptance = Readonly<{
+  turnId: string;
+  finalSequence: number;
+}>;
+
+/**
+ * `VivaAudioSendResult` describes transport outcomes only — `sent`, `pending`, or
+ * a retryable `socket_closed`. A violated turn invariant is not a transport
+ * outcome: a second turn id, a malformed or oversized chunk, a noncontiguous
+ * sequence, or a turn past 2,160,000 retained bytes must fail closed *before*
+ * anything is copied into the ledger or serialized, so it is raised rather than
+ * returned. The exact `VivaClientSendError.code` the plan names is carried on
+ * `error`, and the message never contains PCM, base64, or transcript material.
+ */
+export class VivaAudioSendRejectedError extends Error {
+  readonly error: VivaClientSendError;
+
+  constructor(error: VivaClientSendError) {
+    super(`${error.code}: ${error.message}`);
+    this.name = "VivaAudioSendRejectedError";
+    this.error = error;
+  }
+}
+
+export function isVivaAudioSendRejectedError(value: unknown): value is VivaAudioSendRejectedError {
+  return value instanceof VivaAudioSendRejectedError;
+}
+
 export type VivaAgentManuscriptIntent = {
   responseId: string;
   intent: ManuscriptIntent;
@@ -158,6 +228,12 @@ export type VivaAgentSessionState = {
   close?: VivaAgentCloseDiagnostics;
   generation?: VivaAgentGeneration;
   pendingSubmission?: VivaAgentPendingSubmission;
+  /**
+   * Set only when the server acknowledged the exact in-flight audio turn of the
+   * active generation. It releases the browser ledger; it is NOT a provider
+   * success signal, so `pendingSubmission` survives it.
+   */
+  acceptedAudioTurn?: VivaAudioTurnAcceptance;
   ready?: VivaReadyFrame;
   phase: AgentStudySessionPhase;
   terminalReason?: AgentTerminalSessionReason;
@@ -184,6 +260,12 @@ export type VivaAgentSessionControllerOptions = VivaAgentClientOptions & {
   session: AgentSessionConfig;
   sessionToken?: string | null;
   initialState?: VivaAgentSessionState;
+  /**
+   * Delay for the cancellable background queue pump that drains retained audio
+   * once `bufferedAmount` falls. `retryPendingAudio()` stays the deterministic
+   * path for tests and for Plan 10's reconnect work.
+   */
+  audioQueuePumpIntervalMs?: number;
 };
 
 export type VivaAgentSessionController = {
@@ -196,7 +278,10 @@ export type VivaAgentSessionController = {
   }) => WebSocket;
   reset: () => void;
   sendText: (text: string) => boolean;
-  sendAudio: (pcm16Base64: string) => boolean;
+  sendAudioChunk: (input: VivaAudioChunkInput) => VivaAudioSendResult;
+  endAudioTurn: (input: Readonly<{ turnId: string; finalSequence: number }>) => VivaAudioSendResult;
+  cancelAudioTurn: (turnId: string) => void;
+  retryPendingAudio: () => VivaAudioSendResult;
   acknowledgeAudio: (consumed: readonly VivaAgentAudioOutput[]) => void;
   cancel: () => void;
   stop: () => void;
@@ -602,6 +687,13 @@ export function vivaAgentReducer(
   if (frame.type === "ready") {
     return { ...state, status: "open", ready: frame };
   }
+  // Turn acceptance is ledger-aware: only the controller knows which turn and
+  // final sequence are actually in flight, so it validates the frame and records
+  // `acceptedAudioTurn` itself. The pure reducer stays a no-op rather than
+  // trusting an unmatched acknowledgement.
+  if (frame.type === "audio_turn_accepted") {
+    return state;
+  }
   if (frame.type === "error") {
     return {
       ...state,
@@ -657,6 +749,7 @@ export function vivaAgentReducer(
         transcript: "",
         terminalReason: undefined,
         pendingSubmission: undefined,
+        acceptedAudioTurn: undefined,
         finalTranscript: undefined,
         transcriptConfidence: undefined,
         evaluation: undefined,
@@ -784,10 +877,136 @@ export function createVivaAgentSessionController(
   let currentSessionToken = options.sessionToken ?? null;
   let state = options.initialState ?? initialVivaAgentSessionState();
   const listeners = new Set<(next: VivaAgentSessionState) => void>();
+  let audioLedger: AudioTurnLedger | null = null;
+  let audioQueuePumpTimer: ReturnType<typeof setTimeout> | null = null;
+  const audioQueuePumpIntervalMs = options.audioQueuePumpIntervalMs ?? 20;
 
   function setState(next: VivaAgentSessionState) {
     state = next;
     for (const listener of listeners) listener(state);
+  }
+
+  function cancelAudioQueuePump() {
+    if (audioQueuePumpTimer === null) return;
+    clearTimeout(audioQueuePumpTimer);
+    audioQueuePumpTimer = null;
+  }
+
+  function scheduleAudioQueuePump() {
+    if (audioQueuePumpTimer !== null) return;
+    if (audioQueuePumpIntervalMs <= 0 || typeof setTimeout !== "function") return;
+    const timer = setTimeout(() => {
+      audioQueuePumpTimer = null;
+      if (!audioLedger) return;
+      try {
+        pumpAudioQueue();
+      } catch {
+        // The ledger already failed closed; a background pump never widens it.
+      }
+    }, audioQueuePumpIntervalMs);
+    audioQueuePumpTimer = timer;
+    (timer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  /**
+   * Drains the retained turn in sequence order. `audio_end` can never overtake a
+   * retained chunk because the loop only reaches it after every chunk has been
+   * serialized. Already serialized chunks stay in the ledger until a matching
+   * `audio_turn_accepted`, which is what closes the missing-ack window while
+   * staying inside the 2,160,000-byte turn bound.
+   */
+  function pumpAudioQueue(): VivaAudioSendResult {
+    const ledger = audioLedger;
+    if (!ledger) {
+      throw audioSendRejection("audio_turn_limit", "No active Viva audio input turn");
+    }
+    cancelAudioQueuePump();
+
+    if (!ledger.generationId || activeGeneration?.id !== ledger.generationId) {
+      return audioSocketClosedResult(ledger, "Viva voice generation was replaced");
+    }
+    const generationId = ledger.generationId;
+
+    while (
+      ledger.serializedChunkCount < ledger.chunks.length ||
+      (ledger.endRequested && !ledger.endSerialized)
+    ) {
+      if (socket?.readyState !== 1) {
+        return audioSocketClosedResult(ledger, "Viva voice WebSocket is not open");
+      }
+      if ((socket.bufferedAmount ?? 0) >= VIVA_AUDIO_SEND_BUFFER_HIGH_WATER_BYTES) {
+        scheduleAudioQueuePump();
+        return {
+          acceptedThroughSequence: ledger.lastSerializedSequence,
+          retainedFromSequence: retainedFromSequence(ledger),
+          status: "pending",
+        };
+      }
+      // Chunks always drain first: `audio_end` can only be serialized once every
+      // retained chunk of this turn is on the wire, so it can never overtake one.
+      const chunk =
+        ledger.serializedChunkCount < ledger.chunks.length
+          ? ledger.chunks[ledger.serializedChunkCount]
+          : undefined;
+      if (chunk) {
+        socket.send(
+          JSON.stringify(
+            audioChunkClientFrame({
+              clientGenerationId: generationId,
+              pcm16Base64: pcm16LeBytesToBase64(chunk.bytes),
+              sequence: chunk.sequence,
+              turnId: ledger.turnId,
+            }),
+          ),
+        );
+        ledger.serializedChunkCount += 1;
+        ledger.lastSerializedSequence = chunk.sequence;
+        continue;
+      }
+      socket.send(
+        JSON.stringify(
+          audioEndClientFrame({
+            clientGenerationId: generationId,
+            finalSequence: ledger.finalSequence ?? 0,
+            turnId: ledger.turnId,
+          }),
+        ),
+      );
+      ledger.endSerialized = true;
+      if (!state.pendingSubmission) {
+        setState({ ...state, pendingSubmission: { generationId, kind: "audio" } });
+      }
+    }
+
+    return {
+      acceptedThroughSequence: ledger.lastSerializedSequence ?? retainedFromSequence(ledger),
+      status: "sent",
+    };
+  }
+
+  function releaseAudioLedger() {
+    cancelAudioQueuePump();
+    audioLedger = null;
+  }
+
+  function applyAudioTurnAccepted(frame: AgentAudioTurnAcceptedFrame) {
+    const ledger = audioLedger;
+    const matchesInFlightTurn =
+      ledger !== null &&
+      ledger.generationId === frame.client_generation_id &&
+      activeGeneration?.id === frame.client_generation_id &&
+      ledger.turnId === frame.turn_id &&
+      ledger.endSerialized &&
+      ledger.finalSequence === frame.final_sequence;
+    if (!matchesInFlightTurn) {
+      setState({ ...state, staleEvents: state.staleEvents + 1 });
+      return;
+    }
+    releaseAudioLedger();
+    setState({
+      ...state,
+      acceptedAudioTurn: { finalSequence: frame.final_sequence, turnId: frame.turn_id },
+    });
   }
 
   function createGeneration(reason: VivaAgentGenerationReason): VivaAgentGeneration {
@@ -834,6 +1053,9 @@ export function createVivaAgentSessionController(
   function openSocket(reason: VivaAgentGenerationReason): WebSocket {
     const previousSocket = socket;
     const generation = createGeneration(reason);
+    // A generation replacement never replays the retained turn in Plan 03: the
+    // pump is stopped, but the bounded ledger stays available to Plan 10.
+    cancelAudioQueuePump();
     activeGeneration = generation;
     previousSocket?.close();
     const nextSocket = connectVivaAgent({
@@ -850,7 +1072,12 @@ export function createVivaAgentSessionController(
       if (!isActiveSocketGeneration(nextSocket, generation)) return;
       if (typeof event.data !== "string") return;
       try {
-        setState(vivaAgentReducer(state, parseVivaAgentMessage(event.data)));
+        const frame = parseVivaAgentMessage(event.data);
+        if (frame.type === "audio_turn_accepted") {
+          applyAudioTurnAccepted(frame);
+          return;
+        }
+        setState(vivaAgentReducer(state, frame));
       } catch (error) {
         setState({
           ...state,
@@ -889,6 +1116,8 @@ export function createVivaAgentSessionController(
     close() {
       const closingSocket = socket;
       socket = undefined;
+      // A close stops the pump but never clears the retained turn.
+      cancelAudioQueuePump();
       closingSocket?.close();
       setState({
         ...initialVivaAgentSessionState(),
@@ -914,8 +1143,94 @@ export function createVivaAgentSessionController(
         text,
       });
     },
-    sendAudio(pcm16Base64: string) {
-      return sendSubmissionFrame("audio", audioClientFrame(pcm16Base64));
+    sendAudioChunk(input: VivaAudioChunkInput) {
+      const bytes = input.pcm16Bytes;
+      if (bytes.byteLength === 0 || bytes.byteLength % 2 !== 0) {
+        throw audioSendRejection(
+          "audio_queue_limit",
+          "Audio chunk must contain a non-empty even PCM16 byte count",
+        );
+      }
+      if (bytes.byteLength > VIVA_AUDIO_MAX_CHUNK_BYTES) {
+        throw audioSendRejection("audio_queue_limit", "Audio chunk exceeds the maximum chunk size");
+      }
+      if (!Number.isSafeInteger(input.sequence) || input.sequence < 0) {
+        throw audioSendRejection(
+          "audio_turn_limit",
+          "Audio chunk sequence must be a non-negative safe integer",
+        );
+      }
+      const turnId = requireAudioTurnId(input.turnId);
+      let ledger = audioLedger;
+      if (ledger && ledger.turnId !== turnId) {
+        throw audioSendRejection(
+          "audio_turn_limit",
+          "Another Viva audio input turn is still active",
+        );
+      }
+      if (ledger?.endRequested) {
+        throw audioSendRejection("audio_turn_limit", "The Viva audio input turn already ended");
+      }
+      if (ledger && input.sequence !== ledger.nextSequence) {
+        throw audioSendRejection("audio_turn_limit", "Audio chunk sequence must be contiguous");
+      }
+      if (!ledger && input.sequence !== 0) {
+        throw audioSendRejection("audio_turn_limit", "A Viva audio input turn must start at 0");
+      }
+      const retainedBytes = (ledger?.retainedBytes ?? 0) + bytes.byteLength;
+      if (!Number.isSafeInteger(retainedBytes) || retainedBytes > VIVA_AUDIO_MAX_TURN_BYTES) {
+        throw audioSendRejection(
+          "audio_queue_limit",
+          "Audio turn exceeds the maximum retained turn size",
+        );
+      }
+      if (!ledger) {
+        ledger = createAudioTurnLedger(turnId, activeGeneration?.id ?? null);
+        audioLedger = ledger;
+      }
+      // Copy: the AudioWorklet owns and reuses its sample buffers.
+      ledger.chunks.push({ bytes: bytes.slice(), sequence: input.sequence });
+      ledger.retainedBytes = retainedBytes;
+      ledger.nextSequence = input.sequence + 1;
+      return pumpAudioQueue();
+    },
+    endAudioTurn(input: Readonly<{ turnId: string; finalSequence: number }>) {
+      const ledger = audioLedger;
+      if (!ledger || ledger.turnId !== input.turnId) {
+        throw audioSendRejection("audio_turn_limit", "No matching Viva audio input turn to end");
+      }
+      if (ledger.chunks.length === 0 || input.finalSequence !== ledger.nextSequence - 1) {
+        throw audioSendRejection(
+          "audio_turn_limit",
+          "audio_end must carry the last accepted chunk sequence",
+        );
+      }
+      ledger.endRequested = true;
+      ledger.finalSequence = input.finalSequence;
+      return pumpAudioQueue();
+    },
+    cancelAudioTurn(turnId: string) {
+      const ledger = audioLedger;
+      // A cancellation for another turn is never permission to discard this one.
+      if (!ledger || ledger.turnId !== turnId) return;
+      releaseAudioLedger();
+      const generationId = activeGeneration?.id;
+      if (generationId && generationId === ledger.generationId && socket?.readyState === 1) {
+        socket.send(
+          JSON.stringify({
+            client_generation_id: generationId,
+            turn_id: ledger.turnId,
+            type: "cancel",
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+          }),
+        );
+      }
+      if (state.pendingSubmission?.kind === "audio") {
+        setState({ ...state, pendingSubmission: undefined });
+      }
+    },
+    retryPendingAudio() {
+      return pumpAudioQueue();
     },
     acknowledgeAudio(consumed: readonly VivaAgentAudioOutput[]) {
       // Drop exactly the frames the consumer enqueued to the playback sink — by
@@ -946,6 +1261,75 @@ export function createVivaAgentSessionController(
       };
     },
   };
+}
+
+type AudioLedgerChunk = { sequence: number; bytes: Uint8Array };
+
+/**
+ * One bounded input turn's raw bytes plus its send-queue bookkeeping. The whole
+ * turn — including chunks already serialized into the socket — is retained until
+ * the matching `audio_turn_accepted`, never past 2,160,000 raw bytes.
+ */
+type AudioTurnLedger = {
+  generationId: string | null;
+  turnId: string;
+  chunks: AudioLedgerChunk[];
+  retainedBytes: number;
+  nextSequence: number;
+  serializedChunkCount: number;
+  lastSerializedSequence: number | null;
+  endRequested: boolean;
+  endSerialized: boolean;
+  finalSequence: number | null;
+};
+
+function createAudioTurnLedger(turnId: string, generationId: string | null): AudioTurnLedger {
+  return {
+    chunks: [],
+    endRequested: false,
+    endSerialized: false,
+    finalSequence: null,
+    generationId,
+    lastSerializedSequence: null,
+    nextSequence: 0,
+    retainedBytes: 0,
+    serializedChunkCount: 0,
+    turnId,
+  };
+}
+
+/**
+ * The lowest sequence the browser still holds. Nothing is acknowledged until the
+ * server accepts the whole turn, so this stays at the turn's first sequence for
+ * the turn's lifetime; `acceptedThroughSequence` is the separate serialization
+ * high-water mark. Plan 10's replay work is what may later advance this.
+ */
+function retainedFromSequence(ledger: AudioTurnLedger): number {
+  return ledger.chunks[0]?.sequence ?? ledger.nextSequence;
+}
+
+function audioSocketClosedResult(ledger: AudioTurnLedger, message: string): VivaAudioSendResult {
+  return {
+    acceptedThroughSequence: ledger.lastSerializedSequence,
+    error: { code: "socket_closed", message },
+    retainedFromSequence: retainedFromSequence(ledger),
+    retryable: true,
+    status: "socket_closed",
+  };
+}
+
+function audioSendRejection(
+  code: VivaClientSendError["code"],
+  message: string,
+): VivaAudioSendRejectedError {
+  return new VivaAudioSendRejectedError({ code, message });
+}
+
+function requireAudioTurnId(turnId: string): string {
+  if (typeof turnId !== "string" || turnId.trim().length === 0) {
+    throw audioSendRejection("audio_turn_limit", "Audio turn id must be a non-empty string");
+  }
+  return turnId;
 }
 
 function withClientGeneration(frame: VivaClientFrame, generationId: string): VivaClientFrame {

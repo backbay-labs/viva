@@ -4,6 +4,9 @@ import {
   type AgentStudySourceReference,
   parseVivaClientFrame,
   parseVivaServerFrame,
+  VIVA_AUDIO_MAX_CHUNK_BYTES,
+  VIVA_AUDIO_MAX_TURN_BYTES,
+  VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
   VIVA_VOICE_PROTOCOL_VERSION,
 } from "@viva/core";
 import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/fake-cartesia-gemini-study-session.json";
@@ -27,6 +30,7 @@ import {
   vivaAgentWsUrl,
   vivaApiBaseUrl,
 } from "./viva-agent-client";
+import { pcm16LeBytesToBase64 } from "./viva-audio-capture";
 
 describe("Viva agent browser client", () => {
   test("uses explicit env URL with local service fallback", () => {
@@ -277,7 +281,12 @@ describe("Viva agent browser client", () => {
         event: { type: "session_phase", phase: "feedback" },
       }),
     );
-    controller.sendAudio("AQIDBA==");
+    controller.sendAudioChunk({
+      pcm16Bytes: new Uint8Array([1, 2, 3, 4]),
+      sequence: 0,
+      turnId: "turn-command-frames",
+    });
+    controller.endAudioTurn({ finalSequence: 0, turnId: "turn-command-frames" });
     controller.cancel();
     controller.stop();
     expect(parseVivaClientFrame(JSON.parse(socket.sent[1] ?? "{}"))).toEqual({
@@ -286,9 +295,10 @@ describe("Viva agent browser client", () => {
       type: "text",
       version: VIVA_VOICE_PROTOCOL_VERSION,
     });
-    expect(parseVivaClientFrame(JSON.parse(socket.sent[2] ?? "{}")).type).toBe("audio");
-    expect(parseVivaClientFrame(JSON.parse(socket.sent[3] ?? "{}")).type).toBe("cancel");
-    expect(parseVivaClientFrame(JSON.parse(socket.sent[4] ?? "{}")).type).toBe("stop");
+    expect(parseVivaClientFrame(JSON.parse(socket.sent[2] ?? "{}")).type).toBe("audio_chunk");
+    expect(parseVivaClientFrame(JSON.parse(socket.sent[3] ?? "{}")).type).toBe("audio_end");
+    expect(parseVivaClientFrame(JSON.parse(socket.sent[4] ?? "{}")).type).toBe("cancel");
+    expect(parseVivaClientFrame(JSON.parse(socket.sent[5] ?? "{}")).type).toBe("stop");
   });
 
   test("controller clears stale connected state on reconnect", () => {
@@ -884,7 +894,6 @@ describe("Viva agent browser client", () => {
 
     expect(controller.sendText("first typed response")).toBe(true);
     expect(controller.sendText("second typed response")).toBe(false);
-    expect(controller.sendAudio("AQIDBA==")).toBe(false);
 
     expect(
       socket.sent.slice(1).map((frame) => parseVivaClientFrame(JSON.parse(frame)).type),
@@ -1062,8 +1071,11 @@ describe("Viva agent browser client", () => {
       state = vivaAgentReducer(state, frame);
     }
 
+    // Every response id in this canonical session carries the one client
+    // generation the browser stamps on every frame it sends, so the reducer must
+    // accept the whole turn rather than treating it as a stale response.
     expect(state.audio[0]).toEqual({
-      responseId: "response-1",
+      responseId: "response-1-generation-1",
       frame: { pcm16_base64: "AQIDBA==" },
     });
     expect(state.finalTranscript).toBe("NADH donates electrons to the electron transport chain.");
@@ -1073,7 +1085,7 @@ describe("Viva agent browser client", () => {
     expect(state.sources[0]?.source_id).toBe("src-lecture-5-slide-18");
     expect(state.recap?.voice_session_id).toBe("voice-session-1");
     expect(state.phase).toBe("recap");
-    expect(state.cancelledResponseIds).toContain("response-2");
+    expect(state.cancelledResponseIds).toContain("response-2-generation-1");
     expect(state.staleEvents).toBe(0);
   });
 
@@ -1245,14 +1257,14 @@ describe("Viva agent browser client", () => {
     for (const frame of fakeSessionFixture.server.slice(0, 3).map(parseVivaServerFrame)) {
       state = vivaAgentReducer(state, frame);
     }
-    expect(state.activeResponseId).toBe("response-1");
+    expect(state.activeResponseId).toBe("response-1-generation-1");
 
     state = vivaAgentReducer(
       state,
       parseVivaServerFrame({
         type: "event",
         version: VIVA_VOICE_PROTOCOL_VERSION,
-        event: { type: "cancellation", response_id: "response-1" },
+        event: { type: "cancellation", response_id: "response-1-generation-1" },
       }),
     );
     state = vivaAgentReducer(
@@ -1262,7 +1274,7 @@ describe("Viva agent browser client", () => {
         version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "transcript_final",
-          response_id: "response-2",
+          response_id: "response-2-generation-1",
           text: "replacement answer",
           confidence: 0.9,
         },
@@ -1479,8 +1491,404 @@ function restoreEnv(name: string, value: string | undefined) {
   }
 }
 
+/**
+ * CRIT-AUDIO-01 browser seam: bounded v5 chunk streaming with a retained turn
+ * ledger. Every case here runs against the exact `VivaAudioSendResult` union —
+ * a boolean "sent" answer cannot express retained bytes, so the union is what is
+ * asserted, never a truthy shortcut.
+ */
+describe("bounded audio turn ledger", () => {
+  function openControllerWithLedger() {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
+      session: sessionFixture as AgentSessionConfig,
+      url: "ws://localhost:4318/ws",
+    });
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.open();
+    socket.message(JSON.stringify(readyFixture));
+    return { controller, socket };
+  }
+
+  function pcm16(byteLength: number, seed = 0): Uint8Array {
+    const bytes = new Uint8Array(byteLength);
+    for (let index = 0; index < byteLength; index += 1) bytes[index] = (index + seed) % 251;
+    return bytes;
+  }
+
+  // Drops the session_config frame so assertions read the audio lifecycle only.
+  function audioFrames(socket: FakeWebSocket) {
+    return socket.sent.slice(1).map((raw) => parseVivaClientFrame(JSON.parse(raw)));
+  }
+
+  function acceptedFrame(input: { generationId?: string; turnId: string; finalSequence: number }) {
+    return JSON.stringify({
+      client_generation_id: input.generationId ?? "session_bootstrap-1",
+      final_sequence: input.finalSequence,
+      turn_id: input.turnId,
+      type: "audio_turn_accepted",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+    });
+  }
+
+  test("serializes 960-byte microphone chunks as contiguous protocol v5 frames", () => {
+    const { controller, socket } = openControllerWithLedger();
+
+    const results = [0, 1, 2].map((sequence) =>
+      controller.sendAudioChunk({ pcm16Bytes: pcm16(960, sequence), sequence, turnId: "turn-01" }),
+    );
+    const end = controller.endAudioTurn({ finalSequence: 2, turnId: "turn-01" });
+
+    expect(results).toEqual([
+      { acceptedThroughSequence: 0, status: "sent" },
+      { acceptedThroughSequence: 1, status: "sent" },
+      { acceptedThroughSequence: 2, status: "sent" },
+    ]);
+    expect(end).toEqual({ acceptedThroughSequence: 2, status: "sent" });
+    expect(audioFrames(socket).map((frame) => frame.type)).toEqual([
+      "audio_chunk",
+      "audio_chunk",
+      "audio_chunk",
+      "audio_end",
+    ]);
+    expect(audioFrames(socket)[0]).toEqual({
+      client_generation_id: "session_bootstrap-1",
+      frame: { pcm16_base64: pcm16LeBytesToBase64(pcm16(960, 0)) },
+      sequence: 0,
+      turn_id: "turn-01",
+      type: "audio_chunk",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+    });
+    expect(audioFrames(socket)[3]).toEqual({
+      client_generation_id: "session_bootstrap-1",
+      final_sequence: 2,
+      turn_id: "turn-01",
+      type: "audio_end",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+    });
+    for (const raw of socket.sent) {
+      expect(new TextEncoder().encode(raw).byteLength).toBeLessThan(
+        VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
+      );
+    }
+  });
+
+  test("a maximum 8,192-byte chunk still fits inside the unchanged 64 KiB text cap", () => {
+    const { controller, socket } = openControllerWithLedger();
+
+    expect(
+      controller.sendAudioChunk({
+        pcm16Bytes: pcm16(VIVA_AUDIO_MAX_CHUNK_BYTES),
+        sequence: 0,
+        turnId: "turn-max-chunk",
+      }),
+    ).toEqual({ acceptedThroughSequence: 0, status: "sent" });
+    expect(new TextEncoder().encode(socket.sent[1] ?? "").byteLength).toBeLessThan(
+      VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
+    );
+  });
+
+  test("retains chunks at the 64 KiB high-water mark and never lets audio_end overtake them", () => {
+    const { controller, socket } = openControllerWithLedger();
+
+    expect(
+      controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-02" }),
+    ).toEqual({ acceptedThroughSequence: 0, status: "sent" });
+
+    socket.bufferedAmount = VIVA_VOICE_MAX_TEXT_FRAME_BYTES;
+    expect(
+      controller.sendAudioChunk({ pcm16Bytes: pcm16(960, 3), sequence: 1, turnId: "turn-02" }),
+    ).toEqual({ acceptedThroughSequence: 0, retainedFromSequence: 0, status: "pending" });
+    expect(controller.endAudioTurn({ finalSequence: 1, turnId: "turn-02" })).toEqual({
+      acceptedThroughSequence: 0,
+      retainedFromSequence: 0,
+      status: "pending",
+    });
+    expect(audioFrames(socket).map((frame) => frame.type)).toEqual(["audio_chunk"]);
+
+    socket.bufferedAmount = 0;
+    expect(controller.retryPendingAudio()).toEqual({
+      acceptedThroughSequence: 1,
+      status: "sent",
+    });
+    expect(audioFrames(socket).map((frame) => frame.type)).toEqual([
+      "audio_chunk",
+      "audio_chunk",
+      "audio_end",
+    ]);
+    expect(audioFrames(socket)[1]).toEqual({
+      client_generation_id: "session_bootstrap-1",
+      frame: { pcm16_base64: pcm16LeBytesToBase64(pcm16(960, 3)) },
+      sequence: 1,
+      turn_id: "turn-02",
+      type: "audio_chunk",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+    });
+  });
+
+  test("a closed socket retains from the first unserialized sequence and stays retryable", () => {
+    const { controller, socket } = openControllerWithLedger();
+    controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-03" });
+    socket.close({ code: 1006, reason: "", wasClean: false });
+
+    const closed = controller.sendAudioChunk({
+      pcm16Bytes: pcm16(960, 5),
+      sequence: 1,
+      turnId: "turn-03",
+    });
+
+    expect(closed).toEqual({
+      acceptedThroughSequence: 0,
+      error: { code: "socket_closed", message: "Viva voice WebSocket is not open" },
+      retainedFromSequence: 0,
+      retryable: true,
+      status: "socket_closed",
+    });
+    expect(controller.endAudioTurn({ finalSequence: 1, turnId: "turn-03" })).toEqual(closed);
+    expect(audioFrames(socket).map((frame) => frame.type)).toEqual(["audio_chunk"]);
+    // The close never clears the ledger: the same turn is still the active one.
+    expect(() =>
+      controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-03-b" }),
+    ).toThrow("audio_turn_limit");
+  });
+
+  test("only a matching audio_turn_accepted releases the bounded ledger", () => {
+    const { controller, socket } = openControllerWithLedger();
+    controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-04" });
+    controller.endAudioTurn({ finalSequence: 0, turnId: "turn-04" });
+
+    socket.message(acceptedFrame({ finalSequence: 1, turnId: "turn-04" }));
+    expect(controller.getState().acceptedAudioTurn).toBeUndefined();
+    socket.message(acceptedFrame({ finalSequence: 0, turnId: "turn-other" }));
+    expect(controller.getState().acceptedAudioTurn).toBeUndefined();
+    socket.message(
+      acceptedFrame({ finalSequence: 0, generationId: "some-other-generation", turnId: "turn-04" }),
+    );
+    expect(controller.getState().acceptedAudioTurn).toBeUndefined();
+    expect(controller.getState().staleEvents).toBe(3);
+    expect(() =>
+      controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-05" }),
+    ).toThrow("audio_turn_limit");
+
+    socket.message(acceptedFrame({ finalSequence: 0, turnId: "turn-04" }));
+
+    expect(controller.getState().acceptedAudioTurn).toEqual({
+      finalSequence: 0,
+      turnId: "turn-04",
+    });
+    expect(
+      controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-05" }),
+    ).toEqual({ acceptedThroughSequence: 0, status: "sent" });
+  });
+
+  test("fails closed on a second turn, malformed chunk, or noncontiguous sequence", () => {
+    const { controller, socket } = openControllerWithLedger();
+    controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-06" });
+
+    expect(() =>
+      controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-07" }),
+    ).toThrow("audio_turn_limit");
+    expect(() =>
+      controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 2, turnId: "turn-06" }),
+    ).toThrow("audio_turn_limit");
+    expect(() =>
+      controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-06" }),
+    ).toThrow("audio_turn_limit");
+    expect(() =>
+      controller.sendAudioChunk({
+        pcm16Bytes: pcm16(VIVA_AUDIO_MAX_CHUNK_BYTES + 2),
+        sequence: 1,
+        turnId: "turn-06",
+      }),
+    ).toThrow("audio_queue_limit");
+    expect(() =>
+      controller.sendAudioChunk({ pcm16Bytes: new Uint8Array(0), sequence: 1, turnId: "turn-06" }),
+    ).toThrow("audio_queue_limit");
+    expect(() =>
+      controller.sendAudioChunk({
+        pcm16Bytes: new Uint8Array(961),
+        sequence: 1,
+        turnId: "turn-06",
+      }),
+    ).toThrow("audio_queue_limit");
+    expect(() => controller.endAudioTurn({ finalSequence: 3, turnId: "turn-06" })).toThrow(
+      "audio_turn_limit",
+    );
+    expect(() => controller.endAudioTurn({ finalSequence: 0, turnId: "turn-07" })).toThrow(
+      "audio_turn_limit",
+    );
+
+    // Nothing above grew the ledger: the next contiguous chunk is still sequence 1.
+    expect(
+      controller.sendAudioChunk({ pcm16Bytes: pcm16(960, 9), sequence: 1, turnId: "turn-06" }),
+    ).toEqual({ acceptedThroughSequence: 1, status: "sent" });
+    expect(audioFrames(socket).map((frame) => frame.type)).toEqual(["audio_chunk", "audio_chunk"]);
+  });
+
+  test("caps the retained turn at 2,160,000 raw bytes across pending, retry, and cancel cycles", () => {
+    const { controller, socket } = openControllerWithLedger();
+    socket.bufferedAmount = VIVA_VOICE_MAX_TEXT_FRAME_BYTES;
+
+    let sequence = 0;
+    let retainedBytes = 0;
+    while (retainedBytes + VIVA_AUDIO_MAX_CHUNK_BYTES <= VIVA_AUDIO_MAX_TURN_BYTES) {
+      controller.sendAudioChunk({
+        pcm16Bytes: new Uint8Array(VIVA_AUDIO_MAX_CHUNK_BYTES),
+        sequence,
+        turnId: "turn-08",
+      });
+      retainedBytes += VIVA_AUDIO_MAX_CHUNK_BYTES;
+      sequence += 1;
+    }
+    const tailBytes = VIVA_AUDIO_MAX_TURN_BYTES - retainedBytes;
+    expect(tailBytes).toBeGreaterThan(0);
+
+    expect(
+      controller.sendAudioChunk({
+        pcm16Bytes: new Uint8Array(tailBytes),
+        sequence,
+        turnId: "turn-08",
+      }),
+    ).toEqual({ acceptedThroughSequence: null, retainedFromSequence: 0, status: "pending" });
+    expect(() =>
+      controller.sendAudioChunk({
+        pcm16Bytes: new Uint8Array(2),
+        sequence: sequence + 1,
+        turnId: "turn-08",
+      }),
+    ).toThrow("audio_queue_limit");
+    expect(audioFrames(socket)).toHaveLength(0);
+
+    socket.bufferedAmount = 0;
+    expect(controller.retryPendingAudio()).toEqual({
+      acceptedThroughSequence: sequence,
+      status: "sent",
+    });
+    expect(audioFrames(socket)).toHaveLength(sequence + 1);
+    // Serialized bytes stay retained until acceptance, so the cap still holds.
+    expect(() =>
+      controller.sendAudioChunk({
+        pcm16Bytes: new Uint8Array(2),
+        sequence: sequence + 1,
+        turnId: "turn-08",
+      }),
+    ).toThrow("audio_queue_limit");
+
+    controller.cancelAudioTurn("turn-08");
+    expect(
+      controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-09" }),
+    ).toEqual({ acceptedThroughSequence: 0, status: "sent" });
+  });
+
+  test("cancelAudioTurn scopes the cancel frame and always clears local bytes", () => {
+    const { controller, socket } = openControllerWithLedger();
+    controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-10" });
+
+    // A cancel for a different turn is never permission to discard the live one.
+    controller.cancelAudioTurn("turn-not-active");
+    expect(audioFrames(socket).map((frame) => frame.type)).toEqual(["audio_chunk"]);
+
+    controller.cancelAudioTurn("turn-10");
+    expect(audioFrames(socket).at(-1)).toEqual({
+      client_generation_id: "session_bootstrap-1",
+      turn_id: "turn-10",
+      type: "cancel",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+    });
+    expect(
+      controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-11" }),
+    ).toEqual({ acceptedThroughSequence: 0, status: "sent" });
+
+    socket.close();
+    controller.cancelAudioTurn("turn-11");
+    expect(audioFrames(socket).filter((frame) => frame.type === "cancel")).toHaveLength(1);
+    // Local bytes were still released, so a fresh turn is accepted on reconnect.
+    expect(
+      controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-12" }).status,
+    ).toBe("socket_closed");
+  });
+
+  test("keeps raw PCM and base64 payloads out of send results, errors, and state", () => {
+    const { controller, socket } = openControllerWithLedger();
+    const bytes = pcm16(960, 17);
+    const encoded = pcm16LeBytesToBase64(bytes);
+    controller.sendAudioChunk({ pcm16Bytes: bytes, sequence: 0, turnId: "turn-13" });
+    socket.close({ code: 1006, reason: "", wasClean: false });
+    const closed = controller.sendAudioChunk({
+      pcm16Bytes: pcm16(960, 23),
+      sequence: 1,
+      turnId: "turn-13",
+    });
+
+    expect(JSON.stringify(closed)).not.toContain(encoded);
+    expect(closed.status === "socket_closed" ? closed.error.message : "").toBe(
+      "Viva voice WebSocket is not open",
+    );
+    expect(JSON.stringify(controller.getState())).not.toContain(encoded);
+    expect(JSON.stringify(controller.getState())).not.toContain(
+      pcm16LeBytesToBase64(pcm16(960, 23)),
+    );
+  });
+
+  test("an audio turn end is the pending submission, and a cancel releases it", () => {
+    const { controller } = openControllerWithLedger();
+    controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-14" });
+    expect(controller.getState().pendingSubmission).toBeUndefined();
+
+    controller.endAudioTurn({ finalSequence: 0, turnId: "turn-14" });
+    expect(controller.getState().pendingSubmission).toEqual({
+      generationId: "session_bootstrap-1",
+      kind: "audio",
+    });
+    expect(controller.sendText("typed while audio is pending")).toBe(false);
+
+    controller.cancelAudioTurn("turn-14");
+    expect(controller.getState().pendingSubmission).toBeUndefined();
+    expect(controller.sendText("typed after cancel")).toBe(true);
+  });
+
+  test("a generation replacement retains the ledger without replaying it", () => {
+    const { controller } = openControllerWithLedger();
+    controller.sendAudioChunk({ pcm16Bytes: pcm16(960), sequence: 0, turnId: "turn-15" });
+
+    const next = controller.connect("socket_retry") as unknown as FakeWebSocket;
+    next.open();
+
+    const result = controller.sendAudioChunk({
+      pcm16Bytes: pcm16(960, 4),
+      sequence: 1,
+      turnId: "turn-15",
+    });
+
+    expect(result).toEqual({
+      acceptedThroughSequence: 0,
+      error: { code: "socket_closed", message: "Viva voice generation was replaced" },
+      retainedFromSequence: 0,
+      retryable: true,
+      status: "socket_closed",
+    });
+    // Only the session_config frame reached the replacement socket — no replay.
+    expect(next.sent.map((raw) => parseVivaClientFrame(JSON.parse(raw)).type)).toEqual([
+      "session_config",
+    ]);
+  });
+
+  test("retryPendingAudio fails closed when no audio turn is active", () => {
+    const { controller } = openControllerWithLedger();
+
+    expect(() => controller.retryPendingAudio()).toThrow("audio_turn_limit");
+  });
+});
+
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+  bufferedAmount = 0;
   closeCount = 0;
   readyState = 0;
   sent: string[] = [];
@@ -1499,7 +1907,13 @@ class FakeWebSocket {
     this.listeners.set(type, listeners);
   }
 
+  // Real browsers throw on a send that is not in the OPEN state; the fake mirrors
+  // that so a controller regression that serializes into a closed socket is loud
+  // instead of silently "sent".
   send(data: string) {
+    if (this.readyState !== FakeWebSocket.OPEN) {
+      throw new Error("FakeWebSocket.send called while the socket was not open");
+    }
     this.sent.push(data);
   }
 
