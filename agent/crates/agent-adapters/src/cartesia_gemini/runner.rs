@@ -1433,6 +1433,7 @@ fn tool_execution_error_kind(error: &ToolExecutionError) -> &'static str {
         ToolExecutionError::InvalidArguments(_) => "invalid_arguments",
         ToolExecutionError::Unavailable(_) => "unavailable",
         ToolExecutionError::Store(_) => "store",
+        ToolExecutionError::ReviewSchedule(_) => "review_schedule",
     }
 }
 

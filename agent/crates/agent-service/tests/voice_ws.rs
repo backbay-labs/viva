@@ -10,14 +10,15 @@ use std::{
 
 use agent_adapters::{cartesia_gemini::FakeCartesiaGeminiRuntime, SyntheticBrain};
 use agent_domain::{
-    AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
-    AnswerEvaluation, AudioFrame, BrainError, BrainEvent, BrainInput, BrainProviderError,
-    BrainProviderFailure, BrainProviderFailureParts, BrainUsage, ConceptStatus, PortError,
-    RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard,
-    RecapSourceMoment, SessionConfig, SessionId, SessionTokenNonceClaim, StudyMemoryStore,
-    StudyMode, StudyQuestion, StudySessionRecap, StudySetIngestionStatus, StudySourceReference,
-    StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts, TerminalSessionReason,
-    VoiceUsageRecord,
+    decide_review_schedule, parse_utc_instant, AnswerAttemptEnvelope, AnswerCaptureMode,
+    AnswerCaptureStatus, AnswerContentPolicy, AnswerEvaluation, AudioFrame, BrainError, BrainEvent,
+    BrainInput, BrainProviderError, BrainProviderFailure, BrainProviderFailureParts, BrainUsage,
+    ConceptStatus, PortError, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession,
+    RealtimeSessionTaskGuard, RecapSourceMoment, ReviewOutcomeV1, ReviewSchedulingContextV1,
+    SessionConfig, SessionId, SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudyQuestion,
+    StudySessionRecap, StudySetIngestionStatus, StudySourceReference, StudyStoreBackend,
+    StudyStoreCapabilities, StudyStoreWriteCounts, TerminalSessionReason, VoiceUsageRecord,
+    VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use agent_service::{
     build_router, AppState, ClientFrame, FailureControlConfig, FailureControlScenario, ServerFrame,
@@ -260,6 +261,36 @@ impl StudyMemoryStore for FailingStudyStore {
             .await
     }
 
+    async fn review_scheduling_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<agent_domain::ReviewSchedulingContextV1, PortError> {
+        self.inner
+            .review_scheduling_context(user_id, study_set_id, concept_id)
+            .await
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        decision: agent_domain::ReviewScheduleDecisionV1,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .persist_review_schedule_decision(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                concept_id,
+                decision,
+            )
+            .await
+    }
+
     async fn record_recap(
         &self,
         user_id: &str,
@@ -272,6 +303,45 @@ impl StudyMemoryStore for FailingStudyStore {
             .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
             .await
     }
+}
+
+/// D-01 Branch A library seeding.
+///
+/// The legacy `schedule_review_item(..., "2026-06-19T09:00:00Z")` seed is gone: the
+/// authenticated read model now selects only valid v1 decisions, so the snapshot is
+/// seeded through the authoritative persistence seam at the conformance fixture's
+/// grading instant. `LIBRARY_SEED_*` are literals copied from
+/// `packages/core/src/review-scheduling-conformance-v1.json`
+/// (`new-shaky-hinted-one-miss-no-exam`), not from this code's own output.
+const LIBRARY_SEED_GRADED_AT: &str = "2031-04-05T12:00:00.000Z";
+const LIBRARY_SEED_DUE_AT: &str = "2031-04-07T12:00:00.000Z";
+
+async fn seed_authoritative_review_schedule(store: &Arc<data::InMemoryStudyStore>) {
+    let now = parse_utc_instant(LIBRARY_SEED_GRADED_AT).expect("fixture grading instant parses");
+    let decision = decide_review_schedule(
+        now,
+        &ReviewOutcomeV1 {
+            status: ConceptStatus::Shaky,
+            hint_count: Some(2),
+            miss_count: Some(1),
+        },
+        &ReviewSchedulingContextV1 {
+            schema_version: VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+            exam_at: None,
+            card: None,
+        },
+    )
+    .expect("authoritative decision");
+    store
+        .persist_review_schedule_decision(
+            "user-1",
+            "biology-midterm",
+            "voice-session-1",
+            "nadh",
+            decision,
+        )
+        .await
+        .unwrap();
 }
 
 async fn seed_completed_library_session(store: &Arc<data::InMemoryStudyStore>) {
@@ -296,16 +366,7 @@ async fn seed_completed_library_session(store: &Arc<data::InMemoryStudyStore>) {
         )
         .await
         .unwrap();
-    store
-        .schedule_review_item(
-            "user-1",
-            "biology-midterm",
-            "voice-session-1",
-            "nadh",
-            "2026-06-19T09:00:00Z",
-        )
-        .await
-        .unwrap();
+    seed_authoritative_review_schedule(store).await;
     store
         .record_recap(
             "user-1",
@@ -1152,16 +1213,7 @@ async fn library_route_projects_server_owned_sets_and_completed_session_history(
         )
         .await
         .unwrap();
-    store
-        .schedule_review_item(
-            "user-1",
-            "biology-midterm",
-            "voice-session-1",
-            "nadh",
-            "2026-06-19T09:00:00Z",
-        )
-        .await
-        .unwrap();
+    seed_authoritative_review_schedule(&store).await;
     store
         .record_recap(
             "user-1",
@@ -1314,9 +1366,13 @@ async fn library_route_projects_server_owned_sets_and_completed_session_history(
     assert_eq!(completed["next_review"]["concept_id"], "nadh");
     assert_eq!(
         completed["next_review"]["persisted_due_at"],
-        "2026-06-19T09:00:00Z"
+        LIBRARY_SEED_DUE_AT
     );
-    assert_eq!(completed["next_review"]["source"], "persisted_review_item");
+    assert_eq!(
+        completed["next_review"]["source"],
+        "review_schedule_decision_v1"
+    );
+    assert_eq!(completed["next_review"]["status"], "shaky");
 }
 
 #[tokio::test]
@@ -10444,6 +10500,36 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
     ) -> Result<serde_json::Value, PortError> {
         self.inner
             .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn review_scheduling_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<agent_domain::ReviewSchedulingContextV1, PortError> {
+        self.inner
+            .review_scheduling_context(user_id, study_set_id, concept_id)
+            .await
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        decision: agent_domain::ReviewScheduleDecisionV1,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .persist_review_schedule_decision(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                concept_id,
+                decision,
+            )
             .await
     }
 

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    review_schedule::{ReviewScheduleDecisionV1, ReviewSchedulingContextV1},
     AnswerEvaluation, ConceptStatus, ManuscriptIntent, SessionConfig, SourceConfidence,
     StudyQuestion, StudySessionRecap, StudySourceReference, ToolProposal,
 };
@@ -654,6 +655,39 @@ pub trait StudyMemoryStore: Send + Sync {
         concept_id: &str,
         due_at: &str,
     ) -> Result<Value, PortError>;
+
+    /// The authoritative scheduling inputs the store owns for one concept: the study
+    /// set's persisted exam instant and the latest persisted v1 FSRS card. D-01
+    /// forbids taking either from tool arguments.
+    async fn review_scheduling_context(
+        &self,
+        _user_id: &str,
+        study_set_id: &str,
+        _concept_id: &str,
+    ) -> Result<ReviewSchedulingContextV1, PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            study_set_id,
+            "authoritative review scheduling context is not implemented by this store",
+        ))
+    }
+
+    /// Persist one authoritative D-01 decision. The due date and the v1 card/decision
+    /// JSON are written together or not at all.
+    async fn persist_review_schedule_decision(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        concept_id: &str,
+        _decision: ReviewScheduleDecisionV1,
+    ) -> Result<Value, PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            concept_id,
+            "authoritative review schedule persistence is not implemented by this store",
+        ))
+    }
 
     async fn record_recap(
         &self,

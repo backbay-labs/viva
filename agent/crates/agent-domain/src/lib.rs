@@ -12,6 +12,7 @@ use std::{fmt, sync::Arc, time::Duration};
 mod brain;
 mod ids;
 pub mod ports;
+pub mod review_schedule;
 mod study;
 pub mod tool_executor;
 mod tools;
@@ -32,6 +33,13 @@ pub use ports::{
     StudyLibrarySnapshot, StudyMemoryStore, StudySessionDurableCounts, StudySetIngestionRecord,
     StudySetIngestionStatus, StudySetSummary, StudySourceSpanSummary, StudyStoreBackend,
     StudyStoreCapabilities, StudyStoreWriteCounts, ToolIssuer, VoiceUsageRecord,
+};
+pub use review_schedule::{
+    decide_review_schedule, format_rfc3339_millis, parse_utc_instant, status_rating, Clock,
+    FixedClock, FsrsCardStateV1, PersistedFsrsCardV1, ReviewOutcomeV1, ReviewScheduleCapReasonV1,
+    ReviewScheduleDecisionV1, ReviewScheduleError, ReviewSchedulingContextV1, SystemClock,
+    VIVA_REVIEW_DESIRED_RETENTION, VIVA_REVIEW_EXAM_MARGIN_SECONDS, VIVA_REVIEW_MAX_INTERVAL_DAYS,
+    VIVA_REVIEW_SCHEDULE_POLICY_ID, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 pub use study::{
     fixture_question, fixture_source_reference, AnswerEvaluation, RecapSourceMoment, StudyQuestion,

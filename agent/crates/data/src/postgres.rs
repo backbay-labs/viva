@@ -4,15 +4,18 @@ use std::{
 };
 
 use agent_domain::{
-    AnswerAttemptEnvelope, AnswerEvaluation, ConceptStatus, CreateFileStudySet,
-    CreatePasteStudySet, LibraryNextReviewSummary, LibrarySessionRecapSummary,
-    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
-    SessionConfig, SessionTokenNonceClaim, StudyLibrarySnapshot, StudyMemoryStore, StudyQuestion,
-    StudySessionDurableCounts, StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus,
-    StudySourceReference, StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts,
-    VoiceUsageRecord,
+    format_rfc3339_millis, AnswerAttemptEnvelope, AnswerEvaluation, ConceptStatus,
+    CreateFileStudySet, CreatePasteStudySet, LibraryNextReviewSummary, LibrarySessionRecapSummary,
+    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary,
+    PersistedFsrsCardV1, PortError, ReviewScheduleCapReasonV1, ReviewScheduleDecisionV1,
+    ReviewSchedulingContextV1, SessionConfig, SessionTokenNonceClaim, StudyLibrarySnapshot,
+    StudyMemoryStore, StudyQuestion, StudySessionDurableCounts, StudySessionRecap,
+    StudySetIngestionRecord, StudySetIngestionStatus, StudySourceReference, StudyStoreBackend,
+    StudyStoreCapabilities, StudyStoreWriteCounts, VoiceUsageRecord,
+    VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -1161,18 +1164,24 @@ impl StudyMemoryStore for PostgresStudyStore {
             .transpose()
             .map_err(pg_error)?;
 
+            // D-01: only valid v1 decisions reach the authenticated read model. A
+            // legacy or superseded `review_items` row is never a fallback, and a
+            // `past_exam`-capped decision is excluded from the learner-visible schedule.
             let next_review = sqlx::query(
                 "SELECT
                     COALESCE(c.public_id, c.id::text) AS concept_id,
                     c.label,
-                    c.status,
-                    ri.due_at::text AS persisted_due_at
+                    ri.schedule_decision->>'status' AS decision_status,
+                    ri.due_at AS persisted_due_at
                  FROM review_items ri
                  JOIN concepts c ON c.id = ri.concept_id
                  WHERE ri.user_id = $1
                    AND ri.study_set_id = $2
                    AND ri.status = 'scheduled'
                    AND ri.voice_session_id = $3
+                   AND ri.schedule_schema_version = 1
+                   AND ri.schedule_decision IS NOT NULL
+                   AND (ri.schedule_cap_reason IS DISTINCT FROM 'past_exam')
                  ORDER BY ri.due_at ASC, c.label ASC
                  LIMIT 1",
             )
@@ -1183,20 +1192,23 @@ impl StudyMemoryStore for PostgresStudyStore {
             .await
             .map_err(pg_error)?
             .map(|review_row| {
-                let status_value: String = review_row.try_get("status")?;
-                Ok::<_, sqlx::Error>((review_row, status_value))
+                let status_value: String = review_row.try_get("decision_status")?;
+                let due_at: DateTime<Utc> = review_row.try_get("persisted_due_at")?;
+                Ok::<_, sqlx::Error>((review_row, status_value, due_at))
             })
             .transpose()
             .map_err(pg_error)?
-            .map(|(review_row, status_value)| {
-                Ok::<_, PortError>(LibraryNextReviewSummary {
-                    concept_id: review_row.try_get("concept_id").map_err(pg_error)?,
-                    label: review_row.try_get("label").map_err(pg_error)?,
-                    status: concept_status(&status_value)?,
-                    persisted_due_at: review_row.try_get("persisted_due_at").map_err(pg_error)?,
-                    source: "persisted_review_item".to_owned(),
-                })
-            })
+            .map(
+                |(review_row, status_value, due_at): (_, String, DateTime<Utc>)| {
+                    Ok::<_, PortError>(LibraryNextReviewSummary {
+                        concept_id: review_row.try_get("concept_id").map_err(pg_error)?,
+                        label: review_row.try_get("label").map_err(pg_error)?,
+                        status: concept_status(&status_value)?,
+                        persisted_due_at: format_rfc3339_millis(due_at),
+                        source: "review_schedule_decision_v1".to_owned(),
+                    })
+                },
+            )
             .transpose()?;
 
             sessions.push(LibrarySessionSummary {
@@ -2225,6 +2237,128 @@ impl StudyMemoryStore for PostgresStudyStore {
         }
         self.increment_count(WriteCountKind::ReviewItem)?;
         Ok(json!({ "concept_id": concept_id, "due_at": due_at, "status": "scheduled" }))
+    }
+
+    async fn review_scheduling_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<ReviewSchedulingContextV1, PortError> {
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let concept_uuid = self.concept_uuid_for(study_set_uuid, concept_id).await?;
+
+        // D-01: the exam instant is authoritative store context, never a tool
+        // argument. `study_sets.exam_date` is a calendar DATE, read as midnight UTC.
+        let exam_at = sqlx::query_scalar::<sqlx::Postgres, Option<DateTime<Utc>>>(
+            "SELECT (exam_date::timestamp AT TIME ZONE 'UTC')
+             FROM study_sets
+             WHERE id = $1 AND user_id = $2",
+        )
+        .bind(study_set_uuid)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_error)?
+        .flatten();
+
+        let card = sqlx::query_scalar::<sqlx::Postgres, Value>(
+            "SELECT schedule_card
+             FROM review_items
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND concept_id = $3
+               AND status = 'scheduled'
+               AND schedule_schema_version = 1
+               AND schedule_card IS NOT NULL
+             ORDER BY schedule_generated_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(concept_uuid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_error)?
+        .map(|value| {
+            serde_json::from_value::<PersistedFsrsCardV1>(value)
+                .map_err(|error| PortError::adapter("postgres", error.to_string()))
+        })
+        .transpose()?;
+
+        Ok(ReviewSchedulingContextV1 {
+            schema_version: VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+            exam_at,
+            card,
+        })
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        decision: ReviewScheduleDecisionV1,
+    ) -> Result<Value, PortError> {
+        decision
+            .validate()
+            .map_err(|error| PortError::adapter("postgres", error.to_string()))?;
+
+        let study_set_uuid = Self::uuid_for(study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        let concept_uuid = self.concept_uuid_for(study_set_uuid, concept_id).await?;
+        self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
+            .await?;
+
+        let decision_json = serde_json::to_value(&decision)
+            .map_err(|error| PortError::adapter("postgres", error.to_string()))?;
+        let card_json = serde_json::to_value(&decision.card)
+            .map_err(|error| PortError::adapter("postgres", error.to_string()))?;
+        let cap_reason = decision.cap_reason.map(|reason| match reason {
+            ReviewScheduleCapReasonV1::ExamMargin => "exam_margin",
+            ReviewScheduleCapReasonV1::PastExam => "past_exam",
+        });
+
+        // One statement: the due date and the versioned decision/card land together
+        // or neither does. A replay of the identical decision writes nothing new.
+        let result = sqlx::query(
+            "INSERT INTO review_items (
+                 id, user_id, study_set_id, concept_id, due_at, reason, status, voice_session_id,
+                 schedule_schema_version, schedule_policy_id, schedule_decision, schedule_card,
+                 schedule_generated_at, schedule_cap_reason
+             )
+             VALUES ($1, $2, $3, $4, $5, 'voice_session', 'scheduled', $6, 1, $7, $8, $9, $10, $11)
+             ON CONFLICT (user_id, study_set_id, voice_session_id, concept_id, due_at)
+             WHERE status = 'scheduled' AND voice_session_id IS NOT NULL
+             DO UPDATE SET
+                 schedule_schema_version = EXCLUDED.schedule_schema_version,
+                 schedule_policy_id = EXCLUDED.schedule_policy_id,
+                 schedule_decision = EXCLUDED.schedule_decision,
+                 schedule_card = EXCLUDED.schedule_card,
+                 schedule_generated_at = EXCLUDED.schedule_generated_at,
+                 schedule_cap_reason = EXCLUDED.schedule_cap_reason
+             WHERE review_items.schedule_decision IS DISTINCT FROM EXCLUDED.schedule_decision",
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(concept_uuid)
+        .bind(decision.due_at)
+        .bind(voice_session_uuid)
+        .bind(&decision.policy_id)
+        .bind(&decision_json)
+        .bind(&card_json)
+        .bind(decision.generated_at)
+        .bind(cap_reason)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_error)?;
+
+        if result.rows_affected() > 0 {
+            self.increment_count(WriteCountKind::ReviewItem)?;
+        }
+        Ok(decision.public_summary(concept_id))
     }
 
     async fn record_recap(

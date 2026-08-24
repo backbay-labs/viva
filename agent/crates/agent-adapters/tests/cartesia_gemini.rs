@@ -1575,6 +1575,36 @@ impl StudyMemoryStore for FailStudyToolStore {
             .await
     }
 
+    async fn review_scheduling_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<agent_domain::ReviewSchedulingContextV1, PortError> {
+        self.inner
+            .review_scheduling_context(user_id, study_set_id, concept_id)
+            .await
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        decision: agent_domain::ReviewScheduleDecisionV1,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .persist_review_schedule_decision(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                concept_id,
+                decision,
+            )
+            .await
+    }
+
     async fn record_recap(
         &self,
         user_id: &str,
@@ -1736,6 +1766,36 @@ impl StudyMemoryStore for BlockingAnswerStore {
     ) -> Result<serde_json::Value, PortError> {
         self.inner
             .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn review_scheduling_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<agent_domain::ReviewSchedulingContextV1, PortError> {
+        self.inner
+            .review_scheduling_context(user_id, study_set_id, concept_id)
+            .await
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        decision: agent_domain::ReviewScheduleDecisionV1,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .persist_review_schedule_decision(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                concept_id,
+                decision,
+            )
             .await
     }
 

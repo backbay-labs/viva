@@ -62,6 +62,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0014_session_recaps_one_row_per_session.sql",
         include_str!("../../../migrations/0014_session_recaps_one_row_per_session.sql"),
     ),
+    (
+        "0015_review_schedule_decisions_v1.sql",
+        include_str!("../../../migrations/0015_review_schedule_decisions_v1.sql"),
+    ),
 ];
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
@@ -342,6 +346,36 @@ mod tests {
         assert!(sql.contains(
             "PRIMARY KEY (user_id, study_set_id, voice_session_id, response_id, concept_id, payload_sha256)"
         ));
+    }
+
+    #[test]
+    fn migrations_define_the_v1_review_schedule_decision_columns() {
+        let sql = migration_sql();
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS schedule_schema_version SMALLINT"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS schedule_decision JSONB"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS schedule_card JSONB"));
+        assert!(sql.contains("review_items_schedule_v1_complete"));
+        assert!(sql.contains("schedule_schema_version = 1"));
+        assert!(sql.contains("review_items_schedule_cap_reason_valid"));
+        assert!(sql.contains("IN ('exam_margin', 'past_exam')"));
+        assert!(sql.contains("review_items_schedule_decision_v1_idx"));
+    }
+
+    #[test]
+    fn migrations_supersede_the_four_known_fixed_review_dates_without_inventing_new_ones() {
+        let sql = migration_sql();
+        assert!(sql.contains("SET status = 'superseded'"));
+        for buggy in [
+            "2026-06-18T09:00:00Z",
+            "2026-06-19T09:00:00Z",
+            "2026-06-20T09:00:00Z",
+            "2026-06-24T09:00:00Z",
+        ] {
+            assert!(sql.contains(buggy), "migration must supersede {buggy}");
+        }
+        // Supersession only: the migration never writes a replacement due date.
+        assert!(!sql.contains("SET due_at ="));
+        assert!(!sql.contains("UPDATE review_items\nSET due_at"));
     }
 
     #[test]

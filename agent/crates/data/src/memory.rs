@@ -5,15 +5,16 @@ use std::{
 };
 
 use agent_domain::{
-    AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
-    AnswerEvaluation, ConceptStatus, CreateFileStudySet, CreatePasteStudySet,
-    LibraryNextReviewSummary, LibrarySessionRecapSummary, LibrarySessionSummary,
-    LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError, SessionConfig, SessionStore,
-    SessionTokenNonceClaim, SourceConfidence, StudyConceptSummary, StudyDocumentSummary,
-    StudyLibrarySnapshot, StudyMemoryStore, StudyMode, StudyQuestion, StudySessionDurableCounts,
-    StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus, StudySetSummary,
-    StudySourceReference, StudySourceSpanSummary, StudyStoreBackend, StudyStoreCapabilities,
-    StudyStoreWriteCounts,
+    format_rfc3339_millis, parse_utc_instant, AnswerAttemptEnvelope, AnswerCaptureMode,
+    AnswerCaptureStatus, AnswerContentPolicy, AnswerEvaluation, ConceptStatus, CreateFileStudySet,
+    CreatePasteStudySet, LibraryNextReviewSummary, LibrarySessionRecapSummary,
+    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
+    ReviewScheduleCapReasonV1, ReviewScheduleDecisionV1, ReviewSchedulingContextV1, SessionConfig,
+    SessionStore, SessionTokenNonceClaim, SourceConfidence, StudyConceptSummary,
+    StudyDocumentSummary, StudyLibrarySnapshot, StudyMemoryStore, StudyMode, StudyQuestion,
+    StudySessionDurableCounts, StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus,
+    StudySetSummary, StudySourceReference, StudySourceSpanSummary, StudyStoreBackend,
+    StudyStoreCapabilities, StudyStoreWriteCounts, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -297,6 +298,18 @@ pub struct ReviewItemRecord {
     pub due_at: String,
 }
 
+/// One persisted D-01 `SERVER_PERSISTED_FSRS` decision. Written in the same critical
+/// section as its `ReviewItemRecord`, so the due date and the v1 JSON land together
+/// or not at all.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReviewScheduleDecisionRecord {
+    pub user_id: String,
+    pub study_set_id: String,
+    pub voice_session_id: String,
+    pub concept_id: String,
+    pub decision: ReviewScheduleDecisionV1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PersistedRecapSourceMoment {
     pub source: PersistedSourceReference,
@@ -386,6 +399,13 @@ pub struct InMemoryStudyState {
     pub answer_attempts: Vec<AnswerAttemptRecord>,
     pub concept_statuses: Vec<ConceptStatusRecord>,
     pub review_items: Vec<ReviewItemRecord>,
+    /// Authoritative exam instant per study set for D-01 scheduling, keyed by
+    /// `study_set_id`. Accepts an RFC3339 instant or a bare `YYYY-MM-DD` calendar
+    /// date read as midnight UTC. Never supplied by a tool argument.
+    #[serde(default)]
+    pub study_set_exam_dates: HashMap<String, String>,
+    #[serde(default)]
+    pub review_schedule_decisions: Vec<ReviewScheduleDecisionRecord>,
     pub recaps: Vec<RecapRecord>,
     pub event_authorizations: Vec<EventAuthorizationRecord>,
     pub session_token_nonces: Vec<SessionTokenNonceClaim>,
@@ -503,6 +523,21 @@ impl InMemoryStudyStore {
             .expect("memory store lock poisoned")
             .study_sets
             .insert(record.study_set_id.clone(), record);
+    }
+
+    /// Record the study set's authoritative exam instant for D-01 scheduling.
+    pub fn set_study_set_exam_date(&self, study_set_id: &str, exam_date: Option<String>) {
+        let mut state = self.inner.write().expect("memory store lock poisoned");
+        match exam_date {
+            Some(value) => {
+                state
+                    .study_set_exam_dates
+                    .insert(study_set_id.to_owned(), value);
+            }
+            None => {
+                state.study_set_exam_dates.remove(study_set_id);
+            }
+        }
     }
 
     pub fn upsert_document(&self, record: StudyDocumentRecord) {
@@ -883,6 +918,11 @@ fn remove_session_artifacts(
             || !voice_session_ids.contains(&record.voice_session_id)
     });
     state.review_items.retain(|record| {
+        record.user_id != user_id
+            || record.study_set_id != study_set_id
+            || !voice_session_ids.contains(&record.voice_session_id)
+    });
+    state.review_schedule_decisions.retain(|record| {
         record.user_id != user_id
             || record.study_set_id != study_set_id
             || !voice_session_ids.contains(&record.voice_session_id)
@@ -2325,45 +2365,40 @@ impl StudyMemoryStore for InMemoryStudyStore {
                         missed_concepts: record.recap.missed_concepts.clone(),
                         review_later: record.recap.review_later.clone(),
                     });
+                // D-01: the authenticated read model selects only valid v1 decisions.
+                // A legacy or superseded `review_items` row is never a fallback, and a
+                // `past_exam`-capped decision is excluded from the learner-visible
+                // schedule entirely.
                 let next_review = state
-                    .review_items
+                    .review_schedule_decisions
                     .iter()
-                    .filter(|review| {
-                        review.user_id == user_id
-                            && review.study_set_id == session.study_set_id
-                            && review.voice_session_id == session.voice_session_id
+                    .filter(|record| {
+                        record.user_id == user_id
+                            && record.study_set_id == session.study_set_id
+                            && record.voice_session_id == session.voice_session_id
+                            && record.decision.validate().is_ok()
+                            && record.decision.cap_reason
+                                != Some(ReviewScheduleCapReasonV1::PastExam)
                     })
                     .min_by(|a, b| {
-                        a.due_at
-                            .cmp(&b.due_at)
+                        a.decision
+                            .due_at
+                            .cmp(&b.decision.due_at)
                             .then_with(|| a.concept_id.cmp(&b.concept_id))
                     })
-                    .map(|review| {
+                    .map(|record| {
                         let concept = state
                             .concepts
-                            .get(&concept_key(&review.study_set_id, &review.concept_id));
-                        let status = state
-                            .concept_statuses
-                            .iter()
-                            .rev()
-                            .find(|record| {
-                                record.user_id == user_id
-                                    && record.study_set_id == review.study_set_id
-                                    && record.voice_session_id == review.voice_session_id
-                                    && record.concept_id == review.concept_id
-                            })
-                            .map(|record| record.status.clone())
-                            .or_else(|| concept.map(|record| record.status.clone()))
-                            .unwrap_or(ConceptStatus::Review);
+                            .get(&concept_key(&record.study_set_id, &record.concept_id));
 
                         LibraryNextReviewSummary {
-                            concept_id: review.concept_id.clone(),
+                            concept_id: record.concept_id.clone(),
                             label: concept
-                                .map(|record| record.label.clone())
-                                .unwrap_or_else(|| review.concept_id.clone()),
-                            status,
-                            persisted_due_at: review.due_at.clone(),
-                            source: "persisted_review_item".to_owned(),
+                                .map(|entry| entry.label.clone())
+                                .unwrap_or_else(|| record.concept_id.clone()),
+                            status: record.decision.status.clone(),
+                            persisted_due_at: format_rfc3339_millis(record.decision.due_at),
+                            source: "review_schedule_decision_v1".to_owned(),
                         }
                     });
 
@@ -3052,6 +3087,103 @@ impl StudyMemoryStore for InMemoryStudyStore {
             .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
         if !state.review_items.contains(&record) {
             state.review_items.push(record);
+        }
+        Ok(result)
+    }
+
+    async fn review_scheduling_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<ReviewSchedulingContextV1, PortError> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+        Self::ensure_concept_locked(study_set, &state, concept_id)?;
+
+        // D-01: the exam instant is authoritative store context, never a tool argument.
+        let exam_at = match state
+            .study_set_exam_dates
+            .get(study_set_id)
+            .map(String::as_str)
+        {
+            None => None,
+            Some(raw) => Some(parse_utc_instant(raw).ok_or_else(|| {
+                PortError::adapter(
+                    "memory",
+                    "study set exam date is not a parseable UTC instant",
+                )
+            })?),
+        };
+
+        // Only the latest valid v1 decision seeds the next review; a superseded or
+        // legacy review item never becomes FSRS input.
+        let card = state
+            .review_schedule_decisions
+            .iter()
+            .filter(|record| {
+                record.user_id == user_id
+                    && record.study_set_id == study_set_id
+                    && record.concept_id == concept_id
+                    && record.decision.validate().is_ok()
+            })
+            .max_by_key(|record| record.decision.generated_at)
+            .map(|record| record.decision.card.clone());
+
+        Ok(ReviewSchedulingContextV1 {
+            schema_version: VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+            exam_at,
+            card,
+        })
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        decision: ReviewScheduleDecisionV1,
+    ) -> Result<Value, PortError> {
+        decision
+            .validate()
+            .map_err(|error| PortError::adapter("memory", error.to_string()))?;
+
+        let review_item = ReviewItemRecord {
+            user_id: user_id.to_owned(),
+            study_set_id: study_set_id.to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            concept_id: concept_id.to_owned(),
+            due_at: format_rfc3339_millis(decision.due_at),
+        };
+        let decision_record = ReviewScheduleDecisionRecord {
+            user_id: user_id.to_owned(),
+            study_set_id: study_set_id.to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            concept_id: concept_id.to_owned(),
+            decision: decision.clone(),
+        };
+        let result = decision.public_summary(concept_id);
+
+        // One critical section: scoping, the due date and the v1 decision land
+        // together or not at all, and a replay writes neither a second time.
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        {
+            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+            Self::ensure_concept_locked(study_set, &state, concept_id)?;
+        }
+        if !state.review_schedule_decisions.contains(&decision_record) {
+            if !state.review_items.contains(&review_item) {
+                state.review_items.push(review_item);
+            }
+            state.review_schedule_decisions.push(decision_record);
         }
         Ok(result)
     }
@@ -5141,5 +5273,371 @@ mod tests {
             )
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod review_schedule_decision_tests {
+    use agent_domain::{
+        decide_review_schedule, format_rfc3339_millis, parse_utc_instant, ConceptStatus,
+        ReviewOutcomeV1, ReviewScheduleCapReasonV1, ReviewScheduleDecisionV1,
+        ReviewSchedulingContextV1, SessionConfig, SessionId, StudyMemoryStore, StudyMode,
+        VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+    };
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// Literals copied from `packages/core/src/review-scheduling-conformance-v1.json`
+    /// (`new-shaky-hinted-one-miss-no-exam`, `exam-closer-than-margin`,
+    /// `exam-already-past-fail-closed`).
+    const GRADED_AT: &str = "2031-04-05T12:00:00.000Z";
+    const SHAKY_DUE_AT: &str = "2031-04-07T12:00:00.000Z";
+    const CLOSE_EXAM_AT: &str = "2031-04-05T18:30:00.000Z";
+    const CLOSE_EXAM_DUE_AT: &str = "2031-04-04T18:30:00.000Z";
+    const PAST_EXAM_AT: &str = "2031-03-30T09:15:00.000Z";
+
+    async fn seeded_session_store() -> InMemoryStudyStore {
+        let store = InMemoryStudyStore::seeded_fixture();
+        store
+            .record_voice_session(&SessionConfig {
+                session_id: Some(SessionId::new("voice-session-1")),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .expect("voice session recorded");
+        store
+    }
+
+    fn decision_at(
+        now: &str,
+        status: ConceptStatus,
+        exam_at: Option<&str>,
+    ) -> ReviewScheduleDecisionV1 {
+        decide_review_schedule(
+            parse_utc_instant(now).expect("instant parses"),
+            &ReviewOutcomeV1 {
+                status,
+                hint_count: Some(2),
+                miss_count: Some(1),
+            },
+            &ReviewSchedulingContextV1 {
+                schema_version: VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+                exam_at: exam_at.map(|raw| parse_utc_instant(raw).expect("exam instant parses")),
+                card: None,
+            },
+        )
+        .expect("authoritative decision")
+    }
+
+    #[tokio::test]
+    async fn review_schedule_decision_round_trips_with_its_review_item() {
+        let store = seeded_session_store().await;
+        let decision = decision_at(GRADED_AT, ConceptStatus::Shaky, None);
+        let result = store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "nadh",
+                decision.clone(),
+            )
+            .await
+            .expect("decision persists");
+
+        // The tool-visible result exposes the date and policy, never raw FSRS state.
+        assert_eq!(result["due_at"], SHAKY_DUE_AT);
+        assert_eq!(result["schema_version"], 1);
+        let encoded = result.to_string();
+        assert!(!encoded.contains("stability"), "{encoded}");
+        assert!(!encoded.contains("difficulty"), "{encoded}");
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.review_schedule_decisions.len(), 1);
+        assert_eq!(snapshot.review_schedule_decisions[0].decision, decision);
+        assert_eq!(snapshot.review_items.len(), 1);
+        assert_eq!(snapshot.review_items[0].due_at, SHAKY_DUE_AT);
+        assert_eq!(snapshot.review_items[0].concept_id, "nadh");
+    }
+
+    #[tokio::test]
+    async fn review_schedule_decision_replay_is_idempotent_including_concurrently() {
+        let store = Arc::new(seeded_session_store().await);
+        let decision = decision_at(GRADED_AT, ConceptStatus::Shaky, None);
+
+        store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "nadh",
+                decision.clone(),
+            )
+            .await
+            .expect("first write");
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let decision = decision.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .persist_review_schedule_decision(
+                        "user-1",
+                        "biology-midterm",
+                        "voice-session-1",
+                        "nadh",
+                        decision,
+                    )
+                    .await
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("join").expect("replay succeeds");
+        }
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.review_schedule_decisions.len(), 1);
+        assert_eq!(snapshot.review_items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn review_schedule_decision_rejects_out_of_scope_writes_without_persisting_either_row() {
+        let store = seeded_session_store().await;
+        let decision = decision_at(GRADED_AT, ConceptStatus::Shaky, None);
+        for (user_id, study_set_id, voice_session_id, concept_id) in [
+            ("intruder", "biology-midterm", "voice-session-1", "nadh"),
+            ("user-1", "other-set", "voice-session-1", "nadh"),
+            ("user-1", "biology-midterm", "voice-session-9", "nadh"),
+            (
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "not-a-concept",
+            ),
+        ] {
+            assert!(
+                store
+                    .persist_review_schedule_decision(
+                        user_id,
+                        study_set_id,
+                        voice_session_id,
+                        concept_id,
+                        decision.clone(),
+                    )
+                    .await
+                    .is_err(),
+                "{user_id}/{study_set_id}/{voice_session_id}/{concept_id} must be rejected"
+            );
+        }
+        let snapshot = store.snapshot();
+        assert!(snapshot.review_schedule_decisions.is_empty());
+        assert!(snapshot.review_items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_schedule_decision_context_supplies_exam_and_latest_card_only() {
+        let store = seeded_session_store().await;
+        let empty = store
+            .review_scheduling_context("user-1", "biology-midterm", "nadh")
+            .await
+            .expect("context");
+        assert_eq!(empty.schema_version, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION);
+        assert_eq!(empty.exam_at, None);
+        assert_eq!(empty.card, None);
+
+        let decision = decision_at(GRADED_AT, ConceptStatus::Shaky, None);
+        store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "nadh",
+                decision.clone(),
+            )
+            .await
+            .expect("decision persists");
+        store.set_study_set_exam_date("biology-midterm", Some(CLOSE_EXAM_AT.to_owned()));
+
+        let loaded = store
+            .review_scheduling_context("user-1", "biology-midterm", "nadh")
+            .await
+            .expect("context");
+        assert_eq!(
+            loaded.exam_at,
+            Some(parse_utc_instant(CLOSE_EXAM_AT).expect("exam instant"))
+        );
+        assert_eq!(loaded.card, Some(decision.card.clone()));
+
+        // Another concept in the same study set never inherits this card.
+        let other = store
+            .review_scheduling_context("user-1", "biology-midterm", "atp-synthase")
+            .await
+            .expect("context");
+        assert_eq!(other.card, None);
+    }
+
+    #[tokio::test]
+    async fn review_schedule_decision_context_rejects_an_unparseable_exam_instant() {
+        let store = seeded_session_store().await;
+        store.set_study_set_exam_date("biology-midterm", Some("sometime next week".to_owned()));
+        assert!(store
+            .review_scheduling_context("user-1", "biology-midterm", "nadh")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn review_schedule_decision_library_snapshot_reads_only_valid_v1_decisions() {
+        let store = seeded_session_store().await;
+        store
+            .record_voice_session(&SessionConfig {
+                session_id: Some(SessionId::new("voice-session-2")),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .expect("second voice session recorded");
+
+        // A legacy fixed-date review item must never reach the authenticated read
+        // model, and its presence must not shadow the authoritative v1 decision.
+        for voice_session_id in ["voice-session-1", "voice-session-2"] {
+            store
+                .schedule_review_item(
+                    "user-1",
+                    "biology-midterm",
+                    voice_session_id,
+                    "nadh",
+                    "2026-06-19T09:00:00Z",
+                )
+                .await
+                .expect("legacy seed");
+        }
+        store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "nadh",
+                decision_at(GRADED_AT, ConceptStatus::Shaky, None),
+            )
+            .await
+            .expect("decision persists");
+        for voice_session_id in ["voice-session-1", "voice-session-2"] {
+            store
+                .close_voice_session(voice_session_id, "completed")
+                .await
+                .expect("session closes");
+        }
+
+        let snapshot = store.library_snapshot("user-1").await.expect("snapshot");
+        let legacy_only = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.voice_session_id == "voice-session-2")
+            .expect("legacy-only session");
+        assert!(
+            legacy_only.next_review.is_none(),
+            "a legacy review item is superseded, not a fallback"
+        );
+
+        let projected = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.voice_session_id == "voice-session-1")
+            .expect("projected session");
+        let next_review = projected.next_review.as_ref().expect("v1 next review");
+        assert_eq!(next_review.concept_id, "nadh");
+        assert_eq!(next_review.persisted_due_at, SHAKY_DUE_AT);
+        assert_eq!(next_review.source, "review_schedule_decision_v1");
+        assert_eq!(next_review.status, ConceptStatus::Shaky);
+    }
+
+    #[tokio::test]
+    async fn review_schedule_decision_library_snapshot_hides_past_exam_capped_reviews() {
+        let store = seeded_session_store().await;
+        store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "nadh",
+                decision_at(GRADED_AT, ConceptStatus::Shaky, Some(PAST_EXAM_AT)),
+            )
+            .await
+            .expect("decision persists");
+        store
+            .close_voice_session("voice-session-1", "completed")
+            .await
+            .expect("session closes");
+
+        let snapshot = store.library_snapshot("user-1").await.expect("snapshot");
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.voice_session_id == "voice-session-1")
+            .expect("completed session");
+        assert!(
+            session.next_review.is_none(),
+            "a past-exam-capped decision is excluded from the learner-visible schedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_schedule_decision_persists_the_exam_margin_cap_verbatim() {
+        let store = seeded_session_store().await;
+        let decision = decision_at(GRADED_AT, ConceptStatus::Shaky, Some(CLOSE_EXAM_AT));
+        assert_eq!(format_rfc3339_millis(decision.due_at), CLOSE_EXAM_DUE_AT);
+        assert_eq!(
+            decision.cap_reason,
+            Some(ReviewScheduleCapReasonV1::ExamMargin)
+        );
+
+        store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "nadh",
+                decision,
+            )
+            .await
+            .expect("decision persists");
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.review_items[0].due_at, CLOSE_EXAM_DUE_AT);
+        assert_eq!(
+            snapshot.review_schedule_decisions[0].decision.cap_reason,
+            Some(ReviewScheduleCapReasonV1::ExamMargin)
+        );
+    }
+
+    #[tokio::test]
+    async fn review_schedule_decision_snapshot_never_contains_a_fixed_june_2026_literal() {
+        let store = seeded_session_store().await;
+        for status in [
+            ConceptStatus::Missed,
+            ConceptStatus::Shaky,
+            ConceptStatus::Review,
+            ConceptStatus::Strong,
+        ] {
+            store
+                .persist_review_schedule_decision(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    "nadh",
+                    decision_at(GRADED_AT, status, None),
+                )
+                .await
+                .expect("decision persists");
+        }
+        let encoded = serde_json::to_string(&store.snapshot()).expect("snapshot serializes");
+        assert!(!encoded.contains("2026-06-"), "{encoded}");
     }
 }

@@ -3,21 +3,37 @@ import { Rating } from "ts-fsrs";
 import {
   buildReviewSchedule,
   conceptStatusToRating,
+  decideReviewSchedule,
   dueDateForStatus,
   humanInterval,
+  type PersistedFsrsCardV1,
   type ReviewScheduleInput,
   reviewIntervalForStatus,
   scheduleConceptReview,
+  VIVA_REVIEW_EXAM_MARGIN_SECONDS,
 } from "./scheduling";
 
 const NOW = new Date("2026-06-17T12:00:00.000Z");
 const DAY = 24 * 60 * 60 * 1000;
 
+const MATURE_CARD: PersistedFsrsCardV1 = {
+  schema_version: 1,
+  due_at: "2026-06-17T12:00:00.000Z",
+  stability: 8.2956,
+  difficulty: 5.2,
+  elapsed_days: 0,
+  scheduled_days: 8,
+  reps: 1,
+  lapses: 0,
+  state: "review",
+  last_review_at: "2026-06-09T12:00:00.000Z",
+};
+
 describe("conceptStatusToRating", () => {
-  test("maps each concept status to an FSRS rating", () => {
+  test("maps each concept status to the D-01 recorded FSRS rating", () => {
     expect(conceptStatusToRating("missed")).toBe(Rating.Again);
-    expect(conceptStatusToRating("shaky")).toBe(Rating.Hard);
-    expect(conceptStatusToRating("review")).toBe(Rating.Good);
+    expect(conceptStatusToRating("review")).toBe(Rating.Hard);
+    expect(conceptStatusToRating("shaky")).toBe(Rating.Good);
     expect(conceptStatusToRating("strong")).toBe(Rating.Easy);
   });
 });
@@ -156,6 +172,76 @@ describe("scheduleConceptReview", () => {
 
     expect(item.dueAt.toISOString()).not.toBe("2099-01-01T00:00:00.000Z");
     expect(item.ignoredAdvisorDueAt).toBe("2099-01-01T00:00:00Z");
+  });
+
+  test("a persisted prior card accumulates instead of restarting from an empty card", () => {
+    const firstReview = scheduleConceptReview(base);
+    const laterReview = scheduleConceptReview({ ...base, priorCard: MATURE_CARD });
+
+    expect(laterReview.dueAt.getTime()).toBeGreaterThan(firstReview.dueAt.getTime());
+    expect(laterReview.card.reps).toBe(MATURE_CARD.reps + 1);
+    expect(laterReview.card.stability).toBeGreaterThan(MATURE_CARD.stability);
+  });
+
+  test("the displayed date carries the authoritative decision and never runs past it", () => {
+    for (const status of ["strong", "shaky", "review", "missed"] as const) {
+      const item = scheduleConceptReview({ ...base, status, centrality: 96, hinted: true });
+      const authoritative = decideReviewSchedule({
+        status,
+        now: NOW,
+        hintCount: null,
+        missCount: null,
+        examAt: null,
+        priorCard: null,
+      });
+
+      expect(item.authoritativeDueAt.toISOString()).toBe(authoritative.due_at);
+      expect(item.dueAt.getTime()).toBeLessThanOrEqual(item.authoritativeDueAt.getTime());
+      expect(item.capReason).toBe(null);
+    }
+  });
+
+  test("the exam cap is exactly the recorded D-01 86400-second margin", () => {
+    const examDate = new Date("2026-06-24T09:00:00.000Z");
+    const item = scheduleConceptReview({ ...base, status: "strong", examDate });
+
+    expect(item.authoritativeDueAt.toISOString()).toBe(
+      new Date(examDate.getTime() - VIVA_REVIEW_EXAM_MARGIN_SECONDS * 1000).toISOString(),
+    );
+    expect(item.capReason).toBe("exam_margin");
+  });
+
+  test("an already-past exam fails closed at the exam instant", () => {
+    const examDate = new Date("2026-06-10T09:00:00.000Z");
+    const item = scheduleConceptReview({ ...base, status: "strong", examDate });
+
+    expect(item.authoritativeDueAt.toISOString()).toBe(examDate.toISOString());
+    expect(item.dueAt.getTime()).toBeLessThanOrEqual(examDate.getTime());
+    expect(item.capReason).toBe("past_exam");
+  });
+
+  test("hints and misses are provenance only and never move the authoritative rating", () => {
+    const unaided = decideReviewSchedule({
+      status: "strong",
+      now: NOW,
+      hintCount: 0,
+      missCount: 0,
+      examAt: null,
+      priorCard: null,
+    });
+    const hinted = decideReviewSchedule({
+      status: "strong",
+      now: NOW,
+      hintCount: 4,
+      missCount: 7,
+      examAt: null,
+      priorCard: null,
+    });
+
+    expect(hinted.rating).toBe(unaided.rating);
+    expect(hinted.due_at).toBe(unaided.due_at);
+    expect(hinted.hint_count).toBe(4);
+    expect(hinted.miss_count).toBe(7);
   });
 });
 
