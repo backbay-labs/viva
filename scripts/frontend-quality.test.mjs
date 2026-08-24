@@ -12,9 +12,16 @@ import { fileURLToPath } from "node:url";
  * `checkTokenAuthority` is the one-token-authority checker
  * (`FRONTEND-001`): it rejects a `:root` block that declares the same
  * custom property with more than one literal (non-`var()`) value, and it
- * rejects insufficient contrast for the ochre-on-paper text role. Later
- * tasks extend this file with CSS-ownership and asset checks; they must
- * keep reusing this checker rather than re-implementing its parsing.
+ * rejects insufficient contrast for the ochre-on-paper text role.
+ *
+ * `checkCssOwnership` (added by Task 2) is the CSS-ownership checker: it
+ * rejects a `globals.css` that still contains a selector block or the
+ * wrong/extra imports, rejects a selector's identical declarations
+ * authored in more than one of the four owned sheets, and rejects a
+ * `@viva/ui-web` primitive class with no selector in the package's own
+ * `styles.css`. Later tasks extend this file with asset checks; they
+ * must keep reusing these checkers rather than re-implementing their
+ * parsing.
  */
 
 const MINIMUM_OCHRE_TEXT_CONTRAST = 4.5;
@@ -235,4 +242,401 @@ test("does not let a comment containing literal ':root {' text hijack block pars
   assert.deepEqual(result.errors, []);
   assert.equal(result.ok, true);
   assert.ok(result.contrastRatios["--viva-ochre-text on --viva-paper"] >= 4.5);
+});
+
+/*
+ * CSS-ownership checker (`FRONTEND-001`, Task 2): the split of
+ * `apps/web/app/globals.css` into `packages/ui-web/src/styles.css` plus
+ * `apps/web/app/styles/{base,landing,session}.css`.
+ */
+
+/**
+ * Parses a CSS source string into a flat list of `{ selector, body }`
+ * entries — one per individual (comma-split) selector — from every style
+ * rule in the source, including rules nested inside `@media`/`@supports`.
+ * `@keyframes` blocks are skipped entirely (their "selectors" are
+ * percentages/`from`/`to`, not classes an owner sheet can claim). `body`
+ * is the rule's declaration text with whitespace runs collapsed to a
+ * single space and trimmed, so two rules are compared by their effective
+ * declarations, not incidental formatting.
+ *
+ * @param {string} cssText
+ * @returns {{ selector: string, body: string }[]}
+ */
+function extractSelectorRules(cssText) {
+  const withoutComments = cssText.replace(/\/\*[\s\S]*?\*\//g, "");
+  const entries = [];
+
+  function walk(text) {
+    let i = 0;
+    const n = text.length;
+    while (i < n) {
+      while (i < n && /\s/.test(text[i])) i++;
+      if (i >= n) break;
+      let j = i;
+      let parenDepth = 0;
+      while (j < n) {
+        const c = text[j];
+        if (c === "(") parenDepth++;
+        else if (c === ")") parenDepth--;
+        else if (c === "{" && parenDepth === 0) break;
+        else if (c === ";" && parenDepth === 0) break;
+        j++;
+      }
+      if (j >= n) break;
+      if (text[j] === ";") {
+        i = j + 1;
+        continue;
+      }
+      const header = text.slice(i, j).trim();
+      let depth = 1;
+      let k = j + 1;
+      while (k < n && depth > 0) {
+        if (text[k] === "{") depth++;
+        else if (text[k] === "}") depth--;
+        k++;
+      }
+      const body = text.slice(j + 1, k - 1);
+      if (header.startsWith("@keyframes")) {
+        // internal percentage selectors are not class selectors.
+      } else if (header.startsWith("@")) {
+        walk(body);
+      } else {
+        const normalizedBody = body.replace(/\s+/g, " ").trim();
+        for (const selector of splitTopLevelCommaList(header)) {
+          entries.push({ selector, body: normalizedBody });
+        }
+      }
+      i = k;
+    }
+  }
+
+  walk(withoutComments);
+  return entries;
+}
+
+/** Splits a selector list by top-level commas (respecting parens/brackets). */
+function splitTopLevelCommaList(header) {
+  const parts = [];
+  let depth = 0;
+  let current = "";
+  for (const char of header) {
+    if (char === "(" || char === "[") depth++;
+    else if (char === ")" || char === "]") depth--;
+    if (char === "," && depth === 0) {
+      parts.push(current.trim());
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts.map((entry) => entry.replace(/\s+/g, " "));
+}
+
+/**
+ * Checks the CSS-ownership invariants Task 2 establishes: `globalsCss`
+ * contains only ordered `@import` statements/comments, in the exact
+ * resolved order `@viva/ui-web/styles.css -> ./styles/base.css ->
+ * ./styles/landing.css -> ./styles/session.css`, and no longer imports
+ * `@viva/tokens/theme.css` directly; no *identical* rule (same selector,
+ * same declarations) is authored in more than one of the four owned
+ * sheets; and every selector in `requiredUiWebSelectors` (the classes
+ * `@viva/ui-web`'s own components emit, without the leading `.`) has at
+ * least one declaration in `uiWebStylesCss`.
+ *
+ * A selector legitimately appearing in more than one sheet with
+ * *different* declarations (for example a base chip-family rule in
+ * `uiWebStylesCss` layered under a session-specific refinement in
+ * `sessionCss` for the same `.source-chip` class) is not a
+ * duplicate-authority violation — only an identical (selector,
+ * declarations) pair copied into a second sheet is.
+ *
+ * @param {{
+ *   globalsCss: string,
+ *   uiWebStylesCss: string,
+ *   baseCss: string,
+ *   landingCss: string,
+ *   sessionCss: string,
+ *   requiredUiWebSelectors: string[],
+ * }} sheets
+ */
+function checkCssOwnership({
+  globalsCss,
+  uiWebStylesCss,
+  baseCss,
+  landingCss,
+  sessionCss,
+  requiredUiWebSelectors,
+}) {
+  const errors = [];
+
+  const globalsWithoutComments = globalsCss.replace(/\/\*[\s\S]*?\*\//g, "");
+  if (globalsWithoutComments.includes("{")) {
+    errors.push(
+      "globals.css contains a selector block; it must contain only ordered @import statements",
+    );
+  }
+  const importLines = [...globalsWithoutComments.matchAll(/@import\s+"([^"]+)"\s*;/g)].map(
+    (match) => match[1],
+  );
+  const expectedImportOrder = [
+    "@viva/ui-web/styles.css",
+    "./styles/base.css",
+    "./styles/landing.css",
+    "./styles/session.css",
+  ];
+  if (importLines.join(",") !== expectedImportOrder.join(",")) {
+    errors.push(
+      `globals.css imports must be exactly ${JSON.stringify(expectedImportOrder)} in that order, found ${JSON.stringify(
+        importLines,
+      )}`,
+    );
+  }
+  if (globalsWithoutComments.includes("@viva/tokens/theme.css")) {
+    errors.push(
+      "globals.css must not import @viva/tokens/theme.css directly; the token sheet must enter the app once, through @viva/ui-web/styles.css's own dependency",
+    );
+  }
+
+  const owners = [
+    ["packages/ui-web/src/styles.css", uiWebStylesCss],
+    ["apps/web/app/styles/base.css", baseCss],
+    ["apps/web/app/styles/landing.css", landingCss],
+    ["apps/web/app/styles/session.css", sessionCss],
+  ];
+  /** @type {Map<string, Map<string, string[]>>} selector -> body -> owner names */
+  const bySelector = new Map();
+  for (const [ownerName, cssText] of owners) {
+    for (const { selector, body } of extractSelectorRules(cssText)) {
+      const byBody = bySelector.get(selector) ?? new Map();
+      const ownersForBody = byBody.get(body) ?? [];
+      ownersForBody.push(ownerName);
+      byBody.set(body, ownersForBody);
+      bySelector.set(selector, byBody);
+    }
+  }
+  for (const [selector, byBody] of bySelector) {
+    for (const ownersForBody of byBody.values()) {
+      const uniqueOwners = [...new Set(ownersForBody)];
+      if (uniqueOwners.length > 1) {
+        errors.push(
+          `duplicate authority for selector "${selector}": the identical rule is authored in more than one owner (${uniqueOwners.join(
+            ", ",
+          )})`,
+        );
+      }
+    }
+  }
+
+  const uiWebSelectors = new Set(extractSelectorRules(uiWebStylesCss).map((rule) => rule.selector));
+  const uiWebCssNoComments = uiWebStylesCss.replace(/\/\*[\s\S]*?\*\//g, "");
+  for (const className of requiredUiWebSelectors) {
+    const escaped = className.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const hasBareSelector = uiWebSelectors.has(`.${className}`);
+    const hasCompoundSelector = new RegExp(`\\.${escaped}(?![\\w-])`).test(uiWebCssNoComments);
+    if (!hasBareSelector && !hasCompoundSelector) {
+      errors.push(`@viva/ui-web primitive class ".${className}" has no selector in styles.css`);
+    }
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
+/**
+ * Prop-driven template-literal variants (`` `action-card--${accent}` ``
+ * and similar) in `packages/ui-web/src/index.tsx` that a static regex
+ * scan cannot resolve to a literal string. Each is cross-referenced
+ * against that component's own prop union type in `index.tsx`, mirroring
+ * `packages/ui-web/src/index.test.tsx`'s own coverage list.
+ */
+const KNOWN_PROP_DRIVEN_VARIANT_CLASS_NAMES = [
+  // ActionCard's `accent?: "plum" | "sage" | "gold" | "amber"`
+  "action-card--plum",
+  "action-card--sage",
+  "action-card--gold",
+  "action-card--amber",
+  // FeedbackCard's `accent?: "plum" | "sage" | "gold" | "amber"`
+  "feedback-card--plum",
+  "feedback-card--sage",
+  "feedback-card--gold",
+  "feedback-card--amber",
+  // SourceChip's `tone?: "plum" | "neutral"`
+  "source-chip--plum",
+  "source-chip--neutral",
+  // MasteryChip's `tier: ConceptStatus` ("strong" | "shaky" | "missed" | "review")
+  "mastery-chip--strong",
+  "mastery-chip--shaky",
+  "mastery-chip--missed",
+  "mastery-chip--review",
+  // TimelineItem's `status: "done" | "today" | "upcoming"`
+  "timeline-item--done",
+  "timeline-item--today",
+  "timeline-item--upcoming",
+];
+
+/**
+ * Statically enumerates the class names `packages/ui-web/src/index.tsx`
+ * emits via `className="literal"` and `className={...}` (plain strings,
+ * template literals, and ternaries within the expression). A token
+ * ending in `-` is a dangling template-prefix fragment (e.g.
+ * `"action-card--"` left over from `` `action-card--${accent}` ``, never
+ * a real class), so it is dropped rather than required.
+ *
+ * @param {string} source
+ */
+function emittedClassNames(source) {
+  const found = new Set();
+  const addTokens = (text) => {
+    for (const token of text.split(/\s+/).filter(Boolean)) found.add(token);
+  };
+  for (const match of source.matchAll(/className="([^"]*)"/g)) addTokens(match[1]);
+  const openTag = /className=\{/g;
+  let open;
+  // biome-ignore lint/suspicious/noAssignInExpressions: single-pass balanced scan
+  while ((open = openTag.exec(source))) {
+    const start = open.index + open[0].length;
+    let depth = 1;
+    let i = start;
+    while (i < source.length && depth > 0) {
+      if (source[i] === "{") depth += 1;
+      else if (source[i] === "}") depth -= 1;
+      i += 1;
+    }
+    const expression = source.slice(start, i - 1);
+    for (const template of expression.matchAll(/`([^`]*)`/g)) {
+      addTokens(template[1].replace(/\$\{[^}]*\}/g, " "));
+    }
+    for (const literal of expression.matchAll(/"([^"]*)"/g)) addTokens(literal[1]);
+  }
+  return [...found].filter((name) => !name.endsWith("-"));
+}
+
+function requiredUiWebSelectorsFromSource(indexTsxSource) {
+  const all = new Set([
+    ...emittedClassNames(indexTsxSource),
+    ...KNOWN_PROP_DRIVEN_VARIANT_CLASS_NAMES,
+  ]);
+  // `ActionCard`'s `primary` prop has emitted `action-card--primary` since
+  // before this task's split (verified against the pre-Task-2
+  // `globals.css` at HEAD) with no corresponding rule ever declared — a
+  // pre-existing gap, not something this mechanical CSS-ownership move
+  // introduced or is in scope to newly style.
+  all.delete("action-card--primary");
+  return [...all];
+}
+
+test("checkCssOwnership rejects an identical rule duplicated across owners (mastery-ring mutation)", () => {
+  const result = checkCssOwnership({
+    globalsCss:
+      '@import "@viva/ui-web/styles.css";\n@import "./styles/base.css";\n@import "./styles/landing.css";\n@import "./styles/session.css";\n',
+    uiWebStylesCss: ".mastery-ring {\n  height: 88px;\n  width: 88px;\n}\n",
+    baseCss: "",
+    landingCss: ".mastery-ring {\n  height: 88px;\n  width: 88px;\n}\n",
+    sessionCss: "",
+    requiredUiWebSelectors: ["mastery-ring"],
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some(
+      (error) => error.includes("mastery-ring") && error.includes("duplicate authority"),
+    ),
+    `expected a duplicate-authority error naming mastery-ring, got: ${JSON.stringify(result.errors)}`,
+  );
+});
+
+test("checkCssOwnership accepts the same selector layered with different declarations across two owners (source-chip)", () => {
+  // packages/ui-web/src/styles.css's SourceChip primitive establishes the
+  // base look; apps/web/app/styles/session.css separately refines the
+  // *same* `.source-chip` class (shared with session's local
+  // `StatusChip` sibling) at a later cascade position — a real, existing
+  // layering, not a copy-pasted duplicate authority.
+  const result = checkCssOwnership({
+    globalsCss:
+      '@import "@viva/ui-web/styles.css";\n@import "./styles/base.css";\n@import "./styles/landing.css";\n@import "./styles/session.css";\n',
+    uiWebStylesCss: ".source-chip {\n  color: var(--viva-plum);\n  font-size: 0.76rem;\n}\n",
+    baseCss: "",
+    landingCss: "",
+    sessionCss:
+      ".source-chip {\n  background: rgba(222, 208, 241, 0.5);\n  color: var(--viva-amethyst-deep);\n}\n",
+    requiredUiWebSelectors: ["source-chip"],
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.errors, []);
+});
+
+test("checkCssOwnership rejects a required @viva/ui-web primitive with no style", () => {
+  const result = checkCssOwnership({
+    globalsCss:
+      '@import "@viva/ui-web/styles.css";\n@import "./styles/base.css";\n@import "./styles/landing.css";\n@import "./styles/session.css";\n',
+    uiWebStylesCss: ".avatar {\n  display: inline-flex;\n}\n",
+    baseCss: "",
+    landingCss: "",
+    sessionCss: "",
+    requiredUiWebSelectors: ["avatar", "mastery-ring"],
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((error) => error.includes('".mastery-ring" has no selector')),
+    `expected a missing-style error naming .mastery-ring, got: ${JSON.stringify(result.errors)}`,
+  );
+});
+
+test("checkCssOwnership rejects a globals.css that still contains a selector block", () => {
+  const result = checkCssOwnership({
+    globalsCss:
+      '@import "@viva/ui-web/styles.css";\n@import "./styles/base.css";\n@import "./styles/landing.css";\n@import "./styles/session.css";\nbody { margin: 0; }\n',
+    uiWebStylesCss: "",
+    baseCss: "",
+    landingCss: "",
+    sessionCss: "",
+    requiredUiWebSelectors: [],
+  });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes("selector block")));
+});
+
+test("checkCssOwnership rejects the wrong import order and a lingering direct theme.css import", () => {
+  const wrongOrder = checkCssOwnership({
+    globalsCss: '@import "./styles/base.css";\n@import "@viva/ui-web/styles.css";\n',
+    uiWebStylesCss: "",
+    baseCss: "",
+    landingCss: "",
+    sessionCss: "",
+    requiredUiWebSelectors: [],
+  });
+  assert.equal(wrongOrder.ok, false);
+  assert.ok(wrongOrder.errors.some((error) => error.includes("imports must be exactly")));
+
+  const lingeringTokenImport = checkCssOwnership({
+    globalsCss:
+      '@import "@viva/tokens/theme.css";\n@import "@viva/ui-web/styles.css";\n@import "./styles/base.css";\n@import "./styles/landing.css";\n@import "./styles/session.css";\n',
+    uiWebStylesCss: "",
+    baseCss: "",
+    landingCss: "",
+    sessionCss: "",
+    requiredUiWebSelectors: [],
+  });
+  assert.equal(lingeringTokenImport.ok, false);
+  assert.ok(
+    lingeringTokenImport.errors.some((error) =>
+      error.includes("must not import @viva/tokens/theme.css directly"),
+    ),
+  );
+});
+
+test("checkCssOwnership accepts the real, split repository CSS", () => {
+  const readRepo = (relativePath) =>
+    fs.readFileSync(fileURLToPath(new URL(`../${relativePath}`, import.meta.url)), "utf8");
+  const indexTsxSource = readRepo("packages/ui-web/src/index.tsx");
+  const result = checkCssOwnership({
+    globalsCss: readRepo("apps/web/app/globals.css"),
+    uiWebStylesCss: readRepo("packages/ui-web/src/styles.css"),
+    baseCss: readRepo("apps/web/app/styles/base.css"),
+    landingCss: readRepo("apps/web/app/styles/landing.css"),
+    sessionCss: readRepo("apps/web/app/styles/session.css"),
+    requiredUiWebSelectors: requiredUiWebSelectorsFromSource(indexTsxSource),
+  });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
 });

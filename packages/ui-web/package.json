@@ -5,7 +5,8 @@
   "type": "module",
   "main": "./src/index.tsx",
   "exports": {
-    ".": "./src/index.tsx"
+    ".": "./src/index.tsx",
+    "./styles.css": "./src/styles.css"
   },
   "scripts": {
     "build": "tsc --noEmit",
@@ -14,11 +15,15 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "react": "19.2.3"
+    "@viva/tokens": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": "^19.2.3"
   },
   "devDependencies": {
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "react": "19.2.3",
     "react-dom": "19.2.3",
     "typescript": "^5.9.3"
   }
