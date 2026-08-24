@@ -15,24 +15,32 @@ import {
  * for.
  */
 
-const themeCss = await fetch(new URL("./theme.css", import.meta.url)).then((response) => response.text());
+const themeCss = await fetch(new URL("./theme.css", import.meta.url)).then((response) =>
+  response.text(),
+);
 
 type Declaration = { name: string; value: string };
 
+// Parses every `:root { ... }` block in the source (a stylesheet may
+// legally contain more than one, and every one contributes to the cascade,
+// so reading only the first would miss a declaration reintroduced in a
+// later block). Comments are stripped from the *entire* source before any
+// `:root` matching happens, so a comment containing literal text like
+// ":root {" cannot hijack block boundaries either.
 function parseRootDeclarations(css: string): Declaration[] {
-  const rootMatch = css.match(/:root\s*{([^}]*)}/s);
-  if (!rootMatch) return [];
-  const withoutComments = rootMatch[1].replace(/\/\*[\s\S]*?\*\//g, "");
+  const withoutComments = css.replace(/\/\*[\s\S]*?\*\//g, "");
   const declarations: Declaration[] = [];
-  for (const rawStatement of withoutComments.split(";")) {
-    const statement = rawStatement.trim();
-    if (!statement.startsWith("--")) continue;
-    const colonIndex = statement.indexOf(":");
-    if (colonIndex === -1) continue;
-    declarations.push({
-      name: statement.slice(0, colonIndex).trim(),
-      value: statement.slice(colonIndex + 1).trim(),
-    });
+  for (const rootMatch of withoutComments.matchAll(/:root\s*{([^}]*)}/gs)) {
+    for (const rawStatement of rootMatch[1].split(";")) {
+      const statement = rawStatement.trim();
+      if (!statement.startsWith("--")) continue;
+      const colonIndex = statement.indexOf(":");
+      if (colonIndex === -1) continue;
+      declarations.push({
+        name: statement.slice(0, colonIndex).trim(),
+        value: statement.slice(colonIndex + 1).trim(),
+      });
+    }
   }
   return declarations;
 }
@@ -63,7 +71,8 @@ function relativeLuminance([r, g, b]: [number, number, number]): number {
 function contrastRatio(hexA: string, hexB: string): number {
   const luminanceA = relativeLuminance(hexToRgb(hexA));
   const luminanceB = relativeLuminance(hexToRgb(hexB));
-  const [lighter, darker] = luminanceA > luminanceB ? [luminanceA, luminanceB] : [luminanceB, luminanceA];
+  const [lighter, darker] =
+    luminanceA > luminanceB ? [luminanceA, luminanceB] : [luminanceB, luminanceA];
   return (lighter + 0.05) / (darker + 0.05);
 }
 
@@ -98,8 +107,10 @@ describe("@viva/tokens theme.css authority", () => {
   });
 
   test("no custom property has more than one literal (non-alias) declaration", () => {
-    for (const [name, occurrences] of declarationsByName) {
-      const literalCount = occurrences.filter((declaration) => isLiteralValue(declaration.value)).length;
+    for (const occurrences of declarationsByName.values()) {
+      const literalCount = occurrences.filter((declaration) =>
+        isLiteralValue(declaration.value),
+      ).length;
       expect(literalCount).toBeLessThanOrEqual(1);
     }
   });
@@ -109,7 +120,11 @@ describe("@viva/tokens theme.css authority", () => {
     for (const name of legacyAliasNames) {
       const occurrences = declarationsByName.get(name) ?? [];
       expect(occurrences.length).toBe(1);
-      expect(occurrences[0]!.value.startsWith("var(--viva-")).toBe(true);
+      const [declaration] = occurrences;
+      if (!declaration) {
+        throw new Error(`theme.css does not declare ${name}`);
+      }
+      expect(declaration.value.startsWith("var(--viva-")).toBe(true);
     }
   });
 
@@ -126,7 +141,9 @@ describe("@viva/tokens theme.css authority", () => {
   });
 
   test("serif/sans tokens resolve through --viva-font-serif/--viva-font-sans with the current family stack as fallback", () => {
-    expect(literalValueOf("--viva-serif")).toBe('var(--viva-font-serif, "Cormorant", Georgia, serif)');
+    expect(literalValueOf("--viva-serif")).toBe(
+      'var(--viva-font-serif, "Cormorant", Georgia, serif)',
+    );
     expect(literalValueOf("--viva-sans")).toBe(
       'var(--viva-font-sans, "Hanken Grotesk", "Avenir Next", -apple-system, BlinkMacSystemFont, sans-serif)',
     );

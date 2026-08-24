@@ -90,6 +90,9 @@
      rendering is unchanged. No remote (network) font declaration appears in
      this file. */
   --viva-serif: var(--viva-font-serif, "Cormorant", Georgia, serif);
+  /* biome-ignore format: keep this declaration on one line — it is asserted
+     verbatim (single-line) against the plan's locked literal string in
+     packages/tokens/src/index.test.ts. */
   --viva-sans: var(--viva-font-sans, "Hanken Grotesk", "Avenir Next", -apple-system, BlinkMacSystemFont, sans-serif);
 
   /* ---- legacy aliases: no literal values below this line ---- */

@@ -22,28 +22,34 @@ const MINIMUM_OCHRE_TEXT_CONTRAST = 4.5;
 /** @typedef {{ name: string, value: string }} Declaration */
 
 /**
- * Parses the declarations inside the first `:root { ... }` block of a CSS
- * source string. Comments are stripped before splitting on `;`, so a
+ * Parses the declarations inside *every* `:root { ... }` block of a CSS
+ * source string. A stylesheet may legally contain more than one `:root`
+ * block, and every one of them contributes to the cascade, so a checker
+ * that only read the first would be blind to a duplicate (or
+ * contrast-insufficient) declaration reintroduced in a later block.
+ * Comments are stripped from the *entire* source before any `:root`
+ * matching happens (not merely from within an already-matched block), so a
  * comment containing a literal colon (e.g. "restrained luxury: warm
- * vellum") can never be mistaken for a declaration.
+ * vellum") can never be mistaken for a declaration, and a comment
+ * containing literal text like ":root {" can never hijack block matching.
  *
  * @param {string} css
  * @returns {Declaration[]}
  */
 function parseRootDeclarations(css) {
-  const rootMatch = css.match(/:root\s*{([^}]*)}/s);
-  if (!rootMatch) return [];
-  const withoutComments = rootMatch[1].replace(/\/\*[\s\S]*?\*\//g, "");
+  const withoutComments = css.replace(/\/\*[\s\S]*?\*\//g, "");
   const declarations = [];
-  for (const rawStatement of withoutComments.split(";")) {
-    const statement = rawStatement.trim();
-    if (!statement.startsWith("--")) continue;
-    const colonIndex = statement.indexOf(":");
-    if (colonIndex === -1) continue;
-    declarations.push({
-      name: statement.slice(0, colonIndex).trim(),
-      value: statement.slice(colonIndex + 1).trim(),
-    });
+  for (const rootMatch of withoutComments.matchAll(/:root\s*{([^}]*)}/gs)) {
+    for (const rawStatement of rootMatch[1].split(";")) {
+      const statement = rawStatement.trim();
+      if (!statement.startsWith("--")) continue;
+      const colonIndex = statement.indexOf(":");
+      if (colonIndex === -1) continue;
+      declarations.push({
+        name: statement.slice(0, colonIndex).trim(),
+        value: statement.slice(colonIndex + 1).trim(),
+      });
+    }
   }
   return declarations;
 }
@@ -96,7 +102,8 @@ function relativeLuminance([r, g, b]) {
 function contrastRatio(hexA, hexB) {
   const luminanceA = relativeLuminance(hexToRgb(hexA));
   const luminanceB = relativeLuminance(hexToRgb(hexB));
-  const [lighter, darker] = luminanceA > luminanceB ? [luminanceA, luminanceB] : [luminanceB, luminanceA];
+  const [lighter, darker] =
+    luminanceA > luminanceB ? [luminanceA, luminanceB] : [luminanceB, luminanceA];
   return (lighter + 0.05) / (darker + 0.05);
 }
 
@@ -114,7 +121,9 @@ function checkTokenAuthority(cssText) {
   const contrastRatios = {};
 
   for (const [name, occurrences] of byName) {
-    const literalOccurrences = occurrences.filter((declaration) => isLiteralValue(declaration.value));
+    const literalOccurrences = occurrences.filter((declaration) =>
+      isLiteralValue(declaration.value),
+    );
     if (literalOccurrences.length > 1) {
       errors.push(
         `duplicate literal declaration of ${name}: found ${literalOccurrences.length} literal values (${literalOccurrences
@@ -187,6 +196,42 @@ test("accepts the canonical theme.css authority", () => {
   const themeCssPath = fileURLToPath(new URL("../packages/tokens/src/theme.css", import.meta.url));
   const themeCss = fs.readFileSync(themeCssPath, "utf8");
   const result = checkTokenAuthority(themeCss);
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
+  assert.ok(result.contrastRatios["--viva-ochre-text on --viva-paper"] >= 4.5);
+});
+
+test("rejects the canonical theme.css with a duplicate literal appended in a second :root block", () => {
+  // Regression test: a checker that reads only the *first* `:root` block in
+  // a source is blind to a duplicate (or contrast-insufficient) declaration
+  // reintroduced in a later one. This is exactly the shape of the original
+  // FRONTEND-001 defect (globals.css had two literal `:root` palette
+  // blocks), so appending a second `:root` block to the real, currently
+  // passing theme.css must still be rejected.
+  const themeCssPath = fileURLToPath(new URL("../packages/tokens/src/theme.css", import.meta.url));
+  const themeCss = fs.readFileSync(themeCssPath, "utf8");
+  const mutated = `${themeCss}\n:root {\n  --viva-paper: #eeeeee;\n  --viva-ochre-text: #c88b48;\n}\n`;
+  const result = checkTokenAuthority(mutated);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((error) => error.includes("--viva-paper")),
+    `expected an error naming --viva-paper, got: ${JSON.stringify(result.errors)}`,
+  );
+  assert.ok(
+    result.errors.some((error) => error.includes("--viva-ochre-text")),
+    `expected an error naming --viva-ochre-text, got: ${JSON.stringify(result.errors)}`,
+  );
+});
+
+test("does not let a comment containing literal ':root {' text hijack block parsing", () => {
+  const fixture = `
+    /* legacy note: an old rule once read :root { color: red } here */
+    :root {
+      --viva-paper: #fffdf8;
+      --viva-ochre-text: #8a5a23;
+    }
+  `;
+  const result = checkTokenAuthority(fixture);
   assert.deepEqual(result.errors, []);
   assert.equal(result.ok, true);
   assert.ok(result.contrastRatios["--viva-ochre-text on --viva-paper"] >= 4.5);
