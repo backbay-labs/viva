@@ -528,13 +528,9 @@ export function LiveSessionPage() {
         textAnswerMode: textAnswerModeRef.current,
       })
     ) {
-      // Flush the capture source so its tail becomes the turn's last chunk, then
-      // submit exactly one `audio_end`. The retained ledger is NOT cleared here:
-      // it is released only by `audio_turn_accepted`, so a `pending` or
-      // `socket_closed` result keeps its retry metadata instead of pretending the
-      // answer was sent.
-      captureRef.current?.end();
-      if (getAudioTurnDriver().submit()) return;
+      // Flush the capture tail into the turn's last chunk and send exactly one
+      // `audio_end`, leaving the microphone open for the next question.
+      if (submitSpokenCaptureTurn(captureRef, getAudioTurnDriver())) return;
     } else {
       cancelActiveAudioTurn();
     }
@@ -1099,7 +1095,28 @@ export function enterTextAnswerMode(
 }
 
 type LiveCaptureController = Pick<VivaPcm16StreamingCaptureController, "stop"> &
-  Partial<Pick<VivaPcm16StreamingCaptureController, "cancel">>;
+  Partial<Pick<VivaPcm16StreamingCaptureController, "cancel" | "flush">>;
+
+/**
+ * Submit the spoken answer: flush the capture tail into the turn's last chunk,
+ * then send exactly one `audio_end`.
+ *
+ * The capture source is deliberately left running. It is session-scoped, not
+ * turn-scoped: `stop`/`end`/`cancel` release the browser source, which stops
+ * every `MediaStream` track and closes the `AudioContext`, while the page's
+ * `captureStarted` flag stays set and no question change resets it — so ending
+ * capture here would leave a dead controller behind and make every later spoken
+ * answer impossible. The retained ledger is not cleared either: only
+ * `audio_turn_accepted` releases it, so `pending` and `socket_closed` keep their
+ * retry metadata instead of pretending the answer was sent.
+ */
+export function submitSpokenCaptureTurn(
+  captureRef: { current: LiveCaptureController | null },
+  driver: Pick<LiveAudioTurnDriver, "submit">,
+): VivaAudioSendResult | null {
+  captureRef.current?.flush?.();
+  return driver.submit();
+}
 
 export function micStateForAudioCaptureError(error: unknown): RuntimeMicState {
   return isVivaAudioWorkletUnavailableError(error) ? "unsupported" : "denied";
@@ -1243,8 +1260,10 @@ export function createLiveAudioTurnDriver(input: {
       };
       const capturedSamples = active.capturedSamples + byteLength / 2;
       if (!Number.isSafeInteger(capturedSamples) || capturedSamples > maxTurnSamples) {
+        // End before notifying — see the comment on the exact-cap branch below.
+        const end = turn ? endActiveTurn(turn) : null;
         input.onCapacityReached?.();
-        return { chunk: null, end: turn ? endActiveTurn(turn) : null, ignored: "capped" };
+        return { chunk: null, end, ignored: "capped" };
       }
       let result: VivaAudioSendResult;
       try {
@@ -1266,8 +1285,15 @@ export function createLiveAudioTurnDriver(input: {
         turnId: active.turnId,
       };
       if (capturedSamples === maxTurnSamples) {
+        // The turn's single `audio_end` is sent BEFORE the capacity callback,
+        // because that callback stops the capture source and the source flushes
+        // its buffered tail synchronously back into `captureFrame`. Ending first
+        // leaves this driver awaiting acceptance, so the flushed tail is ignored
+        // instead of re-entering this branch and calling back into the stop that
+        // produced it — which recursed until the stack was exhausted.
+        const end = endActiveTurn(turn);
         input.onCapacityReached?.();
-        return { chunk, end: endActiveTurn(turn), ignored: null };
+        return { chunk, end, ignored: null };
       }
       return { chunk, end: null, ignored: null };
     },

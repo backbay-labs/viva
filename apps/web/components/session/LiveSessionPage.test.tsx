@@ -6,7 +6,16 @@ import {
   VivaAudioSendRejectedError,
   type VivaAudioSendResult,
 } from "../../lib/viva-agent-client";
-import { VivaAudioWorkletUnavailableError } from "../../lib/viva-audio-capture";
+import {
+  startVivaPcm16StreamingCapture,
+  VIVA_AUDIO_SAMPLE_RATE_HZ,
+  type VivaAudioCaptureEndReason,
+  type VivaAudioCaptureSampleFrame,
+  type VivaAudioCaptureSource,
+  type VivaAudioCaptureStartOptions,
+  VivaAudioWorkletUnavailableError,
+  type VivaPcm16StreamingCaptureController,
+} from "../../lib/viva-audio-capture";
 import { projectTrace } from "../../lib/viva-session-projection";
 import {
   browserLifecycleReconnectPlan,
@@ -33,6 +42,7 @@ import {
   shouldUseLiveMicAudioTransport,
   spokenTurnFallbackAction,
   stopCaptureForRecap,
+  submitSpokenCaptureTurn,
   textAnswerPayload,
   textAnswerStateForSession,
 } from "./LiveSessionPage";
@@ -962,4 +972,141 @@ describe("live audio turn driver", () => {
     expect(first.startsWith("turn-")).toBe(true);
     expect(/^turn-[A-Za-z0-9-]+$/.test(first)).toBe(true);
   });
+
+  test("the real capture source at the raw sample cap ends once and stops without recursion", () => {
+    const { calls, seam } = recordingSeam();
+    const source = new FakeLiveCaptureSource(VIVA_AUDIO_SAMPLE_RATE_HZ);
+    const captureRef: { current: VivaPcm16StreamingCaptureController | null } = { current: null };
+    let capacityReached = 0;
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-cap"),
+      maxTurnSamples: 960,
+      // The page's exact capacity wiring, in the page's exact order: the stop
+      // runs before the ref is cleared, so a re-entrant callback still sees the
+      // live controller.
+      onCapacityReached: () => {
+        capacityReached += 1;
+        captureRef.current?.stop();
+        captureRef.current = null;
+      },
+    });
+    captureRef.current = startVivaPcm16StreamingCapture({
+      onFrame: (frame) => {
+        driver.captureFrame(frame);
+      },
+      source,
+    });
+
+    // 700-sample worklet callbacks leave a partial tail buffered at the exact
+    // moment the cap is reached, and stopping capture flushes that tail straight
+    // back into `captureFrame` while the capping callback is still on the stack.
+    source.push(new Float32Array(700).fill(0.25));
+    source.push(new Float32Array(700).fill(-0.25));
+
+    expect(capacityReached).toBe(1);
+    expect(calls).toEqual([
+      { byteLength: 960, kind: "chunk", sequence: 0, turnId: "turn-cap" },
+      { byteLength: 960, kind: "chunk", sequence: 1, turnId: "turn-cap" },
+      { finalSequence: 1, kind: "end", turnId: "turn-cap" },
+    ]);
+    expect(driver.getTurn()).toBe(null);
+    expect(driver.isAwaitingAcceptance()).toBe(true);
+    expect(source.stopped).toBe(true);
+  });
+
+  test("submitting a spoken turn flushes the tail and keeps the microphone open", () => {
+    const { calls, seam } = recordingSeam();
+    const source = new FakeLiveCaptureSource(VIVA_AUDIO_SAMPLE_RATE_HZ);
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-first", "turn-second"),
+    });
+    const capture = startVivaPcm16StreamingCapture({
+      onFrame: (frame) => {
+        driver.captureFrame(frame);
+      },
+      source,
+    });
+    const captureRef = { current: capture };
+
+    source.push(new Float32Array(700).fill(0.25));
+
+    expect(submitSpokenCaptureTurn(captureRef, driver)).toEqual({
+      acceptedThroughSequence: 1,
+      status: "sent",
+    });
+
+    // The buffered 220-sample tail is the turn's last chunk, ahead of the end.
+    expect(calls).toEqual([
+      { byteLength: 960, kind: "chunk", sequence: 0, turnId: "turn-first" },
+      { byteLength: 440, kind: "chunk", sequence: 1, turnId: "turn-first" },
+      { finalSequence: 1, kind: "end", turnId: "turn-first" },
+    ]);
+    // Submitting an answer must not tear the microphone down. The page keeps
+    // `captureStarted` true for the whole session and nothing resets it on a
+    // question change, so a stopped source here would silently make every later
+    // spoken answer impossible.
+    expect(capture.isActive()).toBe(true);
+    expect(source.stopped).toBe(false);
+    expect(captureRef.current).toBe(capture);
+    expect(
+      canStartMicrophoneCapture({
+        captureStarted: true,
+        consentAcknowledged: true,
+        textAnswerMode: false,
+      }),
+    ).toBe(false);
+
+    // Next question: acceptance releases the turn and the same live capture opens
+    // a second one with no new gesture and no new getUserMedia prompt.
+    expect(driver.release("turn-first")).toBe(true);
+    source.push(new Float32Array(480).fill(-0.25));
+
+    expect(calls.at(-1)).toEqual({
+      byteLength: 960,
+      kind: "chunk",
+      sequence: 0,
+      turnId: "turn-second",
+    });
+  });
 });
+
+class FakeLiveCaptureSource implements VivaAudioCaptureSource {
+  readonly sampleRateHz: number;
+  stopped = false;
+  #onSamples:
+    | ((samples: Float32Array, sampleRateHz: number, frame?: VivaAudioCaptureSampleFrame) => void)
+    | null = null;
+  #onEnded: ((reason: VivaAudioCaptureEndReason) => void) | null = null;
+
+  constructor(sampleRateHz: number) {
+    this.sampleRateHz = sampleRateHz;
+  }
+
+  start(
+    onSamples: (
+      samples: Float32Array,
+      sampleRateHz: number,
+      frame?: VivaAudioCaptureSampleFrame,
+    ) => void,
+    options?: VivaAudioCaptureStartOptions,
+  ) {
+    this.#onSamples = onSamples;
+    this.#onEnded = options?.onEnded ?? null;
+  }
+
+  stop() {
+    this.stopped = true;
+    this.#onSamples = null;
+    this.#onEnded?.("stopped");
+  }
+
+  push(samples: Float32Array) {
+    this.#onSamples?.(samples, this.sampleRateHz, {
+      rms: 0,
+      sampleRateHz: this.sampleRateHz,
+      samples,
+    });
+  }
+}

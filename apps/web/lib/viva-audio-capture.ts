@@ -63,6 +63,16 @@ export type VivaPcm16StreamingCaptureOptions = {
 };
 
 export type VivaPcm16StreamingCaptureController = {
+  /**
+   * Emit the buffered tail as one final chunk and keep capturing.
+   *
+   * A turn boundary is not a capture-lifecycle boundary: the microphone stays
+   * open across the whole session while each answer is delimited by the turn
+   * controller. `stop`/`end`/`cancel` all release the source — in the browser
+   * that stops every `MediaStream` track and closes the `AudioContext`, which
+   * cannot be undone without a fresh user gesture and permission prompt.
+   */
+  flush: () => void;
   stop: () => void;
   cancel: () => void;
   end: () => void;
@@ -335,6 +345,10 @@ export function startVivaPcm16StreamingCapture(
     sampleRateHz: targetSampleRateHz,
   });
   let active = true;
+  // A flushed tail frame reaches consumer code that may call `stop()`/`end()`
+  // again from inside the callback; that nested request is already being served
+  // by the finish in progress, so it must not restart the flush.
+  let finishing = false;
   let pendingPcm16 = new Uint8Array(0);
   let sequence = 0;
   // Exactly one resampler for this capture lifecycle. It is created on the first
@@ -356,15 +370,23 @@ export function startVivaPcm16StreamingCapture(
     resamplerSourceRateHz = 0;
   }
 
+  // `onFrame` is consumer code that can synchronously re-enter this capture — the
+  // 45-second turn cap stops capture from inside the callback, and stopping
+  // flushes the tail straight back through `onFrame`. Every mutation below is
+  // therefore published BEFORE the callback runs: the sequence counter advances
+  // first, and the pending buffer always holds exactly the bytes that have not
+  // been emitted yet. A re-entrant flush can then only see unsent bytes, and can
+  // never replay a frame or reuse a sequence number.
   function emitFrame(bytes: Uint8Array) {
     const pcm16Bytes = bytes.slice();
+    const frameSequence = sequence;
+    sequence += 1;
     options.onFrame({
-      byteLength: bytes.byteLength,
+      byteLength: pcm16Bytes.byteLength,
       pcm16Base64: pcm16LeBytesToBase64(pcm16Bytes),
       pcm16Bytes,
-      sequence,
+      sequence: frameSequence,
     });
-    sequence += 1;
   }
 
   function pushPcm16(bytes: Uint8Array) {
@@ -372,20 +394,20 @@ export function startVivaPcm16StreamingCapture(
     const merged = new Uint8Array(pendingPcm16.byteLength + bytes.byteLength);
     merged.set(pendingPcm16);
     merged.set(bytes, pendingPcm16.byteLength);
+    pendingPcm16 = merged;
 
-    let offset = 0;
-    while (merged.byteLength - offset >= frameByteLength) {
-      emitFrame(merged.slice(offset, offset + frameByteLength));
-      offset += frameByteLength;
+    while (active && pendingPcm16.byteLength >= frameByteLength) {
+      const frame = pendingPcm16.subarray(0, frameByteLength);
+      pendingPcm16 = pendingPcm16.slice(frameByteLength);
+      emitFrame(frame);
     }
-    pendingPcm16 = merged.slice(offset);
   }
 
   function flushPendingFrame() {
-    if (active && pendingPcm16.byteLength > 0) {
-      emitFrame(pendingPcm16);
-      pendingPcm16 = new Uint8Array(0);
-    }
+    if (!active || pendingPcm16.byteLength === 0) return;
+    const tail = pendingPcm16;
+    pendingPcm16 = new Uint8Array(0);
+    emitFrame(tail);
   }
 
   function stopSource() {
@@ -434,7 +456,8 @@ export function startVivaPcm16StreamingCapture(
   }
 
   function finish(flush: boolean) {
-    if (!active) return;
+    if (!active || finishing) return;
+    finishing = true;
     if (flush) flushPendingFrame();
     active = false;
     pendingPcm16 = new Uint8Array(0);
@@ -445,6 +468,7 @@ export function startVivaPcm16StreamingCapture(
   return {
     cancel: () => finish(false),
     end: () => finish(true),
+    flush: () => flushPendingFrame(),
     isActive: () => active,
     stop: () => finish(true),
   };

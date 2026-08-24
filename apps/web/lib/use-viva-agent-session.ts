@@ -63,6 +63,15 @@ function disconnectedAudioSendResult(retainedFromSequence: number): VivaAudioSen
  * base). Each method delegates and returns the controller's discriminated
  * `VivaAudioSendResult` unchanged; with no mounted controller the caller gets a
  * retryable `socket_closed` rather than a silently dropped chunk.
+ *
+ * Fail-closed rejections are the one case a result cannot carry: the locked
+ * `VivaAudioSendResult` union has no variant for `audio_turn_limit` or
+ * `audio_queue_limit`, so the controller raises `VivaAudioSendRejectedError` for
+ * those and this surface deliberately lets it propagate rather than inventing a
+ * status. Callers that can hit them — a second concurrent `turnId`, an oversized
+ * chunk, a sequence gap, or a turn over 2,160,000 raw bytes — must catch it
+ * (`isVivaAudioSendRejectedError`), exactly as `createLiveAudioTurnDriver` does
+ * through its `onSendRejected` hook.
  */
 export function createVivaAgentAudioCommands(
   getController: () => VivaAgentSessionController | null,

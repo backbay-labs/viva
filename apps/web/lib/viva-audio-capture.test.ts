@@ -450,9 +450,114 @@ describe("streaming Float32 resampler", () => {
   });
 });
 
+describe("streaming capture turn lifecycle", () => {
+  // 20 ms of mono PCM16 at 24 kHz — the production capture chunk.
+  const FRAME_BYTES = 960;
+
+  /** Distinct per-sample values, so a replayed byte range cannot hide in a fill. */
+  function rampSamples(count: number, startIndex = 0): Float32Array {
+    const samples = new Float32Array(count);
+    for (let index = 0; index < count; index += 1) {
+      samples[index] = (((startIndex + index) % 2_000) + 1) / 4_000;
+    }
+    return samples;
+  }
+
+  test("flushes a turn tail without ending the microphone lifecycle", () => {
+    // `end()` terminates the whole capture generation: it stops the source — which
+    // in the browser stops every MediaStream track and closes the AudioContext —
+    // and, because `active` is already false by then, never reports `onEnded`. A
+    // page that submitted an answer with it would keep a "capture started" flag
+    // pointing at a dead controller and could never reopen the microphone, so a
+    // turn boundary must flush instead of ending.
+    const terminated = new FakeAudioCaptureSource(VIVA_AUDIO_SAMPLE_RATE_HZ);
+    const terminatedEndReasons: VivaAudioCaptureEndReason[] = [];
+    const terminatedCapture = startVivaPcm16StreamingCapture({
+      onEnded: (reason) => terminatedEndReasons.push(reason),
+      onFrame: () => {},
+      source: terminated,
+    });
+
+    terminatedCapture.end();
+
+    expect(terminated.stopped).toBe(true);
+    expect(terminatedCapture.isActive()).toBe(false);
+    expect(terminatedEndReasons).toEqual([]);
+
+    const source = new FakeAudioCaptureSource(VIVA_AUDIO_SAMPLE_RATE_HZ);
+    const frames: { sequence: number; byteLength: number }[] = [];
+    const capture = startVivaPcm16StreamingCapture({
+      onFrame: (frame) => frames.push({ byteLength: frame.byteLength, sequence: frame.sequence }),
+      source,
+    });
+
+    source.push(rampSamples(700));
+
+    expect(frames).toEqual([{ byteLength: FRAME_BYTES, sequence: 0 }]);
+
+    capture.flush();
+
+    // The buffered 220-sample tail becomes the turn's last chunk...
+    expect(frames).toEqual([
+      { byteLength: FRAME_BYTES, sequence: 0 },
+      { byteLength: 440, sequence: 1 },
+    ]);
+    // ...and the microphone stays open for the next question.
+    expect(capture.isActive()).toBe(true);
+    expect(source.stopped).toBe(false);
+
+    // A second flush with nothing buffered emits nothing, and capture continues.
+    capture.flush();
+    source.push(rampSamples(480, 700));
+
+    expect(frames).toEqual([
+      { byteLength: FRAME_BYTES, sequence: 0 },
+      { byteLength: 440, sequence: 1 },
+      { byteLength: FRAME_BYTES, sequence: 2 },
+    ]);
+    expect(capture.isActive()).toBe(true);
+  });
+
+  test("a consumer that stops capture from inside onFrame never replays buffered bytes", () => {
+    const source = new FakeAudioCaptureSource(VIVA_AUDIO_SAMPLE_RATE_HZ);
+    const emitted: { sequence: number; bytes: number[] }[] = [];
+    const capture = startVivaPcm16StreamingCapture({
+      onFrame: (frame) => {
+        emitted.push({ bytes: Array.from(frame.pcm16Bytes), sequence: frame.sequence });
+        // The 45-second turn cap does exactly this: the consumer stops capture
+        // from inside the frame callback, so the tail flush re-enters `onFrame`
+        // while the emitting callback is still on the stack — and the re-entrant
+        // callback asks to stop again.
+        if (frame.sequence >= 1) capture.stop();
+      },
+      source,
+    });
+
+    const first = rampSamples(700);
+    const second = rampSamples(700, 700);
+    source.push(first);
+    source.push(second);
+
+    const expectedBytes = Array.from(
+      float32ToPcm16LeBytes(Float32Array.from([...first, ...second])),
+    );
+    // Every captured byte is emitted exactly once, in order, under contiguous
+    // sequence numbers: nothing is replayed and nothing is stranded in a buffer
+    // that the stop already abandoned.
+    expect(emitted.map((frame) => frame.sequence)).toEqual([0, 1, 2]);
+    expect(emitted.flatMap((frame) => frame.bytes)).toEqual(expectedBytes);
+    expect(capture.isActive()).toBe(false);
+    expect(source.stopped).toBe(true);
+    // The nested stop request is already being served, so the source (real
+    // MediaStream tracks and AudioContext) is torn down exactly once.
+    expect(source.stopCount).toBe(1);
+  });
+});
+
 class FakeAudioCaptureSource implements VivaAudioCaptureSource {
   readonly sampleRateHz: number;
   stopped = false;
+  stopCount = 0;
   #onSamples:
     | ((samples: Float32Array, sampleRateHz: number, frame?: VivaAudioCaptureSampleFrame) => void)
     | null = null;
@@ -476,6 +581,7 @@ class FakeAudioCaptureSource implements VivaAudioCaptureSource {
 
   stop() {
     this.stopped = true;
+    this.stopCount += 1;
     this.#onSamples = null;
     this.#onEnded?.("stopped");
   }
