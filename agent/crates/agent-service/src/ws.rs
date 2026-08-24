@@ -5863,252 +5863,262 @@ mod tests {
         ));
     }
 
-    const TEST_GENERATION: &str = "generation-7";
-    const TEST_TURN: &str = "turn-01";
+    /// Connection-local assembler unit tests. The module name keeps every
+    /// plan-named test reachable through the `audio_assembler` filter without
+    /// renaming the test functions themselves.
+    mod audio_assembler {
+        use super::*;
 
-    fn pcm_chunk(bytes: usize) -> AudioFrame {
-        AudioFrame::from_pcm16_bytes(vec![0xAB_u8; bytes])
-    }
+        const TEST_GENERATION: &str = "generation-7";
+        const TEST_TURN: &str = "turn-01";
 
-    fn push_chunk(
-        assembly: &mut Option<IncomingAudioTurn>,
-        sequence: u32,
-        bytes: usize,
-    ) -> Result<AudioAssemblyAction, ClientFrameError> {
-        accept_audio_chunk(
-            assembly,
-            TEST_GENERATION.to_owned(),
-            TEST_TURN.to_owned(),
-            sequence,
-            pcm_chunk(bytes),
-        )
-    }
-
-    fn assert_sanitized_audio_error(error: ClientFrameError, frame: &AudioFrame) {
-        let encoded = frame.pcm16_base64();
-        if !encoded.is_empty() {
-            assert!(!error.message.contains(&encoded));
-            assert!(!error.close_reason.contains(&encoded));
-            assert!(!error.terminal_reason.contains(&encoded));
-        }
-        assert!(!error.message.contains("pcm16"));
-        assert!(!error.close_reason.contains("pcm16"));
-    }
-
-    #[test]
-    fn audio_assembler_requires_zero_based_contiguous_sequences() {
-        let mut assembly = None;
-        for sequence in 0..3 {
-            let action =
-                push_chunk(&mut assembly, sequence, 960).expect("contiguous chunk accepted");
-            assert!(matches!(action, AudioAssemblyAction::Pending));
+        fn pcm_chunk(bytes: usize) -> AudioFrame {
+            AudioFrame::from_pcm16_bytes(vec![0xAB_u8; bytes])
         }
 
-        let turn = assembly.as_ref().expect("assembly is retained until end");
-        assert_eq!(turn.client_generation_id, TEST_GENERATION);
-        assert_eq!(turn.turn_id, TEST_TURN);
-        assert_eq!(turn.next_sequence, 3);
-        assert_eq!(turn.pcm16.len(), 2_880);
-
-        let mut nonzero_start = None;
-        let error =
-            push_chunk(&mut nonzero_start, 1, 960).expect_err("a turn cannot start after zero");
-        assert_eq!(error, ClientFrameError::invalid_audio_frame());
-        assert!(nonzero_start.is_none());
-    }
-
-    #[test]
-    fn audio_assembler_rejects_duplicate_gap_and_out_of_order_sequences() {
-        for replayed in [0_u32, 2] {
-            let mut assembly = None;
-            push_chunk(&mut assembly, 0, 960).expect("first chunk accepted");
-            let error = push_chunk(&mut assembly, replayed, 960)
-                .expect_err("duplicate and gapped sequences fail closed");
-            assert_eq!(error, ClientFrameError::invalid_audio_frame());
-            assert!(assembly.is_none(), "a rejected frame clears the assembly");
-        }
-
-        let mut assembly = None;
-        push_chunk(&mut assembly, 0, 960).expect("first chunk accepted");
-        push_chunk(&mut assembly, 1, 960).expect("second chunk accepted");
-        let error = push_chunk(&mut assembly, 1, 960)
-            .expect_err("a sequence cannot be reused out of order");
-        assert_eq!(error, ClientFrameError::invalid_audio_frame());
-        assert!(assembly.is_none());
-    }
-
-    #[test]
-    fn audio_assembler_rejects_mismatched_generation_or_turn() {
-        for (generation, turn_id) in [(TEST_GENERATION, "turn-02"), ("generation-8", TEST_TURN)] {
-            let mut assembly = None;
-            push_chunk(&mut assembly, 0, 960).expect("first chunk accepted");
-            let error = accept_audio_chunk(
-                &mut assembly,
-                generation.to_owned(),
-                turn_id.to_owned(),
-                1,
-                pcm_chunk(960),
-            )
-            .expect_err("a second identity cannot join an active turn");
-            assert_eq!(error, ClientFrameError::invalid_audio_frame());
-            assert!(assembly.is_none());
-        }
-
-        for (generation, turn_id) in [("", TEST_TURN), (TEST_GENERATION, "   ")] {
-            let mut assembly = None;
-            let error = accept_audio_chunk(
-                &mut assembly,
-                generation.to_owned(),
-                turn_id.to_owned(),
-                0,
-                pcm_chunk(960),
-            )
-            .expect_err("empty identity fails closed");
-            assert_eq!(error, ClientFrameError::invalid_audio_frame());
-            assert!(assembly.is_none());
-        }
-    }
-
-    #[test]
-    fn audio_assembler_rejects_empty_odd_or_oversized_chunks() {
-        for (bytes, expected) in [
-            (0_usize, ClientFrameError::invalid_audio_frame()),
-            (1, ClientFrameError::invalid_audio_frame()),
-            (
-                VIVA_AUDIO_MAX_CHUNK_BYTES + 1,
-                ClientFrameError::oversized_audio_chunk(),
-            ),
-        ] {
-            let mut assembly = None;
-            let frame = pcm_chunk(bytes);
-            let error = accept_audio_chunk(
-                &mut assembly,
+        fn push_chunk(
+            assembly: &mut Option<IncomingAudioTurn>,
+            sequence: u32,
+            bytes: usize,
+        ) -> Result<AudioAssemblyAction, ClientFrameError> {
+            accept_audio_chunk(
+                assembly,
                 TEST_GENERATION.to_owned(),
                 TEST_TURN.to_owned(),
-                0,
-                frame.clone(),
+                sequence,
+                pcm_chunk(bytes),
             )
-            .expect_err("invalid chunk sizes fail closed");
-            assert_eq!(error, expected);
-            assert!(assembly.is_none());
-            assert_sanitized_audio_error(error, &frame);
         }
 
-        let mut assembly = None;
-        push_chunk(&mut assembly, 0, VIVA_AUDIO_MAX_CHUNK_BYTES)
-            .expect("the exact chunk ceiling is accepted");
-        assert_eq!(
-            assembly.expect("assembly retained").pcm16.len(),
-            VIVA_AUDIO_MAX_CHUNK_BYTES
-        );
-    }
-
-    #[test]
-    fn audio_assembler_accepts_exact_45_second_limit_and_rejects_one_more_sample() {
-        let full_chunks = VIVA_AUDIO_MAX_TURN_BYTES / VIVA_AUDIO_MAX_CHUNK_BYTES;
-        let tail = VIVA_AUDIO_MAX_TURN_BYTES - full_chunks * VIVA_AUDIO_MAX_CHUNK_BYTES;
-
-        let fill_to_limit = || {
-            let mut assembly = None;
-            let mut sequence = 0_u32;
-            for _ in 0..full_chunks {
-                push_chunk(&mut assembly, sequence, VIVA_AUDIO_MAX_CHUNK_BYTES)
-                    .expect("chunk under the turn cap is accepted");
-                sequence += 1;
+        fn assert_sanitized_audio_error(error: ClientFrameError, frame: &AudioFrame) {
+            let encoded = frame.pcm16_base64();
+            if !encoded.is_empty() {
+                assert!(!error.message.contains(&encoded));
+                assert!(!error.close_reason.contains(&encoded));
+                assert!(!error.terminal_reason.contains(&encoded));
             }
-            push_chunk(&mut assembly, sequence, tail).expect("the exact turn ceiling is accepted");
+            assert!(!error.message.contains("pcm16"));
+            assert!(!error.close_reason.contains("pcm16"));
+        }
+
+        #[test]
+        fn audio_assembler_requires_zero_based_contiguous_sequences() {
+            let mut assembly = None;
+            for sequence in 0..3 {
+                let action =
+                    push_chunk(&mut assembly, sequence, 960).expect("contiguous chunk accepted");
+                assert!(matches!(action, AudioAssemblyAction::Pending));
+            }
+
+            let turn = assembly.as_ref().expect("assembly is retained until end");
+            assert_eq!(turn.client_generation_id, TEST_GENERATION);
+            assert_eq!(turn.turn_id, TEST_TURN);
+            assert_eq!(turn.next_sequence, 3);
+            assert_eq!(turn.pcm16.len(), 2_880);
+
+            let mut nonzero_start = None;
+            let error =
+                push_chunk(&mut nonzero_start, 1, 960).expect_err("a turn cannot start after zero");
+            assert_eq!(error, ClientFrameError::invalid_audio_frame());
+            assert!(nonzero_start.is_none());
+        }
+
+        #[test]
+        fn audio_assembler_rejects_duplicate_gap_and_out_of_order_sequences() {
+            for replayed in [0_u32, 2] {
+                let mut assembly = None;
+                push_chunk(&mut assembly, 0, 960).expect("first chunk accepted");
+                let error = push_chunk(&mut assembly, replayed, 960)
+                    .expect_err("duplicate and gapped sequences fail closed");
+                assert_eq!(error, ClientFrameError::invalid_audio_frame());
+                assert!(assembly.is_none(), "a rejected frame clears the assembly");
+            }
+
+            let mut assembly = None;
+            push_chunk(&mut assembly, 0, 960).expect("first chunk accepted");
+            push_chunk(&mut assembly, 1, 960).expect("second chunk accepted");
+            let error = push_chunk(&mut assembly, 1, 960)
+                .expect_err("a sequence cannot be reused out of order");
+            assert_eq!(error, ClientFrameError::invalid_audio_frame());
+            assert!(assembly.is_none());
+        }
+
+        #[test]
+        fn audio_assembler_rejects_mismatched_generation_or_turn() {
+            for (generation, turn_id) in [(TEST_GENERATION, "turn-02"), ("generation-8", TEST_TURN)]
+            {
+                let mut assembly = None;
+                push_chunk(&mut assembly, 0, 960).expect("first chunk accepted");
+                let error = accept_audio_chunk(
+                    &mut assembly,
+                    generation.to_owned(),
+                    turn_id.to_owned(),
+                    1,
+                    pcm_chunk(960),
+                )
+                .expect_err("a second identity cannot join an active turn");
+                assert_eq!(error, ClientFrameError::invalid_audio_frame());
+                assert!(assembly.is_none());
+            }
+
+            for (generation, turn_id) in [("", TEST_TURN), (TEST_GENERATION, "   ")] {
+                let mut assembly = None;
+                let error = accept_audio_chunk(
+                    &mut assembly,
+                    generation.to_owned(),
+                    turn_id.to_owned(),
+                    0,
+                    pcm_chunk(960),
+                )
+                .expect_err("empty identity fails closed");
+                assert_eq!(error, ClientFrameError::invalid_audio_frame());
+                assert!(assembly.is_none());
+            }
+        }
+
+        #[test]
+        fn audio_assembler_rejects_empty_odd_or_oversized_chunks() {
+            for (bytes, expected) in [
+                (0_usize, ClientFrameError::invalid_audio_frame()),
+                (1, ClientFrameError::invalid_audio_frame()),
+                (
+                    VIVA_AUDIO_MAX_CHUNK_BYTES + 1,
+                    ClientFrameError::oversized_audio_chunk(),
+                ),
+            ] {
+                let mut assembly = None;
+                let frame = pcm_chunk(bytes);
+                let error = accept_audio_chunk(
+                    &mut assembly,
+                    TEST_GENERATION.to_owned(),
+                    TEST_TURN.to_owned(),
+                    0,
+                    frame.clone(),
+                )
+                .expect_err("invalid chunk sizes fail closed");
+                assert_eq!(error, expected);
+                assert!(assembly.is_none());
+                assert_sanitized_audio_error(error, &frame);
+            }
+
+            let mut assembly = None;
+            push_chunk(&mut assembly, 0, VIVA_AUDIO_MAX_CHUNK_BYTES)
+                .expect("the exact chunk ceiling is accepted");
             assert_eq!(
-                assembly.as_ref().expect("assembly retained").pcm16.len(),
-                VIVA_AUDIO_MAX_TURN_BYTES
-            );
-            (assembly, sequence)
-        };
-
-        let (mut accepted, final_sequence) = fill_to_limit();
-        let action = accept_audio_end(&mut accepted, TEST_GENERATION, TEST_TURN, final_sequence)
-            .expect("the exact 45-second turn completes");
-        let AudioAssemblyAction::Complete { frame, .. } = action else {
-            panic!("expected one complete assembled turn");
-        };
-        assert_eq!(frame.pcm16_bytes().len(), VIVA_AUDIO_MAX_TURN_BYTES);
-
-        let (mut overflowing, final_sequence) = fill_to_limit();
-        let error = push_chunk(&mut overflowing, final_sequence + 1, 2)
-            .expect_err("one more sample fails closed");
-        assert_eq!(error, ClientFrameError::oversized_audio_turn());
-        assert!(overflowing.is_none());
-    }
-
-    #[test]
-    fn audio_assembler_end_requires_last_sequence_and_emits_one_complete_frame() {
-        let mut mismatched = None;
-        for sequence in 0..3 {
-            push_chunk(&mut mismatched, sequence, 960).expect("chunk accepted");
-        }
-        let error = accept_audio_end(&mut mismatched, TEST_GENERATION, TEST_TURN, 3)
-            .expect_err("audio_end must name the last accepted sequence");
-        assert_eq!(error, ClientFrameError::invalid_audio_frame());
-        assert!(mismatched.is_none());
-
-        let mut assembly = None;
-        for sequence in 0..3 {
-            let action = push_chunk(&mut assembly, sequence, 960).expect("chunk accepted");
-            assert!(
-                matches!(action, AudioAssemblyAction::Pending),
-                "no provider turn before explicit end"
+                assembly.expect("assembly retained").pcm16.len(),
+                VIVA_AUDIO_MAX_CHUNK_BYTES
             );
         }
-        let action = accept_audio_end(&mut assembly, TEST_GENERATION, TEST_TURN, 2)
-            .expect("the completed turn is admitted once");
-        let AudioAssemblyAction::Complete {
-            client_generation_id,
-            turn_id,
-            final_sequence,
-            frame,
-        } = action
-        else {
-            panic!("expected one complete assembled turn");
-        };
-        assert_eq!(client_generation_id, TEST_GENERATION);
-        assert_eq!(turn_id, TEST_TURN);
-        assert_eq!(final_sequence, 2);
-        assert_eq!(frame.pcm16_bytes().len(), 2_880);
-        assert!(assembly.is_none(), "the completed turn is moved out once");
 
-        let mut empty = None;
-        let error = accept_audio_end(&mut empty, TEST_GENERATION, TEST_TURN, 0)
-            .expect_err("audio_end without an assembled turn fails closed");
-        assert_eq!(error, ClientFrameError::invalid_audio_frame());
-    }
+        #[test]
+        fn audio_assembler_accepts_exact_45_second_limit_and_rejects_one_more_sample() {
+            let full_chunks = VIVA_AUDIO_MAX_TURN_BYTES / VIVA_AUDIO_MAX_CHUNK_BYTES;
+            let tail = VIVA_AUDIO_MAX_TURN_BYTES - full_chunks * VIVA_AUDIO_MAX_CHUNK_BYTES;
 
-    #[test]
-    fn audio_assembler_matching_cancel_discards_without_emitting_brain_input() {
-        let mut assembly = None;
-        for sequence in 0..3 {
-            push_chunk(&mut assembly, sequence, 960).expect("chunk accepted");
+            let fill_to_limit = || {
+                let mut assembly = None;
+                let mut sequence = 0_u32;
+                for _ in 0..full_chunks {
+                    push_chunk(&mut assembly, sequence, VIVA_AUDIO_MAX_CHUNK_BYTES)
+                        .expect("chunk under the turn cap is accepted");
+                    sequence += 1;
+                }
+                push_chunk(&mut assembly, sequence, tail)
+                    .expect("the exact turn ceiling is accepted");
+                assert_eq!(
+                    assembly.as_ref().expect("assembly retained").pcm16.len(),
+                    VIVA_AUDIO_MAX_TURN_BYTES
+                );
+                (assembly, sequence)
+            };
+
+            let (mut accepted, final_sequence) = fill_to_limit();
+            let action =
+                accept_audio_end(&mut accepted, TEST_GENERATION, TEST_TURN, final_sequence)
+                    .expect("the exact 45-second turn completes");
+            let AudioAssemblyAction::Complete { frame, .. } = action else {
+                panic!("expected one complete assembled turn");
+            };
+            assert_eq!(frame.pcm16_bytes().len(), VIVA_AUDIO_MAX_TURN_BYTES);
+
+            let (mut overflowing, final_sequence) = fill_to_limit();
+            let error = push_chunk(&mut overflowing, final_sequence + 1, 2)
+                .expect_err("one more sample fails closed");
+            assert_eq!(error, ClientFrameError::oversized_audio_turn());
+            assert!(overflowing.is_none());
         }
-        let action = accept_audio_cancel(&mut assembly, TEST_GENERATION, TEST_TURN)
-            .expect("a matching cancel discards the assembly");
-        assert!(matches!(action, AudioAssemblyAction::Cancelled));
-        assert!(assembly.is_none(), "no phantom provider turn is created");
 
-        let mut other = None;
-        accept_audio_chunk(
-            &mut other,
-            TEST_GENERATION.to_owned(),
-            "turn-02".to_owned(),
-            0,
-            pcm_chunk(960),
-        )
-        .expect("chunk accepted");
-        let error = accept_audio_cancel(&mut other, TEST_GENERATION, TEST_TURN)
-            .expect_err("a mismatched cancel is a protocol error");
-        assert_eq!(error, ClientFrameError::invalid_audio_frame());
-        assert!(other.is_none());
+        #[test]
+        fn audio_end_requires_last_sequence_and_emits_one_complete_frame() {
+            let mut mismatched = None;
+            for sequence in 0..3 {
+                push_chunk(&mut mismatched, sequence, 960).expect("chunk accepted");
+            }
+            let error = accept_audio_end(&mut mismatched, TEST_GENERATION, TEST_TURN, 3)
+                .expect_err("audio_end must name the last accepted sequence");
+            assert_eq!(error, ClientFrameError::invalid_audio_frame());
+            assert!(mismatched.is_none());
 
-        let mut empty = None;
-        let error = accept_audio_cancel(&mut empty, TEST_GENERATION, TEST_TURN)
-            .expect_err("a scoped cancel without an assembly is a protocol error");
-        assert_eq!(error, ClientFrameError::invalid_audio_frame());
+            let mut assembly = None;
+            for sequence in 0..3 {
+                let action = push_chunk(&mut assembly, sequence, 960).expect("chunk accepted");
+                assert!(
+                    matches!(action, AudioAssemblyAction::Pending),
+                    "no provider turn before explicit end"
+                );
+            }
+            let action = accept_audio_end(&mut assembly, TEST_GENERATION, TEST_TURN, 2)
+                .expect("the completed turn is admitted once");
+            let AudioAssemblyAction::Complete {
+                client_generation_id,
+                turn_id,
+                final_sequence,
+                frame,
+            } = action
+            else {
+                panic!("expected one complete assembled turn");
+            };
+            assert_eq!(client_generation_id, TEST_GENERATION);
+            assert_eq!(turn_id, TEST_TURN);
+            assert_eq!(final_sequence, 2);
+            assert_eq!(frame.pcm16_bytes().len(), 2_880);
+            assert!(assembly.is_none(), "the completed turn is moved out once");
+
+            let mut empty = None;
+            let error = accept_audio_end(&mut empty, TEST_GENERATION, TEST_TURN, 0)
+                .expect_err("audio_end without an assembled turn fails closed");
+            assert_eq!(error, ClientFrameError::invalid_audio_frame());
+        }
+
+        #[test]
+        fn matching_cancel_discards_without_emitting_brain_input() {
+            let mut assembly = None;
+            for sequence in 0..3 {
+                push_chunk(&mut assembly, sequence, 960).expect("chunk accepted");
+            }
+            let action = accept_audio_cancel(&mut assembly, TEST_GENERATION, TEST_TURN)
+                .expect("a matching cancel discards the assembly");
+            assert!(matches!(action, AudioAssemblyAction::Cancelled));
+            assert!(assembly.is_none(), "no phantom provider turn is created");
+
+            let mut other = None;
+            accept_audio_chunk(
+                &mut other,
+                TEST_GENERATION.to_owned(),
+                "turn-02".to_owned(),
+                0,
+                pcm_chunk(960),
+            )
+            .expect("chunk accepted");
+            let error = accept_audio_cancel(&mut other, TEST_GENERATION, TEST_TURN)
+                .expect_err("a mismatched cancel is a protocol error");
+            assert_eq!(error, ClientFrameError::invalid_audio_frame());
+            assert!(other.is_none());
+
+            let mut empty = None;
+            let error = accept_audio_cancel(&mut empty, TEST_GENERATION, TEST_TURN)
+                .expect_err("a scoped cancel without an assembly is a protocol error");
+            assert_eq!(error, ClientFrameError::invalid_audio_frame());
+        }
     }
 }

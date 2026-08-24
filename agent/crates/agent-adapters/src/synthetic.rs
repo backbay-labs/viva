@@ -1195,17 +1195,40 @@ mod tests {
             .await
             .unwrap();
 
+        // Read past the first evaluation to the turn's terminal event, so a
+        // second evaluation would be counted rather than hidden by an early
+        // break.
         let mut transcripts = Vec::new();
         let mut evaluations = 0_u32;
-        for _ in 0..24 {
-            match timeout(Duration::from_secs(2), session.events.recv()).await {
+        let mut completed = false;
+        for _ in 0..64 {
+            match timeout(Duration::from_secs(5), session.events.recv()).await {
                 Ok(Some(BrainEvent::TranscriptFinal { text, .. })) => transcripts.push(text),
-                Ok(Some(BrainEvent::AnswerEvaluated { .. })) => {
-                    evaluations += 1;
+                Ok(Some(BrainEvent::AnswerEvaluated { .. })) => evaluations += 1,
+                Ok(Some(BrainEvent::ResponseCompleted { .. })) => {
+                    completed = true;
                     break;
                 }
                 Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
+                Ok(None) => break,
+                Err(_) => panic!("the assembled turn never reached its terminal event"),
+            }
+        }
+        assert!(completed, "the assembled turn completed exactly once");
+
+        // Close the input side and drain the remainder of the stream: any
+        // second provider turn for the same assembled frame surfaces here.
+        let RealtimeSession {
+            input,
+            mut events,
+            task_guard: _task_guard,
+        } = session;
+        drop(input);
+        while let Ok(Some(event)) = timeout(Duration::from_secs(5), events.recv()).await {
+            match event {
+                BrainEvent::TranscriptFinal { text, .. } => transcripts.push(text),
+                BrainEvent::AnswerEvaluated { .. } => evaluations += 1,
+                _ => {}
             }
         }
 

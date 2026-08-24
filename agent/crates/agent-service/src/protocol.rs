@@ -15,12 +15,21 @@ pub const VIVA_VOICE_MAX_BINARY_FRAME_BYTES: usize = 256 * 1024;
 /// Alias of the existing 24 kHz voice constant; one literal source.
 pub const VIVA_AUDIO_SAMPLE_RATE_HZ: u32 = VIVA_VOICE_SAMPLE_RATE_HZ;
 pub const VIVA_AUDIO_MAX_CHUNK_SAMPLES: usize = 4_096;
-/// 8,192 raw bytes: mono `pcm_s16le` is two bytes per sample.
-pub const VIVA_AUDIO_MAX_CHUNK_BYTES: usize = VIVA_AUDIO_MAX_CHUNK_SAMPLES * 2;
-/// 1,080,000 samples: the 45-second bound on one browser turn.
-pub const VIVA_AUDIO_MAX_TURN_SAMPLES: usize = 45 * VIVA_AUDIO_SAMPLE_RATE_HZ as usize;
-/// 2,160,000 raw bytes.
-pub const VIVA_AUDIO_MAX_TURN_BYTES: usize = VIVA_AUDIO_MAX_TURN_SAMPLES * 2;
+/// Mono `pcm_s16le` is two bytes per sample.
+pub const VIVA_AUDIO_MAX_CHUNK_BYTES: usize = 8_192;
+/// The 45-second bound on one browser turn.
+pub const VIVA_AUDIO_MAX_TURN_SAMPLES: usize = 1_080_000;
+pub const VIVA_AUDIO_MAX_TURN_BYTES: usize = 2_160_000;
+
+// The locked v5 audio constants are written as literals so both language
+// contracts read identically. This compile-time block keeps the literals
+// self-consistent in production builds, not only under `cargo test`.
+const _: () = {
+    assert!(VIVA_AUDIO_MAX_CHUNK_BYTES == VIVA_AUDIO_MAX_CHUNK_SAMPLES * 2);
+    assert!(VIVA_AUDIO_MAX_TURN_SAMPLES == 45 * VIVA_AUDIO_SAMPLE_RATE_HZ as usize);
+    assert!(VIVA_AUDIO_MAX_TURN_BYTES == VIVA_AUDIO_MAX_TURN_SAMPLES * 2);
+    assert!(VIVA_AUDIO_MAX_CHUNK_BYTES < VIVA_VOICE_MAX_TEXT_FRAME_BYTES);
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -585,6 +594,16 @@ mod tests {
         assert_eq!(VIVA_AUDIO_MAX_TURN_SAMPLES, 1_080_000);
         assert_eq!(VIVA_AUDIO_MAX_TURN_BYTES, 2_160_000);
         assert_eq!(VIVA_VOICE_MAX_TEXT_FRAME_BYTES, 64 * 1024);
+
+        // The locked literals above are the contract; these restate the
+        // derivation they encode so a future edit cannot drift one from
+        // the other.
+        assert_eq!(VIVA_AUDIO_MAX_CHUNK_BYTES, VIVA_AUDIO_MAX_CHUNK_SAMPLES * 2);
+        assert_eq!(
+            VIVA_AUDIO_MAX_TURN_SAMPLES,
+            45 * VIVA_AUDIO_SAMPLE_RATE_HZ as usize
+        );
+        assert_eq!(VIVA_AUDIO_MAX_TURN_BYTES, VIVA_AUDIO_MAX_TURN_SAMPLES * 2);
     }
 
     #[test]
