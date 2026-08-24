@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(max-width: 500px)" srcset="docs/assets/hero-mobile.svg" />
-    <img src="docs/assets/hero.svg" alt="Viva: study by talking, not rereading" width="900" />
+    <img src="docs/assets/hero.svg" alt="Viva: study by talking" width="900" />
   </picture>
 </p>
 
