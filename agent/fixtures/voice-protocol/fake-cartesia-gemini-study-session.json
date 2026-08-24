@@ -3,6 +3,7 @@
     {
       "type": "session_config",
       "version": 5,
+      "client_generation_id": "1",
       "session": {
         "session_id": "voice-session-1",
         "user_id": "user-1",
@@ -83,7 +84,7 @@
       "version": 5,
       "event": {
         "type": "question_started",
-        "response_id": "response-1",
+        "response_id": "response-1-generation-1",
         "question": {
           "question_id": "q-oxidative-phosphorylation-nadh",
           "prompt": "Explain the role of NADH in oxidative phosphorylation.",
@@ -285,7 +286,7 @@
       "version": 5,
       "event": {
         "type": "cancellation",
-        "response_id": "response-2"
+        "response_id": "response-2-generation-1"
       }
     }
   ]

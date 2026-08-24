@@ -48,7 +48,7 @@
     {
       "kind": "question_emitted",
       "voice_session_id": "voice-session-1",
-      "detail": "response-1"
+      "detail": "response-1-generation-1"
     },
     {
       "kind": "provider_admission",
@@ -78,7 +78,7 @@
     {
       "kind": "cancel_received",
       "voice_session_id": "voice-session-1",
-      "detail": "response-2"
+      "detail": "response-2-generation-1"
     },
     {
       "kind": "stop_received",

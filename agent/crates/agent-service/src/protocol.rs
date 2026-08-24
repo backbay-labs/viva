@@ -814,7 +814,20 @@ mod tests {
         ))
         .expect("fixture is valid full fake provider session");
         let session_config = match fixture.client.first().expect("client frame exists") {
-            ClientFrame::SessionConfig { session, .. } => session.clone(),
+            ClientFrame::SessionConfig {
+                session,
+                client_generation_id,
+                ..
+            } => {
+                // The real WebSocket path moves the frame-level generation onto the
+                // domain config (`ws.rs`, authorized initial session config), so a
+                // session's question response ids carry it. This in-process harness
+                // must apply the same assignment or it silently diverges from the
+                // server it is asserting against.
+                let mut session = session.clone();
+                session.client_generation_id = client_generation_id.clone();
+                session
+            }
             other => panic!("expected session_config, got {other:?}"),
         };
         let (audio_frame, audio_generation_id) =
