@@ -6,6 +6,7 @@ import {
   orbStateForSession,
   RECAP_PLAYBACK_MAX_WAIT_MS,
   retryAttemptResolution,
+  sessionProviderStatusLabel,
   shouldNavigateToRecap,
   stageCopyForConnection,
 } from "@/agent/session-view-model";
@@ -50,6 +51,21 @@ describe("orbStateForSession", () => {
     expect(orbStateForSession({ phase: "ready", speaking: true, status: "open" })).toBe(
       "correcting",
     );
+  });
+});
+
+describe("sessionProviderStatusLabel", () => {
+  test("shows an interrupted connection before any generic busy copy", () => {
+    expect(
+      sessionProviderStatusLabel({
+        busy: true,
+        captureState: "idle",
+        connectionStatusLabel: "provider disconnected",
+        disconnected: true,
+        hasQuestion: true,
+        speaking: false,
+      }),
+    ).toBe("provider disconnected");
   });
 });
 

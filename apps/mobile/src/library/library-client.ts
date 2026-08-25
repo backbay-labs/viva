@@ -76,6 +76,13 @@ export function fetchMobileAgentReadiness(config: AppConfig, fetchImpl: typeof f
   });
 }
 
+export function selectMobileSessionStudySetId(
+  requestedStudySetId: string | undefined,
+  config: Pick<AppConfig, "studySetId">,
+): string {
+  return requestedStudySetId?.trim() || config.studySetId;
+}
+
 /**
  * Decide whether one exact library row can cross the mobile session boundary.
  *

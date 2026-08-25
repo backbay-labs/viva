@@ -21,6 +21,7 @@ import {
   type RetryAttemptState,
   retryAttemptResolution,
   type SessionCorrectionModel,
+  sessionProviderStatusLabel,
   shouldNavigateToRecap,
   stageCopyForConnection,
 } from "@/agent/session-view-model";
@@ -29,14 +30,17 @@ import { ActionButton } from "@/components/actions";
 import { OrnamentRule, SparkIcon } from "@/components/brand";
 import { VivaText } from "@/components/type";
 import { VoiceOrb, VoiceStateLabel, VoiceWaveform } from "@/components/voice-orb";
-import { loadLibrary, studySetForSession } from "@/library/library-client";
+import {
+  loadLibrary,
+  selectMobileSessionStudySetId,
+  studySetForSession,
+} from "@/library/library-client";
 import { loadAppConfig } from "@/runtime/config";
 import { colors, fonts, layout, radius, space } from "@/theme/tokens";
 
 // Protocol v4 is typed-only. Local PCM capture is a device/readiness seam and
 // must not become a transport capability until the protocol-v5 milestone.
 const voiceTurnsEnabled = false as const;
-const DEFAULT_FIXTURE_STUDY_SET_ID = "biology-midterm";
 
 type CaptureState = "blocked" | "idle" | "listening" | "requesting";
 type SessionLoadState =
@@ -75,7 +79,7 @@ export default function SessionScreen() {
             kind: "ready",
             studySet: studySetForSession(
               snapshot,
-              requestedStudySetId ?? DEFAULT_FIXTURE_STUDY_SET_ID,
+              selectMobileSessionStudySetId(requestedStudySetId, config),
               config,
               Platform.OS,
             ),
@@ -512,19 +516,14 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                 </View>
                 <View testID="session-provider-status">
                   <VoiceStateLabel>
-                    {captureState === "requesting"
-                      ? "Opening microphone…"
-                      : captureState === "listening"
-                        ? "Listening locally"
-                        : busy
-                          ? "Reading your answer…"
-                          : disconnected
-                            ? connectionCopy.statusLabel
-                            : agent.speaking
-                              ? "Examiner speaking"
-                              : agent.derived.question
-                                ? "Question ready"
-                                : connectionCopy.statusLabel}
+                    {sessionProviderStatusLabel({
+                      busy,
+                      captureState,
+                      connectionStatusLabel: connectionCopy.statusLabel,
+                      disconnected,
+                      hasQuestion: Boolean(agent.derived.question),
+                      speaking: agent.speaking,
+                    })}
                   </VoiceStateLabel>
                 </View>
               </View>

@@ -236,12 +236,17 @@ export function applyMobileAppStateChange(input: {
   playback: Pick<MobilePlaybackSession, "resetForGeneration">;
   status: VivaAgentSessionState["status"];
 }): "backgrounded" | "none" | "reconnected" {
-  if (input.nextState === "background" || input.nextState === "inactive") {
+  if (input.nextState === "background") {
     input.controller.close();
     void input.capture.cancel();
     input.playback.resetForGeneration();
     return "backgrounded";
   }
+  // iOS emits `inactive` for Control Center, permission prompts, and the
+  // transition into background. Closing here discards a live turn before the
+  // OS has actually backgrounded the app; the subsequent background event is
+  // the authoritative teardown boundary.
+  if (input.nextState === "inactive") return "none";
   if (
     input.nextState === "active" &&
     foregroundReconnectAction({ hasRecap: input.hasRecap, status: input.status }) === "reconnect"

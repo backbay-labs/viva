@@ -10,6 +10,7 @@ import {
   decideMobileLibraryStart,
   fetchMobileAgentReadiness,
   loadLibrary,
+  selectMobileSessionStudySetId,
   studySetForSession,
   weakestConcept,
 } from "./library-client";
@@ -157,6 +158,15 @@ class AuthFakeWebSocket {
 }
 
 describe("mobile library client", () => {
+  test("uses the configured study set for a parameterless session route", () => {
+    expect(selectMobileSessionStudySetId(undefined, { studySetId: "chem-final" })).toBe(
+      "chem-final",
+    );
+    expect(selectMobileSessionStudySetId(" biology-midterm ", { studySetId: "chem-final" })).toBe(
+      "biology-midterm",
+    );
+  });
+
   test("loads and projects the direct agent snapshot with explicit configuration", async () => {
     const calls: Array<{ init?: RequestInit; input: string }> = [];
     const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {

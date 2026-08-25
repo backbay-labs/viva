@@ -12,11 +12,73 @@ export type HomeLibraryModel = {
   weakConceptTitle: string;
 };
 
+export type HomeLibraryLoadState =
+  | { kind: "error" }
+  | { kind: "loading" }
+  | { kind: "ready"; model: HomeLibraryModel };
+
+export type HomeDisplayState = {
+  activeStudySetId: string | null;
+  displayModel: HomeLibraryModel;
+};
+
+export type HomeTodayCopy = {
+  dateLabel: string;
+  greeting: string;
+};
+
 const unavailableConcept = {
   weakConceptDetail: "Concept detail unavailable from library",
   weakConceptId: null,
   weakConceptTitle: "Concept detail unavailable",
 } as const;
+
+const loadingHomeModel = {
+  canStart: false,
+  contextLabel: "Checking study sets",
+  studySetId: null,
+  studySetTitle: "Opening your library",
+  weakConceptDetail: "Waiting for live library data",
+  weakConceptId: null,
+  weakConceptTitle: "Concept detail unavailable",
+} satisfies HomeLibraryModel;
+
+const errorHomeModel = {
+  canStart: false,
+  contextLabel: "Agent offline",
+  studySetId: null,
+  studySetTitle: "Library unavailable",
+  weakConceptDetail: "Live study data unavailable",
+  weakConceptId: null,
+  weakConceptTitle: "Concept detail unavailable",
+} satisfies HomeLibraryModel;
+
+export function homeDisplayState(state: HomeLibraryLoadState): HomeDisplayState {
+  if (state.kind === "loading") {
+    return { activeStudySetId: null, displayModel: loadingHomeModel };
+  }
+  if (state.kind === "error") {
+    return { activeStudySetId: null, displayModel: errorHomeModel };
+  }
+  return {
+    activeStudySetId: state.model.canStart ? state.model.studySetId : null,
+    displayModel: state.model,
+  };
+}
+
+export function homeTodayCopy(now: Date = new Date()): HomeTodayCopy {
+  const weekday = new Intl.DateTimeFormat("en-GB", { weekday: "long" }).format(now);
+  const dayAndMonth = new Intl.DateTimeFormat("en-GB", {
+    day: "numeric",
+    month: "long",
+  }).format(now);
+  const hour = now.getHours();
+  const period = hour < 12 ? "morning" : hour < 18 ? "afternoon" : "evening";
+  return {
+    dateLabel: `${weekday} · ${dayAndMonth}`,
+    greeting: `Good ${period}.`,
+  };
+}
 
 export function homeModelFromLibrary(
   projection: VivaLibraryProjection,

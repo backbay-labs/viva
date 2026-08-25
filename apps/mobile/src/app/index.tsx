@@ -8,36 +8,38 @@ import { ActionButton } from "@/components/actions";
 import { OrnamentRule, SparkIcon, Wordmark } from "@/components/brand";
 import { VivaText } from "@/components/type";
 import { OrbBackdrop, VoiceOrb } from "@/components/voice-orb";
-import { type HomeLibraryModel, homeModelFromLibrary } from "@/library/home-model";
+import {
+  type HomeLibraryLoadState,
+  homeDisplayState,
+  homeModelFromLibrary,
+  homeTodayCopy,
+} from "@/library/home-model";
 import { fetchMobileAgentReadiness, loadLibrary } from "@/library/library-client";
 import { loadAppConfig } from "@/runtime/config";
 import { colors, fonts, layout, radius, space } from "@/theme/tokens";
-
-const offlineFallback: HomeLibraryModel = {
-  canStart: true,
-  contextLabel: "exam Friday",
-  studySetId: null,
-  studySetTitle: "Biology Midterm",
-  weakConceptDetail: "Weak concept · unavailable offline",
-  weakConceptId: null,
-  weakConceptTitle: "Concept detail unavailable",
-};
 
 export default function HomeScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const config = useMemo(() => loadAppConfig(), []);
-  const [homeModel, setHomeModel] = useState<HomeLibraryModel | null>(null);
+  const [libraryState, setLibraryState] = useState<HomeLibraryLoadState>({ kind: "loading" });
+  const [now, setNow] = useState(() => new Date());
   const [readinessCaption, setReadinessCaption] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
+    setLibraryState({ kind: "loading" });
     void loadLibrary(config)
       .then(({ projection, snapshot }) => {
-        if (active) setHomeModel(homeModelFromLibrary(projection, snapshot, config, Platform.OS));
+        if (active) {
+          setLibraryState({
+            kind: "ready",
+            model: homeModelFromLibrary(projection, snapshot, config, Platform.OS),
+          });
+        }
       })
       .catch(() => {
-        if (active) setHomeModel(null);
+        if (active) setLibraryState({ kind: "error" });
       });
 
     void fetchMobileAgentReadiness(config).then((probe) => {
@@ -56,12 +58,13 @@ export default function HomeScreen() {
     };
   }, [config]);
 
-  const displayModel = homeModel ?? offlineFallback;
-  const activeStudySetId = homeModel
-    ? homeModel.canStart
-      ? homeModel.studySetId
-      : null
-    : config.studySetId;
+  useEffect(() => {
+    const timer = setInterval(() => setNow(new Date()), 60_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const { activeStudySetId, displayModel } = homeDisplayState(libraryState);
+  const todayCopy = useMemo(() => homeTodayCopy(now), [now]);
 
   const beginRecall = () => {
     if (!activeStudySetId) return;
@@ -116,10 +119,10 @@ export default function HomeScreen() {
 
         <View style={styles.heroCopy}>
           <VivaText tone="muted" variant="eyebrow">
-            Monday · 24 August
+            {todayCopy.dateLabel}
           </VivaText>
           <VivaText accessibilityRole="header" style={styles.greeting} variant="display">
-            Good evening,{"\n"}Ananya.
+            {todayCopy.greeting}
           </VivaText>
           <OrnamentRule />
           <VivaText style={styles.promise}>Close the notes. Begin recall.</VivaText>

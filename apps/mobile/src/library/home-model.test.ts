@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { projectLibrarySnapshot, type VivaLibrarySnapshot } from "@/agent/shared-web";
 import type { AppConfig } from "@/runtime/config";
-import { homeModelFromLibrary } from "./home-model";
+import { homeDisplayState, homeModelFromLibrary, homeTodayCopy } from "./home-model";
 
 const config: AppConfig = {
   agentHttpUrl: "http://127.0.0.1:4318",
@@ -50,6 +50,26 @@ const cannedLibrarySnapshot: VivaLibrarySnapshot = {
 };
 
 describe("homeModelFromLibrary", () => {
+  test("keeps loading and failed library states neutral and non-startable", () => {
+    expect(homeDisplayState({ kind: "loading" })).toMatchObject({
+      activeStudySetId: null,
+      displayModel: { canStart: false, studySetId: null, studySetTitle: "Opening your library" },
+    });
+    expect(homeDisplayState({ kind: "error" })).toMatchObject({
+      activeStudySetId: null,
+      displayModel: { canStart: false, studySetId: null, studySetTitle: "Library unavailable" },
+    });
+  });
+
+  test("formats the current local date and a neutral time-dependent greeting", () => {
+    expect(homeTodayCopy(new Date(2026, 7, 25, 8))).toEqual({
+      dateLabel: "Tuesday · 25 August",
+      greeting: "Good morning.",
+    });
+    expect(homeTodayCopy(new Date(2026, 7, 25, 14)).greeting).toBe("Good afternoon.");
+    expect(homeTodayCopy(new Date(2026, 7, 25, 20)).greeting).toBe("Good evening.");
+  });
+
   test("uses study-set metadata and the real persisted next-review signal", () => {
     const projection = projectLibrarySnapshot(cannedLibrarySnapshot, {
       now: new Date("2026-08-24T13:00:00.000Z"),

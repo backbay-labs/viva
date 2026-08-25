@@ -25,20 +25,36 @@ function httpFromWs(wsUrl: string): string {
   return url.toString().replace(/\/+$/, "");
 }
 
-export function loadAppConfig(
-  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
-): AppConfig {
-  const agentWsUrl = trimmed(env.EXPO_PUBLIC_VIVA_AGENT_WS_URL) ?? DEFAULT_WS_URL;
+export function runtimeExpoPublicEnv(): Record<string, string | undefined> {
+  // Expo replaces EXPO_PUBLIC_* values only for direct, statically analyzable
+  // property reads. Keep this object literal explicit; `process.env` passed as
+  // a whole object silently falls back in native and exported bundles.
+  return {
+    EXPO_PUBLIC_VIVA_AGENT_HTTP_URL: process.env.EXPO_PUBLIC_VIVA_AGENT_HTTP_URL,
+    EXPO_PUBLIC_VIVA_AGENT_WS_URL: process.env.EXPO_PUBLIC_VIVA_AGENT_WS_URL,
+    EXPO_PUBLIC_VIVA_REST_BEARER_TOKEN: process.env.EXPO_PUBLIC_VIVA_REST_BEARER_TOKEN,
+    EXPO_PUBLIC_VIVA_SESSION_TOKEN: process.env.EXPO_PUBLIC_VIVA_SESSION_TOKEN,
+    EXPO_PUBLIC_VIVA_STUDY_SET_ID: process.env.EXPO_PUBLIC_VIVA_STUDY_SET_ID,
+    EXPO_PUBLIC_VIVA_USER_ID: process.env.EXPO_PUBLIC_VIVA_USER_ID,
+    EXPO_PUBLIC_VIVA_WS_BEARER_TOKEN: process.env.EXPO_PUBLIC_VIVA_WS_BEARER_TOKEN,
+    EXPO_PUBLIC_VIVA_WS_ORIGIN: process.env.EXPO_PUBLIC_VIVA_WS_ORIGIN,
+  };
+}
+
+export function loadAppConfig(env?: Record<string, string | undefined>): AppConfig {
+  const resolvedEnv = env ?? runtimeExpoPublicEnv();
+  const agentWsUrl = trimmed(resolvedEnv.EXPO_PUBLIC_VIVA_AGENT_WS_URL) ?? DEFAULT_WS_URL;
   const agentHttpUrl =
-    trimmed(env.EXPO_PUBLIC_VIVA_AGENT_HTTP_URL)?.replace(/\/+$/, "") ?? httpFromWs(agentWsUrl);
+    trimmed(resolvedEnv.EXPO_PUBLIC_VIVA_AGENT_HTTP_URL)?.replace(/\/+$/, "") ??
+    httpFromWs(agentWsUrl);
   return {
     agentHttpUrl,
     agentWsUrl,
-    restBearerToken: trimmed(env.EXPO_PUBLIC_VIVA_REST_BEARER_TOKEN),
-    sessionToken: trimmed(env.EXPO_PUBLIC_VIVA_SESSION_TOKEN),
-    studySetId: trimmed(env.EXPO_PUBLIC_VIVA_STUDY_SET_ID) ?? "biology-midterm",
-    userId: trimmed(env.EXPO_PUBLIC_VIVA_USER_ID) ?? "user-1",
-    wsBearerToken: trimmed(env.EXPO_PUBLIC_VIVA_WS_BEARER_TOKEN),
-    wsOrigin: trimmed(env.EXPO_PUBLIC_VIVA_WS_ORIGIN),
+    restBearerToken: trimmed(resolvedEnv.EXPO_PUBLIC_VIVA_REST_BEARER_TOKEN),
+    sessionToken: trimmed(resolvedEnv.EXPO_PUBLIC_VIVA_SESSION_TOKEN),
+    studySetId: trimmed(resolvedEnv.EXPO_PUBLIC_VIVA_STUDY_SET_ID) ?? "biology-midterm",
+    userId: trimmed(resolvedEnv.EXPO_PUBLIC_VIVA_USER_ID) ?? "user-1",
+    wsBearerToken: trimmed(resolvedEnv.EXPO_PUBLIC_VIVA_WS_BEARER_TOKEN),
+    wsOrigin: trimmed(resolvedEnv.EXPO_PUBLIC_VIVA_WS_ORIGIN),
   };
 }

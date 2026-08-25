@@ -1,8 +1,26 @@
 import { describe, expect, test } from "bun:test";
-import { loadAppConfig } from "@/runtime/config";
+import { loadAppConfig, runtimeExpoPublicEnv } from "@/runtime/config";
 import { installRuntimeGlobals } from "@/runtime/globals";
 
 describe("loadAppConfig", () => {
+  test("reads Expo public runtime defaults through the static bundle seam", () => {
+    const previousWsUrl = process.env.EXPO_PUBLIC_VIVA_AGENT_WS_URL;
+    const previousUserId = process.env.EXPO_PUBLIC_VIVA_USER_ID;
+    try {
+      process.env.EXPO_PUBLIC_VIVA_AGENT_WS_URL = "wss://mobile.example/ws";
+      process.env.EXPO_PUBLIC_VIVA_USER_ID = "runtime-user";
+      const env = runtimeExpoPublicEnv();
+      expect(env.EXPO_PUBLIC_VIVA_AGENT_WS_URL).toBe("wss://mobile.example/ws");
+      expect(env.EXPO_PUBLIC_VIVA_USER_ID).toBe("runtime-user");
+      expect(loadAppConfig().agentHttpUrl).toBe("https://mobile.example");
+    } finally {
+      if (previousWsUrl === undefined) delete process.env.EXPO_PUBLIC_VIVA_AGENT_WS_URL;
+      else process.env.EXPO_PUBLIC_VIVA_AGENT_WS_URL = previousWsUrl;
+      if (previousUserId === undefined) delete process.env.EXPO_PUBLIC_VIVA_USER_ID;
+      else process.env.EXPO_PUBLIC_VIVA_USER_ID = previousUserId;
+    }
+  });
+
   test("defaults to loopback dev agent and fixture identity", () => {
     const config = loadAppConfig({});
     expect(config.agentWsUrl).toBe("ws://127.0.0.1:4318/ws");

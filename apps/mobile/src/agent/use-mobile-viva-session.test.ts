@@ -240,6 +240,20 @@ describe("foregroundReconnectAction", () => {
         capture,
         controller,
         hasRecap: false,
+        nextState: "inactive",
+        playback,
+        status: "open",
+      }),
+    ).toBe("none");
+    expect(captureCalls).toEqual({ cancel: 0, reset: 0 });
+    expect(playbackCalls.reset).toBe(0);
+    expect(FakeWebSocket.instances[0]?.readyState).toBe(1);
+
+    expect(
+      applyMobileAppStateChange({
+        capture,
+        controller,
+        hasRecap: false,
         nextState: "background",
         playback,
         status: "open",
