@@ -8,6 +8,9 @@
   ],
   "scripts": {
     "dev": "turbo run dev --filter=@viva/web",
+    "dev:mobile": "bun run --cwd apps/mobile start",
+    "dev:mobile:ios": "bun run --cwd apps/mobile ios",
+    "dev:mobile:android": "bun run --cwd apps/mobile android",
     "dev:agent": "node scripts/dev-agent.mjs",
     "dev:agent:signed": "VIVA_DEV_AGENT_SIGNED_SESSION=1 node scripts/dev-agent.mjs",
     "dev:web": "bun run --cwd apps/web dev",
