@@ -1064,7 +1064,7 @@ describe("Viva agent browser client", () => {
 
     expect(state.audio[0]).toEqual({
       responseId: "response-1",
-      frame: { pcm16_base64: "AQIDBA==" },
+      frame: fakeSessionFixture.server[11]?.event?.frame,
     });
     expect(state.finalTranscript).toBe("NADH donates electrons to the electron transport chain.");
     expect(state.evaluation?.answer_text).toBe(

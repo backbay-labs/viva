@@ -806,9 +806,13 @@ test("hosted monitor S3 uploads honor the publication deadline", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (_url, options = {}) =>
     new Promise((_resolve, reject) => {
-      options.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
-        once: true,
-      });
+      options.signal?.addEventListener(
+        "abort",
+        () => {
+          reject(new Error("aborted"));
+        },
+        { once: true },
+      );
     });
   try {
     await assert.rejects(

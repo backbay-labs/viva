@@ -1,7 +1,7 @@
 use agent_adapters::cartesia_gemini::{
-    gemini_request, viva_tool_declarations, CartesiaGeminiBrain, CartesiaGeminiConfig,
-    FakeCartesiaGeminiRuntime, FakeRuntimeInterrupt, FakeSessionScenario, GeminiConfig, InkConfig,
-    SonicConfig, ThinkingLevel,
+    fake_examiner_tone_pcm16, gemini_request, viva_tool_declarations, CartesiaGeminiBrain,
+    CartesiaGeminiConfig, FakeCartesiaGeminiRuntime, FakeRuntimeInterrupt, FakeSessionScenario,
+    GeminiConfig, InkConfig, SonicConfig, ThinkingLevel,
 };
 use agent_domain::{
     viva_max_submitted_answer_resolution, AnswerAttemptEnvelope, AnswerEvaluation, AudioFrame,
@@ -406,7 +406,9 @@ async fn fake_runtime_is_selectable_realtime_brain_without_live_keys() {
                 saw_manuscript_intent = true;
             }
             BrainEvent::AudioDelta { frame, .. } => {
-                assert_eq!(frame.pcm16_bytes(), [1, 2, 3, 4]);
+                // 600 ms examiner tone (24 kHz mono PCM16), delivered unmodified.
+                assert_eq!(frame.pcm16_bytes().len(), 28_800);
+                assert_eq!(frame.pcm16_bytes(), fake_examiner_tone_pcm16().as_slice());
                 saw_audio = true;
             }
             BrainEvent::RecapReady { recap, .. } => {
@@ -789,7 +791,9 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
             }
             BrainEvent::AudioDelta { response_id, frame } => {
                 if response_id == "response-2" {
-                    assert_eq!(frame.pcm16_bytes(), [1, 2, 3, 4]);
+                    // The retried turn re-synthesizes the full examiner tone.
+                    assert_eq!(frame.pcm16_bytes().len(), 28_800);
+                    assert_eq!(frame.pcm16_bytes(), fake_examiner_tone_pcm16().as_slice());
                     saw_new_audio = true;
                 }
             }
@@ -885,7 +889,8 @@ async fn fake_runtime_replays_provider_shaped_pipeline_without_live_selection() 
     )));
     assert!(events.iter().any(|event| matches!(
         event,
-        BrainEvent::AudioDelta { frame, .. } if frame.pcm16_bytes() == [1, 2, 3, 4]
+        BrainEvent::AudioDelta { frame, .. }
+            if frame.pcm16_bytes() == fake_examiner_tone_pcm16().as_slice()
     )));
     assert_eq!(store.snapshot().answer_attempts.len(), 1);
     assert!(CartesiaGeminiConfig::default().missing_live_keys());

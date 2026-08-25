@@ -30,6 +30,7 @@ pub use llm::{
     gemini_request, parse_gemini_sse_line, viva_tool_declarations, GeminiConfig, GeminiStreamEvent,
     ThinkingLevel,
 };
+pub use runner::fake_examiner_tone_pcm16;
 pub use stt::{audio_frame_bytes, parse_ink_event, InkConfig, InkEvent};
 pub use tts::{parse_sonic_event, sonic_generation_request, SonicConfig, SonicEvent};
 

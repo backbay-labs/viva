@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <title>Viva monochrome icon</title>
+  <circle cx="512" cy="512" r="224" fill="none" stroke="#000" stroke-width="42" />
+  <path
+    d="M512 372c14 86 42 114 128 128-86 14-114 42-128 128-14-86-42-114-128-128 86-14 114-42 128-128Z"
+    fill="#000"
+  />
+</svg>

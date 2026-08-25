@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <title>Viva app icon</title>
+  <defs>
+    <radialGradient id="vellum" cx="38%" cy="28%" r="85%">
+      <stop offset="0" stop-color="#fffdf8" />
+      <stop offset="1" stop-color="#eee4d6" />
+    </radialGradient>
+    <radialGradient id="orb" cx="36%" cy="28%" r="72%">
+      <stop offset="0" stop-color="#d9c6ea" />
+      <stop offset="0.48" stop-color="#805aa9" />
+      <stop offset="1" stop-color="#321a46" />
+    </radialGradient>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#vellum)" />
+  <circle cx="512" cy="512" r="275" fill="none" stroke="#d9c7e5" stroke-width="8" />
+  <circle cx="512" cy="512" r="230" fill="#efe5f4" opacity="0.9" />
+  <circle cx="512" cy="512" r="196" fill="url(#orb)" stroke="#fffaf2" stroke-width="14" />
+  <circle cx="448" cy="442" r="54" fill="#fff" opacity="0.13" />
+  <path
+    d="M512 408c10 64 32 86 96 96-64 10-86 32-96 96-10-64-32-86-96-96 64-10 86-32 96-96Z"
+    fill="#fffdf8"
+  />
+  <circle cx="746" cy="292" r="11" fill="#bd9a55" />
+</svg>

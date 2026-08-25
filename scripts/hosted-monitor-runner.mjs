@@ -1000,8 +1000,10 @@ export async function putS3Object(store, key, body, contentType, options = {}) {
       ? defaultPublishTimeoutMs
       : remainingPublishMs(options.deadlineMs);
   const controller = new AbortController();
+  // This timer is the completion path when fetch has not produced a live
+  // socket handle yet. Keep it referenced while the upload promise is awaited
+  // so Node cannot drain the event loop before enforcing the deadline.
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  timeout.unref?.();
   let response;
   try {
     response = await fetch(endpoint, {
