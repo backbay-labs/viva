@@ -51,14 +51,19 @@ pub use learning_recap::{
     ConceptLabel, RecapBuildError, RecapConceptOutcome, ReviewScheduleAuthority,
     ReviewScheduleSummary, SessionLearningEvidence,
 };
+// `PortErrorKind` is the store-side half of the typed classification boundary:
+// Plans 07/08/09 select retry policy, terminal reason, HTTP status, and
+// durability handling from it, and `StudyStoreWriteOutcome` makes a session or
+// usage write report what it actually did.
 pub use ports::{
     AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
     CreateFileStudySet, CreatePasteStudySet, LibraryNextReviewSummary, LibrarySessionRecapSummary,
     LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
-    SessionStore, SessionTokenNonceClaim, StudyConceptSummary, StudyDocumentSummary,
+    PortErrorKind, SessionStore, SessionTokenNonceClaim, StudyConceptSummary, StudyDocumentSummary,
     StudyLibrarySnapshot, StudyMemoryStore, StudySessionDurableCounts, StudySetIngestionRecord,
     StudySetIngestionStatus, StudySetSummary, StudySourceSpanSummary, StudyStoreBackend,
-    StudyStoreCapabilities, StudyStoreWriteCounts, ToolIssuer, VoiceUsageRecord,
+    StudyStoreCapabilities, StudyStoreWriteCounts, StudyStoreWriteOutcome, ToolIssuer,
+    VoiceUsageRecord,
 };
 pub use review_schedule::{
     decide_review_schedule, format_rfc3339_millis, parse_utc_instant, status_rating, Clock,

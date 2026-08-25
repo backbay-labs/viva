@@ -62,6 +62,7 @@ pub struct StudyStoreWriteCounts {
     pub concept_statuses: usize,
     pub review_items: usize,
     pub recaps: usize,
+    pub voice_usage: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -341,37 +342,137 @@ pub struct StudyLibrarySnapshot {
     pub sessions: Vec<LibrarySessionSummary>,
 }
 
+/// How a port failed, as data. Plans 07/08/09 select retry policy, terminal
+/// reason, HTTP status, and durability handling from this enum — never from the
+/// diagnostic `reason` text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PortErrorKind {
+    /// The port cannot answer at all: unimplemented, disabled, or unreachable.
+    Unavailable,
+    /// The caller's arguments are semantically invalid; retrying is pointless.
+    InvalidInput,
+    /// The write lost a uniqueness/replay race, such as a reused nonce.
+    Conflict,
+    /// The backing store could not durably commit: SQL, pool, or transaction.
+    Durability,
+    /// An invariant inside the adapter broke; nothing about the request was wrong.
+    Internal,
+}
+
+impl PortErrorKind {
+    pub const ALL: [Self; 5] = [
+        Self::Unavailable,
+        Self::InvalidInput,
+        Self::Conflict,
+        Self::Durability,
+        Self::Internal,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::InvalidInput => "invalid_input",
+            Self::Conflict => "conflict",
+            Self::Durability => "durability",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+impl std::fmt::Display for PortErrorKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One structured port failure. Every field is private: `reason` is a diagnostic
+/// string for logs, and a consumer that could destructure it would be one
+/// refactor away from classifying on prose again.
 #[derive(Debug, thiserror::Error)]
-pub enum PortError {
-    #[error("{port} unavailable for {id}: {reason}")]
-    Unavailable {
-        port: &'static str,
-        id: String,
-        reason: String,
-    },
-    #[error("{port} adapter error: {reason}")]
-    Adapter { port: &'static str, reason: String },
+#[error("{port} {kind} for {id}: {reason}")]
+pub struct PortError {
+    kind: PortErrorKind,
+    port: &'static str,
+    id: String,
+    reason: String,
 }
 
 impl PortError {
-    pub fn unavailable(
+    fn new(
+        kind: PortErrorKind,
         port: &'static str,
         id: impl Into<String>,
         reason: impl Into<String>,
     ) -> Self {
-        Self::Unavailable {
+        Self {
+            kind,
             port,
             id: id.into(),
             reason: reason.into(),
         }
     }
 
-    pub fn adapter(port: &'static str, reason: impl Into<String>) -> Self {
-        Self::Adapter {
-            port,
-            reason: reason.into(),
-        }
+    pub fn unavailable(
+        port: &'static str,
+        id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(PortErrorKind::Unavailable, port, id, reason)
     }
+
+    pub fn invalid_input(
+        port: &'static str,
+        id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(PortErrorKind::InvalidInput, port, id, reason)
+    }
+
+    pub fn conflict(port: &'static str, id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::new(PortErrorKind::Conflict, port, id, reason)
+    }
+
+    pub fn durability(
+        port: &'static str,
+        id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(PortErrorKind::Durability, port, id, reason)
+    }
+
+    pub fn internal(port: &'static str, id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::new(PortErrorKind::Internal, port, id, reason)
+    }
+
+    pub fn kind(&self) -> PortErrorKind {
+        self.kind
+    }
+
+    pub fn port(&self) -> &'static str {
+        self.port
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Diagnostics only. Nothing may branch on this text.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn is_durability(&self) -> bool {
+        matches!(self.kind, PortErrorKind::Durability)
+    }
+}
+
+/// What a study-store write actually did. A caller that cannot tell an insert
+/// from a replay cannot report truthfully, so the outcome may not be dropped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum StudyStoreWriteOutcome {
+    Inserted,
+    IdempotentReplay,
 }
 
 #[async_trait]
@@ -391,24 +492,50 @@ pub trait StudyMemoryStore: Send + Sync {
         StudyStoreWriteCounts::default()
     }
 
+    /// Every default below is truth-bearing: it either claims a read observed the
+    /// durable record or claims a write happened. A partial store cannot make
+    /// either claim, so each one fails closed with `Unavailable` rather than
+    /// answering `Ok(0)`, `Ok(false)`, `Ok(())`, `Ok(None)`, or a fabricated
+    /// document. These are intentional compatibility boundaries for partial/test
+    /// stores, not acceptable production behavior; Plan 09 overrides them all.
     async fn pending_answer_attempts_for_session(
         &self,
-        _voice_session_id: &str,
+        voice_session_id: &str,
     ) -> Result<usize, PortError> {
-        Ok(0)
+        Err(PortError::unavailable(
+            "study_store",
+            voice_session_id,
+            "pending answer attempt counting is not implemented by this store",
+        ))
     }
 
-    async fn record_voice_session(&self, _config: &SessionConfig) -> Result<(), PortError> {
-        Ok(())
+    /// Reports whether the session row was inserted or replayed. Plan 09 returns
+    /// `IdempotentReplay` only for a genuine replay of the same session.
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            config
+                .session_id
+                .as_ref()
+                .map_or("unknown", |session_id| session_id.as_str()),
+            "voice session recording is not implemented by this store",
+        ))
     }
 
     async fn study_session_durable_counts(
         &self,
         _user_id: &str,
         _study_set_id: &str,
-        _voice_session_id: &str,
+        voice_session_id: &str,
     ) -> Result<StudySessionDurableCounts, PortError> {
-        Ok(StudySessionDurableCounts::default())
+        Err(PortError::unavailable(
+            "study_store",
+            voice_session_id,
+            "durable session counts are not implemented by this store",
+        ))
     }
 
     async fn answer_attempt_was_recorded(
@@ -416,9 +543,13 @@ pub trait StudyMemoryStore: Send + Sync {
         _user_id: &str,
         _study_set_id: &str,
         _voice_session_id: &str,
-        _response_id: &str,
+        response_id: &str,
     ) -> Result<bool, PortError> {
-        Ok(false)
+        Err(PortError::unavailable(
+            "study_store",
+            response_id,
+            "answer attempt durability lookup is not implemented by this store",
+        ))
     }
 
     async fn claim_session_token_nonce(
@@ -437,10 +568,14 @@ pub trait StudyMemoryStore: Send + Sync {
 
     async fn close_voice_session(
         &self,
-        _voice_session_id: &str,
+        voice_session_id: &str,
         _terminal_reason: &str,
     ) -> Result<Value, PortError> {
-        Ok(serde_json::json!({ "closed": false }))
+        Err(PortError::unavailable(
+            "study_store",
+            voice_session_id,
+            "voice session closure is not implemented by this store",
+        ))
     }
 
     async fn create_paste_study_set(
@@ -518,9 +653,13 @@ pub trait StudyMemoryStore: Send + Sync {
     async fn active_question(
         &self,
         _user_id: &str,
-        _study_set_id: &str,
+        study_set_id: &str,
     ) -> Result<Option<StudyQuestion>, PortError> {
-        Ok(None)
+        Err(PortError::unavailable(
+            "study_store",
+            study_set_id,
+            "active question lookup is not implemented by this store",
+        ))
     }
 
     async fn authorize_question_started(
@@ -711,8 +850,17 @@ pub trait StudyMemoryStore: Send + Sync {
         recap: StudySessionRecap,
     ) -> Result<Value, PortError>;
 
-    async fn record_voice_usage(&self, _event: VoiceUsageRecord) -> Result<(), PortError> {
-        Ok(())
+    /// Usage has no stable event key, so a successful insert always reports
+    /// `Inserted`; this plan invents no usage idempotency.
+    async fn record_voice_usage(
+        &self,
+        event: VoiceUsageRecord,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            event.voice_session_id.as_deref().unwrap_or("unknown"),
+            "voice usage recording is not implemented by this store",
+        ))
     }
 
     /// Persist one authoritative Plan 04 [`TurnOutcome`] and return the exact
