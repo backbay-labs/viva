@@ -4,6 +4,7 @@ import {
   VIVA_LEARNER_LOOP_EVIDENCE_FIELDS,
 } from "./learner-loop-contract";
 import {
+  learnerRecoveryCopyEntry,
   learnerRecoveryCopyForState,
   VIVA_LEARNER_RECOVERY_COPY_CONTRACT,
 } from "./learner-recovery-copy";
@@ -154,5 +155,51 @@ describe("BAC-523 learner recovery copy contract", () => {
       expect(entry?.learner.secondary_action.label).toBe("Refresh session");
       expect(entry?.learner.secondary_action.intent).toBe("refresh_session");
     }
+  });
+});
+
+/**
+ * `LEARN-006` — the secondary action carries the state's own next-action intent.
+ *
+ * Reusing `primary_action_intent` for both buttons silently rewrites what the
+ * second button does. The synthetic entry below is the only honest way to see
+ * that: it is the one state whose two intents differ, so a validator that reads
+ * the wrong field cannot pass by coincidence.
+ */
+describe("LEARN-006 recovery actions keep distinct intents", () => {
+  test("derives every secondary action from next_action_label and next_action_intent", () => {
+    for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {
+      const entry = learnerRecoveryCopyForState(state.id);
+      expect(entry?.learner.primary_action.label).toBe(state.copy.primary_action_label);
+      expect(entry?.learner.primary_action.intent).toBe(state.copy.primary_action_intent);
+      expect(entry?.learner.secondary_action.label).toBe(state.copy.next_action_label);
+      expect(entry?.learner.secondary_action.intent).toBe(state.copy.next_action_intent);
+    }
+  });
+
+  test("keeps a retry_agent primary and a disabled next action distinct", () => {
+    const source = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+      (state) => state.id === "provider_timeout",
+    );
+    expect(source).not.toBeUndefined();
+    if (!source) return;
+
+    const entry = learnerRecoveryCopyEntry({
+      ...source,
+      copy: {
+        ...source.copy,
+        next_action_label: "Wait for result",
+        next_action_intent: "disabled",
+        primary_action_label: "Retry agent",
+        primary_action_intent: "retry_agent",
+      },
+    });
+
+    expect(entry.learner.primary_action).toEqual({ label: "Retry agent", intent: "retry_agent" });
+    expect(entry.learner.secondary_action).toEqual({
+      label: "Wait for result",
+      intent: "disabled",
+    });
+    expect(entry.learner.secondary_action.intent).not.toBe(entry.learner.primary_action.intent);
   });
 });

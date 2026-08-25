@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import {
+  VIVA_LEARNER_LOOP_ACTION_INTENTS,
+  VIVA_LEARNER_LOOP_AUTHORITIES,
   VIVA_LEARNER_LOOP_CONTRACT,
   VIVA_LEARNER_LOOP_EVIDENCE_FIELDS,
   VIVA_LEARNER_LOOP_MAX_TURN_MS,
+  VIVA_LEARNER_LOOP_RESOLUTION_KINDS,
   VIVA_RUNTIME_COPY_CAUSES,
   validateLearnerLoopContract,
 } from "./learner-loop-contract";
+import contractJson from "./learner-loop-contract.json" with { type: "json" };
 
 const REQUIRED_STATE_IDS = Object.freeze([
   "pre_loop_upload",
@@ -220,5 +224,296 @@ describe("BAC-510 learner loop contract", () => {
     for (const cause of VIVA_RUNTIME_COPY_CAUSES) {
       expect(contractCauses.has(cause)).toBe(true);
     }
+  });
+});
+
+/**
+ * `LEARN-006` — the learner-loop JSON is untrusted input.
+ *
+ * Every case below clones the raw JSON, mutates exactly one field, and requires a
+ * field-specific validation error. A mutation that only produced a wrong-shaped
+ * `LearnerLoopContract` at the type level would prove nothing: the validator is
+ * the only thing standing between a hand-edited JSON file and learner-visible
+ * copy, so it has to reject each drift on its own.
+ */
+type JsonRecord = Record<string, unknown>;
+
+function rawContract(): JsonRecord {
+  return JSON.parse(JSON.stringify(contractJson)) as JsonRecord;
+}
+
+function rawStates(contract: JsonRecord): JsonRecord[] {
+  return contract.states as JsonRecord[];
+}
+
+function rawState(contract: JsonRecord, id: string): JsonRecord {
+  const state = rawStates(contract).find((candidate) => candidate.id === id);
+  if (!state) {
+    throw new Error(`learner loop fixture is missing state ${id}`);
+  }
+  return state;
+}
+
+function rawCopy(contract: JsonRecord, id: string): JsonRecord {
+  return rawState(contract, id).copy as JsonRecord;
+}
+
+function rawStrings(record: JsonRecord, key: string): string[] {
+  return record[key] as string[];
+}
+
+const SCHEMA_DRIFT_CASES: ReadonlyArray<{
+  readonly name: string;
+  readonly mutate: (contract: JsonRecord) => void;
+  readonly message: string;
+}> = Object.freeze([
+  {
+    name: "schema",
+    mutate: (contract) => {
+      contract.schema = "viva.learner_loop_contract.v2";
+    },
+    message: "Invalid learner loop contract schema",
+  },
+  {
+    name: "authority",
+    mutate: (contract) => {
+      rawState(contract, "durability_degraded").authority = "optimistic_ui";
+    },
+    message: "Unknown learner loop authority optimistic_ui",
+  },
+  {
+    name: "resolution kind",
+    mutate: (contract) => {
+      rawState(contract, "happy_feedback").resolution_kind = "probably_fine";
+    },
+    message: "Unknown learner loop resolution kind probably_fine",
+  },
+  {
+    name: "primary action intent",
+    mutate: (contract) => {
+      rawCopy(contract, "retry_prompt").primary_action_intent = "open_provider_console";
+    },
+    message: "Unknown learner loop primary action intent open_provider_console",
+  },
+  {
+    name: "next action intent",
+    mutate: (contract) => {
+      rawCopy(contract, "retry_prompt").next_action_intent = "open_provider_console";
+    },
+    message: "Unknown learner loop next action intent open_provider_console",
+  },
+  {
+    name: "learner_safe",
+    mutate: (contract) => {
+      rawState(contract, "turn_cap").learner_safe = false;
+    },
+    message: "Learner loop state turn_cap must declare learner_safe true",
+  },
+  {
+    name: "sanitized_evidence",
+    mutate: (contract) => {
+      rawState(contract, "turn_cap").sanitized_evidence = false;
+    },
+    message: "Learner loop state turn_cap must declare sanitized_evidence true",
+  },
+  {
+    name: "evidence incident sanitized_evidence",
+    mutate: (contract) => {
+      (contract.evidence_incident as JsonRecord).sanitized_evidence = false;
+    },
+    message: "Learner loop evidence_incident must declare sanitized_evidence true",
+  },
+  {
+    name: "terminal reason",
+    mutate: (contract) => {
+      rawState(contract, "rollback").terminal_reason = "roll_back";
+    },
+    message: "Unknown learner loop terminal reason roll_back",
+  },
+  {
+    name: "runtime copy cause",
+    mutate: (contract) => {
+      rawStrings(rawState(contract, "provider_rate_limit"), "runtime_copy_causes")[0] =
+        "provider_quota";
+    },
+    message: "Unknown runtime copy cause provider_quota",
+  },
+  {
+    name: "evidence field",
+    mutate: (contract) => {
+      rawStrings(rawState(contract, "deploy_drain"), "operator_diagnostics").push("response_body");
+    },
+    message: "Unknown learner loop evidence field response_body",
+  },
+  {
+    name: "contract max bound",
+    mutate: (contract) => {
+      contract.max_submitted_answer_resolution_ms = 60_000;
+    },
+    message: "Invalid learner loop max submitted-answer resolution",
+  },
+  {
+    name: "state max bound",
+    mutate: (contract) => {
+      rawState(contract, "turn_cap").max_resolution_ms = 60_000;
+    },
+    message: "Invalid submitted-answer bound for turn_cap",
+  },
+  {
+    name: "duplicate state id",
+    mutate: (contract) => {
+      const states = rawStates(contract);
+      states.push(JSON.parse(JSON.stringify(states[0])) as JsonRecord);
+    },
+    message: "Duplicate learner loop state id pre_loop_upload",
+  },
+  {
+    name: "duplicate resolution key",
+    mutate: (contract) => {
+      rawState(contract, "turn_cap").terminal_reason = "rollback";
+    },
+    message: "Duplicate submitted-answer resolution key rollback",
+  },
+  {
+    name: "duplicate runtime cause",
+    mutate: (contract) => {
+      rawStrings(rawState(contract, "provider_timeout"), "runtime_copy_causes").push(
+        "provider_timeout",
+      );
+    },
+    message: "Duplicate runtime copy cause provider_timeout",
+  },
+  {
+    name: "duplicate operator diagnostic",
+    mutate: (contract) => {
+      rawStrings(rawState(contract, "deploy_drain"), "operator_diagnostics").push("stage");
+    },
+    message: "Duplicate learner loop evidence field stage",
+  },
+  {
+    name: "unmapped runtime cause",
+    mutate: (contract) => {
+      rawState(contract, "rollback").runtime_copy_causes = [];
+    },
+    message: "Unmapped runtime copy cause rollback",
+  },
+  {
+    name: "missing success mapping",
+    mutate: (contract) => {
+      for (const state of rawStates(contract)) {
+        if (state.resolution_kind === "success") {
+          state.resolution_kind = "recoverable";
+        }
+      }
+    },
+    message: "Learner loop contract has no success resolution state",
+  },
+  {
+    name: "unknown contract field",
+    mutate: (contract) => {
+      contract.owner_override = "ops";
+    },
+    message: "Unknown learner loop contract field owner_override",
+  },
+  {
+    name: "missing state field",
+    mutate: (contract) => {
+      delete rawState(contract, "refresh").stage;
+    },
+    message: "Learner loop state refresh is missing stage",
+  },
+  {
+    name: "unknown copy field",
+    mutate: (contract) => {
+      rawCopy(contract, "refresh").provider_message = "429 from upstream";
+    },
+    message: "Unknown learner loop copy field provider_message",
+  },
+  {
+    name: "evidence field list",
+    mutate: (contract) => {
+      rawStrings(contract, "evidence_fields").pop();
+    },
+    message: "Invalid learner loop evidence fields",
+  },
+]);
+
+describe("LEARN-006 learner loop contract validates unknown input", () => {
+  test("accepts the canonical JSON handed in as unknown", () => {
+    const parsed = validateLearnerLoopContract(rawContract() as unknown);
+
+    expect(parsed.schema).toBe("viva.learner_loop_contract.v1");
+    expect(parsed.states.length).toBe(VIVA_LEARNER_LOOP_CONTRACT.states.length);
+    expect(parsed.states.map((state) => state.id)).toEqual(
+      VIVA_LEARNER_LOOP_CONTRACT.states.map((state) => state.id),
+    );
+  });
+
+  test("rejects values that are not a contract object at all", () => {
+    for (const value of [null, undefined, 7, "contract", true, [], () => undefined]) {
+      expect(() => validateLearnerLoopContract(value)).toThrow(
+        "Learner loop contract must be an object",
+      );
+    }
+  });
+
+  for (const drift of SCHEMA_DRIFT_CASES) {
+    test(`rejects drift in ${drift.name}`, () => {
+      const contract = rawContract();
+      drift.mutate(contract);
+
+      expect(() => validateLearnerLoopContract(contract)).toThrow(drift.message);
+    });
+  }
+
+  test("publishes the closed allowlists the validator enforces", () => {
+    expect([...VIVA_LEARNER_LOOP_RESOLUTION_KINDS].sort()).toEqual([
+      "deferred",
+      "recoverable",
+      "success",
+      "terminal",
+    ]);
+    expect([...VIVA_LEARNER_LOOP_AUTHORITIES].sort()).toEqual([
+      "agent_event",
+      "client_lifecycle_event",
+      "durable_store_event",
+      "pre_loop_service_event",
+      "server_control_event",
+      "session_event",
+    ]);
+    expect([...VIVA_LEARNER_LOOP_ACTION_INTENTS].sort()).toEqual([
+      "disabled",
+      "refresh_session",
+      "retry_agent",
+      "start_session",
+      "submit_turn",
+    ]);
+
+    const resolutionKinds = new Set<string>(VIVA_LEARNER_LOOP_RESOLUTION_KINDS);
+    const authorities = new Set<string>(VIVA_LEARNER_LOOP_AUTHORITIES);
+    const intents = new Set<string>(VIVA_LEARNER_LOOP_ACTION_INTENTS);
+    for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {
+      expect(resolutionKinds.has(state.resolution_kind)).toBe(true);
+      expect(authorities.has(state.authority)).toBe(true);
+      expect(intents.has(state.copy.primary_action_intent)).toBe(true);
+      expect(intents.has(state.copy.next_action_intent)).toBe(true);
+    }
+  });
+
+  test("gives every state an explicit next action intent", () => {
+    for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {
+      expect(state.copy.next_action_label.length).toBeGreaterThan(0);
+      expect(state.copy.next_action_intent.length).toBeGreaterThan(0);
+    }
+  });
+
+  test("returns a reconstructed contract, not the caller's object", () => {
+    const contract = rawContract();
+    const parsed = validateLearnerLoopContract(contract);
+
+    expect(parsed).not.toBe(contract);
+    expect(Object.isFrozen(parsed)).toBe(true);
+    expect(Object.isFrozen(parsed.states)).toBe(true);
+    expect(Object.isFrozen(parsed.states[0]?.copy)).toBe(true);
   });
 });

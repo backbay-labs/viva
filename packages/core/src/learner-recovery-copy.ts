@@ -1,7 +1,8 @@
 import {
-  type LearnerLoopCopy,
+  type LearnerLoopActionIntent,
   type LearnerLoopEvidenceField,
   type LearnerLoopResolutionKind,
+  type LearnerLoopState,
   type LearnerLoopTerminalReason,
   type RuntimeCopyCause,
   VIVA_LEARNER_LOOP_CONTRACT,
@@ -11,7 +12,7 @@ export const VIVA_LEARNER_RECOVERY_COPY_SCHEMA = "viva.learner_recovery_copy.v1"
 
 export type LearnerRecoveryAction = {
   label: string;
-  intent: LearnerLoopCopy["primary_action_intent"];
+  intent: LearnerLoopActionIntent;
 };
 
 export type LearnerRecoveryCopyEntry = {
@@ -45,11 +46,20 @@ export type LearnerRecoveryCopyContract = {
   states: LearnerRecoveryCopyEntry[];
 };
 
-function learnerAction(label: string, intent: LearnerLoopCopy["primary_action_intent"]) {
+function learnerAction(label: string, intent: LearnerLoopActionIntent): LearnerRecoveryAction {
   return { label, intent };
 }
 
-function recoveryCopyEntry(state: (typeof VIVA_LEARNER_LOOP_CONTRACT.states)[number]) {
+/**
+ * Project one validated learner-loop state into its recovery-copy entry.
+ *
+ * The secondary action reads `next_action_intent`, never
+ * `primary_action_intent`: the two buttons are separate commands, and reusing
+ * the primary intent silently rewrites what the second button does — a state
+ * that offers `retry_agent` first and a deliberately `disabled` follow-up would
+ * otherwise ship two retry buttons.
+ */
+export function learnerRecoveryCopyEntry(state: LearnerLoopState): LearnerRecoveryCopyEntry {
   return {
     state_id: state.id,
     state_label: state.label,
@@ -65,10 +75,7 @@ function recoveryCopyEntry(state: (typeof VIVA_LEARNER_LOOP_CONTRACT.states)[num
         state.copy.primary_action_label,
         state.copy.primary_action_intent,
       ),
-      secondary_action: learnerAction(
-        state.copy.next_action_label,
-        state.copy.primary_action_intent,
-      ),
+      secondary_action: learnerAction(state.copy.next_action_label, state.copy.next_action_intent),
     },
     operator: {
       diagnostic_fields: state.operator_diagnostics,
@@ -86,7 +93,7 @@ export const VIVA_LEARNER_RECOVERY_COPY_CONTRACT = Object.freeze({
   source_schema: VIVA_LEARNER_LOOP_CONTRACT.schema,
   source_max_submitted_answer_resolution_ms:
     VIVA_LEARNER_LOOP_CONTRACT.max_submitted_answer_resolution_ms,
-  states: VIVA_LEARNER_LOOP_CONTRACT.states.map(recoveryCopyEntry),
+  states: VIVA_LEARNER_LOOP_CONTRACT.states.map(learnerRecoveryCopyEntry),
 } satisfies LearnerRecoveryCopyContract);
 
 export function learnerRecoveryCopyForState(stateId: string): LearnerRecoveryCopyEntry | undefined {
