@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { Concept, StudySet } from "@viva/core";
-
-import type { VivaLibrarySnapshot } from "@/agent/shared-web";
+import { studySetToAgentSessionConfig, type VivaLibrarySnapshot } from "@/agent/shared-web";
+import {
+  createMobileSessionController,
+  type MobileVivaSessionController,
+} from "@/agent/use-mobile-viva-session";
 import type { AppConfig } from "@/runtime/config";
 import {
   decideMobileLibraryStart,
@@ -99,11 +102,58 @@ const cannedLibrarySnapshot: VivaLibrarySnapshot = {
 const config: AppConfig = {
   agentHttpUrl: "http://127.0.0.1:4318",
   agentWsUrl: "ws://127.0.0.1:4318/ws",
+  restBearerToken: null,
   sessionToken: null,
   studySetId: "biology-midterm",
   userId: "user-1",
+  wsBearerToken: null,
   wsOrigin: null,
 };
+
+type SocketListener = (event: Event & { data?: unknown }) => void;
+
+class AuthFakeWebSocket {
+  static instances: AuthFakeWebSocket[] = [];
+  readonly listeners = new Map<string, SocketListener[]>();
+  readonly sent: unknown[] = [];
+  readyState = 0;
+
+  constructor(
+    readonly url: string,
+    readonly protocols?: string | string[],
+    readonly options?: { headers?: Record<string, string> },
+  ) {
+    AuthFakeWebSocket.instances.push(this);
+  }
+
+  addEventListener(type: string, listener: SocketListener): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  close(): void {
+    this.readyState = 3;
+  }
+
+  open(): void {
+    this.readyState = 1;
+    this.emit("open", new Event("open"));
+  }
+
+  removeEventListener(type: string, listener: SocketListener): void {
+    this.listeners.set(
+      type,
+      (this.listeners.get(type) ?? []).filter((candidate) => candidate !== listener),
+    );
+  }
+
+  send(value: unknown): void {
+    this.sent.push(value);
+  }
+
+  private emit(type: string, event: Event & { data?: unknown }): void {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+}
 
 describe("mobile library client", () => {
   test("loads and projects the direct agent snapshot with explicit configuration", async () => {
@@ -128,7 +178,7 @@ describe("mobile library client", () => {
     ]);
   });
 
-  test("uses the explicit Stage-1 token as the protected library bearer", async () => {
+  test("uses the explicit REST bearer as the protected library bearer", async () => {
     const calls: Array<{ init?: RequestInit; input: string }> = [];
     const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ init, input: String(input) });
@@ -138,9 +188,54 @@ describe("mobile library client", () => {
       });
     }) as typeof fetch;
 
-    await loadLibrary({ ...config, sessionToken: "spike-bearer" }, fetchImpl);
+    await loadLibrary({ ...config, restBearerToken: "rest-bearer" }, fetchImpl);
 
-    expect(calls[0]?.init?.headers).toEqual({ authorization: "Bearer spike-bearer" });
+    expect(calls[0]?.init?.headers).toEqual({ authorization: "Bearer rest-bearer" });
+  });
+
+  test("keeps static REST/WS bearers separate from the signed first-frame capability", async () => {
+    const authConfig: AppConfig = {
+      ...config,
+      restBearerToken: "rest-static",
+      sessionToken: "config-signed",
+      wsBearerToken: "ws-static",
+    };
+    const calls: Array<{ init?: RequestInit; input: string }> = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init, input: String(input) });
+      return new Response(JSON.stringify(cannedLibrarySnapshot), {
+        headers: { "content-type": "application/json" },
+        status: 200,
+      });
+    }) as typeof fetch;
+
+    const loaded = await loadLibrary(authConfig, fetchImpl);
+    const studySet = studySetForSession(loaded.snapshot, "biology-midterm", authConfig);
+    AuthFakeWebSocket.instances = [];
+    const controller: MobileVivaSessionController = createMobileSessionController({
+      WebSocketImpl: AuthFakeWebSocket as unknown as typeof WebSocket,
+      config: authConfig,
+      session: studySetToAgentSessionConfig(studySet, {
+        mode: "quiz",
+        userId: authConfig.userId,
+      }),
+      sessionToken: studySet.sessionToken,
+    });
+
+    expect(calls[0]?.init?.headers).toEqual({ authorization: "Bearer rest-static" });
+    controller.connect();
+    const socket = AuthFakeWebSocket.instances[0];
+    expect(socket?.protocols).toEqual(["viva-voice", `bearer.${btoa("ws-static")}`]);
+    socket?.open();
+    const firstFrame = JSON.parse(String(socket?.sent[0])) as {
+      session_token?: string;
+      type?: string;
+    };
+    expect(firstFrame.type).toBe("session_config");
+    expect(firstFrame.session_token).toBe("viva1.mobile-session");
+    expect(firstFrame.session_token).not.toBe("config-signed");
+    expect("sendAudio" in controller).toBe(false);
+    expect(socket?.sent.every((value) => typeof value === "string")).toBe(true);
   });
 
   test("maps only server-owned metadata and leaves absent learning detail neutral", () => {

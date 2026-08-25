@@ -21,6 +21,7 @@ import {
   type VivaAgentSessionController,
   type VivaAgentSessionState,
   type VivaAudioCaptureEndReason,
+  vivaAgentProtocols,
 } from "@/agent/shared-web";
 import { createMobileCaptureSession, type MobileCaptureSession } from "@/audio/capture";
 import { createMobilePlaybackSession, type MobilePlaybackSession } from "@/audio/playback";
@@ -84,6 +85,7 @@ export function createGuardedWebSocketImplementation(
   WebSocketImpl: typeof WebSocket,
   wsOrigin: string | null,
   onRecapPartialReason?: (reason: AgentTerminalSessionReason) => void,
+  wsBearerToken?: string | null,
 ): typeof WebSocket {
   const NativeWebSocket = WebSocketImpl as unknown as NativeWebSocketConstructor;
 
@@ -92,9 +94,10 @@ export function createGuardedWebSocketImplementation(
     readonly #partialReasonListener?: EventListener;
 
     constructor(url: string, protocols?: string | string[]) {
+      const handshakeProtocols = wsBearerToken ? vivaAgentProtocols(wsBearerToken) : protocols;
       this.#native = wsOrigin
-        ? new NativeWebSocket(url, protocols, { headers: { Origin: wsOrigin } })
-        : new NativeWebSocket(url, protocols);
+        ? new NativeWebSocket(url, handshakeProtocols, { headers: { Origin: wsOrigin } })
+        : new NativeWebSocket(url, handshakeProtocols);
       this.#partialReasonListener = (event) => {
         const reason = recapPartialReasonFromMessage((event as MessageEvent).data);
         if (reason) onRecapPartialReason?.(reason);
@@ -177,16 +180,25 @@ export function createMobileSessionController(options: {
     options.WebSocketImpl ?? WebSocket,
     options.config.wsOrigin,
     options.onRecapPartialReason,
+    options.config.wsBearerToken,
   );
+  const selectedSessionToken = options.sessionToken ?? options.config.sessionToken;
   const controller = createVivaAgentSessionController({
     WebSocketImpl,
     session: options.session,
-    sessionToken: options.sessionToken ?? options.config.sessionToken,
-    token: options.sessionToken ?? options.config.sessionToken ?? undefined,
+    sessionToken: selectedSessionToken,
+    token: options.config.wsBearerToken ?? selectedSessionToken ?? undefined,
     url: options.config.agentWsUrl,
   });
   const { sendAudio: _forbiddenAudioCapability, ...typedController } = controller;
   return typedController;
+}
+
+export function selectMobileSessionToken(
+  config: AppConfig,
+  studySet: Pick<StudySet, "sessionToken">,
+): string | null {
+  return studySet.sessionToken?.trim() || config.sessionToken;
 }
 
 function recapPartialReasonFromMessage(data: unknown): AgentTerminalSessionReason | undefined {
@@ -308,7 +320,7 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
       config,
       onRecapPartialReason: setRecapPartialReason,
       session,
-      sessionToken: config.sessionToken ?? options.studySet.sessionToken,
+      sessionToken: selectMobileSessionToken(config, options.studySet),
     });
     controllerRef.current = controller;
     setAgentState(controller.getState());
@@ -324,7 +336,7 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
       void playback.close();
       if (controllerRef.current === controller) controllerRef.current = null;
     };
-  }, [capture, config, options.studySet.sessionToken, playback, session]);
+  }, [capture, config, options.studySet, playback, session]);
 
   useEffect(() => {
     const subscription = nativeAppState().addEventListener("change", (nextState) => {

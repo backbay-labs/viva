@@ -1,9 +1,11 @@
 export type AppConfig = {
   agentHttpUrl: string;
   agentWsUrl: string;
+  restBearerToken: string | null;
   sessionToken: string | null;
   studySetId: string;
   userId: string;
+  wsBearerToken: string | null;
   wsOrigin: string | null;
 };
 
@@ -32,9 +34,11 @@ export function loadAppConfig(
   return {
     agentHttpUrl,
     agentWsUrl,
+    restBearerToken: trimmed(env.EXPO_PUBLIC_VIVA_REST_BEARER_TOKEN),
     sessionToken: trimmed(env.EXPO_PUBLIC_VIVA_SESSION_TOKEN),
     studySetId: trimmed(env.EXPO_PUBLIC_VIVA_STUDY_SET_ID) ?? "biology-midterm",
     userId: trimmed(env.EXPO_PUBLIC_VIVA_USER_ID) ?? "user-1",
+    wsBearerToken: trimmed(env.EXPO_PUBLIC_VIVA_WS_BEARER_TOKEN),
     wsOrigin: trimmed(env.EXPO_PUBLIC_VIVA_WS_ORIGIN),
   };
 }

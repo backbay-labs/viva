@@ -7,6 +7,8 @@ describe("loadAppConfig", () => {
     const config = loadAppConfig({});
     expect(config.agentWsUrl).toBe("ws://127.0.0.1:4318/ws");
     expect(config.agentHttpUrl).toBe("http://127.0.0.1:4318");
+    expect(config.restBearerToken).toBe(null);
+    expect(config.wsBearerToken).toBe(null);
     expect(config.userId).toBe("user-1");
     expect(config.studySetId).toBe("biology-midterm");
     expect(config.sessionToken).toBe(null);
@@ -29,6 +31,18 @@ describe("loadAppConfig", () => {
     expect(config.agentHttpUrl).toBe("http://10.0.0.5:4318");
     expect(config.userId).toBe("user-2");
     expect(config.studySetId).toBe("chem-final");
+  });
+
+  test("keeps REST, WebSocket, and first-frame credentials independent", () => {
+    const config = loadAppConfig({
+      EXPO_PUBLIC_VIVA_REST_BEARER_TOKEN: "rest-static",
+      EXPO_PUBLIC_VIVA_SESSION_TOKEN: "signed-first-frame",
+      EXPO_PUBLIC_VIVA_WS_BEARER_TOKEN: "ws-static",
+    });
+
+    expect(config.restBearerToken).toBe("rest-static");
+    expect(config.wsBearerToken).toBe("ws-static");
+    expect(config.sessionToken).toBe("signed-first-frame");
   });
 });
 

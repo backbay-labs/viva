@@ -5,6 +5,7 @@ import {
   createGuardedWebSocketImplementation,
   createMobileSessionController,
   foregroundReconnectAction,
+  selectMobileSessionToken,
 } from "@/agent/use-mobile-viva-session";
 import type { AppConfig } from "@/runtime/config";
 import syntheticStudySession from "../../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
@@ -61,9 +62,11 @@ class FakeWebSocket {
 const config: AppConfig = {
   agentHttpUrl: "http://127.0.0.1:4318",
   agentWsUrl: "ws://127.0.0.1:4318/ws",
+  restBearerToken: null,
   sessionToken: null,
   studySetId: "biology-midterm",
   userId: "user-1",
+  wsBearerToken: null,
   wsOrigin: "https://mobile.viva.example",
 };
 
@@ -179,6 +182,20 @@ describe("createMobileSessionController", () => {
       }),
     );
     expect(reasons).toEqual(["provider_timeout"]);
+  });
+});
+
+describe("selectMobileSessionToken", () => {
+  test("prefers the library-issued capability over configured first-frame material", () => {
+    expect(
+      selectMobileSessionToken(
+        { ...config, sessionToken: "config-signed" },
+        { sessionToken: "library-signed" },
+      ),
+    ).toBe("library-signed");
+    expect(selectMobileSessionToken({ ...config, sessionToken: "config-signed" }, {})).toBe(
+      "config-signed",
+    );
   });
 });
 

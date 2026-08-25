@@ -26,6 +26,7 @@ export {
   fetchVivaLibrarySnapshot,
   initialVivaAgentSessionState,
   parseVivaAgentMessage,
+  vivaAgentProtocols,
   vivaAgentReducer,
 } from "@viva-web/viva-agent-client";
 export type {

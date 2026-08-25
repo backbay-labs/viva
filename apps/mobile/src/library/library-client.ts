@@ -47,7 +47,7 @@ export async function loadLibrary(
 ): Promise<LoadedLibrary> {
   const snapshot = await fetchVivaLibrarySnapshot({
     apiBaseUrl: config.agentHttpUrl,
-    bearerToken: config.sessionToken ?? undefined,
+    bearerToken: config.restBearerToken ?? undefined,
     fetchImpl,
     userId: config.userId,
   });

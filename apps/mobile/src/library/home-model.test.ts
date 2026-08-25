@@ -7,9 +7,11 @@ import { homeModelFromLibrary } from "./home-model";
 const config: AppConfig = {
   agentHttpUrl: "http://127.0.0.1:4318",
   agentWsUrl: "ws://127.0.0.1:4318/ws",
+  restBearerToken: null,
   sessionToken: null,
   studySetId: "biology-midterm",
   userId: "user-1",
+  wsBearerToken: null,
   wsOrigin: null,
 };
 
