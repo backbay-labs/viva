@@ -232,6 +232,13 @@ impl VivaToolExecutor {
     /// recording instant, previous statuses, and retry disposition are all read
     /// back from server-owned state, and only the criterion-level verdicts come
     /// from the injected [`AnswerEvaluator`].
+    ///
+    /// The question comes from this session's own progression cursor, never from
+    /// the study set's global `active_question` shortcut. `LEARN-004B` made
+    /// progression a per-session cursor, so the shortcut — which takes no session
+    /// and answers with the study set's first active question — names the right
+    /// question only until the cursor first advances. Gating an answer on it
+    /// would refuse the second answer of every session.
     async fn evaluate_spoken_answer(
         &self,
         response_id: &str,
@@ -242,18 +249,10 @@ impl VivaToolExecutor {
         let transcript_confidence =
             optional_confidence_arg(proposal.arguments(), "transcript_confidence")?;
 
-        let question = self.active_question().await?;
-        if question.question_id != question_id {
-            return Err(ToolExecutionError::InvalidArguments(format!(
-                "question `{question_id}` is not active"
-            )));
-        }
-        validate_authorized_rubric(&question)?;
-        let source_ids = authorized_source_ids(&question.rubric);
-
-        // One session-evidence read serves three server-owned bindings: the
-        // replay identity, the previous concept statuses, and the challenged
-        // outcome a replacement may supersede.
+        // One session-evidence read serves four server-owned bindings: the
+        // authorized question this session is on, the replay identity, the
+        // previous concept statuses, and the challenged outcome a replacement may
+        // supersede.
         let evidence = self
             .store
             .session_learning_evidence(
@@ -262,6 +261,9 @@ impl VivaToolExecutor {
                 &self.session.voice_session_id,
             )
             .await?;
+        let question = self.session_question(&evidence, &question_id).await?;
+        validate_authorized_rubric(&question)?;
+        let source_ids = authorized_source_ids(&question.rubric);
         let recorded = RecordedResponse::find(&evidence, response_id);
         let supersedes_response_id =
             bind_supersedes(proposal.arguments(), &evidence, &question.question_id)?;
@@ -582,17 +584,35 @@ impl VivaToolExecutor {
             })
     }
 
-    async fn active_question(&self) -> Result<StudyQuestion, ToolExecutionError> {
-        let mut question = self
-            .store
-            .active_question(&self.session.user_id, &self.session.study_set_id)
-            .await?
-            .ok_or_else(|| {
-                ToolExecutionError::Unavailable(format!(
-                    "no active generated question is available for study set `{}`",
-                    self.session.study_set_id
-                ))
-            })?;
+    /// The question this session is actually on, bound from its own persisted
+    /// progression state.
+    ///
+    /// Two facts are server-owned here and neither comes from the proposal: which
+    /// question this session is on, and what that question's rubric says. The
+    /// caller's `question_id` is only ever checked against the cursor's question —
+    /// a mismatch, or a session that is on no question at all, refuses the turn
+    /// rather than grading an answer against a question the server did not ask.
+    ///
+    /// The source tuple is re-resolved through deterministic retrieval, so a
+    /// stored question citing a source this session cannot retrieve fails closed
+    /// instead of carrying an unverified citation into a persisted outcome.
+    async fn session_question(
+        &self,
+        evidence: &SessionLearningEvidence,
+        question_id: &str,
+    ) -> Result<StudyQuestion, ToolExecutionError> {
+        let mut question = evidence.current_question.clone().ok_or_else(|| {
+            ToolExecutionError::Unavailable(format!(
+                "session `{}` is not on a question, so `{question_id}` cannot be answered",
+                self.session.voice_session_id
+            ))
+        })?;
+        if question.question_id != question_id {
+            return Err(ToolExecutionError::InvalidArguments(format!(
+                "question `{question_id}` is not the question session `{}` is on",
+                self.session.voice_session_id
+            )));
+        }
         question.source = self.canonical_source(&question.source.source_id).await?;
         Ok(question)
     }

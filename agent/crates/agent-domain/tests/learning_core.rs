@@ -24,8 +24,9 @@ use agent_domain::{
         StudySessionRecap as StudySessionRecapV2, VIVA_STUDY_SESSION_RECAP_SCHEMA,
     },
     study_projection::{
-        StudyProjectionConceptV1, StudyProjectionQuestionProgressV1, StudyProjectionReviewItemV1,
-        StudyProjectionSessionV1, StudyProjectionStudySetV1, StudyProjectionVersionV1,
+        StudyProjectionActiveQuestionV1, StudyProjectionConceptV1,
+        StudyProjectionQuestionProgressV1, StudyProjectionReviewItemV1, StudyProjectionSessionV1,
+        StudyProjectionSourceCitationV1, StudyProjectionStudySetV1, StudyProjectionVersionV1,
     },
     AnswerEvaluation,
     AnswerEvaluator,
@@ -776,6 +777,9 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
             user_id: user_id.to_owned(),
             study_set_id: study_set_id.to_owned(),
             voice_session_id: voice_session_id.to_owned(),
+            // This single-question store keeps the session on its one authorized
+            // question for the whole session.
+            current_question: self.question.clone(),
             outcomes: self.recorded_outcomes(),
             concept_labels: self.concept_labels.clone(),
             // Under D-01A the recap's review entries are the persisted decisions,
@@ -4464,4 +4468,714 @@ fn session_completion_terminal_reason_is_the_only_declaration() {
             );
         }
     }
+}
+
+// ===========================================================================
+// LEARN-004B x LEARN-002 — the session's own second answer
+//
+// Progression is a persisted, session-scoped cursor; the study set's
+// `active_question` shortcut is global and session-blind. The store below
+// implements both faithfully, so the two-turn sequence a real session runs
+// (`select_next_question` -> `evaluate_spoken_answer` -> `select_next_question`
+// -> `evaluate_spoken_answer`) crosses exactly the seam where those two
+// authorities can disagree.
+// ===========================================================================
+
+/// A store that answers both authorities exactly as their port contracts
+/// document them.
+///
+/// * `active_question` is the study-set-wide shortcut: it takes no session and no
+///   cursor, so — like `InMemoryStudyStore` — it always answers with the first
+///   active question in persisted ingestion order.
+/// * `select_next_question` is the `OrderedV1` session cursor: it selects the
+///   first active question this session has not completed, and
+///   `record_turn_outcome` applies the outcome's disposition to that cursor in
+///   the same call that persists the outcome.
+///
+/// Every other method is real hand-derived behaviour over the same persisted
+/// state; nothing here fabricates a learner fact, and an unimplemented path
+/// keeps the trait's fail-closed default.
+struct FakeSessionTurnStore {
+    voice_session_id: String,
+    questions: BTreeMap<String, StudyQuestion>,
+    /// Active question IDs in persisted ingestion order.
+    active_order: Vec<String>,
+    sources: BTreeMap<String, StudySourceReference>,
+    concept_labels: Vec<ConceptLabel>,
+    cursor: Mutex<QuestionProgressionCursor>,
+    selections: Mutex<BTreeMap<String, QuestionProgressionResult>>,
+    outcomes: Mutex<Vec<TurnOutcome>>,
+    statuses: Mutex<BTreeMap<String, ConceptStatus>>,
+    schedule_decisions: Mutex<Vec<(String, String, ReviewScheduleDecisionV1)>>,
+}
+
+impl FakeSessionTurnStore {
+    fn from_fixture(fixture: &ProgressionFixture) -> Self {
+        let mut sources = BTreeMap::new();
+        let mut concept_labels = Vec::new();
+        for (question_id, question) in &fixture.questions {
+            sources.insert(question.source.source_id.clone(), question.source.clone());
+            concept_labels.push(ConceptLabel {
+                concept_id: question.concept_id.clone(),
+                label: format!("Concept behind {question_id}"),
+            });
+        }
+        Self {
+            voice_session_id: fixture.voice_session_id.clone(),
+            questions: fixture.questions.clone(),
+            active_order: fixture.active_question_ids.clone(),
+            sources,
+            concept_labels,
+            cursor: Mutex::new(
+                fixture
+                    .cursors
+                    .get("initial")
+                    .expect("the fixture pins an initial cursor")
+                    .clone(),
+            ),
+            selections: Mutex::new(BTreeMap::new()),
+            outcomes: Mutex::new(Vec::new()),
+            statuses: Mutex::new(BTreeMap::new()),
+            schedule_decisions: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn cursor(&self) -> QuestionProgressionCursor {
+        self.cursor.lock().expect("cursor lock").clone()
+    }
+
+    fn recorded_outcomes(&self) -> Vec<TurnOutcome> {
+        self.outcomes.lock().expect("outcomes lock").clone()
+    }
+
+    fn status(&self, concept_id: &str) -> ConceptStatus {
+        self.statuses
+            .lock()
+            .expect("statuses lock")
+            .get(concept_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn total(&self) -> u32 {
+        u32::try_from(self.active_order.len()).expect("small question count")
+    }
+}
+
+#[async_trait::async_trait]
+impl agent_domain::StudyMemoryStore for FakeSessionTurnStore {
+    /// The study set's global shortcut, faithful to the port contract: no
+    /// session, no cursor, always the first active question in ingestion order.
+    async fn active_question(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+    ) -> Result<Option<StudyQuestion>, PortError> {
+        Ok(self
+            .active_order
+            .first()
+            .and_then(|question_id| self.questions.get(question_id))
+            .cloned())
+    }
+
+    async fn study_context(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+    ) -> Result<Option<Value>, PortError> {
+        Ok(None)
+    }
+
+    async fn source_reference(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        Ok(self.sources.get(source_id).cloned())
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        response_id: &str,
+        _evaluation: AnswerEvaluation,
+    ) -> Result<Value, PortError> {
+        Err(PortError::unavailable(
+            "fake_session_turn_store",
+            response_id,
+            "record_answer_evaluation is retired by the turn-outcome authority",
+        ))
+    }
+
+    async fn record_concept_status(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        _response_id: &str,
+        concept_id: &str,
+        _status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        Err(PortError::unavailable(
+            "fake_session_turn_store",
+            concept_id,
+            "independent concept status writes are retired",
+        ))
+    }
+
+    async fn schedule_review_item(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        concept_id: &str,
+        _due_at: &str,
+    ) -> Result<Value, PortError> {
+        Err(PortError::unavailable(
+            "fake_session_turn_store",
+            concept_id,
+            "legacy due-date writes are not implemented by this store",
+        ))
+    }
+
+    async fn record_recap(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+        _response_id: &str,
+        _recap: agent_domain::StudySessionRecap,
+    ) -> Result<Value, PortError> {
+        Err(PortError::unavailable(
+            "fake_session_turn_store",
+            voice_session_id,
+            "recap persistence is not part of this two-turn contract",
+        ))
+    }
+
+    async fn review_scheduling_context(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<ReviewSchedulingContextV1, PortError> {
+        let card = self
+            .schedule_decisions
+            .lock()
+            .expect("schedule decisions lock")
+            .iter()
+            .rfind(|(_, stored_concept, _)| stored_concept == concept_id)
+            .map(|(_, _, decision)| decision.card.clone());
+        Ok(ReviewSchedulingContextV1 {
+            schema_version: VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+            exam_at: None,
+            card,
+        })
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        decision: ReviewScheduleDecisionV1,
+    ) -> Result<Value, PortError> {
+        decision.validate().map_err(|error| {
+            PortError::invalid_input("fake_session_turn_store", concept_id, error.to_string())
+        })?;
+        let mut rows = self
+            .schedule_decisions
+            .lock()
+            .expect("schedule decisions lock");
+        if let Some((_, _, stored)) = rows.iter().find(|(stored_response, stored_concept, _)| {
+            stored_response == response_id && stored_concept == concept_id
+        }) {
+            return Ok(stored.public_summary(concept_id));
+        }
+        let summary = decision.public_summary(concept_id);
+        rows.push((response_id.to_owned(), concept_id.to_owned(), decision));
+        Ok(summary)
+    }
+
+    /// The outcome transaction: the persisted outcome and the cursor move
+    /// together, so an `Advance` completes the question the session was on.
+    async fn record_turn_outcome(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        outcome: TurnOutcome,
+    ) -> Result<PersistedTurnOutcome, PortError> {
+        let mut outcomes = self.outcomes.lock().expect("outcomes lock");
+        if let Some(stored) = outcomes
+            .iter()
+            .find(|stored| stored.response_id == outcome.response_id)
+        {
+            if *stored != outcome {
+                return Err(PortError::conflict(
+                    "fake_session_turn_store",
+                    &outcome.response_id,
+                    "a different payload was already recorded for this response",
+                ));
+            }
+            return Ok(PersistedTurnOutcome {
+                turn_outcome: stored.clone(),
+                record: TurnOutcomeRecordReceipt {
+                    schema: VIVA_TURN_OUTCOME_RECORD_SCHEMA.to_owned(),
+                    response_id: outcome.response_id.clone(),
+                    replayed: true,
+                },
+            });
+        }
+
+        if let TurnResolution::Evaluated {
+            concept_transitions,
+            ..
+        } = &outcome.resolution
+        {
+            let mut statuses = self.statuses.lock().expect("statuses lock");
+            for transition in concept_transitions {
+                let previous = statuses
+                    .get(&transition.concept_id)
+                    .cloned()
+                    .unwrap_or_default();
+                if previous != transition.from_status {
+                    return Err(PortError::conflict(
+                        "fake_session_turn_store",
+                        &transition.concept_id,
+                        "transition does not start from the persisted status",
+                    ));
+                }
+            }
+            for transition in concept_transitions {
+                statuses.insert(transition.concept_id.clone(), transition.to_status.clone());
+            }
+        }
+
+        let disposition = match &outcome.resolution {
+            TurnResolution::Evaluated { disposition, .. }
+            | TurnResolution::Deferred { disposition, .. } => *disposition,
+        };
+        let mut cursor = self.cursor.lock().expect("cursor lock");
+        if disposition == QuestionDisposition::Advance {
+            if let Some(current) = cursor.current_question_id.take() {
+                if !cursor.completed_question_ids.contains(&current) {
+                    cursor.completed_question_ids.push(current);
+                }
+            }
+        }
+        drop(cursor);
+
+        outcomes.push(outcome.clone());
+        Ok(PersistedTurnOutcome {
+            record: TurnOutcomeRecordReceipt {
+                schema: VIVA_TURN_OUTCOME_RECORD_SCHEMA.to_owned(),
+                response_id: outcome.response_id.clone(),
+                replayed: false,
+            },
+            turn_outcome: outcome,
+        })
+    }
+
+    async fn session_learning_evidence(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<SessionLearningEvidence, PortError> {
+        let cursor = self.cursor();
+        Ok(SessionLearningEvidence {
+            user_id: user_id.to_owned(),
+            study_set_id: study_set_id.to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            // The cursor's own question, not the study set's first active one.
+            current_question: cursor
+                .current_question_id
+                .as_ref()
+                .and_then(|question_id| self.questions.get(question_id))
+                .cloned(),
+            outcomes: self.recorded_outcomes(),
+            concept_labels: self.concept_labels.clone(),
+            review_decisions: Vec::new(),
+        })
+    }
+
+    /// The session-scoped read model. Its `active_question` is the cursor's own
+    /// current question, never the study set's global first one.
+    async fn authenticated_study_projection(
+        &self,
+        _user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<AuthenticatedStudyProjectionV1, PortError> {
+        let cursor = self.cursor();
+        let active_question = cursor
+            .current_question_id
+            .as_ref()
+            .and_then(|question_id| self.questions.get(question_id))
+            .map(|question| StudyProjectionActiveQuestionV1 {
+                id: question.question_id.clone(),
+                concept_id: question.concept_id.clone(),
+                prompt: question.prompt.clone(),
+                source_citations: vec![StudyProjectionSourceCitationV1 {
+                    source_id: question.source.source_id.clone(),
+                    document_id: question.source.document_id.clone(),
+                    span: question.source.span.clone(),
+                    label: question.source.span.clone(),
+                    confidence: question.source.confidence.clone(),
+                }],
+            });
+        Ok(AuthenticatedStudyProjectionV1 {
+            version: StudyProjectionVersionV1,
+            study_set: StudyProjectionStudySetV1 {
+                id: study_set_id.to_owned(),
+                title: "Cellular respiration".to_owned(),
+                course: None,
+                exam_label: None,
+                ingestion_status: StudySetIngestionStatus::Ready,
+            },
+            session: StudyProjectionSessionV1 {
+                id: voice_session_id.to_owned(),
+                mode: StudyMode::Quiz,
+                goal: None,
+            },
+            concepts: self
+                .concept_labels
+                .iter()
+                .map(|label| StudyProjectionConceptV1 {
+                    id: label.concept_id.clone(),
+                    label: label.label.clone(),
+                    status: self.status(&label.concept_id),
+                    last_reviewed_at: None,
+                    due_at: None,
+                })
+                .collect(),
+            active_question,
+            question_progress: StudyProjectionQuestionProgressV1 {
+                completed: u32::try_from(cursor.completed_question_ids.len())
+                    .expect("small question count"),
+                total: self.total(),
+            },
+            review_schedule: Vec::new(),
+        })
+    }
+
+    async fn select_next_question(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        policy: ProgressionPolicyId,
+    ) -> Result<QuestionProgressionResult, PortError> {
+        if voice_session_id != self.voice_session_id {
+            return Err(PortError::invalid_input(
+                "fake_session_turn_store",
+                voice_session_id,
+                "the cursor belongs to a different voice session",
+            ));
+        }
+        if policy != ProgressionPolicyId::OrderedV1 {
+            return Err(PortError::unavailable(
+                "fake_session_turn_store",
+                voice_session_id,
+                "only the selected ordered_v1 progression policy is implemented",
+            ));
+        }
+
+        let mut selections = self.selections.lock().expect("selections lock");
+        if let Some(stored) = selections.get(response_id) {
+            return Ok(stored.clone());
+        }
+
+        let mut cursor = self.cursor.lock().expect("cursor lock");
+        let total = self.total();
+        let current = cursor
+            .current_question_id
+            .clone()
+            .filter(|id| !cursor.completed_question_ids.contains(id));
+        let selected = match current {
+            Some(id) => Some(id),
+            None => self
+                .active_order
+                .iter()
+                .find(|id| !cursor.completed_question_ids.contains(id))
+                .cloned(),
+        };
+
+        let result = match selected {
+            None => {
+                cursor.current_question_id = None;
+                cursor.revision += 1;
+                QuestionProgressionResult::Exhausted {
+                    completed: u32::try_from(cursor.completed_question_ids.len())
+                        .expect("small question count"),
+                    total,
+                    revision: cursor.revision,
+                }
+            }
+            Some(question_id) => {
+                let ordinal = self
+                    .active_order
+                    .iter()
+                    .position(|id| id == &question_id)
+                    .map(|index| u32::try_from(index + 1).expect("small question count"))
+                    .ok_or_else(|| {
+                        PortError::invalid_input(
+                            "fake_session_turn_store",
+                            &question_id,
+                            "the cursor names a question that is not active",
+                        )
+                    })?;
+                let question = self.questions.get(&question_id).cloned().ok_or_else(|| {
+                    PortError::invalid_input(
+                        "fake_session_turn_store",
+                        &question_id,
+                        "the cursor names a question this store does not hold",
+                    )
+                })?;
+                let repeat = cursor.current_question_id.as_deref() == Some(question_id.as_str());
+                let attempt = cursor
+                    .attempt_counts
+                    .entry(question_id.clone())
+                    .or_insert(0);
+                *attempt += 1;
+                let attempt = *attempt;
+                cursor.current_question_id = Some(question_id);
+                cursor.revision += 1;
+                if repeat {
+                    QuestionProgressionResult::Retry {
+                        question,
+                        ordinal,
+                        total,
+                        attempt,
+                        revision: cursor.revision,
+                    }
+                } else {
+                    QuestionProgressionResult::Selected {
+                        question,
+                        ordinal,
+                        total,
+                        selection_reason: "ordered_v1:first_active_uncompleted".to_owned(),
+                        revision: cursor.revision,
+                    }
+                }
+            }
+        };
+        selections.insert(response_id.to_owned(), result.clone());
+        Ok(result)
+    }
+}
+
+fn session_turn_executor(
+    store: &Arc<FakeSessionTurnStore>,
+    evaluator: Arc<dyn AnswerEvaluator>,
+) -> VivaToolExecutor {
+    VivaToolExecutor::with_clock(
+        Arc::clone(store) as Arc<dyn agent_domain::StudyMemoryStore>,
+        AuthorizedStudySession {
+            user_id: USER_ID.to_owned(),
+            study_set_id: STUDY_SET_ID.to_owned(),
+            voice_session_id: store.voice_session_id.clone(),
+            active_concepts: Vec::new(),
+        },
+        evaluator,
+        Arc::new(FixedClock::new(
+            agent_domain::parse_utc_instant(NOW).expect("clock instant parses"),
+        )),
+    )
+}
+
+/// The question this session's cursor is on, as the server itself reports it.
+fn selected_question(result: &Value) -> StudyQuestion {
+    match progression_from(result) {
+        QuestionProgressionResult::Selected { question, .. }
+        | QuestionProgressionResult::Retry { question, .. } => question,
+        QuestionProgressionResult::Exhausted { .. } => {
+            panic!("the session still has an uncompleted question")
+        }
+    }
+}
+
+/// One satisfied assessment per rubric criterion of the supplied question, at a
+/// confidence the locked policy reads as `Strong`.
+fn satisfies(question: &StudyQuestion) -> EvaluationDecision {
+    EvaluationDecision::Evaluated {
+        assessments: question
+            .rubric
+            .criteria
+            .iter()
+            .map(|criterion| {
+                assessment(
+                    &criterion.criterion_id,
+                    CriterionAssessmentKind::Satisfied,
+                    0.93,
+                )
+            })
+            .collect(),
+        concise_feedback: "Server-authorized feedback about the bound rubric claims.".to_owned(),
+        retry_prompt: None,
+    }
+}
+
+/// The full two-turn sequence a real session runs.
+///
+/// Turn one answers the question the cursor selected; its `Advance` completes
+/// that question and moves the cursor to the second. Turn two answers the
+/// question the server itself just selected, so it must be evaluated — the
+/// global first-active-question shortcut still names question one, and a gate
+/// that consults it would reject the second answer of every session.
+#[tokio::test]
+async fn session_cursor_evaluates_the_second_answer_of_the_session() {
+    let fixture = progression_fixture();
+    let store = Arc::new(FakeSessionTurnStore::from_fixture(&fixture));
+
+    let first_selection = session_turn_executor(&store, Arc::new(UnreachableEvaluator))
+        .execute(
+            "sel-1",
+            ToolProposal::select_next_question(STUDY_SET_ID, &store.voice_session_id, "quiz"),
+        )
+        .await
+        .expect("the first selection succeeds")
+        .result;
+    let first_question = selected_question(&first_selection);
+    assert_eq!(first_question.question_id, fixture.active_question_ids[0]);
+
+    let first_answer =
+        session_turn_executor(&store, ScriptedEvaluator::once(satisfies(&first_question)))
+            .execute(
+                "ans-1",
+                ToolProposal::evaluate_spoken_answer(
+                    STUDY_SET_ID,
+                    &store.voice_session_id,
+                    &first_question.question_id,
+                    "NADH hands its electrons to the first complex of the chain.",
+                ),
+            )
+            .await
+            .expect("the first answer of the session is evaluated")
+            .result;
+    let first_outcome = turn_outcome_from(&first_answer);
+    assert_eq!(first_outcome.question_id, first_question.question_id);
+    assert_eq!(
+        store.cursor().completed_question_ids,
+        vec![first_question.question_id.clone()],
+        "an evaluated Advance completes the question the session was on",
+    );
+
+    let second_selection = session_turn_executor(&store, Arc::new(UnreachableEvaluator))
+        .execute(
+            "sel-2",
+            ToolProposal::select_next_question(STUDY_SET_ID, &store.voice_session_id, "quiz"),
+        )
+        .await
+        .expect("the second selection succeeds")
+        .result;
+    let second_question = selected_question(&second_selection);
+    assert_eq!(second_question.question_id, fixture.active_question_ids[1]);
+    assert_ne!(second_question.question_id, first_question.question_id);
+
+    let second_answer = session_turn_executor(
+        &store,
+        ScriptedEvaluator::once(satisfies(&second_question)),
+    )
+    .execute(
+        "ans-2",
+        ToolProposal::evaluate_spoken_answer(
+            STUDY_SET_ID,
+            &store.voice_session_id,
+            &second_question.question_id,
+            "Protons are pumped out, so the gradient runs back inward.",
+        ),
+    )
+    .await
+    .expect(
+        "the second answer of the session is evaluated against the question the server selected",
+    )
+    .result;
+
+    let second_outcome = turn_outcome_from(&second_answer);
+    assert_eq!(second_outcome.question_id, second_question.question_id);
+    assert_eq!(
+        second_outcome.rubric_policy_version, second_question.rubric.policy_version,
+        "the second turn grades against the second question's own rubric",
+    );
+    let (label, _, transitions) = evaluated_parts(&second_outcome);
+    assert_eq!(label, EvaluationLabel::Strong);
+    assert_eq!(
+        transitions,
+        vec![(second_question.concept_id.clone(), ConceptStatus::Strong)],
+        "mastery moves on the second question's concept, not the first question's",
+    );
+    assert_eq!(
+        store.cursor().completed_question_ids,
+        vec![
+            first_question.question_id.clone(),
+            second_question.question_id.clone()
+        ],
+    );
+}
+
+/// The gate the session cursor replaces must lose none of its authority: a
+/// session that is on no question grades nothing at all, an answer to a question
+/// this session is not on is still refused, and neither refusal costs an
+/// evaluator call or a persisted outcome.
+#[tokio::test]
+async fn session_cursor_refuses_an_answer_to_a_question_the_session_is_not_on() {
+    let fixture = progression_fixture();
+    let store = Arc::new(FakeSessionTurnStore::from_fixture(&fixture));
+
+    // Before the first selection the cursor is on nothing, and the study set's
+    // global shortcut would still happily name its first active question.
+    let unasked = session_turn_executor(&store, Arc::new(UnreachableEvaluator))
+        .execute(
+            "ans-0",
+            ToolProposal::evaluate_spoken_answer(
+                STUDY_SET_ID,
+                &store.voice_session_id,
+                &fixture.active_question_ids[0],
+                "An answer offered before the server asked anything.",
+            ),
+        )
+        .await
+        .expect_err("a session on no question cannot grade an answer");
+    assert!(
+        matches!(unasked, ToolExecutionError::Unavailable(_)),
+        "a session on no question fails closed, got {unasked:?}",
+    );
+
+    session_turn_executor(&store, Arc::new(UnreachableEvaluator))
+        .execute(
+            "sel-1",
+            ToolProposal::select_next_question(STUDY_SET_ID, &store.voice_session_id, "quiz"),
+        )
+        .await
+        .expect("the first selection succeeds");
+
+    let unselected = &fixture.active_question_ids[2];
+    let error = session_turn_executor(&store, Arc::new(UnreachableEvaluator))
+        .execute(
+            "ans-1",
+            ToolProposal::evaluate_spoken_answer(
+                STUDY_SET_ID,
+                &store.voice_session_id,
+                unselected,
+                "An answer to a question this session was never asked.",
+            ),
+        )
+        .await
+        .expect_err("a question the session is not on cannot be graded");
+    assert!(
+        matches!(error, ToolExecutionError::InvalidArguments(ref message) if message.contains(unselected)),
+        "the refusal names the unauthorized question, got {error:?}",
+    );
+    assert!(
+        store.recorded_outcomes().is_empty(),
+        "a refused answer persists no outcome",
+    );
 }
