@@ -332,7 +332,7 @@ pub fn assert_schema_has_no_raw_payload_columns() -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::memory::{validate_challenge_resolution, validate_turn_outcome};
     use crate::PostgresStudyStore;
@@ -399,7 +399,7 @@ mod tests {
     /// question activity are all per-schema, so two cases running against the same
     /// database cannot see each other's rows or convince each other that a migration
     /// has already run.
-    struct PostgresSchemaFixture {
+    pub(crate) struct PostgresSchemaFixture {
         admin_pool: sqlx::PgPool,
         pool: sqlx::PgPool,
         /// Always self-generated as `viva_data_test_{uuid simple}`; never derived
@@ -409,7 +409,7 @@ mod tests {
 
     impl PostgresSchemaFixture {
         /// A fresh schema with the full sqlx-ledger migration chain applied.
-        async fn migrated() -> Self {
+        pub(crate) async fn migrated() -> Self {
             let fixture = Self::empty().await;
             run_migrations(&fixture.pool)
                 .await
@@ -453,14 +453,14 @@ mod tests {
             }
         }
 
-        fn pool(&self) -> &sqlx::PgPool {
+        pub(crate) fn pool(&self) -> &sqlx::PgPool {
             &self.pool
         }
 
         /// Cleanup is an assertion, not a best-effort side effect: a schema that
         /// cannot be dropped leaks state into the next run, and the test that leaked
         /// it is the one that must say so.
-        async fn cleanup(self) -> Result<(), sqlx::Error> {
+        pub(crate) async fn cleanup(self) -> Result<(), sqlx::Error> {
             self.pool.close().await;
             assert!(
                 is_generated_test_schema_name(&self.schema_name),
@@ -4620,8 +4620,8 @@ mod tests {
     // is a difference in the store and never in the test data.
     // ------------------------------------------------------------------
 
-    const LEARNING_USER_ID: &str = "user-101";
-    const LEARNING_SET_ID: &str = "set-cellular-respiration";
+    pub(crate) const LEARNING_USER_ID: &str = "user-101";
+    pub(crate) const LEARNING_SET_ID: &str = "set-cellular-respiration";
 
     #[derive(Deserialize)]
     struct LearningProgressionFixture {
@@ -4642,8 +4642,8 @@ mod tests {
     }
 
     #[derive(Deserialize)]
-    struct LearningEvidenceFixture {
-        evidence: std::collections::BTreeMap<String, SessionLearningEvidence>,
+    pub(crate) struct LearningEvidenceFixture {
+        pub(crate) evidence: std::collections::BTreeMap<String, SessionLearningEvidence>,
         recaps: std::collections::BTreeMap<String, StudySessionRecap>,
     }
 
@@ -4661,7 +4661,7 @@ mod tests {
         .expect("learning-core turn outcome fixture is valid")
     }
 
-    fn evidence_fixture() -> LearningEvidenceFixture {
+    pub(crate) fn evidence_fixture() -> LearningEvidenceFixture {
         serde_json::from_str(include_str!(
             "../../../fixtures/learning-core/recaps-v1.json"
         ))
@@ -4674,7 +4674,7 @@ mod tests {
     /// fixture. Two extra inactive questions and two extra source spans exist only
     /// because the evidence fixtures cite them; they carry no fixture-pinned
     /// content and are never part of a compared value.
-    struct LearningCoreSeed {
+    pub(crate) struct LearningCoreSeed {
         documents: Vec<(String, String)>,
         sources: Vec<StudySourceReference>,
         concepts: Vec<(String, String, ConceptStatus)>,
@@ -4719,7 +4719,7 @@ mod tests {
         }
     }
 
-    fn learning_core_seed() -> LearningCoreSeed {
+    pub(crate) fn learning_core_seed() -> LearningCoreSeed {
         let fixture = progression_fixture();
         let mut questions = Vec::new();
         let mut sources = Vec::new();
@@ -4803,7 +4803,7 @@ mod tests {
         }
     }
 
-    fn seed_learning_core_memory(seed: &LearningCoreSeed) -> crate::InMemoryStudyStore {
+    pub(crate) fn seed_learning_core_memory(seed: &LearningCoreSeed) -> crate::InMemoryStudyStore {
         let store = crate::InMemoryStudyStore::new();
         store.upsert_study_set(crate::StudySetRecord {
             study_set_id: LEARNING_SET_ID.to_owned(),
@@ -4859,7 +4859,10 @@ mod tests {
         store
     }
 
-    async fn open_learning_session(store: &dyn StudyMemoryStore, voice_session_id: &str) {
+    pub(crate) async fn open_learning_session(
+        store: &dyn StudyMemoryStore,
+        voice_session_id: &str,
+    ) {
         let outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new(voice_session_id)),
@@ -4873,7 +4876,7 @@ mod tests {
         assert_eq!(outcome, StudyStoreWriteOutcome::Inserted);
     }
 
-    async fn seed_learning_core_postgres(pool: &sqlx::PgPool, seed: &LearningCoreSeed) {
+    pub(crate) async fn seed_learning_core_postgres(pool: &sqlx::PgPool, seed: &LearningCoreSeed) {
         sqlx::query(
             "INSERT INTO study_sets (id, user_id, title, course, ingestion_status, ingestion_error)
              VALUES ($1, $2, 'Cellular respiration', 'BIO 201', 'ready', NULL)",
@@ -7342,10 +7345,10 @@ mod tests {
             .study_sets
             .iter()
             .all(|summary| summary.id != LEARNING_SET_ID));
-        // This backend reports an unavailable set as a typed error rather than
-        // `Ok(None)`; the durable backend reports `Ok(None)`. That `Option`-versus-
-        // error split predates this task and belongs to Plan 06's port contract —
-        // what matters here is that neither backend returns a question.
+        // Both backends report an unavailable set as `Unavailable`. `Ok(None)` means
+        // the different thing "this readable set has no active question left", and
+        // one backend used to answer a tombstone with it; `DATA-015`'s shared
+        // conformance suite closed that split.
         assert_eq!(
             store
                 .active_question(LEARNING_USER_ID, LEARNING_SET_ID)
@@ -7440,12 +7443,15 @@ mod tests {
             .study_sets
             .iter()
             .all(|summary| summary.id != LEARNING_SET_ID));
+        // `DATA-011`: the same `Unavailable` the in-memory backend gives. A
+        // tombstoned set is not a readable set with no question left.
         assert_eq!(
             store
                 .active_question(LEARNING_USER_ID, LEARNING_SET_ID)
                 .await
-                .expect("active question lookup"),
-            None
+                .expect_err("a tombstone has no active question")
+                .kind(),
+            PortErrorKind::Unavailable
         );
         assert_eq!(
             store

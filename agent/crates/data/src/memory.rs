@@ -3421,6 +3421,14 @@ impl StudyMemoryStore for InMemoryStudyStore {
         if study_set.user_id != user_id {
             return Ok(None);
         }
+        // `DATA-004`/D-05 `HARD_PURGE_TEXT`: a tombstoned set is not part of any
+        // ordinary read projection. Postgres already excludes it with
+        // `deleted_at IS NULL`; without this, one backend answered a deleted set's
+        // context with its scrubbed tombstone — content-free, but still an
+        // existence answer the other backend refuses to give.
+        if state.deleted_study_sets.contains_key(study_set_id) {
+            return Ok(None);
+        }
         let documents = state
             .documents
             .values()

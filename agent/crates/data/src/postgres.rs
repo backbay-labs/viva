@@ -406,12 +406,60 @@ impl PostgresStudyStore {
     /// have to race each other so their conflict-safe upserts are what proves
     /// convergence. `FOR SHARE` conflicts with `FOR UPDATE` and with the deletion's
     /// `UPDATE`, and with nothing else.
+    /// `DATA-004`/`DATA-010`: one global lock order — study-set row, then session
+    /// rows, then children.
+    ///
+    /// Every artifact writer already ends up holding a `FOR KEY SHARE` lock on its
+    /// study set's row, because every artifact table has a foreign key to
+    /// `study_sets` and PostgreSQL takes that lock when the row is inserted — which
+    /// is *after* the writer locked its session row. `delete_study_set` takes the
+    /// same two locks in the opposite order (`study_sets FOR UPDATE`, then sessions
+    /// `FOR UPDATE`). Two transactions taking the same two locks in opposite orders
+    /// is a deadlock, and a delete racing a concept-status or turn-outcome write
+    /// produced exactly that, intermittently, as a `Durability` error on a delete
+    /// that `DATA-004` requires to succeed.
+    ///
+    /// Taking the study-set lock explicitly and first makes the order global. It
+    /// stays `FOR KEY SHARE`, which is what the foreign key would have taken
+    /// anyway: concurrent writers still do not serialize against each other, and
+    /// only the deletion's `FOR UPDATE` excludes them. It also carries the
+    /// tombstone guard, so a writer that arrives after a committed deletion is
+    /// refused here instead of at its own insert.
+    async fn lock_active_study_set(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: &str,
+        study_set_uuid: Uuid,
+    ) -> Result<(), PortError> {
+        let locked = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id
+             FROM study_sets
+             WHERE id = $1
+               AND user_id = $2
+               AND deleted_at IS NULL
+             FOR KEY SHARE",
+        )
+        .bind(study_set_uuid)
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(pg_error)?;
+        if locked.is_some() {
+            return Ok(());
+        }
+        Err(PortError::unavailable(
+            "postgres",
+            study_set_uuid.to_string(),
+            "study set is not available for this user",
+        ))
+    }
+
     async fn lock_open_session_shared(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         user_id: &str,
         study_set_uuid: Uuid,
         voice_session_uuid: Uuid,
     ) -> Result<(), PortError> {
+        Self::lock_active_study_set(tx, user_id, study_set_uuid).await?;
         let locked = sqlx::query_scalar::<_, Uuid>(
             "SELECT id
              FROM voice_sessions
@@ -443,6 +491,7 @@ impl PostgresStudyStore {
         study_set_uuid: Uuid,
         voice_session_uuid: Uuid,
     ) -> Result<(), PortError> {
+        Self::lock_active_study_set(tx, user_id, study_set_uuid).await?;
         let locked = sqlx::query_scalar::<_, Uuid>(
             "SELECT id
              FROM voice_sessions
@@ -2318,21 +2367,34 @@ impl StudyMemoryStore for PostgresStudyStore {
         // that store them (migration `0018`), not recovered by rule from the
         // question id: an authored question whose concept is not `q-{concept}` is a
         // question the derivation could never have described.
-        let owned = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(
-                SELECT 1 FROM study_sets
-                WHERE id = $1
-                  AND user_id = $2
-                  AND ingestion_status = 'ready'
-                  AND deleted_at IS NULL
-             )",
+        //
+        // `DATA-011`: one ownership answer, shared with memory. A set that does not
+        // exist, belongs to another user, or has been tombstoned is `Unavailable` —
+        // the same fail-closed answer the in-memory guard gives — and never
+        // `Ok(None)`, which means the different thing "this readable set has no
+        // active question left". Collapsing the two hid deletion behind an ordinary
+        // empty read on exactly one backend. Readiness stays `Ok(None)`, because a
+        // pending or failed set is readable and simply has no question yet.
+        let ingestion_status = sqlx::query_scalar::<_, String>(
+            "SELECT ingestion_status
+             FROM study_sets
+             WHERE id = $1
+               AND user_id = $2
+               AND deleted_at IS NULL",
         )
         .bind(study_set_uuid)
         .bind(user_id)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(pg_error)?;
-        if !owned {
+        let Some(ingestion_status) = ingestion_status else {
+            return Err(PortError::unavailable(
+                "postgres",
+                study_set_id,
+                "study set is not available for this user",
+            ));
+        };
+        if ingestion_status != StudySetIngestionStatus::Ready.as_str() {
             return Ok(None);
         }
         Ok(Self::active_questions(&self.pool, study_set_uuid)
