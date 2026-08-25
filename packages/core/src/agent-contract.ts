@@ -2,14 +2,23 @@ export const VIVA_VOICE_PROTOCOL_VERSION = 5 as const;
 /** v5 is the only accepted and emitted version; v4 input is rejected, never upgraded. */
 export const VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS = [VIVA_VOICE_PROTOCOL_VERSION] as const;
 export const VIVA_VOICE_SAMPLE_RATE_HZ = 24_000;
+export const VIVA_VOICE_CHANNELS = 1 as const;
+/** `pcm_s16le` is a signed 16-bit sample, so two bytes. */
+export const VIVA_VOICE_BYTES_PER_SAMPLE = 2 as const;
 export const VIVA_VOICE_INPUT_ENCODING = "pcm_s16le";
 export const VIVA_VOICE_MAX_TEXT_FRAME_BYTES = 64 * 1024;
-export const VIVA_VOICE_MAX_BINARY_FRAME_BYTES = 256 * 1024;
+/** The 45-second bound on one browser turn. */
+export const VIVA_VOICE_MAX_TURN_SECONDS = 45 as const;
 
 /** Alias of the existing 24 kHz voice constant; one literal source. */
 export const VIVA_AUDIO_SAMPLE_RATE_HZ = VIVA_VOICE_SAMPLE_RATE_HZ;
 export const VIVA_AUDIO_MAX_CHUNK_SAMPLES = 4_096 as const;
 export const VIVA_AUDIO_MAX_CHUNK_BYTES = 8_192 as const;
+/**
+ * `VOICE-SIZE-002`: the maximum chunk in canonical RFC 4648 base64 *with* padding.
+ * This is a derived ceiling, never a second size authority.
+ */
+export const VIVA_AUDIO_MAX_CHUNK_BASE64_CHARS = 10_924 as const;
 export const VIVA_AUDIO_MAX_TURN_SAMPLES = 1_080_000 as const;
 export const VIVA_AUDIO_MAX_TURN_BYTES = 2_160_000 as const;
 
@@ -564,6 +573,38 @@ export function parseVivaClientFrame(value: unknown): VivaClientFrame {
 }
 
 /**
+ * `VOICE-SIZE-002`: the wire envelope is measured in UTF-8 bytes and rejected above the
+ * unchanged 64 KiB text-frame cap *before* any nested parsing, so an oversized payload
+ * is never allocated into a document tree.
+ */
+export function parseVivaClientFrameJson(json: string): VivaClientFrame {
+  return parseVivaClientFrame(parseVivaVoiceWireJson(json));
+}
+
+export function parseVivaServerFrameJson(json: string): VivaServerFrame {
+  return parseVivaServerFrame(parseVivaVoiceWireJson(json));
+}
+
+function parseVivaVoiceWireJson(json: string): unknown {
+  if (new TextEncoder().encode(json).length > VIVA_VOICE_MAX_TEXT_FRAME_BYTES) {
+    throw new VivaVoiceProtocolError(
+      "VOICE_PROTOCOL_FRAME_TOO_LARGE",
+      "$",
+      "Viva voice frame exceeds the maximum text frame size",
+    );
+  }
+  try {
+    return JSON.parse(json) as unknown;
+  } catch {
+    throw new VivaVoiceProtocolError(
+      "VOICE_PROTOCOL_MALFORMED_JSON",
+      "$",
+      "Malformed Viva voice frame JSON",
+    );
+  }
+}
+
+/**
  * Sequence numbers start at 0, are contiguous, and cannot be reused. Fractional,
  * negative, and unsafe integers fail closed before any allocation.
  */
@@ -574,22 +615,69 @@ function requireSequenceNumber(value: unknown, label: string): number {
   return value;
 }
 
+/** The one JSON path a rejected audio payload is ever reported at. */
+const PCM16_BASE64_PATH = "$.frame.pcm16_base64";
+
+/**
+ * Decodes `frame.pcm16_base64` only long enough to enforce canonical padded base64 and
+ * the raw byte bounds. The decoded bytes are dropped here; they are never stored,
+ * logged, or copied into a diagnostic. The aggregate turn bound stays in Plan 03's
+ * stateful assembler, which consumes the same constants.
+ */
 function parseAudioChunkPayload(value: unknown): AgentAudioFrame {
   const frame = requireRecord(value, "audio chunk");
-  const encoded = requireNonEmptyString(frame.pcm16_base64, "pcm16_base64");
-  let byteLength: number;
+  if (!("pcm16_base64" in frame)) {
+    throw new VivaVoiceProtocolError(
+      "VOICE_PROTOCOL_MISSING_FIELD",
+      PCM16_BASE64_PATH,
+      "Missing pcm16_base64",
+    );
+  }
+  const invalidPayload = () =>
+    new VivaVoiceProtocolError(
+      "VOICE_PROTOCOL_INVALID_FIELD",
+      PCM16_BASE64_PATH,
+      "Invalid pcm16_base64",
+    );
+  const encoded = frame.pcm16_base64;
+  if (typeof encoded !== "string") throw invalidPayload();
+  const decoded = decodeCanonicalPaddedBase64(encoded);
+  if (decoded === null) throw invalidPayload();
+  if (decoded.length > VIVA_AUDIO_MAX_CHUNK_BYTES) {
+    throw new VivaVoiceProtocolError(
+      "VOICE_PROTOCOL_FRAME_TOO_LARGE",
+      PCM16_BASE64_PATH,
+      "Audio chunk exceeds maximum size",
+    );
+  }
+  if (decoded.length === 0 || decoded.length % VIVA_VOICE_BYTES_PER_SAMPLE !== 0) {
+    throw invalidPayload();
+  }
+  return { pcm16_base64: encoded };
+}
+
+/** Canonical RFC 4648 base64 with padding; the unpadded alphabet is rejected. */
+const CANONICAL_PADDED_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/**
+ * `pcm16_base64` is standard RFC 4648 base64 with padding. Re-encoding the decoded
+ * bytes must reproduce the payload exactly, which rejects missing padding and non-zero
+ * unused bits in the final group. Unpadded base64url is a `viva1` session-token
+ * encoding and is never accepted here.
+ */
+function decodeCanonicalPaddedBase64(encoded: string): Uint8Array | null {
+  if (!CANONICAL_PADDED_BASE64.test(encoded)) return null;
+  let binary: string;
   try {
-    byteLength = atob(encoded).length;
+    binary = atob(encoded);
   } catch {
-    throw new Error("Invalid pcm16_base64");
+    return null;
   }
-  if (byteLength === 0 || byteLength % 2 !== 0) {
-    throw new Error("Invalid pcm16_base64");
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
   }
-  if (byteLength > VIVA_AUDIO_MAX_CHUNK_BYTES) {
-    throw new Error("Audio chunk exceeds maximum size");
-  }
-  return frame as AgentAudioFrame;
+  return btoa(binary) === encoded ? bytes : null;
 }
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {

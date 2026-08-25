@@ -18,16 +18,22 @@ import {
   audioEndClientFrame,
   negotiateVivaVoiceProtocolVersion,
   parseVivaClientFrame,
+  parseVivaClientFrameJson,
   parseVivaServerFrame,
+  parseVivaServerFrameJson,
   sessionConfigFrame,
+  VIVA_AUDIO_MAX_CHUNK_BASE64_CHARS,
   VIVA_AUDIO_MAX_CHUNK_BYTES,
   VIVA_AUDIO_MAX_CHUNK_SAMPLES,
   VIVA_AUDIO_MAX_TURN_BYTES,
   VIVA_AUDIO_MAX_TURN_SAMPLES,
   VIVA_AUDIO_SAMPLE_RATE_HZ,
+  VIVA_VOICE_BYTES_PER_SAMPLE,
+  VIVA_VOICE_CHANNELS,
   VIVA_VOICE_DIAGNOSTIC_CODES,
   VIVA_VOICE_INPUT_ENCODING,
   VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
+  VIVA_VOICE_MAX_TURN_SECONDS,
   VIVA_VOICE_PROTOCOL_ADVERTISEMENT,
   VIVA_VOICE_PROTOCOL_VERSION,
   VIVA_VOICE_SAMPLE_RATE_HZ,
@@ -161,8 +167,9 @@ describe("Viva voice agent contract", () => {
     );
     expect(() => parseVivaClientFrame({ ...chunk, turn_id: "  " })).toThrow("Missing turn_id");
     expect(() => parseVivaClientFrame({ ...chunk, frame: { pcm16_base64: "" } })).toThrow(
-      "Missing pcm16_base64",
+      "Invalid pcm16_base64",
     );
+    expect(() => parseVivaClientFrame({ ...chunk, frame: {} })).toThrow("Missing pcm16_base64");
     // "AQ==" decodes to one odd PCM byte, which cannot be a whole 16-bit sample.
     expect(() => parseVivaClientFrame({ ...chunk, frame: { pcm16_base64: "AQ==" } })).toThrow(
       "Invalid pcm16_base64",
@@ -864,6 +871,199 @@ describe("Viva voice v5 protocol negotiation and the single ready representation
   });
 });
 
+/**
+ * `VOICE-SIZE-001` / `VOICE-SIZE-002`. Plan 03's chunk and turn constants are the
+ * contract; this plan adds only the derived base64 ceiling, deletes the stale v4
+ * binary surface, and pins the two byte-exact size diagnostics. The aggregate turn
+ * state machine stays in Plan 03's `ws.rs` assembler; nothing here duplicates it.
+ */
+describe("Viva voice v5 frame size contract", () => {
+  test("preserves the Plan 03 audio constants and adds only the derived base64 ceiling", () => {
+    expect(VIVA_VOICE_SAMPLE_RATE_HZ).toBe(24_000);
+    expect(VIVA_VOICE_CHANNELS).toBe(1);
+    expect(VIVA_VOICE_BYTES_PER_SAMPLE).toBe(2);
+    expect(VIVA_VOICE_INPUT_ENCODING).toBe("pcm_s16le");
+    expect(VIVA_VOICE_MAX_TURN_SECONDS).toBe(45);
+    expect(VIVA_VOICE_MAX_TEXT_FRAME_BYTES).toBe(65_536);
+    expect(VIVA_AUDIO_MAX_CHUNK_SAMPLES).toBe(4_096);
+    expect(VIVA_AUDIO_MAX_CHUNK_BYTES).toBe(8_192);
+    expect(VIVA_AUDIO_MAX_CHUNK_BASE64_CHARS).toBe(10_924);
+    expect(VIVA_AUDIO_MAX_TURN_SAMPLES).toBe(1_080_000);
+    expect(VIVA_AUDIO_MAX_TURN_BYTES).toBe(2_160_000);
+
+    // The literals above are the contract; these restate the derivation they encode.
+    expect(VIVA_AUDIO_MAX_CHUNK_BYTES).toBe(
+      VIVA_AUDIO_MAX_CHUNK_SAMPLES * VIVA_VOICE_CHANNELS * VIVA_VOICE_BYTES_PER_SAMPLE,
+    );
+    expect(VIVA_AUDIO_MAX_TURN_SAMPLES).toBe(
+      VIVA_VOICE_MAX_TURN_SECONDS * VIVA_AUDIO_SAMPLE_RATE_HZ,
+    );
+    expect(VIVA_AUDIO_MAX_TURN_BYTES).toBe(
+      VIVA_AUDIO_MAX_TURN_SAMPLES * VIVA_VOICE_CHANNELS * VIVA_VOICE_BYTES_PER_SAMPLE,
+    );
+    expect(VIVA_AUDIO_MAX_CHUNK_BASE64_CHARS).toBe(Math.ceil(VIVA_AUDIO_MAX_CHUNK_BYTES / 3) * 4);
+    expect(VIVA_AUDIO_SAMPLE_RATE_HZ).toBe(VIVA_VOICE_SAMPLE_RATE_HZ);
+  });
+
+  test("deletes the stale v4 binary frame surface from the shared contract", async () => {
+    const contract = (await import("./agent-contract")) as Record<string, unknown>;
+    expect("VIVA_VOICE_MAX_BINARY_FRAME_BYTES" in contract).toBe(false);
+
+    const source = await readAgentContractSource();
+    for (const stale of ["VIVA_VOICE_MAX_BINARY_FRAME_BYTES", "AgentBinary", "BinaryFrame"]) {
+      expect(source).not.toContain(stale);
+    }
+    // Plan 10 owns browser pre-send enforcement; this module publishes no transport.
+    for (const consumerOnly of ["WebSocket", "bufferedAmount", "sendFrame"]) {
+      expect(source).not.toContain(consumerOnly);
+    }
+  });
+
+  test("keeps the maximum chunk's 10,924 base64 characters inside the 64 KiB envelope", () => {
+    const encoded = bytesToBase64(new Uint8Array(VIVA_AUDIO_MAX_CHUNK_BYTES));
+    expect(encoded).toHaveLength(VIVA_AUDIO_MAX_CHUNK_BASE64_CHARS);
+
+    const frame = {
+      type: "audio_chunk",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "generation-fixture-audio",
+      turn_id: "turn-fixture-audio",
+      sequence: 2_249,
+      frame: { pcm16_base64: encoded },
+    };
+    const wire = JSON.stringify(frame);
+
+    expect(parseVivaClientFrameJson(wire)).toEqual(frame);
+    expect(utf8ByteLength(wire)).toBeLessThan(VIVA_VOICE_MAX_TEXT_FRAME_BYTES);
+  });
+
+  test("rejects a JSON envelope above 65,536 UTF-8 bytes at $ before nested parsing", () => {
+    // Measured as UTF-8 bytes, not UTF-16 code units: this string is 65,536 code
+    // units and 65,537 bytes, so it must fail on size rather than on JSON shape.
+    const multiByteBoundary = `é${"x".repeat(65_535)}`;
+    expect(multiByteBoundary).toHaveLength(65_536);
+    expect(utf8ByteLength(multiByteBoundary)).toBe(65_537);
+
+    for (const oversized of ["x".repeat(65_537), multiByteBoundary]) {
+      for (const parse of [parseVivaClientFrameJson, parseVivaServerFrameJson]) {
+        const rejection = captureVoiceProtocolError(() => parse(oversized));
+        expect(rejection.code).toBe("VOICE_PROTOCOL_FRAME_TOO_LARGE");
+        expect(rejection.path).toBe("$");
+      }
+    }
+
+    // Exactly at the cap the envelope is admitted and only then parsed, so the
+    // boundary is `> 65,536` rather than `>= 65,536`.
+    for (const parse of [parseVivaClientFrameJson, parseVivaServerFrameJson]) {
+      const rejection = captureVoiceProtocolError(() => parse("x".repeat(65_536)));
+      expect(rejection.code).toBe("VOICE_PROTOCOL_MALFORMED_JSON");
+      expect(rejection.path).toBe("$");
+    }
+  });
+
+  test("rejects a decoded chunk above 8,192 raw bytes at $.frame.pcm16_base64", () => {
+    const chunk = (rawBytes: number) => ({
+      type: "audio_chunk",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "generation-fixture-audio",
+      turn_id: "turn-fixture-audio",
+      sequence: 0,
+      frame: { pcm16_base64: bytesToBase64(new Uint8Array(rawBytes)) },
+    });
+
+    expect(parseVivaClientFrame(chunk(VIVA_AUDIO_MAX_CHUNK_BYTES))).toEqual(
+      chunk(VIVA_AUDIO_MAX_CHUNK_BYTES),
+    );
+
+    // 8,193 is the plan's named boundary and 8,194 keeps whole 16-bit samples, so
+    // neither can be excused as an odd-byte rejection.
+    for (const rawBytes of [VIVA_AUDIO_MAX_CHUNK_BYTES + 1, VIVA_AUDIO_MAX_CHUNK_BYTES + 2]) {
+      const rejection = captureVoiceProtocolError(() => parseVivaClientFrame(chunk(rawBytes)));
+      expect(rejection.code).toBe("VOICE_PROTOCOL_FRAME_TOO_LARGE");
+      expect(rejection.path).toBe("$.frame.pcm16_base64");
+      expect(rejection.message).not.toContain(chunk(rawBytes).frame.pcm16_base64);
+    }
+  });
+
+  test("rejects a pcm16_base64 payload that is not canonical padded base64", () => {
+    const chunk = (pcm16Base64: string) => ({
+      type: "audio_chunk",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "generation-fixture-audio",
+      turn_id: "turn-fixture-audio",
+      sequence: 0,
+      frame: { pcm16_base64: pcm16Base64 },
+    });
+
+    // Canonical RFC 4648 base64 *with* padding is the only accepted encoding; the
+    // unpadded base64url form belongs to `viva1` token segments, never to audio.
+    for (const payload of ["AAB=", "AAA", "AA==A", "AA-A", "AA_A", "AA A", "AAA=\n", "", "===="]) {
+      const rejection = captureVoiceProtocolError(() => parseVivaClientFrame(chunk(payload)));
+      expect(rejection.code).toBe("VOICE_PROTOCOL_INVALID_FIELD");
+      expect(rejection.path).toBe("$.frame.pcm16_base64");
+    }
+
+    // An odd raw byte count cannot be a whole 16-bit sample.
+    const oddRejection = captureVoiceProtocolError(() => parseVivaClientFrame(chunk("AQ==")));
+    expect(oddRejection.code).toBe("VOICE_PROTOCOL_INVALID_FIELD");
+    expect(oddRejection.path).toBe("$.frame.pcm16_base64");
+
+    expect(parseVivaClientFrame(chunk("AAA="))).toEqual(chunk("AAA="));
+  });
+
+  test("accepts every 45-second turn shape without inferring a chunk-count cap", () => {
+    // 8,192 bytes is a maximum, never a fixed or minimum chunk size, so no chunk
+    // count and no final-sequence ceiling can be derived from it.
+    const turnShapes = [
+      { label: "20 ms production chunks", chunkBytes: 960, chunkCount: 2_250 },
+      { label: "10 ms chunks", chunkBytes: 480, chunkCount: 4_500 },
+      { label: "maximum-size chunks", chunkBytes: VIVA_AUDIO_MAX_CHUNK_BYTES, chunkCount: 263 },
+    ] as const;
+
+    for (const shape of turnShapes) {
+      const encoded = bytesToBase64(new Uint8Array(shape.chunkBytes));
+      const aggregateBytes = shape.chunkBytes * shape.chunkCount;
+      expect(aggregateBytes).toBeLessThanOrEqual(VIVA_AUDIO_MAX_TURN_BYTES);
+      expect(aggregateBytes / VIVA_VOICE_BYTES_PER_SAMPLE).toBeLessThanOrEqual(
+        VIVA_AUDIO_MAX_TURN_SAMPLES,
+      );
+
+      for (let sequence = 0; sequence < shape.chunkCount; sequence += 1) {
+        const frame = {
+          type: "audio_chunk",
+          version: VIVA_VOICE_PROTOCOL_VERSION,
+          client_generation_id: "generation-fixture-audio",
+          turn_id: "turn-fixture-audio",
+          sequence,
+          frame: { pcm16_base64: encoded },
+        };
+        expect(parseVivaClientFrame(frame)).toEqual(frame);
+      }
+
+      const finalSequence = shape.chunkCount - 1;
+      const end = {
+        type: "audio_end",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        client_generation_id: "generation-fixture-audio",
+        turn_id: "turn-fixture-audio",
+        final_sequence: finalSequence,
+      };
+      expect(parseVivaClientFrame(end)).toEqual(end);
+    }
+
+    // The 20 ms production turn ends at sequence 2,249; smaller valid chunks push
+    // the final sequence past it while the aggregate bounds stay identical.
+    expect(2_250 * 960).toBe(VIVA_AUDIO_MAX_TURN_BYTES);
+    expect(4_500 - 1).toBeGreaterThan(2_250 - 1);
+    expect(4_500 * 480).toBe(VIVA_AUDIO_MAX_TURN_BYTES);
+
+    // Only per-chunk and aggregate bounds reject; there is no count ceiling.
+    expect(263 * VIVA_AUDIO_MAX_CHUNK_BYTES).toBeLessThanOrEqual(VIVA_AUDIO_MAX_TURN_BYTES);
+    expect(264 * VIVA_AUDIO_MAX_CHUNK_BYTES).toBeGreaterThan(VIVA_AUDIO_MAX_TURN_BYTES);
+    expect(VIVA_AUDIO_MAX_TURN_BYTES + 2).toBeGreaterThan(VIVA_AUDIO_MAX_TURN_BYTES);
+  });
+});
+
 type SessionTokenVectorCase = {
   id: string;
   token: string;
@@ -1175,6 +1375,22 @@ function isCanonicalUnpaddedBase64Url(segment: string): boolean {
   for (const byte of bytes) binary += String.fromCharCode(byte);
   const reencoded = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   return reencoded === segment;
+}
+
+function utf8ByteLength(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+/**
+ * Reads this plan's behavioural source as text so the size and purity fences can be
+ * asserted from inside the suite. Only the test reaches the filesystem;
+ * `agent-contract.ts` itself stays pure ESM with no host access (`VOICE-RUNTIME-001`).
+ */
+async function readAgentContractSource(): Promise<string> {
+  const host = globalThis as unknown as {
+    Bun: { file(path: string): { text(): Promise<string> } };
+  };
+  return host.Bun.file(new URL("./agent-contract.ts", import.meta.url).pathname).text();
 }
 
 function bytesToBase64(bytes: Uint8Array): string {

@@ -12,16 +12,22 @@ pub const VIVA_VOICE_PROTOCOL_VERSION: u32 = 5;
 /// v5 is the only accepted and emitted version; v4 input is rejected, never upgraded.
 pub const VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS: [u32; 1] = [VIVA_VOICE_PROTOCOL_VERSION];
 pub const VIVA_VOICE_SAMPLE_RATE_HZ: u32 = 24_000;
+pub const VIVA_VOICE_CHANNELS: usize = 1;
+/// `pcm_s16le` is a signed 16-bit sample, so two bytes.
+pub const VIVA_VOICE_BYTES_PER_SAMPLE: usize = 2;
 pub const VIVA_VOICE_INPUT_ENCODING: &str = "pcm_s16le";
 pub const VIVA_VOICE_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
-pub const VIVA_VOICE_MAX_BINARY_FRAME_BYTES: usize = 256 * 1024;
+/// The 45-second bound on one browser turn.
+pub const VIVA_VOICE_MAX_TURN_SECONDS: usize = 45;
 
 /// Alias of the existing 24 kHz voice constant; one literal source.
 pub const VIVA_AUDIO_SAMPLE_RATE_HZ: u32 = VIVA_VOICE_SAMPLE_RATE_HZ;
 pub const VIVA_AUDIO_MAX_CHUNK_SAMPLES: usize = 4_096;
 /// Mono `pcm_s16le` is two bytes per sample.
 pub const VIVA_AUDIO_MAX_CHUNK_BYTES: usize = 8_192;
-/// The 45-second bound on one browser turn.
+/// `VOICE-SIZE-002`: the maximum chunk in canonical RFC 4648 base64 *with* padding.
+/// This is a derived ceiling, never a second size authority.
+pub const VIVA_AUDIO_MAX_CHUNK_BASE64_CHARS: usize = 10_924;
 pub const VIVA_AUDIO_MAX_TURN_SAMPLES: usize = 1_080_000;
 pub const VIVA_AUDIO_MAX_TURN_BYTES: usize = 2_160_000;
 
@@ -29,11 +35,24 @@ pub const VIVA_AUDIO_MAX_TURN_BYTES: usize = 2_160_000;
 // contracts read identically. This compile-time block keeps the literals
 // self-consistent in production builds, not only under `cargo test`.
 const _: () = {
-    assert!(VIVA_AUDIO_MAX_CHUNK_BYTES == VIVA_AUDIO_MAX_CHUNK_SAMPLES * 2);
-    assert!(VIVA_AUDIO_MAX_TURN_SAMPLES == 45 * VIVA_AUDIO_SAMPLE_RATE_HZ as usize);
-    assert!(VIVA_AUDIO_MAX_TURN_BYTES == VIVA_AUDIO_MAX_TURN_SAMPLES * 2);
+    assert!(
+        VIVA_AUDIO_MAX_CHUNK_BYTES
+            == VIVA_AUDIO_MAX_CHUNK_SAMPLES * VIVA_VOICE_CHANNELS * VIVA_VOICE_BYTES_PER_SAMPLE
+    );
+    assert!(
+        VIVA_AUDIO_MAX_TURN_SAMPLES
+            == VIVA_VOICE_MAX_TURN_SECONDS * VIVA_AUDIO_SAMPLE_RATE_HZ as usize
+    );
+    assert!(
+        VIVA_AUDIO_MAX_TURN_BYTES
+            == VIVA_AUDIO_MAX_TURN_SAMPLES * VIVA_VOICE_CHANNELS * VIVA_VOICE_BYTES_PER_SAMPLE
+    );
+    assert!(VIVA_AUDIO_MAX_CHUNK_BASE64_CHARS == VIVA_AUDIO_MAX_CHUNK_BYTES.div_ceil(3) * 4);
     assert!(VIVA_AUDIO_MAX_CHUNK_BYTES < VIVA_VOICE_MAX_TEXT_FRAME_BYTES);
 };
+
+/// The one JSON path a rejected audio payload is ever reported at.
+const PCM16_BASE64_PATH: &str = "$.frame.pcm16_base64";
 
 /// The protocol advertisement a ready frame carries. Both languages publish the exact
 /// same shape so version negotiation cannot drift across the wire.
@@ -160,6 +179,83 @@ impl fmt::Display for VoiceProtocolDiagnostic {
 }
 
 impl std::error::Error for VoiceProtocolDiagnostic {}
+
+/// `VOICE-SIZE-002`: the wire envelope is measured in UTF-8 bytes and rejected above
+/// the unchanged 64 KiB text-frame cap *before* any nested parsing, so an oversized
+/// payload is never allocated into a document tree.
+pub fn parse_client_frame_json(json: &str) -> Result<ClientFrame, VoiceProtocolDiagnostic> {
+    let value = parse_voice_wire_json(json)?;
+    validate_audio_chunk_payload(&value)?;
+    serde_json::from_value(value).map_err(|_| {
+        VoiceProtocolDiagnostic::new(VoiceProtocolDiagnosticCode::InvalidEnvelope, "$")
+    })
+}
+
+pub fn parse_server_frame_json(json: &str) -> Result<ServerFrame, VoiceProtocolDiagnostic> {
+    let value = parse_voice_wire_json(json)?;
+    serde_json::from_value(value).map_err(|_| {
+        VoiceProtocolDiagnostic::new(VoiceProtocolDiagnosticCode::InvalidEnvelope, "$")
+    })
+}
+
+fn parse_voice_wire_json(json: &str) -> Result<serde_json::Value, VoiceProtocolDiagnostic> {
+    if json.len() > VIVA_VOICE_MAX_TEXT_FRAME_BYTES {
+        return Err(VoiceProtocolDiagnostic::new(
+            VoiceProtocolDiagnosticCode::FrameTooLarge,
+            "$",
+        ));
+    }
+    serde_json::from_str(json)
+        .map_err(|_| VoiceProtocolDiagnostic::new(VoiceProtocolDiagnosticCode::MalformedJson, "$"))
+}
+
+/// Decodes `frame.pcm16_base64` only long enough to enforce canonical padded base64
+/// and the raw byte bounds. The decoded bytes are dropped here; they are never
+/// stored, logged, or copied into a diagnostic. The aggregate turn bound stays in
+/// Plan 03's stateful assembler, which consumes the same constants.
+fn validate_audio_chunk_payload(value: &serde_json::Value) -> Result<(), VoiceProtocolDiagnostic> {
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("audio_chunk") {
+        return Ok(());
+    }
+    let Some(frame) = value.get("frame") else {
+        return Err(VoiceProtocolDiagnostic::new(
+            VoiceProtocolDiagnosticCode::MissingField,
+            "$.frame",
+        ));
+    };
+    let Some(encoded) = frame.get("pcm16_base64") else {
+        return Err(VoiceProtocolDiagnostic::new(
+            VoiceProtocolDiagnosticCode::MissingField,
+            PCM16_BASE64_PATH,
+        ));
+    };
+    let invalid_payload = || {
+        VoiceProtocolDiagnostic::new(VoiceProtocolDiagnosticCode::InvalidField, PCM16_BASE64_PATH)
+    };
+    let encoded = encoded.as_str().ok_or_else(invalid_payload)?;
+    let decoded = decode_canonical_padded_base64(encoded).ok_or_else(invalid_payload)?;
+    if decoded.len() > VIVA_AUDIO_MAX_CHUNK_BYTES {
+        return Err(VoiceProtocolDiagnostic::new(
+            VoiceProtocolDiagnosticCode::FrameTooLarge,
+            PCM16_BASE64_PATH,
+        ));
+    }
+    if decoded.is_empty() || decoded.len() % VIVA_VOICE_BYTES_PER_SAMPLE != 0 {
+        return Err(invalid_payload());
+    }
+    Ok(())
+}
+
+/// `pcm16_base64` is standard RFC 4648 base64 with padding. Re-encoding the decoded
+/// bytes must reproduce the payload exactly, which rejects missing padding and
+/// non-zero unused bits in the final group. Unpadded base64url is a `viva1`
+/// session-token encoding and is never accepted here.
+fn decode_canonical_padded_base64(encoded: &str) -> Option<Vec<u8>> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let decoded = STANDARD.decode(encoded).ok()?;
+    (STANDARD.encode(&decoded) == encoded).then_some(decoded)
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -927,7 +1023,7 @@ mod tests {
                 client_generation_id,
                 ..
             } => {
-                // The real WebSocket path moves the frame-level generation onto the
+                // The real socket path moves the frame-level generation onto the
                 // domain config (`ws.rs`, authorized initial session config), so a
                 // session's question response ids carry it. This in-process harness
                 // must apply the same assignment or it silently diverges from the
@@ -1051,7 +1147,7 @@ mod tests {
         }
     }
 
-    /// Frames only the WebSocket boundary produces: the post-release completion
+    /// Frames only the socket boundary produces: the post-release completion
     /// marker and the bounded-audio-turn acceptance the assembler emits.
     fn without_websocket_only_frames(frames: &[ServerFrame]) -> Vec<ServerFrame> {
         let mut filtered = Vec::with_capacity(frames.len());
@@ -1585,5 +1681,189 @@ mod tests {
         let dead_ready_type = format!("Ready{}", "Frame");
         assert!(!include_str!("protocol.rs").contains(&dead_ready_type));
         assert!(!include_str!("lib.rs").contains(&dead_ready_type));
+    }
+
+    /// `VOICE-SIZE-001` / `VOICE-SIZE-002`. Plan 03's chunk and turn constants are the
+    /// contract; this plan adds only the derived base64 ceiling, deletes the stale v4
+    /// binary surface, and pins the two byte-exact size diagnostics. The aggregate turn
+    /// state machine stays in Plan 03's `ws.rs` assembler; nothing here duplicates it.
+    #[test]
+    fn voice_v5_frame_size_contract_is_exact() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        assert_eq!(VIVA_VOICE_SAMPLE_RATE_HZ, 24_000);
+        assert_eq!(VIVA_VOICE_CHANNELS, 1);
+        assert_eq!(VIVA_VOICE_BYTES_PER_SAMPLE, 2);
+        assert_eq!(VIVA_VOICE_INPUT_ENCODING, "pcm_s16le");
+        assert_eq!(VIVA_VOICE_MAX_TURN_SECONDS, 45);
+        assert_eq!(VIVA_VOICE_MAX_TEXT_FRAME_BYTES, 65_536);
+        assert_eq!(VIVA_AUDIO_MAX_CHUNK_SAMPLES, 4_096);
+        assert_eq!(VIVA_AUDIO_MAX_CHUNK_BYTES, 8_192);
+        assert_eq!(VIVA_AUDIO_MAX_CHUNK_BASE64_CHARS, 10_924);
+        assert_eq!(VIVA_AUDIO_MAX_TURN_SAMPLES, 1_080_000);
+        assert_eq!(VIVA_AUDIO_MAX_TURN_BYTES, 2_160_000);
+        assert_eq!(VIVA_AUDIO_SAMPLE_RATE_HZ, VIVA_VOICE_SAMPLE_RATE_HZ);
+
+        // The literals above are the contract; these restate the derivation they encode.
+        assert_eq!(
+            VIVA_AUDIO_MAX_CHUNK_BYTES,
+            VIVA_AUDIO_MAX_CHUNK_SAMPLES * VIVA_VOICE_CHANNELS * VIVA_VOICE_BYTES_PER_SAMPLE
+        );
+        assert_eq!(
+            VIVA_AUDIO_MAX_TURN_SAMPLES,
+            VIVA_VOICE_MAX_TURN_SECONDS * VIVA_AUDIO_SAMPLE_RATE_HZ as usize
+        );
+        assert_eq!(
+            VIVA_AUDIO_MAX_TURN_BYTES,
+            VIVA_AUDIO_MAX_TURN_SAMPLES * VIVA_VOICE_CHANNELS * VIVA_VOICE_BYTES_PER_SAMPLE
+        );
+        assert_eq!(
+            VIVA_AUDIO_MAX_CHUNK_BASE64_CHARS,
+            VIVA_AUDIO_MAX_CHUNK_BYTES.div_ceil(3) * 4
+        );
+
+        // The stale v4 binary surface is gone from both the contract and its re-export.
+        // Needles are assembled at runtime so these assertions cannot match themselves.
+        let source = include_str!("protocol.rs");
+        let lib_source = include_str!("lib.rs");
+        for stale in [
+            format!("VIVA_VOICE_MAX_BINARY{}", "_FRAME_BYTES"),
+            format!("Agent{}", "Binary"),
+            format!("Binary{}", "Frame"),
+        ] {
+            assert!(
+                !source.contains(&stale),
+                "protocol.rs still carries {stale}"
+            );
+            assert!(!lib_source.contains(&stale), "lib.rs still carries {stale}");
+        }
+        // Plan 10 owns browser pre-send enforcement; this module publishes no transport.
+        for consumer_only in [
+            format!("Web{}", "Socket"),
+            format!("buffered{}", "Amount"),
+            format!("send{}", "Frame"),
+        ] {
+            assert!(
+                !source.contains(&consumer_only),
+                "protocol.rs implements consumer behaviour {consumer_only}"
+            );
+        }
+
+        // Envelope size is measured in UTF-8 bytes before any nested parsing. This
+        // string is 65,536 characters and 65,537 bytes, so it must fail on size.
+        let multi_byte_boundary = format!("\u{e9}{}", "x".repeat(65_535));
+        assert_eq!(multi_byte_boundary.chars().count(), 65_536);
+        assert_eq!(multi_byte_boundary.len(), 65_537);
+        for oversized in ["x".repeat(65_537), multi_byte_boundary] {
+            for diagnostic in [
+                parse_client_frame_json(&oversized).expect_err("oversized envelope rejects"),
+                parse_server_frame_json(&oversized).expect_err("oversized envelope rejects"),
+            ] {
+                assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::FrameTooLarge);
+                assert_eq!(diagnostic.path, "$");
+            }
+        }
+        // Exactly at the cap the envelope is admitted and only then parsed, so the
+        // boundary is `> 65,536` rather than `>= 65,536`.
+        let at_cap = "x".repeat(65_536);
+        for diagnostic in [
+            parse_client_frame_json(&at_cap).expect_err("malformed JSON rejects"),
+            parse_server_frame_json(&at_cap).expect_err("malformed JSON rejects"),
+        ] {
+            assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::MalformedJson);
+            assert_eq!(diagnostic.path, "$");
+        }
+
+        let chunk_json = |encoded: &str| {
+            serde_json::to_string(&json!({
+                "type": "audio_chunk",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": "generation-fixture-audio",
+                "turn_id": "turn-fixture-audio",
+                "sequence": 0,
+                "frame": { "pcm16_base64": encoded },
+            }))
+            .expect("chunk frame serializes")
+        };
+        let raw_chunk_json = |raw_bytes: usize| chunk_json(&STANDARD.encode(vec![0_u8; raw_bytes]));
+
+        assert_eq!(
+            STANDARD
+                .encode(vec![0_u8; VIVA_AUDIO_MAX_CHUNK_BYTES])
+                .len(),
+            VIVA_AUDIO_MAX_CHUNK_BASE64_CHARS
+        );
+        assert!(raw_chunk_json(VIVA_AUDIO_MAX_CHUNK_BYTES).len() < VIVA_VOICE_MAX_TEXT_FRAME_BYTES);
+        parse_client_frame_json(&raw_chunk_json(VIVA_AUDIO_MAX_CHUNK_BYTES))
+            .expect("the maximum chunk parses");
+
+        // 8,193 is the plan's named boundary and 8,194 keeps whole 16-bit samples, so
+        // neither can be excused as an odd-byte rejection.
+        for raw_bytes in [
+            VIVA_AUDIO_MAX_CHUNK_BYTES + 1,
+            VIVA_AUDIO_MAX_CHUNK_BYTES + 2,
+        ] {
+            let diagnostic = parse_client_frame_json(&raw_chunk_json(raw_bytes))
+                .expect_err("an oversized chunk rejects");
+            assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::FrameTooLarge);
+            assert_eq!(diagnostic.path, "$.frame.pcm16_base64");
+            assert!(!format!("{diagnostic:?}").contains("AAAA"));
+        }
+
+        // Canonical RFC 4648 base64 *with* padding is the only accepted audio encoding;
+        // the unpadded base64url form belongs to `viva1` token segments.
+        for payload in [
+            "AAB=", "AAA", "AA==A", "AA-A", "AA_A", "AA A", "AAA=\n", "", "====", "AQ==",
+        ] {
+            let diagnostic = parse_client_frame_json(&chunk_json(payload))
+                .expect_err("non-canonical padded base64 rejects");
+            assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::InvalidField);
+            assert_eq!(diagnostic.path, "$.frame.pcm16_base64");
+        }
+        parse_client_frame_json(&chunk_json("AAA=")).expect("a two-byte sample chunk parses");
+
+        // 8,192 bytes is a maximum, never a fixed or minimum chunk size, so no chunk
+        // count and no final-sequence ceiling can be derived from it.
+        for (chunk_bytes, chunk_count) in [
+            (960_usize, 2_250_usize),
+            (480, 4_500),
+            (VIVA_AUDIO_MAX_CHUNK_BYTES, 263),
+        ] {
+            let encoded = STANDARD.encode(vec![0_u8; chunk_bytes]);
+            let aggregate_bytes = chunk_bytes * chunk_count;
+            assert!(aggregate_bytes <= VIVA_AUDIO_MAX_TURN_BYTES);
+            assert!(aggregate_bytes / VIVA_VOICE_BYTES_PER_SAMPLE <= VIVA_AUDIO_MAX_TURN_SAMPLES);
+
+            for sequence in 0..chunk_count {
+                let wire = serde_json::to_string(&json!({
+                    "type": "audio_chunk",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": "generation-fixture-audio",
+                    "turn_id": "turn-fixture-audio",
+                    "sequence": sequence,
+                    "frame": { "pcm16_base64": encoded },
+                }))
+                .expect("chunk frame serializes");
+                parse_client_frame_json(&wire).expect("every in-bounds chunk parses");
+            }
+
+            let end = serde_json::to_string(&json!({
+                "type": "audio_end",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": "generation-fixture-audio",
+                "turn_id": "turn-fixture-audio",
+                "final_sequence": chunk_count - 1,
+            }))
+            .expect("audio end serializes");
+            parse_client_frame_json(&end).expect("the matching audio end parses");
+        }
+
+        // The 20 ms production turn ends at sequence 2,249; smaller valid chunks push
+        // the final sequence past it while the aggregate bounds stay identical.
+        assert_eq!(2_250 * 960, VIVA_AUDIO_MAX_TURN_BYTES);
+        assert_eq!(4_500 * 480, VIVA_AUDIO_MAX_TURN_BYTES);
+        assert!(4_500 - 1 > 2_250 - 1);
+        assert!(263 * VIVA_AUDIO_MAX_CHUNK_BYTES <= VIVA_AUDIO_MAX_TURN_BYTES);
+        assert!(264 * VIVA_AUDIO_MAX_CHUNK_BYTES > VIVA_AUDIO_MAX_TURN_BYTES);
     }
 }
