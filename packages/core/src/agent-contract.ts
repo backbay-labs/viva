@@ -1,4 +1,6 @@
 export const VIVA_VOICE_PROTOCOL_VERSION = 5 as const;
+/** v5 is the only accepted and emitted version; v4 input is rejected, never upgraded. */
+export const VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS = [VIVA_VOICE_PROTOCOL_VERSION] as const;
 export const VIVA_VOICE_SAMPLE_RATE_HZ = 24_000;
 export const VIVA_VOICE_INPUT_ENCODING = "pcm_s16le";
 export const VIVA_VOICE_MAX_TEXT_FRAME_BYTES = 64 * 1024;
@@ -10,6 +12,72 @@ export const VIVA_AUDIO_MAX_CHUNK_SAMPLES = 4_096 as const;
 export const VIVA_AUDIO_MAX_CHUNK_BYTES = 8_192 as const;
 export const VIVA_AUDIO_MAX_TURN_SAMPLES = 1_080_000 as const;
 export const VIVA_AUDIO_MAX_TURN_BYTES = 2_160_000 as const;
+
+/**
+ * VOICE-DIAGNOSTIC-001: the closed, stable diagnostic vocabulary shared with the Rust
+ * contract. A diagnostic carries a code and a JSON path and never the rejected value.
+ */
+export const VIVA_VOICE_DIAGNOSTIC_CODES = [
+  "VOICE_PROTOCOL_UNSUPPORTED_VERSION",
+  "VOICE_PROTOCOL_MALFORMED_JSON",
+  "VOICE_PROTOCOL_INVALID_ENVELOPE",
+  "VOICE_PROTOCOL_UNKNOWN_FRAME",
+  "VOICE_PROTOCOL_UNKNOWN_FIELD",
+  "VOICE_PROTOCOL_MISSING_FIELD",
+  "VOICE_PROTOCOL_INVALID_FIELD",
+  "VOICE_PROTOCOL_NONCANONICAL_BASE64URL",
+  "VOICE_PROTOCOL_FORBIDDEN_AUTHORITY",
+  "VOICE_PROTOCOL_FRAME_TOO_LARGE",
+  "VOICE_PROTOCOL_AUDIO_SEQUENCE",
+  "VOICE_PROTOCOL_TURN_TOO_LARGE",
+  "VOICE_PROTOCOL_INVARIANT",
+] as const;
+
+export type VivaVoiceDiagnosticCode = (typeof VIVA_VOICE_DIAGNOSTIC_CODES)[number];
+
+export class VivaVoiceProtocolError extends Error {
+  readonly code: VivaVoiceDiagnosticCode;
+  readonly path: string;
+
+  constructor(code: VivaVoiceDiagnosticCode, path: string, message: string) {
+    super(message);
+    this.name = "VivaVoiceProtocolError";
+    this.code = code;
+    this.path = path;
+  }
+}
+
+export type VivaVoiceProtocolAdvertisement = {
+  preferred_version: typeof VIVA_VOICE_PROTOCOL_VERSION;
+  supported_versions: readonly [typeof VIVA_VOICE_PROTOCOL_VERSION];
+};
+
+export const VIVA_VOICE_PROTOCOL_ADVERTISEMENT: VivaVoiceProtocolAdvertisement = {
+  preferred_version: VIVA_VOICE_PROTOCOL_VERSION,
+  supported_versions: VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS,
+};
+
+/**
+ * Negotiation selects the greatest shared version. This release supports only v5, so a
+ * peer list without v5 has no overlap and fails closed instead of downgrading to v4.
+ */
+export function negotiateVivaVoiceProtocolVersion(
+  localSupportedVersions: readonly number[],
+  peerSupportedVersions: readonly number[],
+): typeof VIVA_VOICE_PROTOCOL_VERSION {
+  const shared = localSupportedVersions.filter((version) =>
+    peerSupportedVersions.includes(version),
+  );
+  const selected = shared.length === 0 ? undefined : Math.max(...shared);
+  if (selected !== VIVA_VOICE_PROTOCOL_VERSION) {
+    throw new VivaVoiceProtocolError(
+      "VOICE_PROTOCOL_UNSUPPORTED_VERSION",
+      "$.protocol.supported_versions",
+      "Unsupported Viva voice protocol version",
+    );
+  }
+  return VIVA_VOICE_PROTOCOL_VERSION;
+}
 
 export type AgentStudyMode = "quiz" | "teach" | "mock" | "cram";
 export type AgentConceptStatus = "strong" | "shaky" | "missed" | "review";
@@ -216,6 +284,7 @@ export type VivaClientFrame =
 export type VivaReadyFrame = {
   type: "ready";
   version: typeof VIVA_VOICE_PROTOCOL_VERSION;
+  protocol: VivaVoiceProtocolAdvertisement;
   sample_rate_hz: typeof VIVA_VOICE_SAMPLE_RATE_HZ;
   input_encoding: typeof VIVA_VOICE_INPUT_ENCODING;
   brain: AgentBrainReadiness;
@@ -329,7 +398,7 @@ export function parseVivaServerFrame(value: unknown): VivaServerFrame {
   const frame = requireRecord(value, "server frame");
   const type = frame.type;
   if (frame.version !== VIVA_VOICE_PROTOCOL_VERSION) {
-    throw new Error("Unsupported Viva voice protocol version");
+    throw unsupportedVersion();
   }
 
   if (type === "ready") {
@@ -339,9 +408,15 @@ export function parseVivaServerFrame(value: unknown): VivaServerFrame {
     if (frame.input_encoding !== VIVA_VOICE_INPUT_ENCODING) {
       throw new Error("Unexpected Viva voice input encoding");
     }
-    parseBrainReadiness(frame.brain);
-    parseStoreReadiness(frame.store);
-    return frame as VivaReadyFrame;
+    return {
+      type: "ready",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      protocol: parseVivaVoiceProtocolAdvertisement(frame.protocol),
+      sample_rate_hz: VIVA_VOICE_SAMPLE_RATE_HZ,
+      input_encoding: VIVA_VOICE_INPUT_ENCODING,
+      brain: parseBrainReadiness(frame.brain),
+      store: parseStoreReadiness(frame.store),
+    };
   }
 
   if (type === "audio_turn_accepted") {
@@ -445,7 +520,7 @@ export function parseVivaServerEvent(value: unknown): VivaServerEvent {
 export function parseVivaClientFrame(value: unknown): VivaClientFrame {
   const frame = requireRecord(value, "client frame");
   if (frame.version !== VIVA_VOICE_PROTOCOL_VERSION) {
-    throw new Error("Unsupported Viva voice protocol version");
+    throw unsupportedVersion();
   }
   if ("client_generation_id" in frame && frame.client_generation_id !== undefined) {
     requireNonEmptyString(frame.client_generation_id, "client_generation_id");
@@ -611,25 +686,85 @@ function parseSessionConfig(value: unknown): AgentSessionConfig {
   return session as unknown as AgentSessionConfig;
 }
 
+function unsupportedVersion(): VivaVoiceProtocolError {
+  return new VivaVoiceProtocolError(
+    "VOICE_PROTOCOL_UNSUPPORTED_VERSION",
+    "$.version",
+    "Unsupported Viva voice protocol version",
+  );
+}
+
+/**
+ * The frozen unversioned v4-era fixtures predate the advertisement and are retired once
+ * every consumer migrates to `fixtures/voice-protocol/v5/` (Plan 05 Task 9 Step 6).
+ * Until then they still parse through this single ready representation and receive the
+ * canonical v5 advertisement; a present-but-non-v5 advertisement always fails closed.
+ */
+function parseVivaVoiceProtocolAdvertisement(value: unknown): VivaVoiceProtocolAdvertisement {
+  if (value === undefined) {
+    return {
+      preferred_version: VIVA_VOICE_PROTOCOL_VERSION,
+      supported_versions: VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS,
+    };
+  }
+  const advertisement = requireRecord(value, "protocol advertisement");
+  const supportedVersions = requireArray(
+    advertisement.supported_versions,
+    "supported_versions",
+  ).map((version) => {
+    if (typeof version !== "number" || !Number.isSafeInteger(version)) {
+      throw new VivaVoiceProtocolError(
+        "VOICE_PROTOCOL_INVALID_FIELD",
+        "$.protocol.supported_versions",
+        "Invalid Viva voice supported versions",
+      );
+    }
+    return version;
+  });
+  const negotiated = negotiateVivaVoiceProtocolVersion(
+    VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS,
+    supportedVersions,
+  );
+  if (advertisement.preferred_version !== negotiated) {
+    throw new VivaVoiceProtocolError(
+      "VOICE_PROTOCOL_UNSUPPORTED_VERSION",
+      "$.protocol.preferred_version",
+      "Unsupported Viva voice protocol version",
+    );
+  }
+  return {
+    preferred_version: VIVA_VOICE_PROTOCOL_VERSION,
+    supported_versions: VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS,
+  };
+}
+
 function parseBrainReadiness(value: unknown): AgentBrainReadiness {
   const brain = requireRecord(value, "brain readiness");
-  requireNonEmptyString(brain.provider, "provider");
-  requireBoolean(brain.configured, "configured");
-  requireBoolean(brain.selectable, "selectable");
-  requireBoolean(brain.live_runtime, "live_runtime");
-  return brain as unknown as AgentBrainReadiness;
+  return {
+    provider: requireNonEmptyString(brain.provider, "provider"),
+    configured: requireBoolean(brain.configured, "configured"),
+    selectable: requireBoolean(brain.selectable, "selectable"),
+    live_runtime: requireBoolean(brain.live_runtime, "live_runtime"),
+  };
 }
 
 function parseStoreReadiness(value: unknown): AgentStoreReadiness {
   const store = requireRecord(value, "store readiness");
-  requireNonEmptyString(store.backend, "store backend");
-  requireBoolean(store.available, "store available");
-  requireBoolean(store.durable, "store durable");
-  requireBoolean(store.nonce_replay_protection, "store nonce replay protection");
-  requireBoolean(store.raw_audio_persistence, "raw audio persistence");
-  requireBoolean(store.transcript_persistence, "transcript persistence");
-  requireBoolean(store.uuid_schema_translation, "uuid schema translation");
-  return store as unknown as AgentStoreReadiness;
+  return {
+    backend: requireNonEmptyString(store.backend, "store backend"),
+    available: requireBoolean(store.available, "store available"),
+    durable: requireBoolean(store.durable, "store durable"),
+    nonce_replay_protection: requireBoolean(
+      store.nonce_replay_protection,
+      "store nonce replay protection",
+    ),
+    raw_audio_persistence: requireBoolean(store.raw_audio_persistence, "raw audio persistence"),
+    transcript_persistence: requireBoolean(store.transcript_persistence, "transcript persistence"),
+    uuid_schema_translation: requireBoolean(
+      store.uuid_schema_translation,
+      "uuid schema translation",
+    ),
+  };
 }
 
 function parseManuscriptIntent(value: unknown): ManuscriptIntent {

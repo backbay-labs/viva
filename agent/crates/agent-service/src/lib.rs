@@ -14,7 +14,9 @@ pub use config::{
     VoiceWsAccess,
 };
 pub use protocol::{
-    ClientFrame, ReadyFrame, ServerFrame, VivaServerEvent, VIVA_VOICE_INPUT_ENCODING,
-    VIVA_VOICE_MAX_BINARY_FRAME_BYTES, VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
-    VIVA_VOICE_PROTOCOL_VERSION, VIVA_VOICE_SAMPLE_RATE_HZ,
+    negotiate_voice_protocol_version, ClientFrame, ServerFrame, VivaServerEvent,
+    VoiceProtocolAdvertisement, VoiceProtocolDiagnostic, VoiceProtocolDiagnosticCode,
+    VIVA_VOICE_INPUT_ENCODING, VIVA_VOICE_MAX_BINARY_FRAME_BYTES, VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
+    VIVA_VOICE_PROTOCOL_VERSION, VIVA_VOICE_SAMPLE_RATE_HZ, VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS,
+    VOICE_PROTOCOL_ADVERTISEMENT,
 };

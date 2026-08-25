@@ -11,10 +11,12 @@ import sessionFixture from "../../../agent/fixtures/voice-protocol/session-confi
 import evidencePackFixture from "../../../agent/fixtures/voice-protocol/synthetic-evidence-pack.json";
 import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
 import authDecisionFixture from "../../../agent/fixtures/voice-protocol/v5/auth-decision.json";
+import readyV5Fixture from "../../../agent/fixtures/voice-protocol/v5/server-ready.json";
 import {
   type AgentSessionConfig,
   audioChunkClientFrame,
   audioEndClientFrame,
+  negotiateVivaVoiceProtocolVersion,
   parseVivaClientFrame,
   parseVivaServerFrame,
   sessionConfigFrame,
@@ -23,10 +25,14 @@ import {
   VIVA_AUDIO_MAX_TURN_BYTES,
   VIVA_AUDIO_MAX_TURN_SAMPLES,
   VIVA_AUDIO_SAMPLE_RATE_HZ,
+  VIVA_VOICE_DIAGNOSTIC_CODES,
   VIVA_VOICE_INPUT_ENCODING,
   VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
+  VIVA_VOICE_PROTOCOL_ADVERTISEMENT,
   VIVA_VOICE_PROTOCOL_VERSION,
   VIVA_VOICE_SAMPLE_RATE_HZ,
+  VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS,
+  VivaVoiceProtocolError,
 } from "./agent-contract";
 import { seedStudySets } from "./index";
 
@@ -711,6 +717,121 @@ describe("Viva voice agent contract", () => {
   });
 });
 
+describe("Viva voice v5 protocol negotiation and the single ready representation", () => {
+  test("advertises protocol v5 as the only supported version", () => {
+    expect(VIVA_VOICE_PROTOCOL_VERSION).toBe(5);
+    expect(VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS).toEqual([5]);
+    expect(VIVA_VOICE_PROTOCOL_ADVERTISEMENT).toEqual({
+      preferred_version: 5,
+      supported_versions: [5],
+    });
+    // Plan 03's audio handoff is untouched by this task.
+    expect(VIVA_AUDIO_MAX_CHUNK_SAMPLES).toBe(4_096);
+    expect(VIVA_AUDIO_MAX_CHUNK_BYTES).toBe(8_192);
+    expect(VIVA_AUDIO_MAX_TURN_SAMPLES).toBe(1_080_000);
+    expect(VIVA_AUDIO_MAX_TURN_BYTES).toBe(2_160_000);
+  });
+
+  test("selects the greatest shared version and fails closed without an overlap", () => {
+    expect(negotiateVivaVoiceProtocolVersion([5], [5])).toBe(5);
+    expect(negotiateVivaVoiceProtocolVersion(VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS, [4, 5])).toBe(
+      5,
+    );
+    expect(negotiateVivaVoiceProtocolVersion([4, 5], [5, 6])).toBe(5);
+
+    for (const peerVersions of [[], [4], [6], [1, 2, 3, 4]]) {
+      const rejection = captureVoiceProtocolError(() =>
+        negotiateVivaVoiceProtocolVersion(VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS, peerVersions),
+      );
+      expect(rejection.code).toBe("VOICE_PROTOCOL_UNSUPPORTED_VERSION");
+      expect(rejection.path).toBe("$.protocol.supported_versions");
+      // Diagnostics carry code and path only; never the rejected values.
+      expect(rejection.message).not.toContain(JSON.stringify(peerVersions));
+    }
+    expect(VIVA_VOICE_DIAGNOSTIC_CODES).toContain("VOICE_PROTOCOL_UNSUPPORTED_VERSION");
+  });
+
+  test("rejects legacy v4 frames with the stable unsupported-version diagnostic", () => {
+    const v4Ready = {
+      type: "ready",
+      version: 4,
+      protocol: { preferred_version: 4, supported_versions: [4] },
+      sample_rate_hz: VIVA_VOICE_SAMPLE_RATE_HZ,
+      input_encoding: VIVA_VOICE_INPUT_ENCODING,
+      brain: { provider: "synthetic", configured: true, selectable: true, live_runtime: false },
+      store: readyV5Fixture.store,
+    };
+    const serverRejection = captureVoiceProtocolError(() => parseVivaServerFrame(v4Ready));
+    expect(serverRejection.code).toBe("VOICE_PROTOCOL_UNSUPPORTED_VERSION");
+    expect(serverRejection.path).toBe("$.version");
+
+    const clientRejection = captureVoiceProtocolError(() =>
+      parseVivaClientFrame({ type: "stop", version: 4, client_generation_id: "generation-1" }),
+    );
+    expect(clientRejection.code).toBe("VOICE_PROTOCOL_UNSUPPORTED_VERSION");
+    expect(clientRejection.path).toBe("$.version");
+
+    // A v5 frame whose advertisement claims another version is not silently upgraded.
+    const advertisementRejection = captureVoiceProtocolError(() =>
+      parseVivaServerFrame({
+        ...readyV5Fixture,
+        protocol: { preferred_version: 4, supported_versions: [4] },
+      }),
+    );
+    expect(advertisementRejection.code).toBe("VOICE_PROTOCOL_UNSUPPORTED_VERSION");
+  });
+
+  test("reconstructs the canonical v5 ready fixture rather than returning the caller's object", () => {
+    const source = JSON.parse(JSON.stringify(readyV5Fixture)) as Record<string, unknown>;
+    const parsed = parseVivaServerFrame(source);
+
+    expect(parsed).not.toBe(source);
+    expect(parsed).toEqual(readyV5Fixture);
+    expect(JSON.stringify(parsed)).toBe(JSON.stringify(readyV5Fixture));
+    expect(Object.keys(parsed)).toEqual([
+      "type",
+      "version",
+      "protocol",
+      "sample_rate_hz",
+      "input_encoding",
+      "brain",
+      "store",
+    ]);
+
+    if (parsed.type !== "ready") throw new Error("Expected ready frame");
+    expect(parsed.protocol).toEqual({ preferred_version: 5, supported_versions: [5] });
+    expect(parsed.brain).not.toBe(source.brain);
+    expect(parsed.store).not.toBe(source.store);
+
+    // Mutating the caller's object after parsing cannot reach the returned frame.
+    (source.brain as Record<string, unknown>).provider = "mutated-provider";
+    (source.store as Record<string, unknown>).durable = true;
+    expect(parsed.brain.provider).toBe("synthetic");
+    expect(parsed.store.durable).toBe(false);
+  });
+
+  test("supplies the canonical advertisement for the retiring unversioned ready fixture", () => {
+    // The frozen root corpus predates the advertisement and is deleted once every
+    // consumer migrates (Plan 05 Task 9 Step 6). Until then it still parses through the
+    // one ready representation, and the parser supplies the canonical v5 advertisement
+    // instead of inventing a second ready shape. A present-but-wrong advertisement
+    // still fails closed, as the v4 case above proves.
+    const parsed = parseVivaServerFrame(readyFixture);
+
+    if (parsed.type !== "ready") throw new Error("Expected ready frame");
+    expect(parsed.protocol).toEqual(VIVA_VOICE_PROTOCOL_ADVERTISEMENT);
+    expect(Object.keys(parsed)).toEqual([
+      "type",
+      "version",
+      "protocol",
+      "sample_rate_hz",
+      "input_encoding",
+      "brain",
+      "store",
+    ]);
+  });
+});
+
 type SessionTokenVectorCase = {
   id: string;
   token: string;
@@ -941,7 +1062,9 @@ describe("Viva voice v5 authentication decision and shared session-token vectors
       "fixture-session",
     );
     expect(sessionTokenVectorClaims("VOICE-TOKEN-REJECT-EMPTY-NONCE").nonce).toBe("");
-    expect(sessionTokenVectorClaims("VOICE-TOKEN-REJECT-UNKNOWN-CLAIM")).toHaveProperty("role");
+    expect(Object.keys(sessionTokenVectorClaims("VOICE-TOKEN-REJECT-UNKNOWN-CLAIM"))).toContain(
+      "role",
+    );
     expect(
       Object.keys(
         sessionTokenVectorClaims("VOICE-TOKEN-REJECT-UNKNOWN-FAILURE-CONTROL-CLAIM")
@@ -976,6 +1099,16 @@ describe("Viva voice v5 authentication decision and shared session-token vectors
     }
   });
 });
+
+function captureVoiceProtocolError(run: () => unknown): VivaVoiceProtocolError {
+  try {
+    run();
+  } catch (error) {
+    if (error instanceof VivaVoiceProtocolError) return error;
+    throw error;
+  }
+  throw new Error("Expected a redaction-safe VivaVoiceProtocolError");
+}
 
 function sessionTokenVectorCase(id: string): SessionTokenVectorCase {
   const vector = sessionTokenVectors.cases.find((candidate) => candidate.id === id);

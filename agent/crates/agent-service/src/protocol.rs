@@ -1,3 +1,5 @@
+use std::fmt;
+
 use agent_domain::{
     AnswerEvaluation, AudioFrame, BrainEvent, BrainProviderError, ConceptStatus, ManuscriptIntent,
     RealtimeBrainCapabilities, SessionConfig, StudyQuestion, StudySessionPhase, StudySessionRecap,
@@ -7,6 +9,8 @@ use agent_domain::{
 use serde::{Deserialize, Serialize};
 
 pub const VIVA_VOICE_PROTOCOL_VERSION: u32 = 5;
+/// v5 is the only accepted and emitted version; v4 input is rejected, never upgraded.
+pub const VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS: [u32; 1] = [VIVA_VOICE_PROTOCOL_VERSION];
 pub const VIVA_VOICE_SAMPLE_RATE_HZ: u32 = 24_000;
 pub const VIVA_VOICE_INPUT_ENCODING: &str = "pcm_s16le";
 pub const VIVA_VOICE_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
@@ -30,6 +34,132 @@ const _: () = {
     assert!(VIVA_AUDIO_MAX_TURN_BYTES == VIVA_AUDIO_MAX_TURN_SAMPLES * 2);
     assert!(VIVA_AUDIO_MAX_CHUNK_BYTES < VIVA_VOICE_MAX_TEXT_FRAME_BYTES);
 };
+
+/// The protocol advertisement a ready frame carries. Both languages publish the exact
+/// same shape so version negotiation cannot drift across the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceProtocolAdvertisement {
+    pub preferred_version: u32,
+    pub supported_versions: [u32; 1],
+}
+
+pub const VOICE_PROTOCOL_ADVERTISEMENT: VoiceProtocolAdvertisement = VoiceProtocolAdvertisement {
+    preferred_version: VIVA_VOICE_PROTOCOL_VERSION,
+    supported_versions: VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS,
+};
+
+impl Default for VoiceProtocolAdvertisement {
+    fn default() -> Self {
+        VOICE_PROTOCOL_ADVERTISEMENT
+    }
+}
+
+/// Negotiation selects the greatest shared version. This release supports only v5, so a
+/// list without v5 has no overlap and fails closed instead of downgrading to v4.
+pub fn negotiate_voice_protocol_version(
+    local_supported_versions: &[u32],
+    peer_supported_versions: &[u32],
+) -> Result<u32, VoiceProtocolDiagnostic> {
+    local_supported_versions
+        .iter()
+        .copied()
+        .filter(|version| peer_supported_versions.contains(version))
+        .max()
+        .filter(|version| *version == VIVA_VOICE_PROTOCOL_VERSION)
+        .ok_or_else(|| {
+            VoiceProtocolDiagnostic::new(
+                VoiceProtocolDiagnosticCode::UnsupportedVersion,
+                "$.protocol.supported_versions",
+            )
+        })
+}
+
+/// `VOICE-DIAGNOSTIC-001`: the closed, stable diagnostic vocabulary shared with the
+/// TypeScript contract. Codes and paths are the whole error surface; a rejected value
+/// never becomes part of a diagnostic.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum VoiceProtocolDiagnosticCode {
+    UnsupportedVersion,
+    MalformedJson,
+    InvalidEnvelope,
+    UnknownFrame,
+    UnknownField,
+    MissingField,
+    InvalidField,
+    NoncanonicalBase64Url,
+    ForbiddenAuthority,
+    FrameTooLarge,
+    AudioSequence,
+    TurnTooLarge,
+    Invariant,
+}
+
+impl VoiceProtocolDiagnosticCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedVersion => "VOICE_PROTOCOL_UNSUPPORTED_VERSION",
+            Self::MalformedJson => "VOICE_PROTOCOL_MALFORMED_JSON",
+            Self::InvalidEnvelope => "VOICE_PROTOCOL_INVALID_ENVELOPE",
+            Self::UnknownFrame => "VOICE_PROTOCOL_UNKNOWN_FRAME",
+            Self::UnknownField => "VOICE_PROTOCOL_UNKNOWN_FIELD",
+            Self::MissingField => "VOICE_PROTOCOL_MISSING_FIELD",
+            Self::InvalidField => "VOICE_PROTOCOL_INVALID_FIELD",
+            Self::NoncanonicalBase64Url => "VOICE_PROTOCOL_NONCANONICAL_BASE64URL",
+            Self::ForbiddenAuthority => "VOICE_PROTOCOL_FORBIDDEN_AUTHORITY",
+            Self::FrameTooLarge => "VOICE_PROTOCOL_FRAME_TOO_LARGE",
+            Self::AudioSequence => "VOICE_PROTOCOL_AUDIO_SEQUENCE",
+            Self::TurnTooLarge => "VOICE_PROTOCOL_TURN_TOO_LARGE",
+            Self::Invariant => "VOICE_PROTOCOL_INVARIANT",
+        }
+    }
+}
+
+impl fmt::Debug for VoiceProtocolDiagnosticCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl fmt::Display for VoiceProtocolDiagnosticCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A redaction-safe parser diagnostic: code and JSON path only.
+#[derive(Clone, Eq, PartialEq)]
+pub struct VoiceProtocolDiagnostic {
+    pub code: VoiceProtocolDiagnosticCode,
+    pub path: String,
+}
+
+impl VoiceProtocolDiagnostic {
+    pub fn new(code: VoiceProtocolDiagnosticCode, path: impl Into<String>) -> Self {
+        Self {
+            code,
+            path: path.into(),
+        }
+    }
+}
+
+impl fmt::Debug for VoiceProtocolDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VoiceProtocolDiagnostic")
+            .field("code", &self.code)
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+impl fmt::Display for VoiceProtocolDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} at {}", self.code, self.path)
+    }
+}
+
+impl std::error::Error for VoiceProtocolDiagnostic {}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -89,41 +219,18 @@ impl ClientFrame {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ReadyFrame {
-    #[serde(rename = "type")]
-    pub frame_type: String,
-    pub version: u32,
-    pub sample_rate_hz: u32,
-    pub input_encoding: String,
-    pub brain: RealtimeBrainCapabilities,
-    pub store: StudyStoreCapabilities,
-}
-
-impl ReadyFrame {
-    pub fn new() -> Self {
-        Self {
-            frame_type: "ready".to_owned(),
-            version: VIVA_VOICE_PROTOCOL_VERSION,
-            sample_rate_hz: VIVA_VOICE_SAMPLE_RATE_HZ,
-            input_encoding: VIVA_VOICE_INPUT_ENCODING.to_owned(),
-            brain: default_ready_brain(),
-            store: default_ready_store(),
-        }
-    }
-}
-
-impl Default for ReadyFrame {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
     Ready {
         version: u32,
+        /// The frozen unversioned v4-era fixtures predate the advertisement and are
+        /// retired once every consumer migrates to `fixtures/voice-protocol/v5/`
+        /// (Plan 05 Task 9 Step 6). Until then they still parse through this single
+        /// ready representation and receive the canonical v5 advertisement; every
+        /// frame this service emits carries it explicitly.
+        #[serde(default)]
+        protocol: VoiceProtocolAdvertisement,
         sample_rate_hz: u32,
         input_encoding: String,
         brain: RealtimeBrainCapabilities,
@@ -353,6 +460,7 @@ impl ServerFrame {
     ) -> Self {
         Self::Ready {
             version: VIVA_VOICE_PROTOCOL_VERSION,
+            protocol: VOICE_PROTOCOL_ADVERTISEMENT,
             sample_rate_hz: VIVA_VOICE_SAMPLE_RATE_HZ,
             input_encoding: VIVA_VOICE_INPUT_ENCODING.to_owned(),
             brain,
@@ -1355,5 +1463,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `VOICE-VERSION-001` and `VOICE-READY-001`. v5 is the only advertised, negotiated,
+    /// and emitted version, and `ServerFrame::Ready` is the sole ready representation.
+    #[test]
+    fn voice_v5_ready_matches_fixture() {
+        use serde_json::{json, Value};
+
+        const READY_FIXTURE_JSON: &str =
+            include_str!("../../../fixtures/voice-protocol/v5/server-ready.json");
+
+        assert_eq!(VIVA_VOICE_PROTOCOL_VERSION, 5);
+        assert_eq!(VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS, [5]);
+        assert_eq!(
+            VOICE_PROTOCOL_ADVERTISEMENT,
+            VoiceProtocolAdvertisement {
+                preferred_version: 5,
+                supported_versions: [5],
+            }
+        );
+
+        // Negotiation selects the greatest shared version, which this release pins to v5.
+        assert_eq!(
+            negotiate_voice_protocol_version(&VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS, &[5])
+                .expect("v5 overlap negotiates"),
+            5
+        );
+        assert_eq!(
+            negotiate_voice_protocol_version(&VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS, &[4, 5])
+                .expect("greatest shared version"),
+            5
+        );
+        for peer in [Vec::new(), vec![4], vec![6], vec![1, 2, 3, 4]] {
+            let diagnostic =
+                negotiate_voice_protocol_version(&VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS, &peer)
+                    .expect_err("no overlap fails closed");
+            assert_eq!(
+                diagnostic.code,
+                VoiceProtocolDiagnosticCode::UnsupportedVersion
+            );
+            assert_eq!(diagnostic.path, "$.protocol.supported_versions");
+            // Diagnostics carry code and path only: never the rejected peer versions.
+            let rendered = format!("{diagnostic:?}");
+            assert_eq!(
+                rendered,
+                "VoiceProtocolDiagnostic { code: VOICE_PROTOCOL_UNSUPPORTED_VERSION, path: \"$.protocol.supported_versions\" }"
+            );
+            for version in &peer {
+                assert!(!rendered.contains(&version.to_string()));
+            }
+        }
+
+        // The canonical v5 ready fixture is exactly what the service emits.
+        let fixture: Value =
+            serde_json::from_str(READY_FIXTURE_JSON).expect("v5 ready fixture is valid JSON");
+        assert_eq!(
+            serde_json::to_value(ServerFrame::ready()).expect("ready serializes"),
+            fixture
+        );
+        assert_eq!(
+            fixture["protocol"],
+            json!({ "preferred_version": 5, "supported_versions": [5] })
+        );
+        let round_tripped: ServerFrame =
+            serde_json::from_str(READY_FIXTURE_JSON).expect("v5 ready fixture round-trips");
+        assert_eq!(round_tripped, ServerFrame::ready());
+
+        // Canonical key order, including the advertisement between version and sample rate.
+        let mut cursor = 0_usize;
+        for key in [
+            "type",
+            "version",
+            "protocol",
+            "preferred_version",
+            "supported_versions",
+            "sample_rate_hz",
+            "input_encoding",
+            "brain",
+            "provider",
+            "store",
+            "backend",
+        ] {
+            let needle = format!("\"{key}\"");
+            let offset = READY_FIXTURE_JSON[cursor..]
+                .find(&needle)
+                .unwrap_or_else(|| panic!("server-ready.json is missing {key} in canonical order"));
+            cursor += offset + needle.len();
+        }
+
+        // VOICE-READY-001: the standalone duplicate ready struct and its re-export are
+        // gone. The needle is assembled at runtime so this assertion cannot match itself.
+        let dead_ready_type = format!("Ready{}", "Frame");
+        assert!(!include_str!("protocol.rs").contains(&dead_ready_type));
+        assert!(!include_str!("lib.rs").contains(&dead_ready_type));
     }
 }
