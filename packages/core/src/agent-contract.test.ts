@@ -63,7 +63,7 @@ import {
   VivaVoiceProtocolError,
   vivaServerEventTerminalReason,
 } from "./agent-contract";
-import { seedStudySets } from "./index";
+import { seedStudySets } from "./fixtures";
 
 describe("Viva voice agent contract", () => {
   test("uses protocol v5 because bounded audio turns replace whole-turn audio frames", () => {
