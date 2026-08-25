@@ -380,6 +380,13 @@ fn crate_root_publishes_the_locked_learning_recap_seam() {
 /// permanent, so the shim has to carry a machine-checkable removal trigger and must
 /// stay inert: `agent-domain` itself never names it, so deleting the one export line
 /// and the `study.rs` declaration behind it is the whole removal.
+///
+/// The same doc block is also where the root swap's other half has to survive. The
+/// swap forced two edits inside Plan-04-owned files, and the rationale for them
+/// lived in the `study.rs` comment the swap deleted, so a reader of the diff would
+/// otherwise find a Plan 06 commit touching Plan 04's files with the explanation
+/// removed in the same hunk. Requiring both edits to be named here keeps that record
+/// attached to the seam that caused them.
 #[test]
 fn study_session_recap_v1_is_a_shim_with_a_removal_trigger_the_domain_never_uses() {
     const ALIAS: &str = "StudySessionRecapV1";
@@ -417,6 +424,10 @@ fn study_session_recap_v1_is_a_shim_with_a_removal_trigger_the_domain_never_uses
         "agent-adapters",
         "agent-service",
         "data",
+        // The two Plan-04-owned edits the same root swap forced. Naming them here
+        // is what keeps the deleted `study.rs` rationale in the tree.
+        "from_evidence_recap",
+        "tool_executor.rs",
     ] {
         assert!(
             doc_block.contains(required),

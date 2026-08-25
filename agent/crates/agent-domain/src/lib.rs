@@ -87,6 +87,17 @@ pub use session_state::{StudySessionState, StudySessionTransitionError};
 /// declaration unreachable from a private module — dead under `-D warnings` — while
 /// consumer source still names its fields.
 ///
+/// The same swap forced the only two edits this plan makes inside Plan-04-owned
+/// files, recorded here because the deleted code is what carried their rationale:
+/// `study.rs` loses `StudySessionRecap::from_evidence_recap`, the lossy V1
+/// projection of the v2 fold, and the `record_recap` call site in `tool_executor.rs`
+/// now persists the v2 recap directly. Plan 04 designed that bridge to expire on
+/// exactly this swap — its own doc comment called the swap "the intended forcing
+/// function" that stops the body compiling, and labelled the function a recorded
+/// `LEARN-011`-window cleanup — so the content of both edits is determined by Plan
+/// 04's recorded design rather than chosen here. The superseded declaration itself
+/// is deliberately left standing: Plans 07/08/09 still name its fields.
+///
 /// Removal trigger: when `agent-adapters`, `agent-service`, and `data` have each
 /// migrated to the v2 recap (Plans 07, 08, and 09), delete this line together with
 /// the `StudySessionRecap` declaration in `study.rs`. Nothing else has to change —
