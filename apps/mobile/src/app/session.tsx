@@ -140,7 +140,7 @@ export default function SessionScreen() {
 
 function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   const router = useRouter();
-  const agent = useMobileVivaSession({ mode: "quiz", studySet });
+  const agent = useMobileVivaSession({ mode: "quiz", platform: Platform.OS, studySet });
   const [elapsed, setElapsed] = useState(0);
   const [hintVisible, setHintVisible] = useState(false);
   const [sourceVisible, setSourceVisible] = useState(false);

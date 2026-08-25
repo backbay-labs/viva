@@ -195,6 +195,45 @@ export function studySetForSession(
   };
 }
 
+/**
+ * Select the capability for a replacement socket.
+ *
+ * A signed session capability is single-use, so reconnecting with the token
+ * stored on the original StudySet is guaranteed to fail replay protection.
+ * A fresh library snapshot mints new action capabilities. Prefer its resume
+ * action only when it names the session we were already using; otherwise use
+ * the newly minted start action and its matching session id.
+ */
+export function studySetForSessionRefresh(
+  snapshot: VivaLibrarySnapshot,
+  studySetId: string,
+  currentSessionId: string,
+  config: AppConfig,
+  platform: MobileRuntimePlatform = "unknown",
+): StudySet {
+  const startStudySet = studySetForSession(snapshot, studySetId, config, platform);
+  const row = snapshot.study_sets.find((studySet) => studySet.id === studySetId);
+  if (!row) return startStudySet;
+
+  const resume = sessionCapability(row.actions.resume);
+  const normalizedCurrentSessionId = currentSessionId.trim();
+  const normalizedResumeSessionId = resume?.sessionId?.trim();
+  const normalizedResumeToken = resume?.sessionToken?.trim();
+  if (
+    normalizedCurrentSessionId &&
+    normalizedResumeSessionId === normalizedCurrentSessionId &&
+    normalizedResumeToken
+  ) {
+    return {
+      ...startStudySet,
+      sessionId: normalizedResumeSessionId,
+      sessionToken: normalizedResumeToken,
+    };
+  }
+
+  return startStudySet;
+}
+
 export function weakestConcept(studySet: StudySet): Concept | undefined {
   return studySet.concepts.reduce<Concept | undefined>((weakest, candidate) => {
     if (!weakest || candidate.misses > weakest.misses) return candidate;

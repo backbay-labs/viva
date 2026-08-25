@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import type { AgentSessionConfig } from "@viva/core";
+import type { AgentSessionConfig, StudySet } from "@viva/core";
+import type { VivaLibrarySnapshot } from "@/agent/shared-web";
 import {
   applyMobileAppStateChange,
   createGuardedWebSocketImplementation,
   createMobileSessionController,
   foregroundReconnectAction,
+  loadMobileSessionRefresh,
   selectMobileSessionToken,
 } from "@/agent/use-mobile-viva-session";
 import type { AppConfig } from "@/runtime/config";
@@ -143,6 +145,91 @@ describe("createMobileSessionController", () => {
     expect(JSON.parse(String(socket?.sent[0])).session_token).toBe("library-capability");
   });
 
+  test("loads a fresh matching resume capability before replacing a signed socket", async () => {
+    const snapshot = {
+      privacy: {
+        copy: "Voice recordings and transcripts are not saved.",
+        export: { available: false, unavailable_reason: "control_token_unavailable" },
+        export_contains_raw_provider_payloads: false,
+        raw_audio_persistence: false,
+        transcript_persistence: false,
+        transcripts_saved: false,
+        voice_recordings_saved: false,
+      },
+      sessions: [],
+      study_sets: [
+        {
+          actions: {
+            archive: { available: false, unavailable_reason: "server_mutation_unavailable" },
+            delete: { available: false, unavailable_reason: "server_mutation_unavailable" },
+            resume: {
+              available: true,
+              session_id: "session-1",
+              session_token: "fresh-resume-capability",
+            },
+            start: {
+              available: true,
+              session_id: "session-2",
+              session_token: "fresh-start-capability",
+            },
+          },
+          concept_count: 1,
+          course: null,
+          documents: [
+            {
+              deleted: false,
+              display_name: "notes.txt",
+              id: "notes-1",
+              processing_status: "ready",
+              source_kind: "file",
+            },
+          ],
+          id: "biology-midterm",
+          ingestion_error: null,
+          ingestion_status: "ready",
+          question_count: 1,
+          server_owned: true,
+          title: "Biology Midterm",
+          user_id: "user-1",
+        },
+      ],
+      user_id: "user-1",
+    } satisfies VivaLibrarySnapshot;
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify(snapshot), {
+        headers: { "content-type": "application/json" },
+        status: 200,
+      })) as typeof fetch;
+    const studySet = { id: "biology-midterm" } as StudySet;
+
+    const refreshed = await loadMobileSessionRefresh({
+      config,
+      currentSession: session,
+      fetchImpl,
+      mode: "quiz",
+      studySet,
+    });
+
+    expect(refreshed.session.session_id).toBe("session-1");
+    expect(refreshed.sessionToken).toBe("fresh-resume-capability");
+
+    FakeWebSocket.instances = [];
+    const controller = createMobileSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      config,
+      session,
+      sessionToken: "spent-capability",
+    });
+    controller.connect();
+    controller.refreshSession(refreshed);
+    const replacementSocket = FakeWebSocket.instances[1];
+    replacementSocket?.open();
+    expect(JSON.parse(String(replacementSocket?.sent[0]))).toMatchObject({
+      session: { session_id: "session-1" },
+      session_token: "fresh-resume-capability",
+    });
+  });
+
   test("preserves recap partial_reason before the shared projection drops it", () => {
     FakeWebSocket.instances = [];
     const reasons: string[] = [];
@@ -242,7 +329,7 @@ describe("foregroundReconnectAction", () => {
         hasRecap: false,
         nextState: "inactive",
         playback,
-        status: "open",
+        refreshSession: () => controller.refreshSession({ reason: "socket_retry" }),
       }),
     ).toBe("none");
     expect(captureCalls).toEqual({ cancel: 0, reset: 0 });
@@ -256,7 +343,7 @@ describe("foregroundReconnectAction", () => {
         hasRecap: false,
         nextState: "background",
         playback,
-        status: "open",
+        refreshSession: () => controller.refreshSession({ reason: "socket_retry" }),
       }),
     ).toBe("backgrounded");
     expect(captureCalls).toEqual({ cancel: 1, reset: 0 });
@@ -268,7 +355,7 @@ describe("foregroundReconnectAction", () => {
         hasRecap: false,
         nextState: "active",
         playback,
-        status: "closed",
+        refreshSession: () => controller.refreshSession({ reason: "socket_retry" }),
       }),
     ).toBe("reconnected");
     FakeWebSocket.instances[1]?.open();

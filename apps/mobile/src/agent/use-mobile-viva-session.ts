@@ -6,7 +6,7 @@ import {
   type StudySet,
   VIVA_AGENT_TERMINAL_SESSION_REASONS,
 } from "@viva/core";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AppStateStatus } from "react-native";
 
 import { sessionResultStore } from "@/agent/session-store";
@@ -25,6 +25,11 @@ import {
 } from "@/agent/shared-web";
 import { createMobileCaptureSession, type MobileCaptureSession } from "@/audio/capture";
 import { createMobilePlaybackSession, type MobilePlaybackSession } from "@/audio/playback";
+import {
+  loadLibrary,
+  type MobileRuntimePlatform,
+  studySetForSessionRefresh,
+} from "@/library/library-client";
 import { type AppConfig, loadAppConfig } from "@/runtime/config";
 
 const ALLOWED_MOBILE_FRAME_TYPES = new Set(["session_config", "text", "cancel", "stop"]);
@@ -47,6 +52,7 @@ export type MobileVivaSessionController = Omit<VivaAgentSessionController, "send
 export type UseMobileVivaSessionOptions = {
   config?: AppConfig;
   mode: StudyMode;
+  platform?: MobileRuntimePlatform;
   studySet: StudySet;
 };
 
@@ -230,11 +236,11 @@ export function foregroundReconnectAction(input: {
 
 export function applyMobileAppStateChange(input: {
   capture: Pick<MobileCaptureSession, "cancel" | "reset">;
-  controller: Pick<MobileVivaSessionController, "close" | "refreshSession">;
+  controller: Pick<MobileVivaSessionController, "close" | "getState">;
   hasRecap: boolean;
   nextState: AppStateStatus;
   playback: Pick<MobilePlaybackSession, "resetForGeneration">;
-  status: VivaAgentSessionState["status"];
+  refreshSession: () => void;
 }): "backgrounded" | "none" | "reconnected" {
   if (input.nextState === "background") {
     input.controller.close();
@@ -247,16 +253,42 @@ export function applyMobileAppStateChange(input: {
   // OS has actually backgrounded the app; the subsequent background event is
   // the authoritative teardown boundary.
   if (input.nextState === "inactive") return "none";
+  const status = input.controller.getState().status;
   if (
     input.nextState === "active" &&
-    foregroundReconnectAction({ hasRecap: input.hasRecap, status: input.status }) === "reconnect"
+    foregroundReconnectAction({ hasRecap: input.hasRecap, status }) === "reconnect"
   ) {
     void input.capture.reset();
     input.playback.resetForGeneration();
-    input.controller.refreshSession({ reason: "socket_retry" });
+    input.refreshSession();
     return "reconnected";
   }
   return "none";
+}
+
+export async function loadMobileSessionRefresh(input: {
+  config: AppConfig;
+  currentSession: AgentSessionConfig;
+  fetchImpl?: typeof fetch;
+  mode: StudyMode;
+  platform?: MobileRuntimePlatform;
+  studySet: StudySet;
+}): Promise<{ session: AgentSessionConfig; sessionToken: string | null }> {
+  const { snapshot } = await loadLibrary(input.config, input.fetchImpl);
+  const refreshedStudySet = studySetForSessionRefresh(
+    snapshot,
+    input.studySet.id,
+    input.currentSession.session_id,
+    input.config,
+    input.platform,
+  );
+  return {
+    session: studySetToAgentSessionConfig(refreshedStudySet, {
+      mode: input.mode,
+      userId: input.config.userId,
+    }),
+    sessionToken: selectMobileSessionToken(input.config, refreshedStudySet),
+  };
 }
 
 function nativeAppState(): AppStatePort {
@@ -305,10 +337,71 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
     [],
   );
   const controllerRef = useRef<MobileVivaSessionController | null>(null);
+  const activeSessionRef = useRef(session);
+  const refreshEpochRef = useRef(0);
+  const refreshPromiseRef = useRef<Promise<WebSocket | undefined> | null>(null);
   const [agentState, setAgentState] = useState<VivaAgentSessionState>(initialVivaAgentSessionState);
   const derived = useMemo(() => deriveVivaAgentUiState(agentState), [agentState]);
-  const latestLifecycle = useRef({ hasRecap: false, status: agentState.status });
-  latestLifecycle.current = { hasRecap: Boolean(derived.recap), status: agentState.status };
+  const latestLifecycle = useRef({ hasRecap: false });
+  latestLifecycle.current = { hasRecap: Boolean(derived.recap) };
+
+  const refreshWithFreshCapability = useCallback(
+    (reason: VivaAgentGenerationReason = "socket_retry"): Promise<WebSocket | undefined> => {
+      const existingRefresh = refreshPromiseRef.current;
+      if (existingRefresh) return existingRefresh;
+
+      const controller = controllerRef.current;
+      if (!controller) return Promise.resolve(undefined);
+      const refreshEpoch = ++refreshEpochRef.current;
+      setCaptureIssue(undefined);
+      setRecapPartialReason(undefined);
+      void capture.reset();
+      playback.resetForGeneration();
+
+      const refreshPromise = loadMobileSessionRefresh({
+        config,
+        currentSession: activeSessionRef.current,
+        mode: options.mode,
+        platform: options.platform,
+        studySet: options.studySet,
+      })
+        .then(({ session: refreshedSession, sessionToken }) => {
+          if (refreshEpochRef.current !== refreshEpoch || controllerRef.current !== controller) {
+            return undefined;
+          }
+          activeSessionRef.current = refreshedSession;
+          return controller.refreshSession({
+            reason,
+            session: refreshedSession,
+            sessionToken,
+          });
+        })
+        .catch((error: unknown) => {
+          if (refreshEpochRef.current === refreshEpoch && controllerRef.current === controller) {
+            const currentState = controller.getState();
+            setAgentState({
+              ...currentState,
+              errors: [
+                ...currentState.errors,
+                `Could not refresh the session capability: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              ],
+              status: "error",
+            });
+          }
+          return undefined;
+        })
+        .finally(() => {
+          if (refreshPromiseRef.current === refreshPromise) {
+            refreshPromiseRef.current = null;
+          }
+        });
+      refreshPromiseRef.current = refreshPromise;
+      return refreshPromise;
+    },
+    [capture, config, options.mode, options.platform, options.studySet, playback],
+  );
 
   useEffect(() => {
     captureCallbacksActive.current = true;
@@ -321,6 +414,7 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
     sessionResultStore.clear();
     setCaptureIssue(undefined);
     setRecapPartialReason(undefined);
+    activeSessionRef.current = session;
     const controller = createMobileSessionController({
       config,
       onRecapPartialReason: setRecapPartialReason,
@@ -333,6 +427,8 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
     const connectTimer = setTimeout(() => controller.connect(), 0);
 
     return () => {
+      refreshEpochRef.current += 1;
+      refreshPromiseRef.current = null;
       clearTimeout(connectTimer);
       unsubscribe();
       controller.close();
@@ -347,16 +443,23 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
     const subscription = nativeAppState().addEventListener("change", (nextState) => {
       const controller = controllerRef.current;
       if (!controller) return;
+      if (nextState === "background") {
+        refreshEpochRef.current += 1;
+        refreshPromiseRef.current = null;
+      }
       applyMobileAppStateChange({
         capture,
         controller,
         ...latestLifecycle.current,
         nextState,
         playback,
+        refreshSession: () => {
+          void refreshWithFreshCapability();
+        },
       });
     });
     return () => subscription.remove();
-  }, [capture, playback]);
+  }, [capture, playback, refreshWithFreshCapability]);
 
   useEffect(() => {
     if (!derived.recap && !derived.terminalReason) return;
@@ -405,16 +508,8 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
     derived,
     playback,
     readiness,
-    refreshSession: (input?: {
-      reason?: VivaAgentGenerationReason;
-      sessionToken?: string | null;
-    }) => {
-      setCaptureIssue(undefined);
-      setRecapPartialReason(undefined);
-      void capture.reset();
-      playback.resetForGeneration();
-      return controllerRef.current?.refreshSession(input);
-    },
+    refreshSession: (input?: { reason?: VivaAgentGenerationReason }) =>
+      refreshWithFreshCapability(input?.reason),
     reset: () => {
       setCaptureIssue(undefined);
       setRecapPartialReason(undefined);

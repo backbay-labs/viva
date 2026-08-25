@@ -12,6 +12,7 @@ import {
   loadLibrary,
   selectMobileSessionStudySetId,
   studySetForSession,
+  studySetForSessionRefresh,
   weakestConcept,
 } from "./library-client";
 
@@ -323,6 +324,39 @@ describe("mobile library client", () => {
       },
     ]);
     expect(weakestConcept(studySet)).toBeUndefined();
+  });
+
+  test("uses a freshly minted matching resume capability for a replacement socket", () => {
+    const row = cannedLibrarySnapshot.study_sets[0];
+    if (!row) throw new Error("canned biology study set is missing");
+    const refreshedSnapshot = withStudySet(cannedLibrarySnapshot, {
+      actions: {
+        ...row.actions,
+        resume: {
+          available: true,
+          session_id: "voice-session-new",
+          session_token: "viva1.fresh-resume-capability",
+        },
+        start: {
+          available: true,
+          session_id: "voice-session-replacement",
+          session_token: "viva1.fresh-start-capability",
+        },
+      },
+    });
+
+    expect(
+      studySetForSessionRefresh(refreshedSnapshot, "biology-midterm", "voice-session-new", config),
+    ).toMatchObject({
+      sessionId: "voice-session-new",
+      sessionToken: "viva1.fresh-resume-capability",
+    });
+    expect(
+      studySetForSessionRefresh(refreshedSnapshot, "biology-midterm", "different-session", config),
+    ).toMatchObject({
+      sessionId: "voice-session-replacement",
+      sessionToken: "viva1.fresh-start-capability",
+    });
   });
 
   test("fails closed when the selected study set is absent", () => {
