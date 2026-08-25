@@ -14,7 +14,8 @@ use agent_domain::{
     StudyDocumentSummary, StudyLibrarySnapshot, StudyMemoryStore, StudyMode, StudyQuestion,
     StudySessionDurableCounts, StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus,
     StudySetSummary, StudySourceReference, StudySourceSpanSummary, StudyStoreBackend,
-    StudyStoreCapabilities, StudyStoreWriteCounts, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+    StudyStoreCapabilities, StudyStoreWriteCounts, StudyStoreWriteOutcome,
+    VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -165,13 +166,29 @@ fn event_authorization_record<T: Serialize>(
     })
 }
 
+/// A poisoned state lock is a broken adapter invariant, not a caller error and
+/// not a storage failure.
+fn state_lock_poisoned() -> PortError {
+    PortError::internal(
+        "memory",
+        "study_state",
+        "in-memory study state lock poisoned",
+    )
+}
+
+/// Encoding an already-typed record this store itself holds cannot fail for a
+/// caller reason; a failure here means the adapter's own invariant broke.
+fn json_invariant(id: &'static str, error: &serde_json::Error) -> PortError {
+    PortError::internal("memory", id, error.to_string())
+}
+
 fn payload_sha256<T: Serialize>(
     kind: EventAuthorizationKind,
     response_id: &str,
     payload: &T,
 ) -> Result<String, PortError> {
     let payload = serde_json::to_vec(payload)
-        .map_err(|error| PortError::adapter("memory", error.to_string()))?;
+        .map_err(|error| json_invariant("event_authorization_payload", &error))?;
     let mut hasher = Sha256::new();
     hasher.update(kind.as_str().as_bytes());
     hasher.update([0]);
@@ -332,10 +349,13 @@ impl ReviewScheduleDecisionRecord {
     }
 }
 
+/// The stored half of a v2 recap source moment. Plan 04's recap carries only the
+/// response and source identity — no excerpt, no status label — so this record
+/// holds exactly that and nothing learner-authored.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PersistedRecapSourceMoment {
-    pub source: PersistedSourceReference,
-    pub status: ConceptStatus,
+    pub response_id: String,
+    pub source_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -350,18 +370,19 @@ pub struct PersistedSessionRecap {
 
 impl From<&StudySessionRecap> for PersistedSessionRecap {
     fn from(recap: &StudySessionRecap) -> Self {
+        let buckets = crate::recap_label_buckets(recap);
         Self {
             voice_session_id: recap.voice_session_id.clone(),
-            strong_concepts: recap.strong_concepts.clone(),
-            shaky_concepts: recap.shaky_concepts.clone(),
-            missed_concepts: recap.missed_concepts.clone(),
-            review_later: recap.review_later.clone(),
+            strong_concepts: buckets.strong,
+            shaky_concepts: buckets.shaky,
+            missed_concepts: buckets.missed,
+            review_later: buckets.review_later,
             source_moments: recap
                 .source_moments
                 .iter()
                 .map(|moment| PersistedRecapSourceMoment {
-                    source: PersistedSourceReference::from(&moment.source),
-                    status: moment.status.clone(),
+                    response_id: moment.response_id.clone(),
+                    source_id: moment.source_id.clone(),
                 })
                 .collect(),
         }
@@ -559,7 +580,13 @@ impl InMemoryStudyStore {
             }
         }
         .parse()
-        .map_err(|error| PortError::adapter("memory", format!("invalid fixture UUID: {error}")))?;
+        .map_err(|error| {
+            PortError::internal(
+                "memory",
+                logical_id,
+                format!("invalid fixture UUID: {error}"),
+            )
+        })?;
 
         Ok(FixtureIdTranslation {
             logical_id: logical_id.to_owned(),
@@ -843,8 +870,9 @@ impl InMemoryStudyStore {
             )
         })?;
         if source != record.question.source {
-            return Err(PortError::adapter(
+            return Err(PortError::internal(
                 "memory",
+                &record.question.question_id,
                 "active question source tuple does not match deterministic retrieval",
             ));
         }
@@ -922,8 +950,9 @@ impl InMemoryStudyStore {
                 continue;
             };
             if source != record.question.source {
-                return Err(PortError::adapter(
+                return Err(PortError::internal(
                     "memory",
+                    &record.question.question_id,
                     "active question source tuple does not match deterministic retrieval",
                 ));
             }
@@ -1769,17 +1798,22 @@ fn questions_for_concepts(
             let secondary = follow_up_concept_label(concepts, concept, &source)
                 .unwrap_or(title)
                 .to_owned();
+            let question_id = format!("q-{}", concept.public_id);
+            let prompt = format!(
+                "Explain {} in your own words using the pasted notes.",
+                concept.label
+            );
+            let rubric = crate::generated_question_rubric(&question_id, &prompt, &source.source_id);
             StudyQuestion {
-                question_id: format!("q-{}", concept.public_id),
-                prompt: format!(
-                    "Explain {} in your own words using the pasted notes.",
-                    concept.label
-                ),
+                question_id,
+                concept_id: concept.public_id.clone(),
+                prompt,
                 expected_terms: expected_terms_for_concept(concepts, concept, &source),
                 follow_up: format!(
                     "Now connect {} to {secondary} in one precise sentence.",
                     concept.label
                 ),
+                rubric,
                 source,
             }
         })
@@ -1977,7 +2011,7 @@ impl SessionStore<VoiceSessionRecord> for InMemoryStudyStore {
         Ok(self
             .inner
             .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?
+            .map_err(|_| state_lock_poisoned())?
             .sessions
             .iter()
             .rev()
@@ -1986,10 +2020,7 @@ impl SessionStore<VoiceSessionRecord> for InMemoryStudyStore {
     }
 
     async fn save(&self, session: &VoiceSessionRecord) -> Result<(), PortError> {
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
         state.sessions.retain(|existing| {
             existing.voice_session_id != session.voice_session_id
                 || existing.user_id != session.user_id
@@ -2022,6 +2053,10 @@ impl StudyMemoryStore for InMemoryStudyStore {
             concept_statuses: state.concept_statuses.len(),
             review_items: state.review_items.len(),
             recaps: state.recaps.len(),
+            // This backend records no voice usage at all — `record_voice_usage`
+            // keeps the fail-closed `Unavailable` default — so the honest count is
+            // zero rather than an omitted field.
+            voice_usage: 0,
         }
     }
 
@@ -2029,10 +2064,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         &self,
         voice_session_id: &str,
     ) -> Result<usize, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         Ok(state
             .answer_attempts
             .iter()
@@ -2048,10 +2080,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         study_set_id: &str,
         voice_session_id: &str,
     ) -> Result<StudySessionDurableCounts, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         Ok(StudySessionDurableCounts {
             answer_attempts: state
                 .answer_attempts
@@ -2099,10 +2128,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         voice_session_id: &str,
         response_id: &str,
     ) -> Result<bool, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         Ok(state.answer_attempts.iter().any(|attempt| {
             attempt.user_id == user_id
                 && attempt.study_set_id == study_set_id
@@ -2111,15 +2137,15 @@ impl StudyMemoryStore for InMemoryStudyStore {
         }))
     }
 
-    async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
         let user_id = required_user_id(config)?;
         let study_set_id = required_study_set_id(config)?;
         let voice_session_id = required_session_id(config)?;
-        {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let replayed = {
+            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
             Self::study_set_locked(&state, user_id, study_set_id)?;
             if let Some(existing) = state
                 .sessions
@@ -2127,8 +2153,9 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 .find(|session| session.voice_session_id == voice_session_id)
             {
                 if existing.user_id != user_id || existing.study_set_id != study_set_id {
-                    return Err(PortError::adapter(
+                    return Err(PortError::conflict(
                         "memory",
+                        voice_session_id,
                         "voice session ownership cannot be changed",
                     ));
                 }
@@ -2139,19 +2166,26 @@ impl StudyMemoryStore for InMemoryStudyStore {
                         "closed voice session cannot be reopened",
                     ));
                 }
+                true
+            } else {
+                false
             }
-        }
-        self.save(&VoiceSessionRecord::from_config(config)).await
+        };
+        self.save(&VoiceSessionRecord::from_config(config)).await?;
+        // The outcome reports the physical truth this backend can see: the row
+        // already existed, or it did not.
+        Ok(if replayed {
+            StudyStoreWriteOutcome::IdempotentReplay
+        } else {
+            StudyStoreWriteOutcome::Inserted
+        })
     }
 
     async fn claim_session_token_nonce(
         &self,
         claim: SessionTokenNonceClaim,
     ) -> Result<(), PortError> {
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
         Self::study_set_locked(&state, &claim.user_id, &claim.study_set_id)?;
         if state.session_token_nonces.iter().any(|used| {
             used.user_id == claim.user_id
@@ -2177,10 +2211,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         voice_session_id: &str,
         terminal_reason: &str,
     ) -> Result<Value, PortError> {
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
         let session = state
             .sessions
             .iter_mut()
@@ -2212,10 +2243,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         let exam_at = crate::ingestion_exam_instant("memory", input.exam_date.as_deref())?;
         let generated = generate_paste_study_set(input)?;
         {
-            let mut state = self
-                .inner
-                .write()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
             Self::persist_ingestion_record_locked(&mut state, &generated, false);
             Self::capture_exam_instant_locked(&mut state, &generated.study_set.id, exam_at);
         }
@@ -2229,10 +2257,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         let exam_at = crate::ingestion_exam_instant("memory", input.exam_date.as_deref())?;
         let generated = generate_file_study_set(input)?;
         {
-            let mut state = self
-                .inner
-                .write()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
             Self::persist_ingestion_record_locked(&mut state, &generated, false);
             Self::capture_exam_instant_locked(&mut state, &generated.study_set.id, exam_at);
         }
@@ -2253,10 +2278,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             })?
             .to_owned();
         let (title, course) = {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
             let existing = Self::study_set_locked(&state, &input.user_id, &study_set_id)?;
             (existing.title.clone(), existing.course.clone())
         };
@@ -2273,10 +2295,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             session_id: input.session_id,
         })?;
         {
-            let mut state = self
-                .inner
-                .write()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
             Self::persist_ingestion_record_locked(&mut state, &generated, true);
             Self::capture_exam_instant_locked(&mut state, &generated.study_set.id, exam_at);
         }
@@ -2288,10 +2307,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         user_id: &str,
         study_set_id: &str,
     ) -> Result<Option<Value>, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         let Some(study_set) = state.study_sets.get(study_set_id) else {
             return Ok(None);
         };
@@ -2353,10 +2369,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
     }
 
     async fn library_snapshot(&self, user_id: &str) -> Result<StudyLibrarySnapshot, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
 
         let mut study_sets = state
             .study_sets
@@ -2510,10 +2523,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         user_id: &str,
         study_set_id: &str,
     ) -> Result<Value, PortError> {
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
         Self::study_set_locked(&state, user_id, study_set_id)?;
 
         let mut deleted_documents = 0usize;
@@ -2581,10 +2591,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         study_set_id: &str,
         voice_session_id: &str,
     ) -> Result<Value, PortError> {
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
         Self::study_set_locked(&state, user_id, study_set_id)?;
 
         let session = state
@@ -2623,10 +2630,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         user_id: &str,
         study_set_id: &str,
     ) -> Result<Option<StudyQuestion>, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         Self::active_question_locked(&state, user_id, study_set_id)
     }
 
@@ -2637,10 +2641,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         voice_session_id: &str,
         question: &StudyQuestion,
     ) -> Result<(), PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
         let canonical =
             Self::active_question_locked(&state, user_id, study_set_id)?.ok_or_else(|| {
@@ -2651,8 +2652,9 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 )
             })?;
         if canonical != *question {
-            return Err(PortError::adapter(
+            return Err(PortError::invalid_input(
                 "memory",
+                &question.question_id,
                 "question tuple does not match deterministic retrieval",
             ));
         }
@@ -2667,13 +2669,10 @@ impl StudyMemoryStore for InMemoryStudyStore {
         response_id: &str,
         evaluation: &AnswerEvaluation,
     ) -> Result<(), PortError> {
-        evaluation
-            .validate_fail_closed()
-            .map_err(|reason| PortError::adapter("memory", reason))?;
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        evaluation.validate_fail_closed().map_err(|reason| {
+            PortError::invalid_input("memory", &evaluation.question_id, reason)
+        })?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
         Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
         let canonical_source = Self::active_question_source_locked(
@@ -2683,8 +2682,9 @@ impl StudyMemoryStore for InMemoryStudyStore {
             &evaluation.question_id,
         )?;
         if canonical_source != evaluation.source {
-            return Err(PortError::adapter(
+            return Err(PortError::invalid_input(
                 "memory",
+                &evaluation.question_id,
                 "answer evaluation source tuple does not match active question source",
             ));
         }
@@ -2696,8 +2696,9 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 && record.response_id == response_id
                 && record.evaluation.as_ref() == Some(&persisted)
         }) {
-            return Err(PortError::adapter(
+            return Err(PortError::conflict(
                 "memory",
+                response_id,
                 "answer evaluation event does not match persisted answer attempt",
             ));
         }
@@ -2710,8 +2711,9 @@ impl StudyMemoryStore for InMemoryStudyStore {
             evaluation,
         )?;
         if !state.event_authorizations.contains(&authorization) {
-            return Err(PortError::adapter(
+            return Err(PortError::conflict(
                 "memory",
+                response_id,
                 "answer evaluation event does not match authorized browser payload",
             ));
         }
@@ -2725,10 +2727,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         voice_session_id: &str,
         source: &StudySourceReference,
     ) -> Result<(), PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
         let canonical =
             Self::source_reference_locked(&state, user_id, study_set_id, &source.source_id)
@@ -2740,8 +2739,9 @@ impl StudyMemoryStore for InMemoryStudyStore {
                     )
                 })?;
         if canonical != *source {
-            return Err(PortError::adapter(
+            return Err(PortError::invalid_input(
                 "memory",
+                &source.source_id,
                 "source tuple does not match deterministic retrieval",
             ));
         }
@@ -2757,10 +2757,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         concept_id: &str,
         status: &ConceptStatus,
     ) -> Result<(), PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
         Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
         Self::ensure_concept_locked(study_set, &state, concept_id)?;
@@ -2771,8 +2768,9 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 && record.concept_id == concept_id
                 && record.status == *status
         }) {
-            return Err(PortError::adapter(
+            return Err(PortError::conflict(
                 "memory",
+                response_id,
                 "concept status event does not match persisted concept status write",
             ));
         }
@@ -2786,8 +2784,9 @@ impl StudyMemoryStore for InMemoryStudyStore {
             &payload,
         )?;
         if !state.event_authorizations.contains(&authorization) {
-            return Err(PortError::adapter(
+            return Err(PortError::conflict(
                 "memory",
+                response_id,
                 "concept status event does not match authorized browser payload",
             ));
         }
@@ -2801,10 +2800,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         voice_session_id: &str,
         intent: &agent_domain::ManuscriptIntent,
     ) -> Result<(), PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
         Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
         match intent {
@@ -2866,37 +2862,28 @@ impl StudyMemoryStore for InMemoryStudyStore {
         recap: &StudySessionRecap,
     ) -> Result<(), PortError> {
         if recap.voice_session_id != voice_session_id {
-            return Err(PortError::adapter(
+            return Err(PortError::invalid_input(
                 "memory",
+                voice_session_id,
                 "recap session does not match authorized session",
             ));
         }
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         let _study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
         Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
         for moment in &recap.source_moments {
-            let canonical = Self::source_reference_locked(
-                &state,
-                user_id,
-                study_set_id,
-                &moment.source.source_id,
-            )
-            .ok_or_else(|| {
-                PortError::unavailable(
-                    "memory",
-                    moment.source.source_id.clone(),
-                    "recap source reference unavailable",
-                )
-            })?;
-            if canonical != moment.source {
-                return Err(PortError::adapter(
-                    "memory",
-                    "recap source tuple does not match deterministic retrieval",
-                ));
-            }
+            // The v2 recap moment carries only the response and source identity, so
+            // deterministic retrieval is proven by resolving that source id against
+            // this tenant's own spans; there is no client-supplied tuple left to
+            // disagree with.
+            Self::source_reference_locked(&state, user_id, study_set_id, &moment.source_id)
+                .ok_or_else(|| {
+                    PortError::unavailable(
+                        "memory",
+                        moment.source_id.clone(),
+                        "recap source reference unavailable",
+                    )
+                })?;
         }
         let authorization = event_authorization_record(
             user_id,
@@ -2907,8 +2894,9 @@ impl StudyMemoryStore for InMemoryStudyStore {
             recap,
         )?;
         if !state.event_authorizations.contains(&authorization) {
-            return Err(PortError::adapter(
+            return Err(PortError::conflict(
                 "memory",
+                response_id,
                 "recap event does not match authorized browser payload",
             ));
         }
@@ -2924,12 +2912,9 @@ impl StudyMemoryStore for InMemoryStudyStore {
     ) -> Result<Value, PortError> {
         envelope
             .validate_fail_closed()
-            .map_err(|reason| PortError::adapter("memory", reason))?;
+            .map_err(|reason| PortError::invalid_input("memory", &envelope.response_id, reason))?;
         {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
             let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
             Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
             Self::active_question_source_locked(study_set, &state, user_id, &envelope.question_id)?;
@@ -2944,11 +2929,8 @@ impl StudyMemoryStore for InMemoryStudyStore {
             evaluation: None,
         };
         let result = serde_json::to_value(&record)
-            .map_err(|error| PortError::adapter("memory", error.to_string()))?;
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            .map_err(|error| json_invariant("study_store_record", &error))?;
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
         if let Some(existing) = state.answer_attempts.iter_mut().find(|existing| {
             existing.user_id == user_id
                 && existing.study_set_id == study_set_id
@@ -2956,13 +2938,14 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 && existing.response_id == envelope.response_id
         }) {
             if existing.envelope != record.envelope {
-                return Err(PortError::adapter(
+                return Err(PortError::conflict(
                     "memory",
+                    &envelope.response_id,
                     "answer attempt envelope cannot be changed",
                 ));
             }
             return serde_json::to_value(existing)
-                .map_err(|error| PortError::adapter("memory", error.to_string()));
+                .map_err(|error| json_invariant("answer_attempt_record", &error));
         }
         state.answer_attempts.push(record);
         Ok(result)
@@ -2976,21 +2959,19 @@ impl StudyMemoryStore for InMemoryStudyStore {
         response_id: &str,
         evaluation: AnswerEvaluation,
     ) -> Result<Value, PortError> {
-        evaluation
-            .validate_fail_closed()
-            .map_err(|reason| PortError::adapter("memory", reason))?;
+        evaluation.validate_fail_closed().map_err(|reason| {
+            PortError::invalid_input("memory", &evaluation.question_id, reason)
+        })?;
         let canonical_source = {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
             let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
             Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
             Self::active_question_source_locked(study_set, &state, user_id, &evaluation.question_id)
         }?;
         if canonical_source != evaluation.source {
-            return Err(PortError::adapter(
+            return Err(PortError::invalid_input(
                 "memory",
+                &evaluation.question_id,
                 "answer evaluation source tuple does not match active question source",
             ));
         }
@@ -3003,10 +2984,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             EventAuthorizationKind::AnswerEvaluation,
             &evaluation,
         )?;
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
         let result = if let Some(existing) = state.answer_attempts.iter_mut().find(|record| {
             record.user_id == user_id
                 && record.study_set_id == study_set_id
@@ -3014,14 +2992,15 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 && record.response_id == response_id
         }) {
             if existing.envelope.question_id != evaluation.question_id {
-                return Err(PortError::adapter(
+                return Err(PortError::conflict(
                     "memory",
+                    response_id,
                     "answer evaluation question does not match attempt envelope",
                 ));
             }
             existing.evaluation = Some(persisted_evaluation);
             serde_json::to_value(existing)
-                .map_err(|error| PortError::adapter("memory", error.to_string()))?
+                .map_err(|error| json_invariant("study_store_record", &error))?
         } else {
             let record = AnswerAttemptRecord {
                 user_id: user_id.to_owned(),
@@ -3052,7 +3031,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 evaluation: Some(persisted_evaluation),
             };
             let result = serde_json::to_value(&record)
-                .map_err(|error| PortError::adapter("memory", error.to_string()))?;
+                .map_err(|error| json_invariant("study_store_record", &error))?;
             state.answer_attempts.push(record);
             result
         };
@@ -3066,10 +3045,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         study_set_id: &str,
         source_id: &str,
     ) -> Result<Option<StudySourceReference>, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         Ok(Self::source_reference_locked(
             &state,
             user_id,
@@ -3088,10 +3064,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         status: ConceptStatus,
     ) -> Result<ConceptStatus, PortError> {
         {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
             let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
             Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
             Self::ensure_concept_locked(study_set, &state, concept_id)?;
@@ -3115,10 +3088,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             EventAuthorizationKind::ConceptStatus,
             &payload,
         )?;
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
         if state.event_authorizations.contains(&authorization) {
             return Ok(status);
         }
@@ -3142,10 +3112,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         due_at: &str,
     ) -> Result<Value, PortError> {
         {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
             let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
             Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
             Self::ensure_concept_locked(study_set, &state, concept_id)?;
@@ -3158,11 +3125,8 @@ impl StudyMemoryStore for InMemoryStudyStore {
             due_at: due_at.to_owned(),
         };
         let result = serde_json::to_value(&record)
-            .map_err(|error| PortError::adapter("memory", error.to_string()))?;
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            .map_err(|error| json_invariant("study_store_record", &error))?;
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
         if !state.review_items.contains(&record) {
             state.review_items.push(record);
         }
@@ -3175,10 +3139,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         study_set_id: &str,
         concept_id: &str,
     ) -> Result<ReviewSchedulingContextV1, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
         Self::ensure_concept_locked(study_set, &state, concept_id)?;
 
@@ -3190,8 +3151,9 @@ impl StudyMemoryStore for InMemoryStudyStore {
         {
             None => None,
             Some(raw) => Some(parse_utc_instant(raw).ok_or_else(|| {
-                PortError::adapter(
+                PortError::internal(
                     "memory",
+                    study_set_id,
                     "study set exam date is not a parseable UTC instant",
                 )
             })?),
@@ -3229,7 +3191,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
     ) -> Result<Value, PortError> {
         decision
             .validate()
-            .map_err(|error| PortError::adapter("memory", error.to_string()))?;
+            .map_err(|error| PortError::invalid_input("memory", concept_id, error.to_string()))?;
 
         let authorization = event_authorization_record(
             user_id,
@@ -3258,10 +3220,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
 
         // One critical section: scoping, the due date and the v1 decision land
         // together or not at all, and a replay writes neither a second time.
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
         {
             let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
             Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
@@ -3296,45 +3255,27 @@ impl StudyMemoryStore for InMemoryStudyStore {
         recap: StudySessionRecap,
     ) -> Result<Value, PortError> {
         if recap.voice_session_id != voice_session_id {
-            return Err(PortError::adapter(
+            return Err(PortError::invalid_input(
                 "memory",
+                voice_session_id,
                 "recap session does not match authorized session",
             ));
         }
         {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
             Self::study_set_locked(&state, user_id, study_set_id)?;
             Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
         }
         for moment in &recap.source_moments {
-            let canonical_source = {
-                let state = self
-                    .inner
-                    .read()
-                    .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-                Self::source_reference_locked(
-                    &state,
-                    user_id,
-                    study_set_id,
-                    &moment.source.source_id,
-                )
-            }
-            .ok_or_else(|| {
-                PortError::unavailable(
-                    "memory",
-                    moment.source.source_id.clone(),
-                    "recap source reference is not available for this user and study set",
-                )
-            })?;
-            if canonical_source != moment.source {
-                return Err(PortError::adapter(
-                    "memory",
-                    "recap source tuple does not match deterministic retrieval",
-                ));
-            }
+            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
+            Self::source_reference_locked(&state, user_id, study_set_id, &moment.source_id)
+                .ok_or_else(|| {
+                    PortError::unavailable(
+                        "memory",
+                        moment.source_id.clone(),
+                        "recap source reference is not available for this user and study set",
+                    )
+                })?;
         }
         let record = RecapRecord {
             user_id: user_id.to_owned(),
@@ -3351,12 +3292,9 @@ impl StudyMemoryStore for InMemoryStudyStore {
             &recap,
         )?;
         let result = serde_json::to_value(&record)
-            .map_err(|error| PortError::adapter("memory", error.to_string()))?;
+            .map_err(|error| json_invariant("study_store_record", &error))?;
         {
-            let mut state = self
-                .inner
-                .write()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
             state.recaps.retain(|existing| {
                 existing.user_id != record.user_id
                     || existing.study_set_id != record.study_set_id
@@ -3372,8 +3310,12 @@ impl StudyMemoryStore for InMemoryStudyStore {
 #[cfg(test)]
 mod tests {
     use agent_domain::{
-        fixture_question, fixture_source_reference, AuthorizedStudySession, ConceptStatus,
-        RecapSourceMoment, SessionId, SourceConfidence, ToolProposal, VivaToolExecutor,
+        fixture_question, fixture_source_reference,
+        learning_recap::{
+            RecapConceptOutcome, RecapSourceMoment, ReviewScheduleAuthority, ReviewScheduleSummary,
+            VIVA_STUDY_SESSION_RECAP_SCHEMA,
+        },
+        ConceptStatus, SessionId, SourceConfidence,
     };
 
     use super::*;
@@ -3425,7 +3367,9 @@ mod tests {
     }
 
     async fn record_fixture_session(store: &InMemoryStudyStore) {
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new("voice-session-1")),
                 user_id: Some("user-1".to_owned()),
@@ -3435,6 +3379,53 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    /// One accepted evaluation for the store's own active question, so the source
+    /// tuple always matches deterministic retrieval.
+    fn fixture_evaluation(question: &StudyQuestion) -> AnswerEvaluation {
+        AnswerEvaluation {
+            question_id: question.question_id.clone(),
+            answer_text: "NADH donates electrons.".to_owned(),
+            label: "mostly correct".to_owned(),
+            concise_feedback: "Grounded in the seeded source.".to_owned(),
+            retry_prompt: question.follow_up.clone(),
+            source: question.source.clone(),
+            concept_status: ConceptStatus::Strong,
+            confidence_score: 0.84,
+        }
+    }
+
+    fn fixture_recap() -> StudySessionRecap {
+        StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+            voice_session_id: "voice-session-1".to_owned(),
+            headline: "Strong concepts: 1 of 2.".to_owned(),
+            summary: "Graded concepts: 2. Evaluated turns: 1. Deferred turns: 0.".to_owned(),
+            concepts: vec![
+                RecapConceptOutcome {
+                    concept_id: "oxidative-phosphorylation".to_owned(),
+                    label: "Oxidative phosphorylation".to_owned(),
+                    status: ConceptStatus::Strong,
+                },
+                RecapConceptOutcome {
+                    concept_id: "atp-synthase".to_owned(),
+                    label: "ATP synthase".to_owned(),
+                    status: ConceptStatus::Shaky,
+                },
+            ],
+            review_schedule: vec![ReviewScheduleSummary {
+                concept_id: "atp-synthase".to_owned(),
+                due_at: "2031-04-07T12:00:00.000Z".to_owned(),
+                authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+            }],
+            next_action: "Review the scheduled concepts on their due dates.".to_owned(),
+            source_moments: vec![RecapSourceMoment {
+                response_id: "response-1".to_owned(),
+                source_id: fixture_source_reference().source_id,
+            }],
+            deferred_turns: 0,
+        }
     }
 
     #[tokio::test]
@@ -3513,7 +3504,9 @@ mod tests {
     async fn study_session_durable_counts_are_scoped_to_authorized_session() {
         let store = seeded_store();
         record_fixture_session(&store).await;
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new("voice-session-2")),
                 user_id: Some("user-1".to_owned()),
@@ -3554,15 +3547,34 @@ mod tests {
                     session_id,
                     "response-1",
                     StudySessionRecap {
+                        schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA
+                            .to_owned(),
                         voice_session_id: session_id.to_owned(),
                         headline: "Durable recap".to_owned(),
                         summary: "Recorded from durable state.".to_owned(),
-                        strong_concepts: vec!["oxidative-phosphorylation".to_owned()],
-                        shaky_concepts: vec![],
-                        missed_concepts: vec![],
-                        review_later: vec!["atp-synthase".to_owned()],
+                        concepts: vec![
+                            agent_domain::learning_recap::RecapConceptOutcome {
+                                concept_id: "oxidative-phosphorylation".to_owned(),
+                                label: "Oxidative phosphorylation".to_owned(),
+                                status: ConceptStatus::Strong,
+                            },
+                            agent_domain::learning_recap::RecapConceptOutcome {
+                                concept_id: "atp-synthase".to_owned(),
+                                label: "ATP synthase".to_owned(),
+                                status: ConceptStatus::Shaky,
+                            },
+                        ],
+                        review_schedule: vec![
+                            agent_domain::learning_recap::ReviewScheduleSummary {
+                                concept_id: "atp-synthase".to_owned(),
+                                due_at: "2031-04-07T12:00:00.000Z".to_owned(),
+                                authority:
+                                    agent_domain::learning_recap::ReviewScheduleAuthority::ServerPersistedFsrs,
+                            },
+                        ],
                         next_action: "Continue".to_owned(),
                         source_moments: vec![],
+                        deferred_turns: 0,
                     },
                 )
                 .await
@@ -3608,7 +3620,9 @@ mod tests {
         assert!(session_deleted.answer_attempts.is_empty());
 
         let study_delete_session_id = "voice-session-study-delete";
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new(study_delete_session_id)),
                 user_id: Some("user-1".to_owned()),
@@ -3655,9 +3669,15 @@ mod tests {
         });
         let question = StudyQuestion {
             question_id: "q-fadh2-entry-point".to_owned(),
+            concept_id: crate::generated_question_concept_id("q-fadh2-entry-point"),
             prompt: "Where does FADH2 enter the electron transport chain?".to_owned(),
             expected_terms: vec!["complex ii".to_owned(), "fewer protons".to_owned()],
             follow_up: "Connect the entry point to ATP yield.".to_owned(),
+            rubric: crate::generated_question_rubric(
+                "q-fadh2-entry-point",
+                "Where does FADH2 enter the electron transport chain?",
+                &source.source_id,
+            ),
             source,
         };
         store.upsert_question(StudyQuestionRecord {
@@ -4233,7 +4253,9 @@ mod tests {
             .await
             .expect("file ingestion succeeds");
         let voice_session_id = "voice-session-file-flow";
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new(voice_session_id)),
                 user_id: Some("user-1".to_owned()),
@@ -4259,67 +4281,32 @@ mod tests {
             .expect("file-generated concept")
             .public_id
             .clone();
-        let executor = VivaToolExecutor::new(
-            store.clone(),
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: record.study_set.id.clone(),
-                voice_session_id: voice_session_id.to_owned(),
-                mode: StudyMode::Quiz,
-                active_concepts: vec![concept_id.clone()],
-            },
-        );
+        assert!(active_question.source.span.starts_with("document:chars:"));
 
-        let selected = executor
-            .execute(
-                "response-file-0",
-                ToolProposal::select_next_question(&record.study_set.id, voice_session_id, "quiz"),
+        let canonical_source = store
+            .source_reference(
+                "user-1",
+                &record.study_set.id,
+                &active_question.source.source_id,
             )
             .await
-            .unwrap();
-        assert_eq!(
-            selected.result["question"]["source"]["source_id"],
-            active_question.source.source_id
-        );
-        assert!(selected.result["question"]["source"]["span"]
-            .as_str()
             .unwrap()
-            .starts_with("document:chars:"));
+            .expect("file-generated source reference");
+        assert_eq!(canonical_source.document_id, record.documents[0].id);
+        assert!(canonical_source.span.starts_with("document:chars:"));
 
-        let source_result = executor
-            .execute(
-                "response-file-1",
-                ToolProposal::retrieve_source_reference(
-                    &record.study_set.id,
-                    voice_session_id,
-                    &active_question.source.source_id,
-                ),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            source_result.result["source"]["document_id"],
-            record.documents[0].id
-        );
-        assert!(source_result.result["source"]["span"]
-            .as_str()
-            .unwrap()
-            .starts_with("document:chars:"));
-
-        let concept_status = executor
-            .execute(
+        let concept_status = store
+            .record_concept_status(
+                "user-1",
+                &record.study_set.id,
+                voice_session_id,
                 "response-file-2",
-                ToolProposal::mark_concept_status(
-                    &record.study_set.id,
-                    voice_session_id,
-                    &concept_id,
-                    "shaky",
-                ),
+                &concept_id,
+                ConceptStatus::Shaky,
             )
             .await
             .unwrap();
-        assert_eq!(concept_status.result["concept_id"], concept_id);
-        assert_eq!(concept_status.result["status"], "shaky");
+        assert_eq!(concept_status, ConceptStatus::Shaky);
 
         let snapshot = store.snapshot();
         assert!(snapshot.concept_statuses.iter().any(|status| {
@@ -4434,7 +4421,9 @@ mod tests {
             .await
             .expect("second paste ingests");
         for record in [&first, &second] {
-            store
+            // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+            // truth is asserted.
+            let _outcome = store
                 .record_voice_session(&SessionConfig {
                     session_id: Some(SessionId::new(record.session_id.clone())),
                     user_id: Some(record.study_set.user_id.clone()),
@@ -4446,90 +4435,67 @@ mod tests {
                 .expect("records paste voice session");
         }
 
-        let first_executor = VivaToolExecutor::new(
-            store.clone(),
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: first.study_set.id.clone(),
-                voice_session_id: first.session_id.clone(),
-                mode: StudyMode::Quiz,
-                active_concepts: first
-                    .concepts
-                    .iter()
-                    .map(|concept| concept.public_id.clone())
-                    .collect(),
-            },
-        );
-        let second_executor = VivaToolExecutor::new(
-            store.clone(),
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: second.study_set.id.clone(),
-                voice_session_id: second.session_id.clone(),
-                mode: StudyMode::Quiz,
-                active_concepts: second
-                    .concepts
-                    .iter()
-                    .map(|concept| concept.public_id.clone())
-                    .collect(),
-            },
-        );
-
-        let first_question = first_executor
-            .execute(
-                "response-0",
-                ToolProposal::select_next_question(&first.study_set.id, &first.session_id, "quiz"),
-            )
+        let first_question = store
+            .active_question("user-1", &first.study_set.id)
             .await
+            .expect("first active question read")
             .expect("selects first generated question");
-        let second_question = second_executor
-            .execute(
-                "response-0",
-                ToolProposal::select_next_question(
-                    &second.study_set.id,
-                    &second.session_id,
-                    "quiz",
-                ),
-            )
+        let second_question = store
+            .active_question("user-1", &second.study_set.id)
             .await
+            .expect("second active question read")
             .expect("selects second generated question");
-        let first_question_id = first_question.result["question"]["question_id"]
-            .as_str()
-            .expect("question id");
-        let second_question_id = second_question.result["question"]["question_id"]
-            .as_str()
-            .expect("question id");
 
-        assert_ne!(first_question_id, "q-oxidative-phosphorylation-nadh");
-        assert_ne!(second_question_id, "q-oxidative-phosphorylation-nadh");
-        assert_ne!(first_question_id, second_question_id);
         assert_ne!(
-            first_question.result["question"]["source"]["source_id"],
-            "src-lecture-5-slide-18"
+            first_question.question_id,
+            "q-oxidative-phosphorylation-nadh"
         );
+        assert_ne!(
+            second_question.question_id,
+            "q-oxidative-phosphorylation-nadh"
+        );
+        assert_ne!(first_question.question_id, second_question.question_id);
+        assert_ne!(first_question.source.source_id, "src-lecture-5-slide-18");
 
-        first_executor
-            .execute(
+        store
+            .record_answer_evaluation(
+                "user-1",
+                &first.study_set.id,
+                &first.session_id,
                 "response-1",
-                ToolProposal::evaluate_spoken_answer(
-                    &first.study_set.id,
-                    &first.session_id,
-                    first_question_id,
-                    "mitosis chromosome spindle",
-                ),
+                AnswerEvaluation {
+                    question_id: first_question.question_id.clone(),
+                    answer_text: "mitosis chromosome spindle".to_owned(),
+                    label: "mostly correct".to_owned(),
+                    concise_feedback: "Grounded in the first study set.".to_owned(),
+                    retry_prompt: first_question.follow_up.clone(),
+                    source: first_question.source.clone(),
+                    concept_status: ConceptStatus::Strong,
+                    confidence_score: 0.8,
+                },
             )
             .await
             .expect("first generated answer records");
+
+        // The second set's question and source belong to a different study set, so
+        // the first session may not evaluate against them and may not write.
         let baseline_writes = store.write_counts();
-        let wrong_set = first_executor
-            .execute(
-                "response-1",
-                ToolProposal::evaluate_spoken_answer(
-                    &first.study_set.id,
-                    &first.session_id,
-                    second_question_id,
-                    "photosynthesis chloroplast",
-                ),
+        let wrong_set = store
+            .record_answer_evaluation(
+                "user-1",
+                &first.study_set.id,
+                &first.session_id,
+                "response-2",
+                AnswerEvaluation {
+                    question_id: second_question.question_id.clone(),
+                    answer_text: "photosynthesis chloroplast".to_owned(),
+                    label: "mostly correct".to_owned(),
+                    concise_feedback: "Wrong study set.".to_owned(),
+                    retry_prompt: second_question.follow_up.clone(),
+                    source: second_question.source.clone(),
+                    concept_status: ConceptStatus::Strong,
+                    confidence_score: 0.8,
+                },
             )
             .await;
 
@@ -4714,19 +4680,22 @@ mod tests {
                 "voice-session-1",
                 "response-0",
                 StudySessionRecap {
+                    schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
                     voice_session_id: "voice-session-1".to_owned(),
                     headline: "Closed".to_owned(),
                     summary: "Closed session recap.".to_owned(),
-                    strong_concepts: vec!["NADH".to_owned()],
-                    shaky_concepts: vec![],
-                    missed_concepts: vec![],
-                    review_later: vec![],
-                    next_action: "Stop".to_owned(),
-                    source_moments: vec![RecapSourceMoment {
-                        text: "Closed recap source".to_owned(),
-                        source: fixture_source_reference(),
+                    concepts: vec![RecapConceptOutcome {
+                        concept_id: "nadh".to_owned(),
+                        label: "NADH".to_owned(),
                         status: ConceptStatus::Strong,
                     }],
+                    review_schedule: vec![],
+                    next_action: "Stop".to_owned(),
+                    source_moments: vec![RecapSourceMoment {
+                        response_id: "response-0".to_owned(),
+                        source_id: fixture_source_reference().source_id,
+                    }],
+                    deferred_turns: 0,
                 },
             )
             .await
@@ -4790,19 +4759,33 @@ mod tests {
             .is_err());
 
         let recap = StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
             voice_session_id: "voice-session-1".to_owned(),
             headline: "Done".to_owned(),
             summary: "Recap".to_owned(),
-            strong_concepts: vec!["NADH".to_owned()],
-            shaky_concepts: vec![],
-            missed_concepts: vec![],
-            review_later: vec!["ATP synthase".to_owned()],
+            concepts: vec![
+                RecapConceptOutcome {
+                    concept_id: "nadh".to_owned(),
+                    label: "NADH".to_owned(),
+                    status: ConceptStatus::Strong,
+                },
+                RecapConceptOutcome {
+                    concept_id: "atp-synthase".to_owned(),
+                    label: "ATP synthase".to_owned(),
+                    status: ConceptStatus::Shaky,
+                },
+            ],
+            review_schedule: vec![ReviewScheduleSummary {
+                concept_id: "atp-synthase".to_owned(),
+                due_at: "2031-04-07T12:00:00.000Z".to_owned(),
+                authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+            }],
             next_action: "Review tomorrow".to_owned(),
             source_moments: vec![RecapSourceMoment {
-                text: "NADH source".to_owned(),
-                source: fixture_source_reference(),
-                status: ConceptStatus::Strong,
+                response_id: "response-0".to_owned(),
+                source_id: fixture_source_reference().source_id,
             }],
+            deferred_turns: 0,
         };
         store
             .record_recap(
@@ -4852,34 +4835,58 @@ mod tests {
         record_fixture_session(&store).await;
 
         let first_recap = StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
             voice_session_id: "voice-session-1".to_owned(),
             headline: "First recap".to_owned(),
             summary: "Initial recap.".to_owned(),
-            strong_concepts: vec!["NADH".to_owned()],
-            shaky_concepts: vec![],
-            missed_concepts: vec![],
-            review_later: vec!["ATP synthase".to_owned()],
+            concepts: vec![
+                RecapConceptOutcome {
+                    concept_id: "nadh".to_owned(),
+                    label: "NADH".to_owned(),
+                    status: ConceptStatus::Strong,
+                },
+                RecapConceptOutcome {
+                    concept_id: "atp-synthase".to_owned(),
+                    label: "ATP synthase".to_owned(),
+                    status: ConceptStatus::Shaky,
+                },
+            ],
+            review_schedule: vec![ReviewScheduleSummary {
+                concept_id: "atp-synthase".to_owned(),
+                due_at: "2031-04-07T12:00:00.000Z".to_owned(),
+                authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+            }],
             next_action: "Review oxidative phosphorylation.".to_owned(),
             source_moments: vec![RecapSourceMoment {
-                text: "NADH source".to_owned(),
-                source: fixture_source_reference(),
-                status: ConceptStatus::Strong,
+                response_id: "response-a".to_owned(),
+                source_id: fixture_source_reference().source_id,
             }],
+            deferred_turns: 0,
         };
         let second_recap = StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
             voice_session_id: "voice-session-1".to_owned(),
             headline: "Second recap".to_owned(),
             summary: "Replacement recap.".to_owned(),
-            strong_concepts: vec!["ATP synthase".to_owned()],
-            shaky_concepts: vec!["NADH".to_owned()],
-            missed_concepts: vec![],
-            review_later: vec![],
+            concepts: vec![
+                RecapConceptOutcome {
+                    concept_id: "atp-synthase".to_owned(),
+                    label: "ATP synthase".to_owned(),
+                    status: ConceptStatus::Strong,
+                },
+                RecapConceptOutcome {
+                    concept_id: "nadh".to_owned(),
+                    label: "NADH".to_owned(),
+                    status: ConceptStatus::Shaky,
+                },
+            ],
+            review_schedule: vec![],
             next_action: "Compare electron transport steps.".to_owned(),
             source_moments: vec![RecapSourceMoment {
-                text: "ATP synthase source".to_owned(),
-                source: fixture_source_reference(),
-                status: ConceptStatus::Shaky,
+                response_id: "response-b".to_owned(),
+                source_id: fixture_source_reference().source_id,
             }],
+            deferred_turns: 0,
         };
 
         store
@@ -5041,19 +5048,22 @@ mod tests {
             .is_err());
 
         let mismatched_session_recap = StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
             voice_session_id: "voice-session-2".to_owned(),
             headline: "Done".to_owned(),
             summary: "Recap".to_owned(),
-            strong_concepts: vec!["NADH".to_owned()],
-            shaky_concepts: vec![],
-            missed_concepts: vec![],
-            review_later: vec!["ATP synthase".to_owned()],
-            next_action: "Review tomorrow".to_owned(),
-            source_moments: vec![RecapSourceMoment {
-                text: "Mismatched recap source".to_owned(),
-                source: fixture_source_reference(),
+            concepts: vec![RecapConceptOutcome {
+                concept_id: "nadh".to_owned(),
+                label: "NADH".to_owned(),
                 status: ConceptStatus::Strong,
             }],
+            review_schedule: vec![],
+            next_action: "Review tomorrow".to_owned(),
+            source_moments: vec![RecapSourceMoment {
+                response_id: "response-0".to_owned(),
+                source_id: fixture_source_reference().source_id,
+            }],
+            deferred_turns: 0,
         };
         assert!(store
             .record_recap(
@@ -5066,22 +5076,25 @@ mod tests {
             .await
             .is_err());
 
-        let mut forged_recap_source = fixture_source_reference();
-        forged_recap_source.document_id = "wrong-doc".to_owned();
+        // The v2 recap moment carries only a source id, so a forged moment is a
+        // source id this user and study set do not own.
         let recap = StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
             voice_session_id: "voice-session-1".to_owned(),
             headline: "Done".to_owned(),
             summary: "Recap".to_owned(),
-            strong_concepts: vec!["NADH".to_owned()],
-            shaky_concepts: vec![],
-            missed_concepts: vec![],
-            review_later: vec!["ATP synthase".to_owned()],
-            next_action: "Review tomorrow".to_owned(),
-            source_moments: vec![RecapSourceMoment {
-                text: "Forged recap source".to_owned(),
-                source: forged_recap_source,
+            concepts: vec![RecapConceptOutcome {
+                concept_id: "nadh".to_owned(),
+                label: "NADH".to_owned(),
                 status: ConceptStatus::Strong,
             }],
+            review_schedule: vec![],
+            next_action: "Review tomorrow".to_owned(),
+            source_moments: vec![RecapSourceMoment {
+                response_id: "response-0".to_owned(),
+                source_id: "src-not-owned-by-this-study-set".to_owned(),
+            }],
+            deferred_turns: 0,
         };
 
         assert!(store
@@ -5129,19 +5142,33 @@ mod tests {
                 "voice-session-1",
                 "response-0",
                 StudySessionRecap {
+                    schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
                     voice_session_id: "voice-session-1".to_owned(),
                     headline: "Done".to_owned(),
                     summary: "Recap".to_owned(),
-                    strong_concepts: vec!["NADH".to_owned()],
-                    shaky_concepts: vec![],
-                    missed_concepts: vec![],
-                    review_later: vec!["ATP synthase".to_owned()],
+                    concepts: vec![
+                        RecapConceptOutcome {
+                            concept_id: "nadh".to_owned(),
+                            label: "NADH".to_owned(),
+                            status: ConceptStatus::Strong,
+                        },
+                        RecapConceptOutcome {
+                            concept_id: "atp-synthase".to_owned(),
+                            label: "ATP synthase".to_owned(),
+                            status: ConceptStatus::Shaky,
+                        },
+                    ],
+                    review_schedule: vec![ReviewScheduleSummary {
+                        concept_id: "atp-synthase".to_owned(),
+                        due_at: "2031-04-07T12:00:00.000Z".to_owned(),
+                        authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+                    }],
                     next_action: "Review tomorrow".to_owned(),
                     source_moments: vec![RecapSourceMoment {
-                        text: "NADH source".to_owned(),
-                        source: fixture_source_reference(),
-                        status: ConceptStatus::Strong,
+                        response_id: "response-0".to_owned(),
+                        source_id: fixture_source_reference().source_id,
                     }],
+                    deferred_turns: 0,
                 },
             )
             .await
@@ -5158,98 +5185,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_tool_executor_handles_all_viva_tools_with_authorized_session() {
+    async fn every_authorized_store_write_lands_exactly_once_for_one_session() {
         let store = Arc::new(seeded_store());
         record_fixture_session(&store).await;
-        let executor = VivaToolExecutor::new(
-            store.clone(),
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: "biology-midterm".to_owned(),
-                voice_session_id: "voice-session-1".to_owned(),
-                mode: StudyMode::Quiz,
-                active_concepts: vec![
-                    "oxidative-phosphorylation".to_owned(),
-                    "atp-synthase".to_owned(),
-                ],
-            },
-        );
-        let question = executor
-            .execute(
-                "response-0",
-                ToolProposal::select_next_question("biology-midterm", "voice-session-1", "quiz"),
-            )
+        let question = store
+            .active_question("user-1", "biology-midterm")
             .await
-            .unwrap();
-        assert_eq!(
-            question.result["question"]["source"]["source_id"],
-            "src-lecture-5-slide-18"
-        );
+            .unwrap()
+            .expect("seeded active question");
+        assert_eq!(question.source.source_id, "src-lecture-5-slide-18");
 
-        executor
-            .execute(
+        store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
                 "response-1",
-                ToolProposal::evaluate_spoken_answer(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "q-oxidative-phosphorylation-nadh",
-                    "NADH donates electrons.",
-                ),
+                fixture_evaluation(&question),
             )
             .await
             .unwrap();
-        executor
-            .execute(
+        assert!(store
+            .source_reference("user-1", "biology-midterm", "src-lecture-5-slide-18")
+            .await
+            .unwrap()
+            .is_some());
+        store
+            .record_concept_status(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
                 "response-1",
-                ToolProposal::retrieve_source_reference(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "src-lecture-5-slide-18",
-                ),
+                "oxidative-phosphorylation",
+                ConceptStatus::Strong,
             )
             .await
             .unwrap();
-        executor
-            .execute(
-                "response-1",
-                ToolProposal::mark_concept_status(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "oxidative-phosphorylation",
-                    "strong",
-                ),
+        store
+            .schedule_review_item(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "atp-synthase",
+                "2031-04-07T12:00:00.000Z",
             )
             .await
             .unwrap();
-        executor
-            .execute(
-                "response-1",
-                ToolProposal::schedule_review_item(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "atp-synthase",
-                    "shaky",
-                ),
-            )
-            .await
-            .unwrap();
-        executor
-            .execute(
+        store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
                 "response-0",
-                ToolProposal::build_session_recap("biology-midterm", "voice-session-1"),
-            )
-            .await
-            .unwrap();
-        executor
-            .execute(
-                "response-1",
-                ToolProposal::challenge_correction(
-                    "biology-midterm",
-                    "voice-session-1",
-                    &fixture_source_reference(),
-                    "correction-1",
-                    "Re-check this source.",
-                ),
+                fixture_recap(),
             )
             .await
             .unwrap();
@@ -5262,64 +5250,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_tool_executor_replay_keeps_store_counts_exact() {
+    async fn replaying_every_authorized_store_write_keeps_counts_exact() {
         let store = Arc::new(seeded_store());
         record_fixture_session(&store).await;
-        let executor = VivaToolExecutor::new(
-            store.clone(),
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: "biology-midterm".to_owned(),
-                voice_session_id: "voice-session-1".to_owned(),
-                mode: StudyMode::Quiz,
-                active_concepts: vec![
-                    "oxidative-phosphorylation".to_owned(),
-                    "atp-synthase".to_owned(),
-                ],
-            },
-        );
+        let question = store
+            .active_question("user-1", "biology-midterm")
+            .await
+            .unwrap()
+            .expect("seeded active question");
 
         for _ in 0..2 {
-            executor
-                .execute(
+            store
+                .record_answer_evaluation(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
                     "response-1",
-                    ToolProposal::evaluate_spoken_answer(
-                        "biology-midterm",
-                        "voice-session-1",
-                        "q-oxidative-phosphorylation-nadh",
-                        "NADH donates electrons.",
-                    ),
+                    fixture_evaluation(&question),
                 )
                 .await
                 .unwrap();
-            executor
-                .execute(
+            store
+                .record_concept_status(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
                     "response-1",
-                    ToolProposal::mark_concept_status(
-                        "biology-midterm",
-                        "voice-session-1",
-                        "oxidative-phosphorylation",
-                        "strong",
-                    ),
+                    "oxidative-phosphorylation",
+                    ConceptStatus::Strong,
                 )
                 .await
                 .unwrap();
-            executor
-                .execute(
-                    "response-1",
-                    ToolProposal::schedule_review_item(
-                        "biology-midterm",
-                        "voice-session-1",
-                        "atp-synthase",
-                        "shaky",
-                    ),
+            store
+                .schedule_review_item(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    "atp-synthase",
+                    "2031-04-07T12:00:00.000Z",
                 )
                 .await
                 .unwrap();
-            executor
-                .execute(
+            store
+                .record_recap(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
                     "response-0",
-                    ToolProposal::build_session_recap("biology-midterm", "voice-session-1"),
+                    fixture_recap(),
                 )
                 .await
                 .unwrap();
@@ -5333,42 +5311,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_tool_executor_rejects_session_and_source_forgery() {
+    async fn store_rejects_wrong_study_set_and_forged_source_tuple() {
         let store = Arc::new(seeded_store());
         record_fixture_session(&store).await;
-        let executor = VivaToolExecutor::new(
-            store,
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: "biology-midterm".to_owned(),
-                voice_session_id: "voice-session-1".to_owned(),
-                mode: StudyMode::Quiz,
-                active_concepts: vec![
-                    "oxidative-phosphorylation".to_owned(),
-                    "atp-synthase".to_owned(),
-                ],
-            },
-        );
-        assert!(executor
-            .execute(
-                "response-0",
-                ToolProposal::select_next_question("wrong-set", "voice-session-1", "quiz",),
-            )
-            .await
-            .is_err());
+
+        // A study set this session is not bound to yields no question at all: the
+        // store refuses rather than answering with someone else's question.
+        assert!(store.active_question("user-1", "wrong-set").await.is_err());
 
         let mut forged_source = fixture_source_reference();
         forged_source.excerpt = "forged excerpt".to_owned();
-        assert!(executor
-            .execute(
-                "response-1",
-                ToolProposal::challenge_correction(
-                    "biology-midterm",
-                    "voice-session-1",
-                    &forged_source,
-                    "correction-1",
-                    "Re-check this source.",
-                ),
+        assert!(store
+            .authorize_source_reference(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                &forged_source,
             )
             .await
             .is_err());
@@ -5378,10 +5336,9 @@ mod tests {
 #[cfg(test)]
 mod review_schedule_decision_tests {
     use agent_domain::{
-        decide_review_schedule, format_rfc3339_millis, parse_utc_instant, AuthorizedStudySession,
-        Clock, ConceptStatus, FsrsCardStateV1, ReviewOutcomeV1, ReviewScheduleCapReasonV1,
-        ReviewScheduleDecisionV1, ReviewSchedulingContextV1, SessionConfig, SessionId,
-        StudyMemoryStore, StudyMode, ToolProposal, VivaToolExecutor,
+        decide_review_schedule, format_rfc3339_millis, parse_utc_instant, Clock, ConceptStatus,
+        FsrsCardStateV1, ReviewOutcomeV1, ReviewScheduleCapReasonV1, ReviewScheduleDecisionV1,
+        ReviewSchedulingContextV1, SessionConfig, SessionId, StudyMemoryStore, StudyMode,
         VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
     };
     use chrono::{DateTime, Duration, Utc};
@@ -5403,7 +5360,9 @@ mod review_schedule_decision_tests {
 
     async fn seeded_session_store() -> InMemoryStudyStore {
         let store = InMemoryStudyStore::seeded_fixture();
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new("voice-session-1")),
                 user_id: Some("user-1".to_owned()),
@@ -5462,53 +5421,61 @@ mod review_schedule_decision_tests {
         }
     }
 
-    fn scheduling_executor(
-        store: Arc<InMemoryStudyStore>,
-        clock: Arc<dyn Clock>,
-    ) -> VivaToolExecutor {
-        VivaToolExecutor::with_clock(
-            store,
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: "biology-midterm".to_owned(),
-                voice_session_id: "voice-session-1".to_owned(),
-                mode: StudyMode::Quiz,
-                active_concepts: vec!["nadh".to_owned()],
+    /// Grade the same outcome again a moment later, exactly as a live replay does.
+    ///
+    /// `LEARN-009` removed the `schedule_review_item` tool, so the wall-clock replay
+    /// this test cares about is expressed directly: two decisions computed from one
+    /// graded outcome at two instants necessarily differ, and the store must still
+    /// keep the first one authoritative.
+    async fn schedule_shaky(
+        store: &InMemoryStudyStore,
+        clock: &AdvancingClock,
+        response_id: &str,
+    ) -> Value {
+        // Exactly what the live path does: the authoritative card and exam instant
+        // are read from the store, never supplied by the caller.
+        let context = store
+            .review_scheduling_context("user-1", "biology-midterm", "nadh")
+            .await
+            .expect("scheduling context");
+        let decision = decide_review_schedule(
+            clock.now(),
+            &ReviewOutcomeV1 {
+                status: ConceptStatus::Shaky,
+                hint_count: Some(2),
+                miss_count: Some(1),
             },
-            clock,
+            &context,
         )
+        .expect("authoritative decision");
+        store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                response_id,
+                "nadh",
+                decision,
+            )
+            .await
+            .expect("decision persists")
     }
 
-    fn shaky_proposal() -> ToolProposal {
-        ToolProposal::schedule_review_item("biology-midterm", "voice-session-1", "nadh", "shaky")
-    }
-
-    /// The replay property that matters: the same tool call, replayed through the live
-    /// executor while the wall clock moves, must not write a second scheduled review
-    /// and must not advance the persisted FSRS card. Replaying a decision object that
-    /// was built once cannot exercise this, because the second decision differs.
+    /// The replay property that matters: the same graded outcome, replayed while the
+    /// wall clock moves, must not write a second scheduled review and must not
+    /// advance the persisted FSRS card. Replaying a decision object that was built
+    /// once cannot exercise this, because the second decision differs.
     #[tokio::test]
-    async fn review_schedule_decision_replay_through_the_executor_never_writes_twice() {
+    async fn review_schedule_decision_replay_under_a_moving_clock_never_writes_twice() {
         let store = Arc::new(seeded_session_store().await);
-        let executor = scheduling_executor(
-            Arc::clone(&store),
-            Arc::new(AdvancingClock::new(
-                parse_utc_instant(GRADED_AT).expect("instant parses"),
-            )),
-        );
+        let clock = AdvancingClock::new(parse_utc_instant(GRADED_AT).expect("instant parses"));
 
-        let first = executor
-            .execute("response-7", shaky_proposal())
-            .await
-            .expect("first schedule");
-        let replay = executor
-            .execute("response-7", shaky_proposal())
-            .await
-            .expect("replayed schedule");
+        let first = schedule_shaky(&store, &clock, "response-7").await;
+        let replay = schedule_shaky(&store, &clock, "response-7").await;
 
         assert_eq!(
             replay, first,
-            "a replayed tool call must report the already-persisted decision"
+            "a replayed graded outcome must report the already-persisted decision"
         );
 
         let snapshot = store.snapshot();
@@ -5530,29 +5497,27 @@ mod review_schedule_decision_tests {
         assert_eq!(context.card.as_ref().map(|card| card.reps), Some(1));
     }
 
-    /// The same property under concurrency, still through the live executor: eight
-    /// racing replays each read a different instant from the clock and so each compute
-    /// a different schedule, and exactly one of them may be persisted.
+    /// The same property under concurrency: eight racing replays each read a
+    /// different instant from the clock and so each compute a different schedule,
+    /// and exactly one of them may be persisted.
     #[tokio::test]
-    async fn review_schedule_decision_concurrent_executor_replays_write_exactly_one_row() {
+    async fn review_schedule_decision_concurrent_replays_write_exactly_one_row() {
         let store = Arc::new(seeded_session_store().await);
-        let executor = Arc::new(scheduling_executor(
-            Arc::clone(&store),
-            Arc::new(AdvancingClock::new(
-                parse_utc_instant(GRADED_AT).expect("instant parses"),
-            )),
+        let clock = Arc::new(AdvancingClock::new(
+            parse_utc_instant(GRADED_AT).expect("instant parses"),
         ));
 
         let mut handles = Vec::new();
         for _ in 0..8 {
-            let executor = Arc::clone(&executor);
+            let store = Arc::clone(&store);
+            let clock = Arc::clone(&clock);
             handles.push(tokio::spawn(async move {
-                executor.execute("response-7", shaky_proposal()).await
+                schedule_shaky(&store, &clock, "response-7").await
             }));
         }
         let mut results = Vec::new();
         for handle in handles {
-            results.push(handle.await.expect("join").expect("replay succeeds"));
+            results.push(handle.await.expect("join"));
         }
         for result in &results {
             assert_eq!(result, &results[0], "every replay reports one schedule");
@@ -5569,21 +5534,10 @@ mod review_schedule_decision_tests {
     #[tokio::test]
     async fn review_schedule_decision_a_distinct_graded_outcome_still_advances_the_card() {
         let store = Arc::new(seeded_session_store().await);
-        let executor = scheduling_executor(
-            Arc::clone(&store),
-            Arc::new(AdvancingClock::new(
-                parse_utc_instant(GRADED_AT).expect("instant parses"),
-            )),
-        );
+        let clock = AdvancingClock::new(parse_utc_instant(GRADED_AT).expect("instant parses"));
 
-        executor
-            .execute("response-7", shaky_proposal())
-            .await
-            .expect("first schedule");
-        executor
-            .execute("response-8", shaky_proposal())
-            .await
-            .expect("second graded outcome");
+        schedule_shaky(&store, &clock, "response-7").await;
+        schedule_shaky(&store, &clock, "response-8").await;
 
         let snapshot = store.snapshot();
         assert_eq!(snapshot.review_schedule_decisions.len(), 2);
@@ -5600,26 +5554,17 @@ mod review_schedule_decision_tests {
     #[tokio::test]
     async fn review_schedule_decision_guard_separates_outcomes_within_one_response() {
         let store = Arc::new(seeded_session_store().await);
-        let executor = scheduling_executor(
-            Arc::clone(&store),
-            Arc::new(AdvancingClock::new(
-                parse_utc_instant(GRADED_AT).expect("instant parses"),
-            )),
-        );
+        let clock = AdvancingClock::new(parse_utc_instant(GRADED_AT).expect("instant parses"));
 
-        executor
-            .execute("response-7", shaky_proposal())
-            .await
-            .expect("shaky schedule");
-        executor
-            .execute(
+        schedule_shaky(&store, &clock, "response-7").await;
+        store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
                 "response-7",
-                ToolProposal::schedule_review_item(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "nadh",
-                    "strong",
-                ),
+                "nadh",
+                decision_at(GRADED_AT, ConceptStatus::Strong, None),
             )
             .await
             .expect("strong schedule");
@@ -5989,7 +5934,9 @@ mod review_schedule_decision_tests {
     #[tokio::test]
     async fn review_schedule_decision_library_snapshot_reads_only_valid_v1_decisions() {
         let store = seeded_session_store().await;
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new("voice-session-2")),
                 user_id: Some("user-1".to_owned()),

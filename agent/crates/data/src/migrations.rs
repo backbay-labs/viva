@@ -283,9 +283,13 @@ mod tests {
     use super::*;
     use crate::PostgresStudyStore;
     use agent_domain::{
-        fixture_question, fixture_source_reference, ConceptStatus, SessionConfig, SessionId,
-        SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudySessionRecap,
-        StudyStoreWriteCounts, ToolProposal, VivaToolExecutor, VoiceUsageRecord,
+        fixture_question, fixture_source_reference,
+        learning_recap::{
+            RecapConceptOutcome, RecapSourceMoment, ReviewScheduleAuthority, ReviewScheduleSummary,
+            VIVA_STUDY_SESSION_RECAP_SCHEMA,
+        },
+        ConceptStatus, PortErrorKind, SessionConfig, SessionId, SessionTokenNonceClaim,
+        StudyMemoryStore, StudyMode, StudySessionRecap, StudyStoreWriteCounts, VoiceUsageRecord,
     };
     use serde::Deserialize;
     use std::sync::Arc;
@@ -476,86 +480,10 @@ mod tests {
 
         let store = Arc::new(crate::PostgresStudyStore::new(pool.clone()));
         record_fixture_session(store.as_ref()).await;
-        let executor = VivaToolExecutor::new(
-            store.clone(),
-            agent_domain::AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: "biology-midterm".to_owned(),
-                voice_session_id: "voice-session-1".to_owned(),
-                mode: StudyMode::Quiz,
-                active_concepts: vec![
-                    "oxidative-phosphorylation".to_owned(),
-                    "atp-synthase".to_owned(),
-                ],
-            },
-        );
-
-        let question = executor
-            .execute(
-                "response-0",
-                ToolProposal::select_next_question("biology-midterm", "voice-session-1", "quiz"),
-            )
-            .await
-            .expect("selects seeded question");
-        assert_eq!(
-            question.result["question"]["source"]["source_id"],
-            "src-lecture-5-slide-18"
-        );
-        executor
-            .execute(
-                "response-1",
-                ToolProposal::evaluate_spoken_answer(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "q-oxidative-phosphorylation-nadh",
-                    "NADH donates electrons.",
-                ),
-            )
-            .await
-            .expect("records answer");
-        executor
-            .execute(
-                "response-1",
-                ToolProposal::retrieve_source_reference(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "src-lecture-5-slide-18",
-                ),
-            )
-            .await
-            .expect("retrieves source");
-        executor
-            .execute(
-                "response-1",
-                ToolProposal::mark_concept_status(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "oxidative-phosphorylation",
-                    "strong",
-                ),
-            )
-            .await
-            .expect("records concept status");
-        executor
-            .execute(
-                "response-1",
-                ToolProposal::schedule_review_item(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "atp-synthase",
-                    "shaky",
-                ),
-            )
-            .await
-            .expect("schedules review");
-        executor
-            .execute(
-                "response-0",
-                ToolProposal::build_session_recap("biology-midterm", "voice-session-1"),
-            )
-            .await
-            .expect("records recap");
-        store
+        record_one_counted_turn(store.as_ref(), "voice-session-1").await;
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_usage(VoiceUsageRecord {
                 voice_session_id: Some("voice-session-1".to_owned()),
                 provider: "synthetic".to_owned(),
@@ -714,29 +642,20 @@ mod tests {
             .is_none());
         set_source_deleted(&pool, false).await;
 
-        let mut forged_recap_source = fixture_source_reference();
-        forged_recap_source.document_id = "wrong-doc".to_owned();
+        // The v2 recap moment carries only a source id, so a forged moment is a
+        // source id this user and study set do not own.
+        let mut forged_recap = fixture_recap();
+        forged_recap.source_moments = vec![RecapSourceMoment {
+            response_id: "response-0".to_owned(),
+            source_id: "src-not-owned-by-this-study-set".to_owned(),
+        }];
         assert!(negative_store
             .record_recap(
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
                 "response-0",
-                StudySessionRecap {
-                    voice_session_id: "voice-session-1".to_owned(),
-                    headline: "Done".to_owned(),
-                    summary: "Recap".to_owned(),
-                    strong_concepts: vec!["NADH".to_owned()],
-                    shaky_concepts: vec![],
-                    missed_concepts: vec![],
-                    review_later: vec!["ATP synthase".to_owned()],
-                    next_action: "Review tomorrow".to_owned(),
-                    source_moments: vec![agent_domain::RecapSourceMoment {
-                        text: "Forged recap source".to_owned(),
-                        source: forged_recap_source,
-                        status: ConceptStatus::Strong,
-                    }],
-                },
+                forged_recap,
             )
             .await
             .is_err());
@@ -763,10 +682,11 @@ mod tests {
         let baseline_rows = db_row_counts(&pool).await;
 
         record_count_table_session(store.as_ref(), &session_id).await;
-        let executor = count_table_executor(store.clone(), &session_id);
-        replay_counted_provider_turn(&executor, &session_id).await;
-        replay_counted_provider_turn(&executor, &session_id).await;
-        store
+        record_one_counted_turn(store.as_ref(), &session_id).await;
+        record_one_counted_turn(store.as_ref(), &session_id).await;
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_usage(VoiceUsageRecord {
                 voice_session_id: Some(session_id),
                 provider: "synthetic".to_owned(),
@@ -809,8 +729,7 @@ mod tests {
         let store = Arc::new(crate::PostgresStudyStore::new(pool.clone()));
         let session_id = Uuid::new_v4().to_string();
         record_count_table_session(store.as_ref(), &session_id).await;
-        let executor = count_table_executor(store.clone(), &session_id);
-        replay_counted_provider_turn(&executor, &session_id).await;
+        record_one_counted_turn(store.as_ref(), &session_id).await;
 
         let counts = store
             .study_session_durable_counts("user-1", "biology-midterm", &session_id)
@@ -849,13 +768,9 @@ mod tests {
             .claim_session_token_nonce(claim.clone())
             .await
             .expect_err("replayed nonce claim is rejected");
-        match replay {
-            PortError::Unavailable { port, reason, .. } => {
-                assert_eq!(port, "postgres");
-                assert_eq!(reason, "session token nonce already used");
-            }
-            other => panic!("unexpected replay error: {other}"),
-        }
+        assert_eq!(replay.kind(), PortErrorKind::Unavailable);
+        assert_eq!(replay.port(), "postgres");
+        assert_eq!(replay.reason(), "session token nonce already used");
         assert_eq!(session_token_nonce_rows(&pool, &claim).await, 1);
     }
 
@@ -872,7 +787,9 @@ mod tests {
         let store = PostgresStudyStore::new(pool);
         record_fixture_session(&store).await;
         let second_session_id = "55555555-5555-4555-8555-555555555555";
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new(second_session_id)),
                 user_id: Some("user-1".to_owned()),
@@ -1509,8 +1426,9 @@ mod tests {
         let mut first = fixture_recap();
         first.voice_session_id.clone_from(&session_id);
         let mut replacement = first.clone();
-        replacement.strong_concepts.push("ATP synthase".to_owned());
-        replacement.shaky_concepts.clear();
+        for concept in &mut replacement.concepts {
+            concept.status = ConceptStatus::Strong;
+        }
 
         store
             .record_recap(
@@ -1738,7 +1656,9 @@ mod tests {
             .expect("fixture seed applies");
         let store = PostgresStudyStore::new(pool.clone());
         let session_id = "55555555-5555-4555-8555-555555555555";
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new(session_id)),
                 user_id: Some("user-1".to_owned()),
@@ -1748,7 +1668,9 @@ mod tests {
             })
             .await
             .expect("records privacy session");
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_usage(VoiceUsageRecord {
                 voice_session_id: Some(session_id.to_owned()),
                 provider: "synthetic".to_owned(),
@@ -1811,7 +1733,9 @@ mod tests {
             concept_status_event_rows_for_session(&pool, session_id).await,
             0
         );
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_usage(VoiceUsageRecord {
                 voice_session_id: Some(session_id.to_owned()),
                 provider: "synthetic".to_owned(),
@@ -1840,7 +1764,9 @@ mod tests {
         assert_eq!(session_status(&pool, session_id).await, "deleted");
 
         let study_delete_session_id = "66666666-6666-4666-8666-666666666666";
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new(study_delete_session_id)),
                 user_id: Some("user-1".to_owned()),
@@ -1850,7 +1776,9 @@ mod tests {
             })
             .await
             .expect("records study delete session");
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_usage(VoiceUsageRecord {
                 voice_session_id: Some(study_delete_session_id.to_owned()),
                 provider: "synthetic".to_owned(),
@@ -1919,7 +1847,9 @@ mod tests {
             concept_status_event_rows_for_session(&pool, study_delete_session_id).await,
             0
         );
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_usage(VoiceUsageRecord {
                 voice_session_id: Some(study_delete_session_id.to_owned()),
                 provider: "synthetic".to_owned(),
@@ -1981,7 +1911,9 @@ mod tests {
     }
 
     async fn record_fixture_session(store: &dyn StudyMemoryStore) {
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new("voice-session-1")),
                 user_id: Some("user-1".to_owned()),
@@ -1994,7 +1926,9 @@ mod tests {
     }
 
     async fn record_count_table_session(store: &dyn StudyMemoryStore, session_id: &str) {
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new(session_id)),
                 user_id: Some("user-1".to_owned()),
@@ -2008,100 +1942,104 @@ mod tests {
 
     fn fixture_recap() -> StudySessionRecap {
         StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
             voice_session_id: "voice-session-1".to_owned(),
-            headline: "Done".to_owned(),
-            summary: "Recap".to_owned(),
-            strong_concepts: vec!["NADH".to_owned()],
-            shaky_concepts: vec!["ATP synthase".to_owned()],
-            missed_concepts: vec![],
-            review_later: vec!["ATP synthase".to_owned()],
-            next_action: "Review tomorrow".to_owned(),
-            source_moments: vec![agent_domain::RecapSourceMoment {
-                text: "NADH donates electrons.".to_owned(),
-                source: fixture_source_reference(),
-                status: ConceptStatus::Strong,
+            headline: "Strong concepts: 1 of 2.".to_owned(),
+            summary: "Graded concepts: 2. Evaluated turns: 1. Deferred turns: 0.".to_owned(),
+            concepts: vec![
+                RecapConceptOutcome {
+                    concept_id: "oxidative-phosphorylation".to_owned(),
+                    label: "Oxidative phosphorylation".to_owned(),
+                    status: ConceptStatus::Strong,
+                },
+                RecapConceptOutcome {
+                    concept_id: "atp-synthase".to_owned(),
+                    label: "ATP synthase".to_owned(),
+                    status: ConceptStatus::Shaky,
+                },
+            ],
+            review_schedule: vec![ReviewScheduleSummary {
+                concept_id: "atp-synthase".to_owned(),
+                due_at: "2031-04-07T12:00:00.000Z".to_owned(),
+                authority: ReviewScheduleAuthority::ServerPersistedFsrs,
             }],
+            next_action: "Review the scheduled concepts on their due dates.".to_owned(),
+            source_moments: vec![RecapSourceMoment {
+                response_id: "response-count-table-answer".to_owned(),
+                source_id: fixture_source_reference().source_id,
+            }],
+            deferred_turns: 0,
         }
     }
 
-    fn count_table_executor(
-        store: Arc<crate::PostgresStudyStore>,
-        session_id: &str,
-    ) -> VivaToolExecutor {
-        VivaToolExecutor::new(
-            store,
-            agent_domain::AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: "biology-midterm".to_owned(),
-                voice_session_id: session_id.to_owned(),
-                mode: StudyMode::Quiz,
-                active_concepts: vec![
-                    "oxidative-phosphorylation".to_owned(),
-                    "atp-synthase".to_owned(),
-                ],
-            },
-        )
-    }
-
-    async fn replay_counted_provider_turn(executor: &VivaToolExecutor, session_id: &str) {
-        executor
-            .execute(
-                "response-count-table-question",
-                ToolProposal::select_next_question("biology-midterm", session_id, "quiz"),
-            )
+    /// One counted provider turn, written through the store ports `data` owns.
+    ///
+    /// Plan 04's `LEARN-009` removed the `mark_concept_status` and
+    /// `schedule_review_item` tools and rebuilt the remaining live tools on the
+    /// progression/outcome/evidence ports Plan 09 Task 6 implements, so the count
+    /// truth table is driven directly against the store. The scenario's write set is
+    /// unchanged: one answer attempt, one concept status, one review item, one recap.
+    async fn record_one_counted_turn(store: &crate::PostgresStudyStore, session_id: &str) {
+        let question = store
+            .active_question("user-1", "biology-midterm")
             .await
-            .expect("selects seeded question");
-        executor
-            .execute(
+            .expect("active question read")
+            .expect("seeded active question");
+        assert_eq!(question.source.source_id, "src-lecture-5-slide-18");
+        store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                session_id,
                 "response-count-table-answer",
-                ToolProposal::evaluate_spoken_answer(
-                    "biology-midterm",
-                    session_id,
-                    "q-oxidative-phosphorylation-nadh",
-                    "NADH donates electrons.",
-                ),
+                agent_domain::AnswerEvaluation {
+                    question_id: question.question_id.clone(),
+                    answer_text: "NADH donates electrons.".to_owned(),
+                    label: "mostly correct".to_owned(),
+                    concise_feedback: "Grounded in the seeded source.".to_owned(),
+                    retry_prompt: question.follow_up.clone(),
+                    source: question.source.clone(),
+                    concept_status: ConceptStatus::Strong,
+                    confidence_score: 0.84,
+                },
             )
             .await
             .expect("records answer");
-        executor
-            .execute(
-                "response-count-table-answer",
-                ToolProposal::retrieve_source_reference(
-                    "biology-midterm",
-                    session_id,
-                    "src-lecture-5-slide-18",
-                ),
-            )
+        store
+            .source_reference("user-1", "biology-midterm", "src-lecture-5-slide-18")
             .await
+            .expect("source read")
             .expect("retrieves source");
-        executor
-            .execute(
+        store
+            .record_concept_status(
+                "user-1",
+                "biology-midterm",
+                session_id,
                 "response-count-table-answer",
-                ToolProposal::mark_concept_status(
-                    "biology-midterm",
-                    session_id,
-                    "oxidative-phosphorylation",
-                    "strong",
-                ),
+                "oxidative-phosphorylation",
+                ConceptStatus::Strong,
             )
             .await
             .expect("records concept status");
-        executor
-            .execute(
-                "response-count-table-answer",
-                ToolProposal::schedule_review_item(
-                    "biology-midterm",
-                    session_id,
-                    "atp-synthase",
-                    "shaky",
-                ),
+        store
+            .schedule_review_item(
+                "user-1",
+                "biology-midterm",
+                session_id,
+                "atp-synthase",
+                "2031-04-07T12:00:00.000Z",
             )
             .await
             .expect("schedules review");
-        executor
-            .execute(
+        let mut recap = fixture_recap();
+        recap.voice_session_id = session_id.to_owned();
+        store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                session_id,
                 "response-count-table-recap",
-                ToolProposal::build_session_recap("biology-midterm", session_id),
+                recap,
             )
             .await
             .expect("records recap");

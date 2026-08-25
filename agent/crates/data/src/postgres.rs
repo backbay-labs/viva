@@ -11,7 +11,7 @@ use agent_domain::{
     ReviewSchedulingContextV1, SessionConfig, SessionTokenNonceClaim, StudyLibrarySnapshot,
     StudyMemoryStore, StudyQuestion, StudySessionDurableCounts, StudySessionRecap,
     StudySetIngestionRecord, StudySetIngestionStatus, StudySourceReference, StudyStoreBackend,
-    StudyStoreCapabilities, StudyStoreWriteCounts, VoiceUsageRecord,
+    StudyStoreCapabilities, StudyStoreWriteCounts, StudyStoreWriteOutcome, VoiceUsageRecord,
     VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use async_trait::async_trait;
@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::{
     memory::{generate_file_study_set, generate_paste_study_set},
-    InMemoryStudyStore,
+    recap_label_buckets, InMemoryStudyStore,
 };
 
 #[derive(Clone, Debug)]
@@ -119,7 +119,7 @@ fn payload_sha256<T: Serialize>(
     payload: &T,
 ) -> Result<String, PortError> {
     let payload = serde_json::to_vec(payload)
-        .map_err(|error| PortError::adapter("postgres", error.to_string()))?;
+        .map_err(|error| json_invariant("event_authorization_payload", &error))?;
     let mut hasher = Sha256::new();
     hasher.update(kind.as_str().as_bytes());
     hasher.update([0]);
@@ -173,7 +173,7 @@ impl PostgresStudyStore {
         let mut ledger = self
             .event_authorizations
             .write()
-            .map_err(|_| PortError::adapter("postgres", "event authorization lock poisoned"))?;
+            .map_err(|_| lock_poisoned("event_authorizations"))?;
         // The ledger records that one authorized outcome was written, and it is only
         // ever consulted by membership. A replay writes nothing, so it must not
         // append a second entry either — which is what the in-memory backend already
@@ -204,7 +204,7 @@ impl PostgresStudyStore {
         Ok(self
             .event_authorizations
             .read()
-            .map_err(|_| PortError::adapter("postgres", "event authorization lock poisoned"))?
+            .map_err(|_| lock_poisoned("event_authorizations"))?
             .contains(&record))
     }
 
@@ -313,7 +313,7 @@ impl PostgresStudyStore {
         let mut counts = self
             .counts
             .write()
-            .map_err(|_| PortError::adapter("postgres", "write count lock poisoned"))?;
+            .map_err(|_| lock_poisoned("write_counts"))?;
         match kind {
             WriteCountKind::Session => counts.sessions += 1,
             WriteCountKind::AnswerAttempt => counts.answer_attempts += 1,
@@ -581,7 +581,7 @@ impl PostgresStudyStore {
         .map_err(pg_error)?
         .map(|value| {
             serde_json::from_value::<ReviewScheduleDecisionV1>(value)
-                .map_err(|error| PortError::adapter("postgres", error.to_string()))
+                .map_err(|error| json_invariant("review_schedule_decision_json", &error))
         })
         .transpose()
     }
@@ -634,7 +634,11 @@ impl StudyMemoryStore for PostgresStudyStore {
         .await
         .map_err(pg_error)?;
         usize::try_from(count).map_err(|_| {
-            PortError::adapter("postgres", "pending answer attempt count overflowed usize")
+            PortError::internal(
+                "postgres",
+                voice_session_id,
+                "pending answer attempt count overflowed usize",
+            )
         })
     }
 
@@ -703,7 +707,15 @@ impl StudyMemoryStore for PostgresStudyStore {
         .map_err(pg_error)
     }
 
-    async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
+    // `DATA-003`/Task 4: this upsert still cannot tell an insert from a replay —
+    // `ON CONFLICT DO UPDATE` reports one affected row either way — so it reports
+    // exactly what it does, which is to count every accepted call as a write. Task
+    // 4 Step 3 replaces the statement with `RETURNING (xmax = '0'::xid)` and only
+    // then can `IdempotentReplay` be returned truthfully.
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
         let session_id = required(config.session_id.as_deref(), "session_id")?;
         let user_id = required(config.user_id.as_deref(), "user_id")?;
         let study_set_id = required(config.study_set_id.as_deref(), "study_set_id")?;
@@ -728,13 +740,14 @@ impl StudyMemoryStore for PostgresStudyStore {
         .await
         .map_err(pg_error)?;
         if result.rows_affected() == 0 {
-            return Err(PortError::adapter(
+            return Err(PortError::conflict(
                 "postgres",
+                session_id,
                 "voice session cannot be reopened or ownership changed",
             ));
         }
         self.increment_count(WriteCountKind::Session)?;
-        Ok(())
+        Ok(StudyStoreWriteOutcome::Inserted)
     }
 
     async fn claim_session_token_nonce(
@@ -756,7 +769,11 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(voice_session_uuid)
         .bind(&claim.nonce)
         .bind(i64::try_from(claim.expires_at).map_err(|_| {
-            PortError::adapter("postgres", "session token expiry exceeds postgres bigint")
+            PortError::invalid_input(
+                "postgres",
+                &claim.nonce,
+                "session token expiry exceeds postgres bigint",
+            )
         })?)
         .execute(&self.pool)
         .await
@@ -819,7 +836,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         };
         self.event_authorizations
             .write()
-            .map_err(|_| PortError::adapter("postgres", "event authorization lock poisoned"))?
+            .map_err(|_| lock_poisoned("event_authorizations"))?
             .retain(|record| record.voice_session_id != voice_session_id);
         Ok(json!({
             "voice_session_id": voice_session_id,
@@ -1054,7 +1071,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         tx.commit().await.map_err(pg_error)?;
         self.event_authorizations
             .write()
-            .map_err(|_| PortError::adapter("postgres", "event authorization lock poisoned"))?
+            .map_err(|_| lock_poisoned("event_authorizations"))?
             .retain(|record| record.study_set_id != generated.study_set.id);
         Ok(generated)
     }
@@ -1213,10 +1230,10 @@ impl StudyMemoryStore for PostgresStudyStore {
                 server_owned: true,
                 documents,
                 concept_count: usize::try_from(concept_count).map_err(|_| {
-                    PortError::adapter("postgres", "concept count exceeds usize range")
+                    PortError::internal("postgres", user_id, "concept count exceeds usize range")
                 })?,
                 question_count: usize::try_from(question_count).map_err(|_| {
-                    PortError::adapter("postgres", "question count exceeds usize range")
+                    PortError::internal("postgres", user_id, "question count exceeds usize range")
                 })?,
                 open_session_id,
             });
@@ -1464,7 +1481,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         tx.commit().await.map_err(pg_error)?;
         self.event_authorizations
             .write()
-            .map_err(|_| PortError::adapter("postgres", "authorization lock poisoned"))?
+            .map_err(|_| lock_poisoned("event_authorizations"))?
             .retain(|record| record.user_id != user_id || record.study_set_id != study_set_id);
 
         Ok(json!({
@@ -1573,7 +1590,7 @@ impl StudyMemoryStore for PostgresStudyStore {
 
         self.event_authorizations
             .write()
-            .map_err(|_| PortError::adapter("postgres", "authorization lock poisoned"))?
+            .map_err(|_| lock_poisoned("event_authorizations"))?
             .retain(|record| {
                 record.user_id != user_id
                     || record.study_set_id != study_set_id
@@ -1628,15 +1645,19 @@ impl StudyMemoryStore for PostgresStudyStore {
             return Ok(None);
         };
         let locator: Value = row.try_get("locator").map_err(pg_error)?;
+        let question_id: String = row.try_get("question_id").map_err(pg_error)?;
+        let prompt: String = row.try_get("prompt").map_err(pg_error)?;
+        let source_id =
+            Self::logical_id_for_uuid(row.try_get::<Uuid, _>("source_id").map_err(pg_error)?);
         Ok(Some(StudyQuestion {
-            question_id: row.try_get("question_id").map_err(pg_error)?,
-            prompt: row.try_get("prompt").map_err(pg_error)?,
+            concept_id: crate::generated_question_concept_id(&question_id),
+            rubric: crate::generated_question_rubric(&question_id, &prompt, &source_id),
+            question_id,
+            prompt,
             expected_terms: row.try_get("expected_terms").map_err(pg_error)?,
             follow_up: row.try_get("follow_up").map_err(pg_error)?,
             source: StudySourceReference {
-                source_id: Self::logical_id_for_uuid(
-                    row.try_get::<Uuid, _>("source_id").map_err(pg_error)?,
-                ),
+                source_id,
                 document_id: Self::logical_id_for_uuid(
                     row.try_get::<Uuid, _>("document_id").map_err(pg_error)?,
                 ),
@@ -1678,8 +1699,9 @@ impl StudyMemoryStore for PostgresStudyStore {
                 )
             })?;
         if canonical != *question {
-            return Err(PortError::adapter(
+            return Err(PortError::invalid_input(
                 "postgres",
+                &question.question_id,
                 "question tuple does not match deterministic retrieval",
             ));
         }
@@ -1694,9 +1716,9 @@ impl StudyMemoryStore for PostgresStudyStore {
         response_id: &str,
         evaluation: &AnswerEvaluation,
     ) -> Result<(), PortError> {
-        evaluation
-            .validate_fail_closed()
-            .map_err(|reason| PortError::adapter("postgres", reason))?;
+        evaluation.validate_fail_closed().map_err(|reason| {
+            PortError::invalid_input("postgres", &evaluation.question_id, reason)
+        })?;
         let study_set_uuid = Self::uuid_for(study_set_id)?;
         let voice_session_uuid = Self::uuid_for(voice_session_id)?;
         self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
@@ -1705,8 +1727,9 @@ impl StudyMemoryStore for PostgresStudyStore {
             .active_question_source(user_id, study_set_id, &evaluation.question_id)
             .await?;
         if canonical != evaluation.source {
-            return Err(PortError::adapter(
+            return Err(PortError::invalid_input(
                 "postgres",
+                &evaluation.question_id,
                 "answer evaluation source tuple does not match active question source",
             ));
         }
@@ -1720,8 +1743,9 @@ impl StudyMemoryStore for PostgresStudyStore {
             )
             .await?
         {
-            return Err(PortError::adapter(
+            return Err(PortError::conflict(
                 "postgres",
+                response_id,
                 "answer evaluation event does not match persisted answer attempt",
             ));
         }
@@ -1733,8 +1757,9 @@ impl StudyMemoryStore for PostgresStudyStore {
             EventAuthorizationKind::AnswerEvaluation,
             evaluation,
         )? {
-            return Err(PortError::adapter(
+            return Err(PortError::conflict(
                 "postgres",
+                response_id,
                 "answer evaluation event does not match authorized browser payload",
             ));
         }
@@ -1763,8 +1788,9 @@ impl StudyMemoryStore for PostgresStudyStore {
                 )
             })?;
         if canonical != *source {
-            return Err(PortError::adapter(
+            return Err(PortError::invalid_input(
                 "postgres",
+                &source.source_id,
                 "source tuple does not match deterministic retrieval",
             ));
         }
@@ -1794,8 +1820,9 @@ impl StudyMemoryStore for PostgresStudyStore {
             EventAuthorizationKind::ConceptStatus,
             &payload,
         )? {
-            return Err(PortError::adapter(
+            return Err(PortError::conflict(
                 "postgres",
+                response_id,
                 "concept status event does not match authorized browser payload",
             ));
         }
@@ -1873,8 +1900,9 @@ impl StudyMemoryStore for PostgresStudyStore {
         recap: &StudySessionRecap,
     ) -> Result<(), PortError> {
         if recap.voice_session_id != voice_session_id {
-            return Err(PortError::adapter(
+            return Err(PortError::invalid_input(
                 "postgres",
+                voice_session_id,
                 "recap session does not match authorized session",
             ));
         }
@@ -1883,22 +1911,19 @@ impl StudyMemoryStore for PostgresStudyStore {
         self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
             .await?;
         for moment in &recap.source_moments {
-            let canonical = self
-                .source_reference(user_id, study_set_id, &moment.source.source_id)
+            // The v2 recap moment carries only the response and source identity, so
+            // deterministic retrieval is proven by resolving that source id against
+            // this tenant's own spans; there is no client-supplied tuple left to
+            // disagree with.
+            self.source_reference(user_id, study_set_id, &moment.source_id)
                 .await?
                 .ok_or_else(|| {
                     PortError::unavailable(
                         "postgres",
-                        moment.source.source_id.clone(),
+                        moment.source_id.clone(),
                         "recap source reference unavailable",
                     )
                 })?;
-            if canonical != moment.source {
-                return Err(PortError::adapter(
-                    "postgres",
-                    "recap source tuple does not match deterministic retrieval",
-                ));
-            }
         }
         if !self.has_event_authorization(
             user_id,
@@ -1908,8 +1933,9 @@ impl StudyMemoryStore for PostgresStudyStore {
             EventAuthorizationKind::StudySessionRecap,
             recap,
         )? {
-            return Err(PortError::adapter(
+            return Err(PortError::conflict(
                 "postgres",
+                response_id,
                 "recap event does not match authorized browser payload",
             ));
         }
@@ -1923,9 +1949,9 @@ impl StudyMemoryStore for PostgresStudyStore {
         voice_session_id: &str,
         envelope: AnswerAttemptEnvelope,
     ) -> Result<Value, PortError> {
-        envelope
-            .validate_fail_closed()
-            .map_err(|reason| PortError::adapter("postgres", reason))?;
+        envelope.validate_fail_closed().map_err(|reason| {
+            PortError::invalid_input("postgres", &envelope.response_id, reason)
+        })?;
         let study_set_uuid = Self::uuid_for(study_set_id)?;
         let voice_session_uuid = Self::uuid_for(voice_session_id)?;
         self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
@@ -1933,8 +1959,9 @@ impl StudyMemoryStore for PostgresStudyStore {
         self.active_question_source(user_id, study_set_id, &envelope.question_id)
             .await?;
         let submission_sequence = i32::try_from(envelope.submission_sequence).map_err(|_| {
-            PortError::adapter(
+            PortError::invalid_input(
                 "postgres",
+                &envelope.response_id,
                 "answer submission sequence exceeds postgres integer",
             )
         })?;
@@ -2032,8 +2059,9 @@ impl StudyMemoryStore for PostgresStudyStore {
             .await
             .map_err(pg_error)?;
             if !matches {
-                return Err(PortError::adapter(
+                return Err(PortError::conflict(
                     "postgres",
+                    &envelope.response_id,
                     "answer attempt envelope cannot be changed",
                 ));
             }
@@ -2060,15 +2088,16 @@ impl StudyMemoryStore for PostgresStudyStore {
         response_id: &str,
         evaluation: AnswerEvaluation,
     ) -> Result<Value, PortError> {
-        evaluation
-            .validate_fail_closed()
-            .map_err(|reason| PortError::adapter("postgres", reason))?;
+        evaluation.validate_fail_closed().map_err(|reason| {
+            PortError::invalid_input("postgres", &evaluation.question_id, reason)
+        })?;
         let canonical = self
             .active_question_source(user_id, study_set_id, &evaluation.question_id)
             .await?;
         if canonical != evaluation.source {
-            return Err(PortError::adapter(
+            return Err(PortError::invalid_input(
                 "postgres",
+                &evaluation.question_id,
                 "answer evaluation source tuple does not match active question source",
             ));
         }
@@ -2112,8 +2141,9 @@ impl StudyMemoryStore for PostgresStudyStore {
             .await
             .map_err(pg_error)?;
             if existing_response {
-                return Err(PortError::adapter(
+                return Err(PortError::conflict(
                     "postgres",
+                    response_id,
                     "answer evaluation question does not match persisted attempt envelope",
                 ));
             }
@@ -2397,7 +2427,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         .map_err(pg_error)?
         .map(|value| {
             serde_json::from_value::<PersistedFsrsCardV1>(value)
-                .map_err(|error| PortError::adapter("postgres", error.to_string()))
+                .map_err(|error| json_invariant("persisted_fsrs_card_json", &error))
         })
         .transpose()?;
 
@@ -2419,7 +2449,7 @@ impl StudyMemoryStore for PostgresStudyStore {
     ) -> Result<Value, PortError> {
         decision
             .validate()
-            .map_err(|error| PortError::adapter("postgres", error.to_string()))?;
+            .map_err(|error| PortError::invalid_input("postgres", concept_id, error.to_string()))?;
 
         let study_set_uuid = Self::uuid_for(study_set_id)?;
         let voice_session_uuid = Self::uuid_for(voice_session_id)?;
@@ -2483,9 +2513,9 @@ impl StudyMemoryStore for PostgresStudyStore {
         }
 
         let decision_json = serde_json::to_value(&decision)
-            .map_err(|error| PortError::adapter("postgres", error.to_string()))?;
+            .map_err(|error| json_invariant("review_schedule_decision_json", &error))?;
         let card_json = serde_json::to_value(&decision.card)
-            .map_err(|error| PortError::adapter("postgres", error.to_string()))?;
+            .map_err(|error| json_invariant("persisted_fsrs_card_json", &error))?;
         let cap_reason = decision.cap_reason.map(|reason| match reason {
             ReviewScheduleCapReasonV1::ExamMargin => "exam_margin",
             ReviewScheduleCapReasonV1::PastExam => "past_exam",
@@ -2557,8 +2587,9 @@ impl StudyMemoryStore for PostgresStudyStore {
                 )
                 .await?
                 .ok_or_else(|| {
-                    PortError::adapter(
+                    PortError::conflict(
                         "postgres",
+                        response_id,
                         "review schedule write conflicted with an unrelated scheduled row",
                     )
                 })?;
@@ -2598,8 +2629,9 @@ impl StudyMemoryStore for PostgresStudyStore {
         recap: StudySessionRecap,
     ) -> Result<Value, PortError> {
         if recap.voice_session_id != voice_session_id {
-            return Err(PortError::adapter(
+            return Err(PortError::invalid_input(
                 "postgres",
+                voice_session_id,
                 "recap session does not match authorized session",
             ));
         }
@@ -2609,24 +2641,18 @@ impl StudyMemoryStore for PostgresStudyStore {
             .await?;
         let mut source_span_ids = Vec::new();
         for moment in &recap.source_moments {
-            let canonical = self
-                .source_reference(user_id, study_set_id, &moment.source.source_id)
+            self.source_reference(user_id, study_set_id, &moment.source_id)
                 .await?
                 .ok_or_else(|| {
                     PortError::unavailable(
                         "postgres",
-                        moment.source.source_id.clone(),
+                        moment.source_id.clone(),
                         "recap source reference unavailable",
                     )
                 })?;
-            if canonical != moment.source {
-                return Err(PortError::adapter(
-                    "postgres",
-                    "recap source tuple does not match deterministic retrieval",
-                ));
-            }
-            source_span_ids.push(Self::uuid_for(&moment.source.source_id)?);
+            source_span_ids.push(Self::uuid_for(&moment.source_id)?);
         }
+        let buckets = recap_label_buckets(&recap);
         let inserted = sqlx::query_scalar::<_, bool>(
             "INSERT INTO session_recaps (
                  id,
@@ -2652,10 +2678,10 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(user_id)
         .bind(study_set_uuid)
         .bind(voice_session_uuid)
-        .bind(&recap.strong_concepts)
-        .bind(&recap.shaky_concepts)
-        .bind(&recap.missed_concepts)
-        .bind(&recap.review_later)
+        .bind(&buckets.strong)
+        .bind(&buckets.shaky)
+        .bind(&buckets.missed)
+        .bind(&buckets.review_later)
         .bind(&source_span_ids)
         .fetch_one(&self.pool)
         .await
@@ -2673,15 +2699,18 @@ impl StudyMemoryStore for PostgresStudyStore {
         )?;
         Ok(json!({
             "voice_session_id": voice_session_id,
-            "strong_concepts": recap.strong_concepts,
-            "shaky_concepts": recap.shaky_concepts,
-            "missed_concepts": recap.missed_concepts,
-            "review_later": recap.review_later,
+            "strong_concepts": buckets.strong,
+            "shaky_concepts": buckets.shaky,
+            "missed_concepts": buckets.missed,
+            "review_later": buckets.review_later,
             "source_span_ids": source_span_ids,
         }))
     }
 
-    async fn record_voice_usage(&self, event: VoiceUsageRecord) -> Result<(), PortError> {
+    async fn record_voice_usage(
+        &self,
+        event: VoiceUsageRecord,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
         let voice_session_uuid = event
             .voice_session_id
             .as_deref()
@@ -2697,7 +2726,15 @@ impl StudyMemoryStore for PostgresStudyStore {
             .map_err(pg_error)?
             .unwrap_or(false);
             if deleted {
-                return Ok(());
+                // No row was written, so neither write outcome is true here. The
+                // typed contract makes that sayable: a usage event aimed at a
+                // deleted session lost to deletion. Task 4 Step 5 adds the
+                // `FOR UPDATE` serialization this check still lacks.
+                return Err(PortError::conflict(
+                    "postgres",
+                    event.voice_session_id.as_deref().unwrap_or("unknown"),
+                    "voice session was deleted before usage could be recorded",
+                ));
             }
         }
         sqlx::query(
@@ -2754,7 +2791,10 @@ impl StudyMemoryStore for PostgresStudyStore {
         .execute(&self.pool)
         .await
         .map_err(pg_error)?;
-        Ok(())
+        // Usage records carry no stable event identity, so an accepted write is
+        // always a real insert; Plan 09 never reports a usage replay it cannot
+        // identify.
+        Ok(StudyStoreWriteOutcome::Inserted)
     }
 }
 
@@ -2782,8 +2822,9 @@ fn concept_status(value: &str) -> Result<ConceptStatus, PortError> {
         "shaky" => Ok(ConceptStatus::Shaky),
         "missed" => Ok(ConceptStatus::Missed),
         "review" => Ok(ConceptStatus::Review),
-        other => Err(PortError::adapter(
+        other => Err(PortError::internal(
             "postgres",
+            "concept_status",
             format!("unknown concept status `{other}`"),
         )),
     }
@@ -2796,8 +2837,9 @@ fn ingestion_status(value: &str) -> Result<StudySetIngestionStatus, PortError> {
         "retry" => Ok(StudySetIngestionStatus::Retry),
         "ready" => Ok(StudySetIngestionStatus::Ready),
         "failed" => Ok(StudySetIngestionStatus::Failed),
-        other => Err(PortError::adapter(
+        other => Err(PortError::internal(
             "postgres",
+            "ingestion_status",
             format!("unknown ingestion status `{other}`"),
         )),
     }
@@ -2808,8 +2850,9 @@ fn source_confidence(value: &str) -> Result<agent_domain::SourceConfidence, Port
         "high" => Ok(agent_domain::SourceConfidence::High),
         "medium" => Ok(agent_domain::SourceConfidence::Medium),
         "low" => Ok(agent_domain::SourceConfidence::Low),
-        other => Err(PortError::adapter(
+        other => Err(PortError::internal(
             "postgres",
+            "source_confidence",
             format!("unknown source confidence `{other}`"),
         )),
     }
@@ -2824,19 +2867,42 @@ fn source_confidence_str(confidence: &agent_domain::SourceConfidence) -> &'stati
 }
 
 fn to_i64(value: u64, label: &str) -> Result<i64, PortError> {
-    i64::try_from(value)
-        .map_err(|_| PortError::adapter("postgres", format!("{label} exceeds BIGINT range")))
+    i64::try_from(value).map_err(|_| {
+        PortError::invalid_input("postgres", label, format!("{label} exceeds BIGINT range"))
+    })
 }
 
 fn count_to_usize(count: i64) -> Result<usize, PortError> {
-    usize::try_from(count)
-        .map_err(|_| PortError::adapter("postgres", "durable count exceeds platform usize"))
+    usize::try_from(count).map_err(|_| {
+        PortError::internal(
+            "postgres",
+            "durable_counts",
+            "durable count exceeds platform usize",
+        )
+    })
 }
 
 fn optional_u64_to_i64(value: Option<u64>, label: &str) -> Result<Option<i64>, PortError> {
     value.map(|value| to_i64(value, label)).transpose()
 }
 
+/// Every SQL/pool/transaction failure is a durability failure: the store could
+/// not commit or could not answer, and nothing about the caller's request was
+/// wrong. Plans 07/08 select retry policy from `PortErrorKind::Durability`, never
+/// from this diagnostic text.
 fn pg_error(error: sqlx::Error) -> PortError {
-    PortError::adapter("postgres", error.to_string())
+    PortError::durability("postgres", "sqlx", error.to_string())
+}
+
+/// A poisoned process-local lock is a broken adapter invariant, not a caller
+/// error and not a storage failure.
+fn lock_poisoned(lock: &'static str) -> PortError {
+    PortError::internal("postgres", lock, "postgres store lock poisoned")
+}
+
+/// Encoding an already-typed domain value, or decoding one this store itself
+/// wrote, cannot fail for a caller reason; a failure here means the adapter's own
+/// invariant broke.
+fn json_invariant(id: &'static str, error: &serde_json::Error) -> PortError {
+    PortError::internal("postgres", id, error.to_string())
 }
