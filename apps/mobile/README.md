@@ -110,16 +110,18 @@ prove native playback, native capture, or human audibility.
 
 Source branch: `mobile-live-loop-v1`. The tested native app was the debug development build for
 bundle/application ID `com.backbay.viva`, connected through loopback to the real Rust
-`agent-service`. Tests covered unsigned synthetic, protected signed-session, and abrupt-loss paths.
+`agent-service`. Tests covered unsigned synthetic, protected signed-session, airplane-mode, and
+abrupt-loss paths. On Android, Metro alone used `adb reverse tcp:8081 tcp:8081`; the agent HTTP and
+WebSocket URLs used the emulator host alias `10.0.2.2:4318`, with no agent-port reverse tunnel.
 
 | Gate | Environment | Result | Evidence / limitation |
 | --- | --- | --- | --- |
 | Native build and link | iPhone 17 simulator, iOS 26.5 | PASS | CocoaPods installed `RNAudioAPI 0.13.3`; Xcode reported `BUILD SUCCEEDED`; the app installed and launched. |
 | Android native build and link | `viva-api36`, Android 16/API 36 Google APIs ARM64 emulator | PASS | CLI SDK 36, Build Tools 36.0.0, NDK 27.1.12297006, CMake 3.22.1, and emulator 37.1.11 were provisioned. Gradle completed 365 tasks in 9m47s, built the ARM64 native audio module, installed the APK, and launched it. |
-| Library projection and entry | iOS and Android simulators, unsigned and protected loopback HTTP | PASS | Home rendered the server-owned `Biology Midterm` / `Biology 201` row. Unsigned exact-fixture admission and protected signed action both enabled **Begin recall**. Protected health/readiness calls and library calls used only the REST bearer. |
-| Typed live loop | Android API 36 emulator, Home entry, real synthetic agent | PASS | Home → **Begin recall** produced the canonical grounded question. The first typed answer produced `Partially correct`; **Try again** accepted a distinct answer and produced `Mostly correct`; the source rendered `Lecture 5 · Slide 18`; **End** opened the real recap. The same correction/retry/recap loop was also exercised on the iOS simulator. |
+| Library projection and entry | iOS and Android simulators, unsigned and protected loopback HTTP | PASS | Home rendered the server-owned `Biology Midterm` / `Biology 201` row. Unsigned exact-fixture admission and protected signed action both enabled **Begin recall**. Android's unsigned path used exact `http/ws://10.0.2.2:4318`; admission stays denied for that alias outside the Android runtime and for mixed endpoint routes. Protected health/readiness calls and library calls used only the REST bearer. |
+| Typed live loop | Android API 36 emulator, Home entry, real synthetic agent | PASS | Over exact `10.0.2.2` agent routing, Home → **Begin recall** produced the canonical grounded question. The first typed answer produced `Partially correct`; **Try again** accepted a distinct answer and produced `Mostly correct`; the source rendered `Lecture 5 · Slide 18`; **Complete session** opened the real recap. The same correction/retry/recap loop was also exercised on the iOS simulator. |
 | Local capture lifecycle | iOS 26.5 and Android API 36 simulators | PARTIAL | Both native permission paths reached `Listening locally` and returned to the typed fallback. Both reported exactly `0 local frames`; permission/session/teardown are proven, but nonzero samples are not. No audio was sent. |
-| Interruption and recovery | Android API 36 and iOS simulators | PASS | Hard agent-process loss produced `PROVIDER DISCONNECTED`, disabled answer controls, exposed **Retry connection**, and returned to the grounded question after restart. Graceful drain produced an honest terminal-only recap instead of offering a false retry. |
+| Interruption and recovery | Android API 36 and iOS simulators | PARTIAL | Hard agent-process loss produced `PROVIDER DISCONNECTED`, disabled answer controls, exposed **Retry connection**, and returned to the grounded question after restart. Android airplane mode produced the same honest interruption copy and recovered after radios returned and the agent's 45-second stale-session turn lease expired. An immediate airplane-mode retry is still unsafe: the authoritative duplicate-session guard returns `session_cap` and the app opens an early-ended recap. Graceful drain produced an honest terminal-only recap instead of offering a false retry. |
 | Examiner audio on native | Both simulators | NOT PROVEN | The synthetic provider emits no audio. The fake provider contains only four PCM bytes/two samples: enough to prove queue and speaking-state transitions, not human-audible examiner speech or audible cancellation. |
 | Physical iPhone | Host inventory | BLOCKED | `xcrun xctrace list devices` reported only the Mac and simulators; no physical iPhone was attached. `iproxy` was also unavailable, so the required USB-loopback topology could not be established. |
 | RN bearer-subprotocol acceptance | iOS 26.5 and Android API 36 simulators | PASS | On iOS, the native socket offered `viva-voice` plus a redacted bearer protocol, negotiated `viva-voice`, received `ready`, then correctly rejected an invalid first-frame token. On Android, protected Home loaded, the library minted a signed capability, the static WebSocket bearer passed upgrade, and the separate signed first-frame capability reached `Question ready`. No credential values were logged in the record. |
@@ -129,9 +131,10 @@ bundle/application ID `com.backbay.viva`, connected through loopback to the real
 
 The failed rows are acceptance failures, not waived checks. Stage 0 cannot be called fully
 device-accepted until a physical platform proves the typed loop, human-audible playback and
-cancellation, nonzero native capture alongside agent-side zero-audio receipt, and authoritative
-next-review scheduling. Repository reproducibility also remains P0-blocked until the root lockfile
-is regenerated by its owner. For a physical phone, prefer USB loopback tunneling. A public-LAN
+cancellation, nonzero native capture alongside agent-side zero-audio receipt, immediate
+airplane-mode retry no longer loses to the stale-session lease, and authoritative next-review
+scheduling. Repository reproducibility also remains P0-blocked until the root lockfile is
+regenerated by its owner. For a physical phone, prefer USB loopback tunneling. A public-LAN
 alternative requires durable signed-session storage, explicit REST/WS credentials, and an origin
 allowlist; `agent-service` otherwise fails closed by design.
 
