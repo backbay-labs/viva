@@ -23,11 +23,15 @@ import {
 import { loadAppConfig } from "@/runtime/config";
 import { colors, fonts, layout, radius, space } from "@/theme/tokens";
 
+type LibraryLoadState =
+  | { kind: "error" }
+  | { kind: "loading" }
+  | { kind: "ready"; library: LoadedLibrary };
+
 export default function LibraryScreen() {
   const router = useRouter();
   const config = useMemo(() => loadAppConfig(), []);
-  const [library, setLibrary] = useState<LoadedLibrary | null>(null);
-  const [loadError, setLoadError] = useState(false);
+  const [loadState, setLoadState] = useState<LibraryLoadState>({ kind: "loading" });
   const [refreshing, setRefreshing] = useState(false);
   const [picking, setPicking] = useState(false);
   const [pickerNote, setPickerNote] = useState<string | null>(null);
@@ -35,11 +39,14 @@ export default function LibraryScreen() {
   const refreshLibrary = useCallback(
     async (pulled = false) => {
       if (pulled) setRefreshing(true);
-      setLoadError(false);
+      // Signed start/resume capabilities are single-use and short-lived. Do
+      // not leave a previously loaded row actionable while its replacement is
+      // being fetched or after that fetch fails.
+      setLoadState({ kind: "loading" });
       try {
-        setLibrary(await loadLibrary(config));
+        setLoadState({ kind: "ready", library: await loadLibrary(config) });
       } catch {
-        setLoadError(true);
+        setLoadState({ kind: "error" });
       } finally {
         if (pulled) setRefreshing(false);
       }
@@ -50,6 +57,8 @@ export default function LibraryScreen() {
   useEffect(() => {
     void refreshLibrary();
   }, [refreshLibrary]);
+
+  const library = loadState.kind === "ready" ? loadState.library : null;
 
   const chooseDocument = async () => {
     setPicking(true);
@@ -129,13 +138,13 @@ export default function LibraryScreen() {
         </View>
 
         <View accessibilityLabel="Study sets from the Viva agent" style={styles.sourceList}>
-          {!library && !loadError ? (
+          {loadState.kind === "loading" ? (
             <View accessibilityLiveRegion="polite" style={styles.stateCard}>
               <ActivityIndicator color={colors.plumVivid} />
               <VivaText tone="muted">Opening the library…</VivaText>
             </View>
           ) : null}
-          {loadError ? (
+          {loadState.kind === "error" ? (
             <View accessibilityLiveRegion="polite" style={styles.stateCard}>
               <VivaText style={styles.stateTitle} variant="lead">
                 The folios are out of reach.

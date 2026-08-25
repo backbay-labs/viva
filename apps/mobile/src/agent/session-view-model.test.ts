@@ -6,6 +6,7 @@ import {
   orbStateForSession,
   RECAP_PLAYBACK_MAX_WAIT_MS,
   retryAttemptResolution,
+  sessionAnswerControlsBusy,
   sessionProviderStatusLabel,
   shouldNavigateToRecap,
   stageCopyForConnection,
@@ -66,6 +67,14 @@ describe("sessionProviderStatusLabel", () => {
         speaking: false,
       }),
     ).toBe("provider disconnected");
+  });
+});
+
+describe("sessionAnswerControlsBusy", () => {
+  test("blocks capture and typed-answer controls while examiner audio is active", () => {
+    expect(sessionAnswerControlsBusy({ busy: false, speaking: true })).toBe(true);
+    expect(sessionAnswerControlsBusy({ busy: false, speaking: false })).toBe(false);
+    expect(sessionAnswerControlsBusy({ busy: true, speaking: false })).toBe(true);
   });
 });
 

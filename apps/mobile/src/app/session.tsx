@@ -21,6 +21,7 @@ import {
   type RetryAttemptState,
   retryAttemptResolution,
   type SessionCorrectionModel,
+  sessionAnswerControlsBusy,
   sessionProviderStatusLabel,
   shouldNavigateToRecap,
   stageCopyForConnection,
@@ -297,7 +298,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   };
 
   const startListening = async () => {
-    if (endingRef.current) return;
+    if (endingRef.current || agent.speaking) return;
     unlockPlayback();
     agent.clearCaptureIssue();
     setCaptureMessage(undefined);
@@ -358,7 +359,12 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
       AccessibilityInfo.announceForAccessibility("Write an answer before submitting.");
       return;
     }
-    if (endingRef.current || !agent.derived.canSubmitAnswer || !agent.sendText(answer)) {
+    if (
+      endingRef.current ||
+      agent.speaking ||
+      !agent.derived.canSubmitAnswer ||
+      !agent.sendText(answer)
+    ) {
       if (retryAttempt) setRetryAttempt(undefined);
       AccessibilityInfo.announceForAccessibility(
         "The agent is not ready for an answer. Wait for the question or retry the connection.",
@@ -446,6 +452,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     retrySubmitted ||
     Boolean(agent.agentState.pendingSubmission) ||
     agent.derived.phase === "thinking";
+  const answerControlsBusy = sessionAnswerControlsBusy({ busy, speaking: agent.speaking });
   const showCorrection = Boolean(correction) && !retrying && !disconnected;
   const webInstrumentation = {
     dataSet: { vivaSpeaking: agent.speaking ? "true" : "false" },
@@ -603,7 +610,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                   <TextInput
                     accessibilityLabelledBy="answer-label"
                     autoFocus={captureState === "blocked" || retrying}
-                    editable={!busy}
+                    editable={!answerControlsBusy}
                     multiline
                     onChangeText={setTypedAnswer}
                     placeholder="Explain it from memory…"
@@ -614,7 +621,9 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                     value={typedAnswer}
                   />
                   <ActionButton
-                    disabled={busy || !agent.derived.canSubmitAnswer || !typedAnswer.trim()}
+                    disabled={
+                      answerControlsBusy || !agent.derived.canSubmitAnswer || !typedAnswer.trim()
+                    }
                     onPress={submitTypedAnswer}
                     testID="session-submit"
                   >
@@ -626,7 +635,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
               <View style={styles.actionDock}>
                 {agent.derived.question && captureState === "idle" && !typing ? (
                   <ActionButton
-                    disabled={!agent.derived.canSubmitAnswer || busy}
+                    disabled={!agent.derived.canSubmitAnswer || answerControlsBusy}
                     icon={<SparkIcon color={colors.plumSoft} size={15} />}
                     onPress={() => void startListening()}
                   >
@@ -643,7 +652,9 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                 ) : null}
                 <View style={styles.secondaryActions}>
                   <ActionButton
-                    disabled={!agent.derived.question || captureState === "requesting" || busy}
+                    disabled={
+                      !agent.derived.question || captureState === "requesting" || answerControlsBusy
+                    }
                     onPress={() => {
                       unlockPlayback();
                       setHintVisible((value) => !value);
@@ -654,7 +665,9 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                     {hintVisible ? "Hide hint" : "Hint"}
                   </ActionButton>
                   <ActionButton
-                    disabled={!agent.derived.question || captureState === "requesting" || busy}
+                    disabled={
+                      !agent.derived.question || captureState === "requesting" || answerControlsBusy
+                    }
                     onPress={() => {
                       unlockPlayback();
                       setTyping((value) => !value);
@@ -667,7 +680,9 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                   </ActionButton>
                 </View>
                 <ActionButton
-                  disabled={!agent.derived.question || captureState === "requesting" || busy}
+                  disabled={
+                    !agent.derived.question || captureState === "requesting" || answerControlsBusy
+                  }
                   onPress={() => {
                     unlockPlayback();
                     setSourceVisible((value) => !value);

@@ -48,6 +48,10 @@ export type SessionCaptureState = "blocked" | "idle" | "listening" | "requesting
 // native completion callback so the learner cannot be stranded on the session.
 export const RECAP_PLAYBACK_MAX_WAIT_MS = 2 * 60_000;
 
+export function sessionAnswerControlsBusy(input: { busy: boolean; speaking: boolean }): boolean {
+  return input.busy || input.speaking;
+}
+
 export function drainSessionPlayback(input: {
   acknowledgeAudio: (audio: readonly VivaAgentAudioOutput[]) => void;
   audio: readonly VivaAgentAudioOutput[];
