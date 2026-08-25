@@ -424,8 +424,9 @@ fn study_session_recap_v1_is_a_shim_with_a_removal_trigger_the_domain_never_uses
         "agent-adapters",
         "agent-service",
         "data",
-        // The two Plan-04-owned edits the same root swap forced. Naming them here
-        // is what keeps the deleted `study.rs` rationale in the tree.
+        // The two Plan-04-owned edits made at the root swap (one compile-forced,
+        // one A-10-authorized cleanup). Naming them here is what keeps the
+        // deleted `study.rs` rationale in the tree.
         "from_evidence_recap",
         "tool_executor.rs",
     ] {
