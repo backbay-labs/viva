@@ -66,6 +66,14 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0015_review_schedule_decisions_v1.sql",
         include_str!("../../../migrations/0015_review_schedule_decisions_v1.sql"),
     ),
+    (
+        "0016_durable_event_authorization_digests.sql",
+        include_str!("../../../migrations/0016_durable_event_authorization_digests.sql"),
+    ),
+    (
+        "0017_privacy_tombstone_and_schema_cleanup.sql",
+        include_str!("../../../migrations/0017_privacy_tombstone_and_schema_cleanup.sql"),
+    ),
 ];
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
@@ -482,6 +490,38 @@ mod tests {
             .expect("sqlx ledger count query succeeds")
     }
 
+    async fn column_exists(pool: &sqlx::PgPool, table: &str, column: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name = $1
+                   AND column_name = $2
+             )",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(pool)
+        .await
+        .expect("column existence query succeeds")
+    }
+
+    async fn index_exists(pool: &sqlx::PgPool, index: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM pg_indexes
+                 WHERE schemaname = current_schema()
+                   AND indexname = $1
+             )",
+        )
+        .bind(index)
+        .fetch_one(pool)
+        .await
+        .expect("index existence query succeeds")
+    }
+
     async fn table_exists(pool: &sqlx::PgPool, table: &str) -> bool {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (
@@ -593,6 +633,197 @@ mod tests {
             .cleanup()
             .await
             .expect("backfill schema drops cleanly");
+    }
+
+    /// `DATA-005`/`DATA-013`: the final applied schema, read from the catalog.
+    ///
+    /// This asserts the state a real database ends in, not the text of a migration
+    /// file: a migration that is written but never reached, or reached but rolled
+    /// back by a later one, has to fail here.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_final_schema_has_durable_authorization_and_deletion_tombstone() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool();
+
+        assert!(table_exists(pool, "event_authorization_digests").await);
+        for column in [
+            "user_id",
+            "study_set_id",
+            "voice_session_id",
+            "response_id",
+            "event_kind",
+            "payload_sha256",
+            "created_at",
+        ] {
+            assert!(
+                column_exists(pool, "event_authorization_digests", column).await,
+                "event_authorization_digests.{column}"
+            );
+        }
+        // The digest is learner-derived but carries no event JSON: a raw payload
+        // column here would put browser event bodies back in the database.
+        for forbidden in ["payload", "payload_json", "event_json", "answer_text"] {
+            assert!(
+                !column_exists(pool, "event_authorization_digests", forbidden).await,
+                "event_authorization_digests must not store {forbidden}"
+            );
+        }
+        assert!(
+            index_exists(pool, "event_authorization_digests_session_lookup_idx").await,
+            "session lookup index"
+        );
+
+        // The deletion tombstone is its own column, never an overloaded ingestion
+        // status: active reads require `deleted_at IS NULL`.
+        assert!(column_exists(pool, "study_sets", "deleted_at").await);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// `DATA-009`: `0014` superseded the payload index with a one-row-per-session
+    /// unique index, but the superseded index stayed behind and kept a btree row-size
+    /// limit on recap content. The chain must end with it gone.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_final_schema_drops_obsolete_recap_index() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool();
+
+        assert!(
+            !index_exists(pool, "session_recaps_voice_session_payload_idx").await,
+            "the superseded payload index must not survive the chain"
+        );
+        assert!(
+            index_exists(pool, "session_recaps_voice_session_unique_idx").await,
+            "the one-row-per-session index that replaced it must remain"
+        );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// `DATA-013`: the exact six-column inventory the `DATA-SCHEMA-UNWRITTEN` rule
+    /// names. Every one was added by a migration and bound by no production writer;
+    /// the deterministic default is to drop it, and a column that reappears without a
+    /// merged typed writer fails here.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_final_schema_enforces_data_schema_unwritten_rule() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool();
+
+        for column in [
+            "provider_attempt_id",
+            "terminal_reason",
+            "failure_class",
+            "stage",
+            "retry_eligible",
+            "concept_id",
+        ] {
+            assert!(
+                !column_exists(pool, "answer_attempts", column).await,
+                "answer_attempts.{column} is written by nothing and must be dropped"
+            );
+        }
+        // The columns production actually binds are untouched.
+        for column in [
+            "response_id",
+            "question_id",
+            "submission_sequence",
+            "idempotency_key",
+            "capture_mode",
+            "capture_status",
+            "answer_content_policy",
+            "pre_provider_state",
+            "evaluation_label",
+            "concept_status",
+            "confidence_score",
+            "source_span_id",
+        ] {
+            assert!(
+                column_exists(pool, "answer_attempts", column).await,
+                "answer_attempts.{column} is bound by a production writer"
+            );
+        }
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// `DATA-009`, behaviourally: a large but entirely valid recap is accepted.
+    ///
+    /// The superseded payload index indexed the recap arrays themselves, so a recap
+    /// whose concept labels exceed the btree row limit was rejected by the database
+    /// with an index error the learner could do nothing about. This inserts through
+    /// `PostgresStudyStore::record_recap`, not raw SQL, so the whole write path is
+    /// what is proven.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_large_recap_does_not_hit_obsolete_payload_index_limit() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        record_fixture_session(&store).await;
+
+        // The labels are high-entropy on purpose. A btree index value may be
+        // compressed but never stored out of line, so repetitive prose slips under
+        // the 2704-byte limit and would prove nothing; incompressible content makes
+        // the superseded index reject the write deterministically.
+        let mut recap = fixture_recap();
+        recap.concepts = (0..64)
+            .map(|index| RecapConceptOutcome {
+                concept_id: format!("concept-{index:03}"),
+                label: format!(
+                    "{}{}{}",
+                    Uuid::new_v4().simple(),
+                    Uuid::new_v4().simple(),
+                    Uuid::new_v4().simple()
+                ),
+                status: ConceptStatus::Strong,
+            })
+            .collect();
+        recap.review_schedule = Vec::new();
+        let payload_bytes: usize = recap.concepts.iter().map(|c| c.label.len()).sum();
+        assert!(
+            payload_bytes > 2704,
+            "the recap must exceed the btree row limit the obsolete index imposed, got {payload_bytes}"
+        );
+
+        store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-large-recap",
+                recap,
+            )
+            .await
+            .expect("a large valid recap is accepted");
+
+        let stored = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM session_recaps WHERE voice_session_id = $1",
+        )
+        .bind(fixture_uuid("voice-session-1").expect("voice session fixture UUID"))
+        .fetch_one(&pool)
+        .await
+        .expect("recap row count query succeeds");
+        assert_eq!(stored, 1);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     #[test]
