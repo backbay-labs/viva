@@ -7892,4 +7892,475 @@ pub(crate) mod tests {
             .await
             .expect("isolated test schema drops cleanly");
     }
+
+    // ------------------------------------------------------------------
+    // Task 14 — the full migration chain, the historical upgrade, and the
+    // shared backend conformance proof, on real PostgreSQL 16.
+    //
+    // These are the whole-chain assertions the per-task suites cannot make:
+    // every earlier test starts from a fully migrated schema, so none of them
+    // proves that the chain reaches that schema from an empty database, that it
+    // is idempotent through the sqlx ledger, or that a database that stopped at
+    // `0014` upgrades without losing a row.
+    // ------------------------------------------------------------------
+
+    /// The whole chain from empty, twice, through the sqlx ledger.
+    ///
+    /// The second run is the one that matters: migrations are append-only after
+    /// merge, so the ledger — not "IF NOT EXISTS" in the SQL — is what must make a
+    /// re-run a no-op. A migration that is only idempotent because its statements
+    /// happen to be re-runnable would still pass a single-run test.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_full_migration_chain_runs_from_empty_schema_twice_via_ledger() {
+        let fixture = PostgresSchemaFixture::empty().await;
+        let pool = fixture.pool();
+        assert!(!table_exists(pool, "_sqlx_migrations").await);
+
+        run_migrations(pool)
+            .await
+            .expect("the chain applies to an empty schema");
+        assert_eq!(sqlx_ledger_row_count(pool).await, MIGRATIONS.len() as i64);
+        let applied_after_first = applied_migration_names(pool).await;
+
+        run_migrations(pool)
+            .await
+            .expect("the chain re-applies as a ledger no-op");
+        assert_eq!(sqlx_ledger_row_count(pool).await, MIGRATIONS.len() as i64);
+        assert_eq!(applied_migration_names(pool).await, applied_after_first);
+
+        // The final schema is complete, and complete in the same way, after the
+        // second run.
+        for table in CANARY_SCOPED_TABLES {
+            assert!(table_exists(pool, table).await, "{table}");
+        }
+        assert!(column_exists(pool, "study_sets", "deleted_at").await);
+        assert!(column_exists(pool, "study_sets", "exam_at").await);
+        assert!(column_exists(pool, "study_questions", "ingestion_ordinal").await);
+        assert!(!index_exists(pool, "session_recaps_voice_session_payload_idx").await);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    async fn applied_migration_names(pool: &sqlx::PgPool) -> Vec<String> {
+        sqlx::query_scalar::<_, String>("SELECT description FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await
+            .expect("sqlx ledger description query succeeds")
+    }
+
+    /// A database that stopped at `0014` upgrades to the final schema without
+    /// losing a row, and the cleanup migrations actually fire.
+    ///
+    /// The rows below are the ones a real `0014` database can hold and the final
+    /// schema cannot: duplicate recap payloads the `0013` index allowed, values in
+    /// all six `DATA-SCHEMA-UNWRITTEN` columns, a recap whose arrays exceed the
+    /// obsolete multi-array index ceiling, and live nonce and usage rows. If `0017`
+    /// dropped a column that still held data, or `0018` backfilled an ordinal onto
+    /// rows it could not see, this is where it shows.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_upgrade_0014_to_latest_preserves_rows_and_applies_cleanup() {
+        let fixture = PostgresSchemaFixture::empty().await;
+        let pool = fixture.pool().clone();
+        run_migrations_until(&pool, "0015_review_schedule_decisions_v1.sql")
+            .await
+            .expect("the historical chain applies through 0014");
+        assert!(index_exists(&pool, "session_recaps_voice_session_payload_idx").await);
+        for column in UNWRITTEN_ANSWER_ATTEMPT_COLUMNS {
+            assert!(
+                column_exists(&pool, "answer_attempts", column).await,
+                "{column}"
+            );
+        }
+
+        let study_set_id = Uuid::new_v4();
+        let document_id = Uuid::new_v4();
+        let source_id = Uuid::new_v4();
+        let concept_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let attempt_id = Uuid::new_v4();
+        let recap_id = Uuid::new_v4();
+        seed_0014_rows(
+            &pool,
+            Historical0014Rows {
+                study_set_id,
+                document_id,
+                source_id,
+                concept_id,
+                session_id,
+                attempt_id,
+                recap_id,
+            },
+        )
+        .await;
+
+        // A recap far larger than the obsolete multi-array index could hold. The
+        // btree tuple limit is ~2704 bytes across all indexed columns, so five
+        // arrays of 400 labels cannot be indexed at all — which is exactly why
+        // `0017` drops that index.
+        let large: Vec<String> = (0..400)
+            .map(|index| format!("concept-{index:04}-{}", "x".repeat(40)))
+            .collect();
+        sqlx::query(
+            "UPDATE session_recaps
+             SET strong_concepts = $2, shaky_concepts = $2, missed_concepts = $2, review_later = $2
+             WHERE id = $1",
+        )
+        .bind(recap_id)
+        .bind(&large)
+        .execute(&pool)
+        .await
+        .expect_err("the obsolete payload index cannot hold a large recap");
+
+        let before = historical_row_counts(&pool).await;
+        assert_eq!(before, (1, 1, 1, 1, 1, 1, 1, 1, 1));
+
+        for (name, _) in MIGRATIONS
+            .iter()
+            .skip_while(|(name, _)| *name != "0015_review_schedule_decisions_v1.sql")
+        {
+            apply_migration_sql(&pool, name)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("migration {name} applies to a 0014 database: {error}")
+                });
+        }
+
+        // Every row survived the upgrade.
+        assert_eq!(historical_row_counts(&pool).await, before);
+
+        // The cleanup actually happened.
+        assert!(!index_exists(&pool, "session_recaps_voice_session_payload_idx").await);
+        for column in UNWRITTEN_ANSWER_ATTEMPT_COLUMNS {
+            assert!(
+                !column_exists(&pool, "answer_attempts", column).await,
+                "{column} must be dropped by 0017"
+            );
+        }
+        assert!(column_exists(&pool, "study_sets", "deleted_at").await);
+        assert!(table_exists(&pool, "event_authorization_digests").await);
+
+        // `0018` backfilled the pre-existing question and its ingestion cursor.
+        let ordinal = sqlx::query_scalar::<_, i64>(
+            "SELECT ingestion_ordinal FROM study_questions WHERE study_set_id = $1",
+        )
+        .bind(study_set_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the upgraded question has an ordinal");
+        assert_eq!(ordinal, 1);
+        let next_ordinal = sqlx::query_scalar::<_, i64>(
+            "SELECT next_ordinal FROM study_question_ingestion_cursors WHERE study_set_id = $1",
+        )
+        .bind(study_set_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the upgraded set has an ingestion cursor");
+        assert_eq!(next_ordinal, 2);
+
+        // The large recap the obsolete index refused is accepted now.
+        sqlx::query(
+            "UPDATE session_recaps
+             SET strong_concepts = $2, shaky_concepts = $2, missed_concepts = $2, review_later = $2
+             WHERE id = $1",
+        )
+        .bind(recap_id)
+        .bind(&large)
+        .execute(&pool)
+        .await
+        .expect("a large recap fits once the obsolete payload index is gone");
+
+        // The upgraded database still behaves: the tombstone-aware guard refuses a
+        // set that is deleted through the production port, and the delete is
+        // idempotent.
+        let store = PostgresStudyStore::new(pool.clone());
+        let receipt = store
+            .delete_study_set("upgrade-user", &study_set_id.to_string())
+            .await
+            .expect("the upgraded set deletes");
+        assert_eq!(
+            store
+                .delete_study_set("upgrade-user", &study_set_id.to_string())
+                .await
+                .expect("a repeated delete is idempotent"),
+            receipt
+        );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    const UNWRITTEN_ANSWER_ATTEMPT_COLUMNS: &[&str] = &[
+        "provider_attempt_id",
+        "terminal_reason",
+        "failure_class",
+        "stage",
+        "retry_eligible",
+        "concept_id",
+    ];
+
+    #[derive(Clone, Copy)]
+    struct Historical0014Rows {
+        study_set_id: Uuid,
+        document_id: Uuid,
+        source_id: Uuid,
+        concept_id: Uuid,
+        session_id: Uuid,
+        attempt_id: Uuid,
+        recap_id: Uuid,
+    }
+
+    /// One row in every table a `0014` database has, including values in all six
+    /// columns `0017` drops.
+    async fn seed_0014_rows(pool: &sqlx::PgPool, ids: Historical0014Rows) {
+        sqlx::query(
+            "INSERT INTO study_sets (id, user_id, title, course, ingestion_status)
+             VALUES ($1, 'upgrade-user', 'Upgrade fixture', 'BIO 201', 'ready')",
+        )
+        .bind(ids.study_set_id)
+        .execute(pool)
+        .await
+        .expect("historical study set inserts");
+        sqlx::query(
+            "INSERT INTO study_documents (id, study_set_id, display_name, source_kind)
+             VALUES ($1, $2, 'Lecture 9', 'pdf')",
+        )
+        .bind(ids.document_id)
+        .bind(ids.study_set_id)
+        .execute(pool)
+        .await
+        .expect("historical document inserts");
+        sqlx::query(
+            "INSERT INTO source_spans (id, document_id, locator, excerpt)
+             VALUES ($1, $2, '{\"span\": \"slide:9\"}'::jsonb, 'Historical excerpt.')",
+        )
+        .bind(ids.source_id)
+        .bind(ids.document_id)
+        .execute(pool)
+        .await
+        .expect("historical source span inserts");
+        sqlx::query(
+            "INSERT INTO concepts (id, study_set_id, label, status, source_span_id, public_id)
+             VALUES ($1, $2, 'Historical concept', 'review', $3, 'concept-historical')",
+        )
+        .bind(ids.concept_id)
+        .bind(ids.study_set_id)
+        .bind(ids.source_id)
+        .execute(pool)
+        .await
+        .expect("historical concept inserts");
+        sqlx::query(
+            "INSERT INTO study_questions (
+                 id, study_set_id, question_id, source_span_id, prompt, expected_terms,
+                 follow_up, active
+             )
+             VALUES ($1, $2, 'q-concept-historical', $3, 'State the historical claim.',
+                     ARRAY['historical'], 'Say it in one sentence.', TRUE)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(ids.study_set_id)
+        .bind(ids.source_id)
+        .execute(pool)
+        .await
+        .expect("historical question inserts");
+        sqlx::query(
+            "INSERT INTO voice_sessions (id, user_id, study_set_id, mode, status)
+             VALUES ($1, 'upgrade-user', $2, 'quiz', 'open')",
+        )
+        .bind(ids.session_id)
+        .bind(ids.study_set_id)
+        .execute(pool)
+        .await
+        .expect("historical session inserts");
+        // All six `DATA-SCHEMA-UNWRITTEN` columns carry values, so `0017` is
+        // dropping data rather than empty columns.
+        sqlx::query(
+            "INSERT INTO answer_attempts (
+                 id, voice_session_id, question_id, response_id, idempotency_key,
+                 evaluation_label, concept_status, confidence_score, source_span_id,
+                 provider_attempt_id, terminal_reason, failure_class, stage, retry_eligible,
+                 concept_id
+             )
+             VALUES ($1, $2, 'q-concept-historical', 'resp-historical', 'key-historical',
+                     'mostly correct', 'strong', 0.8, $3,
+                     'provider-attempt-1', 'completed', 'none', 'evaluated', TRUE, $4)",
+        )
+        .bind(ids.attempt_id)
+        .bind(ids.session_id)
+        .bind(ids.source_id)
+        .bind(ids.concept_id)
+        .execute(pool)
+        .await
+        .expect("historical answer attempt inserts");
+        sqlx::query(
+            "INSERT INTO review_items (id, user_id, study_set_id, concept_id, due_at, reason, status)
+             VALUES ($1, 'upgrade-user', $2, $3, NOW(), 'historical', 'scheduled')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(ids.study_set_id)
+        .bind(ids.concept_id)
+        .execute(pool)
+        .await
+        .expect("historical review item inserts");
+        sqlx::query(
+            "INSERT INTO session_recaps (
+                 id, user_id, study_set_id, voice_session_id, strong_concepts, source_span_ids
+             )
+             VALUES ($1, 'upgrade-user', $2, $3, ARRAY['Historical concept'], ARRAY[$4]::uuid[])",
+        )
+        .bind(ids.recap_id)
+        .bind(ids.study_set_id)
+        .bind(ids.session_id)
+        .bind(ids.source_id)
+        .execute(pool)
+        .await
+        .expect("historical recap inserts");
+        sqlx::query(
+            "INSERT INTO concept_status_events (
+                 user_id, study_set_id, voice_session_id, response_id, concept_id,
+                 payload_sha256, status
+             )
+             VALUES ('upgrade-user', $1, $2, 'resp-historical', $3, $4, 'strong')",
+        )
+        .bind(ids.study_set_id)
+        .bind(ids.session_id)
+        .bind(ids.concept_id)
+        .bind(OTHER_PAYLOAD_SHA256)
+        .execute(pool)
+        .await
+        .expect("historical concept status event inserts");
+        sqlx::query(
+            "INSERT INTO voice_session_token_nonces (
+                 user_id, study_set_id, voice_session_id, nonce, expires_at
+             )
+             VALUES ('upgrade-user', $1, $2, 'nonce-historical', 4102444800)",
+        )
+        .bind(ids.study_set_id)
+        .bind(ids.session_id)
+        .execute(pool)
+        .await
+        .expect("historical nonce inserts");
+        sqlx::query(
+            "INSERT INTO voice_usage_events (
+                 id, voice_session_id, provider, model, duration_seconds
+             )
+             VALUES ($1, $2, 'synthetic', 'synthetic-viva', 3)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(ids.session_id)
+        .execute(pool)
+        .await
+        .expect("historical usage event inserts");
+    }
+
+    async fn historical_row_counts(
+        pool: &sqlx::PgPool,
+    ) -> (i64, i64, i64, i64, i64, i64, i64, i64, i64) {
+        let count = async |sql: &'static str| {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(pool)
+                .await
+                .expect("historical row count query succeeds")
+        };
+        (
+            count("SELECT COUNT(*) FROM study_sets").await,
+            count("SELECT COUNT(*) FROM study_documents").await,
+            count("SELECT COUNT(*) FROM source_spans").await,
+            count("SELECT COUNT(*) FROM concepts").await,
+            count("SELECT COUNT(*) FROM study_questions").await,
+            count("SELECT COUNT(*) FROM voice_sessions").await,
+            count("SELECT COUNT(*) FROM answer_attempts").await,
+            count("SELECT COUNT(*) FROM session_recaps").await,
+            count("SELECT COUNT(*) FROM concept_status_events").await,
+        )
+    }
+
+    /// The applied schema, the migration directory, and the privacy inventory are
+    /// one fact, not three.
+    ///
+    /// `MIGRATIONS` is the include list the binary ships; the directory is what a
+    /// reviewer reads; the canary inventory is the table list the deletion proof
+    /// scans. A migration added to the directory but not the include list would
+    /// never run in production, and a table added to the schema but not the
+    /// inventory would never be scanned for learner text.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_latest_schema_matches_migration_directory_and_privacy_inventory() {
+        let mut on_disk =
+            std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations"))
+                .expect("the migration directory is readable")
+                .map(|entry| {
+                    entry
+                        .expect("migration directory entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .filter(|name| name.ends_with(".sql"))
+                .collect::<Vec<_>>();
+        on_disk.sort();
+        let included = MIGRATIONS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            included, on_disk,
+            "MIGRATIONS must match the directory exactly"
+        );
+        assert_eq!(
+            included.last().map(String::as_str),
+            Some("0018_learning_turn_outcomes.sql"),
+            "Plan 09 allocated 0016-0018 and, under D-04 CONFIRM_DELETE, no undo migration"
+        );
+
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool();
+
+        // Every table the deletion canary scan enumerates exists in the applied
+        // schema, and every learner-data table in the applied schema is enumerated.
+        let mut applied = sqlx::query_scalar::<_, String>(
+            "SELECT table_name
+             FROM information_schema.tables
+             WHERE table_schema = current_schema()
+               AND table_type = 'BASE TABLE'
+               AND table_name <> '_sqlx_migrations'",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("applied table listing query succeeds");
+        applied.sort();
+        let mut inventory = CANARY_SCOPED_TABLES
+            .iter()
+            .map(|table| (*table).to_owned())
+            .collect::<Vec<_>>();
+        inventory.sort();
+        assert_eq!(
+            applied, inventory,
+            "the canary inventory and the applied schema must name the same tables"
+        );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// The Task 13 conformance runner, re-run here as part of the full-chain proof.
+    ///
+    /// It invokes the one shared runner and its one comparison; there is no second
+    /// expectation table to drift from the first.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_memory_backend_full_store_conformance_matches() {
+        crate::memory::store_conformance::assert_backends_agree(
+            crate::memory::store_conformance::ConformanceScenario::AllOwnedPorts,
+        )
+        .await;
+    }
 }

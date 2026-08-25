@@ -45,7 +45,7 @@ use uuid::Uuid;
 /// It is declared here, not in `lib.rs`, so the crate's public surface is
 /// untouched; it is not memory-specific and imports both backends.
 #[cfg(test)]
-mod store_conformance;
+pub(crate) mod store_conformance;
 
 /// `DATA-015`: ingestion — classification, decoding, and generation, owned in one
 /// place. The port methods below delegate their whole body to it.

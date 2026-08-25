@@ -991,17 +991,21 @@ fn canary_occurrences(record: &StudySetIngestionRecord) -> usize {
 // ---------------------------------------------------------------------------
 
 async fn memory_trace(scenario: ConformanceScenario) -> CanonicalStoreTrace {
-    let fixture = CanonicalStoreFixture::new(scenario);
+    memory_trace_of(&CanonicalStoreFixture::new(scenario)).await
+}
+
+async fn memory_trace_of(fixture: &CanonicalStoreFixture) -> CanonicalStoreTrace {
     let store = seed_learning_core_memory(&fixture.seed);
-    exercise_store_scenario(ConformanceBackend::Memory(&store), &fixture).await
+    exercise_store_scenario(ConformanceBackend::Memory(&store), fixture).await
 }
 
 /// Both backends over the same scenario, compared as one value.
 ///
 /// The Postgres run is the one under test; the in-process memory run is the
-/// reference, recomputed here so the two are always the same fixture and the same
-/// code path rather than a stored expectation that can rot.
-async fn assert_backends_agree(scenario: ConformanceScenario) {
+/// reference, recomputed here from the *same* `CanonicalStoreFixture` value so
+/// the two are the same inputs on the same code path, rather than a stored
+/// expectation that can rot.
+pub(crate) async fn assert_backends_agree(scenario: ConformanceScenario) {
     let schema = PostgresSchemaFixture::migrated().await;
     let pool = schema.pool().clone();
     let fixture = CanonicalStoreFixture::new(scenario);
@@ -1009,7 +1013,7 @@ async fn assert_backends_agree(scenario: ConformanceScenario) {
     let postgres = PostgresStudyStore::new(pool.clone());
     let actual = exercise_store_scenario(ConformanceBackend::Postgres(&postgres), &fixture).await;
 
-    let expected = memory_trace(scenario).await;
+    let expected = memory_trace_of(&fixture).await;
     assert_traces_match(
         &expected,
         &actual,
