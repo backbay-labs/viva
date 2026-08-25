@@ -200,9 +200,9 @@ impl VivaToolExecutor {
     /// Progression is a persisted, session-scoped cursor, so this asks the store
     /// for the authorized selection under the selected `OrderedV1` policy and
     /// reports exactly what came back. It never calls the global
-    /// [`Self::active_question`] shortcut, which answers with the study set's
-    /// first active question and therefore cannot advance, retry, resume, or
-    /// exhaust a session.
+    /// [`StudyMemoryStore::active_question`] shortcut, which answers with the
+    /// study set's first active question and therefore cannot advance, retry,
+    /// resume, or exhaust a session.
     ///
     /// The authorized response identity is the idempotency source: the store
     /// authorizes one selection per response, so a replay — or two callers racing
