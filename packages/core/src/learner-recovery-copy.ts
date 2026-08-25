@@ -63,6 +63,13 @@ function learnerAction(label: string, intent: LearnerLoopActionIntent): LearnerR
  * The entry is deep-frozen for the same reason the source contract is: it is
  * derived copy, and a consumer that edits it in place changes what every other
  * consumer of the same entry renders.
+ *
+ * The two array fields are copied rather than aliased. Every other field is
+ * rebuilt from a scalar, so passing the argument's arrays straight through was
+ * the one path by which the freeze reached data the caller still owns —
+ * `deepFreeze` is documented as never doing that. The copies also make the
+ * entry a snapshot: appending to the caller's array afterwards cannot change
+ * what an already-projected entry reports.
  */
 export function learnerRecoveryCopyEntry(state: LearnerLoopState): LearnerRecoveryCopyEntry {
   return deepFreeze({
@@ -70,7 +77,7 @@ export function learnerRecoveryCopyEntry(state: LearnerLoopState): LearnerRecove
     state_label: state.label,
     resolution_kind: state.resolution_kind,
     submitted_answer_resolution: state.submitted_answer_resolution,
-    runtime_copy_causes: state.runtime_copy_causes,
+    runtime_copy_causes: [...state.runtime_copy_causes],
     learner: {
       capsule_label: state.copy.capsule_label,
       marginalia_title: state.copy.marginalia_title,
@@ -83,7 +90,7 @@ export function learnerRecoveryCopyEntry(state: LearnerLoopState): LearnerRecove
       secondary_action: learnerAction(state.copy.next_action_label, state.copy.next_action_intent),
     },
     operator: {
-      diagnostic_fields: state.operator_diagnostics,
+      diagnostic_fields: [...state.operator_diagnostics],
       evidence_code: state.evidence_code,
       failure_class: state.failure_class,
       readiness_failure_kind: state.readiness_failure_kind,

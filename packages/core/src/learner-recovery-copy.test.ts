@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  type LearnerLoopState,
   VIVA_LEARNER_LOOP_CONTRACT,
   VIVA_LEARNER_LOOP_EVIDENCE_FIELDS,
 } from "./learner-loop-contract";
@@ -318,5 +319,62 @@ describe("LEARN-010 the recovery copy contract is deeply immutable", () => {
 
     expect(entry).not.toBeUndefined();
     expect(Object.isFrozen(entry)).toBe(true);
+  });
+
+  /**
+   * `LEARN-010` — the deep freeze is applied to reconstructed data only.
+   *
+   * `deepFreeze` documents that it "is never applied to caller-owned input",
+   * and Step 3 scopes it to "only reconstructed validated data". Every other
+   * field of the projected entry is rebuilt from scalars, but
+   * `runtime_copy_causes` and `diagnostic_fields` were handed straight through
+   * from the argument, so projecting a caller's state froze two arrays the
+   * caller still owned. That is invisible while every in-repo caller passes an
+   * already-frozen contract state, and a surprise the first time a caller
+   * builds its own state and then cannot append to it.
+   */
+  test("projecting a caller-owned state does not freeze the caller's arrays", () => {
+    const callerCauses: LearnerLoopState["runtime_copy_causes"] = ["live_runtime"];
+    const callerDiagnostics: LearnerLoopState["operator_diagnostics"] = ["stage"];
+    const callerState: LearnerLoopState = {
+      id: "caller_owned_state",
+      label: "Caller owned state",
+      stage: "session_active",
+      resolution_kind: "recoverable",
+      submitted_answer_resolution: false,
+      max_resolution_ms: 1_000,
+      learner_safe: true,
+      authority: "session_event",
+      sanitized_evidence: true,
+      runtime_copy_causes: callerCauses,
+      copy: {
+        capsule_label: "Caller capsule",
+        marginalia_title: "Caller title",
+        marginalia_text: "Caller text",
+        next_action_label: "Caller next",
+        next_action_intent: "disabled",
+        primary_action_label: "Caller primary",
+        primary_action_intent: "retry_agent",
+        status_label: "Caller status",
+      },
+      operator_diagnostics: callerDiagnostics,
+    };
+
+    const entry = learnerRecoveryCopyEntry(callerState);
+
+    expect(Object.isFrozen(callerCauses)).toBe(false);
+    expect(Object.isFrozen(callerDiagnostics)).toBe(false);
+    expect(entry.runtime_copy_causes).not.toBe(callerCauses);
+    expect(entry.operator.diagnostic_fields).not.toBe(callerDiagnostics);
+    expect(Object.isFrozen(entry.runtime_copy_causes)).toBe(true);
+    expect(Object.isFrozen(entry.operator.diagnostic_fields)).toBe(true);
+    expect([...entry.runtime_copy_causes]).toEqual(["live_runtime"]);
+    expect([...entry.operator.diagnostic_fields]).toEqual(["stage"]);
+
+    callerCauses.push("agent_offline");
+    callerDiagnostics.push("provider");
+
+    expect([...entry.runtime_copy_causes]).toEqual(["live_runtime"]);
+    expect([...entry.operator.diagnostic_fields]).toEqual(["stage"]);
   });
 });
