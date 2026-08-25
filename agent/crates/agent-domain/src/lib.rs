@@ -22,8 +22,13 @@ pub mod study_projection;
 pub mod tool_executor;
 mod tools;
 
+// The typed failure boundary Plans 07/08 classify against: `BrainFailureClass`
+// selects the terminal reason, `BrainFailureStage` records where the failure was
+// observed, and `BrainProviderErrorClassificationError` turns a missing typed
+// failure into a typed error instead of a message-substring fallback.
 pub use brain::{
-    BrainError, BrainEvent, BrainEventStream, BrainInput, BrainProviderError, BrainProviderFailure,
+    BrainError, BrainEvent, BrainEventStream, BrainFailureClass, BrainFailureStage, BrainInput,
+    BrainProviderError, BrainProviderErrorClassificationError, BrainProviderFailure,
     BrainProviderFailureParts, BrainUsage, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind,
     ManuscriptIntent, ManuscriptRegister, Planner, RealtimeBrain, RealtimeBrainCapabilities,
     RealtimeSession, RealtimeSessionTaskGuard, SessionConfig, SourceConfidence, SourceContext,

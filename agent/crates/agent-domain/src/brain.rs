@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use futures_util::{stream::BoxStream, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use std::fmt;
 use tokio::{sync::mpsc, task::AbortHandle};
 
@@ -315,28 +315,169 @@ pub struct BrainProviderError {
 }
 
 impl BrainProviderError {
-    pub fn new(source: impl Into<String>, message: impl Into<String>) -> Self {
+    /// The only constructor. There is deliberately no unclassified `new`: a
+    /// provider error that reaches a terminal path must carry the typed failure
+    /// that classified it, and `source`/`message` stay diagnostics.
+    pub fn from_failure(failure: BrainProviderFailure) -> Self {
         Self {
-            source: source.into(),
-            message: message.into(),
-            failure: None,
-        }
-    }
-
-    pub fn from_stage_failure(failure: BrainProviderFailure) -> Self {
-        Self {
-            source: failure.provider.clone(),
+            source: failure.provider().to_owned(),
             message: failure.to_string(),
             failure: Some(failure),
         }
     }
+
+    pub fn failure(&self) -> Option<&BrainProviderFailure> {
+        self.failure.as_ref()
+    }
+
+    /// A missing typed failure is an invariant breach, not an invitation to
+    /// classify from `source`/`message`. Plan 08 converts this typed error into
+    /// an explicit `BrainFailureClass::Rollback` failure at stage `Websocket`.
+    pub fn require_failure(
+        &self,
+    ) -> Result<&BrainProviderFailure, BrainProviderErrorClassificationError> {
+        self.failure()
+            .ok_or(BrainProviderErrorClassificationError::MissingTypedFailure)
+    }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BrainProviderErrorClassificationError {
+    #[error("provider error is missing a typed failure")]
+    MissingTypedFailure,
+}
+
+/// The single failure-vocabulary declaration, mirroring the
+/// `define_terminal_session_reasons!` pattern Plan 04 owns in `study.rs`: one
+/// variant list generates the enum, its serde token, [`ALL`](BrainFailureClass::ALL),
+/// `as_str`, and `Display`, so no adapter, service, or store can keep a second
+/// string table that drifts from this one.
+macro_rules! define_failure_vocabulary {
+    (
+        $(#[$enum_meta:meta])*
+        $name:ident { $( $variant:ident => $wire:literal ),+ $(,)? }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        pub enum $name {
+            $(#[serde(rename = $wire)] $variant),+
+        }
+
+        impl $name {
+            /// Every declared variant, in declaration order.
+            pub const ALL: [Self; define_failure_vocabulary!(@count $($variant),+)] =
+                [$(Self::$variant),+];
+
+            /// The canonical wire token. The serde name is generated from this
+            /// same literal, so the two can never disagree.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire),+
+                }
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+    };
+    (@count $($variant:ident),+) => {
+        <[()]>::len(&[$(define_failure_vocabulary!(@one $variant)),+])
+    };
+    (@one $variant:ident) => { () };
+}
+
+define_failure_vocabulary! {
+    /// Why a session or turn failed. This is classification data, never prose:
+    /// exactly one class selects exactly one [`TerminalSessionReason`], so no
+    /// consumer may parse a provider message to pick a terminal reason, retry
+    /// policy, durability path, HTTP status, or alert class.
+    ///
+    /// Protocol-only observability labels (`pending_evaluation`,
+    /// `pre_loop_unavailable`, `session_bootstrap_unavailable`,
+    /// `session_auth_failure`) are deliberately absent: they are non-terminal or
+    /// pre-session protocol signals that Plan 08 keeps outside typed
+    /// [`BrainError`] classification.
+    BrainFailureClass {
+        DeployDrain => "deploy_drain",
+        SessionCap => "session_cap",
+        TurnCap => "turn_cap",
+        LocalRateLimit => "local_rate_limit",
+        CostBudget => "cost_budget",
+        ProviderAuthFailure => "provider_auth_failure",
+        QuotaRateFailure => "quota_rate_failure",
+        Timeout => "timeout",
+        MalformedStream => "malformed_stream",
+        NetworkDisconnect => "network_disconnect",
+        SlowClient => "slow_client",
+        Cancellation => "cancellation",
+        PartialStageSuccess => "partial_stage_success",
+        DurabilityDegraded => "durability_degraded",
+        ToolExecutorFailure => "tool_executor_failure",
+        Rollback => "rollback",
+    }
+}
+
+const _: () = assert!(BrainFailureClass::ALL.len() == 16);
+
+define_failure_vocabulary! {
+    /// Where the failure was observed. The stage is diagnostic context; it never
+    /// selects a terminal reason on its own.
+    BrainFailureStage {
+        Session => "session",
+        Store => "store",
+        Tools => "tools",
+        Recap => "recap",
+        Gemini => "gemini",
+        Provider => "provider",
+        ProviderAuth => "provider_auth",
+        Websocket => "websocket",
+        Transport => "transport",
+        PreLoop => "pre_loop",
+        Startup => "startup",
+        SessionAuth => "session_auth",
+        Deployment => "deployment",
+        Rollback => "rollback",
+    }
+}
+
+const _: () = assert!(BrainFailureStage::ALL.len() == 14);
+
+impl BrainFailureClass {
+    /// The one class-to-terminal mapping, exhaustive over all 16
+    /// [`TerminalSessionReason`] variants.
+    pub const fn terminal_reason(self) -> TerminalSessionReason {
+        match self {
+            Self::DeployDrain => TerminalSessionReason::Drained,
+            Self::SessionCap => TerminalSessionReason::SessionCap,
+            Self::TurnCap => TerminalSessionReason::TurnCap,
+            Self::LocalRateLimit => TerminalSessionReason::RateLimit,
+            Self::CostBudget => TerminalSessionReason::CostBudget,
+            Self::ProviderAuthFailure => TerminalSessionReason::ProviderAuthFailed,
+            Self::QuotaRateFailure => TerminalSessionReason::ProviderRateLimited,
+            Self::Timeout => TerminalSessionReason::ProviderTimeout,
+            Self::MalformedStream => TerminalSessionReason::ProviderMalformedStream,
+            Self::NetworkDisconnect => TerminalSessionReason::ProviderNetworkDisconnect,
+            Self::SlowClient => TerminalSessionReason::SlowClient,
+            Self::Cancellation => TerminalSessionReason::ProviderCancelled,
+            Self::PartialStageSuccess => TerminalSessionReason::PartialStageSuccess,
+            Self::DurabilityDegraded => TerminalSessionReason::DurabilityDegraded,
+            Self::ToolExecutorFailure => TerminalSessionReason::ToolExecutorFailure,
+            Self::Rollback => TerminalSessionReason::Rollback,
+        }
+    }
+}
+
+/// The construction input for [`BrainProviderFailure`]. It carries no
+/// `terminal_reason`: the class is the single authority for that. `retry_eligible`
+/// stays explicit because retryability can differ by status or attempt within one
+/// class.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrainProviderFailureParts {
-    pub failure_class: String,
-    pub stage: String,
-    pub terminal_reason: TerminalSessionReason,
+    pub failure_class: BrainFailureClass,
+    pub stage: BrainFailureStage,
     pub retry_eligible: bool,
     pub latency_ms: u64,
     pub provider: String,
@@ -344,30 +485,111 @@ pub struct BrainProviderFailureParts {
     pub metadata: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// A classified runtime failure. Every field is private and every path in —
+/// construction and deserialization alike — runs through [`BrainProviderFailure::new`],
+/// so a raw provider string, a smuggled secret, or a hand-picked terminal reason
+/// cannot enter the domain.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BrainProviderFailure {
-    pub failure_class: String,
-    pub stage: String,
-    pub terminal_reason: TerminalSessionReason,
-    pub retry_eligible: bool,
-    pub latency_ms: u64,
-    pub provider: String,
-    pub model: String,
-    pub metadata: String,
+    failure_class: BrainFailureClass,
+    stage: BrainFailureStage,
+    terminal_reason: TerminalSessionReason,
+    retry_eligible: bool,
+    latency_ms: u64,
+    provider: String,
+    model: String,
+    metadata: String,
 }
 
 impl BrainProviderFailure {
     pub fn new(parts: BrainProviderFailureParts) -> Self {
         Self {
-            failure_class: sanitize_stage_token(parts.failure_class),
-            stage: sanitize_stage_token(parts.stage),
-            terminal_reason: parts.terminal_reason,
+            failure_class: parts.failure_class,
+            stage: parts.stage,
+            terminal_reason: parts.failure_class.terminal_reason(),
             retry_eligible: parts.retry_eligible,
             latency_ms: parts.latency_ms,
             provider: sanitize_stage_token(parts.provider),
             model: sanitize_stage_token(parts.model),
             metadata: sanitize_stage_metadata(parts.metadata),
         }
+    }
+
+    pub fn failure_class(&self) -> BrainFailureClass {
+        self.failure_class
+    }
+
+    pub fn stage(&self) -> BrainFailureStage {
+        self.stage
+    }
+
+    pub fn terminal_reason(&self) -> TerminalSessionReason {
+        self.terminal_reason
+    }
+
+    pub fn retry_eligible(&self) -> bool {
+        self.retry_eligible
+    }
+
+    pub fn latency_ms(&self) -> u64 {
+        self.latency_ms
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn metadata(&self) -> &str {
+        &self.metadata
+    }
+}
+
+/// The wire shape of a failure. It exists so that deserialization can validate
+/// the incoming `terminal_reason` against the class before handing the remaining
+/// values to the sanitizing constructor; a derived `Deserialize` would bypass
+/// both checks.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrainProviderFailureWire {
+    failure_class: BrainFailureClass,
+    stage: BrainFailureStage,
+    terminal_reason: TerminalSessionReason,
+    retry_eligible: bool,
+    latency_ms: u64,
+    provider: String,
+    model: String,
+    metadata: String,
+}
+
+impl<'de> Deserialize<'de> for BrainProviderFailure {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = BrainProviderFailureWire::deserialize(deserializer)?;
+        let implied = wire.failure_class.terminal_reason();
+        if wire.terminal_reason != implied {
+            return Err(de::Error::custom(format!(
+                "failure_class {} implies terminal reason {}, not {}",
+                wire.failure_class.as_str(),
+                implied.as_str(),
+                wire.terminal_reason.as_str(),
+            )));
+        }
+
+        Ok(Self::new(BrainProviderFailureParts {
+            failure_class: wire.failure_class,
+            stage: wire.stage,
+            retry_eligible: wire.retry_eligible,
+            latency_ms: wire.latency_ms,
+            provider: wire.provider,
+            model: wire.model,
+            metadata: wire.metadata,
+        }))
     }
 }
 
@@ -445,16 +667,33 @@ impl BrainUsage {
     }
 }
 
+/// Every brain failure is a classified failure. The former stringly variants
+/// (`MissingApiKey`, `Connection`, `Protocol`, `StageFailure`) are gone: a
+/// missing API key is a `ProviderAuthFailure` at stage `ProviderAuth`, a dropped
+/// connection is a `NetworkDisconnect` at stage `Transport`, and a protocol
+/// defect is a `MalformedStream` — each with the terminal reason its class
+/// implies, chosen at the boundary that observed the status rather than parsed
+/// out of a message downstream.
 #[derive(Debug, thiserror::Error)]
 pub enum BrainError {
-    #[error("missing API key for realtime brain")]
-    MissingApiKey,
-    #[error("brain connection failed: {0}")]
-    Connection(String),
-    #[error("brain protocol error: {0}")]
-    Protocol(String),
     #[error("{0}")]
-    StageFailure(Box<BrainProviderFailure>),
+    Failure(Box<BrainProviderFailure>),
+}
+
+impl BrainError {
+    pub fn from_failure(failure: BrainProviderFailure) -> Self {
+        Self::Failure(Box::new(failure))
+    }
+
+    pub fn failure(&self) -> &BrainProviderFailure {
+        match self {
+            Self::Failure(failure) => failure,
+        }
+    }
+
+    pub fn terminal_reason(&self) -> TerminalSessionReason {
+        self.failure().terminal_reason()
+    }
 }
 
 #[async_trait]
@@ -511,4 +750,99 @@ pub trait Planner: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SpeechIntent {
     pub text: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_failure() -> BrainProviderFailure {
+        BrainProviderFailure::new(BrainProviderFailureParts {
+            failure_class: BrainFailureClass::Timeout,
+            stage: BrainFailureStage::Gemini,
+            retry_eligible: true,
+            latency_ms: 42,
+            provider: "gemini".to_owned(),
+            model: "gemini-realtime".to_owned(),
+            metadata: "http_status=504".to_owned(),
+        })
+    }
+
+    /// The serialized field names and their order are the published wire
+    /// contract for Plans 05/07/08; a rename here is a protocol break.
+    #[test]
+    fn failure_serializes_with_the_published_field_names_in_order() {
+        assert_eq!(
+            serde_json::to_string(&fixture_failure()).expect("failure serializes"),
+            concat!(
+                r#"{"failure_class":"timeout","stage":"gemini","#,
+                r#""terminal_reason":"provider_timeout","retry_eligible":true,"#,
+                r#""latency_ms":42,"provider":"gemini","model":"gemini-realtime","#,
+                r#""metadata":"http_status=504"}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn failure_round_trips_through_the_sanitizing_deserializer() {
+        let failure = fixture_failure();
+        let encoded = serde_json::to_string(&failure).expect("failure serializes");
+        let decoded: BrainProviderFailure =
+            serde_json::from_str(&encoded).expect("failure deserializes");
+        assert_eq!(decoded, failure);
+    }
+
+    #[test]
+    fn provider_fallback_event_carries_a_typed_failure_across_the_wire() {
+        let event = BrainEvent::ProviderFallbackActivated {
+            response_id: "response-1".to_owned(),
+            provider: "gemini".to_owned(),
+            from_model: "gemini-realtime".to_owned(),
+            to_model: "gemini-fallback".to_owned(),
+            reason: "provider timeout".to_owned(),
+            failure: Some(fixture_failure()),
+        };
+
+        let decoded: BrainEvent =
+            serde_json::from_value(serde_json::to_value(&event).expect("event serializes"))
+                .expect("event deserializes");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn sanitize_stage_token_keeps_only_allowlisted_characters() {
+        assert_eq!(
+            sanitize_stage_token("gemini\nBearer secret-token".to_owned()),
+            "geminiBearersecret-token",
+        );
+        assert_eq!(
+            sanitize_stage_token("model\u{1F525}/../../raw_prompt".to_owned()),
+            "modelraw_prompt",
+        );
+    }
+
+    #[test]
+    fn sanitize_stage_token_falls_back_to_unknown_when_nothing_survives() {
+        assert_eq!(sanitize_stage_token(String::new()), "unknown");
+        assert_eq!(
+            sanitize_stage_token("\u{1F525} \u{2028}".to_owned()),
+            "unknown",
+        );
+    }
+
+    #[test]
+    fn sanitize_stage_token_caps_at_ninety_six_characters() {
+        assert_eq!(sanitize_stage_token("p".repeat(4_096)).len(), 96);
+    }
+
+    #[test]
+    fn sanitize_stage_metadata_keeps_only_diagnostic_punctuation() {
+        assert_eq!(
+            sanitize_stage_metadata(
+                "http_status=503\nraw_prompt=<secret> bearer.token \"quoted\"".to_owned()
+            ),
+            "http_status=503raw_prompt=secret bearer.token quoted",
+        );
+        assert_eq!(sanitize_stage_metadata("k=v,".repeat(4_096)).len(), 240);
+    }
 }
