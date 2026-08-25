@@ -43,7 +43,7 @@ import { colors, fonts, layout, radius, space } from "@/theme/tokens";
 // must not become a transport capability until the protocol-v5 milestone.
 const voiceTurnsEnabled = false as const;
 
-type CaptureState = "blocked" | "idle" | "listening" | "requesting";
+type CaptureState = "blocked" | "idle" | "listening" | "requesting" | "stopping";
 type SessionLoadState =
   | { kind: "loading" }
   | { kind: "ready"; studySet: StudySet }
@@ -155,6 +155,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   const [retryAttempt, setRetryAttempt] = useState<RetryAttemptState>();
   const [recapPlaybackWaitExpired, setRecapPlaybackWaitExpired] = useState(false);
   const endingRef = useRef(false);
+  const captureCancellationRef = useRef<Promise<void> | null>(null);
   const handledCancelRef = useRef(0);
   const handledGenerationRef = useRef<string | undefined>(undefined);
   const playbackUnlockedRef = useRef(false);
@@ -172,6 +173,8 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   useEffect(() => {
     if (captureState === "requesting") {
       AccessibilityInfo.announceForAccessibility("Requesting microphone access");
+    } else if (captureState === "stopping") {
+      AccessibilityInfo.announceForAccessibility("Stopping local microphone capture");
     } else if (captureState === "listening") {
       AccessibilityInfo.announceForAccessibility("Viva is listening locally");
     } else if (captureState === "blocked") {
@@ -180,6 +183,13 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
       AccessibilityInfo.announceForAccessibility("Correction ready");
     }
   }, [agent.derived.evaluation, captureState, retrying]);
+
+  useEffect(
+    () => () => {
+      captureCancellationRef.current = null;
+    },
+    [],
+  );
 
   useEffect(() => {
     const generationId = agent.agentState.generation?.id;
@@ -277,7 +287,10 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   ]);
 
   useEffect(() => {
-    if (!agent.captureIssue || (captureState !== "listening" && captureState !== "requesting")) {
+    if (
+      !agent.captureIssue ||
+      (captureState !== "listening" && captureState !== "requesting" && captureState !== "stopping")
+    ) {
       return;
     }
     setCaptureState("blocked");
@@ -293,9 +306,18 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     if (!agent.speaking || (captureState !== "listening" && captureState !== "requesting")) {
       return;
     }
-    setCaptureState("idle");
+    if (captureCancellationRef.current) return;
+    setCaptureState("stopping");
     setCaptureMessage("Examiner playback started, so local microphone capture was stopped.");
-  }, [agent.speaking, captureState]);
+    const cancellation = agent.capture.cancel();
+    captureCancellationRef.current = cancellation;
+    const settleCancellation = () => {
+      if (captureCancellationRef.current !== cancellation) return;
+      captureCancellationRef.current = null;
+      setCaptureState((state) => (state === "stopping" ? "idle" : state));
+    };
+    void cancellation.then(settleCancellation, settleCancellation);
+  }, [agent.capture, agent.speaking, captureState]);
 
   const unlockPlayback = () => {
     if (playbackUnlockedRef.current) return;
@@ -328,6 +350,10 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
 
     try {
       await agent.capture.start();
+      if (outcome !== "pending") {
+        await agent.capture.cancel();
+        return;
+      }
       const playbackActive = agent.playback.isActive();
       if (playbackActive || !agent.capture.isActive()) {
         outcome = "failed";
@@ -338,10 +364,6 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
             : "Microphone capture was interrupted. Start listening again when you are ready.",
         );
         setCaptureState("idle");
-        return;
-      }
-      if (outcome !== "pending") {
-        await agent.capture.cancel();
         return;
       }
       outcome = "recording";
@@ -454,9 +476,10 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     retrying && correction
       ? correction.retryPrompt
       : (agent.derived.question?.prompt ?? connectionCopy.title);
+  const captureTransitioning = captureState === "requesting" || captureState === "stopping";
   const localPhase = retrying
     ? "listening"
-    : captureState === "requesting"
+    : captureTransitioning
       ? "thinking"
       : captureState === "listening"
         ? "listening"
@@ -665,6 +688,9 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                 {captureState === "requesting" ? (
                   <ActionButton loading>Opening microphone</ActionButton>
                 ) : null}
+                {captureState === "stopping" ? (
+                  <ActionButton loading>Stopping microphone</ActionButton>
+                ) : null}
                 {captureState === "listening" ? (
                   <ActionButton
                     disabled={answerControlsBusy}
@@ -675,9 +701,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                 ) : null}
                 <View style={styles.secondaryActions}>
                   <ActionButton
-                    disabled={
-                      !agent.derived.question || captureState === "requesting" || answerControlsBusy
-                    }
+                    disabled={!agent.derived.question || captureTransitioning || answerControlsBusy}
                     onPress={() => {
                       unlockPlayback();
                       setHintVisible((value) => !value);
@@ -688,9 +712,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                     {hintVisible ? "Hide hint" : "Hint"}
                   </ActionButton>
                   <ActionButton
-                    disabled={
-                      !agent.derived.question || captureState === "requesting" || answerControlsBusy
-                    }
+                    disabled={!agent.derived.question || captureTransitioning || answerControlsBusy}
                     onPress={() => {
                       unlockPlayback();
                       setTyping((value) => !value);
@@ -703,9 +725,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                   </ActionButton>
                 </View>
                 <ActionButton
-                  disabled={
-                    !agent.derived.question || captureState === "requesting" || answerControlsBusy
-                  }
+                  disabled={!agent.derived.question || captureTransitioning || answerControlsBusy}
                   onPress={() => {
                     unlockPlayback();
                     setSourceVisible((value) => !value);

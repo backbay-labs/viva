@@ -68,6 +68,19 @@ describe("sessionProviderStatusLabel", () => {
       }),
     ).toBe("provider disconnected");
   });
+
+  test("keeps pending capture cancellation visible over generic playback status", () => {
+    expect(
+      sessionProviderStatusLabel({
+        busy: false,
+        captureState: "stopping",
+        connectionStatusLabel: "connected",
+        disconnected: false,
+        hasQuestion: true,
+        speaking: true,
+      }),
+    ).toBe("Stopping microphone…");
+  });
 });
 
 describe("sessionAnswerControlsBusy", () => {

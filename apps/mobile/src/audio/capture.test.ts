@@ -203,4 +203,39 @@ describe("createMobileCaptureSession", () => {
     expect(session.isActive()).toBe(false);
     expect(session.getFrames()).toHaveLength(0);
   });
+
+  test("serializes a new start behind a canceled pending startup", async () => {
+    const sources: PendingCaptureSource[] = [];
+    const session = createMobileCaptureSession({
+      sourceFactory: () => {
+        const source = new PendingCaptureSource();
+        sources.push(source);
+        return source;
+      },
+    });
+
+    const firstStart = session.start();
+    const cancellation = session.cancel();
+    let secondSettled = false;
+    const secondStart = session.start().then(() => {
+      secondSettled = true;
+    });
+
+    await Promise.resolve();
+    expect(sources).toHaveLength(1);
+    expect(secondSettled).toBe(false);
+
+    sources[0]?.finishStart();
+    await Promise.all([firstStart, cancellation]);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sources).toHaveLength(2);
+    expect(secondSettled).toBe(false);
+
+    sources[1]?.finishStart();
+    await secondStart;
+
+    expect(session.isActive()).toBe(true);
+  });
 });
