@@ -1,9 +1,6 @@
-use std::{
-    fmt::Write as _,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, RwLock,
-    },
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 
 use agent_domain::{
@@ -21,12 +18,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
-    memory::{generate_file_study_set, generate_paste_study_set},
+    memory::{
+        generate_file_study_set, generate_paste_study_set, payload_sha256,
+        ConceptStatusEventPayload, EventAuthorizationKind, ReviewScheduleEventPayload,
+    },
     recap_label_buckets, InMemoryStudyStore,
 };
 
@@ -34,12 +33,11 @@ use crate::{
 pub struct PostgresStudyStore {
     pool: PgPool,
     counts: Arc<PostgresWriteCounters>,
-    event_authorizations: Arc<RwLock<Vec<EventAuthorizationRecord>>>,
 }
 
 /// The published write counts, one lock-free counter per kind.
 ///
-/// `DATA-002`/`DATA-010`: the previous `RwLock<StudyStoreWriteCounts>` made the
+/// `DATA-002`/`DATA-010`: the previous `Arc<RwLock<StudyStoreWriteCounts>>` made the
 /// post-commit count update fallible, so a poisoned local lock turned an
 /// already-committed row into a returned error. Callers retry returned errors,
 /// and a usage event has no stable identity to retry against, so that path could
@@ -81,178 +79,92 @@ impl PostgresWriteCounters {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EventAuthorizationKind {
-    AnswerEvaluation,
-    ConceptStatus,
-    ReviewSchedule,
-    StudySessionRecap,
-}
-
-impl EventAuthorizationKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AnswerEvaluation => "answer_evaluation",
-            Self::ConceptStatus => "concept_status",
-            Self::ReviewSchedule => "review_schedule",
-            Self::StudySessionRecap => "study_session_recap",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct EventAuthorizationRecord {
-    user_id: String,
-    study_set_id: String,
-    voice_session_id: String,
-    response_id: String,
-    kind: EventAuthorizationKind,
-    payload_sha256: String,
-}
-
-#[derive(Serialize)]
-struct ConceptStatusEventPayload<'a> {
-    concept_id: &'a str,
-    status: &'a ConceptStatus,
-}
-
-/// The replay-stable half of a scheduling outcome. Mirrors the in-memory store's
-/// payload field-for-field so both backends agree on what counts as a replay: the
-/// graded inputs, never the clock-derived schedule they produce.
-#[derive(Serialize)]
-struct ReviewScheduleEventPayload<'a> {
-    concept_id: &'a str,
-    policy_id: &'a str,
-    status: &'a ConceptStatus,
-    rating: u8,
-    hint_count: Option<u32>,
-    miss_count: Option<u32>,
-}
-
-impl<'a> ReviewScheduleEventPayload<'a> {
-    fn new(concept_id: &'a str, decision: &'a ReviewScheduleDecisionV1) -> Self {
-        Self {
-            concept_id,
-            policy_id: &decision.policy_id,
-            status: &decision.status,
-            rating: decision.rating,
-            hint_count: decision.hint_count,
-            miss_count: decision.miss_count,
-        }
-    }
-}
-
-fn event_authorization_record<T: Serialize>(
-    user_id: &str,
-    study_set_id: &str,
-    voice_session_id: &str,
-    response_id: &str,
-    kind: EventAuthorizationKind,
-    payload: &T,
-) -> Result<EventAuthorizationRecord, PortError> {
-    Ok(EventAuthorizationRecord {
-        user_id: user_id.to_owned(),
-        study_set_id: study_set_id.to_owned(),
-        voice_session_id: voice_session_id.to_owned(),
-        response_id: response_id.to_owned(),
-        kind,
-        payload_sha256: payload_sha256(kind, response_id, payload)?,
-    })
-}
-
-fn payload_sha256<T: Serialize>(
-    kind: EventAuthorizationKind,
-    response_id: &str,
-    payload: &T,
-) -> Result<String, PortError> {
-    let payload = serde_json::to_vec(payload)
-        .map_err(|error| json_invariant("event_authorization_payload", &error))?;
-    let mut hasher = Sha256::new();
-    hasher.update(kind.as_str().as_bytes());
-    hasher.update([0]);
-    hasher.update(response_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(payload);
-    let digest = hasher.finalize();
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(&mut encoded, "{byte:02x}");
-    }
-    Ok(encoded)
-}
-
 impl PostgresStudyStore {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
             counts: Arc::new(PostgresWriteCounters::default()),
-            event_authorizations: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
-    /// Test seam: the ledger is private and is only ever consulted by membership, so
-    /// nothing else can observe how many entries a replay leaves behind.
-    #[cfg(test)]
-    pub(crate) fn event_authorization_ledger_len(&self) -> usize {
-        self.event_authorizations
-            .read()
-            .expect("event authorization lock poisoned")
-            .len()
-    }
-
-    fn record_event_authorization<T: Serialize>(
-        &self,
+    /// Records that one browser payload was authorized, in the same transaction
+    /// as the domain row it authorizes.
+    ///
+    /// `DATA-005`: the digest and its authoritative write commit together or roll
+    /// back together, so authority can never outlive — or precede — the record it
+    /// belongs to. There is no process-local shadow cache: a durable store that
+    /// keeps one loses every authorization on restart and shows none of them to a
+    /// second instance, which is the same thing as having no authorization at all
+    /// on a two-instance deployment.
+    ///
+    /// The table stores no raw event JSON; the digest is still learner-derived,
+    /// so session close and both privacy deletions remove it.
+    async fn insert_event_authorization<T: Serialize>(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         user_id: &str,
-        study_set_id: &str,
-        voice_session_id: &str,
+        study_set_uuid: Uuid,
+        voice_session_uuid: Uuid,
         response_id: &str,
         kind: EventAuthorizationKind,
         payload: &T,
     ) -> Result<(), PortError> {
-        let record = event_authorization_record(
-            user_id,
-            study_set_id,
-            voice_session_id,
-            response_id,
-            kind,
-            payload,
-        )?;
-        let mut ledger = self
-            .event_authorizations
-            .write()
-            .map_err(|_| lock_poisoned("event_authorizations"))?;
-        // The ledger records that one authorized outcome was written, and it is only
-        // ever consulted by membership. A replay writes nothing, so it must not
-        // append a second entry either — which is what the in-memory backend already
-        // does, and the two backends have to agree.
-        if !ledger.contains(&record) {
-            ledger.push(record);
-        }
+        let digest = payload_sha256("postgres", kind, response_id, payload)?;
+        sqlx::query(
+            "INSERT INTO event_authorization_digests (
+                 user_id,
+                 study_set_id,
+                 voice_session_id,
+                 response_id,
+                 event_kind,
+                 payload_sha256
+             )
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .bind(response_id)
+        .bind(kind.as_str())
+        .bind(&digest)
+        .execute(&mut **tx)
+        .await
+        .map_err(pg_error)?;
         Ok(())
     }
 
-    fn has_event_authorization<T: Serialize>(
+    /// An exact match on all six key fields. Five of six is not authorization.
+    async fn has_event_authorization<T: Serialize>(
         &self,
         user_id: &str,
-        study_set_id: &str,
-        voice_session_id: &str,
+        study_set_uuid: Uuid,
+        voice_session_uuid: Uuid,
         response_id: &str,
         kind: EventAuthorizationKind,
         payload: &T,
     ) -> Result<bool, PortError> {
-        let record = event_authorization_record(
-            user_id,
-            study_set_id,
-            voice_session_id,
-            response_id,
-            kind,
-            payload,
-        )?;
-        Ok(self
-            .event_authorizations
-            .read()
-            .map_err(|_| lock_poisoned("event_authorizations"))?
-            .contains(&record))
+        let digest = payload_sha256("postgres", kind, response_id, payload)?;
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM event_authorization_digests
+                 WHERE user_id = $1
+                   AND study_set_id = $2
+                   AND voice_session_id = $3
+                   AND response_id = $4
+                   AND event_kind = $5
+                   AND payload_sha256 = $6
+             )",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .bind(response_id)
+        .bind(kind.as_str())
+        .bind(&digest)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(pg_error)
     }
 
     fn uuid_for(logical_id: &str) -> Result<Uuid, PortError> {
@@ -868,6 +780,11 @@ impl StudyMemoryStore for PostgresStudyStore {
         terminal_reason: &str,
     ) -> Result<Value, PortError> {
         let voice_session_uuid = Self::uuid_for(voice_session_id)?;
+        // `DATA-005`: closing a session ends its browser authority in the same
+        // transaction that closes it. An *open* session may therefore resume
+        // across a restart or on a second instance; a closed one cannot replay
+        // browser authority anywhere.
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
         let updated = sqlx::query(
             "UPDATE voice_sessions
              SET status = 'closed',
@@ -878,7 +795,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         )
         .bind(voice_session_uuid)
         .bind(terminal_reason)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(pg_error)?;
         let (status, stored_terminal_reason): (String, Option<String>) = if let Some(row) = updated
@@ -894,7 +811,7 @@ impl StudyMemoryStore for PostgresStudyStore {
                      WHERE id = $1",
             )
             .bind(voice_session_uuid)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(pg_error)?
             .ok_or_else(|| {
@@ -905,10 +822,12 @@ impl StudyMemoryStore for PostgresStudyStore {
                 row.try_get("terminal_reason").map_err(pg_error)?,
             )
         };
-        self.event_authorizations
-            .write()
-            .map_err(|_| lock_poisoned("event_authorizations"))?
-            .retain(|record| record.voice_session_id != voice_session_id);
+        sqlx::query("DELETE FROM event_authorization_digests WHERE voice_session_id = $1")
+            .bind(voice_session_uuid)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_error)?;
+        tx.commit().await.map_err(pg_error)?;
         Ok(json!({
             "voice_session_id": voice_session_id,
             "status": status,
@@ -1139,11 +1058,16 @@ impl StudyMemoryStore for PostgresStudyStore {
 
         Self::insert_ingestion_artifacts(&mut tx, &generated, study_set_uuid).await?;
 
+        // A retry replaces this set's documents, spans, concepts, and questions, so
+        // every browser authorization derived from the previous ones stops being
+        // authority in the same transaction that replaces them.
+        sqlx::query("DELETE FROM event_authorization_digests WHERE study_set_id = $1")
+            .bind(study_set_uuid)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_error)?;
+
         tx.commit().await.map_err(pg_error)?;
-        self.event_authorizations
-            .write()
-            .map_err(|_| lock_poisoned("event_authorizations"))?
-            .retain(|record| record.study_set_id != generated.study_set.id);
         Ok(generated)
     }
 
@@ -1543,6 +1467,16 @@ impl StudyMemoryStore for PostgresStudyStore {
         .execute(&mut *tx)
         .await
         .map_err(pg_error)?;
+        // Learner-derived: the digest is removed with every other session artifact.
+        sqlx::query(
+            "DELETE FROM event_authorization_digests
+             WHERE user_id = $1 AND study_set_id = $2",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
         sqlx::query(
             "DELETE FROM voice_session_token_nonces
              WHERE user_id = $1 AND study_set_id = $2",
@@ -1554,10 +1488,6 @@ impl StudyMemoryStore for PostgresStudyStore {
         .map_err(pg_error)?;
 
         tx.commit().await.map_err(pg_error)?;
-        self.event_authorizations
-            .write()
-            .map_err(|_| lock_poisoned("event_authorizations"))?
-            .retain(|record| record.user_id != user_id || record.study_set_id != study_set_id);
 
         Ok(json!({
             "study_set_id": study_set_id,
@@ -1658,6 +1588,17 @@ impl StudyMemoryStore for PostgresStudyStore {
             .execute(&mut *tx)
             .await
             .map_err(pg_error)?;
+        // Learner-derived: the digest is removed with every other session artifact.
+        sqlx::query(
+            "DELETE FROM event_authorization_digests
+             WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
         sqlx::query(
             "DELETE FROM voice_session_token_nonces
              WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3",
@@ -1669,15 +1610,6 @@ impl StudyMemoryStore for PostgresStudyStore {
         .await
         .map_err(pg_error)?;
         tx.commit().await.map_err(pg_error)?;
-
-        self.event_authorizations
-            .write()
-            .map_err(|_| lock_poisoned("event_authorizations"))?
-            .retain(|record| {
-                record.user_id != user_id
-                    || record.study_set_id != study_set_id
-                    || record.voice_session_id != voice_session_id
-            });
 
         Ok(json!({
             "voice_session_id": voice_session_id,
@@ -1831,14 +1763,17 @@ impl StudyMemoryStore for PostgresStudyStore {
                 "answer evaluation event does not match persisted answer attempt",
             ));
         }
-        if !self.has_event_authorization(
-            user_id,
-            study_set_id,
-            voice_session_id,
-            response_id,
-            EventAuthorizationKind::AnswerEvaluation,
-            evaluation,
-        )? {
+        if !self
+            .has_event_authorization(
+                user_id,
+                study_set_uuid,
+                voice_session_uuid,
+                response_id,
+                EventAuthorizationKind::AnswerEvaluation,
+                evaluation,
+            )
+            .await?
+        {
             return Err(PortError::conflict(
                 "postgres",
                 response_id,
@@ -1894,14 +1829,17 @@ impl StudyMemoryStore for PostgresStudyStore {
             .await?;
         self.concept_uuid_for(study_set_uuid, concept_id).await?;
         let payload = ConceptStatusEventPayload { concept_id, status };
-        if !self.has_event_authorization(
-            user_id,
-            study_set_id,
-            voice_session_id,
-            response_id,
-            EventAuthorizationKind::ConceptStatus,
-            &payload,
-        )? {
+        if !self
+            .has_event_authorization(
+                user_id,
+                study_set_uuid,
+                voice_session_uuid,
+                response_id,
+                EventAuthorizationKind::ConceptStatus,
+                &payload,
+            )
+            .await?
+        {
             return Err(PortError::conflict(
                 "postgres",
                 response_id,
@@ -2007,14 +1945,17 @@ impl StudyMemoryStore for PostgresStudyStore {
                     )
                 })?;
         }
-        if !self.has_event_authorization(
-            user_id,
-            study_set_id,
-            voice_session_id,
-            response_id,
-            EventAuthorizationKind::StudySessionRecap,
-            recap,
-        )? {
+        if !self
+            .has_event_authorization(
+                user_id,
+                study_set_uuid,
+                voice_session_uuid,
+                response_id,
+                EventAuthorizationKind::StudySessionRecap,
+                recap,
+            )
+            .await?
+        {
             return Err(PortError::conflict(
                 "postgres",
                 response_id,
@@ -2201,6 +2142,11 @@ impl StudyMemoryStore for PostgresStudyStore {
         // columns are still empty); its second is an identical replay. Together
         // with the envelope writer's compat upgrade, both interleavings converge
         // on the same complete tuple.
+        //
+        // `DATA-005`: the attempt row and the browser authorization digest commit
+        // in one transaction, so authority can never exist for an evaluation that
+        // was rolled back.
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
         let inserted = sqlx::query_scalar::<_, bool>(
             "INSERT INTO answer_attempts (
                 id,
@@ -2261,27 +2207,31 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(concept_status_str(&evaluation.concept_status))
         .bind(f64::from(evaluation.confidence_score))
         .bind(source_span_uuid)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(pg_error)?;
         let Some(inserted) = inserted else {
+            tx.rollback().await.map_err(pg_error)?;
             return Err(PortError::conflict(
                 "postgres",
                 response_id,
                 "answer evaluation does not match the persisted attempt for this response",
             ));
         };
-        if inserted {
-            self.increment_count(WriteCountKind::AnswerAttempt);
-        }
-        self.record_event_authorization(
+        Self::insert_event_authorization(
+            &mut tx,
             user_id,
-            study_set_id,
-            voice_session_id,
+            study_set_uuid,
+            voice_session_uuid,
             response_id,
             EventAuthorizationKind::AnswerEvaluation,
             &evaluation,
-        )?;
+        )
+        .await?;
+        tx.commit().await.map_err(pg_error)?;
+        if inserted {
+            self.increment_count(WriteCountKind::AnswerAttempt);
+        }
         Ok(json!({
             "voice_session_id": voice_session_id,
             "question_id": evaluation.question_id,
@@ -2358,8 +2308,12 @@ impl StudyMemoryStore for PostgresStudyStore {
             concept_id,
             status: &status,
         };
-        let payload_digest =
-            payload_sha256(EventAuthorizationKind::ConceptStatus, response_id, &payload)?;
+        let payload_digest = payload_sha256(
+            "postgres",
+            EventAuthorizationKind::ConceptStatus,
+            response_id,
+            &payload,
+        )?;
         let mut tx = self.pool.begin().await.map_err(pg_error)?;
         let event_insert = sqlx::query(
             "INSERT INTO concept_status_events (
@@ -2386,15 +2340,17 @@ impl StudyMemoryStore for PostgresStudyStore {
         .await
         .map_err(pg_error)?;
         if event_insert.rows_affected() == 0 {
-            tx.commit().await.map_err(pg_error)?;
-            self.record_event_authorization(
+            Self::insert_event_authorization(
+                &mut tx,
                 user_id,
-                study_set_id,
-                voice_session_id,
+                study_set_uuid,
+                voice_session_uuid,
                 response_id,
                 EventAuthorizationKind::ConceptStatus,
                 &payload,
-            )?;
+            )
+            .await?;
+            tx.commit().await.map_err(pg_error)?;
             return Ok(status);
         }
         let result = sqlx::query(
@@ -2421,16 +2377,18 @@ impl StudyMemoryStore for PostgresStudyStore {
                 "concept is not available for this study set",
             ));
         }
-        tx.commit().await.map_err(pg_error)?;
-        self.increment_count(WriteCountKind::ConceptStatus);
-        self.record_event_authorization(
+        Self::insert_event_authorization(
+            &mut tx,
             user_id,
-            study_set_id,
-            voice_session_id,
+            study_set_uuid,
+            voice_session_uuid,
             response_id,
             EventAuthorizationKind::ConceptStatus,
             &payload,
-        )?;
+        )
+        .await?;
+        tx.commit().await.map_err(pg_error)?;
+        self.increment_count(WriteCountKind::ConceptStatus);
         Ok(status)
     }
 
@@ -2548,8 +2506,14 @@ impl StudyMemoryStore for PostgresStudyStore {
         self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
             .await?;
 
+        // The graded-outcome digest is this write's durable replay key, persisted on
+        // the review row itself by migration 0015. It is not a browser
+        // authorization digest: no `authorize_*` path consults a review schedule,
+        // and migration 0016's `event_kind` check admits only the three browser
+        // events that do have one.
         let payload = ReviewScheduleEventPayload::new(concept_id, &decision);
         let payload_digest = payload_sha256(
+            "postgres",
             EventAuthorizationKind::ReviewSchedule,
             response_id,
             &payload,
@@ -2592,14 +2556,6 @@ impl StudyMemoryStore for PostgresStudyStore {
         .await?
         {
             tx.commit().await.map_err(pg_error)?;
-            self.record_event_authorization(
-                user_id,
-                study_set_id,
-                voice_session_id,
-                response_id,
-                EventAuthorizationKind::ReviewSchedule,
-                &payload,
-            )?;
             return Ok(persisted.public_summary(concept_id));
         }
 
@@ -2684,14 +2640,6 @@ impl StudyMemoryStore for PostgresStudyStore {
                         "review schedule write conflicted with an unrelated scheduled row",
                     )
                 })?;
-                self.record_event_authorization(
-                    user_id,
-                    study_set_id,
-                    voice_session_id,
-                    response_id,
-                    EventAuthorizationKind::ReviewSchedule,
-                    &payload,
-                )?;
                 return Ok(persisted.public_summary(concept_id));
             }
             Err(error) => return Err(pg_error(error)),
@@ -2700,14 +2648,6 @@ impl StudyMemoryStore for PostgresStudyStore {
         if result.rows_affected() > 0 {
             self.increment_count(WriteCountKind::ReviewItem);
         }
-        self.record_event_authorization(
-            user_id,
-            study_set_id,
-            voice_session_id,
-            response_id,
-            EventAuthorizationKind::ReviewSchedule,
-            &payload,
-        )?;
         Ok(decision.public_summary(concept_id))
     }
 
@@ -2744,6 +2684,9 @@ impl StudyMemoryStore for PostgresStudyStore {
             source_span_ids.push(Self::uuid_for(&moment.source_id)?);
         }
         let buckets = recap_label_buckets(&recap);
+        // `DATA-005`: the recap row and its browser authorization digest commit
+        // together.
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
         let inserted = sqlx::query_scalar::<_, bool>(
             "INSERT INTO session_recaps (
                  id,
@@ -2774,20 +2717,23 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(&buckets.missed)
         .bind(&buckets.review_later)
         .bind(&source_span_ids)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(pg_error)?;
-        if inserted {
-            self.increment_count(WriteCountKind::Recap);
-        }
-        self.record_event_authorization(
+        Self::insert_event_authorization(
+            &mut tx,
             user_id,
-            study_set_id,
-            voice_session_id,
+            study_set_uuid,
+            voice_session_uuid,
             response_id,
             EventAuthorizationKind::StudySessionRecap,
             &recap,
-        )?;
+        )
+        .await?;
+        tx.commit().await.map_err(pg_error)?;
+        if inserted {
+            self.increment_count(WriteCountKind::Recap);
+        }
         Ok(json!({
             "voice_session_id": voice_session_id,
             "strong_concepts": buckets.strong,
@@ -2994,12 +2940,6 @@ fn optional_u64_to_i64(value: Option<u64>, label: &str) -> Result<Option<i64>, P
 /// from this diagnostic text.
 fn pg_error(error: sqlx::Error) -> PortError {
     PortError::durability("postgres", "sqlx", error.to_string())
-}
-
-/// A poisoned process-local lock is a broken adapter invariant, not a caller
-/// error and not a storage failure.
-fn lock_poisoned(lock: &'static str) -> PortError {
-    PortError::internal("postgres", lock, "postgres store lock poisoned")
 }
 
 /// Encoding an already-typed domain value, or decoding one this store itself

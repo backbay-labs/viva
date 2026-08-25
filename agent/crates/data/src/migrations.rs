@@ -1938,11 +1938,49 @@ mod tests {
                 .await
                 .expect("decision persists");
         }
+        // The durable proof that a replay wrote nothing: one scheduled review row
+        // for this graded outcome, keyed on the response and the replay-stable
+        // payload digest, and one counted review write.
+        //
+        // This assertion used to read a process-local ledger. Task 5 removed that
+        // ledger, and a review schedule has no browser authorization digest to read
+        // instead (no `authorize_*` path consults one, and migration 0016's
+        // `event_kind` check admits only the three browser events that do) — so the
+        // claim is made against the durable rows that actually carry it.
+        let scheduled_rows = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM review_items
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND voice_session_id = $3
+               AND status = 'scheduled'
+               AND schedule_schema_version = 1
+               AND schedule_response_id = $4",
+        )
+        .bind("user-1")
+        .bind(fixture_uuid("biology-midterm").expect("study set fixture UUID"))
+        .bind(fixture_uuid("voice-session-1").expect("voice session fixture UUID"))
+        .bind("response-ledger")
+        .fetch_one(&pool)
+        .await
+        .expect("scheduled review row count query succeeds");
         assert_eq!(
-            store.event_authorization_ledger_len(),
-            1,
-            "a replay writes nothing, so it appends no second authorization"
+            scheduled_rows, 1,
+            "a replay writes nothing, so it creates no second scheduled review"
         );
+        let distinct_digests = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT schedule_payload_sha256)
+             FROM review_items
+             WHERE schedule_response_id = $1",
+        )
+        .bind("response-ledger")
+        .fetch_one(&pool)
+        .await
+        .expect("schedule digest query succeeds");
+        assert_eq!(distinct_digests, 1);
+        assert_eq!(store.write_counts().review_items, 1);
+        // A schedule write is not a browser event, so it writes no browser digest.
+        assert_eq!(digest_rows_for_session(&pool, "voice-session-1").await, 0);
 
         fixture
             .cleanup()
@@ -3235,6 +3273,643 @@ mod tests {
                 assert_eq!(usage_store.write_counts().voice_usage, 0);
             }
         }
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 5 (`DATA-005`)
+    //
+    // Browser-event authorization is durable, tenant-scoped, and dies with the
+    // session it authorized. A process-local ledger cannot make any of those
+    // claims: it disappears on restart, is invisible to a second instance, and
+    // grows without bound under replay.
+    // ------------------------------------------------------------------
+
+    const OTHER_PAYLOAD_SHA256: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    async fn digest_rows_for_session(pool: &sqlx::PgPool, voice_session_id: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM event_authorization_digests
+             WHERE voice_session_id = $1",
+        )
+        .bind(fixture_uuid(voice_session_id).expect("voice session fixture UUID"))
+        .fetch_one(pool)
+        .await
+        .expect("authorization digest row count query succeeds")
+    }
+
+    async fn digest_rows_for_study_set(pool: &sqlx::PgPool, study_set_id: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM event_authorization_digests
+             WHERE study_set_id = $1",
+        )
+        .bind(fixture_uuid(study_set_id).expect("study set fixture UUID"))
+        .fetch_one(pool)
+        .await
+        .expect("authorization digest row count query succeeds")
+    }
+
+    /// Rewrites exactly one column of the single stored digest row.
+    ///
+    /// Rewriting the durable key is the same thing as a caller presenting a
+    /// different value for that field: either way, five of six key fields match
+    /// and one does not. Each helper is a literal statement — there is no
+    /// dynamic column name anywhere in this file.
+    async fn swap_digest_user(pool: &sqlx::PgPool, from: &str, to: &str) -> u64 {
+        sqlx::query("UPDATE event_authorization_digests SET user_id = $2 WHERE user_id = $1")
+            .bind(from)
+            .bind(to)
+            .execute(pool)
+            .await
+            .expect("digest user swap succeeds")
+            .rows_affected()
+    }
+
+    async fn swap_digest_study_set(pool: &sqlx::PgPool, from: Uuid, to: Uuid) -> u64 {
+        sqlx::query(
+            "UPDATE event_authorization_digests SET study_set_id = $2 WHERE study_set_id = $1",
+        )
+        .bind(from)
+        .bind(to)
+        .execute(pool)
+        .await
+        .expect("digest study set swap succeeds")
+        .rows_affected()
+    }
+
+    async fn swap_digest_voice_session(pool: &sqlx::PgPool, from: Uuid, to: Uuid) -> u64 {
+        sqlx::query(
+            "UPDATE event_authorization_digests
+             SET voice_session_id = $2
+             WHERE voice_session_id = $1",
+        )
+        .bind(from)
+        .bind(to)
+        .execute(pool)
+        .await
+        .expect("digest voice session swap succeeds")
+        .rows_affected()
+    }
+
+    async fn swap_digest_response(pool: &sqlx::PgPool, from: &str, to: &str) -> u64 {
+        sqlx::query(
+            "UPDATE event_authorization_digests SET response_id = $2 WHERE response_id = $1",
+        )
+        .bind(from)
+        .bind(to)
+        .execute(pool)
+        .await
+        .expect("digest response swap succeeds")
+        .rows_affected()
+    }
+
+    async fn swap_digest_event_kind(pool: &sqlx::PgPool, from: &str, to: &str) -> u64 {
+        sqlx::query(
+            "UPDATE event_authorization_digests SET event_kind = $2 WHERE event_kind = $1",
+        )
+        .bind(from)
+        .bind(to)
+        .execute(pool)
+        .await
+        .expect("digest event kind swap succeeds")
+        .rows_affected()
+    }
+
+    /// Replaces the stored digest and returns what it was, so the caller can put
+    /// it back and prove the rejection changed nothing.
+    async fn swap_digest_payload(pool: &sqlx::PgPool, to: &str) -> String {
+        let previous =
+            sqlx::query_scalar::<_, String>("SELECT payload_sha256 FROM event_authorization_digests")
+                .fetch_one(pool)
+                .await
+                .expect("digest payload read succeeds");
+        sqlx::query("UPDATE event_authorization_digests SET payload_sha256 = $1")
+            .bind(to)
+            .execute(pool)
+            .await
+            .expect("digest payload swap succeeds");
+        previous
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_answer_evaluation_authorization_survives_store_reconstruction() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let session_id = Uuid::new_v4().to_string();
+        let evaluation = fixture_evaluation("mostly correct", ConceptStatus::Strong, 0.84);
+
+        // Store A writes, then is dropped: a restart, expressed as an object graph.
+        {
+            let first_store = PostgresStudyStore::new(pool.clone());
+            record_count_table_session(&first_store, &session_id).await;
+            first_store
+                .record_answer_evaluation(
+                    "user-1",
+                    "biology-midterm",
+                    &session_id,
+                    "response-restart",
+                    evaluation.clone(),
+                )
+                .await
+                .expect("evaluation records under the first store");
+        }
+
+        let second_store = PostgresStudyStore::new(pool.clone());
+        second_store
+            .authorize_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                "response-restart",
+                &evaluation,
+            )
+            .await
+            .expect("a reconstructed store authorizes the durable digest");
+        assert_eq!(digest_rows_for_session(&pool, &session_id).await, 1);
+
+        // Closing the session ends browser authority for it, durably.
+        second_store
+            .close_voice_session(&session_id, "completed")
+            .await
+            .expect("session closes");
+        assert_eq!(digest_rows_for_session(&pool, &session_id).await, 0);
+        let error = second_store
+            .authorize_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                "response-restart",
+                &evaluation,
+            )
+            .await
+            .expect_err("a closed session cannot replay browser authority");
+        assert!(matches!(
+            error.kind(),
+            PortErrorKind::Conflict | PortErrorKind::Unavailable
+        ));
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_concept_status_authorization_is_visible_to_second_instance() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        // Both instances exist before the write, so nothing can be explained by
+        // one of them having observed the other's construction.
+        let writer = PostgresStudyStore::new(pool.clone());
+        let reader = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&writer, &session_id).await;
+
+        writer
+            .record_concept_status(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                "response-two-instance",
+                "nadh",
+                ConceptStatus::Strong,
+            )
+            .await
+            .expect("concept status records under the writing instance");
+
+        reader
+            .authorize_concept_status(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                "response-two-instance",
+                "nadh",
+                &ConceptStatus::Strong,
+            )
+            .await
+            .expect("the second instance authorizes the durable digest");
+        assert_eq!(digest_rows_for_session(&pool, &session_id).await, 1);
+
+        let error = reader
+            .authorize_concept_status(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                "response-two-instance",
+                "nadh",
+                &ConceptStatus::Missed,
+            )
+            .await
+            .expect_err("a different status is a different payload");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_recap_authorization_is_visible_to_second_instance() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let writer = PostgresStudyStore::new(pool.clone());
+        let reader = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&writer, &session_id).await;
+        let mut recap = fixture_recap();
+        recap.voice_session_id.clone_from(&session_id);
+
+        writer
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                "response-recap-two-instance",
+                recap.clone(),
+            )
+            .await
+            .expect("recap records under the writing instance");
+
+        reader
+            .authorize_recap(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                "response-recap-two-instance",
+                &recap,
+            )
+            .await
+            .expect("the second instance authorizes the durable digest");
+        assert_eq!(digest_rows_for_session(&pool, &session_id).await, 1);
+
+        let mut forged = recap.clone();
+        forged.headline = "Strong concepts: 2 of 2.".to_owned();
+        let error = reader
+            .authorize_recap(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                "response-recap-two-instance",
+                &forged,
+            )
+            .await
+            .expect_err("a changed recap is a different payload");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_authorization_digest_rejects_wrong_response_kind_payload_and_tenant() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        insert_secondary_study_set(&pool).await;
+        let store = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        let other_session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&store, &session_id).await;
+        record_count_table_session(&store, &other_session_id).await;
+        let evaluation = fixture_evaluation("mostly correct", ConceptStatus::Strong, 0.84);
+        let response_id = "response-negative-matrix";
+
+        store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                response_id,
+                evaluation.clone(),
+            )
+            .await
+            .expect("evaluation records");
+        assert_eq!(digest_rows_for_session(&pool, &session_id).await, 1);
+
+        let session_uuid = parse_uuid(&session_id).expect("session id is a UUID");
+        let other_session_uuid = parse_uuid(&other_session_id).expect("session id is a UUID");
+        let study_set_uuid = fixture_uuid("biology-midterm").expect("study set fixture UUID");
+        let other_study_set_uuid =
+            parse_uuid("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").expect("secondary set UUID");
+
+        let authorize = |store: PostgresStudyStore, session_id: String, evaluation: AnswerEvaluation| async move {
+            store
+                .authorize_answer_evaluation(
+                    "user-1",
+                    "biology-midterm",
+                    &session_id,
+                    response_id,
+                    &evaluation,
+                )
+                .await
+        };
+
+        // Baseline: the untouched six-field key authorizes.
+        authorize(store.clone(), session_id.clone(), evaluation.clone())
+            .await
+            .expect("the stored digest authorizes its own event");
+
+        // 1 — user.
+        assert_eq!(swap_digest_user(&pool, "user-1", "user-2").await, 1);
+        let error = authorize(store.clone(), session_id.clone(), evaluation.clone())
+            .await
+            .expect_err("a digest recorded for another tenant is not authority here");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+        assert_eq!(swap_digest_user(&pool, "user-2", "user-1").await, 1);
+
+        // 2 — study set.
+        assert_eq!(
+            swap_digest_study_set(&pool, study_set_uuid, other_study_set_uuid).await,
+            1
+        );
+        let error = authorize(store.clone(), session_id.clone(), evaluation.clone())
+            .await
+            .expect_err("a digest recorded for another study set is not authority here");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+        assert_eq!(
+            swap_digest_study_set(&pool, other_study_set_uuid, study_set_uuid).await,
+            1
+        );
+
+        // 3 — voice session.
+        assert_eq!(
+            swap_digest_voice_session(&pool, session_uuid, other_session_uuid).await,
+            1
+        );
+        let error = authorize(store.clone(), session_id.clone(), evaluation.clone())
+            .await
+            .expect_err("a digest recorded for another session is not authority here");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+        assert_eq!(
+            swap_digest_voice_session(&pool, other_session_uuid, session_uuid).await,
+            1
+        );
+
+        // 4 — response.
+        assert_eq!(
+            swap_digest_response(&pool, response_id, "response-other").await,
+            1
+        );
+        let error = authorize(store.clone(), session_id.clone(), evaluation.clone())
+            .await
+            .expect_err("a digest recorded for another response is not authority here");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+        assert_eq!(
+            swap_digest_response(&pool, "response-other", response_id).await,
+            1
+        );
+
+        // 5 — event kind.
+        assert_eq!(
+            swap_digest_event_kind(&pool, "answer_evaluation", "concept_status").await,
+            1
+        );
+        let error = authorize(store.clone(), session_id.clone(), evaluation.clone())
+            .await
+            .expect_err("a concept-status digest does not authorize an evaluation");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+        assert_eq!(
+            swap_digest_event_kind(&pool, "concept_status", "answer_evaluation").await,
+            1
+        );
+
+        // 6 — payload.
+        let original_payload = swap_digest_payload(&pool, OTHER_PAYLOAD_SHA256).await;
+        let error = authorize(store.clone(), session_id.clone(), evaluation.clone())
+            .await
+            .expect_err("a digest of another payload is not authority for this one");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+        let restored = swap_digest_payload(&pool, &original_payload).await;
+        assert_eq!(restored, OTHER_PAYLOAD_SHA256);
+
+        // Every rejection left the row untouched, so the original still authorizes.
+        authorize(store.clone(), session_id.clone(), evaluation.clone())
+            .await
+            .expect("the restored digest authorizes its own event again");
+        assert_eq!(digest_rows_for_session(&pool, &session_id).await, 1);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[derive(Deserialize)]
+    struct LearningRecapFixtures {
+        recaps: std::collections::BTreeMap<String, StudySessionRecap>,
+    }
+
+    /// The Plan 04 recap fixtures, re-pointed at the seeded tenant.
+    ///
+    /// Only the identity fields both backends validate against their own rows are
+    /// replaced; every byte of canonical recap content — headline, summary,
+    /// concepts, review schedule, next action, deferred turns — is the fixture's.
+    fn learning_core_recap_fixtures(voice_session_id: &str) -> Vec<(String, StudySessionRecap)> {
+        let fixtures: LearningRecapFixtures = serde_json::from_str(include_str!(
+            "../../../fixtures/learning-core/recaps-v1.json"
+        ))
+        .expect("learning-core recap fixture is valid JSON");
+        fixtures
+            .recaps
+            .into_iter()
+            .map(|(name, mut recap)| {
+                recap.voice_session_id = voice_session_id.to_owned();
+                recap.source_moments = vec![RecapSourceMoment {
+                    response_id: format!("response-{name}"),
+                    source_id: fixture_source_reference().source_id,
+                }];
+                (name, recap)
+            })
+            .collect()
+    }
+
+    /// `DATA-005` Step 6: the two backends' stored digests are the same bytes.
+    ///
+    /// Both now hash through one crate-private canonical encoder, so this is a
+    /// differential over the whole write path rather than over one function: the
+    /// memory store's ledger and the Postgres digest table must agree for every
+    /// browser event and for every canonical Plan 04 recap fixture.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_memory_authorization_digest_bytes_are_identical() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let durable = PostgresStudyStore::new(pool.clone());
+        let volatile = crate::InMemoryStudyStore::seeded_fixture();
+        let session_id = "voice-session-1";
+        record_fixture_session(&durable).await;
+        record_fixture_session(&volatile).await;
+
+        let evaluation = fixture_evaluation("mostly correct", ConceptStatus::Strong, 0.84);
+        for store in [&durable as &dyn StudyMemoryStore, &volatile] {
+            store
+                .record_answer_evaluation(
+                    "user-1",
+                    "biology-midterm",
+                    session_id,
+                    "response-differential",
+                    evaluation.clone(),
+                )
+                .await
+                .expect("evaluation records on both backends");
+            store
+                .record_concept_status(
+                    "user-1",
+                    "biology-midterm",
+                    session_id,
+                    "response-differential",
+                    "nadh",
+                    ConceptStatus::Strong,
+                )
+                .await
+                .expect("concept status records on both backends");
+        }
+
+        for (name, recap) in learning_core_recap_fixtures(session_id) {
+            for store in [&durable as &dyn StudyMemoryStore, &volatile] {
+                store
+                    .record_recap(
+                        "user-1",
+                        "biology-midterm",
+                        session_id,
+                        &format!("response-{name}"),
+                        recap.clone(),
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("recap fixture {name} records on both backends: {error:?}")
+                    });
+            }
+        }
+
+        let mut durable_digests = sqlx::query_scalar::<_, String>(
+            "SELECT payload_sha256 FROM event_authorization_digests ORDER BY payload_sha256",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("digest read succeeds");
+        durable_digests.sort();
+        let mut volatile_digests = volatile
+            .snapshot()
+            .event_authorizations
+            .into_iter()
+            .map(|record| record.payload_sha256)
+            .collect::<Vec<_>>();
+        volatile_digests.sort();
+
+        // Two browser events plus one digest per canonical recap fixture.
+        assert_eq!(
+            durable_digests.len(),
+            2 + learning_core_recap_fixtures(session_id).len()
+        );
+        assert_eq!(durable_digests, volatile_digests);
+        assert!(durable_digests.iter().all(|digest| digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))));
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_authorization_digest_is_deleted_with_session_and_study_set() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        let evaluation = fixture_evaluation("mostly correct", ConceptStatus::Strong, 0.84);
+
+        let session_delete_id = Uuid::new_v4().to_string();
+        record_count_table_session(&store, &session_delete_id).await;
+        store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                &session_delete_id,
+                "response-session-delete",
+                evaluation.clone(),
+            )
+            .await
+            .expect("evaluation records");
+        store
+            .record_concept_status(
+                "user-1",
+                "biology-midterm",
+                &session_delete_id,
+                "response-session-delete",
+                "nadh",
+                ConceptStatus::Strong,
+            )
+            .await
+            .expect("concept status records");
+        assert_eq!(digest_rows_for_session(&pool, &session_delete_id).await, 2);
+
+        store
+            .delete_session_history("user-1", "biology-midterm", &session_delete_id)
+            .await
+            .expect("session history deletion succeeds");
+        assert_eq!(digest_rows_for_session(&pool, &session_delete_id).await, 0);
+
+        let study_delete_id = Uuid::new_v4().to_string();
+        record_count_table_session(&store, &study_delete_id).await;
+        store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                &study_delete_id,
+                "response-study-delete",
+                evaluation,
+            )
+            .await
+            .expect("evaluation records");
+        assert_eq!(digest_rows_for_study_set(&pool, "biology-midterm").await, 1);
+
+        store
+            .delete_study_set("user-1", "biology-midterm")
+            .await
+            .expect("study set deletion succeeds");
+        assert_eq!(digest_rows_for_study_set(&pool, "biology-midterm").await, 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM event_authorization_digests")
+                .fetch_one(&pool)
+                .await
+                .expect("digest total query succeeds"),
+            0
+        );
 
         fixture
             .cleanup()

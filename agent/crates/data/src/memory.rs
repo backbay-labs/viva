@@ -148,7 +148,16 @@ fn required_study_set_id(config: &SessionConfig) -> Result<&str, PortError> {
     Ok(study_set_id)
 }
 
-fn event_authorization_record<T: Serialize>(
+/// The one canonical authorization record both backends build.
+///
+/// `DATA-005`: memory and Postgres have to agree, byte for byte, on what a
+/// digest is — a digest one backend accepts and the other rejects is a browser
+/// event that is authoritative on exactly one deployment. So there is one
+/// implementation, taking only the backend's own port label for error
+/// attribution, and neither backend hashes an ad hoc map or a
+/// backend-specific projection.
+pub(crate) fn event_authorization_record<T: Serialize>(
+    port: &'static str,
     user_id: &str,
     study_set_id: &str,
     voice_session_id: &str,
@@ -162,7 +171,7 @@ fn event_authorization_record<T: Serialize>(
         voice_session_id: voice_session_id.to_owned(),
         response_id: response_id.to_owned(),
         kind,
-        payload_sha256: payload_sha256(kind, response_id, payload)?,
+        payload_sha256: payload_sha256(port, kind, response_id, payload)?,
     })
 }
 
@@ -182,13 +191,17 @@ fn json_invariant(id: &'static str, error: &serde_json::Error) -> PortError {
     PortError::internal("memory", id, error.to_string())
 }
 
-fn payload_sha256<T: Serialize>(
+/// Exactly 64 lowercase hexadecimal characters over event-kind bytes, NUL,
+/// response-id bytes, NUL, and the canonical JSON encoding of the typed payload.
+pub(crate) fn payload_sha256<T: Serialize>(
+    port: &'static str,
     kind: EventAuthorizationKind,
     response_id: &str,
     payload: &T,
 ) -> Result<String, PortError> {
-    let payload = serde_json::to_vec(payload)
-        .map_err(|error| json_invariant("event_authorization_payload", &error))?;
+    let payload = serde_json::to_vec(payload).map_err(|error| {
+        PortError::internal(port, "event_authorization_payload", error.to_string())
+    })?;
     let mut hasher = Sha256::new();
     hasher.update(kind.as_str().as_bytes());
     hasher.update([0]);
@@ -397,7 +410,7 @@ pub struct RecapRecord {
     pub recap: PersistedSessionRecap,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventAuthorizationKind {
     AnswerEvaluation,
@@ -407,7 +420,7 @@ pub enum EventAuthorizationKind {
 }
 
 impl EventAuthorizationKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::AnswerEvaluation => "answer_evaluation",
             Self::ConceptStatus => "concept_status",
@@ -417,7 +430,7 @@ impl EventAuthorizationKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct EventAuthorizationRecord {
     pub user_id: String,
     pub study_set_id: String,
@@ -428,16 +441,16 @@ pub struct EventAuthorizationRecord {
 }
 
 #[derive(Serialize)]
-struct ConceptStatusEventPayload<'a> {
-    concept_id: &'a str,
-    status: &'a ConceptStatus,
+pub(crate) struct ConceptStatusEventPayload<'a> {
+    pub(crate) concept_id: &'a str,
+    pub(crate) status: &'a ConceptStatus,
 }
 
 /// The replay-stable half of a scheduling outcome: the graded inputs, never the
 /// clock-derived schedule they produce. Two calls that differ only because the wall
 /// clock moved hash identically here, which is what makes a replay detectable.
 #[derive(Serialize)]
-struct ReviewScheduleEventPayload<'a> {
+pub(crate) struct ReviewScheduleEventPayload<'a> {
     concept_id: &'a str,
     policy_id: &'a str,
     status: &'a ConceptStatus,
@@ -447,7 +460,7 @@ struct ReviewScheduleEventPayload<'a> {
 }
 
 impl<'a> ReviewScheduleEventPayload<'a> {
-    fn new(concept_id: &'a str, decision: &'a ReviewScheduleDecisionV1) -> Self {
+    pub(crate) fn new(concept_id: &'a str, decision: &'a ReviewScheduleDecisionV1) -> Self {
         Self {
             concept_id,
             policy_id: &decision.policy_id,
@@ -478,7 +491,10 @@ pub struct InMemoryStudyState {
     #[serde(default)]
     pub review_schedule_decisions: Vec<ReviewScheduleDecisionRecord>,
     pub recaps: Vec<RecapRecord>,
-    pub event_authorizations: Vec<EventAuthorizationRecord>,
+    /// `DATA-005`: a set, not a log. Authorization is only ever consulted by
+    /// membership, so an identical replay carries no new information and must
+    /// not cost another entry; the bound is structural rather than a cap.
+    pub event_authorizations: HashSet<EventAuthorizationRecord>,
     pub session_token_nonces: Vec<SessionTokenNonceClaim>,
 }
 
@@ -2790,6 +2806,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             ));
         }
         let authorization = event_authorization_record(
+            "memory",
             user_id,
             study_set_id,
             voice_session_id,
@@ -2863,6 +2880,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         }
         let payload = ConceptStatusEventPayload { concept_id, status };
         let authorization = event_authorization_record(
+            "memory",
             user_id,
             study_set_id,
             voice_session_id,
@@ -2973,6 +2991,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 })?;
         }
         let authorization = event_authorization_record(
+            "memory",
             user_id,
             study_set_id,
             voice_session_id,
@@ -3064,6 +3083,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         }
         let persisted_evaluation = PersistedAnswerEvaluation::from(&evaluation);
         let authorization = event_authorization_record(
+            "memory",
             user_id,
             study_set_id,
             voice_session_id,
@@ -3122,7 +3142,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             state.answer_attempts.push(record);
             result
         };
-        state.event_authorizations.push(authorization);
+        state.event_authorizations.insert(authorization);
         Ok(result)
     }
 
@@ -3168,6 +3188,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             status: &status,
         };
         let authorization = event_authorization_record(
+            "memory",
             user_id,
             study_set_id,
             voice_session_id,
@@ -3186,7 +3207,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             concept.status = status.clone();
         }
         state.concept_statuses.push(record);
-        state.event_authorizations.push(authorization);
+        state.event_authorizations.insert(authorization);
         Ok(status)
     }
 
@@ -3281,6 +3302,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             .map_err(|error| PortError::invalid_input("memory", concept_id, error.to_string()))?;
 
         let authorization = event_authorization_record(
+            "memory",
             user_id,
             study_set_id,
             voice_session_id,
@@ -3329,7 +3351,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         let result = decision_record.decision.public_summary(concept_id);
         state.review_schedule_decisions.push(decision_record);
         // The authorization ledger stays complete across every authorized write kind.
-        state.event_authorizations.push(authorization);
+        state.event_authorizations.insert(authorization);
         Ok(result)
     }
 
@@ -3371,6 +3393,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             recap: PersistedSessionRecap::from(&recap),
         };
         let authorization = event_authorization_record(
+            "memory",
             user_id,
             study_set_id,
             voice_session_id,
@@ -3388,7 +3411,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
                     || existing.voice_session_id != record.voice_session_id
             });
             state.recaps.push(record);
-            state.event_authorizations.push(authorization);
+            state.event_authorizations.insert(authorization);
         }
         Ok(result)
     }
@@ -3402,7 +3425,7 @@ mod tests {
             RecapConceptOutcome, RecapSourceMoment, ReviewScheduleAuthority, ReviewScheduleSummary,
             VIVA_STUDY_SESSION_RECAP_SCHEMA,
         },
-        ConceptStatus, SessionId, SourceConfidence,
+        ConceptStatus, PortErrorKind, SessionId, SourceConfidence,
     };
 
     use super::*;
@@ -5077,6 +5100,110 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    /// `DATA-005`: the in-memory authorization ledger is a set, not a log.
+    ///
+    /// Authorization is only ever consulted by membership, so an identical replay
+    /// carries no new information — but a `Vec` still grew by one entry per
+    /// replay, which is an unbounded process-local allocation driven by a remote
+    /// caller. The bound is structural: identical records deduplicate.
+    #[tokio::test]
+    async fn memory_authorization_replay_is_deduplicated_and_bounded() {
+        let store = seeded_store();
+        record_fixture_session(&store).await;
+        let question = store
+            .active_question("user-1", "biology-midterm")
+            .await
+            .expect("active question read")
+            .expect("seeded active question");
+        let evaluation = fixture_evaluation(&question);
+        let recap = fixture_recap();
+
+        for _ in 0..16 {
+            store
+                .record_answer_evaluation(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    "response-1",
+                    evaluation.clone(),
+                )
+                .await
+                .expect("evaluation replay is accepted");
+            store
+                .record_concept_status(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    "response-1",
+                    "nadh",
+                    ConceptStatus::Strong,
+                )
+                .await
+                .expect("concept status replay is accepted");
+            store
+                .record_recap(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    "response-1",
+                    recap.clone(),
+                )
+                .await
+                .expect("recap replay is accepted");
+        }
+
+        // Three distinct authorized events, sixteen replays each.
+        assert_eq!(store.snapshot().event_authorizations.len(), 3);
+
+        // Deduplication must not weaken live authorization.
+        store
+            .authorize_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                &evaluation,
+            )
+            .await
+            .expect("the deduplicated record still authorizes its own event");
+        store
+            .authorize_concept_status(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                "nadh",
+                &ConceptStatus::Strong,
+            )
+            .await
+            .expect("the deduplicated record still authorizes its own event");
+        store
+            .authorize_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                &recap,
+            )
+            .await
+            .expect("the deduplicated record still authorizes its own event");
+
+        // A one-field change is still refused.
+        let mut forged = evaluation.clone();
+        forged.label = "wrong".to_owned();
+        let error = store
+            .authorize_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                &forged,
+            )
+            .await
+            .expect_err("a changed payload is not authorized");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
     }
 
     #[tokio::test]
