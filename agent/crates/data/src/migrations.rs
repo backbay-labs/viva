@@ -232,7 +232,13 @@ pub enum FixtureSeedError {
     Sql(#[from] sqlx::Error),
 }
 
+/// Accepts either a fixture logical id or an already-real UUID, exactly as the
+/// production store's own id resolution does. A test that creates a second session
+/// with a real UUID must be able to query for it.
 fn fixture_uuid(logical_id: &str) -> Result<Uuid, FixtureSeedError> {
+    if let Ok(uuid) = logical_id.parse() {
+        return Ok(uuid);
+    }
     Ok(InMemoryStudyStore::fixture_id_translation(logical_id)?.storage_uuid)
 }
 
@@ -293,6 +299,301 @@ mod tests {
     };
     use serde::Deserialize;
     use std::sync::Arc;
+
+    /// The environment contract for the required PostgreSQL suite, as a pure
+    /// function of its two inputs.
+    ///
+    /// There is deliberately no `Option` anywhere in the result: the only two
+    /// answers are a usable URL or a reason the run cannot proceed. `Ok(None)` is
+    /// what the old helper returned, and it is what let a suite that proved nothing
+    /// report success.
+    fn postgres_environment_contract(
+        required: bool,
+        database_url: Option<&str>,
+    ) -> Result<String, String> {
+        let url = database_url
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        match (required, url) {
+            (_, Some(url)) => Ok(url.to_owned()),
+            (true, None) => {
+                Err("DATA_POSTGRES_REQUIRED=1 requires a non-empty DATABASE_URL".to_owned())
+            }
+            (false, None) => Err(
+                "a PostgreSQL test requires DATA_POSTGRES_REQUIRED=1 and a non-empty DATABASE_URL"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    /// The process-environment wrapper around that contract.
+    ///
+    /// It never returns an `Option` and never returns early: a PostgreSQL test that
+    /// reaches this line either gets a URL or fails loudly.
+    fn required_postgres_url() -> String {
+        let required =
+            std::env::var("DATA_POSTGRES_REQUIRED").is_ok_and(|value| value.trim() == "1");
+        let database_url = std::env::var("DATABASE_URL").ok();
+        match postgres_environment_contract(required, database_url.as_deref()) {
+            Ok(url) => url,
+            Err(reason) => panic!("{reason}"),
+        }
+    }
+
+    /// One disposable PostgreSQL schema per test case.
+    ///
+    /// `DATA-001`: the sqlx ledger, the seeded fixture ids, whole-table counters, and
+    /// question activity are all per-schema, so two cases running against the same
+    /// database cannot see each other's rows or convince each other that a migration
+    /// has already run.
+    struct PostgresSchemaFixture {
+        admin_pool: sqlx::PgPool,
+        pool: sqlx::PgPool,
+        /// Always self-generated as `viva_data_test_{uuid simple}`; never derived
+        /// from test input, and never rebuilt or truncated after creation.
+        schema_name: String,
+    }
+
+    impl PostgresSchemaFixture {
+        /// A fresh schema with the full sqlx-ledger migration chain applied.
+        async fn migrated() -> Self {
+            let fixture = Self::empty().await;
+            run_migrations(&fixture.pool)
+                .await
+                .expect("migrations apply inside the isolated schema");
+            fixture
+        }
+
+        /// A fresh, empty schema for the raw historical-backfill path.
+        async fn empty() -> Self {
+            let database_url = required_postgres_url();
+            let admin_pool = crate::connect_pg(&crate::PgConfig::new(database_url.clone()))
+                .await
+                .expect("DATABASE_URL connects for the required postgres suite");
+            let schema_name = format!("viva_data_test_{}", Uuid::new_v4().simple());
+            sqlx::raw_sql(&format!("CREATE SCHEMA \"{schema_name}\""))
+                .execute(&admin_pool)
+                .await
+                .expect("isolated test schema is created");
+
+            // The callback closes over the one quoted identifier this fixture owns.
+            // It never reconstructs or truncates the name.
+            let search_path = format!("SET search_path TO \"{schema_name}\"");
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .after_connect(move |connection, _meta| {
+                    let search_path = search_path.clone();
+                    Box::pin(async move {
+                        use sqlx::Executor as _;
+                        connection.execute(search_path.as_str()).await?;
+                        Ok(())
+                    })
+                })
+                .connect(&database_url)
+                .await
+                .expect("isolated schema pool connects");
+
+            Self {
+                admin_pool,
+                pool,
+                schema_name,
+            }
+        }
+
+        fn pool(&self) -> &sqlx::PgPool {
+            &self.pool
+        }
+
+        /// Cleanup is an assertion, not a best-effort side effect: a schema that
+        /// cannot be dropped leaks state into the next run, and the test that leaked
+        /// it is the one that must say so.
+        async fn cleanup(self) -> Result<(), sqlx::Error> {
+            self.pool.close().await;
+            assert!(
+                is_generated_test_schema_name(&self.schema_name),
+                "refusing to drop `{}`: only self-generated viva_data_test_<32 hex> schemas are droppable",
+                self.schema_name
+            );
+            let dropped = sqlx::raw_sql(&format!("DROP SCHEMA \"{}\" CASCADE", self.schema_name))
+                .execute(&self.admin_pool)
+                .await
+                .map(|_| ());
+            self.admin_pool.close().await;
+            dropped
+        }
+    }
+
+    impl Drop for PostgresSchemaFixture {
+        fn drop(&mut self) {
+            // Best-effort only. `cleanup` is the cleanup path; this exists so a
+            // panicking test still surfaces the leak in its output.
+            if !self.pool.is_closed() {
+                eprintln!(
+                    "postgres test schema `{}` was not cleaned up; call `cleanup()`",
+                    self.schema_name
+                );
+            }
+        }
+    }
+
+    /// `^viva_data_test_[0-9a-f]{32}$`, without widening Cargo ownership for a
+    /// regex dependency. Together with double-quoting, this is the identifier-safety
+    /// mechanism sqlx 0.8 does not provide (`QueryBuilder` has no `push_identifier`).
+    fn is_generated_test_schema_name(name: &str) -> bool {
+        const PREFIX: &str = "viva_data_test_";
+        let Some(suffix) = name.strip_prefix(PREFIX) else {
+            return false;
+        };
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
+
+    /// One authoritative v1 decision, computed the way the live path computes it.
+    fn library_decision() -> agent_domain::ReviewScheduleDecisionV1 {
+        agent_domain::decide_review_schedule(
+            agent_domain::parse_utc_instant("2031-04-05T12:00:00.000Z").expect("instant parses"),
+            &agent_domain::ReviewOutcomeV1 {
+                status: ConceptStatus::Shaky,
+                hint_count: None,
+                miss_count: None,
+            },
+            &agent_domain::ReviewSchedulingContextV1 {
+                schema_version: agent_domain::VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+                exam_at: None,
+                card: None,
+            },
+        )
+        .expect("authoritative decision")
+    }
+
+    async fn study_set_row_count(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM study_sets")
+            .fetch_one(pool)
+            .await
+            .expect("study set count query succeeds")
+    }
+
+    async fn sqlx_ledger_row_count(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(pool)
+            .await
+            .expect("sqlx ledger count query succeeds")
+    }
+
+    async fn table_exists(pool: &sqlx::PgPool, table: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM information_schema.tables
+                 WHERE table_schema = current_schema()
+                   AND table_name = $1
+             )",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .expect("table existence query succeeds")
+    }
+
+    /// `DATA-001`/`QLT-03`: the environment contract, as a pure function.
+    ///
+    /// The old helper answered a missing `DATABASE_URL` with `None`, and every
+    /// PostgreSQL test then returned early and reported success — a suite that
+    /// proves nothing while looking green. Absence of a database is a failure of the
+    /// required command, never a skip. Keeping the rule pure is what lets it be
+    /// proven without a process environment and without a database.
+    #[test]
+    fn postgres_required_environment_never_silently_skips() {
+        assert_eq!(
+            postgres_environment_contract(true, None),
+            Err("DATA_POSTGRES_REQUIRED=1 requires a non-empty DATABASE_URL".to_owned()),
+        );
+        assert_eq!(
+            postgres_environment_contract(true, Some("   ")),
+            Err("DATA_POSTGRES_REQUIRED=1 requires a non-empty DATABASE_URL".to_owned()),
+        );
+        assert_eq!(
+            postgres_environment_contract(true, Some(" postgresql://viva@localhost/db ")),
+            Ok("postgresql://viva@localhost/db".to_owned()),
+        );
+        // Without the flag the answer is still an error, never `None`: nothing in
+        // this module can express "skipped but passing".
+        assert_eq!(
+            postgres_environment_contract(false, None),
+            Err(
+                "a PostgreSQL test requires DATA_POSTGRES_REQUIRED=1 and a non-empty DATABASE_URL"
+                    .to_owned()
+            ),
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_each_case_uses_an_isolated_schema() {
+        let first = PostgresSchemaFixture::migrated().await;
+        let second = PostgresSchemaFixture::migrated().await;
+        assert_ne!(first.schema_name, second.schema_name);
+
+        // A seeded row in one fixture is invisible to the other, so no test can
+        // observe another test's ids, counts, or question activity.
+        seed_postgres_fixture(first.pool())
+            .await
+            .expect("fixture seed applies inside the first schema");
+        assert_eq!(study_set_row_count(first.pool()).await, 1);
+        assert_eq!(study_set_row_count(second.pool()).await, 0);
+
+        // Each schema carries its own sqlx ledger, so neither can convince the other
+        // that a migration has already run.
+        assert_eq!(
+            sqlx_ledger_row_count(first.pool()).await,
+            MIGRATIONS.len() as i64
+        );
+        assert_eq!(
+            sqlx_ledger_row_count(second.pool()).await,
+            MIGRATIONS.len() as i64
+        );
+
+        first.cleanup().await.expect("first schema drops cleanly");
+        second.cleanup().await.expect("second schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_sqlx_ledger_and_raw_backfill_do_not_share_schema_state() {
+        let ledger = PostgresSchemaFixture::migrated().await;
+        let backfill = PostgresSchemaFixture::empty().await;
+
+        // The raw historical path applies the same SQL without the sqlx ledger, so
+        // its schema must end with the same tables and no `_sqlx_migrations` row.
+        for (name, _) in MIGRATIONS {
+            apply_migration_sql(backfill.pool(), name)
+                .await
+                .expect("raw historical migration applies");
+        }
+
+        assert_eq!(
+            sqlx_ledger_row_count(ledger.pool()).await,
+            MIGRATIONS.len() as i64
+        );
+        assert!(!table_exists(backfill.pool(), "_sqlx_migrations").await);
+        for table in [
+            "study_sets",
+            "voice_sessions",
+            "answer_attempts",
+            "concepts",
+        ] {
+            assert!(table_exists(ledger.pool(), table).await, "{table}");
+            assert!(table_exists(backfill.pool(), table).await, "{table}");
+        }
+
+        ledger.cleanup().await.expect("ledger schema drops cleanly");
+        backfill
+            .cleanup()
+            .await
+            .expect("backfill schema drops cleanly");
+    }
 
     #[test]
     fn migrations_keep_raw_payload_columns_out_of_postgres() {
@@ -456,24 +757,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn optional_postgres_migrations_apply_when_database_url_is_set() {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_migrations_apply() {
+        let fixture = PostgresSchemaFixture::empty().await;
+        let pool = fixture.pool().clone();
         run_migrations(&pool)
             .await
             .expect("migrations should apply when DATABASE_URL is configured");
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed should apply after migrations");
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     #[tokio::test]
-    async fn optional_postgres_fixture_replay_and_negative_matrix_when_database_url_is_set() {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_fixture_replay_and_negative_matrix() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed applies");
@@ -662,15 +967,18 @@ mod tests {
 
         assert_eq!(negative_store.write_counts(), baseline);
         assert_eq!(db_row_counts(&pool).await, row_baseline);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     #[tokio::test]
-    async fn optional_postgres_count_truth_table_stays_exact_under_replayed_provider_writes_when_database_url_is_set(
-    ) {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_count_truth_table_stays_exact_under_replayed_provider_writes() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed applies");
@@ -713,15 +1021,18 @@ mod tests {
             count_delta_from_rows(db_row_counts(&pool).await, baseline_rows, expected),
             expected
         );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     #[tokio::test]
-    async fn optional_postgres_study_session_durable_counts_match_real_schema_when_database_url_is_set(
-    ) {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_study_session_durable_counts_match_real_schema() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed applies");
@@ -739,14 +1050,18 @@ mod tests {
         assert_eq!(counts.concept_statuses, 1);
         assert_eq!(counts.review_items, 1);
         assert_eq!(counts.prior_recaps, 1);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     #[tokio::test]
-    async fn optional_postgres_session_token_nonce_claims_reject_replay_when_database_url_is_set() {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_session_token_nonce_claims_reject_replay() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed applies");
@@ -772,15 +1087,18 @@ mod tests {
         assert_eq!(replay.port(), "postgres");
         assert_eq!(replay.reason(), "session token nonce already used");
         assert_eq!(session_token_nonce_rows(&pool, &claim).await, 1);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     #[tokio::test]
-    async fn optional_postgres_library_snapshot_scopes_review_items_to_voice_session_when_database_url_is_set(
-    ) {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_library_snapshot_scopes_review_items_to_voice_session() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed applies");
@@ -799,26 +1117,40 @@ mod tests {
             })
             .await
             .expect("records second fixture session");
+        // D-01A: only an authoritative v1 decision reaches the authenticated read
+        // model, so per-session scoping is proven with the decisions the library
+        // query actually selects. A legacy `schedule_review_item` row is deliberately
+        // never a fallback, which is why this test cannot be written with one.
         store
-            .schedule_review_item(
+            .persist_review_schedule_decision(
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
+                "response-library-1",
                 "nadh",
-                "2026-06-20T09:00:00Z",
+                library_decision(),
             )
             .await
             .expect("schedules first session review");
         store
-            .schedule_review_item(
+            .persist_review_schedule_decision(
                 "user-1",
                 "biology-midterm",
                 second_session_id,
+                "response-library-2",
                 "atp-synthase",
-                "2026-06-18T09:00:00Z",
+                library_decision(),
             )
             .await
             .expect("schedules second session review");
+        // The library snapshot only reports completed sessions, so both sessions have
+        // to close for the per-session scoping to be observable at all. Until this
+        // lane made the PostgreSQL suite required, this test never ran and this
+        // missing close was never visible.
+        store
+            .close_voice_session("voice-session-1", "completed")
+            .await
+            .expect("closes first fixture session");
         store
             .close_voice_session(second_session_id, "completed")
             .await
@@ -853,15 +1185,18 @@ mod tests {
                 .map(|review| review.concept_id.as_str()),
             Some("atp-synthase")
         );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     #[tokio::test]
-    async fn optional_postgres_schedule_review_item_concurrent_replay_is_atomic_when_database_url_is_set(
-    ) {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_schedule_review_item_concurrent_replay_is_atomic() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed applies");
@@ -908,18 +1243,21 @@ mod tests {
         .await
         .expect("review item row count query succeeds");
         assert_eq!(row_count, 1);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     /// The Postgres half of the D-01 replay guard. Two calls that differ only because
     /// the wall clock moved are the same graded outcome: they must leave exactly one
     /// scheduled row, and the persisted FSRS card must not advance.
     #[tokio::test]
-    async fn optional_postgres_review_schedule_decision_replay_writes_one_row_when_database_url_is_set(
-    ) {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_review_schedule_decision_replay_writes_one_row() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed applies");
@@ -1000,6 +1338,11 @@ mod tests {
             Some(1),
             "a replay must not advance the persisted FSRS card"
         );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     /// Long enough for the paste/file ingestion heuristics to derive real source
@@ -1023,12 +1366,10 @@ mod tests {
     /// backend. This drives the whole authoritative path on real PostgreSQL:
     /// ingestion -> `review_scheduling_context` -> `decide_review_schedule`.
     #[tokio::test]
-    async fn optional_postgres_ingestion_persists_the_exam_instant_for_the_d01_cap_when_database_url_is_set(
-    ) {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_ingestion_persists_the_exam_instant_for_the_d01_cap() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         let store = PostgresStudyStore::new(pool.clone());
 
         let ingested = store
@@ -1077,18 +1418,21 @@ mod tests {
             decision.cap_reason,
             Some(agent_domain::ReviewScheduleCapReasonV1::ExamMargin)
         );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     /// The production retry route always sends `exam_date: None`, so a retry that
     /// writes the input verbatim erases the learner's exam instant on the durable
     /// backend exactly as it did in memory.
     #[tokio::test]
-    async fn optional_postgres_file_retry_keeps_the_exam_instant_the_learner_recorded_when_database_url_is_set(
-    ) {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_file_retry_keeps_the_exam_instant_the_learner_recorded() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         let store = PostgresStudyStore::new(pool.clone());
 
         let ingested = store
@@ -1137,16 +1481,19 @@ mod tests {
             Some(agent_domain::parse_utc_instant(EXAM_AT).expect("exam instant")),
             "a file retry must not erase the exam instant the learner already recorded"
         );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     /// Fail closed where the learner supplies the value, on the durable backend too.
     #[tokio::test]
-    async fn optional_postgres_ingestion_rejects_an_unparseable_exam_date_when_database_url_is_set()
-    {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_ingestion_rejects_an_unparseable_exam_date() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         let store = PostgresStudyStore::new(pool.clone());
         store
             .create_paste_study_set(agent_domain::CreatePasteStudySet {
@@ -1159,6 +1506,11 @@ mod tests {
             })
             .await
             .expect_err("an unparseable exam date is rejected where the learner supplies it");
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     /// Under the D-01 exam cap every decision for one concept clamps to the SAME
@@ -1174,15 +1526,14 @@ mod tests {
     /// enough rounds that the interleaving actually occurs. Four racers against a
     /// pool of five: no racer can starve while another holds the guard.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn optional_postgres_review_schedule_decision_concurrent_replay_under_the_exam_cap_writes_one_row_when_database_url_is_set(
-    ) {
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_review_schedule_decision_concurrent_replay_under_the_exam_cap_writes_one_row()
+    {
         const RACERS: usize = 4;
         const ROUNDS: usize = 12;
 
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed applies");
@@ -1311,17 +1662,20 @@ mod tests {
                 "round {round}"
             );
         }
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     /// The two backends must leave the same authorization ledger behind: a replay
     /// performs no write, so it appends no second authorization on either.
     #[tokio::test]
-    async fn optional_postgres_review_schedule_decision_replay_records_exactly_one_authorization_when_database_url_is_set(
-    ) {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_review_schedule_decision_replay_records_exactly_one_authorization() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed applies");
@@ -1356,14 +1710,18 @@ mod tests {
             1,
             "a replay writes nothing, so it appends no second authorization"
         );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     #[tokio::test]
-    async fn optional_postgres_record_recap_concurrent_replay_is_atomic_when_database_url_is_set() {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_record_recap_concurrent_replay_is_atomic() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed applies");
@@ -1408,15 +1766,18 @@ mod tests {
         .await
         .expect("recap row count query succeeds");
         assert_eq!(row_count, 1);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     #[tokio::test]
-    async fn optional_postgres_record_recap_replaces_session_payload_without_incrementing_count_when_database_url_is_set(
-    ) {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_record_recap_replaces_session_payload_without_incrementing_count() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed applies");
@@ -1483,14 +1844,18 @@ mod tests {
             strong_concepts,
             vec!["NADH".to_owned(), "ATP synthase".to_owned()]
         );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     #[tokio::test]
-    async fn optional_postgres_session_recap_backfill_dedupes_existing_session_rows_when_database_url_is_set(
-    ) {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_session_recap_backfill_dedupes_existing_session_rows() {
+        let fixture = PostgresSchemaFixture::empty().await;
+        let pool = fixture.pool().clone();
         run_migrations_until(&pool, "0014_session_recaps_one_row_per_session.sql")
             .await
             .expect("pre-0014 migrations apply");
@@ -1555,7 +1920,7 @@ mod tests {
             "SELECT EXISTS (
                 SELECT 1
                 FROM pg_indexes
-                WHERE schemaname = 'public'
+                WHERE schemaname = current_schema()
                   AND tablename = 'session_recaps'
                   AND indexname = 'session_recaps_voice_session_unique_idx'
             )",
@@ -1590,15 +1955,18 @@ mod tests {
             duplicate_insert.is_err(),
             "0014 unique index must block a second recap row for the same session"
         );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     #[tokio::test]
-    async fn optional_postgres_record_concept_status_concurrent_replay_is_atomic_when_database_url_is_set(
-    ) {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_record_concept_status_concurrent_replay_is_atomic() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed applies");
@@ -1642,15 +2010,18 @@ mod tests {
         .await
         .expect("concept status query succeeds");
         assert_eq!(status, "strong");
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     #[tokio::test]
-    async fn optional_postgres_privacy_deletes_purge_usage_and_preserve_deleted_sessions_when_database_url_is_set(
-    ) {
-        let Some(pool) = optional_postgres_pool().await else {
-            return;
-        };
-        run_migrations(&pool).await.expect("migrations apply");
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_privacy_deletes_purge_usage_and_preserve_deleted_sessions() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
         seed_postgres_fixture(&pool)
             .await
             .expect("fixture seed applies");
@@ -1733,9 +2104,10 @@ mod tests {
             concept_status_event_rows_for_session(&pool, session_id).await,
             0
         );
-        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
-        // truth is asserted.
-        let _outcome = store
+        // Usage aimed at a deleted session writes no row, and now says so: the typed
+        // outcome has no value meaning "nothing happened", so the refusal is a
+        // `Conflict` rather than a silent success the caller would read as `Inserted`.
+        let late_usage = store
             .record_voice_usage(VoiceUsageRecord {
                 voice_session_id: Some(session_id.to_owned()),
                 provider: "synthetic".to_owned(),
@@ -1752,7 +2124,8 @@ mod tests {
                 source_grounded_correction_count: 1,
             })
             .await
-            .expect("ignores usage for deleted session");
+            .expect_err("usage for a deleted session is refused");
+        assert_eq!(late_usage.kind(), PortErrorKind::Conflict);
         assert_eq!(usage_rows_for_session(&pool, session_id).await, 0);
 
         let close_after_delete = store
@@ -1847,9 +2220,9 @@ mod tests {
             concept_status_event_rows_for_session(&pool, study_delete_session_id).await,
             0
         );
-        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
-        // truth is asserted.
-        let _outcome = store
+        // Same refusal after study-set deletion: no row, and a typed conflict rather
+        // than a success the caller would record as an accepted usage event.
+        let late_usage = store
             .record_voice_usage(VoiceUsageRecord {
                 voice_session_id: Some(study_delete_session_id.to_owned()),
                 provider: "synthetic".to_owned(),
@@ -1866,7 +2239,8 @@ mod tests {
                 source_grounded_correction_count: 1,
             })
             .await
-            .expect("ignores usage after study set deletion");
+            .expect_err("usage after study set deletion is refused");
+        assert_eq!(late_usage.kind(), PortErrorKind::Conflict);
         assert_eq!(
             usage_rows_for_session(&pool, study_delete_session_id).await,
             0
@@ -1875,17 +2249,11 @@ mod tests {
             session_status(&pool, study_delete_session_id).await,
             "deleted"
         );
-    }
 
-    async fn optional_postgres_pool() -> Option<sqlx::PgPool> {
-        let database_url = std::env::var("DATABASE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())?;
-        Some(
-            crate::connect_pg(&crate::PgConfig::new(database_url))
-                .await
-                .expect("DATABASE_URL should connect for optional postgres test"),
-        )
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 
     async fn run_migrations_until(
@@ -1949,7 +2317,7 @@ mod tests {
             concepts: vec![
                 RecapConceptOutcome {
                     concept_id: "oxidative-phosphorylation".to_owned(),
-                    label: "Oxidative phosphorylation".to_owned(),
+                    label: "NADH".to_owned(),
                     status: ConceptStatus::Strong,
                 },
                 RecapConceptOutcome {
@@ -2134,6 +2502,19 @@ mod tests {
         expected_delta: ExactCountDelta,
     }
 
+    /// PENDING PLAN 05 FIXTURE AMENDMENT — the unversioned root path is still the
+    /// only place this table exists.
+    ///
+    /// Plan 09 Task 1 Step 5 requires this import to move to a v5 path, but
+    /// `agent/fixtures/voice-protocol/v5/manifest.json` carries no row for the store
+    /// count truth table and `agent/fixtures/voice-protocol/**` is Plan 05's, not
+    /// this lane's. The assertions are still needed — `DATA-002`/`DATA-003` prove
+    /// exact write-count deltas against this table — so the reference is kept and the
+    /// amendment request (add `VOICE-STORE-COUNT-TRUTH-TABLE` at
+    /// `agent/fixtures/voice-protocol/v5/count-truth-table.json`) is escalated to the
+    /// coordinator rather than satisfied by deleting coverage or by this lane writing
+    /// another plan's fixture. Plan 05 must not delete the eleven legacy root fixtures
+    /// until that row exists and this import points at it.
     fn count_truth_table() -> CountTruthTable {
         serde_json::from_str(include_str!(
             "../../../fixtures/voice-protocol/count-truth-table.json"
