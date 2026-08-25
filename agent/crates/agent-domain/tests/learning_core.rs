@@ -16,18 +16,53 @@ use agent_domain::{
         VIVA_CHALLENGE_RESOLUTION_SCHEMA, VIVA_SEMANTIC_RUBRIC_POLICY_VERSION,
         VIVA_TURN_OUTCOME_RECORD_SCHEMA, VIVA_TURN_OUTCOME_SCHEMA,
     },
+    // The v2 recap keeps its full module path: the crate root still exports the
+    // `study.rs` V1 recap under that name until Plan 06's second PR swaps it.
+    learning_recap::{
+        build_session_recap, RecapSourceMoment as RecapSourceMomentV2,
+        StudySessionRecap as StudySessionRecapV2, VIVA_STUDY_SESSION_RECAP_SCHEMA,
+    },
     study_projection::{
         StudyProjectionConceptV1, StudyProjectionQuestionProgressV1, StudyProjectionSessionV1,
         StudyProjectionStudySetV1, StudyProjectionVersionV1,
     },
-    AnswerEvaluation, AnswerEvaluator, AuthenticatedStudyProjectionV1, AuthorizedStudySession,
-    ChallengeDisposition, ChallengeResolution, ConceptLabel, ConceptStatus, CriterionAssessment,
-    CriterionAssessmentKind, EvaluationDecision, EvaluationDeferralReason, EvaluationError,
-    EvaluationLabel, EvaluationRequest, EvaluationRubricV1, FixedClock, PersistedTurnOutcome,
-    PortError, PortErrorKind, QuestionDisposition, ReviewScheduleSummary, RubricCriterionV1,
-    SessionLearningEvidence, SourceConfidence, StudyMode, StudyQuestion, StudySetIngestionStatus,
-    StudySourceReference, ToolExecutionError, ToolProposal, TurnOutcome, TurnOutcomeRecordReceipt,
-    TurnResolution, VivaToolExecutor,
+    AnswerEvaluation,
+    AnswerEvaluator,
+    AuthenticatedStudyProjectionV1,
+    AuthorizedStudySession,
+    ChallengeDisposition,
+    ChallengeResolution,
+    ConceptLabel,
+    ConceptStatus,
+    CriterionAssessment,
+    CriterionAssessmentKind,
+    EvaluationDecision,
+    EvaluationDeferralReason,
+    EvaluationError,
+    EvaluationLabel,
+    EvaluationRequest,
+    EvaluationRubricV1,
+    FixedClock,
+    PersistedTurnOutcome,
+    PortError,
+    PortErrorKind,
+    QuestionDisposition,
+    RecapBuildError,
+    ReviewScheduleAuthority,
+    ReviewScheduleSummary,
+    RubricCriterionV1,
+    SessionLearningEvidence,
+    SourceConfidence,
+    StudyMode,
+    StudyQuestion,
+    StudySetIngestionStatus,
+    StudySourceReference,
+    ToolExecutionError,
+    ToolProposal,
+    TurnOutcome,
+    TurnOutcomeRecordReceipt,
+    TurnResolution,
+    VivaToolExecutor,
 };
 use serde_json::{json, Value};
 
@@ -292,6 +327,20 @@ impl FakeLearningStore {
 
     fn recorded_challenges(&self) -> Vec<ChallengeResolution> {
         self.challenges.lock().expect("challenges lock").clone()
+    }
+
+    fn with_review_decisions(mut self, decisions: Vec<ReviewScheduleSummary>) -> Self {
+        self.review_decisions = decisions;
+        self
+    }
+
+    fn without_session_evidence(mut self) -> Self {
+        self.evidence_unavailable = true;
+        self
+    }
+
+    fn persisted_recaps(&self) -> Vec<Value> {
+        self.persisted_recaps.lock().expect("recaps lock").clone()
     }
 }
 
@@ -1799,4 +1848,400 @@ fn turn_outcome_shared_fixture_covers_every_required_case() {
 
     // Answer text is absent from every persisted fixture value.
     assert!(!TURN_OUTCOMES_FIXTURE.contains("answer_text"));
+}
+
+// ===========================================================================
+// LEARN-001 — recaps derived only from persisted session evidence
+// ===========================================================================
+
+const RECAPS_FIXTURE: &str = include_str!("../../../fixtures/learning-core/recaps-v1.json");
+
+#[derive(serde::Deserialize)]
+struct RecapsFixture {
+    #[allow(dead_code)]
+    schema: String,
+    evidence: BTreeMap<String, SessionLearningEvidence>,
+    recaps: BTreeMap<String, StudySessionRecapV2>,
+}
+
+fn recaps_fixture() -> RecapsFixture {
+    serde_json::from_str(RECAPS_FIXTURE).expect("recaps fixture parses")
+}
+
+fn evidence_case(case: &str) -> SessionLearningEvidence {
+    recaps_fixture()
+        .evidence
+        .remove(case)
+        .unwrap_or_else(|| panic!("recaps fixture declares case {case}"))
+}
+
+fn fold(evidence: &SessionLearningEvidence) -> StudySessionRecapV2 {
+    build_session_recap(evidence).expect("evidence folds into a recap")
+}
+
+#[test]
+fn recap_fold_matches_every_shared_fixture_case() {
+    let fixture = recaps_fixture();
+    assert_eq!(fixture.evidence.len(), 9, "every RED case must be pinned");
+
+    for (case, evidence) in &fixture.evidence {
+        let expected = fixture
+            .recaps
+            .get(case)
+            .unwrap_or_else(|| panic!("case {case} has an expected recap"));
+        let built = build_session_recap(evidence)
+            .unwrap_or_else(|error| panic!("case {case} must fold: {error:?}"));
+        assert_eq!(&built, expected, "case={case}");
+        assert_eq!(built.schema, VIVA_STUDY_SESSION_RECAP_SCHEMA, "case={case}");
+    }
+}
+
+#[test]
+fn recap_replay_and_reconnect_rebuild_the_identical_recap() {
+    // A replayed row contributes once, so the recap equals the single-outcome one.
+    let replayed = evidence_case("evaluated_then_idempotent_replay");
+    let mut single = replayed.clone();
+    single.outcomes.truncate(1);
+    assert_eq!(fold(&replayed), fold(&single));
+
+    // Reconnecting rebuilds from the same persisted rows.
+    let first = evidence_case("mixed_strong_shaky_missed");
+    let reconnected = evidence_case("reconnect_rebuild");
+    assert_eq!(fold(&first), fold(&reconnected));
+    assert_eq!(
+        serde_json::to_string(&fold(&first)).expect("recap serializes"),
+        serde_json::to_string(&fold(&reconnected)).expect("recap serializes"),
+    );
+}
+
+#[test]
+fn recap_never_duplicates_a_concept() {
+    for case in recaps_fixture().evidence.keys() {
+        let recap = fold(&evidence_case(case));
+        let unique = recap
+            .concepts
+            .iter()
+            .map(|concept| concept.concept_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), recap.concepts.len(), "case={case}");
+    }
+}
+
+#[test]
+fn recap_deferred_only_session_has_no_graded_bucket() {
+    let recap = fold(&evidence_case("deferred_only"));
+    assert!(recap.concepts.is_empty());
+    assert!(recap.review_schedule.is_empty());
+    assert!(recap.source_moments.is_empty());
+    assert_eq!(recap.deferred_turns, 2);
+    assert_eq!(recap.headline, "No graded concepts this session.");
+    assert_eq!(
+        recap.summary,
+        "No graded outcome was saved for this session."
+    );
+    assert_eq!(
+        recap.next_action,
+        "Answer one question to start building evidence."
+    );
+}
+
+#[test]
+fn recap_no_outcomes_states_that_nothing_was_saved() {
+    let recap = fold(&evidence_case("no_outcomes"));
+    assert_eq!(
+        recap.summary,
+        "No graded outcome was saved for this session."
+    );
+    assert_eq!(recap.deferred_turns, 0);
+    for claim in ["strong", "weak", "due", "review the scheduled"] {
+        assert!(
+            !recap.summary.to_lowercase().contains(claim),
+            "the no-evidence summary must claim nothing: {}",
+            recap.summary
+        );
+    }
+}
+
+#[test]
+fn recap_graded_without_a_schedule_asks_for_more_evidence() {
+    let mut evidence = evidence_case("mixed_strong_shaky_missed");
+    evidence.review_decisions.clear();
+    let recap = fold(&evidence);
+    assert!(recap.review_schedule.is_empty());
+    assert_eq!(recap.next_action, "Keep answering to build more evidence.");
+    assert_eq!(recap.concepts.len(), 3);
+}
+
+#[test]
+fn recap_source_moment_requires_a_nonsuperseded_evaluated_outcome() {
+    let recap = fold(&evidence_case("source_moment_outside_outcome"));
+    assert_eq!(
+        recap.source_moments,
+        vec![RecapSourceMomentV2 {
+            response_id: "resp-9001".to_owned(),
+            source_id: "src-lec5-slide-18".to_owned(),
+        }]
+    );
+    assert_eq!(recap.deferred_turns, 1);
+
+    // The superseded outcome's source moment disappears with the outcome.
+    let superseded = fold(&evidence_case("superseded_challenged_outcome"));
+    assert_eq!(superseded.source_moments.len(), 1);
+    assert_eq!(superseded.source_moments[0].response_id, "resp-6002");
+}
+
+#[test]
+fn recap_same_label_on_distinct_concepts_stays_two_entries() {
+    let recap = fold(&evidence_case("same_label_distinct_concepts"));
+    assert_eq!(recap.concepts.len(), 2);
+    assert_eq!(recap.concepts[0].label, recap.concepts[1].label);
+    assert_ne!(recap.concepts[0].concept_id, recap.concepts[1].concept_id);
+    assert_ne!(recap.concepts[0].status, recap.concepts[1].status);
+}
+
+#[test]
+fn recap_fails_closed_on_missing_or_duplicate_concept_label() {
+    let mut missing = evidence_case("all_missed");
+    missing
+        .concept_labels
+        .retain(|label| label.concept_id != CONCEPT_ETC);
+    assert_eq!(
+        build_session_recap(&missing),
+        Err(RecapBuildError::MissingConceptLabel {
+            concept_id: CONCEPT_ETC.to_owned()
+        })
+    );
+
+    let mut duplicated = evidence_case("all_missed");
+    duplicated.concept_labels.push(ConceptLabel {
+        concept_id: CONCEPT_ETC.to_owned(),
+        label: "A second label for one concept".to_owned(),
+    });
+    assert_eq!(
+        build_session_recap(&duplicated),
+        Err(RecapBuildError::DuplicateConceptLabel {
+            concept_id: CONCEPT_ETC.to_owned()
+        })
+    );
+}
+
+#[test]
+fn recap_fails_closed_on_duplicate_or_invalid_review_decision() {
+    let mut duplicated = evidence_case("all_missed");
+    duplicated.review_decisions.push(ReviewScheduleSummary {
+        concept_id: CONCEPT_ETC.to_owned(),
+        due_at: "2026-09-09T09:00:00.000Z".to_owned(),
+        authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+    });
+    assert_eq!(
+        build_session_recap(&duplicated),
+        Err(RecapBuildError::DuplicateReviewDecision {
+            concept_id: CONCEPT_ETC.to_owned()
+        })
+    );
+
+    let mut invalid = evidence_case("all_missed");
+    invalid.review_decisions[0].due_at = "soon".to_owned();
+    assert_eq!(
+        build_session_recap(&invalid),
+        Err(RecapBuildError::InvalidReviewDecision {
+            concept_id: CONCEPT_ETC.to_owned()
+        })
+    );
+
+    let mut ungraded = evidence_case("all_missed");
+    ungraded.review_decisions.push(ReviewScheduleSummary {
+        concept_id: "concept-never-graded".to_owned(),
+        due_at: "2026-09-09T09:00:00.000Z".to_owned(),
+        authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+    });
+    assert_eq!(
+        build_session_recap(&ungraded),
+        Err(RecapBuildError::InvalidReviewDecision {
+            concept_id: "concept-never-graded".to_owned()
+        })
+    );
+}
+
+#[test]
+fn recap_fails_closed_on_blank_evidence_identity() {
+    for mutate in [
+        |evidence: &mut SessionLearningEvidence| evidence.user_id = "  ".to_owned(),
+        |evidence: &mut SessionLearningEvidence| evidence.study_set_id = String::new(),
+        |evidence: &mut SessionLearningEvidence| evidence.voice_session_id = "\t".to_owned(),
+    ] {
+        let mut evidence = evidence_case("all_missed");
+        mutate(&mut evidence);
+        assert_eq!(
+            build_session_recap(&evidence),
+            Err(RecapBuildError::EvidenceIdentityMismatch)
+        );
+    }
+}
+
+#[test]
+fn recap_reads_no_expected_term_positions() {
+    // The evidence a recap folds carries no expected terms at all, so a recap can
+    // never be a projection of a question's term list.
+    let encoded = serde_json::to_string(&evidence_case("mixed_strong_shaky_missed"))
+        .expect("evidence serializes");
+    assert!(!encoded.contains("expected_terms"), "{encoded}");
+    assert!(!RECAPS_FIXTURE.contains("expected_terms"));
+}
+
+#[test]
+fn recap_types_reject_unknown_inner_keys() {
+    let fixture: Value = serde_json::from_str(RECAPS_FIXTURE).expect("recaps fixture is JSON");
+
+    let mut recap = fixture["recaps"]["all_missed"].clone();
+    recap
+        .as_object_mut()
+        .expect("recap is an object")
+        .insert("strong_concepts".to_owned(), json!(["fabricated"]));
+    serde_json::from_value::<StudySessionRecapV2>(recap)
+        .expect_err("a legacy bucket key must be rejected, not ignored");
+
+    let mut concept = fixture["recaps"]["all_missed"].clone();
+    concept["concepts"][0]
+        .as_object_mut()
+        .expect("concept is an object")
+        .insert("due_at".to_owned(), json!("2099-01-01T00:00:00Z"));
+    serde_json::from_value::<StudySessionRecapV2>(concept)
+        .expect_err("an unknown recap concept key must be rejected, not ignored");
+
+    let mut evidence = fixture["evidence"]["all_missed"].clone();
+    evidence
+        .as_object_mut()
+        .expect("evidence is an object")
+        .insert("granted_status".to_owned(), json!("strong"));
+    serde_json::from_value::<SessionLearningEvidence>(evidence)
+        .expect_err("an unknown evidence key must be rejected, not ignored");
+}
+
+#[tokio::test]
+async fn recap_tool_folds_persisted_evidence_and_persists_it() {
+    let store =
+        Arc::new(
+            FakeLearningStore::ready().with_review_decisions(vec![ReviewScheduleSummary {
+                concept_id: CONCEPT_ETC.to_owned(),
+                due_at: "2026-08-31T09:00:00.000Z".to_owned(),
+                authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+            }]),
+        );
+    evaluate(
+        &store,
+        ScriptedEvaluator::once(evaluated(all_satisfied(0.9, 0.9, 0.9, 0.9))),
+        "response-1",
+        answer_proposal("A bound spoken answer."),
+    )
+    .await
+    .expect("the graded turn is persisted");
+
+    let result = executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+        .execute(
+            "response-2",
+            ToolProposal::build_session_recap(STUDY_SET_ID, VOICE_SESSION_ID),
+        )
+        .await
+        .expect("build_session_recap succeeds");
+
+    let recap: StudySessionRecapV2 = serde_json::from_value(result.result["recap"].clone())
+        .expect("the tool returns the evidence-derived recap");
+    assert_eq!(recap.schema, VIVA_STUDY_SESSION_RECAP_SCHEMA);
+    assert_eq!(recap.voice_session_id, VOICE_SESSION_ID);
+    assert_eq!(recap.headline, "Strong concepts: 2 of 2.");
+    assert_eq!(
+        recap.summary,
+        "Graded concepts: 2. Evaluated turns: 1. Deferred turns: 0."
+    );
+    assert_eq!(
+        recap
+            .concepts
+            .iter()
+            .map(|concept| (concept.concept_id.as_str(), concept.status.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (CONCEPT_ETC, ConceptStatus::Strong),
+            (CONCEPT_GRADIENT, ConceptStatus::Strong),
+        ]
+    );
+    assert_eq!(recap.review_schedule.len(), 1);
+    assert_eq!(recap.review_schedule[0].concept_id, CONCEPT_ETC);
+    assert_eq!(recap.source_moments.len(), 3);
+
+    // Rebuilding is a pure projection: the second call equals the first exactly.
+    let again = executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+        .execute(
+            "response-3",
+            ToolProposal::build_session_recap(STUDY_SET_ID, VOICE_SESSION_ID),
+        )
+        .await
+        .expect("rebuild succeeds");
+    assert_eq!(again.result["recap"], result.result["recap"]);
+
+    // The recap actually reached the store, and it carries no question term text.
+    let persisted = store.persisted_recaps();
+    assert_eq!(persisted.len(), 2);
+    let encoded = serde_json::to_string(&persisted).expect("persisted recaps serialize");
+    assert!(!encoded.contains("electron donor"), "{encoded}");
+    assert!(!encoded.contains("ATP synthase"), "{encoded}");
+}
+
+#[tokio::test]
+async fn recap_tool_fails_closed_when_session_evidence_is_unavailable() {
+    let store = Arc::new(FakeLearningStore::ready().without_session_evidence());
+    let error = executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+        .execute(
+            "response-1",
+            ToolProposal::build_session_recap(STUDY_SET_ID, VOICE_SESSION_ID),
+        )
+        .await
+        .expect_err("an unreadable evidence store cannot produce a recap");
+    match error {
+        ToolExecutionError::Store(port) => assert_eq!(port.kind(), PortErrorKind::Unavailable),
+        other => panic!("expected a store failure, found {other:?}"),
+    }
+    assert!(store.persisted_recaps().is_empty());
+}
+
+#[tokio::test]
+async fn recap_tool_fails_closed_on_unfoldable_evidence() {
+    let mut store = FakeLearningStore::ready();
+    store.concept_labels.clear();
+    let store = Arc::new(store);
+    evaluate(
+        &store,
+        ScriptedEvaluator::once(evaluated(all_satisfied(0.9, 0.9, 0.9, 0.9))),
+        "response-1",
+        answer_proposal("A bound spoken answer."),
+    )
+    .await
+    .expect_err("an unauthorized concept never grades");
+
+    let mut store = FakeLearningStore::ready();
+    let store_with_outcome = Arc::new(FakeLearningStore::ready());
+    evaluate(
+        &store_with_outcome,
+        ScriptedEvaluator::once(evaluated(all_satisfied(0.9, 0.9, 0.9, 0.9))),
+        "response-1",
+        answer_proposal("A bound spoken answer."),
+    )
+    .await
+    .expect("the graded turn is persisted");
+    *store.outcomes.lock().expect("outcomes lock") = store_with_outcome.recorded_outcomes();
+    store.concept_labels.clear();
+    let store = Arc::new(store);
+
+    let error = executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+        .execute(
+            "response-2",
+            ToolProposal::build_session_recap(STUDY_SET_ID, VOICE_SESSION_ID),
+        )
+        .await
+        .expect_err("evidence missing a concept label cannot be folded");
+    assert!(
+        matches!(error, ToolExecutionError::RecapEvidence(_)),
+        "{error:?}"
+    );
+    assert!(store.persisted_recaps().is_empty());
 }

@@ -15,10 +15,10 @@ use crate::{
         VIVA_CHALLENGE_RESOLUTION_SCHEMA, VIVA_SEMANTIC_RUBRIC_POLICY_VERSION,
         VIVA_TURN_OUTCOME_SCHEMA,
     },
-    learning_recap::SessionLearningEvidence,
-    AnswerAttemptEnvelope, Clock, ConceptStatus, PortError, RecapSourceMoment, ReviewOutcomeV1,
-    ReviewScheduleError, SessionConfig, StudyMemoryStore, StudyMode, StudyQuestion,
-    StudySessionRecap, StudySourceReference, SystemClock, ToolProposal, ToolResult,
+    learning_recap::{RecapBuildError, SessionLearningEvidence},
+    AnswerAttemptEnvelope, Clock, ConceptStatus, PortError, ReviewOutcomeV1, ReviewScheduleError,
+    SessionConfig, StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap,
+    StudySourceReference, SystemClock, ToolProposal, ToolResult,
 };
 
 /// The locked `viva.semantic-rubric.v1` thresholds. These are policy, not tuning
@@ -341,37 +341,22 @@ impl VivaToolExecutor {
         Ok(json!({ "concept_id": concept_id, "status": status }))
     }
 
+    /// A recap is a pure projection of persisted session evidence.
+    ///
+    /// The model's payload is ignored entirely: this reads the store's evidence,
+    /// folds it with the Plan-04-owned pure fold, and persists exactly that. It
+    /// inspects no question, no expected term, and no active source, so a recap
+    /// can never describe a session that was not actually recorded.
     async fn build_session_recap(&self, response_id: &str) -> Result<Value, ToolExecutionError> {
-        let question = self.active_question().await?;
-        let source = question.source.clone();
-        let strong_concepts = question
-            .expected_terms
-            .iter()
-            .take(2)
-            .cloned()
-            .collect::<Vec<_>>();
-        let review_later = question
-            .expected_terms
-            .iter()
-            .skip(2)
-            .take(2)
-            .cloned()
-            .collect::<Vec<_>>();
-        let recap = StudySessionRecap {
-            voice_session_id: self.session.voice_session_id.clone(),
-            headline: format!("{} is ready for another pass.", question.prompt),
-            summary: "The session stayed grounded to the server-owned source span. Review the missed terms before the next call.".to_owned(),
-            strong_concepts,
-            shaky_concepts: review_later.clone(),
-            missed_concepts: vec![],
-            review_later,
-            next_action: "Schedule a short source-backed review tomorrow.".to_owned(),
-            source_moments: vec![RecapSourceMoment {
-                text: format!("Question source: {}", question.prompt),
-                source,
-                status: ConceptStatus::Strong,
-            }],
-        };
+        let evidence = self
+            .store
+            .session_learning_evidence(
+                &self.session.user_id,
+                &self.session.study_set_id,
+                &self.session.voice_session_id,
+            )
+            .await?;
+        let recap = crate::learning_recap::build_session_recap(&evidence)?;
         let record = self
             .store
             .record_recap(
@@ -379,7 +364,7 @@ impl VivaToolExecutor {
                 &self.session.study_set_id,
                 &self.session.voice_session_id,
                 response_id,
-                recap.clone(),
+                StudySessionRecap::from_evidence_recap(&recap),
             )
             .await?;
         Ok(json!({ "recap": recap, "record": record }))
@@ -543,6 +528,16 @@ pub enum ToolExecutionError {
     Store(#[from] PortError),
     #[error("review scheduling error: {0}")]
     ReviewSchedule(#[from] ReviewScheduleError),
+    /// Persisted session evidence that cannot be folded is a store invariant
+    /// break. It fails the tool call rather than degrading into a partial recap.
+    #[error("session evidence cannot be folded into a recap: {0:?}")]
+    RecapEvidence(RecapBuildError),
+}
+
+impl From<RecapBuildError> for ToolExecutionError {
+    fn from(error: RecapBuildError) -> Self {
+        Self::RecapEvidence(error)
+    }
 }
 
 fn bind_study_set_and_session(
