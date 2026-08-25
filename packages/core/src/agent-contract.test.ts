@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import sessionTokenVectorFixture from "../../../agent/fixtures/session-token/v1/vectors.json";
 import audioFixture from "../../../agent/fixtures/voice-protocol/client-audio.json";
 import fakeEvidencePackFixture from "../../../agent/fixtures/voice-protocol/fake-cartesia-gemini-evidence-pack.json";
 import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/fake-cartesia-gemini-study-session.json";
@@ -9,6 +10,7 @@ import readyFixture from "../../../agent/fixtures/voice-protocol/server-ready.js
 import sessionFixture from "../../../agent/fixtures/voice-protocol/session-config.json";
 import evidencePackFixture from "../../../agent/fixtures/voice-protocol/synthetic-evidence-pack.json";
 import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
+import authDecisionFixture from "../../../agent/fixtures/voice-protocol/v5/auth-decision.json";
 import {
   type AgentSessionConfig,
   audioChunkClientFrame,
@@ -708,6 +710,307 @@ describe("Viva voice agent contract", () => {
     ).toThrow("Missing document_id");
   });
 });
+
+type SessionTokenVectorCase = {
+  id: string;
+  token: string;
+  claims: Record<string, unknown> | null;
+  valid: boolean;
+  rejection: string | null;
+};
+
+type SessionTokenVectorFile = {
+  version: number;
+  fake_secret_base64: string;
+  clock_unix_seconds: number;
+  cases: SessionTokenVectorCase[];
+};
+
+/** VOICE-TOKEN-001: the closed rejection vocabulary Rust and Node must both use. */
+const SESSION_TOKEN_REJECTIONS = [
+  "malformed_shape",
+  "noncanonical_base64url",
+  "unknown_claim",
+  "invalid_signature",
+  "malformed_json",
+  "duplicate_claim",
+  "not_yet_valid",
+  "expired",
+  "invalid_time_order",
+  "binding_mismatch",
+  "missing_claim",
+] as const;
+
+/** The exact required case-id set; adding or removing one needs a Plan 05 amendment. */
+const SESSION_TOKEN_VECTOR_EXPECTATIONS: ReadonlyArray<readonly [string, boolean, string | null]> =
+  [
+    ["VOICE-TOKEN-VALID-CANONICAL", true, null],
+    ["VOICE-TOKEN-VALID-FAILURE-CONTROL", true, null],
+    ["VOICE-TOKEN-REJECT-SEGMENT-SHAPE", false, "malformed_shape"],
+    ["VOICE-TOKEN-REJECT-WRONG-PREFIX", false, "malformed_shape"],
+    ["VOICE-TOKEN-REJECT-PADDED-CLAIMS", false, "noncanonical_base64url"],
+    ["VOICE-TOKEN-REJECT-PADDED-SIGNATURE", false, "noncanonical_base64url"],
+    ["VOICE-TOKEN-REJECT-NONCANONICAL-BASE64URL", false, "noncanonical_base64url"],
+    ["VOICE-TOKEN-REJECT-UNKNOWN-CLAIM", false, "unknown_claim"],
+    ["VOICE-TOKEN-REJECT-UNKNOWN-FAILURE-CONTROL-CLAIM", false, "unknown_claim"],
+    ["VOICE-TOKEN-REJECT-BAD-HMAC", false, "invalid_signature"],
+    ["VOICE-TOKEN-REJECT-MALFORMED-JSON", false, "malformed_json"],
+    ["VOICE-TOKEN-REJECT-DUPLICATE-JSON-KEY", false, "duplicate_claim"],
+    ["VOICE-TOKEN-REJECT-NOT-BEFORE", false, "not_yet_valid"],
+    ["VOICE-TOKEN-REJECT-EXPIRES-AT", false, "expired"],
+    ["VOICE-TOKEN-REJECT-ISSUED-ORDER", false, "invalid_time_order"],
+    ["VOICE-TOKEN-REJECT-USER-BINDING", false, "binding_mismatch"],
+    ["VOICE-TOKEN-REJECT-STUDY-SET-BINDING", false, "binding_mismatch"],
+    ["VOICE-TOKEN-REJECT-SESSION-BINDING", false, "binding_mismatch"],
+    ["VOICE-TOKEN-REJECT-EMPTY-NONCE", false, "missing_claim"],
+  ];
+
+/** The exact `failure_control.scenario` vocabulary shared with the Rust service. */
+const FAILURE_CONTROL_SCENARIOS = [
+  "provider_rate_limited",
+  "provider_auth_failed",
+  "provider_timeout",
+  "silent_stall",
+  "provider_malformed_stream",
+  "provider_network_disconnect",
+  "sonic_tts_timeout",
+  "recap_timeout",
+  "invalid_token",
+  "expired_token",
+  "replayed_token",
+  "malformed_token",
+  "slow_stale_socket_close",
+  "double_submit_race",
+  "mic_denied",
+  "typed_fallback",
+] as const;
+
+/**
+ * The canonical fake access token VOICE-AUTH-001 pins in the signed first frame.
+ * It is the same string as the canonical vector so Rust, Node, and the wire fixture
+ * cannot drift apart. Fixture-only credential: the secret is the published fake key.
+ */
+const CANONICAL_FIXTURE_SESSION_TOKEN =
+  "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDAxIn0.JcnhtQUxeV1XJm0RYGo7LuL5yph5SeRaFch8-Iz8_rA";
+
+const sessionTokenVectors = sessionTokenVectorFixture as unknown as SessionTokenVectorFile;
+
+describe("Viva voice v5 authentication decision and shared session-token vectors", () => {
+  test("records the sponsor-selected D-07 retain-token-only branch verbatim", () => {
+    expect(Object.keys(authDecisionFixture)).toEqual([
+      "decision",
+      "branch",
+      "direct_browser_wss",
+      "preupgrade_auth",
+      "first_frame_auth",
+      "refresh_mode",
+      "browser_refresh_absolute_lifetime_required",
+      "in_socket_token_refresh",
+    ]);
+    expect(authDecisionFixture).toEqual({
+      decision: "D-07 TOKEN_ONLY_REFRESH",
+      branch: "retain-token-only",
+      direct_browser_wss: true,
+      preupgrade_auth: "signed_session_access_token",
+      first_frame_auth: "same_signed_session_access_token",
+      refresh_mode: "rotating_one_time_hashed_credential",
+      browser_refresh_absolute_lifetime_required: true,
+      in_socket_token_refresh: false,
+    });
+    // Branch A's refresh credential is never a viva1 access token and never appears
+    // in this contract fixture; token renewal always replaces the socket.
+    const serialized = JSON.stringify(authDecisionFixture);
+    expect(serialized).not.toContain("viva1.");
+    expect(serialized).not.toContain("Bearer ");
+  });
+
+  test("publishes the exact v1 vector schema, fake secret, and pinned runner clock", () => {
+    expect(Object.keys(sessionTokenVectors)).toEqual([
+      "version",
+      "fake_secret_base64",
+      "clock_unix_seconds",
+      "cases",
+    ]);
+    expect(sessionTokenVectors.version).toBe(1);
+    expect(sessionTokenVectors.fake_secret_base64).toBe(
+      "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    );
+    expect([...base64ToBytes(sessionTokenVectors.fake_secret_base64)]).toEqual(
+      Array.from({ length: 32 }, (_unused, index) => index),
+    );
+    // The clock sits inside the canonical fixture window [1800000000, 1800000900).
+    expect(sessionTokenVectors.clock_unix_seconds).toBe(1_800_000_300);
+    for (const vector of sessionTokenVectors.cases) {
+      expect(Object.keys(vector)).toEqual(["id", "token", "claims", "valid", "rejection"]);
+    }
+  });
+
+  test("pins the exact required case-id set with closed rejection strings", () => {
+    expect(sessionTokenVectors.cases.map((vector) => vector.id)).toEqual(
+      SESSION_TOKEN_VECTOR_EXPECTATIONS.map(([id]) => id),
+    );
+
+    for (const [id, valid, rejection] of SESSION_TOKEN_VECTOR_EXPECTATIONS) {
+      const vector = sessionTokenVectorCase(id);
+      expect({ valid: vector.valid, rejection: vector.rejection }).toEqual({ valid, rejection });
+      expect(vector.valid).toBe(vector.rejection === null);
+      if (vector.rejection !== null) {
+        expect(SESSION_TOKEN_REJECTIONS).toContain(
+          vector.rejection as (typeof SESSION_TOKEN_REJECTIONS)[number],
+        );
+      }
+    }
+  });
+
+  test("keeps every recorded claim set identical to its own token claims segment", () => {
+    for (const vector of sessionTokenVectors.cases) {
+      const segments = vector.token.split(".");
+      if (vector.id === "VOICE-TOKEN-REJECT-SEGMENT-SHAPE") {
+        expect(segments).toHaveLength(2);
+        expect(segments[0]).toBe("viva1");
+        continue;
+      }
+      expect(segments).toHaveLength(3);
+      expect(segments[0]).toBe(vector.id === "VOICE-TOKEN-REJECT-WRONG-PREFIX" ? "viva2" : "viva1");
+      if (vector.claims === null) continue;
+      expect(decodeBase64UrlJson(segments[1] ?? "")).toEqual(vector.claims);
+    }
+  });
+
+  test("isolates exactly one defect per rejecting vector", () => {
+    const clock = sessionTokenVectors.clock_unix_seconds;
+    const noncanonicalIds = new Set([
+      "VOICE-TOKEN-REJECT-PADDED-CLAIMS",
+      "VOICE-TOKEN-REJECT-PADDED-SIGNATURE",
+      "VOICE-TOKEN-REJECT-NONCANONICAL-BASE64URL",
+    ]);
+
+    expect(sessionTokenVectorCase("VOICE-TOKEN-VALID-CANONICAL").token).toBe(
+      CANONICAL_FIXTURE_SESSION_TOKEN,
+    );
+    expect(sessionTokenVectorClaims("VOICE-TOKEN-VALID-CANONICAL")).toEqual({
+      user_id: "fixture-user",
+      study_set_id: "fixture-study-set",
+      session_id: "fixture-session",
+      issued_at: 1_800_000_000,
+      not_before: 1_800_000_000,
+      expires_at: 1_800_000_900,
+      nonce: "fixture-nonce-001",
+    });
+    expect(Object.keys(sessionTokenVectorClaims("VOICE-TOKEN-VALID-FAILURE-CONTROL"))).toEqual([
+      "user_id",
+      "study_set_id",
+      "session_id",
+      "issued_at",
+      "not_before",
+      "expires_at",
+      "nonce",
+      "failure_control",
+    ]);
+    const failureControl = sessionTokenVectorClaims("VOICE-TOKEN-VALID-FAILURE-CONTROL")
+      .failure_control as Record<string, unknown>;
+    expect(Object.keys(failureControl)).toEqual([
+      "scenario",
+      "run_id",
+      "expires_at",
+      "nonce",
+      "signature",
+    ]);
+    expect(FAILURE_CONTROL_SCENARIOS).toContain(
+      failureControl.scenario as (typeof FAILURE_CONTROL_SCENARIOS)[number],
+    );
+
+    // Time defects, each against the pinned clock and the issued/not-before/expiry order.
+    expect(
+      sessionTokenVectorClaims("VOICE-TOKEN-REJECT-NOT-BEFORE").not_before as number,
+    ).toBeGreaterThan(clock);
+    expect(
+      sessionTokenVectorClaims("VOICE-TOKEN-REJECT-EXPIRES-AT").expires_at as number,
+    ).toBeLessThanOrEqual(clock);
+    const outOfOrder = sessionTokenVectorClaims("VOICE-TOKEN-REJECT-ISSUED-ORDER");
+    expect(outOfOrder.issued_at as number).toBeGreaterThan(outOfOrder.not_before as number);
+
+    // Binding defects, each against the canonical expected binding.
+    expect(sessionTokenVectorClaims("VOICE-TOKEN-REJECT-USER-BINDING").user_id).not.toBe(
+      "fixture-user",
+    );
+    expect(sessionTokenVectorClaims("VOICE-TOKEN-REJECT-STUDY-SET-BINDING").study_set_id).not.toBe(
+      "fixture-study-set",
+    );
+    expect(sessionTokenVectorClaims("VOICE-TOKEN-REJECT-SESSION-BINDING").session_id).not.toBe(
+      "fixture-session",
+    );
+    expect(sessionTokenVectorClaims("VOICE-TOKEN-REJECT-EMPTY-NONCE").nonce).toBe("");
+    expect(sessionTokenVectorClaims("VOICE-TOKEN-REJECT-UNKNOWN-CLAIM")).toHaveProperty("role");
+    expect(
+      Object.keys(
+        sessionTokenVectorClaims("VOICE-TOKEN-REJECT-UNKNOWN-FAILURE-CONTROL-CLAIM")
+          .failure_control as Record<string, unknown>,
+      ),
+    ).toContain("origin");
+
+    // Encoding defects are confined to the three cases that own them.
+    for (const vector of sessionTokenVectors.cases) {
+      const segments = vector.token.split(".");
+      const canonicalSegments = segments
+        .slice(1)
+        .every((segment) => isCanonicalUnpaddedBase64Url(segment));
+      expect(canonicalSegments).toBe(!noncanonicalIds.has(vector.id));
+    }
+  });
+
+  test("keeps every vector credential clearly fixture-only", () => {
+    const serialized = JSON.stringify(sessionTokenVectors);
+    expect(serialized).not.toContain("sk-");
+    expect(serialized).not.toContain("AIza");
+    expect(serialized).not.toContain("BEGIN PRIVATE KEY");
+
+    for (const vector of sessionTokenVectors.cases) {
+      if (vector.claims === null) continue;
+      for (const key of ["user_id", "study_set_id", "session_id"] as const) {
+        const value = vector.claims[key];
+        if (typeof value === "string") {
+          expect(value.startsWith("fixture-")).toBe(true);
+        }
+      }
+    }
+  });
+});
+
+function sessionTokenVectorCase(id: string): SessionTokenVectorCase {
+  const vector = sessionTokenVectors.cases.find((candidate) => candidate.id === id);
+  if (!vector) throw new Error(`Missing session-token vector ${id}`);
+  return vector;
+}
+
+function sessionTokenVectorClaims(id: string): Record<string, unknown> {
+  const claims = sessionTokenVectorCase(id).claims;
+  if (!claims) throw new Error(`Session-token vector ${id} records no claims`);
+  return claims;
+}
+
+function base64ToBytes(encoded: string): Uint8Array {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function decodeBase64UrlJson(segment: string): unknown {
+  const padded = segment.replace(/-/g, "+").replace(/_/g, "/");
+  return JSON.parse(new TextDecoder().decode(base64ToBytes(padded)));
+}
+
+function isCanonicalUnpaddedBase64Url(segment: string): boolean {
+  if (!/^[A-Za-z0-9_-]*$/.test(segment) || segment.length % 4 === 1) return false;
+  const bytes = base64ToBytes(segment.replace(/-/g, "+").replace(/_/g, "/"));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  const reencoded = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return reencoded === segment;
+}
 
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";

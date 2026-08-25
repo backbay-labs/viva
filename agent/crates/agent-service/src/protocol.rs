@@ -978,4 +978,382 @@ mod tests {
                 )
         )
     }
+
+    /// `D-07 TOKEN_ONLY_REFRESH` (Branch A, `retain-token-only`) and `VOICE-TOKEN-001`.
+    /// Rust and Node read the same recorded branch and the same exhaustive vectors, so
+    /// neither side can drift its admission contract independently.
+    #[test]
+    fn voice_auth_decision_and_token_vectors_are_exact() {
+        use base64::{
+            engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+            Engine as _,
+        };
+        use serde_json::{json, Map, Value};
+
+        const AUTH_DECISION_JSON: &str =
+            include_str!("../../../fixtures/voice-protocol/v5/auth-decision.json");
+        const TOKEN_VECTORS_JSON: &str =
+            include_str!("../../../fixtures/session-token/v1/vectors.json");
+        /// The canonical fake access token `VOICE-AUTH-001` pins in the signed first
+        /// frame. Fixture-only credential signed with the published fake secret.
+        const CANONICAL_FIXTURE_SESSION_TOKEN: &str = "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDAxIn0.JcnhtQUxeV1XJm0RYGo7LuL5yph5SeRaFch8-Iz8_rA";
+        const CLOSED_REJECTIONS: [&str; 11] = [
+            "malformed_shape",
+            "noncanonical_base64url",
+            "unknown_claim",
+            "invalid_signature",
+            "malformed_json",
+            "duplicate_claim",
+            "not_yet_valid",
+            "expired",
+            "invalid_time_order",
+            "binding_mismatch",
+            "missing_claim",
+        ];
+        const EXPECTED_CASES: [(&str, bool, Option<&str>); 19] = [
+            ("VOICE-TOKEN-VALID-CANONICAL", true, None),
+            ("VOICE-TOKEN-VALID-FAILURE-CONTROL", true, None),
+            (
+                "VOICE-TOKEN-REJECT-SEGMENT-SHAPE",
+                false,
+                Some("malformed_shape"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-WRONG-PREFIX",
+                false,
+                Some("malformed_shape"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-PADDED-CLAIMS",
+                false,
+                Some("noncanonical_base64url"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-PADDED-SIGNATURE",
+                false,
+                Some("noncanonical_base64url"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-NONCANONICAL-BASE64URL",
+                false,
+                Some("noncanonical_base64url"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-UNKNOWN-CLAIM",
+                false,
+                Some("unknown_claim"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-UNKNOWN-FAILURE-CONTROL-CLAIM",
+                false,
+                Some("unknown_claim"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-BAD-HMAC",
+                false,
+                Some("invalid_signature"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-MALFORMED-JSON",
+                false,
+                Some("malformed_json"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-DUPLICATE-JSON-KEY",
+                false,
+                Some("duplicate_claim"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-NOT-BEFORE",
+                false,
+                Some("not_yet_valid"),
+            ),
+            ("VOICE-TOKEN-REJECT-EXPIRES-AT", false, Some("expired")),
+            (
+                "VOICE-TOKEN-REJECT-ISSUED-ORDER",
+                false,
+                Some("invalid_time_order"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-USER-BINDING",
+                false,
+                Some("binding_mismatch"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-STUDY-SET-BINDING",
+                false,
+                Some("binding_mismatch"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-SESSION-BINDING",
+                false,
+                Some("binding_mismatch"),
+            ),
+            (
+                "VOICE-TOKEN-REJECT-EMPTY-NONCE",
+                false,
+                Some("missing_claim"),
+            ),
+        ];
+
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SessionTokenVectorFile {
+            version: u32,
+            fake_secret_base64: String,
+            clock_unix_seconds: u64,
+            cases: Vec<SessionTokenVectorCase>,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SessionTokenVectorCase {
+            id: String,
+            token: String,
+            claims: Option<Map<String, Value>>,
+            valid: bool,
+            rejection: Option<String>,
+        }
+
+        let decision: Value =
+            serde_json::from_str(AUTH_DECISION_JSON).expect("auth decision fixture is valid JSON");
+        assert_eq!(
+            decision,
+            json!({
+                "decision": "D-07 TOKEN_ONLY_REFRESH",
+                "branch": "retain-token-only",
+                "direct_browser_wss": true,
+                "preupgrade_auth": "signed_session_access_token",
+                "first_frame_auth": "same_signed_session_access_token",
+                "refresh_mode": "rotating_one_time_hashed_credential",
+                "browser_refresh_absolute_lifetime_required": true,
+                "in_socket_token_refresh": false
+            })
+        );
+        let mut cursor = 0_usize;
+        for key in [
+            "decision",
+            "branch",
+            "direct_browser_wss",
+            "preupgrade_auth",
+            "first_frame_auth",
+            "refresh_mode",
+            "browser_refresh_absolute_lifetime_required",
+            "in_socket_token_refresh",
+        ] {
+            let needle = format!("\"{key}\"");
+            let offset = AUTH_DECISION_JSON[cursor..]
+                .find(&needle)
+                .unwrap_or_else(|| {
+                    panic!("auth-decision.json is missing {key} in canonical order")
+                });
+            cursor += offset + needle.len();
+        }
+        // Branch A's refresh credential is never an access token and never appears here.
+        assert!(!AUTH_DECISION_JSON.contains("viva1."));
+        assert!(!AUTH_DECISION_JSON.contains("Bearer "));
+
+        let vectors: SessionTokenVectorFile =
+            serde_json::from_str(TOKEN_VECTORS_JSON).expect("session token vectors parse strictly");
+        assert_eq!(vectors.version, 1);
+        assert_eq!(
+            vectors.fake_secret_base64,
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        );
+        assert_eq!(
+            STANDARD
+                .decode(&vectors.fake_secret_base64)
+                .expect("fake secret is base64"),
+            (0_u8..32).collect::<Vec<u8>>()
+        );
+        assert_eq!(vectors.clock_unix_seconds, 1_800_000_300);
+        assert_eq!(vectors.cases.len(), EXPECTED_CASES.len());
+
+        for (case, (id, valid, rejection)) in vectors.cases.iter().zip(EXPECTED_CASES) {
+            assert_eq!(case.id, id);
+            assert_eq!(case.valid, valid, "{id}");
+            assert_eq!(case.rejection.as_deref(), rejection, "{id}");
+            assert_eq!(case.valid, case.rejection.is_none(), "{id}");
+            if let Some(rejection) = case.rejection.as_deref() {
+                assert!(
+                    CLOSED_REJECTIONS.contains(&rejection),
+                    "{id} uses an unlisted rejection"
+                );
+            }
+
+            let segments: Vec<&str> = case.token.split('.').collect();
+            if case.id == "VOICE-TOKEN-REJECT-SEGMENT-SHAPE" {
+                assert_eq!(segments.len(), 2, "{id}");
+                assert_eq!(segments[0], "viva1", "{id}");
+                continue;
+            }
+            assert_eq!(segments.len(), 3, "{id}");
+            let expected_prefix = if case.id == "VOICE-TOKEN-REJECT-WRONG-PREFIX" {
+                "viva2"
+            } else {
+                "viva1"
+            };
+            assert_eq!(segments[0], expected_prefix, "{id}");
+
+            // Encoding defects belong only to the three cases that own them.
+            let canonical_segments = segments[1..].iter().all(|segment| {
+                URL_SAFE_NO_PAD
+                    .decode(segment)
+                    .map(|bytes| URL_SAFE_NO_PAD.encode(bytes) == *segment)
+                    .unwrap_or(false)
+            });
+            let owns_encoding_defect = matches!(
+                case.id.as_str(),
+                "VOICE-TOKEN-REJECT-PADDED-CLAIMS"
+                    | "VOICE-TOKEN-REJECT-PADDED-SIGNATURE"
+                    | "VOICE-TOKEN-REJECT-NONCANONICAL-BASE64URL"
+            );
+            assert_eq!(canonical_segments, !owns_encoding_defect, "{id}");
+
+            if let Some(claims) = case.claims.as_ref() {
+                let decoded = URL_SAFE_NO_PAD
+                    .decode(segments[1])
+                    .unwrap_or_else(|_| panic!("{id} claims segment decodes"));
+                let parsed: Value = serde_json::from_slice(&decoded)
+                    .unwrap_or_else(|_| panic!("{id} claims segment is JSON"));
+                assert_eq!(parsed, Value::Object(claims.clone()), "{id}");
+            }
+        }
+
+        let case_by_id = |id: &str| -> &SessionTokenVectorCase {
+            vectors
+                .cases
+                .iter()
+                .find(|case| case.id == id)
+                .unwrap_or_else(|| panic!("missing session-token vector {id}"))
+        };
+        let claims_of = |id: &str| -> &Map<String, Value> {
+            case_by_id(id)
+                .claims
+                .as_ref()
+                .unwrap_or_else(|| panic!("session-token vector {id} records no claims"))
+        };
+        let claims_json_of = |id: &str| -> String {
+            let segment = case_by_id(id)
+                .token
+                .split('.')
+                .nth(1)
+                .expect("claims segment");
+            String::from_utf8(
+                URL_SAFE_NO_PAD
+                    .decode(segment)
+                    .unwrap_or_else(|_| panic!("{id} claims segment decodes")),
+            )
+            .expect("claims segment is UTF-8")
+        };
+
+        assert_eq!(
+            case_by_id("VOICE-TOKEN-VALID-CANONICAL").token,
+            CANONICAL_FIXTURE_SESSION_TOKEN
+        );
+        assert_eq!(
+            claims_json_of("VOICE-TOKEN-VALID-CANONICAL"),
+            "{\"user_id\":\"fixture-user\",\"study_set_id\":\"fixture-study-set\",\"session_id\":\"fixture-session\",\"issued_at\":1800000000,\"not_before\":1800000000,\"expires_at\":1800000900,\"nonce\":\"fixture-nonce-001\"}"
+        );
+        let failure_control_claims = claims_json_of("VOICE-TOKEN-VALID-FAILURE-CONTROL");
+        assert!(
+            failure_control_claims.contains(
+                "\"failure_control\":{\"scenario\":\"provider_rate_limited\",\"run_id\":\"fixture-run-001\",\"expires_at\":1800000900,\"nonce\":\"fixture-failure-nonce-001\",\"signature\":\""
+            ),
+            "failure_control claim keys are ordered scenario, run_id, expires_at, nonce, signature"
+        );
+
+        for case in vectors.cases.iter().filter(|case| case.valid) {
+            let claims = case
+                .claims
+                .as_ref()
+                .expect("valid session-token vectors record claims");
+            let issued_at = claims["issued_at"].as_u64().expect("issued_at");
+            let not_before = claims["not_before"].as_u64().expect("not_before");
+            let expires_at = claims["expires_at"].as_u64().expect("expires_at");
+            assert!(
+                issued_at <= not_before && not_before < expires_at,
+                "{}",
+                case.id
+            );
+            assert!(
+                not_before <= vectors.clock_unix_seconds && vectors.clock_unix_seconds < expires_at,
+                "{}",
+                case.id
+            );
+            assert_eq!(claims["user_id"], json!("fixture-user"), "{}", case.id);
+            assert_eq!(
+                claims["study_set_id"],
+                json!("fixture-study-set"),
+                "{}",
+                case.id
+            );
+            assert_eq!(
+                claims["session_id"],
+                json!("fixture-session"),
+                "{}",
+                case.id
+            );
+            assert!(
+                !claims["nonce"].as_str().expect("nonce").is_empty(),
+                "{}",
+                case.id
+            );
+        }
+
+        assert!(
+            claims_of("VOICE-TOKEN-REJECT-NOT-BEFORE")["not_before"]
+                .as_u64()
+                .expect("not_before")
+                > vectors.clock_unix_seconds
+        );
+        assert!(
+            claims_of("VOICE-TOKEN-REJECT-EXPIRES-AT")["expires_at"]
+                .as_u64()
+                .expect("expires_at")
+                <= vectors.clock_unix_seconds
+        );
+        let out_of_order = claims_of("VOICE-TOKEN-REJECT-ISSUED-ORDER");
+        assert!(
+            out_of_order["issued_at"].as_u64().expect("issued_at")
+                > out_of_order["not_before"].as_u64().expect("not_before")
+        );
+        assert_ne!(
+            claims_of("VOICE-TOKEN-REJECT-USER-BINDING")["user_id"],
+            json!("fixture-user")
+        );
+        assert_ne!(
+            claims_of("VOICE-TOKEN-REJECT-STUDY-SET-BINDING")["study_set_id"],
+            json!("fixture-study-set")
+        );
+        assert_ne!(
+            claims_of("VOICE-TOKEN-REJECT-SESSION-BINDING")["session_id"],
+            json!("fixture-session")
+        );
+        assert_eq!(
+            claims_of("VOICE-TOKEN-REJECT-EMPTY-NONCE")["nonce"],
+            json!("")
+        );
+        assert!(claims_of("VOICE-TOKEN-REJECT-UNKNOWN-CLAIM").contains_key("role"));
+        assert!(
+            claims_of("VOICE-TOKEN-REJECT-UNKNOWN-FAILURE-CONTROL-CLAIM")["failure_control"]
+                .as_object()
+                .expect("failure_control object")
+                .contains_key("origin")
+        );
+
+        assert!(!TOKEN_VECTORS_JSON.contains("sk-"));
+        assert!(!TOKEN_VECTORS_JSON.contains("AIza"));
+        assert!(!TOKEN_VECTORS_JSON.contains("BEGIN PRIVATE KEY"));
+        for case in &vectors.cases {
+            let Some(claims) = case.claims.as_ref() else {
+                continue;
+            };
+            for key in ["user_id", "study_set_id", "session_id"] {
+                if let Some(Value::String(value)) = claims.get(key) {
+                    assert!(value.starts_with("fixture-"), "{} {key}", case.id);
+                }
+            }
+        }
+    }
 }
