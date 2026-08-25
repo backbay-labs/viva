@@ -1,0 +1,83 @@
+{
+  "schema": "viva.voice-fixtures.manifest.v1",
+  "protocol_version": 5,
+  "supported_versions": [5],
+  "legacy_v4_disposition": "reject",
+  "fixtures": [
+    {
+      "id": "VOICE-FIXTURE-MANIFEST",
+      "path": "agent/fixtures/voice-protocol/v5/manifest.json",
+      "kind": "manifest"
+    },
+    {
+      "id": "VOICE-AUTH-DECISION",
+      "path": "agent/fixtures/voice-protocol/v5/auth-decision.json",
+      "kind": "auth_decision"
+    },
+    {
+      "id": "VOICE-CLIENT-SESSION-CONFIG-SIGNED",
+      "path": "agent/fixtures/voice-protocol/v5/client-session-config-signed.json",
+      "kind": "client_frame"
+    },
+    {
+      "id": "VOICE-CLIENT-SESSION-REFRESH",
+      "path": "agent/fixtures/voice-protocol/v5/client-session-refresh.json",
+      "kind": "client_frame"
+    },
+    {
+      "id": "VOICE-AUDIO-TURN-LIFECYCLE",
+      "path": "agent/fixtures/voice-protocol/v5/audio-turn-lifecycle.json",
+      "kind": "frame_sequence"
+    },
+    {
+      "id": "VOICE-CLIENT-TURN-INTENTS",
+      "path": "agent/fixtures/voice-protocol/v5/turn-intents.json",
+      "kind": "client_frame_cases"
+    },
+    {
+      "id": "VOICE-SERVER-TURN-OUTCOMES",
+      "path": "agent/fixtures/voice-protocol/v5/turn-outcomes.json",
+      "kind": "server_event_cases"
+    },
+    {
+      "id": "VOICE-SERVER-READY",
+      "path": "agent/fixtures/voice-protocol/v5/server-ready.json",
+      "kind": "server_frame"
+    },
+    {
+      "id": "VOICE-TERMINAL-SEQUENCES",
+      "path": "agent/fixtures/voice-protocol/v5/terminal-sequences.json",
+      "kind": "frame_sequence"
+    },
+    {
+      "id": "VOICE-TRANSPORT-OUTCOMES",
+      "path": "agent/fixtures/voice-protocol/v5/transport-outcomes.json",
+      "kind": "transport_cases"
+    },
+    {
+      "id": "VOICE-SYNTHETIC-TWO-TURN-SESSION",
+      "path": "agent/fixtures/voice-protocol/v5/synthetic-two-turn-session.json",
+      "kind": "session_sequence"
+    },
+    {
+      "id": "VOICE-FAKE-CARTESIA-GEMINI-TWO-TURN-SESSION",
+      "path": "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-two-turn-session.json",
+      "kind": "session_sequence"
+    },
+    {
+      "id": "VOICE-CLIENT-DIFFERENTIAL-CASES",
+      "path": "agent/fixtures/voice-protocol/v5/client-differential-cases.json",
+      "kind": "differential_cases"
+    },
+    {
+      "id": "VOICE-SERVER-DIFFERENTIAL-CASES",
+      "path": "agent/fixtures/voice-protocol/v5/server-differential-cases.json",
+      "kind": "differential_cases"
+    },
+    {
+      "id": "VOICE-TOKEN-V1-VECTORS",
+      "path": "agent/fixtures/session-token/v1/vectors.json",
+      "kind": "token_vectors"
+    }
+  ]
+}

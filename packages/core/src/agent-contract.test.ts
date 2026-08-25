@@ -10,12 +10,16 @@ import readyFixture from "../../../agent/fixtures/voice-protocol/server-ready.js
 import sessionFixture from "../../../agent/fixtures/voice-protocol/session-config.json";
 import evidencePackFixture from "../../../agent/fixtures/voice-protocol/synthetic-evidence-pack.json";
 import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
+import audioLifecycleFixture from "../../../agent/fixtures/voice-protocol/v5/audio-turn-lifecycle.json";
 import authDecisionFixture from "../../../agent/fixtures/voice-protocol/v5/auth-decision.json";
 import clientDifferentialFixture from "../../../agent/fixtures/voice-protocol/v5/client-differential-cases.json";
 import signedSessionConfigFixture from "../../../agent/fixtures/voice-protocol/v5/client-session-config-signed.json";
 import sessionRefreshFixture from "../../../agent/fixtures/voice-protocol/v5/client-session-refresh.json";
+import fakeTwoTurnFixture from "../../../agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-two-turn-session.json";
+import manifestFixture from "../../../agent/fixtures/voice-protocol/v5/manifest.json";
 import serverDifferentialFixture from "../../../agent/fixtures/voice-protocol/v5/server-differential-cases.json";
 import readyV5Fixture from "../../../agent/fixtures/voice-protocol/v5/server-ready.json";
+import syntheticTwoTurnFixture from "../../../agent/fixtures/voice-protocol/v5/synthetic-two-turn-session.json";
 import terminalSequenceFixture from "../../../agent/fixtures/voice-protocol/v5/terminal-sequences.json";
 import transportOutcomeFixture from "../../../agent/fixtures/voice-protocol/v5/transport-outcomes.json";
 import turnIntentFixture from "../../../agent/fixtures/voice-protocol/v5/turn-intents.json";
@@ -2765,3 +2769,485 @@ describe("Viva voice v5 termination classification", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Task 8 - VOICE-FIXTURE-001 / VOICE-SESSION-001 / VOICE-AUDIO-TURN-LIFECYCLE
+// ---------------------------------------------------------------------------
+
+type ManifestRow = { id: string; path: string; kind: string };
+
+type ManifestFile = {
+  schema: string;
+  protocol_version: number;
+  supported_versions: number[];
+  legacy_v4_disposition: string;
+  fixtures: ManifestRow[];
+};
+
+type AudioSequenceCase = {
+  id: string;
+  wire_sequence_json: string[];
+  valid: boolean;
+  diagnostic_code: string | null;
+  path: string | null;
+};
+
+type AudioSequenceFile = {
+  schema: string;
+  protocol_version: number;
+  cases: AudioSequenceCase[];
+};
+
+type SessionSequenceFile = {
+  schema: string;
+  protocol_version: number;
+  id: string;
+  provider: string;
+  client_generation_id: string;
+  turns: Array<{ turn_id: string; response_id: string; question_id: string }>;
+  client_sequence_json: string[];
+  server_sequence_json: string[];
+};
+
+const voiceManifest = manifestFixture as unknown as ManifestFile;
+const audioLifecycle = audioLifecycleFixture as unknown as AudioSequenceFile;
+const syntheticSession = syntheticTwoTurnFixture as unknown as SessionSequenceFile;
+const fakeProviderSession = fakeTwoTurnFixture as unknown as SessionSequenceFile;
+
+/** `VOICE-FIXTURE-001`: the exact immutable corpus, in manifest order. */
+const EXPECTED_MANIFEST_ROWS: ReadonlyArray<readonly [string, string, string]> = [
+  ["VOICE-FIXTURE-MANIFEST", "agent/fixtures/voice-protocol/v5/manifest.json", "manifest"],
+  ["VOICE-AUTH-DECISION", "agent/fixtures/voice-protocol/v5/auth-decision.json", "auth_decision"],
+  [
+    "VOICE-CLIENT-SESSION-CONFIG-SIGNED",
+    "agent/fixtures/voice-protocol/v5/client-session-config-signed.json",
+    "client_frame",
+  ],
+  [
+    "VOICE-CLIENT-SESSION-REFRESH",
+    "agent/fixtures/voice-protocol/v5/client-session-refresh.json",
+    "client_frame",
+  ],
+  [
+    "VOICE-AUDIO-TURN-LIFECYCLE",
+    "agent/fixtures/voice-protocol/v5/audio-turn-lifecycle.json",
+    "frame_sequence",
+  ],
+  [
+    "VOICE-CLIENT-TURN-INTENTS",
+    "agent/fixtures/voice-protocol/v5/turn-intents.json",
+    "client_frame_cases",
+  ],
+  [
+    "VOICE-SERVER-TURN-OUTCOMES",
+    "agent/fixtures/voice-protocol/v5/turn-outcomes.json",
+    "server_event_cases",
+  ],
+  ["VOICE-SERVER-READY", "agent/fixtures/voice-protocol/v5/server-ready.json", "server_frame"],
+  [
+    "VOICE-TERMINAL-SEQUENCES",
+    "agent/fixtures/voice-protocol/v5/terminal-sequences.json",
+    "frame_sequence",
+  ],
+  [
+    "VOICE-TRANSPORT-OUTCOMES",
+    "agent/fixtures/voice-protocol/v5/transport-outcomes.json",
+    "transport_cases",
+  ],
+  [
+    "VOICE-SYNTHETIC-TWO-TURN-SESSION",
+    "agent/fixtures/voice-protocol/v5/synthetic-two-turn-session.json",
+    "session_sequence",
+  ],
+  [
+    "VOICE-FAKE-CARTESIA-GEMINI-TWO-TURN-SESSION",
+    "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-two-turn-session.json",
+    "session_sequence",
+  ],
+  [
+    "VOICE-CLIENT-DIFFERENTIAL-CASES",
+    "agent/fixtures/voice-protocol/v5/client-differential-cases.json",
+    "differential_cases",
+  ],
+  [
+    "VOICE-SERVER-DIFFERENTIAL-CASES",
+    "agent/fixtures/voice-protocol/v5/server-differential-cases.json",
+    "differential_cases",
+  ],
+  ["VOICE-TOKEN-V1-VECTORS", "agent/fixtures/session-token/v1/vectors.json", "token_vectors"],
+];
+
+/** `VOICE-AUDIO-TURN-LIFECYCLE`: the exact case-id set, in file order. */
+const EXPECTED_AUDIO_LIFECYCLE_CASE_IDS = [
+  "VOICE-CLIENT-AUDIO-VALID-PRODUCTION-SIZE",
+  "VOICE-CLIENT-AUDIO-VALID-SMALL-CHUNK-HIGH-FINAL-SEQUENCE",
+  "VOICE-CLIENT-REJECT-AUDIO-SEQUENCE-DUPLICATE",
+  "VOICE-CLIENT-REJECT-AUDIO-SEQUENCE-GAP",
+  "VOICE-CLIENT-REJECT-AUDIO-SEQUENCE-REORDER",
+  "VOICE-CLIENT-REJECT-AUDIO-END-MISMATCH",
+  "VOICE-CLIENT-REJECT-AUDIO-CHUNK-8193",
+  "VOICE-CLIENT-REJECT-TURN-2160002",
+];
+
+function serverEventsOf(session: SessionSequenceFile): Array<Record<string, unknown>> {
+  return session.server_sequence_json
+    .map((wireJson) => JSON.parse(wireJson) as Record<string, unknown>)
+    .filter((frame) => frame.type === "event")
+    .map((frame) => frame.event as Record<string, unknown>);
+}
+
+function eventsOfType(session: SessionSequenceFile, type: string) {
+  return serverEventsOf(session).filter((event) => event.type === type);
+}
+
+describe("Viva voice v5 fixture manifest", () => {
+  test("lists the exact immutable corpus with no duplicate id or path", () => {
+    expect(voiceManifest.schema).toBe("viva.voice-fixtures.manifest.v1");
+    expect(voiceManifest.protocol_version).toBe(VIVA_VOICE_PROTOCOL_VERSION);
+    expect(voiceManifest.supported_versions).toEqual([VIVA_VOICE_PROTOCOL_VERSION]);
+    expect(voiceManifest.legacy_v4_disposition).toBe("reject");
+
+    expect(voiceManifest.fixtures.map((row) => [row.id, row.path, row.kind] as const)).toEqual(
+      EXPECTED_MANIFEST_ROWS,
+    );
+    expect(new Set(voiceManifest.fixtures.map((row) => row.id)).size).toBe(
+      voiceManifest.fixtures.length,
+    );
+    expect(new Set(voiceManifest.fixtures.map((row) => row.path)).size).toBe(
+      voiceManifest.fixtures.length,
+    );
+  });
+
+  test("every listed fixture exists, parses, and no unlisted JSON file hides in v5", async () => {
+    for (const row of voiceManifest.fixtures) {
+      const file = fixtureHost().Bun.file(repoPath(row.path));
+      expect({ path: row.path, exists: await file.exists() }).toEqual({
+        path: row.path,
+        exists: true,
+      });
+      const parsed = (await file.json()) as Record<string, unknown>;
+      expect({ path: row.path, empty: Object.keys(parsed).length === 0 }).toEqual({
+        path: row.path,
+        empty: false,
+      });
+    }
+
+    const present: string[] = [];
+    const { Glob } = fixtureHost().Bun;
+    const scanned = new Glob("*.json").scan({
+      cwd: repoPath("agent/fixtures/voice-protocol/v5"),
+    });
+    for await (const name of scanned) {
+      present.push(`agent/fixtures/voice-protocol/v5/${name}`);
+    }
+    const listed = voiceManifest.fixtures
+      .map((row) => row.path)
+      .filter((path) => path.startsWith("agent/fixtures/voice-protocol/v5/"));
+    expect(present.sort()).toEqual(listed.sort());
+  });
+
+  test("no v5 fixture carries a live v4 envelope", async () => {
+    for (const row of voiceManifest.fixtures) {
+      if (row.kind === "differential_cases") continue;
+      const raw = await fixtureHost().Bun.file(repoPath(row.path)).text();
+      expect({ path: row.path, v4: /"version"\s*:\s*4/.test(raw) }).toEqual({
+        path: row.path,
+        v4: false,
+      });
+    }
+  });
+});
+
+describe("Viva voice v5 audio turn lifecycle", () => {
+  test("pins the exact case-id set and parses every frame it embeds", () => {
+    expect(audioLifecycle.schema).toBe("viva.voice-audio-sequence-cases.v1");
+    expect(audioLifecycle.protocol_version).toBe(VIVA_VOICE_PROTOCOL_VERSION);
+    expect(audioLifecycle.cases.map((audioCase) => audioCase.id)).toEqual(
+      EXPECTED_AUDIO_LIFECYCLE_CASE_IDS,
+    );
+
+    for (const audioCase of audioLifecycle.cases) {
+      // Per VOICE-DIFFERENTIAL-001 this plan runs each entry through the single-frame
+      // parser only. A per-frame rejection (the oversized chunk) must show up here; the
+      // stateful outcomes are executed behaviourally by Plan 08 against `ws.rs`.
+      const perFrame =
+        !audioCase.valid && audioCase.diagnostic_code === "VOICE_PROTOCOL_FRAME_TOO_LARGE";
+      let perFrameRejections = 0;
+      for (const wireJson of audioCase.wire_sequence_json) {
+        try {
+          const frame = parseVivaClientFrameJson(wireJson);
+          expect({ id: audioCase.id, wire: JSON.stringify(frame) }).toEqual({
+            id: audioCase.id,
+            wire: wireJson,
+          });
+        } catch (error) {
+          if (!(error instanceof VivaVoiceProtocolError)) throw error;
+          perFrameRejections += 1;
+          expect({ id: audioCase.id, code: error.code, path: error.path }).toEqual({
+            id: audioCase.id,
+            code: audioCase.diagnostic_code,
+            path: audioCase.path,
+          });
+        }
+      }
+      expect({ id: audioCase.id, perFrameRejections }).toEqual({
+        id: audioCase.id,
+        perFrameRejections: perFrame ? 1 : 0,
+      });
+    }
+  });
+
+  test("a full-length production turn and a smaller-chunk turn both stay in bounds", () => {
+    const production = audioLifecycle.cases.find(
+      (audioCase) => audioCase.id === "VOICE-CLIENT-AUDIO-VALID-PRODUCTION-SIZE",
+    );
+    const smallChunk = audioLifecycle.cases.find(
+      (audioCase) => audioCase.id === "VOICE-CLIENT-AUDIO-VALID-SMALL-CHUNK-HIGH-FINAL-SEQUENCE",
+    );
+    expect(production === undefined).toBe(false);
+    expect(smallChunk === undefined).toBe(false);
+
+    const productionTotals = audioSequenceTotals(production as AudioSequenceCase);
+    expect(productionTotals.finalSequence).toBe(2249);
+    expect(productionTotals.rawBytes).toBe(VIVA_AUDIO_MAX_TURN_BYTES);
+
+    const smallTotals = audioSequenceTotals(smallChunk as AudioSequenceCase);
+    // There is no derived chunk-count or final-sequence ceiling: smaller valid chunks may
+    // produce more sequence values while aggregate bytes stay inside the turn bound.
+    expect(smallTotals.finalSequence > productionTotals.finalSequence).toBe(true);
+    expect(smallTotals.rawBytes <= VIVA_AUDIO_MAX_TURN_BYTES).toBe(true);
+  });
+
+  test("the aggregate rejection exceeds the turn bound by exactly two even PCM bytes", () => {
+    const aggregate = audioLifecycle.cases.find(
+      (audioCase) => audioCase.id === "VOICE-CLIENT-REJECT-TURN-2160002",
+    );
+    expect(aggregate === undefined).toBe(false);
+    expect([
+      (aggregate as AudioSequenceCase).diagnostic_code,
+      (aggregate as AudioSequenceCase).path,
+    ]).toEqual(["VOICE_PROTOCOL_TURN_TOO_LARGE", "$.frame.pcm16_base64"]);
+    const totals = audioSequenceTotals(aggregate as AudioSequenceCase);
+    expect(totals.rawBytes).toBe(VIVA_AUDIO_MAX_TURN_BYTES + 2);
+    expect(totals.rawBytes % 2).toBe(0);
+  });
+});
+
+function audioSequenceTotals(audioCase: AudioSequenceCase): {
+  rawBytes: number;
+  finalSequence: number;
+} {
+  let rawBytes = 0;
+  let finalSequence = -1;
+  for (const wireJson of audioCase.wire_sequence_json) {
+    const frame = JSON.parse(wireJson) as {
+      type: string;
+      sequence?: number;
+      final_sequence?: number;
+      frame?: { pcm16_base64: string };
+    };
+    if (frame.type === "audio_chunk") {
+      rawBytes += base64ToBytes(frame.frame?.pcm16_base64 ?? "").length;
+    }
+    if (frame.type === "audio_end") finalSequence = frame.final_sequence ?? -1;
+  }
+  return { rawBytes, finalSequence };
+}
+
+describe("Viva voice v5 two-turn session fixtures", () => {
+  const sessions: ReadonlyArray<readonly [string, SessionSequenceFile]> = [
+    ["synthetic", syntheticSession],
+    ["fake-cartesia-gemini", fakeProviderSession],
+  ];
+
+  for (const [label, session] of sessions) {
+    test(`${label}: every frame round-trips byte for byte in wire order`, () => {
+      expect(session.schema).toBe("viva.voice-session-sequence.v1");
+      expect(session.protocol_version).toBe(VIVA_VOICE_PROTOCOL_VERSION);
+      for (const wireJson of session.client_sequence_json) {
+        expect({ label, wire: JSON.stringify(parseVivaClientFrameJson(wireJson)) }).toEqual({
+          label,
+          wire: wireJson,
+        });
+      }
+      for (const wireJson of session.server_sequence_json) {
+        expect({ label, wire: JSON.stringify(parseVivaServerFrameJson(wireJson)) }).toEqual({
+          label,
+          wire: wireJson,
+        });
+      }
+    });
+
+    test(`${label}: opens with one signed generation-bound config`, () => {
+      const first = parseVivaClientFrameJson(session.client_sequence_json[0] as string);
+      expect(first.type).toBe("session_config");
+      if (first.type !== "session_config") throw new Error("Expected session_config");
+      expect(first.client_generation_id).toBe(session.client_generation_id);
+      expect(first.session_token.startsWith("viva1.")).toBe(true);
+      const configs = session.client_sequence_json.filter(
+        (wireJson) => (JSON.parse(wireJson) as { type: string }).type === "session_config",
+      );
+      expect(configs).toHaveLength(1);
+      for (const wireJson of session.client_sequence_json) {
+        const frame = JSON.parse(wireJson) as { client_generation_id: string };
+        expect({ label, generation: frame.client_generation_id }).toEqual({
+          label,
+          generation: session.client_generation_id,
+        });
+      }
+    });
+
+    test(`${label}: two distinct question turns with no identity reuse`, () => {
+      const started = eventsOfType(session, "question_started");
+      expect(started).toHaveLength(2);
+      expect(started.map((event) => event.turn_id)).toEqual(
+        session.turns.map((turn) => turn.turn_id),
+      );
+      expect(started.map((event) => event.response_id)).toEqual(
+        session.turns.map((turn) => turn.response_id),
+      );
+      expect(
+        started.map((event) => (event.question as { question_id: string }).question_id),
+      ).toEqual(session.turns.map((turn) => turn.question_id));
+      expect(new Set(session.turns.map((turn) => turn.turn_id)).size).toBe(2);
+      expect(new Set(session.turns.map((turn) => turn.response_id)).size).toBe(2);
+      expect(new Set(session.turns.map((turn) => turn.question_id)).size).toBe(2);
+    });
+
+    test(`${label}: turn one is a complete monotonic audio lifecycle`, () => {
+      const [firstTurn] = session.turns;
+      const chunks = session.client_sequence_json
+        .map((wireJson) => JSON.parse(wireJson) as Record<string, unknown>)
+        .filter((frame) => frame.type === "audio_chunk" && frame.turn_id === firstTurn?.turn_id);
+      expect(chunks.length > 0).toBe(true);
+      expect(chunks.map((frame) => frame.sequence)).toEqual(chunks.map((_, index) => index));
+
+      const ends = session.client_sequence_json
+        .map((wireJson) => JSON.parse(wireJson) as Record<string, unknown>)
+        .filter((frame) => frame.type === "audio_end" && frame.turn_id === firstTurn?.turn_id);
+      expect(ends).toHaveLength(1);
+      expect((ends[0] as { final_sequence: number }).final_sequence).toBe(chunks.length - 1);
+
+      const accepted = session.server_sequence_json
+        .map((wireJson) => JSON.parse(wireJson) as Record<string, unknown>)
+        .filter((frame) => frame.type === "audio_turn_accepted");
+      expect(accepted).toHaveLength(1);
+      expect((accepted[0] as { turn_id: string }).turn_id).toBe(firstTurn?.turn_id as string);
+    });
+
+    test(`${label}: turn two answers by typed intent and carries a citation challenge`, () => {
+      const secondTurn = session.turns[1];
+      const intents = session.client_sequence_json
+        .map((wireJson) => JSON.parse(wireJson) as Record<string, unknown>)
+        .filter((frame) => frame.type === "turn_intent");
+      expect(intents.map((frame) => frame.turn_id)).toEqual([
+        secondTurn?.turn_id as string,
+        secondTurn?.turn_id as string,
+      ]);
+      expect(intents.map((frame) => (frame.intent as { kind: string }).kind)).toEqual([
+        "citation_challenge",
+        "answer_text",
+      ]);
+    });
+
+    test(`${label}: cancellation is typed and generation-scoped`, () => {
+      const cancels = session.client_sequence_json
+        .map((wireJson) => JSON.parse(wireJson) as Record<string, unknown>)
+        .filter((frame) => frame.type === "cancel");
+      expect(cancels).toHaveLength(1);
+      expect(cancels[0]?.turn_id).toBe(session.turns[0]?.turn_id as string);
+      const cancellations = eventsOfType(session, "cancellation");
+      expect(cancellations).toHaveLength(1);
+      expect(cancellations[0]?.response_id).toBe(session.turns[0]?.response_id as string);
+    });
+
+    test(`${label}: the evaluated path recaps and the deferred path stays nonterminal`, () => {
+      const evaluated = eventsOfType(session, "answer_evaluated");
+      expect(evaluated).toHaveLength(1);
+      expect(evaluated[0]?.response_id).toBe(session.turns[0]?.response_id as string);
+
+      const deferred = eventsOfType(session, "turn_deferred");
+      expect(deferred).toHaveLength(1);
+      expect(deferred[0]?.turn_id).toBe(session.turns[1]?.turn_id as string);
+      expect(deferred[0]?.response_id).toBe(session.turns[1]?.response_id as string);
+      expect(deferred[0]?.question_id).toBe(session.turns[1]?.question_id as string);
+
+      // A deferred turn never produces a grade, a mastery move, or a review write.
+      for (const event of [...evaluated, ...eventsOfType(session, "concept_status")]) {
+        expect({ label, responseId: event.response_id }).toEqual({
+          label,
+          responseId: session.turns[0]?.response_id as string,
+        });
+      }
+
+      const recaps = eventsOfType(session, "recap_ready");
+      expect(recaps).toHaveLength(1);
+      expect(recaps[0]?.partial).toBe(false);
+      expect("partial_reason" in (recaps[0] as Record<string, unknown>)).toBe(false);
+      expect((recaps[0]?.recap as { deferred_turns: number }).deferred_turns).toBe(deferred.length);
+
+      // Nothing in either corpus is terminal: deferral does not end a wire session.
+      for (const wireJson of session.server_sequence_json) {
+        const frame = parseVivaServerFrameJson(wireJson);
+        if (frame.type !== "event") continue;
+        expect({ label, terminal: vivaServerEventTerminalReason(frame.event) }).toEqual({
+          label,
+          terminal: null,
+        });
+      }
+    });
+
+    test(`${label}: no fabricated transcript confidence`, () => {
+      const finals = eventsOfType(session, "transcript_final");
+      expect(finals.length > 0).toBe(true);
+      for (const event of finals) {
+        expect({ label, confidence: event.confidence }).toEqual({ label, confidence: null });
+      }
+    });
+
+    test(`${label}: server frames carry no raw audio turn, credential, or tool payload`, () => {
+      const raw = session.server_sequence_json.join("\n");
+      for (const needle of ["viva1.", "tool_result", "tool_proposal", "sk-", "Authorization"]) {
+        expect({ label, needle, present: raw.includes(needle) }).toEqual({
+          label,
+          needle,
+          present: false,
+        });
+      }
+    });
+  }
+
+  test("the two providers differ only in provider identity, never in learner facts", () => {
+    expect(syntheticSession.provider).toBe("synthetic");
+    expect(fakeProviderSession.provider).toBe("fake_cartesia_gemini");
+    expect(syntheticSession.turns).toEqual(fakeProviderSession.turns);
+    expect(syntheticSession.client_generation_id).toBe(fakeProviderSession.client_generation_id);
+  });
+});
+
+/**
+ * The Bun host, reached through `globalThis` for the same reason
+ * `readAgentContractSource` does: this package's tsconfig carries no Bun or Node type
+ * declarations, and the contract source itself must stay free of host imports.
+ */
+function fixtureHost(): {
+  Bun: {
+    file(path: string): {
+      exists(): Promise<boolean>;
+      text(): Promise<string>;
+      json(): Promise<unknown>;
+    };
+    Glob: new (
+      pattern: string,
+    ) => {
+      scan(options: { cwd: string }): AsyncIterable<string>;
+    };
+  };
+} {
+  return globalThis as unknown as ReturnType<typeof fixtureHost>;
+}
+
+/** An absolute path to a repository-relative fixture path. */
+function repoPath(relative: string): string {
+  return new URL(`../../../${relative}`, import.meta.url).pathname;
+}

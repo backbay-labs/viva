@@ -4848,4 +4848,642 @@ mod tests {
             }
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Task 8 - VOICE-FIXTURE-001 / VOICE-SESSION-001 / VOICE-AUDIO-TURN-LIFECYCLE
+    // -----------------------------------------------------------------------
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ManifestFile {
+        schema: String,
+        protocol_version: u32,
+        supported_versions: Vec<u32>,
+        legacy_v4_disposition: String,
+        fixtures: Vec<ManifestRow>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ManifestRow {
+        id: String,
+        path: String,
+        kind: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AudioSequenceFile {
+        schema: String,
+        protocol_version: u32,
+        cases: Vec<AudioSequenceCase>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AudioSequenceCase {
+        id: String,
+        wire_sequence_json: Vec<String>,
+        valid: bool,
+        diagnostic_code: Option<String>,
+        path: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SessionSequenceFile {
+        schema: String,
+        protocol_version: u32,
+        id: String,
+        provider: String,
+        client_generation_id: String,
+        turns: Vec<SessionTurn>,
+        client_sequence_json: Vec<String>,
+        server_sequence_json: Vec<String>,
+    }
+
+    #[derive(Clone, Deserialize, Eq, PartialEq, Debug)]
+    #[serde(deny_unknown_fields)]
+    struct SessionTurn {
+        turn_id: String,
+        response_id: String,
+        question_id: String,
+    }
+
+    /// `VOICE-FIXTURE-001`: the exact immutable corpus, in manifest order.
+    const EXPECTED_MANIFEST_ROWS: [(&str, &str, &str); 15] = [
+        (
+            "VOICE-FIXTURE-MANIFEST",
+            "agent/fixtures/voice-protocol/v5/manifest.json",
+            "manifest",
+        ),
+        (
+            "VOICE-AUTH-DECISION",
+            "agent/fixtures/voice-protocol/v5/auth-decision.json",
+            "auth_decision",
+        ),
+        (
+            "VOICE-CLIENT-SESSION-CONFIG-SIGNED",
+            "agent/fixtures/voice-protocol/v5/client-session-config-signed.json",
+            "client_frame",
+        ),
+        (
+            "VOICE-CLIENT-SESSION-REFRESH",
+            "agent/fixtures/voice-protocol/v5/client-session-refresh.json",
+            "client_frame",
+        ),
+        (
+            "VOICE-AUDIO-TURN-LIFECYCLE",
+            "agent/fixtures/voice-protocol/v5/audio-turn-lifecycle.json",
+            "frame_sequence",
+        ),
+        (
+            "VOICE-CLIENT-TURN-INTENTS",
+            "agent/fixtures/voice-protocol/v5/turn-intents.json",
+            "client_frame_cases",
+        ),
+        (
+            "VOICE-SERVER-TURN-OUTCOMES",
+            "agent/fixtures/voice-protocol/v5/turn-outcomes.json",
+            "server_event_cases",
+        ),
+        (
+            "VOICE-SERVER-READY",
+            "agent/fixtures/voice-protocol/v5/server-ready.json",
+            "server_frame",
+        ),
+        (
+            "VOICE-TERMINAL-SEQUENCES",
+            "agent/fixtures/voice-protocol/v5/terminal-sequences.json",
+            "frame_sequence",
+        ),
+        (
+            "VOICE-TRANSPORT-OUTCOMES",
+            "agent/fixtures/voice-protocol/v5/transport-outcomes.json",
+            "transport_cases",
+        ),
+        (
+            "VOICE-SYNTHETIC-TWO-TURN-SESSION",
+            "agent/fixtures/voice-protocol/v5/synthetic-two-turn-session.json",
+            "session_sequence",
+        ),
+        (
+            "VOICE-FAKE-CARTESIA-GEMINI-TWO-TURN-SESSION",
+            "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-two-turn-session.json",
+            "session_sequence",
+        ),
+        (
+            "VOICE-CLIENT-DIFFERENTIAL-CASES",
+            "agent/fixtures/voice-protocol/v5/client-differential-cases.json",
+            "differential_cases",
+        ),
+        (
+            "VOICE-SERVER-DIFFERENTIAL-CASES",
+            "agent/fixtures/voice-protocol/v5/server-differential-cases.json",
+            "differential_cases",
+        ),
+        (
+            "VOICE-TOKEN-V1-VECTORS",
+            "agent/fixtures/session-token/v1/vectors.json",
+            "token_vectors",
+        ),
+    ];
+
+    /// Every manifest-listed file, embedded at compile time so a missing one cannot build.
+    const MANIFEST_FIXTURE_SOURCES: [(&str, &str); 15] = [
+        (
+            "agent/fixtures/voice-protocol/v5/manifest.json",
+            include_str!("../../../fixtures/voice-protocol/v5/manifest.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/auth-decision.json",
+            include_str!("../../../fixtures/voice-protocol/v5/auth-decision.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/client-session-config-signed.json",
+            include_str!("../../../fixtures/voice-protocol/v5/client-session-config-signed.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/client-session-refresh.json",
+            include_str!("../../../fixtures/voice-protocol/v5/client-session-refresh.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/audio-turn-lifecycle.json",
+            include_str!("../../../fixtures/voice-protocol/v5/audio-turn-lifecycle.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/turn-intents.json",
+            include_str!("../../../fixtures/voice-protocol/v5/turn-intents.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/turn-outcomes.json",
+            include_str!("../../../fixtures/voice-protocol/v5/turn-outcomes.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/server-ready.json",
+            include_str!("../../../fixtures/voice-protocol/v5/server-ready.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/terminal-sequences.json",
+            include_str!("../../../fixtures/voice-protocol/v5/terminal-sequences.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/transport-outcomes.json",
+            include_str!("../../../fixtures/voice-protocol/v5/transport-outcomes.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/synthetic-two-turn-session.json",
+            include_str!("../../../fixtures/voice-protocol/v5/synthetic-two-turn-session.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-two-turn-session.json",
+            include_str!(
+                "../../../fixtures/voice-protocol/v5/fake-cartesia-gemini-two-turn-session.json"
+            ),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/client-differential-cases.json",
+            include_str!("../../../fixtures/voice-protocol/v5/client-differential-cases.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/server-differential-cases.json",
+            include_str!("../../../fixtures/voice-protocol/v5/server-differential-cases.json"),
+        ),
+        (
+            "agent/fixtures/session-token/v1/vectors.json",
+            include_str!("../../../fixtures/session-token/v1/vectors.json"),
+        ),
+    ];
+
+    const EXPECTED_AUDIO_LIFECYCLE_CASE_IDS: [&str; 8] = [
+        "VOICE-CLIENT-AUDIO-VALID-PRODUCTION-SIZE",
+        "VOICE-CLIENT-AUDIO-VALID-SMALL-CHUNK-HIGH-FINAL-SEQUENCE",
+        "VOICE-CLIENT-REJECT-AUDIO-SEQUENCE-DUPLICATE",
+        "VOICE-CLIENT-REJECT-AUDIO-SEQUENCE-GAP",
+        "VOICE-CLIENT-REJECT-AUDIO-SEQUENCE-REORDER",
+        "VOICE-CLIENT-REJECT-AUDIO-END-MISMATCH",
+        "VOICE-CLIENT-REJECT-AUDIO-CHUNK-8193",
+        "VOICE-CLIENT-REJECT-TURN-2160002",
+    ];
+
+    /// The v5 fixture directory, located by walking up from the crate root. The plan's
+    /// gate runs inside `agent-service`; the isolated harness this lane must use while
+    /// `data`/`agent-adapters` do not compile roots one level higher, so the search stops
+    /// at whichever ancestor actually holds the corpus.
+    fn v5_fixture_dir() -> std::path::PathBuf {
+        let mut cursor = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        loop {
+            let candidate = cursor.join("fixtures/voice-protocol/v5");
+            if candidate.is_dir() {
+                return candidate;
+            }
+            cursor = cursor.parent().expect("the v5 fixture directory exists");
+        }
+    }
+
+    /// Raw byte length of canonical padded base64, without decoding the payload: this
+    /// module never keeps decoded audio around, not even in a test.
+    fn canonical_base64_byte_length(encoded: &str) -> usize {
+        let padding = encoded
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'=')
+            .count();
+        encoded.len() / 4 * 3 - padding
+    }
+
+    fn session_events(session: &SessionSequenceFile, event_type: &str) -> Vec<Value> {
+        session
+            .server_sequence_json
+            .iter()
+            .filter_map(|wire_json| {
+                let frame: Value = serde_json::from_str(wire_json).expect("frame is JSON");
+                let event = frame.get("event")?.clone();
+                (event.get("type").and_then(Value::as_str) == Some(event_type)).then_some(event)
+            })
+            .collect()
+    }
+
+    fn client_frames_of(session: &SessionSequenceFile, frame_type: &str) -> Vec<Value> {
+        session
+            .client_sequence_json
+            .iter()
+            .filter_map(|wire_json| {
+                let frame: Value = serde_json::from_str(wire_json).expect("frame is JSON");
+                (frame.get("type").and_then(Value::as_str) == Some(frame_type)).then_some(frame)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn voice_fixture_manifest_is_complete() {
+        let manifest: ManifestFile = serde_json::from_str(include_str!(
+            "../../../fixtures/voice-protocol/v5/manifest.json"
+        ))
+        .expect("manifest parses strictly");
+        assert_eq!(manifest.schema, "viva.voice-fixtures.manifest.v1");
+        assert_eq!(manifest.protocol_version, VIVA_VOICE_PROTOCOL_VERSION);
+        assert_eq!(
+            manifest.supported_versions,
+            vec![VIVA_VOICE_PROTOCOL_VERSION]
+        );
+        assert_eq!(manifest.legacy_v4_disposition, "reject");
+
+        let rows: Vec<(&str, &str, &str)> = manifest
+            .fixtures
+            .iter()
+            .map(|row| (row.id.as_str(), row.path.as_str(), row.kind.as_str()))
+            .collect();
+        assert_eq!(rows, EXPECTED_MANIFEST_ROWS.to_vec());
+
+        let mut ids = std::collections::BTreeSet::new();
+        let mut paths = std::collections::BTreeSet::new();
+        for row in &manifest.fixtures {
+            assert!(ids.insert(row.id.as_str()), "{} is duplicated", row.id);
+            assert!(
+                paths.insert(row.path.as_str()),
+                "{} is duplicated",
+                row.path
+            );
+        }
+
+        // Every listed file exists (it is embedded at compile time), is non-empty JSON,
+        // and carries no live v4 envelope.
+        let embedded: std::collections::BTreeMap<&str, &str> =
+            MANIFEST_FIXTURE_SOURCES.into_iter().collect();
+        assert_eq!(embedded.len(), EXPECTED_MANIFEST_ROWS.len());
+        for row in &manifest.fixtures {
+            let raw = embedded
+                .get(row.path.as_str())
+                .unwrap_or_else(|| panic!("{} is listed but not embedded", row.path));
+            let parsed: Value = serde_json::from_str(raw)
+                .unwrap_or_else(|error| panic!("{} is not JSON: {error}", row.path));
+            assert!(
+                parsed.as_object().is_some_and(|object| !object.is_empty()),
+                "{} is empty",
+                row.path
+            );
+            if row.kind == "differential_cases" {
+                continue;
+            }
+            assert!(
+                !raw.contains("\"version\":4") && !raw.contains("\"version\": 4"),
+                "{} carries a live v4 envelope",
+                row.path
+            );
+        }
+
+        // No unlisted JSON file hides in the versioned directory.
+        let mut present: Vec<String> = std::fs::read_dir(v5_fixture_dir())
+            .expect("the v5 fixture directory is readable")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.ends_with(".json"))
+            .map(|name| format!("agent/fixtures/voice-protocol/v5/{name}"))
+            .collect();
+        present.sort();
+        let mut listed: Vec<String> = manifest
+            .fixtures
+            .iter()
+            .map(|row| row.path.clone())
+            .filter(|path| path.starts_with("agent/fixtures/voice-protocol/v5/"))
+            .collect();
+        listed.sort();
+        assert_eq!(present, listed);
+    }
+
+    #[test]
+    fn voice_v5_two_turn_fixtures_are_exhaustive() {
+        // `audio-turn-lifecycle.json`: schema, exact case-id set, and per-frame parses.
+        // The stateful outcomes are executed behaviourally by Plan 08 against `ws.rs`.
+        let lifecycle: AudioSequenceFile = serde_json::from_str(include_str!(
+            "../../../fixtures/voice-protocol/v5/audio-turn-lifecycle.json"
+        ))
+        .expect("audio lifecycle file parses strictly");
+        assert_eq!(lifecycle.schema, "viva.voice-audio-sequence-cases.v1");
+        assert_eq!(lifecycle.protocol_version, VIVA_VOICE_PROTOCOL_VERSION);
+        assert_eq!(
+            lifecycle
+                .cases
+                .iter()
+                .map(|audio_case| audio_case.id.as_str())
+                .collect::<Vec<_>>(),
+            EXPECTED_AUDIO_LIFECYCLE_CASE_IDS.to_vec()
+        );
+
+        for audio_case in &lifecycle.cases {
+            let per_frame = !audio_case.valid
+                && audio_case.diagnostic_code.as_deref() == Some("VOICE_PROTOCOL_FRAME_TOO_LARGE");
+            let mut rejections = 0_usize;
+            let mut raw_bytes = 0_usize;
+            let mut final_sequence: i64 = -1;
+            for wire_json in &audio_case.wire_sequence_json {
+                match parse_client_frame_json(wire_json) {
+                    Ok(frame) => {
+                        assert_eq!(
+                            serde_json::to_string(&frame).expect("frame serializes"),
+                            *wire_json,
+                            "{} does not reserialize byte for byte",
+                            audio_case.id
+                        );
+                    }
+                    Err(diagnostic) => {
+                        rejections += 1;
+                        assert_eq!(
+                            Some(diagnostic.code.as_str().to_owned()),
+                            audio_case.diagnostic_code,
+                            "{}",
+                            audio_case.id
+                        );
+                        assert_eq!(
+                            Some(diagnostic.path.clone()),
+                            audio_case.path,
+                            "{}",
+                            audio_case.id
+                        );
+                    }
+                }
+                let value: Value = serde_json::from_str(wire_json).expect("entry is JSON");
+                match value.get("type").and_then(Value::as_str) {
+                    Some("audio_chunk") => {
+                        let encoded = value["frame"]["pcm16_base64"]
+                            .as_str()
+                            .expect("chunk payload is a string");
+                        raw_bytes += canonical_base64_byte_length(encoded);
+                    }
+                    Some("audio_end") => {
+                        final_sequence = value["final_sequence"].as_i64().expect("final sequence");
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                rejections,
+                usize::from(per_frame),
+                "{} per-frame rejection count",
+                audio_case.id
+            );
+
+            match audio_case.id.as_str() {
+                "VOICE-CLIENT-AUDIO-VALID-PRODUCTION-SIZE" => {
+                    assert_eq!(final_sequence, 2_249);
+                    assert_eq!(raw_bytes, VIVA_AUDIO_MAX_TURN_BYTES);
+                }
+                "VOICE-CLIENT-AUDIO-VALID-SMALL-CHUNK-HIGH-FINAL-SEQUENCE" => {
+                    // No derived chunk-count or final-sequence ceiling exists: smaller
+                    // valid chunks may exceed the production final sequence while the
+                    // aggregate stays inside the turn bound.
+                    assert!(final_sequence > 2_249);
+                    assert!(raw_bytes <= VIVA_AUDIO_MAX_TURN_BYTES);
+                }
+                "VOICE-CLIENT-REJECT-TURN-2160002" => {
+                    assert_eq!(raw_bytes, VIVA_AUDIO_MAX_TURN_BYTES + 2);
+                    assert_eq!(raw_bytes % 2, 0);
+                    assert_eq!(
+                        audio_case.diagnostic_code.as_deref(),
+                        Some("VOICE_PROTOCOL_TURN_TOO_LARGE")
+                    );
+                    assert_eq!(audio_case.path.as_deref(), Some("$.frame.pcm16_base64"));
+                }
+                _ => {}
+            }
+        }
+
+        // Both two-turn session corpora.
+        let synthetic: SessionSequenceFile = serde_json::from_str(include_str!(
+            "../../../fixtures/voice-protocol/v5/synthetic-two-turn-session.json"
+        ))
+        .expect("synthetic session parses strictly");
+        let fake_provider: SessionSequenceFile = serde_json::from_str(include_str!(
+            "../../../fixtures/voice-protocol/v5/fake-cartesia-gemini-two-turn-session.json"
+        ))
+        .expect("fake provider session parses strictly");
+        assert_eq!(synthetic.provider, "synthetic");
+        assert_eq!(fake_provider.provider, "fake_cartesia_gemini");
+        assert_eq!(synthetic.turns, fake_provider.turns);
+        assert_eq!(
+            synthetic.client_generation_id,
+            fake_provider.client_generation_id
+        );
+        assert_eq!(synthetic.id, "VOICE-SYNTHETIC-TWO-TURN-SESSION");
+        assert_eq!(
+            fake_provider.id,
+            "VOICE-FAKE-CARTESIA-GEMINI-TWO-TURN-SESSION"
+        );
+
+        for session in [&synthetic, &fake_provider] {
+            let label = session.id.as_str();
+            assert_eq!(session.schema, "viva.voice-session-sequence.v1");
+            assert_eq!(session.protocol_version, VIVA_VOICE_PROTOCOL_VERSION);
+
+            // Byte-exact round trip in both directions, in wire order.
+            for wire_json in &session.client_sequence_json {
+                let frame = parse_client_frame_json(wire_json)
+                    .unwrap_or_else(|error| panic!("{label}: {error}"));
+                assert_eq!(
+                    serde_json::to_string(&frame).expect("frame serializes"),
+                    *wire_json,
+                    "{label} client frame does not reserialize byte for byte"
+                );
+            }
+            for wire_json in &session.server_sequence_json {
+                let frame = parse_server_frame_json(wire_json)
+                    .unwrap_or_else(|error| panic!("{label}: {error}"));
+                assert_eq!(
+                    serde_json::to_string(&frame).expect("frame serializes"),
+                    *wire_json,
+                    "{label} server frame does not reserialize byte for byte"
+                );
+                // Nothing in either corpus is terminal: deferral does not end a session.
+                if let ServerFrame::Event { event, .. } = &frame {
+                    assert_eq!(event.terminal_reason(), None, "{label}");
+                }
+            }
+
+            // One signed, generation-bound first frame, and one generation throughout.
+            let configs = client_frames_of(session, "session_config");
+            assert_eq!(configs.len(), 1, "{label}");
+            assert_eq!(
+                configs[0]["client_generation_id"],
+                json!(session.client_generation_id),
+                "{label}"
+            );
+            const CANONICAL_WIRE_PREFIX: &str = "viva1";
+            let credential = configs[0]["session_token"]
+                .as_str()
+                .expect("credential is a string");
+            assert_eq!(
+                credential.split('.').next(),
+                Some(CANONICAL_WIRE_PREFIX),
+                "{label}"
+            );
+            for wire_json in &session.client_sequence_json {
+                let frame: Value = serde_json::from_str(wire_json).expect("frame is JSON");
+                assert_eq!(
+                    frame["client_generation_id"],
+                    json!(session.client_generation_id),
+                    "{label}"
+                );
+            }
+
+            // Two distinct question turns with no identity reuse.
+            let started = session_events(session, "question_started");
+            assert_eq!(started.len(), 2, "{label}");
+            for (index, turn) in session.turns.iter().enumerate() {
+                assert_eq!(started[index]["turn_id"], json!(turn.turn_id), "{label}");
+                assert_eq!(
+                    started[index]["response_id"],
+                    json!(turn.response_id),
+                    "{label}"
+                );
+                assert_eq!(
+                    started[index]["question"]["question_id"],
+                    json!(turn.question_id),
+                    "{label}"
+                );
+            }
+            let turn_ids: std::collections::BTreeSet<&str> = session
+                .turns
+                .iter()
+                .map(|turn| turn.turn_id.as_str())
+                .collect();
+            let response_ids: std::collections::BTreeSet<&str> = session
+                .turns
+                .iter()
+                .map(|turn| turn.response_id.as_str())
+                .collect();
+            assert_eq!(turn_ids.len(), 2, "{label}");
+            assert_eq!(response_ids.len(), 2, "{label}");
+
+            // Turn one is a complete monotonic audio lifecycle.
+            let chunks = client_frames_of(session, "audio_chunk");
+            assert!(!chunks.is_empty(), "{label}");
+            for (index, chunk) in chunks.iter().enumerate() {
+                assert_eq!(chunk["sequence"], json!(index), "{label}");
+                assert_eq!(chunk["turn_id"], json!(session.turns[0].turn_id), "{label}");
+            }
+            let ends = client_frames_of(session, "audio_end");
+            assert_eq!(ends.len(), 1, "{label}");
+            assert_eq!(
+                ends[0]["final_sequence"],
+                json!(chunks.len() - 1),
+                "{label}"
+            );
+
+            // Turn two answers by typed intent and carries a citation challenge.
+            let intents = client_frames_of(session, "turn_intent");
+            assert_eq!(intents.len(), 2, "{label}");
+            for intent in &intents {
+                assert_eq!(
+                    intent["turn_id"],
+                    json!(session.turns[1].turn_id),
+                    "{label}"
+                );
+            }
+            assert_eq!(intents[0]["intent"]["kind"], json!("citation_challenge"));
+            assert_eq!(intents[1]["intent"]["kind"], json!("answer_text"));
+
+            // Typed, turn-scoped cancellation.
+            let cancels = client_frames_of(session, "cancel");
+            assert_eq!(cancels.len(), 1, "{label}");
+            assert_eq!(cancels[0]["turn_id"], json!(session.turns[0].turn_id));
+            let cancellations = session_events(session, "cancellation");
+            assert_eq!(cancellations.len(), 1, "{label}");
+            assert_eq!(
+                cancellations[0]["response_id"],
+                json!(session.turns[0].response_id)
+            );
+
+            // One evaluated path with a normal recap; one durable deferral that stays
+            // nonterminal and writes no grade, mastery, or review state.
+            let evaluated = session_events(session, "answer_evaluated");
+            assert_eq!(evaluated.len(), 1, "{label}");
+            assert_eq!(
+                evaluated[0]["response_id"],
+                json!(session.turns[0].response_id)
+            );
+            let deferred = session_events(session, "turn_deferred");
+            assert_eq!(deferred.len(), 1, "{label}");
+            assert_eq!(deferred[0]["turn_id"], json!(session.turns[1].turn_id));
+            assert_eq!(
+                deferred[0]["response_id"],
+                json!(session.turns[1].response_id)
+            );
+            assert_eq!(
+                deferred[0]["question_id"],
+                json!(session.turns[1].question_id)
+            );
+            for event in session_events(session, "concept_status") {
+                assert_eq!(event["response_id"], json!(session.turns[0].response_id));
+            }
+            let recaps = session_events(session, "recap_ready");
+            assert_eq!(recaps.len(), 1, "{label}");
+            assert_eq!(recaps[0]["partial"], json!(false), "{label}");
+            assert!(recaps[0].get("partial_reason").is_none(), "{label}");
+            assert_eq!(recaps[0]["recap"]["deferred_turns"], json!(deferred.len()));
+
+            // No fabricated transcript confidence.
+            let finals = session_events(session, "transcript_final");
+            assert!(!finals.is_empty(), "{label}");
+            for event in &finals {
+                assert_eq!(event["confidence"], Value::Null, "{label}");
+            }
+
+            // No credential, tool payload, or raw provider secret in server frames.
+            let rendered = session.server_sequence_json.join("\n");
+            for needle in [
+                CANONICAL_WIRE_PREFIX,
+                "tool_result",
+                "tool_proposal",
+                "Authorization",
+            ] {
+                assert!(!rendered.contains(needle), "{label} leaked {needle}");
+            }
+        }
+    }
 }
