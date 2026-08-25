@@ -1,0 +1,223 @@
+{
+  "schema": "viva.voice-server-event-cases.v1",
+  "protocol_version": 5,
+  "cases": [
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-QUESTION-STARTED-TURN-1",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"turn_id\":\"turn-1\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-QUESTION-STARTED-TURN-2",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question\":{\"question_id\":\"q-fixture-2\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-ANSWER-EVALUATED",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"answer_evaluated\",\"response_id\":\"response-1\",\"evaluation\":{\"question_id\":\"q-fixture-1\",\"answer_text\":\"Fixture answer.\",\"label\":\"mostly correct\",\"concise_feedback\":\"Fixture feedback.\",\"retry_prompt\":\"Fixture retry.\",\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"},\"concept_status\":\"strong\",\"confidence_score\":0.9}}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-DEFERRED-EMPTY-ANSWER-RETRYABLE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-1\",\"response_id\":\"response-1\",\"question_id\":\"question-1\",\"reason\":\"empty_answer\",\"can_retry_same_question\":true}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-DEFERRED-EMPTY-ANSWER-TERMINAL-FOR-QUESTION",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-7\",\"response_id\":\"response-7\",\"question_id\":\"question-7\",\"reason\":\"empty_answer\",\"can_retry_same_question\":false}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-DEFERRED-TRANSCRIPT-UNCERTAIN-RETRYABLE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"transcript_uncertain\",\"can_retry_same_question\":true}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-DEFERRED-TRANSCRIPT-UNCERTAIN-TERMINAL-FOR-QUESTION",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-8\",\"response_id\":\"response-8\",\"question_id\":\"question-8\",\"reason\":\"transcript_uncertain\",\"can_retry_same_question\":false}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-DEFERRED-EVALUATOR-UNAVAILABLE-RETRYABLE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-3\",\"response_id\":\"response-3\",\"question_id\":\"question-3\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-DEFERRED-EVALUATOR-UNAVAILABLE-TERMINAL-FOR-QUESTION",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-9\",\"response_id\":\"response-9\",\"question_id\":\"question-9\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":false}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-DEFERRED-INVALID-EVALUATOR-OUTPUT-RETRYABLE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-4\",\"response_id\":\"response-4\",\"question_id\":\"question-4\",\"reason\":\"invalid_evaluator_output\",\"can_retry_same_question\":true}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-DEFERRED-INVALID-EVALUATOR-OUTPUT-TERMINAL-FOR-QUESTION",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-10\",\"response_id\":\"response-10\",\"question_id\":\"question-10\",\"reason\":\"invalid_evaluator_output\",\"can_retry_same_question\":false}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-DEFERRED-INSUFFICIENT-SEMANTIC-EVIDENCE-RETRYABLE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-5\",\"response_id\":\"response-5\",\"question_id\":\"question-5\",\"reason\":\"insufficient_semantic_evidence\",\"can_retry_same_question\":true}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-DEFERRED-INSUFFICIENT-SEMANTIC-EVIDENCE-TERMINAL-FOR-QUESTION",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-11\",\"response_id\":\"response-11\",\"question_id\":\"question-11\",\"reason\":\"insufficient_semantic_evidence\",\"can_retry_same_question\":false}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-DEFERRED-CONTRADICTORY-EVIDENCE-RETRYABLE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-6\",\"response_id\":\"response-6\",\"question_id\":\"question-6\",\"reason\":\"contradictory_evidence\",\"can_retry_same_question\":true}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-VALID-DEFERRED-CONTRADICTORY-EVIDENCE-TERMINAL-FOR-QUESTION",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-12\",\"response_id\":\"response-12\",\"question_id\":\"question-12\",\"reason\":\"contradictory_evidence\",\"can_retry_same_question\":false}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-QUESTION-STARTED-WITHOUT-TURN",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.turn_id"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-WITHOUT-TURN",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.turn_id"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-WITHOUT-QUESTION",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.question_id"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-WITHOUT-RETRY-AFFORDANCE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.can_retry_same_question"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-UNKNOWN-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"provider_rate_limited\",\"can_retry_same_question\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.reason"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-ADAPTER-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"adapter_unavailable\",\"can_retry_same_question\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.reason"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-RETRYABLE-FIELD",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"retryable\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.retryable"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-TERMINAL-REASON-FIELD",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"terminal_reason\":\"provider_timeout\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.terminal_reason"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-PROVIDER-MESSAGE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"provider_message\":\"the evaluator said so\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.provider_message"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-FEEDBACK",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"feedback\":\"Nearly right.\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.feedback"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-CONFIDENCE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"confidence\":0.91}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.confidence"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-CONCEPT-STATUS",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"status\":\"strong\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.status"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-SCHEDULE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"schedule\":[]}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.schedule"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-MASTERY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"mastery\":1}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.mastery"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-RETRY-AFFORDANCE-TYPE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":\"yes\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.can_retry_same_question"
+    },
+    {
+      "id": "VOICE-TURN-OUTCOME-REJECT-DEFERRED-BLANK-TURN",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.turn_id"
+    }
+  ]
+}

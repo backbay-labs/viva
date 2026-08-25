@@ -326,6 +326,153 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /pushUnless\(missing, "bundle_signing_secret", stringOrNull\(env\.VIVA_RELEASE_BUNDLE_SIGNING_SECRET\) !== null\);/,
     ]),
   },
+  // A-12 (2026-08-25): coordinator-applied sanction rows for Plan 05's v5 wire
+  // contract sources. Every pattern is an anchored literal of a reviewed line;
+  // any new marker occurrence in these files still fails the audit. Plan 12
+  // reconciles at 12B.
+  {
+    file: "agent/crates/agent-service/src/protocol.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*"answer_text",\s*$/,
+      /^\s*require_wire_string\(evaluation\.get\("answer_text"\),\ format!\("\{path\}\.answer_text"\)\)\?;\s*$/,
+      /^\s*Some\("answer_text"\)\ =>\ \{\s*$/,
+      /^\s*ClientTurnIntent::AnswerText\ \{\ \.\.\ \}\ =>\ "answer_text",\s*$/,
+      /^\s*let\ answer_text\ =\ fixture\.client\[1\]\["text"\]\s*$/,
+      /^\s*\.send\(BrainInput::Text\(answer_text\)\)\s*$/,
+      /^\s*"intent":\ \{\ "kind":\ "answer_text",\ "text":\ "NADH\ donates\ electrons\."\ \},\s*$/,
+      /^\s*assert_eq!\(intents\[1\]\["intent"\]\["kind"\],\ json!\("answer_text"\)\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/protocol.rs",
+    marker: "pcm16_base64",
+    patterns: Object.freeze([
+      /^\s*const\ PCM16_BASE64_PATH:\ \&str\ =\ "\$\.frame\.pcm16_base64";\s*$/,
+      /^\s*require_only_wire_keys\(frame,\ \&\["pcm16_base64"\],\ \&format!\("\{path\}\.frame"\)\)\?;\s*$/,
+      /^\s*frame\.get\("pcm16_base64"\),\s*$/,
+      /^\s*format!\("\{path\}\.frame\.pcm16_base64"\),\s*$/,
+      /^\s*\/\/\/\ Decodes\ `frame\.pcm16_base64`\ only\ long\ enough\ to\ enforce\ canonical\ padded\ base64\s*$/,
+      /^\s*require_only_wire_keys\(frame,\ \&\["pcm16_base64"\],\ "\$\.frame"\)\?;\s*$/,
+      /^\s*let\ Some\(encoded\)\ =\ frame\.get\("pcm16_base64"\)\ else\ \{\s*$/,
+      /^\s*PCM16_BASE64_PATH,\s*$/,
+      /^\s*VoiceProtocolDiagnostic::new\(VoiceProtocolDiagnosticCode::InvalidField,\ PCM16_BASE64_PATH\)\s*$/,
+      /^\s*\/\/\/\ `pcm16_base64`\ is\ standard\ RFC\ 4648\ base64\ with\ padding\.\ Re\-encoding\ the\ decoded\s*$/,
+      /^\s*"frame":\ \{\ "pcm16_base64":\ "AQIDBA=="\ \}\s*$/,
+      /^\s*"frame":\ \{\ "pcm16_base64":\ encoded\ \},\s*$/,
+      /^\s*assert_eq!\(diagnostic\.path,\ "\$\.frame\.pcm16_base64"\);\s*$/,
+      /^\s*"frame":\ \{\ "pcm16_base64":\ "AQIDBA=="\ \},\s*$/,
+      /^\s*let\ encoded\ =\ value\["frame"\]\["pcm16_base64"\]\s*$/,
+      /^\s*assert_eq!\(audio_case\.path\.as_deref\(\),\ Some\("\$\.frame\.pcm16_base64"\)\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/protocol.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*const\ SESSION_CREDENTIAL_KEY:\ \&str\ =\ "session_token";\s*$/,
+      /^\s*session_token:\ String,\s*$/,
+      /^\s*let\ credential\ =\ configs\[0\]\["session_token"\]\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/protocol.rs",
+    marker: "source_context",
+    patterns: Object.freeze([
+      /^\s*"source_context",\s*$/,
+      /^\s*const\ SOURCE_CONTEXT_KEYS:\ \[\&str;\ 6\]\ =\ \[\s*$/,
+      /^\s*const\ SOURCE_REFERENCE_KEYS:\ \[\&str;\ 6\]\ =\ SOURCE_CONTEXT_KEYS;\s*$/,
+      /^\s*require_wire_array\(session\.get\("source_context"\),\ "\$\.session\.source_context"\)\?\s*$/,
+      /^\s*let\ path\ =\ format!\("\$\.session\.source_context\[\{index\}\]"\);\s*$/,
+      /^\s*require_only_wire_keys\(source,\ \&SOURCE_CONTEXT_KEYS,\ \&path\)\?;\s*$/,
+      /^\s*"source_context"\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/protocol.rs",
+    marker: "transcript_final",
+    patterns: Object.freeze([
+      /^\s*"transcript_final",\s*$/,
+      /^\s*"transcript_final"\ =>\ \{\s*$/,
+      /^\s*let\ finals\ =\ session_events\(session,\ "transcript_final"\);\s*$/,
+    ]),
+  },
+  {
+    file: "packages/core/src/agent-contract.ts",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*answer_text:\ string;\s*$/,
+      /^\s*\|\ \{\ kind:\ "answer_text";\ text:\ string\ \}\s*$/,
+      /^\s*"answer_text",\s*$/,
+      /^\s*answer_text:\ requireStringAt\(evaluation\.answer_text,\ `\$\{path\}\.answer_text`\),\s*$/,
+      /^\s*if\ \(intent\.kind\ ===\ "answer_text"\)\ \{\s*$/,
+      /^\s*return\ \{\ kind:\ "answer_text",\ text:\ requireStringAt\(intent\.text,\ "\$\.intent\.text"\)\ \};\s*$/,
+    ]),
+  },
+  {
+    file: "packages/core/src/agent-contract.ts",
+    marker: "pcm16_base64",
+    patterns: Object.freeze([
+      /^\s*pcm16_base64:\ string;\s*$/,
+      /^\s*frame:\ \{\ pcm16_base64:\ string\ \};\s*$/,
+      /^\s*frame:\ \{\ pcm16_base64:\ input\.pcm16Base64\ \},\s*$/,
+      /^\s*requireOnlyWireKeys\(frame,\ \["pcm16_base64"\],\ path\);\s*$/,
+      /^\s*return\ \{\ pcm16_base64:\ requireNonEmptyStringAt\(frame\.pcm16_base64,\ `\$\{path\}\.pcm16_base64`\)\ \};\s*$/,
+      /^\s*const\ PCM16_BASE64_PATH\ =\ "\$\.frame\.pcm16_base64";\s*$/,
+      /^\s*\*\ Decodes\ `frame\.pcm16_base64`\ only\ long\ enough\ to\ enforce\ canonical\ padded\ base64\ and\s*$/,
+      /^\s*requireOnlyWireKeys\(frame,\ \["pcm16_base64"\],\ "\$\.frame"\);\s*$/,
+      /^\s*if\ \(!\("pcm16_base64"\ in\ frame\)\)\ \{\s*$/,
+      /^\s*PCM16_BASE64_PATH,\s*$/,
+      /^\s*"Missing\ pcm16_base64",\s*$/,
+      /^\s*"Invalid\ pcm16_base64",\s*$/,
+      /^\s*const\ encoded\ =\ frame\.pcm16_base64;\s*$/,
+      /^\s*return\ \{\ pcm16_base64:\ encoded\ \};\s*$/,
+      /^\s*\*\ `pcm16_base64`\ is\ standard\ RFC\ 4648\ base64\ with\ padding\.\ Re\-encoding\ the\ decoded\s*$/,
+    ]),
+  },
+  {
+    file: "packages/core/src/agent-contract.ts",
+    marker: "prompt",
+    patterns: Object.freeze([
+      /^\s*prompt:\ string;\s*$/,
+      /^\s*retry_prompt:\ string;\s*$/,
+      /^\s*\["question_id",\ "concept_id",\ "prompt",\ "expected_terms",\ "follow_up",\ "rubric",\ "source"\],\s*$/,
+      /^\s*prompt:\ requireNonEmptyStringAt\(question\.prompt,\ `\$\{path\}\.prompt`\),\s*$/,
+      /^\s*"retry_prompt",\s*$/,
+      /^\s*retry_prompt:\ requireNonEmptyStringAt\(evaluation\.retry_prompt,\ `\$\{path\}\.retry_prompt`\),\s*$/,
+    ]),
+  },
+  {
+    file: "packages/core/src/agent-contract.ts",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*const\ SESSION_CREDENTIAL_KEY\ =\ "session_token";\s*$/,
+      /^\s*session_token:\ string;\s*$/,
+      /^\s*session_token:\ signedCredential,\s*$/,
+      /^\s*session_token:\ requireWireCredential\(frame\[SESSION_CREDENTIAL_KEY\]\),\s*$/,
+    ]),
+  },
+  {
+    file: "packages/core/src/agent-contract.ts",
+    marker: "source_context",
+    patterns: Object.freeze([
+      /^\s*source_context:\ AgentSourceContext\[\];\s*$/,
+      /^\s*"source_context",\s*$/,
+      /^\s*source_context:\ requireArrayAt\(session\.source_context,\ "\$\.session\.source_context"\)\.map\(\s*$/,
+      /^\s*\(source,\ index\)\ =>\ parseSourceContext\(source,\ `\$\.session\.source_context\[\$\{index\}\]`\),\s*$/,
+      /^\s*source_context:\ config\.source_context,\s*$/,
+    ]),
+  },
+  {
+    file: "packages/core/src/agent-contract.ts",
+    marker: "transcript_final",
+    patterns: Object.freeze([
+      /^\s*type:\ "transcript_final";\s*$/,
+      /^\s*"transcript_final",\s*$/,
+      /^\s*case\ "transcript_final":\s*$/,
+      /^\s*type:\ "transcript_final",\s*$/,
+    ]),
+  },
 ]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);

@@ -1,0 +1,104 @@
+{
+  "schema": "viva.voice-client-frame-cases.v1",
+  "protocol_version": 5,
+  "cases": [
+    {
+      "id": "VOICE-TURN-INTENT-VALID-ANSWER-TEXT",
+      "wire_json": "{\"type\":\"turn_intent\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"turn-1\",\"intent\":{\"kind\":\"answer_text\",\"text\":\"Fixture answer.\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-INTENT-VALID-ANSWER-TEXT-SECOND-TURN",
+      "wire_json": "{\"type\":\"turn_intent\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"turn-2\",\"intent\":{\"kind\":\"answer_text\",\"text\":\"Second fixture answer.\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-INTENT-VALID-CITATION-CHALLENGE",
+      "wire_json": "{\"type\":\"turn_intent\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"turn-2\",\"intent\":{\"kind\":\"citation_challenge\",\"response_id\":\"response-2\",\"source_id\":\"src-lecture-5-slide-18\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-INTENT-VALID-CITATION-CHALLENGE-FIRST-TURN",
+      "wire_json": "{\"type\":\"turn_intent\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"turn-1\",\"intent\":{\"kind\":\"citation_challenge\",\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-INTENT-REJECT-PLAIN-TEXT-FRAME",
+      "wire_json": "{\"type\":\"text\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"text\":\"Fixture answer.\"}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FRAME",
+      "path": "$.type"
+    },
+    {
+      "id": "VOICE-TURN-INTENT-VALID-LEGACY-SENTINEL-IS-ORDINARY-TEXT",
+      "wire_json": "{\"type\":\"turn_intent\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"turn-1\",\"intent\":{\"kind\":\"answer_text\",\"text\":\"(challenge citation)\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-INTENT-REJECT-MISSING-TURN",
+      "wire_json": "{\"type\":\"turn_intent\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"intent\":{\"kind\":\"answer_text\",\"text\":\"Fixture answer.\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.turn_id"
+    },
+    {
+      "id": "VOICE-TURN-INTENT-REJECT-MISSING-INTENT",
+      "wire_json": "{\"type\":\"turn_intent\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"turn-1\"}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.intent"
+    },
+    {
+      "id": "VOICE-TURN-INTENT-REJECT-MISSING-KIND",
+      "wire_json": "{\"type\":\"turn_intent\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"turn-1\",\"intent\":{\"text\":\"Fixture answer.\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.intent.kind"
+    },
+    {
+      "id": "VOICE-TURN-INTENT-REJECT-CHALLENGE-CARRYING-ANSWER",
+      "wire_json": "{\"type\":\"turn_intent\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"turn-2\",\"intent\":{\"kind\":\"citation_challenge\",\"response_id\":\"response-2\",\"source_id\":\"src-lecture-5-slide-18\",\"text\":\"Fixture answer.\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.intent.text"
+    },
+    {
+      "id": "VOICE-TURN-INTENT-REJECT-ANSWER-CARRYING-SOURCE",
+      "wire_json": "{\"type\":\"turn_intent\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"turn-1\",\"intent\":{\"kind\":\"answer_text\",\"text\":\"Fixture answer.\",\"source_id\":\"src-lecture-5-slide-18\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.intent.source_id"
+    },
+    {
+      "id": "VOICE-TURN-INTENT-REJECT-CHALLENGE-MISSING-SOURCE",
+      "wire_json": "{\"type\":\"turn_intent\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"turn-2\",\"intent\":{\"kind\":\"citation_challenge\",\"response_id\":\"response-2\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.intent.source_id"
+    },
+    {
+      "id": "VOICE-TURN-INTENT-VALID-BLANK-ANSWER-DEFERS-NOT-REJECTS",
+      "wire_json": "{\"type\":\"turn_intent\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"turn-1\",\"intent\":{\"kind\":\"answer_text\",\"text\":\"   \"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-TURN-INTENT-REJECT-V4",
+      "wire_json": "{\"type\":\"turn_intent\",\"version\":4,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"turn-1\",\"intent\":{\"kind\":\"answer_text\",\"text\":\"Fixture answer.\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNSUPPORTED_VERSION",
+      "path": "$.version"
+    }
+  ]
+}

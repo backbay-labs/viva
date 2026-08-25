@@ -1,0 +1,244 @@
+{
+  "version": 1,
+  "fake_secret_base64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "clock_unix_seconds": 1800000300,
+  "cases": [
+    {
+      "id": "VOICE-TOKEN-VALID-CANONICAL",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDAxIn0.JcnhtQUxeV1XJm0RYGo7LuL5yph5SeRaFch8-Iz8_rA",
+      "claims": {
+        "user_id": "fixture-user",
+        "study_set_id": "fixture-study-set",
+        "session_id": "fixture-session",
+        "issued_at": 1800000000,
+        "not_before": 1800000000,
+        "expires_at": 1800000900,
+        "nonce": "fixture-nonce-001"
+      },
+      "valid": true,
+      "rejection": null
+    },
+    {
+      "id": "VOICE-TOKEN-VALID-FAILURE-CONTROL",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDAyIiwiZmFpbHVyZV9jb250cm9sIjp7InNjZW5hcmlvIjoicHJvdmlkZXJfcmF0ZV9saW1pdGVkIiwicnVuX2lkIjoiZml4dHVyZS1ydW4tMDAxIiwiZXhwaXJlc19hdCI6MTgwMDAwMDkwMCwibm9uY2UiOiJmaXh0dXJlLWZhaWx1cmUtbm9uY2UtMDAxIiwic2lnbmF0dXJlIjoiWm1GclpTMW1ZV2xzZFhKbExXTnZiblJ5YjJ3dGMybG5ibUYwZFhKbExUQXdNUSJ9fQ.DNaVLoVmsObfP3yLccyR3fa_u8HnIeKQRWXj-Ixc6N4",
+      "claims": {
+        "user_id": "fixture-user",
+        "study_set_id": "fixture-study-set",
+        "session_id": "fixture-session",
+        "issued_at": 1800000000,
+        "not_before": 1800000000,
+        "expires_at": 1800000900,
+        "nonce": "fixture-nonce-002",
+        "failure_control": {
+          "scenario": "provider_rate_limited",
+          "run_id": "fixture-run-001",
+          "expires_at": 1800000900,
+          "nonce": "fixture-failure-nonce-001",
+          "signature": "ZmFrZS1mYWlsdXJlLWNvbnRyb2wtc2lnbmF0dXJlLTAwMQ"
+        }
+      },
+      "valid": true,
+      "rejection": null
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-SEGMENT-SHAPE",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDAxIn0",
+      "claims": null,
+      "valid": false,
+      "rejection": "malformed_shape"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-WRONG-PREFIX",
+      "token": "viva2.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDAxIn0.JcnhtQUxeV1XJm0RYGo7LuL5yph5SeRaFch8-Iz8_rA",
+      "claims": null,
+      "valid": false,
+      "rejection": "malformed_shape"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-PADDED-CLAIMS",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDAxIn0=.TOjBSS2zDPhZ6BLJRJcC7kvo_uFgn5iKbTrALKHWQfs",
+      "claims": null,
+      "valid": false,
+      "rejection": "noncanonical_base64url"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-PADDED-SIGNATURE",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDAxIn0.JcnhtQUxeV1XJm0RYGo7LuL5yph5SeRaFch8-Iz8_rA=",
+      "claims": null,
+      "valid": false,
+      "rejection": "noncanonical_base64url"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-NONCANONICAL-BASE64URL",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDAxIn3.Fn1Qr7mW-ad7KfeWzxBHn75ztC-wOhaABF9C6YQjLpg",
+      "claims": null,
+      "valid": false,
+      "rejection": "noncanonical_base64url"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-UNKNOWN-CLAIM",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDAzIiwicm9sZSI6ImZpeHR1cmUtYWRtaW4ifQ.-yT09Gde3Jl0pkH_kFK5FgwstUp2Fx4Ncg05K5LhDNU",
+      "claims": {
+        "user_id": "fixture-user",
+        "study_set_id": "fixture-study-set",
+        "session_id": "fixture-session",
+        "issued_at": 1800000000,
+        "not_before": 1800000000,
+        "expires_at": 1800000900,
+        "nonce": "fixture-nonce-003",
+        "role": "fixture-admin"
+      },
+      "valid": false,
+      "rejection": "unknown_claim"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-UNKNOWN-FAILURE-CONTROL-CLAIM",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDA0IiwiZmFpbHVyZV9jb250cm9sIjp7InNjZW5hcmlvIjoicHJvdmlkZXJfcmF0ZV9saW1pdGVkIiwicnVuX2lkIjoiZml4dHVyZS1ydW4tMDAyIiwiZXhwaXJlc19hdCI6MTgwMDAwMDkwMCwibm9uY2UiOiJmaXh0dXJlLWZhaWx1cmUtbm9uY2UtMDAyIiwic2lnbmF0dXJlIjoiWm1GclpTMW1ZV2xzZFhKbExXTnZiblJ5YjJ3dGMybG5ibUYwZFhKbExUQXdNZyIsIm9yaWdpbiI6Imh0dHBzOi8vZml4dHVyZS5pbnZhbGlkIn19.x8n4L_7iUxlRityw-hzLMnNpYJGfn1lGd3vcNObincY",
+      "claims": {
+        "user_id": "fixture-user",
+        "study_set_id": "fixture-study-set",
+        "session_id": "fixture-session",
+        "issued_at": 1800000000,
+        "not_before": 1800000000,
+        "expires_at": 1800000900,
+        "nonce": "fixture-nonce-004",
+        "failure_control": {
+          "scenario": "provider_rate_limited",
+          "run_id": "fixture-run-002",
+          "expires_at": 1800000900,
+          "nonce": "fixture-failure-nonce-002",
+          "signature": "ZmFrZS1mYWlsdXJlLWNvbnRyb2wtc2lnbmF0dXJlLTAwMg",
+          "origin": "https://fixture.invalid"
+        }
+      },
+      "valid": false,
+      "rejection": "unknown_claim"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-BAD-HMAC",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDAxIn0.EAA1S6X0QmDCRSPa3QuOpZBrOOfxtNiBdPhc5CEDh7g",
+      "claims": null,
+      "valid": false,
+      "rejection": "invalid_signature"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-MALFORMED-JSON",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiw.-NuFVcqTBQnVSQ49NJBncGGaM02Nv-awo-XsZ77JnGQ",
+      "claims": null,
+      "valid": false,
+      "rejection": "malformed_json"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-DUPLICATE-JSON-KEY",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDA1Iiwibm9uY2UiOiJmaXh0dXJlLW5vbmNlLTAwNiJ9.-6eyGK5eLpFF3DqT4FtgbXvnqaTOFDKLchjBSTMkERY",
+      "claims": null,
+      "valid": false,
+      "rejection": "duplicate_claim"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-NOT-BEFORE",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwNjAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDA3In0.8FhKFNp1ubS72zDgaiaAa5EyTf8xUIjdvutn4qFk8aE",
+      "claims": {
+        "user_id": "fixture-user",
+        "study_set_id": "fixture-study-set",
+        "session_id": "fixture-session",
+        "issued_at": 1800000000,
+        "not_before": 1800000600,
+        "expires_at": 1800000900,
+        "nonce": "fixture-nonce-007"
+      },
+      "valid": false,
+      "rejection": "not_yet_valid"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-EXPIRES-AT",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxNzk5OTk5NDAwLCJub3RfYmVmb3JlIjoxNzk5OTk5NDAwLCJleHBpcmVzX2F0IjoxODAwMDAwMzAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDA4In0.zliILUBQ2DPSLdr8aD_5gSF3Ma9fPnVotZCVowuqqU0",
+      "claims": {
+        "user_id": "fixture-user",
+        "study_set_id": "fixture-study-set",
+        "session_id": "fixture-session",
+        "issued_at": 1799999400,
+        "not_before": 1799999400,
+        "expires_at": 1800000300,
+        "nonce": "fixture-nonce-008"
+      },
+      "valid": false,
+      "rejection": "expired"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-ISSUED-ORDER",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwNjAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDA5In0.ScVd0eFpcPVhKfSRYRu1d3qKzDICI0ifaghsCYFsNyY",
+      "claims": {
+        "user_id": "fixture-user",
+        "study_set_id": "fixture-study-set",
+        "session_id": "fixture-session",
+        "issued_at": 1800000600,
+        "not_before": 1800000000,
+        "expires_at": 1800000900,
+        "nonce": "fixture-nonce-009"
+      },
+      "valid": false,
+      "rejection": "invalid_time_order"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-USER-BINDING",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyLW90aGVyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDEwIn0._LQBzN2QFyIRNg_qyJqlJT5eXQ9S9UKJt8DSJep0B_A",
+      "claims": {
+        "user_id": "fixture-user-other",
+        "study_set_id": "fixture-study-set",
+        "session_id": "fixture-session",
+        "issued_at": 1800000000,
+        "not_before": 1800000000,
+        "expires_at": 1800000900,
+        "nonce": "fixture-nonce-010"
+      },
+      "valid": false,
+      "rejection": "binding_mismatch"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-STUDY-SET-BINDING",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQtb3RoZXIiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDExIn0.RCOqCawGmi9-PBcGFd1FbmNU4BvDvOBMc3v-AIFCD3Q",
+      "claims": {
+        "user_id": "fixture-user",
+        "study_set_id": "fixture-study-set-other",
+        "session_id": "fixture-session",
+        "issued_at": 1800000000,
+        "not_before": 1800000000,
+        "expires_at": 1800000900,
+        "nonce": "fixture-nonce-011"
+      },
+      "valid": false,
+      "rejection": "binding_mismatch"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-SESSION-BINDING",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uLW90aGVyIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDEyIn0.lhyzi2J9dpHZyCwmYH51onniYxGrbEt1FX5qWyNC9DA",
+      "claims": {
+        "user_id": "fixture-user",
+        "study_set_id": "fixture-study-set",
+        "session_id": "fixture-session-other",
+        "issued_at": 1800000000,
+        "not_before": 1800000000,
+        "expires_at": 1800000900,
+        "nonce": "fixture-nonce-012"
+      },
+      "valid": false,
+      "rejection": "binding_mismatch"
+    },
+    {
+      "id": "VOICE-TOKEN-REJECT-EMPTY-NONCE",
+      "token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6IiJ9.MHeMON4WolCt8Tv_rDubWXSanYEsjOxUDuCNHUQkMxA",
+      "claims": {
+        "user_id": "fixture-user",
+        "study_set_id": "fixture-study-set",
+        "session_id": "fixture-session",
+        "issued_at": 1800000000,
+        "not_before": 1800000000,
+        "expires_at": 1800000900,
+        "nonce": ""
+      },
+      "valid": false,
+      "rejection": "missing_claim"
+    }
+  ]
+}

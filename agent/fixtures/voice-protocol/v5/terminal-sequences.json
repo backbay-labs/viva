@@ -1,0 +1,84 @@
+{
+  "schema": "viva.voice-terminal-sequences.v1",
+  "protocol_version": 5,
+  "sequences": [
+    {
+      "id": "VOICE-TERMINAL-PARTIAL-RECAP-THEN-PHASE",
+      "terminal_reason": "provider_timeout",
+      "terminal_at_index": 0,
+      "wire_sequence_json": [
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":true,\"partial_reason\":\"provider_timeout\"}}",
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"session_phase\",\"phase\":\"recap\",\"terminal_reason\":\"provider_timeout\"}}"
+      ]
+    },
+    {
+      "id": "VOICE-TERMINAL-PARTIAL-RECAP-TRAILING-PHASE-LOST",
+      "terminal_reason": "provider_timeout",
+      "terminal_at_index": 0,
+      "wire_sequence_json": [
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":true,\"partial_reason\":\"provider_timeout\"}}"
+      ]
+    },
+    {
+      "id": "VOICE-TERMINAL-STRUCTURED-ERROR-THEN-PHASE",
+      "terminal_reason": "provider_malformed_stream",
+      "terminal_at_index": 0,
+      "wire_sequence_json": [
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_PROVIDER_FAILURE\",\"message\":\"Provider stream failed.\",\"terminality\":\"terminal\",\"terminal_reason\":\"provider_malformed_stream\"}}",
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"session_phase\",\"phase\":\"recap\",\"terminal_reason\":\"provider_malformed_stream\"}}"
+      ]
+    },
+    {
+      "id": "VOICE-TERMINAL-STRUCTURED-ERROR-TRAILING-PHASE-LOST",
+      "terminal_reason": "provider_malformed_stream",
+      "terminal_at_index": 0,
+      "wire_sequence_json": [
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_PROVIDER_FAILURE\",\"message\":\"Provider stream failed.\",\"terminality\":\"terminal\",\"terminal_reason\":\"provider_malformed_stream\"}}"
+      ]
+    },
+    {
+      "id": "VOICE-TERMINAL-SESSION-PHASE-ONLY",
+      "terminal_reason": "drained",
+      "terminal_at_index": 1,
+      "wire_sequence_json": [
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"session_phase\",\"phase\":\"recap\"}}",
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"session_phase\",\"phase\":\"recap\",\"terminal_reason\":\"drained\"}}"
+      ]
+    },
+    {
+      "id": "VOICE-RECOVERABLE-SESSION-REFRESH-POLICY-DENIED",
+      "terminal_reason": null,
+      "terminal_at_index": null,
+      "wire_sequence_json": [
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_SESSION_REFRESH_POLICY_DENIED\",\"message\":\"Session refresh is not authorized.\",\"terminality\":\"recoverable\"}}",
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"session_phase\",\"phase\":\"listening\"}}"
+      ]
+    },
+    {
+      "id": "VOICE-RECOVERABLE-TELEMETRY-SUPPRESSED",
+      "terminal_reason": null,
+      "terminal_at_index": null,
+      "wire_sequence_json": [
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_TELEMETRY_EVENT_SUPPRESSED\",\"message\":\"telemetry event suppressed\",\"terminality\":\"recoverable\"}}"
+      ]
+    },
+    {
+      "id": "VOICE-NONTERMINAL-COMPLETE-RECAP",
+      "terminal_reason": null,
+      "terminal_at_index": null,
+      "wire_sequence_json": [
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":false}}"
+      ]
+    },
+    {
+      "id": "VOICE-NONTERMINAL-TURN-DEFERRED",
+      "terminal_reason": null,
+      "terminal_at_index": null,
+      "wire_sequence_json": [
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question\":{\"question_id\":\"q-fixture-2\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true}}",
+        "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"session_phase\",\"phase\":\"listening\"}}"
+      ]
+    }
+  ]
+}

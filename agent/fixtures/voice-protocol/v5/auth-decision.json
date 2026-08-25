@@ -1,0 +1,10 @@
+{
+  "decision": "D-07 TOKEN_ONLY_REFRESH",
+  "branch": "retain-token-only",
+  "direct_browser_wss": true,
+  "preupgrade_auth": "signed_session_access_token",
+  "first_frame_auth": "same_signed_session_access_token",
+  "refresh_mode": "rotating_one_time_hashed_credential",
+  "browser_refresh_absolute_lifetime_required": true,
+  "in_socket_token_refresh": false
+}

@@ -1,0 +1,9 @@
+{
+  "type": "session_refresh",
+  "version": 5,
+  "client_generation_id": "viva-session-bootstrap-1-fixture",
+  "context": {
+    "mode": "quiz",
+    "initial_goal": "Review the fixture source."
+  }
+}

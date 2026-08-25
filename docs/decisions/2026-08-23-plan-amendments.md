@@ -90,3 +90,22 @@ Plan 06's ownership boundary ("never modify study/tools/tool_executor.rs") is cr
 
 1. **Task 7 policy-test commit re-sequenced**: `scripts/rust-domain-quality-policy.test.mjs` asserts Plan 12B's `agent:deps:unused`/`agent:domain:mutants` commands and is red until they exist; Plan 06 Task 7 Step 5 itself gates that commit to "the same integration wave as 12b (or later)". The coordinator's earlier dispatch pulled it forward in error; the commit stays on lane 06's branch and merges at the 12B wave. The node-06-second-PR admission excludes it.
 2. **Task 8 pattern defect (pre-recorded for its future dispatch)**: Task 8 Step 1's CONFIRM_DELETE absence grep includes `chrono\.workspace`, which now legitimately matches agent-domain's Cargo.toml because Plan 03's D-01 seam declares chrono. When Task 8 dispatches, the pattern reads as amended to drop `chrono\.workspace` (keeping `uuid\.workspace`).
+
+## A-12 (2026-08-25) — Node 05 admission: redaction sanction rows, audit maxBuffer, export fence, and consumer-fixture edits
+
+Four ratifications attached to the node 05 merge:
+1. **Sanction rows (Plan-12 file, coordinator-applied):** `scripts/redaction-control.mjs` gains SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES rows for `agent/crates/agent-service/src/protocol.rs` and `packages/core/src/agent-contract.ts` — 77 anchored literal patterns, one per reviewed line carrying a plan-pinned v5 wire field name (pcm16_base64, source_context, answer_text, session_token, transcript_final, prompt). The mechanism mirrors the existing ws.rs/config.rs rows; any NEW marker occurrence in these files still fails the audit. Plan 05's lane correctly refused to edit Plan 12's file or obfuscate field access.
+2. **Audit defect fix (Plan-12 file):** `scripts/redaction-control-check.mjs` gains maxBuffer on its git-diff call — Node's 1 MiB default truncated large lane diffs into a hard "Unable to compute redaction diff" error.
+3. **Export fence:** `agent-service/src/lib.rs`'s `pub use protocol::{…}` extension (negotiation fn, advertisement, diagnostics, supported-versions) is ratified — `mod protocol` is private and VOICE-VERSION-001's "Rust exposes" requirement forces the fence; Plan 08 preserves it.
+4. **Consumer-fixture edits:** two Plan-10-owned test files (`viva-session-projection.test.ts`, `LiveSessionShell.test.tsx`) each gained exactly two lines (advertisement import + `protocol:` field in the local ready() helper) — compile-forced by the v5 ready contract, A-08 precedent; Plan 10 owns both wholesale at node 10. Making `protocol` optional was rejected as contract weakening.
+
+## W-05 (2026-08-25) — Known-red window: Plan-10-owned web client vs the v5 contract, between nodes 05 and 10
+
+Node 05's tightened shared contract (v2 recap shape, quiz-only mode, VivaErrorFrame without `message`, v5 client-frame union with `turn_intent` replacing `"text"`, StudyQuestion `concept_id`/`rubric`) breaks the not-yet-migrated Plan-10 web client — the designed web-side twin of the Rust consumer-compile window (adapters/service/data vs Plan 06). The live send-path migration is exactly Plan 10's node-10 scope (the DAG orders 10 after 05 for this reason); a coordinator bridge would do Plan 10's work ad hoc without its RED/GREEN discipline and is rejected.
+
+**Recorded window, from the node 05 merge until the node 10 merge:**
+- `apps/web` typecheck: exactly 20 errors in exactly three files — `lib/use-viva-agent-session.ts` (10), `lib/viva-agent-client.ts` (5), `lib/viva-agent-client.test.ts` (5).
+- `apps/web` test suite: exactly 19 failures confined to four suites — Viva agent browser client, useVivaAgentSession adapter, Viva display state, bounded audio turn ledger (exact names in the coordinator log).
+- `apps/web` production build is red for the same type errors.
+
+Any typecheck error, test failure, or build failure outside this enumeration blocks normally. Intermediate merge gates (07/09/08/11) scope their web checks accordingly; node 11's own files must still typecheck clean. Expires at node 10, which must restore full web green.

@@ -1,0 +1,580 @@
+{
+  "schema": "viva.voice-differential-cases.v1",
+  "protocol_version": 5,
+  "cases": [
+    {
+      "id": "VOICE-SERVER-VALID-READY",
+      "wire_json": "{\"type\":\"ready\",\"version\":5,\"protocol\":{\"preferred_version\":5,\"supported_versions\":[5]},\"sample_rate_hz\":24000,\"input_encoding\":\"pcm_s16le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":true,\"selectable\":true,\"live_runtime\":false},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"durable\":false,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-AUDIO-TURN-ACCEPTED",
+      "wire_json": "{\"type\":\"audio_turn_accepted\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"turn-1\",\"final_sequence\":0}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-ERROR-AUTH-EXPIRED",
+      "wire_json": "{\"type\":\"error\",\"version\":5,\"error\":{\"code\":\"VOICE_AUTH_EXPIRED\",\"message\":\"Fixture message.\",\"retryable\":true}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-ERROR-FRAME-MALFORMED",
+      "wire_json": "{\"type\":\"error\",\"version\":5,\"error\":{\"code\":\"VOICE_CLIENT_FRAME_MALFORMED\",\"message\":\"Fixture message.\",\"retryable\":false}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-SESSION-PHASE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"session_phase\",\"phase\":\"listening\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-SESSION-PHASE-TERMINAL",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"session_phase\",\"phase\":\"recap\",\"terminal_reason\":\"drained\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-QUESTION-STARTED",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"turn_id\":\"turn-1\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-TRANSCRIPT-DELTA",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"transcript_delta\",\"response_id\":\"response-1\",\"text\":\"Fixture delta.\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-TRANSCRIPT-FINAL-NULL-CONFIDENCE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"transcript_final\",\"response_id\":\"response-1\",\"text\":\"Fixture final.\",\"confidence\":null}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-TRANSCRIPT-FINAL-PROVIDER-CONFIDENCE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"transcript_final\",\"response_id\":\"response-1\",\"text\":\"Fixture final.\",\"confidence\":0.5}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-ANSWER-EVALUATED",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"answer_evaluated\",\"response_id\":\"response-1\",\"evaluation\":{\"question_id\":\"q-fixture-1\",\"answer_text\":\"Fixture answer.\",\"label\":\"mostly correct\",\"concise_feedback\":\"Fixture feedback.\",\"retry_prompt\":\"Fixture retry.\",\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"},\"concept_status\":\"strong\",\"confidence_score\":0.9}}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-SOURCE-REFERENCE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"source_reference\",\"response_id\":\"response-1\",\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-CONCEPT-STATUS",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"concept_status\",\"response_id\":\"response-1\",\"concept_id\":\"concept-fixture-1\",\"status\":\"strong\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-MANUSCRIPT-SCENE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"manuscript_intent\",\"response_id\":\"response-1\",\"intent\":{\"type\":\"scene_intent\",\"register\":\"examining\",\"emphasis\":\"measured\"}}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-MANUSCRIPT-ENTITY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"manuscript_intent\",\"response_id\":\"response-1\",\"intent\":{\"type\":\"entity_intent\",\"entity_id\":\"concept-fixture-1\",\"entity_kind\":\"concept\",\"register\":\"reflecting\",\"emphasis\":\"marked\"}}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-MANUSCRIPT-MARGINALIA",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"manuscript_intent\",\"response_id\":\"response-1\",\"intent\":{\"type\":\"marginalia_intent\",\"marginalia_id\":\"note-fixture-1\",\"anchor_entity_id\":\"concept-fixture-1\",\"register\":\"sourcing\",\"emphasis\":\"quiet\"}}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-RECAP-READY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":false}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-RECAP-READY-PARTIAL",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":true,\"partial_reason\":\"provider_timeout\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-AUDIO-DELTA",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"audio_delta\",\"response_id\":\"response-1\",\"frame\":{\"pcm16_base64\":\"AQIDBA==\"}}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-CANCELLATION-NULL",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"cancellation\",\"response_id\":null}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-CANCELLATION-SCOPED",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"cancellation\",\"response_id\":\"response-1\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-STRUCTURED-ERROR",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_TELEMETRY_EVENT_SUPPRESSED\",\"message\":\"telemetry event suppressed\",\"terminality\":\"recoverable\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-STRUCTURED-ERROR-TERMINAL",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_PROVIDER_FAILURE\",\"message\":\"Provider stream failed.\",\"terminality\":\"terminal\",\"terminal_reason\":\"provider_malformed_stream\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-TURN-DEFERRED",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-MALFORMED-JSON",
+      "wire_json": "{\"type\":\"ready\",\"version\":5",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MALFORMED_JSON",
+      "path": "$"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-NON-OBJECT",
+      "wire_json": "[]",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_ENVELOPE",
+      "path": "$"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-V4",
+      "wire_json": "{\"type\":\"ready\",\"version\":4,\"protocol\":{\"preferred_version\":5,\"supported_versions\":[5]},\"sample_rate_hz\":24000,\"input_encoding\":\"pcm_s16le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":true,\"selectable\":true,\"live_runtime\":false},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"durable\":false,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNSUPPORTED_VERSION",
+      "path": "$.version"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-FUTURE-VERSION",
+      "wire_json": "{\"type\":\"ready\",\"version\":6,\"protocol\":{\"preferred_version\":5,\"supported_versions\":[5]},\"sample_rate_hz\":24000,\"input_encoding\":\"pcm_s16le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":true,\"selectable\":true,\"live_runtime\":false},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"durable\":false,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNSUPPORTED_VERSION",
+      "path": "$.version"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-FRAME",
+      "wire_json": "{\"type\":\"handshake\",\"version\":5,\"protocol\":{\"preferred_version\":5,\"supported_versions\":[5]},\"sample_rate_hz\":24000,\"input_encoding\":\"pcm_s16le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":true,\"selectable\":true,\"live_runtime\":false},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"durable\":false,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FRAME",
+      "path": "$.type"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-FRAME-KEY",
+      "wire_json": "{\"type\":\"ready\",\"version\":5,\"protocol\":{\"preferred_version\":5,\"supported_versions\":[5]},\"sample_rate_hz\":24000,\"input_encoding\":\"pcm_s16le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":true,\"selectable\":true,\"live_runtime\":false},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"durable\":false,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true},\"tenant\":\"fixture-tenant\"}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-MISSING-ADVERTISEMENT",
+      "wire_json": "{\"type\":\"ready\",\"version\":5,\"sample_rate_hz\":24000,\"input_encoding\":\"pcm_s16le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":true,\"selectable\":true,\"live_runtime\":false},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"durable\":false,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.protocol"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-V4-ADVERTISEMENT",
+      "wire_json": "{\"type\":\"ready\",\"version\":5,\"protocol\":{\"preferred_version\":4,\"supported_versions\":[4]},\"sample_rate_hz\":24000,\"input_encoding\":\"pcm_s16le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":true,\"selectable\":true,\"live_runtime\":false},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"durable\":false,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNSUPPORTED_VERSION",
+      "path": "$.protocol.supported_versions"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-ADVERTISEMENT-KEY",
+      "wire_json": "{\"type\":\"ready\",\"version\":5,\"protocol\":{\"preferred_version\":5,\"supported_versions\":[5],\"tenant\":\"fixture-tenant\"},\"sample_rate_hz\":24000,\"input_encoding\":\"pcm_s16le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":true,\"selectable\":true,\"live_runtime\":false},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"durable\":false,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.protocol.tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-SAMPLE-RATE",
+      "wire_json": "{\"type\":\"ready\",\"version\":5,\"protocol\":{\"preferred_version\":5,\"supported_versions\":[5]},\"sample_rate_hz\":16000,\"input_encoding\":\"pcm_s16le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":true,\"selectable\":true,\"live_runtime\":false},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"durable\":false,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.sample_rate_hz"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-INPUT-ENCODING",
+      "wire_json": "{\"type\":\"ready\",\"version\":5,\"protocol\":{\"preferred_version\":5,\"supported_versions\":[5]},\"sample_rate_hz\":24000,\"input_encoding\":\"pcm_f32le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":true,\"selectable\":true,\"live_runtime\":false},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"durable\":false,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.input_encoding"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-BRAIN-KEY",
+      "wire_json": "{\"type\":\"ready\",\"version\":5,\"protocol\":{\"preferred_version\":5,\"supported_versions\":[5]},\"sample_rate_hz\":24000,\"input_encoding\":\"pcm_s16le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":true,\"selectable\":true,\"live_runtime\":false,\"tenant\":\"fixture-tenant\"},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"durable\":false,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.brain.tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-BRAIN-WRONG-TYPE",
+      "wire_json": "{\"type\":\"ready\",\"version\":5,\"protocol\":{\"preferred_version\":5,\"supported_versions\":[5]},\"sample_rate_hz\":24000,\"input_encoding\":\"pcm_s16le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":\"yes\",\"selectable\":true,\"live_runtime\":false},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"durable\":false,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.brain.configured"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-STORE-KEY",
+      "wire_json": "{\"type\":\"ready\",\"version\":5,\"protocol\":{\"preferred_version\":5,\"supported_versions\":[5]},\"sample_rate_hz\":24000,\"input_encoding\":\"pcm_s16le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":true,\"selectable\":true,\"live_runtime\":false},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"durable\":false,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true,\"tenant\":\"fixture-tenant\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.store.tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-MISSING-STORE-FLAG",
+      "wire_json": "{\"type\":\"ready\",\"version\":5,\"protocol\":{\"preferred_version\":5,\"supported_versions\":[5]},\"sample_rate_hz\":24000,\"input_encoding\":\"pcm_s16le\",\"brain\":{\"provider\":\"synthetic\",\"configured\":true,\"selectable\":true,\"live_runtime\":false},\"store\":{\"backend\":\"in_memory\",\"available\":true,\"nonce_replay_protection\":true,\"raw_audio_persistence\":false,\"transcript_persistence\":false,\"uuid_schema_translation\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.store.durable"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-AUDIO-TURN-BLANK-TURN",
+      "wire_json": "{\"type\":\"audio_turn_accepted\",\"version\":5,\"client_generation_id\":\"viva-session-bootstrap-1-fixture\",\"turn_id\":\"\",\"final_sequence\":0}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.turn_id"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-EVENT",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"telemetry\",\"response_id\":\"response-1\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FRAME",
+      "path": "$.event.type"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-EVENT-KEY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"session_phase\",\"phase\":\"listening\",\"tenant\":\"fixture-tenant\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-EVENT-PHASE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"session_phase\",\"phase\":\"daydreaming\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.phase"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-EVENT-TERMINAL-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"session_phase\",\"phase\":\"recap\",\"terminal_reason\":\"bored\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.terminal_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-QUESTION-KEY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"turn_id\":\"turn-1\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"},\"tenant\":\"fixture-tenant\"}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.question.tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-MISSING-QUESTION-CONCEPT",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"turn_id\":\"turn-1\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.question.concept_id"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-RUBRIC-CRITERION-KEY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"turn_id\":\"turn-1\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true,\"tenant\":\"fixture-tenant\"}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.question.rubric.criteria[0].tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-SOURCE-KEY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"source_reference\",\"response_id\":\"response-1\",\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\",\"tenant\":\"fixture-tenant\"}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.source.tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-OMITTED-CONFIDENCE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"transcript_final\",\"response_id\":\"response-1\",\"text\":\"Fixture final.\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.confidence"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-CONFIDENCE-OUT-OF-RANGE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"transcript_final\",\"response_id\":\"response-1\",\"text\":\"Fixture final.\",\"confidence\":1.5}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.confidence"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-EVALUATION-KEY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"answer_evaluated\",\"response_id\":\"response-1\",\"evaluation\":{\"question_id\":\"q-fixture-1\",\"answer_text\":\"Fixture answer.\",\"label\":\"mostly correct\",\"concise_feedback\":\"Fixture feedback.\",\"retry_prompt\":\"Fixture retry.\",\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"},\"concept_status\":\"strong\",\"confidence_score\":0.9,\"tenant\":\"fixture-tenant\"}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.evaluation.tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-EVALUATION-LABEL",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"answer_evaluated\",\"response_id\":\"response-1\",\"evaluation\":{\"question_id\":\"q-fixture-1\",\"answer_text\":\"Fixture answer.\",\"label\":\"pretty good\",\"concise_feedback\":\"Fixture feedback.\",\"retry_prompt\":\"Fixture retry.\",\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"},\"concept_status\":\"strong\",\"confidence_score\":0.9}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.evaluation.label"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-EVALUATION-CONFIDENCE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"answer_evaluated\",\"response_id\":\"response-1\",\"evaluation\":{\"question_id\":\"q-fixture-1\",\"answer_text\":\"Fixture answer.\",\"label\":\"mostly correct\",\"concise_feedback\":\"Fixture feedback.\",\"retry_prompt\":\"Fixture retry.\",\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"},\"concept_status\":\"strong\",\"confidence_score\":1.2}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.evaluation.confidence_score"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-RECAP-KEY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0,\"tenant\":\"fixture-tenant\"},\"partial\":false}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.recap.tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-RECAP-MOMENT-KEY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\",\"tenant\":\"fixture-tenant\"}],\"deferred_turns\":0},\"partial\":false}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.recap.source_moments[0].tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-RECAP-REVIEW-AUTHORITY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"client_guess\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":false}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.recap.review_schedule[0].authority"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-RECAP-CONCEPT-KEY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\",\"tenant\":\"fixture-tenant\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":false}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.recap.concepts[0].tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-RECAP-PARTIAL-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":true,\"partial_reason\":\"bored\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.partial_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-RECAP-MISSING-PARTIAL",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.partial"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-RECAP-COMPLETE-WITH-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":false,\"partial_reason\":\"provider_timeout\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVARIANT",
+      "path": "$.event.partial_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-RECAP-PARTIAL-WITHOUT-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.partial_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-QUESTION-STARTED-WITHOUT-TURN",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.turn_id"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-DEFERRED-UNKNOWN-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"provider_gave_up\",\"can_retry_same_question\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-DEFERRED-RETRYABLE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"retryable\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.retryable"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-DEFERRED-TERMINAL-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"terminal_reason\":\"provider_timeout\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.terminal_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-DEFERRED-LEARNER-FACT",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"confidence\":0.91}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.confidence"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-STRUCTURED-ERROR-MISSING-CODE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"message\":\"telemetry event suppressed\",\"terminality\":\"recoverable\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.code"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-STRUCTURED-ERROR-MISSING-TERMINALITY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_TELEMETRY_EVENT_SUPPRESSED\",\"message\":\"telemetry event suppressed\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.terminality"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-STRUCTURED-ERROR-UNKNOWN-TERMINALITY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_TELEMETRY_EVENT_SUPPRESSED\",\"message\":\"telemetry event suppressed\",\"terminality\":\"fatal\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.terminality"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-STRUCTURED-ERROR-RECOVERABLE-WITH-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_TELEMETRY_EVENT_SUPPRESSED\",\"message\":\"telemetry event suppressed\",\"terminality\":\"recoverable\",\"terminal_reason\":\"provider_timeout\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVARIANT",
+      "path": "$.event.terminal_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-STRUCTURED-ERROR-TERMINAL-WITHOUT-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_PROVIDER_FAILURE\",\"message\":\"Provider stream failed.\",\"terminality\":\"terminal\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.terminal_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-STRUCTURED-ERROR-TERMINAL-BAD-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_PROVIDER_FAILURE\",\"message\":\"Provider stream failed.\",\"terminality\":\"terminal\",\"terminal_reason\":\"bored\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.terminal_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-MANUSCRIPT-KEY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"manuscript_intent\",\"response_id\":\"response-1\",\"intent\":{\"type\":\"scene_intent\",\"register\":\"examining\",\"emphasis\":\"measured\",\"tenant\":\"fixture-tenant\"}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.intent.tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-MANUSCRIPT-RENDER-INSTRUCTION",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"manuscript_intent\",\"response_id\":\"response-1\",\"intent\":{\"type\":\"scene_intent\",\"register\":\"examining\",\"emphasis\":\"measured\",\"css\":\"color:red\"}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.intent.css"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-MANUSCRIPT-REGISTER",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"manuscript_intent\",\"response_id\":\"response-1\",\"intent\":{\"type\":\"scene_intent\",\"register\":\"shouting\",\"emphasis\":\"measured\"}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.intent.register"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-MISSING-CANCELLATION-RESPONSE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"cancellation\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.response_id"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-AUDIO-DELTA-KEY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"audio_delta\",\"response_id\":\"response-1\",\"frame\":{\"pcm16_base64\":\"AQIDBA==\",\"tenant\":\"fixture-tenant\"}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.frame.tenant"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-ERROR-MESSAGE-TYPE",
+      "wire_json": "{\"type\":\"error\",\"version\":5,\"error\":{\"code\":\"VOICE_AUTH_INVALID\",\"message\":7,\"retryable\":false}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.error.message"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-ERROR-MESSAGE-MISSING",
+      "wire_json": "{\"type\":\"error\",\"version\":5,\"error\":{\"code\":\"VOICE_AUTH_INVALID\",\"retryable\":false}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.error.message"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-ERROR-CODE",
+      "wire_json": "{\"type\":\"error\",\"version\":5,\"error\":{\"code\":\"VOICE_UNKNOWN\",\"message\":\"Fixture message.\",\"retryable\":false}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.error.code"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-ERROR-RETRYABILITY",
+      "wire_json": "{\"type\":\"error\",\"version\":5,\"error\":{\"code\":\"VOICE_AUTH_INVALID\",\"message\":\"Fixture message.\",\"retryable\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVARIANT",
+      "path": "$.error.retryable"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-UNKNOWN-ERROR-KEY",
+      "wire_json": "{\"type\":\"error\",\"version\":5,\"error\":{\"code\":\"VOICE_AUTH_INVALID\",\"message\":\"Fixture message.\",\"retryable\":false,\"tenant\":\"fixture-tenant\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.error.tenant"
+    }
+  ]
+}

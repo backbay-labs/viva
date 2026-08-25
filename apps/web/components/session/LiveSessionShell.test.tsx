@@ -3,6 +3,7 @@ import {
   type AgentStudySetReadiness,
   type ReviewScheduleItem,
   type SessionRecap,
+  VIVA_VOICE_PROTOCOL_ADVERTISEMENT,
   VIVA_VOICE_PROTOCOL_VERSION,
   type VivaReadyFrame,
 } from "@viva/core";
@@ -190,6 +191,7 @@ function ready(provider: string, overrides: Partial<VivaReadyFrame["brain"]> = {
   return {
     type: "ready",
     version: VIVA_VOICE_PROTOCOL_VERSION,
+    protocol: VIVA_VOICE_PROTOCOL_ADVERTISEMENT,
     sample_rate_hz: 24000,
     input_encoding: "pcm_s16le",
     brain: {

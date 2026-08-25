@@ -11,6 +11,7 @@ import type {
 import {
   VIVA_AGENT_TERMINAL_SESSION_REASONS,
   VIVA_LEARNER_LOOP_CONTRACT,
+  VIVA_VOICE_PROTOCOL_ADVERTISEMENT,
   VIVA_VOICE_PROTOCOL_VERSION,
 } from "@viva/core";
 import type { VivaAgentDerivedState } from "./use-viva-agent-session";
@@ -86,6 +87,7 @@ function ready(provider: string, overrides: Partial<VivaReadyFrame["brain"]> = {
   return {
     type: "ready",
     version: VIVA_VOICE_PROTOCOL_VERSION,
+    protocol: VIVA_VOICE_PROTOCOL_ADVERTISEMENT,
     sample_rate_hz: 24000,
     input_encoding: "pcm_s16le",
     brain: {

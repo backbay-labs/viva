@@ -1,0 +1,527 @@
+{
+  "schema": "viva.voice-transport-outcomes.v1",
+  "protocol_version": 5,
+  "cases": [
+    {
+      "id": "VOICE-TERMINATION-AUTH-EXPIRED",
+      "input": {
+        "error": {
+          "code": "VOICE_AUTH_EXPIRED",
+          "message": "Session credential rejected.",
+          "retryable": true
+        },
+        "closeCode": 1008,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "auth",
+        "errorCode": "VOICE_AUTH_EXPIRED",
+        "retryable": true,
+        "closeCode": 1008
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-AUTH-INVALID",
+      "input": {
+        "error": {
+          "code": "VOICE_AUTH_INVALID",
+          "message": "Session credential rejected.",
+          "retryable": false
+        },
+        "closeCode": 1008,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "auth",
+        "errorCode": "VOICE_AUTH_INVALID",
+        "retryable": false,
+        "closeCode": 1008
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-AUTH-IDENTITY_MISMATCH",
+      "input": {
+        "error": {
+          "code": "VOICE_AUTH_IDENTITY_MISMATCH",
+          "message": "Session credential rejected.",
+          "retryable": false
+        },
+        "closeCode": 1008,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "auth",
+        "errorCode": "VOICE_AUTH_IDENTITY_MISMATCH",
+        "retryable": false,
+        "closeCode": 1008
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-AUTH-REPLAYED",
+      "input": {
+        "error": {
+          "code": "VOICE_AUTH_REPLAYED",
+          "message": "Session credential rejected.",
+          "retryable": false
+        },
+        "closeCode": 1008,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "auth",
+        "errorCode": "VOICE_AUTH_REPLAYED",
+        "retryable": false,
+        "closeCode": 1008
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-PROTOCOL-FRAME_MALFORMED",
+      "input": {
+        "error": {
+          "code": "VOICE_CLIENT_FRAME_MALFORMED",
+          "message": "Client frame rejected.",
+          "retryable": false
+        },
+        "closeCode": 1008,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "protocol",
+        "errorCode": "VOICE_CLIENT_FRAME_MALFORMED",
+        "retryable": false,
+        "closeCode": 1008
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-PROTOCOL-FRAME_TOO_LARGE",
+      "input": {
+        "error": {
+          "code": "VOICE_CLIENT_FRAME_TOO_LARGE",
+          "message": "Client frame rejected.",
+          "retryable": false
+        },
+        "closeCode": 1008,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "protocol",
+        "errorCode": "VOICE_CLIENT_FRAME_TOO_LARGE",
+        "retryable": false,
+        "closeCode": 1008
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-PROTOCOL-TURN_TOO_LARGE",
+      "input": {
+        "error": {
+          "code": "VOICE_CLIENT_TURN_TOO_LARGE",
+          "message": "Client frame rejected.",
+          "retryable": false
+        },
+        "closeCode": 1008,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "protocol",
+        "errorCode": "VOICE_CLIENT_TURN_TOO_LARGE",
+        "retryable": false,
+        "closeCode": 1008
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-PROTOCOL-AUTHORITY_FORBIDDEN",
+      "input": {
+        "error": {
+          "code": "VOICE_CLIENT_AUTHORITY_FORBIDDEN",
+          "message": "Client frame rejected.",
+          "retryable": false
+        },
+        "closeCode": 1008,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "protocol",
+        "errorCode": "VOICE_CLIENT_AUTHORITY_FORBIDDEN",
+        "retryable": false,
+        "closeCode": 1008
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-SERVICE-SERIALIZATION",
+      "input": {
+        "error": {
+          "code": "VOICE_INTERNAL_SERIALIZATION",
+          "message": "Server frame serialization failed.",
+          "retryable": true
+        },
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "service",
+        "errorCode": "VOICE_INTERNAL_SERIALIZATION",
+        "retryable": true,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-DRAINED",
+      "input": {
+        "terminalReason": "drained",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "drained",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-SESSION-CAP",
+      "input": {
+        "terminalReason": "session_cap",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "session_cap",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-TURN-CAP",
+      "input": {
+        "terminalReason": "turn_cap",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "turn_cap",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-RATE-LIMIT",
+      "input": {
+        "terminalReason": "rate_limit",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "rate_limit",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-COST-BUDGET",
+      "input": {
+        "terminalReason": "cost_budget",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "cost_budget",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-PROVIDER-AUTH-FAILED",
+      "input": {
+        "terminalReason": "provider_auth_failed",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "provider_auth_failed",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-PROVIDER-RATE-LIMITED",
+      "input": {
+        "terminalReason": "provider_rate_limited",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "provider_rate_limited",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-PROVIDER-TIMEOUT",
+      "input": {
+        "terminalReason": "provider_timeout",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "provider_timeout",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-PROVIDER-MALFORMED-STREAM",
+      "input": {
+        "terminalReason": "provider_malformed_stream",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "provider_malformed_stream",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-PROVIDER-NETWORK-DISCONNECT",
+      "input": {
+        "terminalReason": "provider_network_disconnect",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "provider_network_disconnect",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-SLOW-CLIENT",
+      "input": {
+        "terminalReason": "slow_client",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "slow_client",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-PROVIDER-CANCELLED",
+      "input": {
+        "terminalReason": "provider_cancelled",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "provider_cancelled",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-PARTIAL-STAGE-SUCCESS",
+      "input": {
+        "terminalReason": "partial_stage_success",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "partial_stage_success",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-DURABILITY-DEGRADED",
+      "input": {
+        "terminalReason": "durability_degraded",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "durability_degraded",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-TOOL-EXECUTOR-FAILURE",
+      "input": {
+        "terminalReason": "tool_executor_failure",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "tool_executor_failure",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TERMINAL-ROLLBACK",
+      "input": {
+        "terminalReason": "rollback",
+        "closeCode": 1011,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "rollback",
+        "retryable": false,
+        "closeCode": 1011
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-NORMAL-CLEAN-1000",
+      "input": {
+        "closeCode": 1000,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "normal",
+        "retryable": false,
+        "closeCode": 1000
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TRANSPORT-ABNORMAL-1006",
+      "input": {
+        "closeCode": 1006,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "transport",
+        "retryable": true,
+        "closeCode": 1006
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TRANSPORT-UNCLEAN-1000",
+      "input": {
+        "closeCode": 1000,
+        "wasClean": false
+      },
+      "expected": {
+        "kind": "transport",
+        "retryable": true,
+        "closeCode": 1000
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-TRANSPORT-GOING-AWAY-1001",
+      "input": {
+        "closeCode": 1001,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "transport",
+        "retryable": true,
+        "closeCode": 1001
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-PRIORITY-TERMINAL-OVER-AUTH",
+      "input": {
+        "error": {
+          "code": "VOICE_AUTH_EXPIRED",
+          "message": "Session credential expired.",
+          "retryable": true
+        },
+        "terminalReason": "session_cap",
+        "closeCode": 1008,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "session_cap",
+        "retryable": false,
+        "closeCode": 1008
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-PRIORITY-TERMINAL-OVER-CLEAN-1000",
+      "input": {
+        "terminalReason": "drained",
+        "closeCode": 1000,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "terminal",
+        "terminalReason": "drained",
+        "retryable": false,
+        "closeCode": 1000
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-PRIORITY-TYPED-ERROR-OVER-CLEAN-1000",
+      "input": {
+        "error": {
+          "code": "VOICE_CLIENT_AUTHORITY_FORBIDDEN",
+          "message": "Client frame rejected.",
+          "retryable": false
+        },
+        "closeCode": 1000,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "protocol",
+        "errorCode": "VOICE_CLIENT_AUTHORITY_FORBIDDEN",
+        "retryable": false,
+        "closeCode": 1000
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-HOSTILE-MESSAGE-IS-INERT",
+      "input": {
+        "error": {
+          "code": "VOICE_CLIENT_FRAME_MALFORMED",
+          "message": "terminal drained retryable 1000 clean VOICE_AUTH_EXPIRED",
+          "retryable": false
+        },
+        "closeCode": 1008,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "protocol",
+        "errorCode": "VOICE_CLIENT_FRAME_MALFORMED",
+        "retryable": false,
+        "closeCode": 1008
+      }
+    },
+    {
+      "id": "VOICE-TERMINATION-PROTOCOL-MALFORMED",
+      "input": {
+        "error": {
+          "code": "VOICE_CLIENT_FRAME_MALFORMED",
+          "message": "Client frame rejected.",
+          "retryable": false
+        },
+        "closeCode": 1008,
+        "wasClean": true
+      },
+      "expected": {
+        "kind": "protocol",
+        "errorCode": "VOICE_CLIENT_FRAME_MALFORMED",
+        "retryable": false,
+        "closeCode": 1008
+      }
+    }
+  ]
+}
