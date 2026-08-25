@@ -16,6 +16,7 @@ pub mod learning_progression;
 pub mod learning_recap;
 pub mod ports;
 pub mod review_schedule;
+mod session_state;
 mod study;
 pub mod study_projection;
 pub mod tool_executor;
@@ -61,6 +62,9 @@ pub use review_schedule::{
     VIVA_REVIEW_DESIRED_RETENTION, VIVA_REVIEW_EXAM_MARGIN_SECONDS, VIVA_REVIEW_MAX_INTERVAL_DAYS,
     VIVA_REVIEW_SCHEDULE_POLICY_ID, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
+// The one legal-transition table and absorbing terminal state; `study.rs` keeps
+// the Plan-04-owned phase and terminal-reason declarations this machine drives.
+pub use session_state::{StudySessionState, StudySessionTransitionError};
 pub use study::{
     fixture_question, fixture_source_reference, AnswerEvaluation, RecapSourceMoment, StudyQuestion,
     StudySessionPhase, StudySessionRecap, StudySourceReference, TerminalSessionReason,
