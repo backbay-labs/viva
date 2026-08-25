@@ -4,6 +4,9 @@
   "version": "1.0.0",
   "expo": {
     "autolinking": {
+      "exclude": [
+        "expo-audio"
+      ],
       "searchPaths": [
         "../../node_modules"
       ]
@@ -16,7 +19,6 @@
     "@viva/tokens": "workspace:*",
     "expo": "~57.0.16",
     "expo-asset": "~57.0.14",
-    "expo-audio": "~57.0.4",
     "expo-constants": "~57.0.14",
     "expo-document-picker": "~57.0.1",
     "expo-font": "~57.0.1",

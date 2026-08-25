@@ -36,21 +36,13 @@
         }
       ],
       [
-        "expo-audio",
-        {
-          "microphonePermission": "Viva uses the microphone only during a study session so you can answer aloud.",
-          "enableBackgroundPlayback": false,
-          "enableBackgroundRecording": false
-        }
-      ],
-      [
         "react-native-audio-api",
         {
           "androidForegroundService": false,
           "androidFSTypes": [],
           "androidPermissions": ["android.permission.RECORD_AUDIO"],
           "iosBackgroundMode": false,
-          "iosMicrophonePermission": "Viva uses the microphone only during a study session so you can answer aloud."
+          "iosMicrophonePermission": "Viva uses the microphone only after you tap Start listening to verify local capture readiness. Protocol v4 does not send this audio."
         }
       ],
       "expo-asset"
