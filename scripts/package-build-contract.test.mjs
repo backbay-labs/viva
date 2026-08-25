@@ -161,3 +161,21 @@ test("Turbo restores web build artifacts and hashes public build inputs", async 
   ];
   assert.equal(requiredBuildEnv.every((name) => turbo.tasks.build.env.includes(name)), true);
 });
+
+test("every Rust workspace package reports Apache-2.0", () => {
+  const result = spawnSync(
+    "cargo",
+    ["metadata", "--format-version", "1", "--no-deps", "--manifest-path", "agent/Cargo.toml"],
+    { cwd: root, encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const metadata = JSON.parse(result.stdout);
+  const workspaceMembers = new Set(metadata.workspace_members);
+  const workspacePackages = metadata.packages.filter((pkg) => workspaceMembers.has(pkg.id));
+  assert.equal(workspacePackages.length, 5);
+  assert.deepEqual([...new Set(workspacePackages.map((pkg) => pkg.license))], ["Apache-2.0"]);
+  assert.equal(
+    workspacePackages.every((pkg) => Array.isArray(pkg.publish) && pkg.publish.length === 0),
+    true,
+  );
+});
