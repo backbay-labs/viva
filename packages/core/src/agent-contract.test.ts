@@ -11,6 +11,8 @@ import sessionFixture from "../../../agent/fixtures/voice-protocol/session-confi
 import evidencePackFixture from "../../../agent/fixtures/voice-protocol/synthetic-evidence-pack.json";
 import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
 import authDecisionFixture from "../../../agent/fixtures/voice-protocol/v5/auth-decision.json";
+import signedSessionConfigFixture from "../../../agent/fixtures/voice-protocol/v5/client-session-config-signed.json";
+import sessionRefreshFixture from "../../../agent/fixtures/voice-protocol/v5/client-session-refresh.json";
 import readyV5Fixture from "../../../agent/fixtures/voice-protocol/v5/server-ready.json";
 import {
   type AgentSessionConfig,
@@ -28,6 +30,7 @@ import {
   VIVA_AUDIO_MAX_TURN_BYTES,
   VIVA_AUDIO_MAX_TURN_SAMPLES,
   VIVA_AUDIO_SAMPLE_RATE_HZ,
+  VIVA_BROWSER_CLIENT_FRAME_TYPES,
   VIVA_VOICE_BYTES_PER_SAMPLE,
   VIVA_VOICE_CHANNELS,
   VIVA_VOICE_DIAGNOSTIC_CODES,
@@ -162,10 +165,11 @@ describe("Viva voice agent contract", () => {
     expect(() => parseVivaClientFrame({ ...chunk, sequence: Number.MAX_SAFE_INTEGER + 2 })).toThrow(
       "Invalid sequence",
     );
+    // A present-but-blank id is invalid; an absent one is missing.
     expect(() => parseVivaClientFrame({ ...chunk, client_generation_id: "" })).toThrow(
-      "Missing client_generation_id",
+      "Invalid client_generation_id",
     );
-    expect(() => parseVivaClientFrame({ ...chunk, turn_id: "  " })).toThrow("Missing turn_id");
+    expect(() => parseVivaClientFrame({ ...chunk, turn_id: "  " })).toThrow("Invalid turn_id");
     expect(() => parseVivaClientFrame({ ...chunk, frame: { pcm16_base64: "" } })).toThrow(
       "Invalid pcm16_base64",
     );
@@ -204,12 +208,16 @@ describe("Viva voice agent contract", () => {
       client_generation_id: "generation-7",
       turn_id: "turn-01",
     };
-
-    expect(parseVivaClientFrame(scoped)).toEqual(scoped);
-    expect(parseVivaClientFrame({ type: "cancel", version: VIVA_VOICE_PROTOCOL_VERSION })).toEqual({
+    const generationScoped = {
       type: "cancel",
       version: VIVA_VOICE_PROTOCOL_VERSION,
-    });
+      client_generation_id: "generation-7",
+    };
+
+    expect(parseVivaClientFrame(scoped)).toEqual(scoped);
+    expect(parseVivaClientFrame(generationScoped)).toEqual(generationScoped);
+    // Cancellation is generation-bound in v5 even when it names no turn, so it can
+    // never reach another generation.
     expect(() =>
       parseVivaClientFrame({
         type: "cancel",
@@ -497,22 +505,27 @@ describe("Viva voice agent contract", () => {
     expect(JSON.stringify(frame)).toBe(JSON.stringify(audioFixture));
   });
 
-  test("builds typed session config frame from shared fixture", () => {
-    const frame = sessionConfigFrame(sessionFixture as unknown as AgentSessionConfig);
-    if (frame.type !== "session_config") throw new Error("Expected session config frame");
+  test("builds the typed signed session config frame from the v5 fixture", () => {
+    const frame = sessionConfigFrame(
+      signedSessionConfigFixture.session as unknown as AgentSessionConfig,
+      signedSessionConfigFixture.session_token,
+      signedSessionConfigFixture.client_generation_id,
+    );
 
     expect(parseVivaClientFrame(frame)).toEqual(frame);
     expect(frame.session.mode).toBe("quiz");
-    expect(frame.session.source_context[0]?.confidence).toBe("high");
+    expect(JSON.stringify(frame)).toBe(JSON.stringify(signedSessionConfigFixture));
   });
 
   test("keeps shared agent concept ids inside the Biology study-set vocabulary", () => {
     const biology = seedStudySets.find((studySet) => studySet.id === "biology-midterm");
     const vocabulary = new Set(biology?.concepts.map((concept) => concept.id) ?? []);
+    // The frozen unversioned corpus is v4 wire shape, so its concept ids are read
+    // structurally rather than through the v5 client parser (Task 9 Step 6 retires it).
     const fixtureIds = new Set([
       ...(sessionFixture as AgentSessionConfig).active_concepts,
-      ...activeConceptIdsFromFixture(fullSessionFixture),
-      ...activeConceptIdsFromFixture(fakeSessionFixture),
+      ...legacyActiveConceptIds(fullSessionFixture),
+      ...legacyActiveConceptIds(fakeSessionFixture),
       ...conceptStatusIdsFromFixture(fullSessionFixture),
       ...conceptStatusIdsFromFixture(fakeSessionFixture),
     ]);
@@ -523,7 +536,7 @@ describe("Viva voice agent contract", () => {
   });
 
   test("rejects browser-authority client frames", () => {
-    expect(() =>
+    const missingIdentity = captureVoiceProtocolError(() =>
       parseVivaClientFrame({
         type: "session_config",
         version: VIVA_VOICE_PROTOCOL_VERSION,
@@ -534,9 +547,11 @@ describe("Viva voice agent contract", () => {
           active_concepts: [],
         },
       }),
-    ).toThrow("Missing session_id");
+    );
+    expect(missingIdentity.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
+    expect(missingIdentity.path).toBe("$.client_generation_id");
 
-    expect(() =>
+    const forgedToolResult = captureVoiceProtocolError(() =>
       parseVivaClientFrame({
         type: "tool_result",
         version: VIVA_VOICE_PROTOCOL_VERSION,
@@ -545,14 +560,22 @@ describe("Viva voice agent contract", () => {
           result: { accepted: true },
         },
       }),
-    ).toThrow("Browser tool_result frames are not accepted");
+    );
+    expect(forgedToolResult.code).toBe("VOICE_PROTOCOL_FORBIDDEN_AUTHORITY");
+    expect(forgedToolResult.path).toBe("$.type");
   });
 
   test("parses shared synthetic study session fixture", () => {
     const serverFrames = fullSessionFixture.server.map(parseVivaServerFrame);
-    const clientFrames = fullSessionFixture.client.map(parseVivaClientFrame);
+    // `VOICE-VERSION-001`: the frozen unversioned corpus is v4 client wire shape —
+    // token-less `session_config` and plain `text` — so v5 rejects it rather than
+    // silently upgrading it. Task 9 Step 6 deletes the corpus outright.
+    for (const frame of fullSessionFixture.client) {
+      expect(VIVA_VOICE_DIAGNOSTIC_CODES).toContain(
+        captureVoiceProtocolError(() => parseVivaClientFrame(frame)).code,
+      );
+    }
 
-    expect(clientFrames[0]?.type).toBe("session_config");
     expect(serverFrames.some((frame) => frame.type === "ready")).toBe(true);
     expect(
       serverFrames.some(
@@ -566,14 +589,17 @@ describe("Viva voice agent contract", () => {
 
   test("parses shared fake Cartesia/Gemini study session fixture", () => {
     const serverFrames = fakeSessionFixture.server.map(parseVivaServerFrame);
-    const clientFrames = fakeSessionFixture.client.map(parseVivaClientFrame);
     const eventTypes = serverFrames.flatMap((frame) =>
       frame.type === "event" ? [frame.event.type] : [],
     );
 
-    expect(clientFrames[0]?.type).toBe("session_config");
-    expect(clientFrames[1]?.type).toBe("audio_chunk");
-    expect(clientFrames[2]?.type).toBe("audio_end");
+    // The v4 `session_config` in this frozen corpus carries no signed credential, so
+    // v5 rejects it; its bounded audio frames are already v5 shaped and still parse.
+    expect(
+      captureVoiceProtocolError(() => parseVivaClientFrame(fakeSessionFixture.client[0])).code,
+    ).toBe("VOICE_PROTOCOL_MISSING_FIELD");
+    expect(parseVivaClientFrame(fakeSessionFixture.client[1]).type).toBe("audio_chunk");
+    expect(parseVivaClientFrame(fakeSessionFixture.client[2]).type).toBe("audio_end");
     expect(serverFrames[0]?.type).toBe("ready");
     expect(serverFrames[3]?.type).toBe("audio_turn_accepted");
     expect(eventTypes).toEqual([
@@ -1332,6 +1358,334 @@ describe("Viva voice v5 authentication decision and shared session-token vectors
   });
 });
 
+/**
+ * `VOICE-AUTH-001` / `VOICE-REFRESH-001` / `VOICE-AUTHORITY-001`. Every v5 client frame
+ * is generation-bound, the first application frame carries the signed credential at the
+ * top level, in-socket refresh is context-only, and the browser-sendable union is
+ * exactly seven variants with no tool authority anywhere in it.
+ */
+const CANONICAL_SIGNED_SESSION_CONFIG = {
+  type: "session_config",
+  version: 5,
+  client_generation_id: "viva-session-bootstrap-1-fixture",
+  session_token: CANONICAL_FIXTURE_SESSION_TOKEN,
+  session: {
+    session_id: "fixture-session",
+    user_id: "fixture-user",
+    study_set_id: "fixture-study-set",
+    mode: "quiz",
+    source_context: [],
+    active_concepts: [],
+  },
+} as const;
+
+const CANONICAL_SESSION_REFRESH = {
+  type: "session_refresh",
+  version: 5,
+  client_generation_id: "viva-session-bootstrap-1-fixture",
+  context: {
+    mode: "quiz",
+    initial_goal: "Review the fixture source.",
+  },
+} as const;
+
+/** One valid frame per browser-authorized variant, all on the same generation. */
+function browserClientFrameSamples(): Record<string, Record<string, unknown>> {
+  return {
+    session_config: structuredClone(CANONICAL_SIGNED_SESSION_CONFIG) as Record<string, unknown>,
+    session_refresh: structuredClone(CANONICAL_SESSION_REFRESH) as Record<string, unknown>,
+    audio_chunk: {
+      type: "audio_chunk",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "viva-session-bootstrap-1-fixture",
+      turn_id: "turn-1",
+      sequence: 0,
+      frame: { pcm16_base64: "AQIDBA==" },
+    },
+    audio_end: {
+      type: "audio_end",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "viva-session-bootstrap-1-fixture",
+      turn_id: "turn-1",
+      final_sequence: 0,
+    },
+    turn_intent: {
+      type: "turn_intent",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "viva-session-bootstrap-1-fixture",
+      turn_id: "turn-1",
+      intent: { kind: "answer_text", text: "NADH donates electrons." },
+    },
+    cancel: {
+      type: "cancel",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "viva-session-bootstrap-1-fixture",
+      turn_id: "turn-1",
+    },
+    stop: {
+      type: "stop",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "viva-session-bootstrap-1-fixture",
+    },
+  };
+}
+
+describe("Viva voice v5 signed first frame, generation identity, and browser authority", () => {
+  test("pins the canonical signed first frame byte-for-byte", () => {
+    expect(signedSessionConfigFixture).toEqual(CANONICAL_SIGNED_SESSION_CONFIG);
+    expect(JSON.stringify(signedSessionConfigFixture)).toBe(
+      JSON.stringify(CANONICAL_SIGNED_SESSION_CONFIG),
+    );
+    expect(parseVivaClientFrame(signedSessionConfigFixture)).toEqual(
+      CANONICAL_SIGNED_SESSION_CONFIG,
+    );
+    // The credential is the same fixture-only string the shared token vectors pin, so
+    // Rust, Node, and the wire fixture cannot drift apart.
+    expect(signedSessionConfigFixture.session_token).toBe(
+      sessionTokenVectorCase("VOICE-TOKEN-VALID-CANONICAL").token,
+    );
+  });
+
+  test("pins the canonical branch-neutral context-only refresh frame byte-for-byte", () => {
+    expect(sessionRefreshFixture).toEqual(CANONICAL_SESSION_REFRESH);
+    expect(JSON.stringify(sessionRefreshFixture)).toBe(JSON.stringify(CANONICAL_SESSION_REFRESH));
+    expect(parseVivaClientFrame(sessionRefreshFixture)).toEqual(CANONICAL_SESSION_REFRESH);
+  });
+
+  test("requires a non-empty client_generation_id on every browser-sendable variant", () => {
+    const samples = browserClientFrameSamples();
+    expect(Object.keys(samples)).toEqual([...VIVA_BROWSER_CLIENT_FRAME_TYPES]);
+
+    for (const [type, frame] of Object.entries(samples)) {
+      expect(parseVivaClientFrame(frame)).toEqual(frame);
+
+      const { client_generation_id: _absent, ...withoutGeneration } = frame;
+      const missing = captureVoiceProtocolError(() => parseVivaClientFrame(withoutGeneration));
+      expect({ type, code: missing.code, path: missing.path }).toEqual({
+        type,
+        code: "VOICE_PROTOCOL_MISSING_FIELD",
+        path: "$.client_generation_id",
+      });
+
+      for (const blank of ["", "   "]) {
+        const empty = captureVoiceProtocolError(() =>
+          parseVivaClientFrame({ ...frame, client_generation_id: blank }),
+        );
+        expect({ type, code: empty.code, path: empty.path }).toEqual({
+          type,
+          code: "VOICE_PROTOCOL_INVALID_FIELD",
+          path: "$.client_generation_id",
+        });
+      }
+    }
+  });
+
+  test("requires the signed credential at the frame top level and forbids a nested one", () => {
+    const { session_token: _absent, ...withoutToken } = CANONICAL_SIGNED_SESSION_CONFIG;
+    const missing = captureVoiceProtocolError(() => parseVivaClientFrame(withoutToken));
+    expect(missing.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
+    expect(missing.path).toBe("$.session_token");
+
+    for (const blank of ["", "   "]) {
+      const empty = captureVoiceProtocolError(() =>
+        parseVivaClientFrame({ ...CANONICAL_SIGNED_SESSION_CONFIG, session_token: blank }),
+      );
+      expect(empty.code).toBe("VOICE_PROTOCOL_INVALID_FIELD");
+      expect(empty.path).toBe("$.session_token");
+    }
+
+    const nested = captureVoiceProtocolError(() =>
+      parseVivaClientFrame({
+        ...CANONICAL_SIGNED_SESSION_CONFIG,
+        session: {
+          ...CANONICAL_SIGNED_SESSION_CONFIG.session,
+          session_token: CANONICAL_FIXTURE_SESSION_TOKEN,
+        },
+      }),
+    );
+    expect(nested.code).toBe("VOICE_PROTOCOL_FORBIDDEN_AUTHORITY");
+    expect(nested.path).toBe("$.session.session_token");
+  });
+
+  test("keeps in-socket refresh context-only and free of credentials or identity", () => {
+    for (const forbidden of [
+      "session_token",
+      "user_id",
+      "study_set_id",
+      "session_id",
+      "source_context",
+      "active_concepts",
+    ]) {
+      const rejection = captureVoiceProtocolError(() =>
+        parseVivaClientFrame({
+          ...CANONICAL_SESSION_REFRESH,
+          context: { ...CANONICAL_SESSION_REFRESH.context, [forbidden]: "fixture-value" },
+        }),
+      );
+      expect({ forbidden, code: rejection.code, path: rejection.path }).toEqual({
+        forbidden,
+        code: "VOICE_PROTOCOL_FORBIDDEN_AUTHORITY",
+        path: `$.context.${forbidden}`,
+      });
+    }
+
+    const unknown = captureVoiceProtocolError(() =>
+      parseVivaClientFrame({
+        ...CANONICAL_SESSION_REFRESH,
+        context: { ...CANONICAL_SESSION_REFRESH.context, tenant: "fixture-tenant" },
+      }),
+    );
+    expect(unknown.code).toBe("VOICE_PROTOCOL_UNKNOWN_FIELD");
+    expect(unknown.path).toBe("$.context.tenant");
+
+    const empty = captureVoiceProtocolError(() =>
+      parseVivaClientFrame({ ...CANONICAL_SESSION_REFRESH, context: {} }),
+    );
+    expect(empty.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
+    expect(empty.path).toBe("$.context");
+
+    // Either key alone is a complete context.
+    for (const context of [{ mode: "quiz" }, { initial_goal: "Review the fixture source." }]) {
+      const frame = { ...CANONICAL_SESSION_REFRESH, context };
+      expect(parseVivaClientFrame(frame)).toEqual(frame);
+    }
+
+    for (const goal of ["", "   ", "g".repeat(513)]) {
+      const rejection = captureVoiceProtocolError(() =>
+        parseVivaClientFrame({ ...CANONICAL_SESSION_REFRESH, context: { initial_goal: goal } }),
+      );
+      expect(rejection.code).toBe("VOICE_PROTOCOL_INVALID_FIELD");
+      expect(rejection.path).toBe("$.context.initial_goal");
+    }
+    const atLimit = {
+      ...CANONICAL_SESSION_REFRESH,
+      context: { initial_goal: "g".repeat(512) },
+    };
+    expect(parseVivaClientFrame(atLimit)).toEqual(atLimit);
+  });
+
+  test("keeps the refresh policy branch out of the parser", async () => {
+    // Parsing a well-formed refresh does not authorize or apply it; Plan 08 owns the
+    // selected D-03 branch and its recoverable denial event. This module carries
+    // neither the denial code nor any branch switch.
+    const source = await readAgentContractSource();
+    expect(source).not.toContain("REFRESH_POLICY");
+    expect(source).not.toContain("POLICY_DENIED");
+
+    // The parsed context is returned intact, never rewritten into a denial.
+    expect(parseVivaClientFrame(sessionRefreshFixture)).toEqual(CANONICAL_SESSION_REFRESH);
+  });
+
+  test("exports exactly the seven browser-authorized variants and no tool authority", async () => {
+    expect([...VIVA_BROWSER_CLIENT_FRAME_TYPES]).toEqual([
+      "session_config",
+      "session_refresh",
+      "audio_chunk",
+      "audio_end",
+      "turn_intent",
+      "cancel",
+      "stop",
+    ]);
+
+    const contract = (await import("./agent-contract")) as Record<string, unknown>;
+    expect("AgentToolProposal" in contract).toBe(false);
+    expect("AgentToolResult" in contract).toBe(false);
+    const source = await readAgentContractSource();
+    expect(source).not.toContain("AgentToolProposal");
+    expect(source).not.toContain("AgentToolResult");
+
+    const forged = captureVoiceProtocolError(() =>
+      parseVivaClientFrame({
+        type: "tool_result",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        client_generation_id: "viva-session-bootstrap-1-fixture",
+        result: { proposal: { name: "write_review_state", arguments: {} }, result: {} },
+      }),
+    );
+    expect(forged.code).toBe("VOICE_PROTOCOL_FORBIDDEN_AUTHORITY");
+    expect(forged.path).toBe("$.type");
+
+    // There is no v5 plain text frame; it is an unknown frame, not a tool authority.
+    const plainText = captureVoiceProtocolError(() =>
+      parseVivaClientFrame({
+        type: "text",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        client_generation_id: "viva-session-bootstrap-1-fixture",
+        text: "NADH donates electrons.",
+      }),
+    );
+    expect(plainText.code).toBe("VOICE_PROTOCOL_UNKNOWN_FRAME");
+    expect(plainText.path).toBe("$.type");
+  });
+
+  test("types answer text and citation challenge so neither can cross-grade", () => {
+    const challenge = {
+      type: "turn_intent",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "viva-session-bootstrap-1-fixture",
+      turn_id: "turn-2",
+      intent: { kind: "citation_challenge", response_id: "response-2", source_id: "src-lecture-5" },
+    };
+    expect(parseVivaClientFrame(challenge)).toEqual(challenge);
+
+    // A citation challenge cannot smuggle answer text, and answer text cannot smuggle
+    // citation identity.
+    const crossGraded = captureVoiceProtocolError(() =>
+      parseVivaClientFrame({
+        ...challenge,
+        intent: { ...challenge.intent, text: "NADH donates electrons." },
+      }),
+    );
+    expect(crossGraded.code).toBe("VOICE_PROTOCOL_UNKNOWN_FIELD");
+    expect(crossGraded.path).toBe("$.intent.text");
+
+    const forgedAnswer = captureVoiceProtocolError(() =>
+      parseVivaClientFrame({
+        ...challenge,
+        intent: { kind: "answer_text", text: "NADH donates electrons.", source_id: "src-1" },
+      }),
+    );
+    expect(forgedAnswer.code).toBe("VOICE_PROTOCOL_UNKNOWN_FIELD");
+    expect(forgedAnswer.path).toBe("$.intent.source_id");
+
+    for (const badId of ["", "  ", ".leading-dot", "a".repeat(129), "has space"]) {
+      const rejection = captureVoiceProtocolError(() =>
+        parseVivaClientFrame({
+          ...challenge,
+          intent: { ...challenge.intent, source_id: badId },
+        }),
+      );
+      expect(rejection.code).toBe("VOICE_PROTOCOL_INVALID_FIELD");
+      expect(rejection.path).toBe("$.intent.source_id");
+    }
+  });
+
+  test("keeps the fake credential out of every diagnostic", () => {
+    const rejections = [
+      captureVoiceProtocolError(() =>
+        parseVivaClientFrame({ ...CANONICAL_SIGNED_SESSION_CONFIG, version: 4 }),
+      ),
+      captureVoiceProtocolError(() =>
+        parseVivaClientFrame({
+          ...CANONICAL_SIGNED_SESSION_CONFIG,
+          session: { ...CANONICAL_SIGNED_SESSION_CONFIG.session, session_id: "" },
+        }),
+      ),
+      captureVoiceProtocolError(() =>
+        parseVivaClientFrameJson(JSON.stringify({ ...CANONICAL_SIGNED_SESSION_CONFIG, type: 7 })),
+      ),
+    ];
+
+    for (const rejection of rejections) {
+      const rendered = `${rejection.name} ${rejection.code} ${rejection.path} ${rejection.message}`;
+      expect(rendered).not.toContain("viva1");
+      expect(rendered).not.toContain("fixture-user");
+      expect(rendered).not.toContain("fixture-session");
+      expect(rendered.toLowerCase()).not.toContain("bearer");
+    }
+  });
+});
+
 function captureVoiceProtocolError(run: () => unknown): VivaVoiceProtocolError {
   try {
     run();
@@ -1401,10 +1755,18 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-function activeConceptIdsFromFixture(fixture: { client: unknown[] }): string[] {
+/**
+ * Reads `active_concepts` out of the frozen unversioned corpus structurally. That corpus
+ * is v4 client wire shape and is deliberately rejected by the v5 parser, so this helper
+ * never routes it through `parseVivaClientFrame`. Retired with the corpus in Task 9.
+ */
+function legacyActiveConceptIds(fixture: { client: unknown[] }): string[] {
   return fixture.client.flatMap((frame) => {
-    const parsed = parseVivaClientFrame(frame);
-    return parsed.type === "session_config" ? parsed.session.active_concepts : [];
+    if (!frame || typeof frame !== "object") return [];
+    const record = frame as Record<string, unknown>;
+    if (record.type !== "session_config") return [];
+    const session = record.session as { active_concepts?: unknown } | undefined;
+    return Array.isArray(session?.active_concepts) ? (session.active_concepts as string[]) : [];
   });
 }
 

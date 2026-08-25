@@ -1,0 +1,14 @@
+{
+  "type": "session_config",
+  "version": 5,
+  "client_generation_id": "viva-session-bootstrap-1-fixture",
+  "session_token": "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDAxIn0.JcnhtQUxeV1XJm0RYGo7LuL5yph5SeRaFch8-Iz8_rA",
+  "session": {
+    "session_id": "fixture-session",
+    "user_id": "fixture-user",
+    "study_set_id": "fixture-study-set",
+    "mode": "quiz",
+    "source_context": [],
+    "active_concepts": []
+  }
+}

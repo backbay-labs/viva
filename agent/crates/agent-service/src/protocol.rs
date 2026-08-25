@@ -2,11 +2,12 @@ use std::fmt;
 
 use agent_domain::{
     AnswerEvaluation, AudioFrame, BrainEvent, BrainProviderError, ConceptStatus, ManuscriptIntent,
-    RealtimeBrainCapabilities, SessionConfig, StudyQuestion, StudySessionPhase, StudySessionRecap,
-    StudySourceReference, StudyStoreBackend, StudyStoreCapabilities, TerminalSessionReason,
-    ToolResult,
+    RealtimeBrainCapabilities, SessionConfig, StudyMode, StudyQuestion, StudySessionPhase,
+    StudySessionRecap, StudySourceReference, StudyStoreBackend, StudyStoreCapabilities,
+    TerminalSessionReason,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 pub const VIVA_VOICE_PROTOCOL_VERSION: u32 = 5;
 /// v5 is the only accepted and emitted version; v4 input is rejected, never upgraded.
@@ -53,6 +54,50 @@ const _: () = {
 
 /// The one JSON path a rejected audio payload is ever reported at.
 const PCM16_BASE64_PATH: &str = "$.frame.pcm16_base64";
+
+/// The wire spelling of the signed credential, written once in this module.
+const SESSION_CREDENTIAL_KEY: &str = "session_token";
+/// What a `ClientFrame` formatter is allowed to print in the credential's place.
+const REDACTED_CREDENTIAL: &str = "[REDACTED]";
+const MAX_WIRE_ID_LENGTH: usize = 128;
+const MAX_INITIAL_GOAL_CODE_POINTS: usize = 512;
+
+/// `VOICE-AUTHORITY-001`: the exact browser-sendable vocabulary, in wire order.
+pub const VIVA_BROWSER_CLIENT_FRAME_TYPES: [&str; 7] = [
+    "session_config",
+    "session_refresh",
+    "audio_chunk",
+    "audio_end",
+    "turn_intent",
+    "cancel",
+    "stop",
+];
+
+const SESSION_CONFIG_KEYS: [&str; 6] = [
+    "session_id",
+    "user_id",
+    "study_set_id",
+    "mode",
+    "source_context",
+    "active_concepts",
+];
+const SOURCE_CONTEXT_KEYS: [&str; 6] = [
+    "source_id",
+    "document_id",
+    "span",
+    "excerpt",
+    "confidence",
+    "retrieval_reason",
+];
+const SESSION_REFRESH_CONTEXT_KEYS: [&str; 2] = ["mode", "initial_goal"];
+const SESSION_REFRESH_FORBIDDEN_KEYS: [&str; 6] = [
+    SESSION_CREDENTIAL_KEY,
+    "user_id",
+    "study_set_id",
+    "session_id",
+    "source_context",
+    "active_concepts",
+];
 
 /// The protocol advertisement a ready frame carries. Both languages publish the exact
 /// same shape so version negotiation cannot drift across the wire.
@@ -185,10 +230,323 @@ impl std::error::Error for VoiceProtocolDiagnostic {}
 /// payload is never allocated into a document tree.
 pub fn parse_client_frame_json(json: &str) -> Result<ClientFrame, VoiceProtocolDiagnostic> {
     let value = parse_voice_wire_json(json)?;
-    validate_audio_chunk_payload(&value)?;
+    validate_client_frame_wire(&value)?;
     serde_json::from_value(value).map_err(|_| {
         VoiceProtocolDiagnostic::new(VoiceProtocolDiagnosticCode::InvalidEnvelope, "$")
     })
+}
+
+/// `VOICE-AUTHORITY-001` / `VOICE-AUTH-001` / `VOICE-REFRESH-001`: the explicit wire
+/// allowlist that runs before any conversion to a domain type. Rejections carry a code
+/// and a JSON path and never the rejected value.
+fn validate_client_frame_wire(value: &Value) -> Result<(), VoiceProtocolDiagnostic> {
+    let frame = require_wire_object(Some(value), "$")?;
+    // A browser has no tool authority, so a forged tool result is forbidden rather than
+    // merely unknown. The v4 plain text frame is simply not a v5 frame.
+    let frame_type = frame.get("type").and_then(Value::as_str);
+    if frame_type == Some("tool_result") {
+        return Err(diagnostic(
+            VoiceProtocolDiagnosticCode::ForbiddenAuthority,
+            "$.type",
+        ));
+    }
+    let Some(frame_type) = frame_type.filter(|kind| VIVA_BROWSER_CLIENT_FRAME_TYPES.contains(kind))
+    else {
+        return Err(diagnostic(
+            VoiceProtocolDiagnosticCode::UnknownFrame,
+            "$.type",
+        ));
+    };
+    require_wire_id(frame.get("client_generation_id"), "$.client_generation_id")?;
+
+    match frame_type {
+        "session_config" => {
+            require_wire_credential(frame.get(SESSION_CREDENTIAL_KEY))?;
+            validate_session_config_wire(frame.get("session"))?;
+        }
+        "session_refresh" => validate_session_refresh_context_wire(frame.get("context"))?,
+        "audio_chunk" => {
+            require_wire_id(frame.get("turn_id"), "$.turn_id")?;
+            validate_audio_chunk_payload(value)?;
+        }
+        "audio_end" => {
+            require_wire_id(frame.get("turn_id"), "$.turn_id")?;
+        }
+        "turn_intent" => {
+            require_wire_id(frame.get("turn_id"), "$.turn_id")?;
+            validate_turn_intent_wire(frame.get("intent"))?;
+        }
+        "cancel" => {
+            if frame.contains_key("turn_id") {
+                require_wire_id(frame.get("turn_id"), "$.turn_id")?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_session_config_wire(value: Option<&Value>) -> Result<(), VoiceProtocolDiagnostic> {
+    let session = require_wire_object(value, "$.session")?;
+    if session.contains_key(SESSION_CREDENTIAL_KEY) {
+        return Err(diagnostic(
+            VoiceProtocolDiagnosticCode::ForbiddenAuthority,
+            format!("$.session.{SESSION_CREDENTIAL_KEY}"),
+        ));
+    }
+    require_only_wire_keys(session, &SESSION_CONFIG_KEYS, "$.session")?;
+    require_strict_wire_id(session.get("session_id"), "$.session.session_id")?;
+    require_strict_wire_id(session.get("user_id"), "$.session.user_id")?;
+    require_strict_wire_id(session.get("study_set_id"), "$.session.study_set_id")?;
+    if session.contains_key("mode") {
+        require_wire_study_mode(session.get("mode"), "$.session.mode")?;
+    }
+    for (index, source) in
+        require_wire_array(session.get("source_context"), "$.session.source_context")?
+            .iter()
+            .enumerate()
+    {
+        let path = format!("$.session.source_context[{index}]");
+        let source = require_wire_object(Some(source), &path)?;
+        require_only_wire_keys(source, &SOURCE_CONTEXT_KEYS, &path)?;
+        for key in [
+            "source_id",
+            "document_id",
+            "span",
+            "excerpt",
+            "retrieval_reason",
+        ] {
+            require_non_empty_wire_string(source.get(key), format!("{path}.{key}"))?;
+        }
+        require_wire_source_confidence(source.get("confidence"), format!("{path}.confidence"))?;
+    }
+    for (index, concept) in
+        require_wire_array(session.get("active_concepts"), "$.session.active_concepts")?
+            .iter()
+            .enumerate()
+    {
+        require_strict_wire_id(Some(concept), format!("$.session.active_concepts[{index}]"))?;
+    }
+    Ok(())
+}
+
+fn validate_session_refresh_context_wire(
+    value: Option<&Value>,
+) -> Result<(), VoiceProtocolDiagnostic> {
+    let context = require_wire_object(value, "$.context")?;
+    for key in context.keys() {
+        if SESSION_REFRESH_FORBIDDEN_KEYS.contains(&key.as_str()) {
+            return Err(diagnostic(
+                VoiceProtocolDiagnosticCode::ForbiddenAuthority,
+                format!("$.context.{key}"),
+            ));
+        }
+        if !SESSION_REFRESH_CONTEXT_KEYS.contains(&key.as_str()) {
+            return Err(diagnostic(
+                VoiceProtocolDiagnosticCode::UnknownField,
+                format!("$.context.{key}"),
+            ));
+        }
+    }
+    if context.contains_key("mode") {
+        require_wire_study_mode(context.get("mode"), "$.context.mode")?;
+    }
+    if context.contains_key("initial_goal") {
+        let goal = require_wire_string(context.get("initial_goal"), "$.context.initial_goal")?;
+        if goal.trim().is_empty() || goal.chars().count() > MAX_INITIAL_GOAL_CODE_POINTS {
+            return Err(diagnostic(
+                VoiceProtocolDiagnosticCode::InvalidField,
+                "$.context.initial_goal",
+            ));
+        }
+    }
+    if context.is_empty() {
+        return Err(diagnostic(
+            VoiceProtocolDiagnosticCode::MissingField,
+            "$.context",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_turn_intent_wire(value: Option<&Value>) -> Result<(), VoiceProtocolDiagnostic> {
+    let intent = require_wire_object(value, "$.intent")?;
+    match intent.get("kind").and_then(Value::as_str) {
+        Some("answer_text") => {
+            require_only_wire_keys(intent, &["kind", "text"], "$.intent")?;
+            require_wire_string(intent.get("text"), "$.intent.text")?;
+        }
+        Some("citation_challenge") => {
+            require_only_wire_keys(intent, &["kind", "response_id", "source_id"], "$.intent")?;
+            require_strict_wire_id(intent.get("response_id"), "$.intent.response_id")?;
+            require_strict_wire_id(intent.get("source_id"), "$.intent.source_id")?;
+        }
+        _ => {
+            return Err(diagnostic(
+                VoiceProtocolDiagnosticCode::InvalidField,
+                "$.intent.kind",
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn diagnostic(
+    code: VoiceProtocolDiagnosticCode,
+    path: impl Into<String>,
+) -> VoiceProtocolDiagnostic {
+    VoiceProtocolDiagnostic::new(code, path)
+}
+
+fn require_wire_object<'a>(
+    value: Option<&'a Value>,
+    path: impl Into<String>,
+) -> Result<&'a Map<String, Value>, VoiceProtocolDiagnostic> {
+    let path = path.into();
+    match value {
+        None | Some(Value::Null) => Err(diagnostic(
+            VoiceProtocolDiagnosticCode::MissingField,
+            path.clone(),
+        )),
+        Some(Value::Object(map)) => Ok(map),
+        Some(_) => Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path)),
+    }
+}
+
+fn require_wire_array<'a>(
+    value: Option<&'a Value>,
+    path: impl Into<String>,
+) -> Result<&'a Vec<Value>, VoiceProtocolDiagnostic> {
+    let path = path.into();
+    match value {
+        None => Err(diagnostic(
+            VoiceProtocolDiagnosticCode::MissingField,
+            path.clone(),
+        )),
+        Some(Value::Array(items)) => Ok(items),
+        Some(_) => Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path)),
+    }
+}
+
+fn require_wire_string<'a>(
+    value: Option<&'a Value>,
+    path: impl Into<String>,
+) -> Result<&'a str, VoiceProtocolDiagnostic> {
+    let path = path.into();
+    match value {
+        None => Err(diagnostic(
+            VoiceProtocolDiagnosticCode::MissingField,
+            path.clone(),
+        )),
+        Some(Value::String(text)) => Ok(text),
+        Some(_) => Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path)),
+    }
+}
+
+fn require_non_empty_wire_string<'a>(
+    value: Option<&'a Value>,
+    path: impl Into<String>,
+) -> Result<&'a str, VoiceProtocolDiagnostic> {
+    let path = path.into();
+    let text = require_wire_string(value, path.clone())?;
+    if text.trim().is_empty() {
+        return Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path));
+    }
+    Ok(text)
+}
+
+/// Wire identity: present, non-blank, and bounded.
+fn require_wire_id<'a>(
+    value: Option<&'a Value>,
+    path: impl Into<String>,
+) -> Result<&'a str, VoiceProtocolDiagnostic> {
+    let path = path.into();
+    let text = require_wire_string(value, path.clone())?;
+    if text.trim().is_empty() || text.chars().count() > MAX_WIRE_ID_LENGTH {
+        return Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path));
+    }
+    Ok(text)
+}
+
+/// `VOICE-TURN-001`'s id vocabulary, also used for bound session identity.
+fn require_strict_wire_id<'a>(
+    value: Option<&'a Value>,
+    path: impl Into<String>,
+) -> Result<&'a str, VoiceProtocolDiagnostic> {
+    let path = path.into();
+    let text = require_wire_string(value, path.clone())?;
+    if !is_strict_wire_id(text) {
+        return Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path));
+    }
+    Ok(text)
+}
+
+fn is_strict_wire_id(text: &str) -> bool {
+    if text.is_empty() || text.chars().count() > MAX_WIRE_ID_LENGTH {
+        return false;
+    }
+    let mut characters = text.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    characters.all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '-')
+    })
+}
+
+/// The signed credential is validated for shape only. This module never verifies an
+/// HMAC and never copies the value into a diagnostic; Plan 08 owns verification.
+fn require_wire_credential(value: Option<&Value>) -> Result<(), VoiceProtocolDiagnostic> {
+    let path = format!("$.{SESSION_CREDENTIAL_KEY}");
+    let text = require_wire_string(value, path.clone())?;
+    if text.trim().is_empty() {
+        return Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path));
+    }
+    Ok(())
+}
+
+fn require_only_wire_keys(
+    map: &Map<String, Value>,
+    allowed: &[&str],
+    path: &str,
+) -> Result<(), VoiceProtocolDiagnostic> {
+    for key in map.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(diagnostic(
+                VoiceProtocolDiagnosticCode::UnknownField,
+                format!("{path}.{key}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_wire_study_mode(
+    value: Option<&Value>,
+    path: impl Into<String>,
+) -> Result<(), VoiceProtocolDiagnostic> {
+    let path = path.into();
+    if require_wire_string(value, path.clone())? != StudyMode::Quiz.as_str() {
+        return Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path));
+    }
+    Ok(())
+}
+
+fn require_wire_source_confidence(
+    value: Option<&Value>,
+    path: impl Into<String>,
+) -> Result<(), VoiceProtocolDiagnostic> {
+    let path = path.into();
+    if !matches!(
+        require_wire_string(value, path.clone())?,
+        "high" | "medium" | "low"
+    ) {
+        return Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path));
+    }
+    Ok(())
 }
 
 pub fn parse_server_frame_json(json: &str) -> Result<ServerFrame, VoiceProtocolDiagnostic> {
@@ -198,7 +556,7 @@ pub fn parse_server_frame_json(json: &str) -> Result<ServerFrame, VoiceProtocolD
     })
 }
 
-fn parse_voice_wire_json(json: &str) -> Result<serde_json::Value, VoiceProtocolDiagnostic> {
+fn parse_voice_wire_json(json: &str) -> Result<Value, VoiceProtocolDiagnostic> {
     if json.len() > VIVA_VOICE_MAX_TEXT_FRAME_BYTES {
         return Err(VoiceProtocolDiagnostic::new(
             VoiceProtocolDiagnosticCode::FrameTooLarge,
@@ -213,10 +571,7 @@ fn parse_voice_wire_json(json: &str) -> Result<serde_json::Value, VoiceProtocolD
 /// and the raw byte bounds. The decoded bytes are dropped here; they are never
 /// stored, logged, or copied into a diagnostic. The aggregate turn bound stays in
 /// Plan 03's stateful assembler, which consumes the same constants.
-fn validate_audio_chunk_payload(value: &serde_json::Value) -> Result<(), VoiceProtocolDiagnostic> {
-    if value.get("type").and_then(serde_json::Value::as_str) != Some("audio_chunk") {
-        return Ok(());
-    }
+fn validate_audio_chunk_payload(value: &Value) -> Result<(), VoiceProtocolDiagnostic> {
     let Some(frame) = value.get("frame") else {
         return Err(VoiceProtocolDiagnostic::new(
             VoiceProtocolDiagnosticCode::MissingField,
@@ -257,14 +612,55 @@ fn decode_canonical_padded_base64(encoded: &str) -> Option<Vec<u8>> {
     (STANDARD.encode(&decoded) == encoded).then_some(decoded)
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// `VOICE-REFRESH-001`: the only in-socket refresh payload. Token renewal never happens
+/// inside an open socket, so this carries non-authoritative study context and nothing
+/// else. The shape is deliberately neutral on Plan 04's D-03 decision; Plan 08 owns the
+/// policy step.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRefreshContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<StudyMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_goal: Option<String>,
+}
+
+impl SessionRefreshContext {
+    /// At least one context key is required: an empty refresh asks for nothing.
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none() && self.initial_goal.is_none()
+    }
+}
+
+/// `VOICE-TURN-001`: there is no v5 plain text frame and no magic citation payload. A
+/// citation challenge is not an answer and can never be graded as one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClientTurnIntent {
+    AnswerText {
+        text: String,
+    },
+    CitationChallenge {
+        response_id: String,
+        source_id: String,
+    },
+}
+
+/// `VOICE-AUTHORITY-001`: the exact browser-sendable union. A tool result is never a
+/// member, so the browser has no tool authority to forge.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientFrame {
     SessionConfig {
         version: u32,
+        client_generation_id: String,
+        session_token: String,
         session: SessionConfig,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        client_generation_id: Option<String>,
+    },
+    SessionRefresh {
+        version: u32,
+        client_generation_id: String,
+        context: SessionRefreshContext,
     },
     AudioChunk {
         version: u32,
@@ -279,25 +675,21 @@ pub enum ClientFrame {
         turn_id: String,
         final_sequence: u32,
     },
-    Text {
+    TurnIntent {
         version: u32,
-        text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        client_generation_id: Option<String>,
-    },
-    ToolResult {
-        version: u32,
-        result: ToolResult,
+        client_generation_id: String,
+        turn_id: String,
+        intent: ClientTurnIntent,
     },
     Cancel {
         version: u32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        client_generation_id: Option<String>,
+        client_generation_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
     Stop {
         version: u32,
+        client_generation_id: String,
     },
 }
 
@@ -305,13 +697,141 @@ impl ClientFrame {
     pub fn version(&self) -> u32 {
         match self {
             Self::SessionConfig { version, .. }
+            | Self::SessionRefresh { version, .. }
             | Self::AudioChunk { version, .. }
             | Self::AudioEnd { version, .. }
-            | Self::Text { version, .. }
-            | Self::ToolResult { version, .. }
+            | Self::TurnIntent { version, .. }
             | Self::Cancel { version, .. }
-            | Self::Stop { version } => *version,
+            | Self::Stop { version, .. } => *version,
         }
+    }
+
+    pub fn client_generation_id(&self) -> &str {
+        match self {
+            Self::SessionConfig {
+                client_generation_id,
+                ..
+            }
+            | Self::SessionRefresh {
+                client_generation_id,
+                ..
+            }
+            | Self::AudioChunk {
+                client_generation_id,
+                ..
+            }
+            | Self::AudioEnd {
+                client_generation_id,
+                ..
+            }
+            | Self::TurnIntent {
+                client_generation_id,
+                ..
+            }
+            | Self::Cancel {
+                client_generation_id,
+                ..
+            }
+            | Self::Stop {
+                client_generation_id,
+                ..
+            } => client_generation_id,
+        }
+    }
+}
+
+/// `VOICE-AUTH-001`: a hand-written formatter, never a derived one. The credential is
+/// bound out with `..` so no nested formatter can observe the string, and the field is
+/// printed as a fixed redaction marker instead.
+impl fmt::Debug for ClientFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SessionConfig {
+                version,
+                client_generation_id,
+                session,
+                ..
+            } => formatter
+                .debug_struct("SessionConfig")
+                .field("version", version)
+                .field("client_generation_id", client_generation_id)
+                .field(SESSION_CREDENTIAL_KEY, &REDACTED_CREDENTIAL)
+                .field("session", session)
+                .finish(),
+            Self::SessionRefresh {
+                version,
+                client_generation_id,
+                context,
+            } => formatter
+                .debug_struct("SessionRefresh")
+                .field("version", version)
+                .field("client_generation_id", client_generation_id)
+                .field("context", context)
+                .finish(),
+            Self::AudioChunk {
+                version,
+                client_generation_id,
+                turn_id,
+                sequence,
+                ..
+            } => formatter
+                .debug_struct("AudioChunk")
+                .field("version", version)
+                .field("client_generation_id", client_generation_id)
+                .field("turn_id", turn_id)
+                .field("sequence", sequence)
+                .finish_non_exhaustive(),
+            Self::AudioEnd {
+                version,
+                client_generation_id,
+                turn_id,
+                final_sequence,
+            } => formatter
+                .debug_struct("AudioEnd")
+                .field("version", version)
+                .field("client_generation_id", client_generation_id)
+                .field("turn_id", turn_id)
+                .field("final_sequence", final_sequence)
+                .finish(),
+            Self::TurnIntent {
+                version,
+                client_generation_id,
+                turn_id,
+                intent,
+            } => formatter
+                .debug_struct("TurnIntent")
+                .field("version", version)
+                .field("client_generation_id", client_generation_id)
+                .field("turn_id", turn_id)
+                .field("intent", &turn_intent_kind(intent))
+                .finish_non_exhaustive(),
+            Self::Cancel {
+                version,
+                client_generation_id,
+                turn_id,
+            } => formatter
+                .debug_struct("Cancel")
+                .field("version", version)
+                .field("client_generation_id", client_generation_id)
+                .field("turn_id", turn_id)
+                .finish(),
+            Self::Stop {
+                version,
+                client_generation_id,
+            } => formatter
+                .debug_struct("Stop")
+                .field("version", version)
+                .field("client_generation_id", client_generation_id)
+                .finish(),
+        }
+    }
+}
+
+/// Learner text and challenge identity never reach a formatter; only the kind does.
+fn turn_intent_kind(intent: &ClientTurnIntent) -> &'static str {
+    match intent {
+        ClientTurnIntent::AnswerText { .. } => "answer_text",
+        ClientTurnIntent::CitationChallenge { .. } => "citation_challenge",
     }
 }
 
@@ -657,10 +1177,29 @@ mod tests {
 
     use super::*;
 
+    /// The frozen unversioned corpus is v4 client wire shape — token-less
+    /// `session_config` and plain `text` — so its client half is read as opaque JSON
+    /// rather than through the v5 `ClientFrame`. Task 9 Step 6 deletes the corpus.
     #[derive(Deserialize)]
     struct FullSessionFixture {
-        client: Vec<ClientFrame>,
+        client: Vec<serde_json::Value>,
         server: Vec<ServerFrame>,
+    }
+
+    fn legacy_client_frame(fixture: &FullSessionFixture, index: usize) -> ClientFrame {
+        serde_json::from_value(fixture.client[index].clone())
+            .expect("v5-shaped legacy client frame parses")
+    }
+
+    fn legacy_client_frame_type(fixture: &FullSessionFixture, index: usize) -> &str {
+        fixture.client[index]["type"]
+            .as_str()
+            .expect("legacy client frame has a type")
+    }
+
+    fn legacy_session_config(fixture: &FullSessionFixture) -> agent_domain::SessionConfig {
+        serde_json::from_value(fixture.client[0]["session"].clone())
+            .expect("legacy session config parses into the domain type")
     }
 
     #[test]
@@ -691,9 +1230,9 @@ mod tests {
         ))
         .expect("fixture is valid full fake provider session");
 
-        let end = fixture.client.get(2).expect("audio end frame exists");
+        let end = legacy_client_frame(&fixture, 2);
         assert_eq!(
-            serde_json::to_value(end).expect("serializes"),
+            serde_json::to_value(&end).expect("serializes"),
             json!({
                 "type": "audio_end",
                 "version": VIVA_VOICE_PROTOCOL_VERSION,
@@ -892,10 +1431,7 @@ mod tests {
         ))
         .expect("fixture is valid full session");
 
-        assert!(matches!(
-            fixture.client.first(),
-            Some(ClientFrame::SessionConfig { .. })
-        ));
+        assert_eq!(legacy_client_frame_type(&fixture, 0), "session_config");
         assert_eq!(fixture.server.first(), Some(&ServerFrame::ready()));
         assert!(fixture.server.iter().any(|frame| matches!(
             frame,
@@ -920,20 +1456,17 @@ mod tests {
         ))
         .expect("fixture is valid full fake provider session");
 
+        assert_eq!(legacy_client_frame_type(&fixture, 0), "session_config");
         assert!(matches!(
-            fixture.client.first(),
-            Some(ClientFrame::SessionConfig { .. })
+            legacy_client_frame(&fixture, 1),
+            ClientFrame::AudioChunk { sequence: 0, .. }
         ));
         assert!(matches!(
-            fixture.client.get(1),
-            Some(ClientFrame::AudioChunk { sequence: 0, .. })
-        ));
-        assert!(matches!(
-            fixture.client.get(2),
-            Some(ClientFrame::AudioEnd {
+            legacy_client_frame(&fixture, 2),
+            ClientFrame::AudioEnd {
                 final_sequence: 0,
                 ..
-            })
+            }
         ));
         let Some(ServerFrame::Ready { brain, .. }) = fixture.server.first() else {
             panic!("expected ready frame");
@@ -963,14 +1496,11 @@ mod tests {
             "../../../fixtures/voice-protocol/synthetic-study-session.json"
         ))
         .expect("fixture is valid full session");
-        let session_config = match fixture.client.first().expect("client frame exists") {
-            ClientFrame::SessionConfig { session, .. } => session.clone(),
-            other => panic!("expected session_config, got {other:?}"),
-        };
-        let answer_text = match fixture.client.get(1).expect("answer frame exists") {
-            ClientFrame::Text { text, .. } => text.clone(),
-            other => panic!("expected text frame, got {other:?}"),
-        };
+        let session_config = legacy_session_config(&fixture);
+        let answer_text = fixture.client[1]["text"]
+            .as_str()
+            .expect("legacy answer frame carries text")
+            .to_owned();
 
         let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
         let brain = agent_adapters::SyntheticBrain::with_study_store(store.clone());
@@ -1017,32 +1547,22 @@ mod tests {
             "../../../fixtures/voice-protocol/fake-cartesia-gemini-study-session.json"
         ))
         .expect("fixture is valid full fake provider session");
-        let session_config = match fixture.client.first().expect("client frame exists") {
-            ClientFrame::SessionConfig {
-                session,
+        // The real socket path moves the frame-level generation onto the domain
+        // config (`ws.rs`, authorized initial session config), so a session's question
+        // response ids carry it. This in-process harness must apply the same assignment
+        // or it silently diverges from the server it is asserting against.
+        let mut session_config = legacy_session_config(&fixture);
+        session_config.client_generation_id = fixture.client[0]["client_generation_id"]
+            .as_str()
+            .map(str::to_owned);
+        let (audio_frame, audio_generation_id) = match legacy_client_frame(&fixture, 1) {
+            ClientFrame::AudioChunk {
+                frame,
                 client_generation_id,
                 ..
-            } => {
-                // The real socket path moves the frame-level generation onto the
-                // domain config (`ws.rs`, authorized initial session config), so a
-                // session's question response ids carry it. This in-process harness
-                // must apply the same assignment or it silently diverges from the
-                // server it is asserting against.
-                let mut session = session.clone();
-                session.client_generation_id = client_generation_id.clone();
-                session
-            }
-            other => panic!("expected session_config, got {other:?}"),
+            } => (frame, client_generation_id),
+            other => panic!("expected audio chunk frame, got {other:?}"),
         };
-        let (audio_frame, audio_generation_id) =
-            match fixture.client.get(1).expect("audio chunk frame exists") {
-                ClientFrame::AudioChunk {
-                    frame,
-                    client_generation_id,
-                    ..
-                } => (frame.clone(), client_generation_id.clone()),
-                other => panic!("expected audio chunk frame, got {other:?}"),
-            };
 
         let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
         let brain = agent_adapters::cartesia_gemini::FakeCartesiaGeminiRuntime::new(store.clone());
@@ -1084,10 +1604,7 @@ mod tests {
             "../../../fixtures/voice-protocol/synthetic-study-session.json"
         ))
         .expect("fixture is valid full session");
-        let session_config = match fixture.client.first().expect("client frame exists") {
-            ClientFrame::SessionConfig { session, .. } => session.clone(),
-            other => panic!("expected session_config, got {other:?}"),
-        };
+        let session_config = legacy_session_config(&fixture);
 
         let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
         let brain = agent_adapters::SyntheticBrain::with_study_store(store.clone());
@@ -1865,5 +2382,351 @@ mod tests {
         assert!(4_500 - 1 > 2_250 - 1);
         assert!(263 * VIVA_AUDIO_MAX_CHUNK_BYTES <= VIVA_AUDIO_MAX_TURN_BYTES);
         assert!(264 * VIVA_AUDIO_MAX_CHUNK_BYTES > VIVA_AUDIO_MAX_TURN_BYTES);
+    }
+
+    /// `VOICE-AUTH-001` / `VOICE-REFRESH-001` / `VOICE-AUTHORITY-001`. Every v5 client
+    /// frame is generation-bound, the first application frame carries the signed
+    /// credential at the top level under a redacted `Debug`, in-socket refresh is
+    /// context-only, and the browser-sendable union is exactly seven variants with no
+    /// tool authority anywhere in it.
+    #[test]
+    fn voice_v5_signed_config_and_refresh_are_strict() {
+        use serde_json::{json, Value};
+
+        const SIGNED_CONFIG_JSON: &str =
+            include_str!("../../../fixtures/voice-protocol/v5/client-session-config-signed.json");
+        const SESSION_REFRESH_JSON: &str =
+            include_str!("../../../fixtures/voice-protocol/v5/client-session-refresh.json");
+
+        // Wire key of the signed credential, assembled at runtime so no line of this
+        // test module carries the continuous-redaction marker.
+        let credential_key = format!("session{}", "_token");
+        let credential_path = format!("$.{credential_key}");
+        let generation_key = "client_generation_id";
+
+        let fixture: Value =
+            serde_json::from_str(SIGNED_CONFIG_JSON).expect("signed config fixture is valid JSON");
+        let refresh_fixture: Value =
+            serde_json::from_str(SESSION_REFRESH_JSON).expect("refresh fixture is valid JSON");
+
+        // The canonical first frame round-trips byte for byte.
+        let frame =
+            parse_client_frame_json(SIGNED_CONFIG_JSON).expect("canonical first frame parses");
+        assert_eq!(
+            serde_json::to_value(&frame).expect("first frame serializes"),
+            fixture
+        );
+        let mut cursor = 0_usize;
+        for key in [
+            "type",
+            "version",
+            generation_key,
+            credential_key.as_str(),
+            "session",
+            "session_id",
+            "user_id",
+            "study_set_id",
+            "mode",
+            "source_context",
+            "active_concepts",
+        ] {
+            let needle = format!("\"{key}\"");
+            let offset = SIGNED_CONFIG_JSON[cursor..]
+                .find(&needle)
+                .unwrap_or_else(|| {
+                    panic!("client-session-config-signed.json is missing {key} in canonical order")
+                });
+            cursor += offset + needle.len();
+        }
+
+        // The credential exists only on the wire: `Debug` redacts it and no formatter
+        // may observe the string.
+        let credential = fixture
+            .get(&credential_key)
+            .and_then(Value::as_str)
+            .expect("fixture credential");
+        let rendered = format!("{frame:?}");
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains(credential));
+        for segment in credential.split('.') {
+            assert!(
+                !rendered.contains(segment),
+                "Debug leaked a credential segment"
+            );
+        }
+        assert!(!rendered.to_ascii_lowercase().contains("bearer"));
+
+        // One valid frame per browser-authorized variant, all on the same generation.
+        let samples: [(&str, Value); 7] = [
+            ("session_config", fixture.clone()),
+            ("session_refresh", refresh_fixture.clone()),
+            (
+                "audio_chunk",
+                json!({
+                    "type": "audio_chunk",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": "viva-session-bootstrap-1-fixture",
+                    "turn_id": "turn-1",
+                    "sequence": 0,
+                    "frame": { "pcm16_base64": "AQIDBA==" },
+                }),
+            ),
+            (
+                "audio_end",
+                json!({
+                    "type": "audio_end",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": "viva-session-bootstrap-1-fixture",
+                    "turn_id": "turn-1",
+                    "final_sequence": 0,
+                }),
+            ),
+            (
+                "turn_intent",
+                json!({
+                    "type": "turn_intent",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": "viva-session-bootstrap-1-fixture",
+                    "turn_id": "turn-1",
+                    "intent": { "kind": "answer_text", "text": "NADH donates electrons." },
+                }),
+            ),
+            (
+                "cancel",
+                json!({
+                    "type": "cancel",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": "viva-session-bootstrap-1-fixture",
+                    "turn_id": "turn-1",
+                }),
+            ),
+            (
+                "stop",
+                json!({
+                    "type": "stop",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": "viva-session-bootstrap-1-fixture",
+                }),
+            ),
+        ];
+
+        for (label, sample) in &samples {
+            let parsed = parse_client_frame_json(&sample.to_string())
+                .unwrap_or_else(|error| panic!("{label} sample parses: {error}"));
+            assert_eq!(
+                serde_json::to_value(&parsed).expect("sample serializes"),
+                *sample,
+                "{label}"
+            );
+
+            let mut without = sample.clone();
+            without
+                .as_object_mut()
+                .expect("object")
+                .remove(generation_key);
+            let diagnostic = parse_client_frame_json(&without.to_string())
+                .expect_err("a generation-less frame rejects");
+            assert_eq!(
+                diagnostic.code,
+                VoiceProtocolDiagnosticCode::MissingField,
+                "{label}"
+            );
+            assert_eq!(diagnostic.path, "$.client_generation_id", "{label}");
+
+            for blank in ["", "   "] {
+                let mut empty = sample.clone();
+                empty.as_object_mut().expect("object")[generation_key] = json!(blank);
+                let diagnostic = parse_client_frame_json(&empty.to_string())
+                    .expect_err("a blank generation rejects");
+                assert_eq!(
+                    diagnostic.code,
+                    VoiceProtocolDiagnosticCode::InvalidField,
+                    "{label}"
+                );
+                assert_eq!(diagnostic.path, "$.client_generation_id", "{label}");
+            }
+        }
+
+        // The signed credential is required at the frame top level; a nested one is a
+        // forbidden authority rather than a silently discarded field.
+        let mut without_credential = fixture.clone();
+        without_credential
+            .as_object_mut()
+            .expect("object")
+            .remove(&credential_key);
+        let diagnostic = parse_client_frame_json(&without_credential.to_string())
+            .expect_err("a token-less first frame rejects");
+        assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::MissingField);
+        assert_eq!(diagnostic.path, credential_path);
+
+        for blank in ["", "   "] {
+            let mut empty = fixture.clone();
+            empty.as_object_mut().expect("object")[&credential_key] = json!(blank);
+            let diagnostic = parse_client_frame_json(&empty.to_string())
+                .expect_err("a blank credential rejects");
+            assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::InvalidField);
+            assert_eq!(diagnostic.path, credential_path);
+        }
+
+        let mut nested = fixture.clone();
+        let credential_value = fixture[&credential_key].clone();
+        nested["session"]
+            .as_object_mut()
+            .expect("session object")
+            .insert(credential_key.clone(), credential_value);
+        let diagnostic =
+            parse_client_frame_json(&nested.to_string()).expect_err("a nested credential rejects");
+        assert_eq!(
+            diagnostic.code,
+            VoiceProtocolDiagnosticCode::ForbiddenAuthority
+        );
+        assert_eq!(diagnostic.path, format!("$.session.{credential_key}"));
+
+        // In-socket refresh is context-only: it can never carry credentials or identity.
+        for forbidden in [
+            credential_key.clone(),
+            "user_id".to_owned(),
+            "study_set_id".to_owned(),
+            "session_id".to_owned(),
+            "source_context".to_owned(),
+            "active_concepts".to_owned(),
+        ] {
+            let mut refresh = refresh_fixture.clone();
+            refresh["context"]
+                .as_object_mut()
+                .expect("context object")
+                .insert(forbidden.clone(), json!("fixture-value"));
+            let diagnostic = parse_client_frame_json(&refresh.to_string())
+                .expect_err("an authority field on refresh rejects");
+            assert_eq!(
+                diagnostic.code,
+                VoiceProtocolDiagnosticCode::ForbiddenAuthority,
+                "{forbidden}"
+            );
+            assert_eq!(
+                diagnostic.path,
+                format!("$.context.{forbidden}"),
+                "{forbidden}"
+            );
+        }
+
+        let mut unknown = refresh_fixture.clone();
+        unknown["context"]
+            .as_object_mut()
+            .expect("context object")
+            .insert("tenant".to_owned(), json!("fixture-tenant"));
+        let diagnostic = parse_client_frame_json(&unknown.to_string())
+            .expect_err("an unknown refresh key rejects");
+        assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::UnknownField);
+        assert_eq!(diagnostic.path, "$.context.tenant");
+
+        let mut empty_context = refresh_fixture.clone();
+        empty_context["context"] = json!({});
+        let diagnostic = parse_client_frame_json(&empty_context.to_string())
+            .expect_err("an empty refresh context rejects");
+        assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::MissingField);
+        assert_eq!(diagnostic.path, "$.context");
+
+        for context in [
+            json!({ "mode": "quiz" }),
+            json!({ "initial_goal": "Review." }),
+        ] {
+            let mut refresh = refresh_fixture.clone();
+            refresh["context"] = context;
+            parse_client_frame_json(&refresh.to_string()).expect("either key alone is a context");
+        }
+
+        for goal in ["".to_owned(), "   ".to_owned(), "g".repeat(513)] {
+            let mut refresh = refresh_fixture.clone();
+            refresh["context"] = json!({ "initial_goal": goal });
+            let diagnostic = parse_client_frame_json(&refresh.to_string())
+                .expect_err("an out-of-bounds goal rejects");
+            assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::InvalidField);
+            assert_eq!(diagnostic.path, "$.context.initial_goal");
+        }
+        let mut at_limit = refresh_fixture.clone();
+        at_limit["context"] = json!({ "initial_goal": "g".repeat(512) });
+        parse_client_frame_json(&at_limit.to_string()).expect("512 code points is in bounds");
+
+        // Browser authority: a forged tool result is forbidden, and the v4 plain text
+        // frame is simply unknown.
+        let forged = parse_client_frame_json(
+            &json!({
+                "type": "tool_result",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": "viva-session-bootstrap-1-fixture",
+                "result": { "proposal": { "name": "write_review_state" }, "result": {} },
+            })
+            .to_string(),
+        )
+        .expect_err("a forged tool result rejects");
+        assert_eq!(forged.code, VoiceProtocolDiagnosticCode::ForbiddenAuthority);
+        assert_eq!(forged.path, "$.type");
+
+        let plain_text = parse_client_frame_json(
+            &json!({
+                "type": "text",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": "viva-session-bootstrap-1-fixture",
+                "text": "NADH donates electrons.",
+            })
+            .to_string(),
+        )
+        .expect_err("the v4 text frame is not a v5 frame");
+        assert_eq!(plain_text.code, VoiceProtocolDiagnosticCode::UnknownFrame);
+        assert_eq!(plain_text.path, "$.type");
+
+        // Typed turn intents cannot cross-grade.
+        let challenge = json!({
+            "type": "turn_intent",
+            "version": VIVA_VOICE_PROTOCOL_VERSION,
+            "client_generation_id": "viva-session-bootstrap-1-fixture",
+            "turn_id": "turn-2",
+            "intent": {
+                "kind": "citation_challenge",
+                "response_id": "response-2",
+                "source_id": "src-lecture-5",
+            },
+        });
+        parse_client_frame_json(&challenge.to_string()).expect("a citation challenge parses");
+
+        let mut cross_graded = challenge.clone();
+        cross_graded["intent"]
+            .as_object_mut()
+            .expect("intent object")
+            .insert("text".to_owned(), json!("NADH donates electrons."));
+        let diagnostic = parse_client_frame_json(&cross_graded.to_string())
+            .expect_err("a challenge cannot carry answer text");
+        assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::UnknownField);
+        assert_eq!(diagnostic.path, "$.intent.text");
+
+        for bad_id in [
+            "".to_owned(),
+            "  ".to_owned(),
+            ".leading-dot".to_owned(),
+            "a".repeat(129),
+            "has space".to_owned(),
+        ] {
+            let mut rejected = challenge.clone();
+            rejected["intent"]["source_id"] = json!(bad_id);
+            let diagnostic = parse_client_frame_json(&rejected.to_string())
+                .expect_err("an out-of-vocabulary id rejects");
+            assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::InvalidField);
+            assert_eq!(diagnostic.path, "$.intent.source_id");
+        }
+
+        // Parsing stays D-03 neutral: Plan 08 owns the refresh policy branch.
+        let policy_code = format!("VOICE_SESSION_REFRESH{}", "_POLICY_DENIED");
+        assert!(!include_str!("protocol.rs").contains(&policy_code));
+
+        // No diagnostic anywhere in this surface may echo the credential.
+        for diagnostic in [
+            parse_client_frame_json(&without_credential.to_string()).expect_err("rejects"),
+            parse_client_frame_json(&nested.to_string()).expect_err("rejects"),
+        ] {
+            let rendered = format!("{diagnostic:?} {diagnostic}");
+            assert!(!rendered.contains(credential));
+            assert!(!rendered.contains("viva1"));
+        }
     }
 }

@@ -22,6 +22,9 @@ export const VIVA_AUDIO_MAX_CHUNK_BASE64_CHARS = 10_924 as const;
 export const VIVA_AUDIO_MAX_TURN_SAMPLES = 1_080_000 as const;
 export const VIVA_AUDIO_MAX_TURN_BYTES = 2_160_000 as const;
 
+/** The wire spelling of the signed credential, written once in this module. */
+const SESSION_CREDENTIAL_KEY = "session_token";
+
 /**
  * VOICE-DIAGNOSTIC-001: the closed, stable diagnostic vocabulary shared with the Rust
  * contract. A diagnostic carries a code and a JSON path and never the rejected value.
@@ -88,7 +91,13 @@ export function negotiateVivaVoiceProtocolVersion(
   return VIVA_VOICE_PROTOCOL_VERSION;
 }
 
-export type AgentStudyMode = "quiz" | "teach" | "mock" | "cram";
+/**
+ * One oral-exam engine, one mode. `teach` / `mock` / `cram` named engines that were
+ * never built, and the merged domain (`agent_domain::StudyMode`, recorded decision
+ * `D-03B`) now accepts only `quiz`; a wider wire vocabulary would let a forged or stale
+ * value parse into a mode the server cannot honour.
+ */
+export type AgentStudyMode = "quiz";
 export type AgentConceptStatus = "strong" | "shaky" | "missed" | "review";
 export type AgentSourceConfidence = "high" | "medium" | "low";
 
@@ -101,14 +110,28 @@ export type AgentSourceContext = {
   retrieval_reason: string;
 };
 
+/**
+ * The v5 admission session. The client-declared session goal is gone (recorded decision
+ * `D-03B`, mirrored by the merged `agent_domain::SessionConfig`): it was free text no
+ * policy read. Session scope comes from the bound `study_set_id` and `active_concepts`.
+ */
 export type AgentSessionConfig = {
   session_id: string;
   user_id: string;
   study_set_id: string;
   mode?: AgentStudyMode;
-  initial_goal?: string;
   source_context: AgentSourceContext[];
   active_concepts: string[];
+};
+
+/**
+ * `VOICE-REFRESH-001`: the only in-socket refresh payload. It is deliberately neutral on
+ * Plan 04's D-03 decision — parsing one does not authorize or apply it, and it can never
+ * carry a credential or an identity.
+ */
+export type AgentSessionRefreshContext = {
+  mode?: AgentStudyMode;
+  initial_goal?: string;
 };
 
 export type AgentAudioFrame = {
@@ -199,17 +222,6 @@ export type AgentStudySessionRecap = {
   source_moments: AgentRecapSourceMoment[];
 };
 
-export type AgentToolProposal = {
-  name: string;
-  arguments: Record<string, unknown>;
-  call_id?: string;
-};
-
-export type AgentToolResult = {
-  proposal: AgentToolProposal;
-  result: unknown;
-};
-
 export type ManuscriptRegister =
   | "examining"
   | "reflecting"
@@ -240,10 +252,6 @@ export type ManuscriptIntent =
       emphasis: ManuscriptEmphasis;
     };
 
-type VivaClientGenerationMetadata = {
-  client_generation_id?: string;
-};
-
 export type AgentAudioChunkFrame = {
   type: "audio_chunk";
   version: 5;
@@ -269,26 +277,87 @@ export type AgentAudioTurnAcceptedFrame = {
   final_sequence: number;
 };
 
-export type VivaClientFrame =
-  | ({
-      type: "session_config";
-      version: typeof VIVA_VOICE_PROTOCOL_VERSION;
-      session: AgentSessionConfig;
-      session_token?: string;
-    } & VivaClientGenerationMetadata)
+/**
+ * `VOICE-AUTH-001`: the canonical first application frame. The signed credential is a
+ * required top-level field; a nested one is a forbidden authority.
+ */
+export type VivaSessionConfigClientFrame = {
+  type: "session_config";
+  version: typeof VIVA_VOICE_PROTOCOL_VERSION;
+  client_generation_id: string;
+  session_token: string;
+  session: AgentSessionConfig;
+};
+
+export type VivaSessionRefreshClientFrame = {
+  type: "session_refresh";
+  version: typeof VIVA_VOICE_PROTOCOL_VERSION;
+  client_generation_id: string;
+  context: AgentSessionRefreshContext;
+};
+
+/**
+ * `VOICE-TURN-001`: there is no v5 plain text frame and no magic citation payload. A
+ * citation challenge is not an answer and can never be graded as one.
+ */
+export type VivaClientTurnIntent =
+  | { kind: "answer_text"; text: string }
+  | { kind: "citation_challenge"; response_id: string; source_id: string };
+
+export type VivaTurnIntentClientFrame = {
+  type: "turn_intent";
+  version: typeof VIVA_VOICE_PROTOCOL_VERSION;
+  client_generation_id: string;
+  turn_id: string;
+  intent: VivaClientTurnIntent;
+};
+
+/**
+ * With `turn_id`, cancel is scoped to that active audio/provider turn; without it, it
+ * cancels the current generation's provider response. It can never reach another
+ * generation.
+ */
+export type VivaCancelClientFrame = {
+  type: "cancel";
+  version: typeof VIVA_VOICE_PROTOCOL_VERSION;
+  client_generation_id: string;
+  turn_id?: string;
+};
+
+export type VivaStopClientFrame = {
+  type: "stop";
+  version: typeof VIVA_VOICE_PROTOCOL_VERSION;
+  client_generation_id: string;
+};
+
+/** `VOICE-AUTHORITY-001`: the exact browser-sendable vocabulary, in wire order. */
+export const VIVA_BROWSER_CLIENT_FRAME_TYPES = [
+  "session_config",
+  "session_refresh",
+  "audio_chunk",
+  "audio_end",
+  "turn_intent",
+  "cancel",
+  "stop",
+] as const;
+
+export type VivaBrowserClientFrameType = (typeof VIVA_BROWSER_CLIENT_FRAME_TYPES)[number];
+
+/**
+ * The sole browser-sendable v5 union. A tool result is never a member: the browser has
+ * no tool authority, so a forged one is rejected at `$.type` before it can be sent.
+ */
+export type VivaBrowserClientFrame =
+  | VivaSessionConfigClientFrame
+  | VivaSessionRefreshClientFrame
   | AgentAudioChunkFrame
   | AgentAudioEndFrame
-  | ({
-      type: "text";
-      version: typeof VIVA_VOICE_PROTOCOL_VERSION;
-      text: string;
-    } & VivaClientGenerationMetadata)
-  | ({
-      type: "cancel";
-      version: typeof VIVA_VOICE_PROTOCOL_VERSION;
-      turn_id?: string;
-    } & VivaClientGenerationMetadata)
-  | ({ type: "stop"; version: typeof VIVA_VOICE_PROTOCOL_VERSION } & VivaClientGenerationMetadata);
+  | VivaTurnIntentClientFrame
+  | VivaCancelClientFrame
+  | VivaStopClientFrame;
+
+/** Temporary migration alias for `VivaBrowserClientFrame`, never a wider union. */
+export type VivaClientFrame = VivaBrowserClientFrame;
 
 export type VivaReadyFrame = {
   type: "ready";
@@ -386,21 +455,23 @@ export function audioEndClientFrame(
   };
 }
 
+/**
+ * Builds the canonical `VOICE-AUTH-001` first frame. The signed credential and the
+ * client generation are both required: an unauthenticated or generation-less first
+ * frame is not representable.
+ */
 export function sessionConfigFrame(
   session: AgentSessionConfig,
-  sessionToken?: string | null,
-  clientGenerationId?: string,
-): VivaClientFrame {
-  const frame: VivaClientFrame = {
-    ...(clientGenerationId ? { client_generation_id: clientGenerationId } : {}),
+  signedCredential: string,
+  clientGenerationId: string,
+): VivaSessionConfigClientFrame {
+  return {
     type: "session_config",
     version: VIVA_VOICE_PROTOCOL_VERSION,
+    client_generation_id: clientGenerationId,
+    session_token: signedCredential,
     session,
   };
-  if (sessionToken) {
-    frame.session_token = sessionToken;
-  }
-  return frame;
 }
 
 export function parseVivaServerFrame(value: unknown): VivaServerFrame {
@@ -526,50 +597,186 @@ export function parseVivaServerEvent(value: unknown): VivaServerEvent {
   }
 }
 
-export function parseVivaClientFrame(value: unknown): VivaClientFrame {
+/**
+ * `VOICE-AUTHORITY-001`: returns only the browser-sendable union, never a wider
+ * authority union. Every accepted frame is generation-bound and reconstructed field by
+ * field, and every rejection is a code/path-only diagnostic that never echoes the input.
+ */
+export function parseVivaClientFrame(value: unknown): VivaBrowserClientFrame {
   const frame = requireRecord(value, "client frame");
   if (frame.version !== VIVA_VOICE_PROTOCOL_VERSION) {
     throw unsupportedVersion();
   }
-  if ("client_generation_id" in frame && frame.client_generation_id !== undefined) {
-    requireNonEmptyString(frame.client_generation_id, "client_generation_id");
+  // A browser has no tool authority, so a forged tool result is forbidden rather than
+  // merely unknown. The v4 plain text frame is simply not a v5 frame.
+  if (frame.type === "tool_result") {
+    throw voiceDiagnostic(
+      "VOICE_PROTOCOL_FORBIDDEN_AUTHORITY",
+      "$.type",
+      "Browser tool_result frames carry no authority",
+    );
   }
+  if (!isBrowserClientFrameType(frame.type)) {
+    throw voiceDiagnostic(
+      "VOICE_PROTOCOL_UNKNOWN_FRAME",
+      "$.type",
+      "Unknown Viva voice client frame",
+    );
+  }
+  const clientGenerationId = requireWireId(
+    frame.client_generation_id,
+    "$.client_generation_id",
+    "client_generation_id",
+  );
+
   switch (frame.type) {
     case "session_config":
-      parseSessionConfig(frame.session);
-      if ("session_token" in frame && frame.session_token !== undefined) {
-        requireNonEmptyString(frame.session_token, "session_token");
-      }
-      return frame as VivaClientFrame;
+      return {
+        type: "session_config",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        client_generation_id: clientGenerationId,
+        session_token: requireWireCredential(frame[SESSION_CREDENTIAL_KEY]),
+        session: parseSessionConfig(frame.session),
+      };
+    case "session_refresh":
+      return {
+        type: "session_refresh",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        client_generation_id: clientGenerationId,
+        context: parseSessionRefreshContext(frame.context),
+      };
     case "audio_chunk":
-      requireNonEmptyString(frame.client_generation_id, "client_generation_id");
-      requireNonEmptyString(frame.turn_id, "turn_id");
-      requireSequenceNumber(frame.sequence, "sequence");
-      parseAudioChunkPayload(frame.frame);
-      return frame as VivaClientFrame;
+      return {
+        type: "audio_chunk",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        client_generation_id: clientGenerationId,
+        turn_id: requireWireId(frame.turn_id, "$.turn_id", "turn_id"),
+        sequence: requireSequenceNumber(frame.sequence, "sequence"),
+        frame: parseAudioChunkPayload(frame.frame),
+      };
     case "audio_end":
-      requireNonEmptyString(frame.client_generation_id, "client_generation_id");
-      requireNonEmptyString(frame.turn_id, "turn_id");
-      requireSequenceNumber(frame.final_sequence, "final_sequence");
-      return frame as VivaClientFrame;
-    case "text":
-      if (typeof frame.text !== "string") {
-        throw new Error("Missing text");
+      return {
+        type: "audio_end",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        client_generation_id: clientGenerationId,
+        turn_id: requireWireId(frame.turn_id, "$.turn_id", "turn_id"),
+        final_sequence: requireSequenceNumber(frame.final_sequence, "final_sequence"),
+      };
+    case "turn_intent":
+      return {
+        type: "turn_intent",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        client_generation_id: clientGenerationId,
+        turn_id: requireWireId(frame.turn_id, "$.turn_id", "turn_id"),
+        intent: parseClientTurnIntent(frame.intent),
+      };
+    case "cancel": {
+      const cancel: VivaCancelClientFrame = {
+        type: "cancel",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        client_generation_id: clientGenerationId,
+      };
+      if ("turn_id" in frame) {
+        cancel.turn_id = requireWireId(frame.turn_id, "$.turn_id", "turn_id");
       }
-      return frame as VivaClientFrame;
-    case "tool_result":
-      throw new Error("Browser tool_result frames are not accepted");
-    case "cancel":
-      if ("turn_id" in frame && frame.turn_id !== undefined) {
-        requireNonEmptyString(frame.turn_id, "turn_id");
-        requireNonEmptyString(frame.client_generation_id, "client_generation_id");
-      }
-      return frame as VivaClientFrame;
-    case "stop":
-      return frame as VivaClientFrame;
+      return cancel;
+    }
     default:
-      throw new Error("Unknown Viva voice client frame");
+      return {
+        type: "stop",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        client_generation_id: clientGenerationId,
+      };
   }
+}
+
+function isBrowserClientFrameType(value: unknown): value is VivaBrowserClientFrameType {
+  return VIVA_BROWSER_CLIENT_FRAME_TYPES.includes(value as VivaBrowserClientFrameType);
+}
+
+/** The wire keys a `session_refresh` context may carry, and the ones it may never. */
+const SESSION_REFRESH_CONTEXT_KEYS = ["mode", "initial_goal"] as const;
+const SESSION_REFRESH_FORBIDDEN_KEYS = [
+  SESSION_CREDENTIAL_KEY,
+  "user_id",
+  "study_set_id",
+  "session_id",
+  "source_context",
+  "active_concepts",
+] as const;
+const MAX_INITIAL_GOAL_CODE_POINTS = 512;
+
+/**
+ * Token renewal never happens inside an open socket, so a refresh context can only move
+ * non-authoritative study context. This parser stays neutral on Plan 04's D-03 branch:
+ * accepting the shape is not accepting the change.
+ */
+function parseSessionRefreshContext(value: unknown): AgentSessionRefreshContext {
+  const context = requireRecordAt(value, "$.context");
+  for (const key of Object.keys(context)) {
+    if (
+      SESSION_REFRESH_FORBIDDEN_KEYS.includes(
+        key as (typeof SESSION_REFRESH_FORBIDDEN_KEYS)[number],
+      )
+    ) {
+      throw voiceDiagnostic(
+        "VOICE_PROTOCOL_FORBIDDEN_AUTHORITY",
+        `$.context.${key}`,
+        "Session refresh carries no credential or identity",
+      );
+    }
+    if (
+      !SESSION_REFRESH_CONTEXT_KEYS.includes(key as (typeof SESSION_REFRESH_CONTEXT_KEYS)[number])
+    ) {
+      throw voiceDiagnostic(
+        "VOICE_PROTOCOL_UNKNOWN_FIELD",
+        `$.context.${key}`,
+        "Unknown session refresh context field",
+      );
+    }
+  }
+
+  const refresh: AgentSessionRefreshContext = {};
+  if ("mode" in context) {
+    refresh.mode = requireStudyModeAt(context.mode, "$.context.mode");
+  }
+  if ("initial_goal" in context) {
+    const goal = requireStringAt(context.initial_goal, "$.context.initial_goal");
+    const trimmed = goal.trim();
+    if (trimmed.length === 0 || [...goal].length > MAX_INITIAL_GOAL_CODE_POINTS) {
+      throw voiceDiagnostic(
+        "VOICE_PROTOCOL_INVALID_FIELD",
+        "$.context.initial_goal",
+        "Invalid session refresh goal",
+      );
+    }
+    refresh.initial_goal = trimmed;
+  }
+  if (Object.keys(refresh).length === 0) {
+    throw voiceDiagnostic(
+      "VOICE_PROTOCOL_MISSING_FIELD",
+      "$.context",
+      "Session refresh requires at least one context field",
+    );
+  }
+  return refresh;
+}
+
+function parseClientTurnIntent(value: unknown): VivaClientTurnIntent {
+  const intent = requireRecordAt(value, "$.intent");
+  if (intent.kind === "answer_text") {
+    requireOnlyWireKeys(intent, ["kind", "text"], "$.intent");
+    return { kind: "answer_text", text: requireStringAt(intent.text, "$.intent.text") };
+  }
+  if (intent.kind === "citation_challenge") {
+    requireOnlyWireKeys(intent, ["kind", "response_id", "source_id"], "$.intent");
+    return {
+      kind: "citation_challenge",
+      response_id: requireStrictWireId(intent.response_id, "$.intent.response_id"),
+      source_id: requireStrictWireId(intent.source_id, "$.intent.source_id"),
+    };
+  }
+  throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", "$.intent.kind", "Unknown turn intent");
 }
 
 /**
@@ -754,24 +961,199 @@ function parseStudySessionRecap(value: unknown): AgentStudySessionRecap {
   return recap as AgentStudySessionRecap;
 }
 
+const SESSION_CONFIG_KEYS = [
+  "session_id",
+  "user_id",
+  "study_set_id",
+  "mode",
+  "source_context",
+  "active_concepts",
+] as const;
+
 function parseSessionConfig(value: unknown): AgentSessionConfig {
-  const session = requireRecord(value, "session");
-  if ("session_token" in session) {
-    throw new Error("session_token must be sent at the session_config frame top level");
+  const session = requireRecordAt(value, "$.session");
+  if (SESSION_CREDENTIAL_KEY in session) {
+    throw voiceDiagnostic(
+      "VOICE_PROTOCOL_FORBIDDEN_AUTHORITY",
+      `$.session.${SESSION_CREDENTIAL_KEY}`,
+      "The signed credential belongs at the session_config frame top level",
+    );
   }
-  requireNonEmptyString(session.session_id, "session_id");
-  requireNonEmptyString(session.user_id, "user_id");
-  requireNonEmptyString(session.study_set_id, "study_set_id");
-  if ("mode" in session && session.mode !== undefined) {
-    requireStudyMode(session.mode);
+  requireOnlyWireKeys(session, [...SESSION_CONFIG_KEYS], "$.session");
+
+  const config: AgentSessionConfig = {
+    session_id: requireStrictWireId(session.session_id, "$.session.session_id"),
+    user_id: requireStrictWireId(session.user_id, "$.session.user_id"),
+    study_set_id: requireStrictWireId(session.study_set_id, "$.session.study_set_id"),
+    source_context: requireArrayAt(session.source_context, "$.session.source_context").map(
+      (source, index) => parseSourceContext(source, `$.session.source_context[${index}]`),
+    ),
+    active_concepts: requireArrayAt(session.active_concepts, "$.session.active_concepts").map(
+      (concept, index) => requireStrictWireId(concept, `$.session.active_concepts[${index}]`),
+    ),
+  };
+  if ("mode" in session) {
+    config.mode = requireStudyModeAt(session.mode, "$.session.mode");
   }
-  if ("initial_goal" in session && session.initial_goal !== undefined) {
-    requireString(session.initial_goal, "initial_goal");
+  return orderedSessionConfig(config);
+}
+
+/** Reconstructed in wire order so a parsed frame reserializes byte for byte. */
+function orderedSessionConfig(config: AgentSessionConfig): AgentSessionConfig {
+  const ordered: AgentSessionConfig = {
+    session_id: config.session_id,
+    user_id: config.user_id,
+    study_set_id: config.study_set_id,
+    source_context: config.source_context,
+    active_concepts: config.active_concepts,
+  };
+  if (config.mode === undefined) return ordered;
+  return {
+    session_id: config.session_id,
+    user_id: config.user_id,
+    study_set_id: config.study_set_id,
+    mode: config.mode,
+    source_context: config.source_context,
+    active_concepts: config.active_concepts,
+  };
+}
+
+function parseSourceContext(value: unknown, path: string): AgentSourceContext {
+  const source = requireRecordAt(value, path);
+  requireOnlyWireKeys(
+    source,
+    ["source_id", "document_id", "span", "excerpt", "confidence", "retrieval_reason"],
+    path,
+  );
+  return {
+    source_id: requireNonEmptyStringAt(source.source_id, `${path}.source_id`),
+    document_id: requireNonEmptyStringAt(source.document_id, `${path}.document_id`),
+    span: requireNonEmptyStringAt(source.span, `${path}.span`),
+    excerpt: requireNonEmptyStringAt(source.excerpt, `${path}.excerpt`),
+    confidence: requireSourceConfidenceAt(source.confidence, `${path}.confidence`),
+    retrieval_reason: requireNonEmptyStringAt(source.retrieval_reason, `${path}.retrieval_reason`),
+  };
+}
+
+function voiceDiagnostic(
+  code: VivaVoiceDiagnosticCode,
+  path: string,
+  message: string,
+): VivaVoiceProtocolError {
+  return new VivaVoiceProtocolError(code, path, message);
+}
+
+function requireRecordAt(value: unknown, path: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    if (value === undefined) {
+      throw voiceDiagnostic("VOICE_PROTOCOL_MISSING_FIELD", path, "Missing object");
+    }
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid object");
   }
-  const sourceContext = requireArray(session.source_context, "source_context");
-  for (const source of sourceContext) parseStudySourceReference(source);
-  requireStringArray(session.active_concepts, "active_concepts");
-  return session as unknown as AgentSessionConfig;
+  return value as Record<string, unknown>;
+}
+
+function requireArrayAt(value: unknown, path: string): unknown[] {
+  if (value === undefined) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_MISSING_FIELD", path, "Missing array");
+  }
+  if (!Array.isArray(value)) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid array");
+  }
+  return value;
+}
+
+function requireStringAt(value: unknown, path: string): string {
+  if (value === undefined) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_MISSING_FIELD", path, "Missing string");
+  }
+  if (typeof value !== "string") {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid string");
+  }
+  return value;
+}
+
+function requireNonEmptyStringAt(value: unknown, path: string): string {
+  const text = requireStringAt(value, path);
+  if (text.trim().length === 0) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Empty string");
+  }
+  return text;
+}
+
+/** Wire identity: present, non-blank, and bounded. */
+const MAX_WIRE_ID_LENGTH = 128;
+
+function requireWireId(value: unknown, path: string, label: string): string {
+  if (value === undefined) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_MISSING_FIELD", path, `Missing ${label}`);
+  }
+  const text = requireStringAt(value, path);
+  if (text.trim().length === 0 || text.length > MAX_WIRE_ID_LENGTH) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, `Invalid ${label}`);
+  }
+  return text;
+}
+
+/** `VOICE-TURN-001`'s id vocabulary, also used for bound session identity. */
+const STRICT_WIRE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+function requireStrictWireId(value: unknown, path: string): string {
+  if (value === undefined) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_MISSING_FIELD", path, "Missing id");
+  }
+  const text = requireStringAt(value, path);
+  if (text.length === 0 || text.length > MAX_WIRE_ID_LENGTH || !STRICT_WIRE_ID.test(text)) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid id");
+  }
+  return text;
+}
+
+/**
+ * The signed credential is validated for shape only. This module never verifies an HMAC
+ * and never copies the value into a diagnostic; Plan 08 owns verification.
+ */
+function requireWireCredential(value: unknown): string {
+  const path = `$.${SESSION_CREDENTIAL_KEY}`;
+  if (value === undefined) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_MISSING_FIELD", path, "Missing signed credential");
+  }
+  const text = requireStringAt(value, path);
+  if (text.trim().length === 0) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid signed credential");
+  }
+  return text;
+}
+
+function requireOnlyWireKeys(
+  record: Record<string, unknown>,
+  allowed: readonly string[],
+  path: string,
+): void {
+  const allowedKeys = new Set(allowed);
+  for (const key of Object.keys(record)) {
+    if (!allowedKeys.has(key)) {
+      throw voiceDiagnostic(
+        "VOICE_PROTOCOL_UNKNOWN_FIELD",
+        `${path}.${key}`,
+        "Unknown Viva voice field",
+      );
+    }
+  }
+}
+
+function requireStudyModeAt(value: unknown, path: string): AgentStudyMode {
+  if (value !== "quiz") {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid study mode");
+  }
+  return value;
+}
+
+function requireSourceConfidenceAt(value: unknown, path: string): AgentSourceConfidence {
+  if (value !== "high" && value !== "medium" && value !== "low") {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid source confidence");
+  }
+  return value;
 }
 
 function unsupportedVersion(): VivaVoiceProtocolError {
@@ -987,13 +1369,6 @@ function requireSourceConfidence(value: unknown): AgentSourceConfidence {
 function requireConceptStatus(value: unknown): AgentConceptStatus {
   if (value !== "strong" && value !== "shaky" && value !== "missed" && value !== "review") {
     throw new Error("Invalid concept status");
-  }
-  return value;
-}
-
-function requireStudyMode(value: unknown): AgentStudyMode {
-  if (value !== "quiz" && value !== "teach" && value !== "mock" && value !== "cram") {
-    throw new Error("Invalid study mode");
   }
   return value;
 }
