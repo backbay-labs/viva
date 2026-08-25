@@ -301,13 +301,34 @@ pub struct ReviewItemRecord {
 /// One persisted D-01 `SERVER_PERSISTED_FSRS` decision. Written in the same critical
 /// section as its `ReviewItemRecord`, so the due date and the v1 JSON land together
 /// or not at all.
+///
+/// `response_id` and `payload_sha256` are the record's replay identity: the scope, the
+/// model response that graded the concept, and a digest of the graded outcome. The
+/// computed schedule is deliberately not part of that identity, because a replay reads
+/// a later clock and so computes a different `due_at`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReviewScheduleDecisionRecord {
     pub user_id: String,
     pub study_set_id: String,
     pub voice_session_id: String,
+    pub response_id: String,
     pub concept_id: String,
+    pub payload_sha256: String,
     pub decision: ReviewScheduleDecisionV1,
+}
+
+impl ReviewScheduleDecisionRecord {
+    /// `payload_sha256` already binds `response_id` (see [`payload_sha256`]), so the
+    /// explicit `response_id` comparison below is belt-and-braces: it keeps the replay
+    /// key readable off the struct instead of resting on a property of the digest.
+    fn is_replay_of(&self, other: &Self) -> bool {
+        self.user_id == other.user_id
+            && self.study_set_id == other.study_set_id
+            && self.voice_session_id == other.voice_session_id
+            && self.response_id == other.response_id
+            && self.concept_id == other.concept_id
+            && self.payload_sha256 == other.payload_sha256
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -359,6 +380,7 @@ pub struct RecapRecord {
 pub enum EventAuthorizationKind {
     AnswerEvaluation,
     ConceptStatus,
+    ReviewSchedule,
     StudySessionRecap,
 }
 
@@ -367,6 +389,7 @@ impl EventAuthorizationKind {
         match self {
             Self::AnswerEvaluation => "answer_evaluation",
             Self::ConceptStatus => "concept_status",
+            Self::ReviewSchedule => "review_schedule",
             Self::StudySessionRecap => "study_session_recap",
         }
     }
@@ -386,6 +409,32 @@ pub struct EventAuthorizationRecord {
 struct ConceptStatusEventPayload<'a> {
     concept_id: &'a str,
     status: &'a ConceptStatus,
+}
+
+/// The replay-stable half of a scheduling outcome: the graded inputs, never the
+/// clock-derived schedule they produce. Two calls that differ only because the wall
+/// clock moved hash identically here, which is what makes a replay detectable.
+#[derive(Serialize)]
+struct ReviewScheduleEventPayload<'a> {
+    concept_id: &'a str,
+    policy_id: &'a str,
+    status: &'a ConceptStatus,
+    rating: u8,
+    hint_count: Option<u32>,
+    miss_count: Option<u32>,
+}
+
+impl<'a> ReviewScheduleEventPayload<'a> {
+    fn new(concept_id: &'a str, decision: &'a ReviewScheduleDecisionV1) -> Self {
+        Self {
+            concept_id,
+            policy_id: &decision.policy_id,
+            status: &decision.status,
+            rating: decision.rating,
+            hint_count: decision.hint_count,
+            miss_count: decision.miss_count,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -576,6 +625,30 @@ impl InMemoryStudyStore {
                 question_key(&record.study_set_id, &record.question.question_id),
                 record,
             );
+    }
+
+    /// Capture the study set's exam instant at ingestion so D-01's exam cap has the
+    /// same authoritative input on this backend as the `study_sets.exam_date` column
+    /// gives the Postgres backend. It is store context, never a tool argument.
+    fn persist_exam_date_locked(
+        state: &mut InMemoryStudyState,
+        study_set_id: &str,
+        exam_date: Option<String>,
+    ) {
+        match exam_date
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => {
+                state
+                    .study_set_exam_dates
+                    .insert(study_set_id.to_owned(), value.to_owned());
+            }
+            None => {
+                state.study_set_exam_dates.remove(study_set_id);
+            }
+        }
     }
 
     fn persist_ingestion_record_locked(
@@ -2137,6 +2210,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         &self,
         input: CreatePasteStudySet,
     ) -> Result<StudySetIngestionRecord, PortError> {
+        let exam_date = input.exam_date.clone();
         let generated = generate_paste_study_set(input)?;
         {
             let mut state = self
@@ -2144,6 +2218,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 .write()
                 .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
             Self::persist_ingestion_record_locked(&mut state, &generated, false);
+            Self::persist_exam_date_locked(&mut state, &generated.study_set.id, exam_date);
         }
         Ok(generated)
     }
@@ -2152,6 +2227,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         &self,
         input: CreateFileStudySet,
     ) -> Result<StudySetIngestionRecord, PortError> {
+        let exam_date = input.exam_date.clone();
         let generated = generate_file_study_set(input)?;
         {
             let mut state = self
@@ -2159,6 +2235,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 .write()
                 .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
             Self::persist_ingestion_record_locked(&mut state, &generated, false);
+            Self::persist_exam_date_locked(&mut state, &generated.study_set.id, exam_date);
         }
         Ok(generated)
     }
@@ -2184,6 +2261,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             let existing = Self::study_set_locked(&state, &input.user_id, &study_set_id)?;
             (existing.title.clone(), existing.course.clone())
         };
+        let exam_date = input.exam_date.clone();
         let generated = generate_file_study_set(CreateFileStudySet {
             user_id: input.user_id,
             study_set_id: Some(study_set_id),
@@ -2201,6 +2279,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 .write()
                 .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
             Self::persist_ingestion_record_locked(&mut state, &generated, true);
+            Self::persist_exam_date_locked(&mut state, &generated.study_set.id, exam_date);
         }
         Ok(generated)
     }
@@ -3145,6 +3224,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         concept_id: &str,
         decision: ReviewScheduleDecisionV1,
     ) -> Result<Value, PortError> {
@@ -3152,6 +3232,14 @@ impl StudyMemoryStore for InMemoryStudyStore {
             .validate()
             .map_err(|error| PortError::adapter("memory", error.to_string()))?;
 
+        let authorization = event_authorization_record(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::ReviewSchedule,
+            &ReviewScheduleEventPayload::new(concept_id, &decision),
+        )?;
         let review_item = ReviewItemRecord {
             user_id: user_id.to_owned(),
             study_set_id: study_set_id.to_owned(),
@@ -3163,10 +3251,11 @@ impl StudyMemoryStore for InMemoryStudyStore {
             user_id: user_id.to_owned(),
             study_set_id: study_set_id.to_owned(),
             voice_session_id: voice_session_id.to_owned(),
+            response_id: response_id.to_owned(),
             concept_id: concept_id.to_owned(),
-            decision: decision.clone(),
+            payload_sha256: authorization.payload_sha256.clone(),
+            decision,
         };
-        let result = decision.public_summary(concept_id);
 
         // One critical section: scoping, the due date and the v1 decision land
         // together or not at all, and a replay writes neither a second time.
@@ -3179,12 +3268,23 @@ impl StudyMemoryStore for InMemoryStudyStore {
             Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
             Self::ensure_concept_locked(study_set, &state, concept_id)?;
         }
-        if !state.review_schedule_decisions.contains(&decision_record) {
-            if !state.review_items.contains(&review_item) {
-                state.review_items.push(review_item);
-            }
-            state.review_schedule_decisions.push(decision_record);
+        // A replay is identified by the graded outcome, never by the schedule it
+        // produced: the wall clock has moved, so the recomputed `due_at` differs. The
+        // first decision stays authoritative and is what the caller reports back.
+        if let Some(persisted) = state
+            .review_schedule_decisions
+            .iter()
+            .find(|record| record.is_replay_of(&decision_record))
+        {
+            return Ok(persisted.decision.public_summary(concept_id));
         }
+        if !state.review_items.contains(&review_item) {
+            state.review_items.push(review_item);
+        }
+        let result = decision_record.decision.public_summary(concept_id);
+        state.review_schedule_decisions.push(decision_record);
+        // The authorization ledger stays complete across every authorized write kind.
+        state.event_authorizations.push(authorization);
         Ok(result)
     }
 
@@ -5279,12 +5379,17 @@ mod tests {
 #[cfg(test)]
 mod review_schedule_decision_tests {
     use agent_domain::{
-        decide_review_schedule, format_rfc3339_millis, parse_utc_instant, ConceptStatus,
-        ReviewOutcomeV1, ReviewScheduleCapReasonV1, ReviewScheduleDecisionV1,
-        ReviewSchedulingContextV1, SessionConfig, SessionId, StudyMemoryStore, StudyMode,
+        decide_review_schedule, format_rfc3339_millis, parse_utc_instant, AuthorizedStudySession,
+        Clock, ConceptStatus, FsrsCardStateV1, ReviewOutcomeV1, ReviewScheduleCapReasonV1,
+        ReviewScheduleDecisionV1, ReviewSchedulingContextV1, SessionConfig, SessionId,
+        StudyMemoryStore, StudyMode, ToolProposal, VivaToolExecutor,
         VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
     };
-    use std::sync::Arc;
+    use chrono::{DateTime, Duration, Utc};
+    use std::sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    };
 
     use super::*;
 
@@ -5333,6 +5438,205 @@ mod review_schedule_decision_tests {
         .expect("authoritative decision")
     }
 
+    /// A clock that moves one second per read, which is exactly what the production
+    /// `SystemClock` does between a tool call and the replay of that same tool call.
+    /// Any replay guard keyed on the *computed* schedule (`due_at`, `generated_at`)
+    /// silently stops holding the moment this clock advances.
+    #[derive(Debug)]
+    struct AdvancingClock {
+        start: DateTime<Utc>,
+        reads: AtomicI64,
+    }
+
+    impl AdvancingClock {
+        fn new(start: DateTime<Utc>) -> Self {
+            Self {
+                start,
+                reads: AtomicI64::new(0),
+            }
+        }
+    }
+
+    impl Clock for AdvancingClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.start + Duration::seconds(self.reads.fetch_add(1, Ordering::SeqCst))
+        }
+    }
+
+    fn scheduling_executor(
+        store: Arc<InMemoryStudyStore>,
+        clock: Arc<dyn Clock>,
+    ) -> VivaToolExecutor {
+        VivaToolExecutor::with_clock(
+            store,
+            AuthorizedStudySession {
+                user_id: "user-1".to_owned(),
+                study_set_id: "biology-midterm".to_owned(),
+                voice_session_id: "voice-session-1".to_owned(),
+                mode: StudyMode::Quiz,
+                active_concepts: vec!["nadh".to_owned()],
+            },
+            clock,
+        )
+    }
+
+    fn shaky_proposal() -> ToolProposal {
+        ToolProposal::schedule_review_item("biology-midterm", "voice-session-1", "nadh", "shaky")
+    }
+
+    /// The replay property that matters: the same tool call, replayed through the live
+    /// executor while the wall clock moves, must not write a second scheduled review
+    /// and must not advance the persisted FSRS card. Replaying a decision object that
+    /// was built once cannot exercise this, because the second decision differs.
+    #[tokio::test]
+    async fn review_schedule_decision_replay_through_the_executor_never_writes_twice() {
+        let store = Arc::new(seeded_session_store().await);
+        let executor = scheduling_executor(
+            Arc::clone(&store),
+            Arc::new(AdvancingClock::new(
+                parse_utc_instant(GRADED_AT).expect("instant parses"),
+            )),
+        );
+
+        let first = executor
+            .execute("response-7", shaky_proposal())
+            .await
+            .expect("first schedule");
+        let replay = executor
+            .execute("response-7", shaky_proposal())
+            .await
+            .expect("replayed schedule");
+
+        assert_eq!(
+            replay, first,
+            "a replayed tool call must report the already-persisted decision"
+        );
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.review_schedule_decisions.len(), 1);
+        assert_eq!(snapshot.review_items.len(), 1);
+        assert_eq!(snapshot.review_items[0].due_at, SHAKY_DUE_AT);
+
+        let card = &snapshot.review_schedule_decisions[0].decision.card;
+        assert_eq!(card.reps, 1, "a replay must not advance the FSRS card");
+        assert_eq!(card.state, FsrsCardStateV1::Review);
+        assert_eq!(format_rfc3339_millis(card.due_at), SHAKY_DUE_AT);
+
+        // The authoritative context the *next* real outcome will read is still the
+        // single graded review, not a replay-inflated one.
+        let context = store
+            .review_scheduling_context("user-1", "biology-midterm", "nadh")
+            .await
+            .expect("context");
+        assert_eq!(context.card.as_ref().map(|card| card.reps), Some(1));
+    }
+
+    /// The same property under concurrency, still through the live executor: eight
+    /// racing replays each read a different instant from the clock and so each compute
+    /// a different schedule, and exactly one of them may be persisted.
+    #[tokio::test]
+    async fn review_schedule_decision_concurrent_executor_replays_write_exactly_one_row() {
+        let store = Arc::new(seeded_session_store().await);
+        let executor = Arc::new(scheduling_executor(
+            Arc::clone(&store),
+            Arc::new(AdvancingClock::new(
+                parse_utc_instant(GRADED_AT).expect("instant parses"),
+            )),
+        ));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let executor = Arc::clone(&executor);
+            handles.push(tokio::spawn(async move {
+                executor.execute("response-7", shaky_proposal()).await
+            }));
+        }
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.expect("join").expect("replay succeeds"));
+        }
+        for result in &results {
+            assert_eq!(result, &results[0], "every replay reports one schedule");
+        }
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.review_schedule_decisions.len(), 1);
+        assert_eq!(snapshot.review_items.len(), 1);
+        assert_eq!(snapshot.review_schedule_decisions[0].decision.card.reps, 1);
+    }
+
+    /// The guard must not over-collapse: a genuinely new graded outcome (a new model
+    /// response) still schedules again and still advances the card.
+    #[tokio::test]
+    async fn review_schedule_decision_a_distinct_graded_outcome_still_advances_the_card() {
+        let store = Arc::new(seeded_session_store().await);
+        let executor = scheduling_executor(
+            Arc::clone(&store),
+            Arc::new(AdvancingClock::new(
+                parse_utc_instant(GRADED_AT).expect("instant parses"),
+            )),
+        );
+
+        executor
+            .execute("response-7", shaky_proposal())
+            .await
+            .expect("first schedule");
+        executor
+            .execute("response-8", shaky_proposal())
+            .await
+            .expect("second graded outcome");
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.review_schedule_decisions.len(), 2);
+
+        let context = store
+            .review_scheduling_context("user-1", "biology-midterm", "nadh")
+            .await
+            .expect("context");
+        assert_eq!(context.card.as_ref().map(|card| card.reps), Some(2));
+    }
+
+    /// A different outcome under the *same* response id is a different event, not a
+    /// replay: the payload, not just the response id, is part of the guard.
+    #[tokio::test]
+    async fn review_schedule_decision_guard_separates_outcomes_within_one_response() {
+        let store = Arc::new(seeded_session_store().await);
+        let executor = scheduling_executor(
+            Arc::clone(&store),
+            Arc::new(AdvancingClock::new(
+                parse_utc_instant(GRADED_AT).expect("instant parses"),
+            )),
+        );
+
+        executor
+            .execute("response-7", shaky_proposal())
+            .await
+            .expect("shaky schedule");
+        executor
+            .execute(
+                "response-7",
+                ToolProposal::schedule_review_item(
+                    "biology-midterm",
+                    "voice-session-1",
+                    "nadh",
+                    "strong",
+                ),
+            )
+            .await
+            .expect("strong schedule");
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.review_schedule_decisions.len(), 2);
+        assert_eq!(
+            snapshot.review_schedule_decisions[0].decision.status,
+            ConceptStatus::Shaky
+        );
+        assert_eq!(
+            snapshot.review_schedule_decisions[1].decision.status,
+            ConceptStatus::Strong
+        );
+    }
+
     #[tokio::test]
     async fn review_schedule_decision_round_trips_with_its_review_item() {
         let store = seeded_session_store().await;
@@ -5342,6 +5646,7 @@ mod review_schedule_decision_tests {
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
+                "response-1",
                 "nadh",
                 decision.clone(),
             )
@@ -5373,6 +5678,7 @@ mod review_schedule_decision_tests {
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
+                "response-1",
                 "nadh",
                 decision.clone(),
             )
@@ -5389,6 +5695,7 @@ mod review_schedule_decision_tests {
                         "user-1",
                         "biology-midterm",
                         "voice-session-1",
+                        "response-1",
                         "nadh",
                         decision,
                     )
@@ -5425,6 +5732,7 @@ mod review_schedule_decision_tests {
                         user_id,
                         study_set_id,
                         voice_session_id,
+                        "response-1",
                         concept_id,
                         decision.clone(),
                     )
@@ -5455,6 +5763,7 @@ mod review_schedule_decision_tests {
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
+                "response-1",
                 "nadh",
                 decision.clone(),
             )
@@ -5478,6 +5787,64 @@ mod review_schedule_decision_tests {
             .await
             .expect("context");
         assert_eq!(other.card, None);
+    }
+
+    /// The exam cap needs a real exam instant on this backend too, not only on
+    /// Postgres: ingestion is where the learner supplies it, so ingestion is where the
+    /// store must capture it.
+    #[tokio::test]
+    async fn review_schedule_decision_context_uses_the_exam_date_captured_at_ingestion() {
+        let store = InMemoryStudyStore::new();
+        let source_sentences = [
+            "Mitochondria electron transport builds a proton gradient across the inner membrane for ATP synthase.",
+            "NADH transfers electrons through Complex I while oxygen accepts them at the end of the chain.",
+            "Chemiosmosis couples proton flow to ATP production during oxidative phosphorylation.",
+        ]
+        .join(" ");
+        let record = store
+            .create_paste_study_set(CreatePasteStudySet {
+                user_id: "user-1".to_owned(),
+                title: "Bio paste".to_owned(),
+                course: None,
+                exam_date: Some(CLOSE_EXAM_AT.to_owned()),
+                pasted_text: format!("{source_sentences} {}", source_sentences.repeat(8)),
+                session_id: Some("paste-session-1".to_owned()),
+            })
+            .await
+            .expect("paste ingestion succeeds");
+        let concept_id = record
+            .concepts
+            .first()
+            .expect("ingestion produced a concept")
+            .public_id
+            .clone();
+
+        let context = store
+            .review_scheduling_context("user-1", &record.study_set.id, &concept_id)
+            .await
+            .expect("context");
+        assert_eq!(
+            context.exam_at,
+            Some(parse_utc_instant(CLOSE_EXAM_AT).expect("exam instant")),
+            "the exam cap has no authoritative input if ingestion drops the exam date"
+        );
+
+        // The cap is now reachable end to end on this backend.
+        let decision = decide_review_schedule(
+            parse_utc_instant(GRADED_AT).expect("instant parses"),
+            &ReviewOutcomeV1 {
+                status: ConceptStatus::Shaky,
+                hint_count: None,
+                miss_count: None,
+            },
+            &context,
+        )
+        .expect("authoritative decision");
+        assert_eq!(format_rfc3339_millis(decision.due_at), CLOSE_EXAM_DUE_AT);
+        assert_eq!(
+            decision.cap_reason,
+            Some(ReviewScheduleCapReasonV1::ExamMargin)
+        );
     }
 
     #[tokio::test]
@@ -5523,6 +5890,7 @@ mod review_schedule_decision_tests {
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
+                "response-1",
                 "nadh",
                 decision_at(GRADED_AT, ConceptStatus::Shaky, None),
             )
@@ -5566,6 +5934,7 @@ mod review_schedule_decision_tests {
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
+                "response-1",
                 "nadh",
                 decision_at(GRADED_AT, ConceptStatus::Shaky, Some(PAST_EXAM_AT)),
             )
@@ -5603,6 +5972,7 @@ mod review_schedule_decision_tests {
                 "user-1",
                 "biology-midterm",
                 "voice-session-1",
+                "response-1",
                 "nadh",
                 decision,
             )
@@ -5631,6 +6001,7 @@ mod review_schedule_decision_tests {
                     "user-1",
                     "biology-midterm",
                     "voice-session-1",
+                    "response-1",
                     "nadh",
                     decision_at(GRADED_AT, status, None),
                 )

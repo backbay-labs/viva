@@ -38,6 +38,7 @@ pub struct PostgresStudyStore {
 enum EventAuthorizationKind {
     AnswerEvaluation,
     ConceptStatus,
+    ReviewSchedule,
     StudySessionRecap,
 }
 
@@ -46,6 +47,7 @@ impl EventAuthorizationKind {
         match self {
             Self::AnswerEvaluation => "answer_evaluation",
             Self::ConceptStatus => "concept_status",
+            Self::ReviewSchedule => "review_schedule",
             Self::StudySessionRecap => "study_session_recap",
         }
     }
@@ -65,6 +67,32 @@ struct EventAuthorizationRecord {
 struct ConceptStatusEventPayload<'a> {
     concept_id: &'a str,
     status: &'a ConceptStatus,
+}
+
+/// The replay-stable half of a scheduling outcome. Mirrors the in-memory store's
+/// payload field-for-field so both backends agree on what counts as a replay: the
+/// graded inputs, never the clock-derived schedule they produce.
+#[derive(Serialize)]
+struct ReviewScheduleEventPayload<'a> {
+    concept_id: &'a str,
+    policy_id: &'a str,
+    status: &'a ConceptStatus,
+    rating: u8,
+    hint_count: Option<u32>,
+    miss_count: Option<u32>,
+}
+
+impl<'a> ReviewScheduleEventPayload<'a> {
+    fn new(concept_id: &'a str, decision: &'a ReviewScheduleDecisionV1) -> Self {
+        Self {
+            concept_id,
+            policy_id: &decision.policy_id,
+            status: &decision.status,
+            rating: decision.rating,
+            hint_count: decision.hint_count,
+            miss_count: decision.miss_count,
+        }
+    }
 }
 
 fn event_authorization_record<T: Serialize>(
@@ -492,6 +520,47 @@ impl PostgresStudyStore {
                 "concept is not available for this study set",
             )
         })
+    }
+
+    /// The v1 decision already on record for one graded outcome, if any. The lookup key
+    /// is the scope plus `(response_id, payload_sha256)` — deliberately not the
+    /// computed `due_at`, which moves with the clock on every replay.
+    async fn persisted_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_uuid: Uuid,
+        voice_session_uuid: Uuid,
+        concept_uuid: Uuid,
+        response_id: &str,
+        payload_sha256: &str,
+    ) -> Result<Option<ReviewScheduleDecisionV1>, PortError> {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT schedule_decision FROM review_items
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND voice_session_id = $3
+               AND concept_id = $4
+               AND status = 'scheduled'
+               AND schedule_schema_version = 1
+               AND schedule_response_id = $5
+               AND schedule_payload_sha256 = $6
+             ORDER BY schedule_generated_at ASC
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .bind(concept_uuid)
+        .bind(response_id)
+        .bind(payload_sha256)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_error)?
+        .map(|value| {
+            serde_json::from_value::<ReviewScheduleDecisionV1>(value)
+                .map_err(|error| PortError::adapter("postgres", error.to_string()))
+        })
+        .transpose()
     }
 }
 
@@ -2298,6 +2367,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         concept_id: &str,
         decision: ReviewScheduleDecisionV1,
     ) -> Result<Value, PortError> {
@@ -2311,6 +2381,39 @@ impl StudyMemoryStore for PostgresStudyStore {
         self.ensure_session(user_id, study_set_uuid, voice_session_uuid)
             .await?;
 
+        let payload = ReviewScheduleEventPayload::new(concept_id, &decision);
+        let payload_digest = payload_sha256(
+            EventAuthorizationKind::ReviewSchedule,
+            response_id,
+            &payload,
+        )?;
+
+        // A replay reads a later clock and so recomputes a different `due_at`; keying
+        // the guard on the schedule would let it write a second scheduled review and
+        // advance the persisted FSRS card. The first decision for this graded outcome
+        // stays authoritative and is what the caller reports back.
+        if let Some(persisted) = self
+            .persisted_review_schedule_decision(
+                user_id,
+                study_set_uuid,
+                voice_session_uuid,
+                concept_uuid,
+                response_id,
+                &payload_digest,
+            )
+            .await?
+        {
+            self.record_event_authorization(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                EventAuthorizationKind::ReviewSchedule,
+                &payload,
+            )?;
+            return Ok(persisted.public_summary(concept_id));
+        }
+
         let decision_json = serde_json::to_value(&decision)
             .map_err(|error| PortError::adapter("postgres", error.to_string()))?;
         let card_json = serde_json::to_value(&decision.card)
@@ -2321,14 +2424,20 @@ impl StudyMemoryStore for PostgresStudyStore {
         });
 
         // One statement: the due date and the versioned decision/card land together
-        // or neither does. A replay of the identical decision writes nothing new.
-        let result = sqlx::query(
+        // or neither does. `review_items_schedule_response_replay_idx` (migration 0015)
+        // makes the guard above hold under a concurrent replay too, and its unique
+        // violation routes back through the same read.
+        let inserted = sqlx::query(
             "INSERT INTO review_items (
                  id, user_id, study_set_id, concept_id, due_at, reason, status, voice_session_id,
                  schedule_schema_version, schedule_policy_id, schedule_decision, schedule_card,
-                 schedule_generated_at, schedule_cap_reason
+                 schedule_generated_at, schedule_cap_reason, schedule_response_id,
+                 schedule_payload_sha256
              )
-             VALUES ($1, $2, $3, $4, $5, 'voice_session', 'scheduled', $6, 1, $7, $8, $9, $10, $11)
+             VALUES (
+                 $1, $2, $3, $4, $5, 'voice_session', 'scheduled', $6, 1, $7, $8, $9, $10, $11,
+                 $12, $13
+             )
              ON CONFLICT (user_id, study_set_id, voice_session_id, concept_id, due_at)
              WHERE status = 'scheduled' AND voice_session_id IS NOT NULL
              DO UPDATE SET
@@ -2337,7 +2446,9 @@ impl StudyMemoryStore for PostgresStudyStore {
                  schedule_decision = EXCLUDED.schedule_decision,
                  schedule_card = EXCLUDED.schedule_card,
                  schedule_generated_at = EXCLUDED.schedule_generated_at,
-                 schedule_cap_reason = EXCLUDED.schedule_cap_reason
+                 schedule_cap_reason = EXCLUDED.schedule_cap_reason,
+                 schedule_response_id = EXCLUDED.schedule_response_id,
+                 schedule_payload_sha256 = EXCLUDED.schedule_payload_sha256
              WHERE review_items.schedule_decision IS DISTINCT FROM EXCLUDED.schedule_decision",
         )
         .bind(Uuid::new_v4())
@@ -2351,13 +2462,56 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(&card_json)
         .bind(decision.generated_at)
         .bind(cap_reason)
+        .bind(response_id)
+        .bind(&payload_digest)
         .execute(&self.pool)
-        .await
-        .map_err(pg_error)?;
+        .await;
+
+        let result = match inserted {
+            Ok(result) => result,
+            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+                // A concurrent replay won the race. Report what it persisted; never
+                // let this call become a second scheduled review.
+                let persisted = self
+                    .persisted_review_schedule_decision(
+                        user_id,
+                        study_set_uuid,
+                        voice_session_uuid,
+                        concept_uuid,
+                        response_id,
+                        &payload_digest,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        PortError::adapter(
+                            "postgres",
+                            "review schedule write conflicted with an unrelated scheduled row",
+                        )
+                    })?;
+                self.record_event_authorization(
+                    user_id,
+                    study_set_id,
+                    voice_session_id,
+                    response_id,
+                    EventAuthorizationKind::ReviewSchedule,
+                    &payload,
+                )?;
+                return Ok(persisted.public_summary(concept_id));
+            }
+            Err(error) => return Err(pg_error(error)),
+        };
 
         if result.rows_affected() > 0 {
             self.increment_count(WriteCountKind::ReviewItem)?;
         }
+        self.record_event_authorization(
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::ReviewSchedule,
+            &payload,
+        )?;
         Ok(decision.public_summary(concept_id))
     }
 

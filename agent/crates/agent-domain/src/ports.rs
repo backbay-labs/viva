@@ -674,11 +674,20 @@ pub trait StudyMemoryStore: Send + Sync {
 
     /// Persist one authoritative D-01 decision. The due date and the v1 card/decision
     /// JSON are written together or not at all.
+    ///
+    /// The write is idempotent per graded outcome, keyed on `response_id` plus the
+    /// outcome payload — never on the computed schedule. A replayed tool call reads a
+    /// later wall clock and therefore produces a *different* `due_at`/`generated_at`,
+    /// so a guard keyed on those values silently lets a replay write a second
+    /// scheduled review and advance the persisted FSRS card. On a replay the store
+    /// writes nothing and returns the already-persisted decision's public summary,
+    /// which is what the caller must report back to the model.
     async fn persist_review_schedule_decision(
         &self,
         _user_id: &str,
         _study_set_id: &str,
         _voice_session_id: &str,
+        _response_id: &str,
         concept_id: &str,
         _decision: ReviewScheduleDecisionV1,
     ) -> Result<Value, PortError> {

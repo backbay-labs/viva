@@ -766,6 +766,7 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
                 &job.spec.user_id,
                 &job.spec.study_set_id,
                 &job.spec.voice_session_id,
+                &job.response_id,
                 concept_id,
                 decision,
             )

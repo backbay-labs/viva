@@ -8,7 +8,9 @@ ALTER TABLE review_items
     ADD COLUMN IF NOT EXISTS schedule_decision JSONB,
     ADD COLUMN IF NOT EXISTS schedule_card JSONB,
     ADD COLUMN IF NOT EXISTS schedule_generated_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS schedule_cap_reason TEXT;
+    ADD COLUMN IF NOT EXISTS schedule_cap_reason TEXT,
+    ADD COLUMN IF NOT EXISTS schedule_response_id TEXT,
+    ADD COLUMN IF NOT EXISTS schedule_payload_sha256 TEXT;
 
 -- A row is either a complete v1 decision or carries no v1 fields at all.
 ALTER TABLE review_items
@@ -60,3 +62,19 @@ CREATE INDEX IF NOT EXISTS review_items_schedule_decision_v1_idx
 CREATE INDEX IF NOT EXISTS review_items_schedule_session_v1_idx
     ON review_items (user_id, study_set_id, voice_session_id, due_at)
     WHERE schedule_schema_version = 1 AND status = 'scheduled';
+
+-- Replay guard. `review_items_voice_session_concept_due_scheduled_idx` (migration
+-- 0012) keys on due_at, which is recomputed from the wall clock on every call, so a
+-- replayed tool call slips past it and writes a second scheduled review — and the
+-- replay has already read the first decision's card back, so the persisted FSRS card
+-- silently advances. The replay identity is the graded outcome instead: the model
+-- response plus a digest of the status/rating/hint/miss inputs that produced it.
+CREATE UNIQUE INDEX IF NOT EXISTS review_items_schedule_response_replay_idx
+    ON review_items (
+        user_id, study_set_id, voice_session_id, concept_id,
+        schedule_response_id, schedule_payload_sha256
+    )
+    WHERE schedule_schema_version = 1
+      AND status = 'scheduled'
+      AND schedule_response_id IS NOT NULL
+      AND schedule_payload_sha256 IS NOT NULL;

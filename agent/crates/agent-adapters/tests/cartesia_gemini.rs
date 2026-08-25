@@ -1591,6 +1591,7 @@ impl StudyMemoryStore for FailStudyToolStore {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         concept_id: &str,
         decision: agent_domain::ReviewScheduleDecisionV1,
     ) -> Result<serde_json::Value, PortError> {
@@ -1599,6 +1600,7 @@ impl StudyMemoryStore for FailStudyToolStore {
                 user_id,
                 study_set_id,
                 voice_session_id,
+                response_id,
                 concept_id,
                 decision,
             )
@@ -1785,6 +1787,7 @@ impl StudyMemoryStore for BlockingAnswerStore {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         concept_id: &str,
         decision: agent_domain::ReviewScheduleDecisionV1,
     ) -> Result<serde_json::Value, PortError> {
@@ -1793,6 +1796,7 @@ impl StudyMemoryStore for BlockingAnswerStore {
                 user_id,
                 study_set_id,
                 voice_session_id,
+                response_id,
                 concept_id,
                 decision,
             )

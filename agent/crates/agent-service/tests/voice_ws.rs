@@ -277,6 +277,7 @@ impl StudyMemoryStore for FailingStudyStore {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         concept_id: &str,
         decision: agent_domain::ReviewScheduleDecisionV1,
     ) -> Result<serde_json::Value, PortError> {
@@ -285,6 +286,7 @@ impl StudyMemoryStore for FailingStudyStore {
                 user_id,
                 study_set_id,
                 voice_session_id,
+                response_id,
                 concept_id,
                 decision,
             )
@@ -337,6 +339,7 @@ async fn seed_authoritative_review_schedule(store: &Arc<data::InMemoryStudyStore
             "user-1",
             "biology-midterm",
             "voice-session-1",
+            "response-1",
             "nadh",
             decision,
         )
@@ -10519,6 +10522,7 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         user_id: &str,
         study_set_id: &str,
         voice_session_id: &str,
+        response_id: &str,
         concept_id: &str,
         decision: agent_domain::ReviewScheduleDecisionV1,
     ) -> Result<serde_json::Value, PortError> {
@@ -10527,6 +10531,7 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
                 user_id,
                 study_set_id,
                 voice_session_id,
+                response_id,
                 concept_id,
                 decision,
             )

@@ -361,6 +361,31 @@ mod tests {
         assert!(sql.contains("review_items_schedule_decision_v1_idx"));
     }
 
+    /// The 0012 guard keys on `due_at`, which a replay recomputes from a later clock.
+    /// The v1 replay guard must key on the graded outcome instead, or a replayed tool
+    /// call writes a second scheduled review and advances the persisted FSRS card.
+    #[test]
+    fn migrations_guard_review_schedule_replays_on_the_graded_outcome_not_the_due_date() {
+        let sql = migration_sql();
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS schedule_response_id TEXT"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS schedule_payload_sha256 TEXT"));
+        assert!(sql.contains(
+            "CREATE UNIQUE INDEX IF NOT EXISTS review_items_schedule_response_replay_idx"
+        ));
+        assert!(sql.contains("schedule_response_id, schedule_payload_sha256"));
+        assert!(sql.contains("AND schedule_response_id IS NOT NULL"));
+        // The replay key must never be the computed schedule.
+        let replay_index = sql
+            .split("review_items_schedule_response_replay_idx")
+            .nth(1)
+            .expect("replay index is defined");
+        let replay_definition = replay_index
+            .split(';')
+            .next()
+            .expect("replay index definition terminates");
+        assert!(!replay_definition.contains("due_at"), "{replay_definition}");
+    }
+
     #[test]
     fn migrations_supersede_the_four_known_fixed_review_dates_without_inventing_new_ones() {
         let sql = migration_sql();
@@ -966,6 +991,98 @@ mod tests {
         .await
         .expect("review item row count query succeeds");
         assert_eq!(row_count, 1);
+    }
+
+    /// The Postgres half of the D-01 replay guard. Two calls that differ only because
+    /// the wall clock moved are the same graded outcome: they must leave exactly one
+    /// scheduled row, and the persisted FSRS card must not advance.
+    #[tokio::test]
+    async fn optional_postgres_review_schedule_decision_replay_writes_one_row_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        record_fixture_session(&store).await;
+
+        let graded_at =
+            agent_domain::parse_utc_instant("2031-04-05T12:00:00.000Z").expect("instant parses");
+        let outcome = agent_domain::ReviewOutcomeV1 {
+            status: ConceptStatus::Shaky,
+            hint_count: Some(2),
+            miss_count: Some(1),
+        };
+        let context = agent_domain::ReviewSchedulingContextV1::empty();
+        let first_decision = agent_domain::decide_review_schedule(graded_at, &outcome, &context)
+            .expect("first decision");
+        // The replay reads a later clock, exactly as the live executor does.
+        let replay_decision = agent_domain::decide_review_schedule(
+            graded_at + chrono::Duration::seconds(1),
+            &outcome,
+            &context,
+        )
+        .expect("replayed decision");
+        assert_ne!(first_decision.due_at, replay_decision.due_at);
+
+        let before = store.write_counts();
+        let first = store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-7",
+                "atp-synthase",
+                first_decision.clone(),
+            )
+            .await
+            .expect("first decision persists");
+        let replay = store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-7",
+                "atp-synthase",
+                replay_decision,
+            )
+            .await
+            .expect("replay observes the guard");
+        assert_eq!(replay, first, "a replay reports the persisted decision");
+
+        let after = store.write_counts();
+        assert_eq!(after.review_items - before.review_items, 1);
+        let row_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM review_items
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND voice_session_id = $3
+               AND concept_id = $4
+               AND status = 'scheduled'
+               AND schedule_schema_version = 1",
+        )
+        .bind("user-1")
+        .bind(fixture_uuid("biology-midterm").expect("study set fixture UUID"))
+        .bind(fixture_uuid("voice-session-1").expect("voice session fixture UUID"))
+        .bind(parse_uuid("77777777-7777-4777-8777-777777777777").expect("concept fixture UUID"))
+        .fetch_one(&pool)
+        .await
+        .expect("review item row count query succeeds");
+        assert_eq!(row_count, 1);
+
+        let context = store
+            .review_scheduling_context("user-1", "biology-midterm", "atp-synthase")
+            .await
+            .expect("authoritative context");
+        assert_eq!(
+            context.card.as_ref().map(|card| card.reps),
+            Some(1),
+            "a replay must not advance the persisted FSRS card"
+        );
     }
 
     #[tokio::test]

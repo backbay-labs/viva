@@ -70,7 +70,7 @@ impl VivaToolExecutor {
             "mark_concept_status" => self.mark_concept_status(response_id, &proposal).await?,
             "build_session_recap" => self.build_session_recap(response_id).await?,
             "challenge_correction" => self.challenge_correction(&proposal).await?,
-            "schedule_review_item" => self.schedule_review_item(&proposal).await?,
+            "schedule_review_item" => self.schedule_review_item(response_id, &proposal).await?,
             other => {
                 return Err(ToolExecutionError::InvalidArguments(format!(
                     "unknown Viva tool `{other}`"
@@ -245,6 +245,7 @@ impl VivaToolExecutor {
 
     async fn schedule_review_item(
         &self,
+        response_id: &str,
         proposal: &ToolProposal,
     ) -> Result<Value, ToolExecutionError> {
         let concept_id = string_arg(proposal.arguments(), "concept_id")?;
@@ -272,17 +273,22 @@ impl VivaToolExecutor {
             miss_count: optional_count_arg(proposal.arguments(), "miss_count")?,
         };
         let decision = decide_review_schedule(now, &outcome, &context)?;
+        // The store is the single authority on what is actually scheduled: it owns the
+        // per-response replay guard, so on a replayed tool call it keeps the first
+        // decision and returns that one. Reporting the locally recomputed decision here
+        // would tell the model a due date that is not the one on record.
         let record = self
             .store
             .persist_review_schedule_decision(
                 &self.session.user_id,
                 &self.session.study_set_id,
                 &self.session.voice_session_id,
+                response_id,
                 &concept_id,
-                decision.clone(),
+                decision,
             )
             .await?;
-        let mut result = decision.public_summary(&concept_id);
+        let mut result = record.clone();
         if let Value::Object(fields) = &mut result {
             fields.insert("record".to_owned(), record);
         }
@@ -593,6 +599,7 @@ mod review_schedule_tests {
             _user_id: &str,
             _study_set_id: &str,
             _voice_session_id: &str,
+            _response_id: &str,
             concept_id: &str,
             decision: ReviewScheduleDecisionV1,
         ) -> Result<Value, PortError> {
