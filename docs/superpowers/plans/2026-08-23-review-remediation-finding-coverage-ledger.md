@@ -127,6 +127,8 @@ Plan-local execution IDs with no ledger row of their own (for example Plan 08's 
 
 At Plan 03 merge time the coordinator appends the merge commit below as one literal line in exactly the format `Plan 03 merge SHA: <40-hex>`. Plan 04's LEARN-000 Step 1 parses exactly that format (taking the last such line) and has no fallback; under the coordinator-authorized Plan 03 two-PR split, the line records the PR `03-audio` merge first and a second line in the same format records the PR `03-scheduling` merge.
 
+Plan 03 merge SHA: 6735f91206438320d05eec4c56ac1da08bb8c2ab
+
 ## Mechanical corpus reconciliation
 
 ### Twenty-one reviewed Markdown documents
