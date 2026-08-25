@@ -1,0 +1,5 @@
+error[E0451]: field `reason` of struct `PortError` is private
+  --> tests/ui/port_error_struct_pattern.rs:15:21
+   |
+15 |     let PortError { reason, .. } = error;
+   |                     ^^^^^^ private field

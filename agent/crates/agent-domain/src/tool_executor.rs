@@ -605,7 +605,14 @@ mod review_schedule_tests {
         ) -> Result<Value, PortError> {
             decision
                 .validate()
-                .map_err(|error| PortError::adapter("test_store", error.to_string()))?;
+                // Plan 06 Task 3 (`DOMAIN-006`) removed the unclassified
+                // `PortError::adapter`; a failed decision validation is semantic
+                // `InvalidInput` per this plan's Plan 09 handoff. Mechanical
+                // constructor rename inside this `#[cfg(test)]` helper only — no
+                // Plan 04 authority, algorithm, or assertion is changed.
+                .map_err(|error| {
+                    PortError::invalid_input("test_store", concept_id, error.to_string())
+                })?;
             let summary = decision.public_summary(concept_id);
             *self.card.lock().expect("card lock") = Some(decision.card.clone());
             self.decisions

@@ -20,6 +20,15 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+# Plan 06 Task 2 (`DOMAIN-004`): `proptest` drives hostile Unicode through the
+# failure constructor and its custom deserializer; `trybuild` compile-proves that
+# private failure fields cannot be bypassed with a struct literal. Both are test
+# only, so the `agent:purity` dependency allowlist (normal dependencies) is
+# unchanged.
+proptest = "1"
+trybuild = "1"
+
 [lib]
 path = "src/lib.rs"
 

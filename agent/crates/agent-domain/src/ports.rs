@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    learning_outcome::{ChallengeResolution, PersistedTurnOutcome, TurnOutcome},
+    learning_progression::{ProgressionPolicyId, QuestionProgressionResult},
+    learning_recap::SessionLearningEvidence,
     review_schedule::{ReviewScheduleDecisionV1, ReviewSchedulingContextV1},
+    study_projection::AuthenticatedStudyProjectionV1,
     AnswerEvaluation, ConceptStatus, ManuscriptIntent, SessionConfig, SourceConfidence,
     StudyQuestion, StudySessionRecap, StudySourceReference, ToolProposal,
 };
@@ -58,6 +62,7 @@ pub struct StudyStoreWriteCounts {
     pub concept_statuses: usize,
     pub review_items: usize,
     pub recaps: usize,
+    pub voice_usage: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -67,6 +72,21 @@ pub struct StudySessionDurableCounts {
     pub review_items: usize,
     pub prior_recaps: usize,
 }
+
+/// Plan 06 Task 4 (`DOMAIN-008`): the domain bounds on answer evidence.
+///
+/// 45 seconds x 24,000 Hz x 2 PCM16 bytes is the largest answer capture the
+/// BAC-510 turn bound can produce, so it is also the largest byte count any
+/// store may be asked to record.
+pub const MAX_ANSWER_BYTE_COUNT: u64 = 2_160_000;
+/// The largest typed answer, in characters.
+pub const MAX_ANSWER_CHAR_COUNT: u64 = 65_536;
+/// The BAC-510 maximum submitted-answer resolution, in milliseconds.
+pub const MAX_ANSWER_DURATION_MS: u64 = 45_000;
+/// `AnswerContentPolicy::DigestOnly` stores exactly one durable content trace:
+/// an HMAC-SHA256 digest rendered as this many lowercase hexadecimal
+/// characters.
+pub const ANSWER_DIGEST_HMAC_HEX_LENGTH: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -151,11 +171,80 @@ impl AnswerAttemptEnvelope {
         if self.pre_provider_state.trim().is_empty() {
             return Err("answer attempt envelope is missing pre_provider_state");
         }
-        if self.content_policy == AnswerContentPolicy::None && self.answer_digest_hmac.is_some() {
-            return Err("answer digest requires digest_only content policy");
+
+        // The content-policy converse, both ways: `DigestOnly` means exactly one
+        // durable content trace and `None` means none at all. The digest shape is
+        // checked on ASCII bytes; an invalid digest is never trimmed, lowercased,
+        // or re-encoded into acceptance.
+        match (self.content_policy, self.answer_digest_hmac.as_deref()) {
+            (AnswerContentPolicy::DigestOnly, None) => {
+                return Err("digest_only content policy requires answer_digest_hmac");
+            }
+            (AnswerContentPolicy::DigestOnly, Some(digest)) => {
+                if !is_canonical_answer_digest_hmac(digest) {
+                    return Err("answer_digest_hmac must be 64 lowercase hexadecimal characters");
+                }
+            }
+            (AnswerContentPolicy::None, Some(_)) => {
+                return Err("answer digest requires digest_only content policy");
+            }
+            (AnswerContentPolicy::None, None) => {}
         }
+
+        // Capture-mode field presence and absence. A byte count is the one
+        // measure both modes record; a character count is typed-only evidence and
+        // an audio capture is a whole number of PCM16 samples.
+        let Some(byte_count) = self.byte_count else {
+            return Err("answer attempt envelope is missing byte_count");
+        };
+        match self.capture_mode {
+            AnswerCaptureMode::Typed => {
+                if self.char_count.is_none() {
+                    return Err("typed answer capture requires char_count");
+                }
+            }
+            AnswerCaptureMode::Audio => {
+                if self.char_count.is_some() {
+                    return Err("audio answer capture must not carry char_count");
+                }
+                if byte_count % 2 != 0 {
+                    return Err("audio answer capture requires an even PCM16 byte_count");
+                }
+            }
+        }
+
+        // Positive, inclusive bounds. A present count of zero is not evidence of
+        // an empty answer; it is an envelope that cannot be trusted.
+        if byte_count == 0 || byte_count > MAX_ANSWER_BYTE_COUNT {
+            return Err("answer byte_count must be positive and within MAX_ANSWER_BYTE_COUNT");
+        }
+        if let Some(char_count) = self.char_count {
+            if char_count == 0 || char_count > MAX_ANSWER_CHAR_COUNT {
+                return Err("answer char_count must be positive and within MAX_ANSWER_CHAR_COUNT");
+            }
+        }
+        if let Some(duration_ms) = self.duration_ms {
+            if duration_ms == 0 || duration_ms > MAX_ANSWER_DURATION_MS {
+                return Err(
+                    "answer duration_ms must be positive and within MAX_ANSWER_DURATION_MS",
+                );
+            }
+        }
+
         Ok(())
     }
+}
+
+/// Exactly `ANSWER_DIGEST_HMAC_HEX_LENGTH` lowercase hexadecimal ASCII bytes.
+///
+/// Byte length is the right measure here: every accepted character is ASCII, so
+/// a value whose byte length differs from its character length is rejected by
+/// construction rather than by a separate check.
+fn is_canonical_answer_digest_hmac(digest: &str) -> bool {
+    digest.len() == ANSWER_DIGEST_HMAC_HEX_LENGTH
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -337,37 +426,137 @@ pub struct StudyLibrarySnapshot {
     pub sessions: Vec<LibrarySessionSummary>,
 }
 
+/// How a port failed, as data. Plans 07/08/09 select retry policy, terminal
+/// reason, HTTP status, and durability handling from this enum — never from the
+/// diagnostic `reason` text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PortErrorKind {
+    /// The port cannot answer at all: unimplemented, disabled, or unreachable.
+    Unavailable,
+    /// The caller's arguments are semantically invalid; retrying is pointless.
+    InvalidInput,
+    /// The write lost a uniqueness/replay race, such as a reused nonce.
+    Conflict,
+    /// The backing store could not durably commit: SQL, pool, or transaction.
+    Durability,
+    /// An invariant inside the adapter broke; nothing about the request was wrong.
+    Internal,
+}
+
+impl PortErrorKind {
+    pub const ALL: [Self; 5] = [
+        Self::Unavailable,
+        Self::InvalidInput,
+        Self::Conflict,
+        Self::Durability,
+        Self::Internal,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::InvalidInput => "invalid_input",
+            Self::Conflict => "conflict",
+            Self::Durability => "durability",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+impl std::fmt::Display for PortErrorKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One structured port failure. Every field is private: `reason` is a diagnostic
+/// string for logs, and a consumer that could destructure it would be one
+/// refactor away from classifying on prose again.
 #[derive(Debug, thiserror::Error)]
-pub enum PortError {
-    #[error("{port} unavailable for {id}: {reason}")]
-    Unavailable {
-        port: &'static str,
-        id: String,
-        reason: String,
-    },
-    #[error("{port} adapter error: {reason}")]
-    Adapter { port: &'static str, reason: String },
+#[error("{port} {kind} for {id}: {reason}")]
+pub struct PortError {
+    kind: PortErrorKind,
+    port: &'static str,
+    id: String,
+    reason: String,
 }
 
 impl PortError {
-    pub fn unavailable(
+    fn new(
+        kind: PortErrorKind,
         port: &'static str,
         id: impl Into<String>,
         reason: impl Into<String>,
     ) -> Self {
-        Self::Unavailable {
+        Self {
+            kind,
             port,
             id: id.into(),
             reason: reason.into(),
         }
     }
 
-    pub fn adapter(port: &'static str, reason: impl Into<String>) -> Self {
-        Self::Adapter {
-            port,
-            reason: reason.into(),
-        }
+    pub fn unavailable(
+        port: &'static str,
+        id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(PortErrorKind::Unavailable, port, id, reason)
     }
+
+    pub fn invalid_input(
+        port: &'static str,
+        id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(PortErrorKind::InvalidInput, port, id, reason)
+    }
+
+    pub fn conflict(port: &'static str, id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::new(PortErrorKind::Conflict, port, id, reason)
+    }
+
+    pub fn durability(
+        port: &'static str,
+        id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(PortErrorKind::Durability, port, id, reason)
+    }
+
+    pub fn internal(port: &'static str, id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::new(PortErrorKind::Internal, port, id, reason)
+    }
+
+    pub fn kind(&self) -> PortErrorKind {
+        self.kind
+    }
+
+    pub fn port(&self) -> &'static str {
+        self.port
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Diagnostics only. Nothing may branch on this text.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn is_durability(&self) -> bool {
+        matches!(self.kind, PortErrorKind::Durability)
+    }
+}
+
+/// What a study-store write actually did. A caller that cannot tell an insert
+/// from a replay cannot report truthfully, so the outcome may not be dropped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum StudyStoreWriteOutcome {
+    Inserted,
+    IdempotentReplay,
 }
 
 #[async_trait]
@@ -387,24 +576,50 @@ pub trait StudyMemoryStore: Send + Sync {
         StudyStoreWriteCounts::default()
     }
 
+    /// Every default below is truth-bearing: it either claims a read observed the
+    /// durable record or claims a write happened. A partial store cannot make
+    /// either claim, so each one fails closed with `Unavailable` rather than
+    /// answering `Ok(0)`, `Ok(false)`, `Ok(())`, `Ok(None)`, or a fabricated
+    /// document. These are intentional compatibility boundaries for partial/test
+    /// stores, not acceptable production behavior; Plan 09 overrides them all.
     async fn pending_answer_attempts_for_session(
         &self,
-        _voice_session_id: &str,
+        voice_session_id: &str,
     ) -> Result<usize, PortError> {
-        Ok(0)
+        Err(PortError::unavailable(
+            "study_store",
+            voice_session_id,
+            "pending answer attempt counting is not implemented by this store",
+        ))
     }
 
-    async fn record_voice_session(&self, _config: &SessionConfig) -> Result<(), PortError> {
-        Ok(())
+    /// Reports whether the session row was inserted or replayed. Plan 09 returns
+    /// `IdempotentReplay` only for a genuine replay of the same session.
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            config
+                .session_id
+                .as_ref()
+                .map_or("unknown", |session_id| session_id.as_str()),
+            "voice session recording is not implemented by this store",
+        ))
     }
 
     async fn study_session_durable_counts(
         &self,
         _user_id: &str,
         _study_set_id: &str,
-        _voice_session_id: &str,
+        voice_session_id: &str,
     ) -> Result<StudySessionDurableCounts, PortError> {
-        Ok(StudySessionDurableCounts::default())
+        Err(PortError::unavailable(
+            "study_store",
+            voice_session_id,
+            "durable session counts are not implemented by this store",
+        ))
     }
 
     async fn answer_attempt_was_recorded(
@@ -412,9 +627,13 @@ pub trait StudyMemoryStore: Send + Sync {
         _user_id: &str,
         _study_set_id: &str,
         _voice_session_id: &str,
-        _response_id: &str,
+        response_id: &str,
     ) -> Result<bool, PortError> {
-        Ok(false)
+        Err(PortError::unavailable(
+            "study_store",
+            response_id,
+            "answer attempt durability lookup is not implemented by this store",
+        ))
     }
 
     async fn claim_session_token_nonce(
@@ -433,10 +652,14 @@ pub trait StudyMemoryStore: Send + Sync {
 
     async fn close_voice_session(
         &self,
-        _voice_session_id: &str,
+        voice_session_id: &str,
         _terminal_reason: &str,
     ) -> Result<Value, PortError> {
-        Ok(serde_json::json!({ "closed": false }))
+        Err(PortError::unavailable(
+            "study_store",
+            voice_session_id,
+            "voice session closure is not implemented by this store",
+        ))
     }
 
     async fn create_paste_study_set(
@@ -514,9 +737,13 @@ pub trait StudyMemoryStore: Send + Sync {
     async fn active_question(
         &self,
         _user_id: &str,
-        _study_set_id: &str,
+        study_set_id: &str,
     ) -> Result<Option<StudyQuestion>, PortError> {
-        Ok(None)
+        Err(PortError::unavailable(
+            "study_store",
+            study_set_id,
+            "active question lookup is not implemented by this store",
+        ))
     }
 
     async fn authorize_question_started(
@@ -707,8 +934,93 @@ pub trait StudyMemoryStore: Send + Sync {
         recap: StudySessionRecap,
     ) -> Result<Value, PortError>;
 
-    async fn record_voice_usage(&self, _event: VoiceUsageRecord) -> Result<(), PortError> {
-        Ok(())
+    /// Usage has no stable event key, so a successful insert always reports
+    /// `Inserted`; this plan invents no usage idempotency.
+    async fn record_voice_usage(
+        &self,
+        event: VoiceUsageRecord,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
+        Err(PortError::unavailable(
+            "study_store",
+            event.voice_session_id.as_deref().unwrap_or("unknown"),
+            "voice usage recording is not implemented by this store",
+        ))
+    }
+
+    /// Persist one authoritative Plan 04 [`TurnOutcome`] and return the exact
+    /// persisted pair. The receipt's `replayed` flag is insert-versus-replay truth
+    /// owned by the store; no caller may reconstruct or fabricate it.
+    ///
+    /// This default — like the four below — is an intentional fail-closed
+    /// compatibility boundary for partial/test stores, not RED-only scaffolding and
+    /// not acceptable production behavior. There is no successful default.
+    async fn record_turn_outcome(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+        _outcome: TurnOutcome,
+    ) -> Result<PersistedTurnOutcome, PortError> {
+        Err(PortError::unavailable(
+            "study_memory_store",
+            voice_session_id,
+            "record_turn_outcome is not implemented",
+        ))
+    }
+
+    async fn session_learning_evidence(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<SessionLearningEvidence, PortError> {
+        Err(PortError::unavailable(
+            "study_memory_store",
+            voice_session_id,
+            "session_learning_evidence is not implemented",
+        ))
+    }
+
+    async fn record_challenge_resolution(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+        _resolution: ChallengeResolution,
+    ) -> Result<ChallengeResolution, PortError> {
+        Err(PortError::unavailable(
+            "study_memory_store",
+            voice_session_id,
+            "record_challenge_resolution is not implemented",
+        ))
+    }
+
+    async fn select_next_question(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+        _response_id: &str,
+        _policy: ProgressionPolicyId,
+    ) -> Result<QuestionProgressionResult, PortError> {
+        Err(PortError::unavailable(
+            "study_memory_store",
+            voice_session_id,
+            "select_next_question is not implemented",
+        ))
+    }
+
+    async fn authenticated_study_projection(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<AuthenticatedStudyProjectionV1, PortError> {
+        Err(PortError::unavailable(
+            "study_memory_store",
+            voice_session_id,
+            "authenticated_study_projection is not implemented",
+        ))
     }
 }
 

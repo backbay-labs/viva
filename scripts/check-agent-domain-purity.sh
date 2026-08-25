@@ -1,20 +1,14 @@
 #!/usr/bin/env sh
 set -eu
 
-if [ ! -d agent ]; then
-  echo "agent/ is missing" >&2
-  exit 1
-fi
+# POSIX entrypoint for the agent-domain purity gate. The semantic boundary lives
+# in scripts/check-agent-domain-purity.mjs; this wrapper only guarantees the
+# runtime is present and that a failure is never swallowed.
 
-matches="$(
-  rg -n -i "LUCA_|Chef Luca|luca_prompt|CookingSession|Voice Lab|safety_confirm|start_cook|recipe|ingredient|allergen|pantry|fridge|\\bcook(ing|ed|s)?\\b|KB_SNAPSHOT_PATH" \
-    agent packages apps \
-    -g '!target' \
-    -g '!docs/superpowers/plans/**' || true
-)"
+command -v node >/dev/null 2>&1 || { echo "node is required" >&2; exit 1; }
 
-if [ -n "$matches" ]; then
-  echo "Luca domain residue found in shipped agent/app surfaces:" >&2
-  echo "$matches" >&2
-  exit 1
-fi
+script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(CDPATH='' cd -- "${script_dir}/.." && pwd)"
+cd "${repo_root}"
+
+exec node scripts/check-agent-domain-purity.mjs
