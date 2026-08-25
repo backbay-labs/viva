@@ -32,15 +32,36 @@ export const AGENT_DOMAIN_BASE_DEPENDENCIES = Object.freeze([
 ]);
 
 /**
- * Pure validation libraries the boundary recognizes as non-I/O. They are only
- * declared by the domain manifest when `D-04 DELETION_UX` selects
- * `SOFT_DELETE_UNDO`; under `CONFIRM_DELETE` the manifest declares neither and
- * the unused-dependency gate is the independent absence backstop.
+ * The review-scheduling seam recorded as `D-01 SERVER_PERSISTED_FSRS`.
+ *
+ * `docs/decisions/2026-08-23-d-01-review-scheduling-authority.md` pins the Rust
+ * crate `fsrs = "=6.6.1"` as the scheduling authority, and Plan 03 declares it in
+ * `agent/crates/agent-domain/Cargo.toml` under that exact pin. It is a pure
+ * spaced-repetition calculation library — it opens no file, socket, or process —
+ * so it belongs on this boundary rather than outside it. The version pin lives in
+ * the manifest and the decision document; this list only records that the name is
+ * sanctioned.
+ */
+export const AGENT_DOMAIN_REVIEW_SCHEDULING_DEPENDENCIES = Object.freeze(["fsrs"]);
+
+/**
+ * Pure validation libraries the boundary recognizes as non-I/O.
+ *
+ * `uuid` is declared by the domain manifest only when `D-04 DELETION_UX` selects
+ * `SOFT_DELETE_UNDO`; under `CONFIRM_DELETE` it is absent and the
+ * unused-dependency gate is the independent absence backstop. `chrono` is also
+ * recognized here, but its presence is not a D-04 signal: the D-01 scheduling
+ * seam above uses it for UTC instants, so it is declared under `CONFIRM_DELETE`
+ * too.
  */
 export const AGENT_DOMAIN_CONDITIONAL_DEPENDENCIES = Object.freeze(["chrono", "uuid"]);
 
 export const AGENT_DOMAIN_DEPENDENCY_ALLOWLIST = Object.freeze(
-  [...AGENT_DOMAIN_BASE_DEPENDENCIES, ...AGENT_DOMAIN_CONDITIONAL_DEPENDENCIES].sort(),
+  [
+    ...AGENT_DOMAIN_BASE_DEPENDENCIES,
+    ...AGENT_DOMAIN_REVIEW_SCHEDULING_DEPENDENCIES,
+    ...AGENT_DOMAIN_CONDITIONAL_DEPENDENCIES,
+  ].sort(),
 );
 
 /** Module roots the domain crate may never import or name. */
