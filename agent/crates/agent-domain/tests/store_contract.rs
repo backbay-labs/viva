@@ -57,7 +57,6 @@ fn fixture_session_config() -> SessionConfig {
         user_id: Some("u".to_owned()),
         study_set_id: Some("s".to_owned()),
         mode: Some(StudyMode::Quiz),
-        initial_goal: None,
         source_context: Vec::new(),
         active_concepts: vec!["concept-electron-transport-chain".to_owned()],
         client_generation_id: None,
