@@ -110,7 +110,21 @@ const trustedRecap: SessionRecap = {
 
 const trustedReviewPlan: ReviewScheduleItem[] = [
   {
+    authoritativeDueAt: new Date("2026-06-18T12:00:00.000Z"),
     authority: "core_fsrs",
+    capReason: null,
+    card: {
+      difficulty: 6.5,
+      due_at: "2026-06-18T12:00:00.000Z",
+      elapsed_days: 0,
+      lapses: 1,
+      last_review_at: "2026-06-17T12:00:00.000Z",
+      reps: 1,
+      scheduled_days: 1,
+      schema_version: 1,
+      stability: 0.6,
+      state: "relearning",
+    },
     conceptId: "atp-synthase",
     dueAt: new Date("2026-06-18T12:00:00.000Z"),
     explanation: ["FSRS rating: Hard", "hint-assisted answer lowered the rating"],
