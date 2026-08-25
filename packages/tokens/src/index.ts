@@ -48,3 +48,31 @@ export const vivaTargetMinToken = "--viva-target-min" as const;
 export type VivaColorTokenName = keyof typeof vivaColorTokens;
 export type VivaRadiusTokenName = keyof typeof vivaRadiusTokens;
 export type VivaTypographyTokenName = keyof typeof vivaTypographyTokens;
+
+/**
+ * A required minimum WCAG 2.x contrast ratio between two `theme.css` custom
+ * properties, named by CSS custom-property name (not a resolved hex value)
+ * so the check always tracks the live token, never a value that could drift
+ * out of sync with `theme.css`.
+ */
+export type VivaContrastPair = {
+  foreground: string;
+  background: string;
+  minimumRatio: number;
+};
+
+/**
+ * The full set of semantic-text contrast pairs `theme.css` must satisfy
+ * (`FRONTEND-002`). Both `packages/tokens/src/index.test.ts` (resolving
+ * against the real `theme.css` literals) and `scripts/frontend-quality.test.mjs`
+ * (the source-level checker `checkTokenAuthority` consumes this same array)
+ * scan every entry here, so a new semantic-text role only needs to be added
+ * once, in this array, to be covered by both.
+ */
+export const vivaContrastPairs: ReadonlyArray<VivaContrastPair> = [
+  { background: "--viva-paper", foreground: "--viva-ochre-text", minimumRatio: 4.5 },
+  { background: "--viva-bg-soft", foreground: "--viva-ochre-text", minimumRatio: 4.5 },
+  { background: "--viva-paper", foreground: "--viva-ink", minimumRatio: 4.5 },
+  { background: "--viva-paper", foreground: "--viva-ink-soft", minimumRatio: 4.5 },
+  { background: "--viva-paper", foreground: "--viva-muted", minimumRatio: 4.5 },
+] as const;

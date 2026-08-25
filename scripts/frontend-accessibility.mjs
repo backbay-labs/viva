@@ -16,10 +16,29 @@ import {
  * and `--compare-computed-style-baseline <path>` — the differential-parity
  * proof that splitting `apps/web/app/globals.css` into
  * `packages/ui-web/src/styles.css` plus `apps/web/app/styles/{base,landing,
- * session}.css` changed no rendering. Task 3 onward adds the landmark/
- * target-size/contrast/assets/session-handoff/deletion/bootstrap/
- * static-export modes named in later tasks' RED commands; this file's
- * mode dispatch is written so those are additive.
+ * session}.css` changed no rendering.
+ *
+ * Task 3 adds two more modes (`FRONTEND-002`):
+ *
+ * - `--owned-surfaces` mounts both `/` and `/session` at 1280x720, 375x667,
+ *   and 320x568 using only this plan's owned CSS/component surfaces — it
+ *   enforces 44px touch targets, the ochre semantic-text-role rule, `/`'s
+ *   single `<main>`, 200%-text-scale zoom safety at 320x568, and keyboard
+ *   traversal/focus-visibility — without requiring any Plan-10 file. It
+ *   must pass before Plan 10 lands.
+ * - `--session-handoff --disclosure-scope all-live-content` mounts
+ *   `/session` alone and asserts the Plan-10-owned session landmark/skip
+ *   target, Transcript button semantics, and D-08 Branch A joint
+ *   typed+voice gating. D-08 Branch A (`all-live-content`) is the only
+ *   recorded/selected D-08 branch in this program, so this is the only
+ *   `--disclosure-scope` value implemented; it is EXPECTED to stay red
+ *   until Plan 10 lands the session landmark/skip target/Transcript
+ *   button/joint gating, at which point Task 12 turns it green on the
+ *   combined tree.
+ *
+ * Later tasks add the remaining assets/deletion/bootstrap/static-export
+ * modes named in their own RED commands; this file's mode dispatch is
+ * written so those are additive.
  */
 
 const ALLOWLISTED_COMPUTED_PROPERTIES = [
@@ -39,12 +58,49 @@ const BASELINE_VIEWPORTS = [
   { width: 375, height: 667, label: "375x667" },
 ];
 
+/** The three viewports Task 3 Step 1 requires every owned-surface check to run at. */
+const OWNED_SURFACE_VIEWPORTS = [
+  { width: 1280, height: 720, label: "1280x720" },
+  { width: 375, height: 667, label: "375x667" },
+  { width: 320, height: 568, label: "320x568" },
+];
+
+/** The narrowest owned-surface viewport, used for the 200%-text-scale zoom-safety check. */
+const ZOOM_TEXT_SCALE_VIEWPORT = { width: 320, height: 568, label: "320x568" };
+
+/** `FRONTEND-002` item 2's minimum actionable-target bounding box, in CSS px. */
+const TOUCH_TARGET_MIN_PX = 44;
+
+/**
+ * The routes `--owned-surfaces` mounts. `/` is fully owned by this plan;
+ * `/session` is Plan 10's route, but its *current*, pre-Plan-10 markup
+ * already renders real `session.css`-styled controls this plan owns the
+ * styling of (touch targets, ochre-text contrast) — this mode checks only
+ * those CSS-driven concerns there, never the session landmark/skip-link/
+ * Transcript-semantics work `--session-handoff` covers instead.
+ */
+const OWNED_SURFACE_ROUTES = ["/", "/session"];
+
 /**
  * A complete, type-shaped `VivaLibrarySnapshot` fixture (see
  * `apps/web/lib/viva-library.ts`) — content is arbitrary but structurally
  * real, so the mounted page renders actual `.viva-library__*` DOM rather
  * than the `snapshot: null` empty-render path. No production data, no
  * session/control-token shape reused from a real deployment.
+ *
+ * `app/page.tsx`'s server pipeline both strips every raw `control_token`
+ * field (`browserInitialLibrarySnapshot`, since this harness never sets
+ * `VIVA_STATIC_EXPORT`) and, since `frontend-harness.mjs` clears the real
+ * signing secret so this harness can never mint a genuine capability,
+ * fails to mint a replacement `same_origin_control_token`/
+ * `session_bootstrap_token`. The library-mutation and session-start
+ * actions below therefore supply their own `same_origin_control_token` /
+ * non-null `session_id` directly, so they still project as *available* on
+ * the browser-facing snapshot — otherwise every mutation button would
+ * render disabled and neither the 44px scan (which, matching item 2's
+ * "every visible *enabled*" wording, skips disabled controls) nor the
+ * keyboard-traversal check (which must reach a real library action and a
+ * real delete decision control) could exercise them at all.
  */
 const LIBRARY_SNAPSHOT_FIXTURE = {
   user_id: "user-1",
@@ -84,7 +140,7 @@ const LIBRARY_SNAPSHOT_FIXTURE = {
       actions: {
         start: {
           available: true,
-          session_id: null,
+          session_id: "biology-midterm-session-slot",
           session_bootstrap_token: "stub-bootstrap-token",
           session_token: null,
           same_origin_control_token: null,
@@ -92,13 +148,23 @@ const LIBRARY_SNAPSHOT_FIXTURE = {
         },
         resume: { available: false, unavailable_reason: "no_active_session" },
         archive: { available: true, control_token: "stub-control-token" },
-        delete: { available: true, control_token: "stub-control-token" },
+        delete: {
+          available: true,
+          control_token: "stub-control-token",
+          same_origin_control_token: "stub-same-origin-control-token",
+        },
       },
     },
   ],
   sessions: [
     {
-      actions: { delete: { available: true, control_token: "stub-control-token" } },
+      actions: {
+        delete: {
+          available: true,
+          control_token: "stub-control-token",
+          same_origin_control_token: "stub-same-origin-control-token",
+        },
+      },
       voice_session_id: "voice-session-1",
       user_id: "user-1",
       study_set_id: "biology-midterm",
@@ -123,10 +189,73 @@ const LIBRARY_SNAPSHOT_FIXTURE = {
   ],
 };
 
+/**
+ * The sanitized-env overrides every owned-surface harness call passes to
+ * `withFrontendDevServer` so the server-rendered library snapshot has real,
+ * deterministic `.viva-library__*` content to check touch targets/contrast
+ * against, instead of the `snapshot: null` empty-render path. Shared by
+ * `captureComputedStyleBaseline` (Task 2) and `runOwnedSurfacesCheck`
+ * (Task 3) so the fixture wiring can never drift between the two.
+ *
+ * @param {string} stubUrl
+ */
+function harnessExtraEnv(stubUrl) {
+  return {
+    VIVA_AGENT_HTTP_URL: stubUrl,
+    VIVA_AGENT_REST_BEARER_TOKEN: "local-frontend-harness-bearer",
+    VIVA_SESSION_ALLOWED_USER_IDS: LIBRARY_SNAPSHOT_FIXTURE.user_id,
+    VIVA_SESSION_ALLOWED_STUDY_SET_IDS: LIBRARY_SNAPSHOT_FIXTURE.study_sets[0].id,
+  };
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const writeFlagIndex = args.indexOf("--write-computed-style-baseline");
   const compareFlagIndex = args.indexOf("--compare-computed-style-baseline");
+
+  if (args.includes("--owned-surfaces")) {
+    const failures = await runOwnedSurfacesCheck();
+    if (failures.length > 0) {
+      console.error(`--owned-surfaces FAILED: ${failures.length} issue(s)`);
+      for (const line of failures) console.error(`  - ${line}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(
+      "--owned-surfaces OK: 0 issues across",
+      OWNED_SURFACE_VIEWPORTS.length,
+      "viewports",
+    );
+    return;
+  }
+
+  if (args.includes("--session-handoff")) {
+    const scopeFlagIndex = args.indexOf("--disclosure-scope");
+    const disclosureScope = scopeFlagIndex !== -1 ? args[scopeFlagIndex + 1] : undefined;
+    if (disclosureScope !== "all-live-content") {
+      fail(
+        "--session-handoff requires --disclosure-scope all-live-content in this program: the " +
+          "coordinator has recorded D-08 Branch A (gate all live content) as the selected D-08 " +
+          "branch, so this script implements only that assertion set. (A D-08 Branch B " +
+          "--disclosure-scope microphone-only mode is not implemented here, since that branch was " +
+          "not selected.)",
+      );
+      return;
+    }
+    const failures = await runSessionHandoffCheck({ disclosureScope });
+    if (failures.length > 0) {
+      console.error(
+        `--session-handoff --disclosure-scope ${disclosureScope} FAILED (EXPECTED until Plan 10 ` +
+          `lands the session landmark/skip target/Transcript button/joint disclosure gating): ` +
+          `${failures.length} issue(s)`,
+      );
+      for (const line of failures) console.error(`  - ${line}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`--session-handoff --disclosure-scope ${disclosureScope} OK: 0 issues`);
+    return;
+  }
 
   if (writeFlagIndex !== -1) {
     const outPath = args[writeFlagIndex + 1];
@@ -158,8 +287,9 @@ async function main() {
   }
 
   fail(
-    "no recognized mode flag. Task 2 supports --write-computed-style-baseline <path> and " +
-      "--compare-computed-style-baseline <path>; later tasks add more modes.",
+    "no recognized mode flag. Supported: --write-computed-style-baseline <path>, " +
+      "--compare-computed-style-baseline <path>, --owned-surfaces, --session-handoff " +
+      "--disclosure-scope all-live-content; later tasks add more modes.",
   );
 }
 
@@ -172,12 +302,7 @@ async function captureComputedStyleBaseline() {
     return await withFrontendDevServer(
       {
         artifactDir,
-        extraEnv: {
-          VIVA_AGENT_HTTP_URL: stub.url,
-          VIVA_AGENT_REST_BEARER_TOKEN: "local-frontend-harness-bearer",
-          VIVA_SESSION_ALLOWED_USER_IDS: LIBRARY_SNAPSHOT_FIXTURE.user_id,
-          VIVA_SESSION_ALLOWED_STUDY_SET_IDS: LIBRARY_SNAPSHOT_FIXTURE.study_sets[0].id,
-        },
+        extraEnv: harnessExtraEnv(stub.url),
       },
       async ({ baseUrl }) => {
         const browser = await launchChromium();
@@ -263,6 +388,507 @@ function diffComputedStyleBaselines(before, after) {
     }
   }
   return differences;
+}
+
+/* --------------------------------------------------------------------- *
+ * Task 3 (`FRONTEND-002`): `--owned-surfaces` and `--session-handoff`.
+ * -------------------------------------------------------------------- */
+
+/**
+ * Mounts `/` and `/session` at all three `OWNED_SURFACE_VIEWPORTS`, running
+ * only checks this plan can satisfy without any Plan-10 file: 44px touch
+ * targets, the ochre semantic-text-role rule, `/`'s single `<main>`, 200%
+ * text-scale zoom safety at 320x568, and keyboard traversal/focus
+ * visibility. Returns a flat list of human-readable failure strings; empty
+ * means every owned-surface check passed.
+ */
+async function runOwnedSurfacesCheck() {
+  const artifactDir = path.join(repoRoot, "artifacts/frontend-accessibility");
+  mkdirSync(artifactDir, { recursive: true });
+  const stub = await startLibrarySnapshotStub(LIBRARY_SNAPSHOT_FIXTURE);
+  const failures = [];
+  try {
+    await withFrontendDevServer(
+      { artifactDir, extraEnv: harnessExtraEnv(stub.url) },
+      async ({ baseUrl }) => {
+        const browser = await launchChromium();
+        try {
+          for (const viewport of OWNED_SURFACE_VIEWPORTS) {
+            for (const route of OWNED_SURFACE_ROUTES) {
+              const context = await browser.newContext({
+                viewport: { width: viewport.width, height: viewport.height },
+              });
+              const page = await context.newPage();
+              try {
+                await gotoRouteReady(page, baseUrl, route);
+                failures.push(
+                  ...(await checkOwnedSurfacePage(page, { route, viewportLabel: viewport.label })),
+                );
+              } finally {
+                await context.close();
+              }
+            }
+          }
+          failures.push(...(await checkZoomSafety(browser, baseUrl)));
+          failures.push(...(await checkKeyboardTraversal(browser, baseUrl)));
+        } finally {
+          await browser.close();
+        }
+      },
+    );
+  } finally {
+    await stub.close();
+  }
+  return failures;
+}
+
+/**
+ * Navigates `page` to `route` and waits for that route's real content to be
+ * attached. `/session` never reaches Playwright's "networkidle" state (its
+ * client keeps retrying a WebSocket connection with no real agent-service
+ * behind this harness), so it waits on `"load"` plus an explicit selector
+ * instead; `/` still uses `"networkidle"` exactly as Task 2 established.
+ *
+ * @param {import("playwright").Page} page
+ * @param {string} baseUrl
+ * @param {string} route
+ */
+async function gotoRouteReady(page, baseUrl, route) {
+  await page.goto(`${baseUrl}${route}`, {
+    waitUntil: route === "/" ? "networkidle" : "load",
+    timeout: 120_000,
+  });
+  if (route === "/") {
+    await page.waitForSelector(".viva-hero", { state: "attached", timeout: 30_000 });
+    await page.waitForSelector(".viva-library", { state: "attached", timeout: 30_000 });
+  } else {
+    await page.waitForSelector(".live-session", { state: "attached", timeout: 30_000 });
+  }
+  await page.evaluate(() => document.fonts.ready);
+}
+
+/**
+ * The in-browser scan shared by every `--owned-surfaces` page visit: every
+ * visible, enabled `button`/`summary`/`a[href]`/`[role=button]`'s bounding
+ * box, every visible text-bearing element's resolved `color` (to catch the
+ * decorative `--viva-ochre` value leaking into real text), and (on `/`
+ * only) the document's `<main>` count.
+ *
+ * @param {import("playwright").Page} page
+ * @param {{ route: string, viewportLabel: string }} context
+ */
+async function checkOwnedSurfacePage(page, { route, viewportLabel }) {
+  const result = await page.evaluate((minTouchPx) => {
+    function isElementVisible(el) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const style = getComputedStyle(el);
+      if (style.visibility === "hidden" || style.display === "none") return false;
+      if (Number.parseFloat(style.opacity) === 0) return false;
+      if (el.closest('[aria-hidden="true"], [hidden]')) return false;
+      return true;
+    }
+    function isDisabled(el) {
+      if ("disabled" in el && el.disabled) return true;
+      return el.getAttribute("aria-disabled") === "true";
+    }
+    function classNameOf(el) {
+      return typeof el.className === "string" ? el.className : "";
+    }
+    function accessibleName(el) {
+      const ariaLabel = el.getAttribute("aria-label");
+      if (ariaLabel?.trim()) return ariaLabel.trim();
+      const labelledBy = el.getAttribute("aria-labelledby");
+      if (labelledBy) {
+        const text = labelledBy
+          .split(/\s+/)
+          .map((id) => document.getElementById(id)?.textContent?.trim() ?? "")
+          .join(" ")
+          .trim();
+        if (text) return text;
+      }
+      const text = el.textContent?.trim();
+      return text ? text.slice(0, 80) : el.tagName.toLowerCase();
+    }
+
+    const undersized = [];
+    for (const el of document.querySelectorAll('button, summary, a[href], [role="button"]')) {
+      if (isDisabled(el)) continue;
+      if (!isElementVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      // A small epsilon absorbs browser subpixel-rounding noise (e.g.
+      // 43.98px measured for an authored 44px box); it must never absorb a
+      // genuine deficit like the Step 4 mutation's 35px.
+      if (rect.width < minTouchPx - 0.1 || rect.height < minTouchPx - 0.1) {
+        undersized.push({
+          name: accessibleName(el),
+          width: Math.round(rect.width * 100) / 100,
+          height: Math.round(rect.height * 100) / 100,
+          tag: el.tagName.toLowerCase(),
+          className: classNameOf(el),
+        });
+      }
+    }
+
+    function resolveVarColor(varExpression) {
+      const probe = document.createElement("span");
+      probe.style.position = "absolute";
+      probe.style.visibility = "hidden";
+      probe.style.color = varExpression;
+      document.body.appendChild(probe);
+      const resolved = getComputedStyle(probe).color;
+      probe.remove();
+      return resolved;
+    }
+    const ochreRgb = resolveVarColor("var(--viva-ochre)");
+    const ochreTextRgb = resolveVarColor("var(--viva-ochre-text)");
+    const ochreViolations = [];
+    if (ochreRgb && ochreRgb !== ochreTextRgb) {
+      for (const el of document.querySelectorAll("body *")) {
+        if (el.closest('[aria-hidden="true"], [hidden]')) continue;
+        const hasDirectText = Array.prototype.some.call(
+          el.childNodes,
+          (node) => node.nodeType === 3 && (node.textContent ?? "").trim().length > 0,
+        );
+        if (!hasDirectText) continue;
+        if (!isElementVisible(el)) continue;
+        if (getComputedStyle(el).color === ochreRgb) {
+          ochreViolations.push({
+            text: (el.textContent ?? "").trim().slice(0, 60),
+            tag: el.tagName.toLowerCase(),
+            className: classNameOf(el),
+          });
+        }
+      }
+    }
+
+    return { undersized, ochreViolations, mainCount: document.querySelectorAll("main").length };
+  }, TOUCH_TARGET_MIN_PX);
+
+  const failures = [];
+  for (const item of result.undersized) {
+    const selector = item.className
+      ? `${item.tag}.${item.className.split(/\s+/).join(".")}`
+      : item.tag;
+    failures.push(
+      `[${route} @ ${viewportLabel}] touch target too small: "${item.name}" (<${selector}>) measured ` +
+        `${item.width}x${item.height}px, need >= ${TOUCH_TARGET_MIN_PX}x${TOUCH_TARGET_MIN_PX}px`,
+    );
+  }
+  for (const item of result.ochreViolations) {
+    const selector = item.className
+      ? `${item.tag}.${item.className.split(/\s+/).join(".")}`
+      : item.tag;
+    failures.push(
+      `[${route} @ ${viewportLabel}] semantic text "${item.text}" (<${selector}>) resolves to the ` +
+        "decorative --viva-ochre color; text must resolve through --viva-ochre-text instead",
+    );
+  }
+  if (route === "/" && result.mainCount !== 1) {
+    failures.push(
+      `[${route} @ ${viewportLabel}] expected exactly one <main>, found ${result.mainCount}`,
+    );
+  }
+  return failures;
+}
+
+/**
+ * `FRONTEND-002` item 4: at a 200% root text scale and 320px viewport,
+ * document horizontal overflow must be at most 1px and privacy/deletion
+ * copy must not be truncated. `html { font-size: 200% }` is the standard
+ * way to emulate a user's OS/browser text-only zoom setting — it grows
+ * every `rem`/`em`-sized value without touching physical viewport width,
+ * exactly what a "200% text scale" accessibility setting does.
+ *
+ * @param {import("playwright").Browser} browser
+ * @param {string} baseUrl
+ */
+async function checkZoomSafety(browser, baseUrl) {
+  const failures = [];
+  const context = await browser.newContext({
+    viewport: { width: ZOOM_TEXT_SCALE_VIEWPORT.width, height: ZOOM_TEXT_SCALE_VIEWPORT.height },
+  });
+  const page = await context.newPage();
+  try {
+    await gotoRouteReady(page, baseUrl, "/");
+    await page.addStyleTag({ content: "html { font-size: 200% !important; }" });
+    // Let layout settle after the injected stylesheet before measuring.
+    await page.waitForTimeout(100);
+    const report = await page.evaluate(() => {
+      const doc = document.documentElement;
+      const overflow = Math.max(0, doc.scrollWidth - doc.clientWidth);
+      const truncated = [];
+      const copyNodes = document.querySelectorAll(
+        '.viva-library__privacy p, .viva-library__privacy span, [aria-label^="Delete"], [aria-label^="Start"], [aria-label^="Resume"]',
+      );
+      for (const el of copyNodes) {
+        const style = getComputedStyle(el);
+        const clippedHorizontally =
+          style.overflow === "hidden" ||
+          style.overflowX === "hidden" ||
+          style.textOverflow === "ellipsis";
+        if (clippedHorizontally && el.scrollWidth > el.clientWidth + 1) {
+          truncated.push(
+            (el.textContent ?? el.getAttribute("aria-label") ?? "").trim().slice(0, 80),
+          );
+        }
+      }
+      return { overflow, truncated };
+    });
+    if (report.overflow > 1) {
+      failures.push(
+        `[/ @ ${ZOOM_TEXT_SCALE_VIEWPORT.label}, 200% text scale] document horizontal overflow is ` +
+          `${report.overflow}px, expected <= 1px`,
+      );
+    }
+    for (const text of report.truncated) {
+      failures.push(
+        `[/ @ ${ZOOM_TEXT_SCALE_VIEWPORT.label}, 200% text scale] copy is truncated: "${text}"`,
+      );
+    }
+  } finally {
+    await context.close();
+  }
+  return failures;
+}
+
+/**
+ * `FRONTEND-002` item 5: keyboard `Tab` traversal from a fresh page reaches
+ * the main hero action, a library Start/Resume action, and a delete
+ * decision control, each with a visible `:focus` indicator (a non-`none`
+ * outline or a `box-shadow`); under `forced-colors: active` emulation the
+ * first focused control still carries an outline.
+ *
+ * @param {import("playwright").Browser} browser
+ * @param {string} baseUrl
+ */
+async function checkKeyboardTraversal(browser, baseUrl) {
+  const failures = [];
+  const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const page = await context.newPage();
+  try {
+    await gotoRouteReady(page, baseUrl, "/");
+    // Several focus rings (e.g. .viva-chip:focus-visible) are declared with
+    // a CSS transition, so getComputedStyle read synchronously after a Tab
+    // press can observe a mid-transition (or even pre-transition) value
+    // rather than the settled focus style. Disabling transitions/animations
+    // makes every focus-driven style change apply instantly, so the
+    // blur/focus comparison below measures the real end state.
+    await page.addStyleTag({
+      content:
+        "*, *::before, *::after { transition: none !important; animation: none !important; }",
+    });
+
+    const tabbed = [];
+    for (let i = 0; i < 60; i++) {
+      await page.keyboard.press("Tab");
+      const info = await page.evaluate(() => {
+        const el = document.activeElement;
+        if (!el || el === document.body) return null;
+
+        // A composite control (e.g. the command pill) may draw its focus
+        // ring on an ancestor via :focus-within/:has(:focus-visible) rather
+        // than on the focused element itself, so this walks a few ancestor
+        // levels rather than only inspecting `el`'s own computed style. But
+        // an *ambient* decorative outline/box-shadow present regardless of
+        // focus must not count as "visible focus indicator" either — so
+        // this blurs the element, snapshots the same properties again, and
+        // only counts a property that genuinely *changes* between the
+        // focused and blurred states, then restores focus so the next Tab
+        // press continues naturally from here.
+        function chain(node) {
+          const nodes = [];
+          for (let cur = node, depth = 0; cur && depth < 5; cur = cur.parentElement, depth++) {
+            nodes.push(cur);
+          }
+          return nodes;
+        }
+        function snapshot(nodes) {
+          return nodes.map((node) => {
+            const style = getComputedStyle(node);
+            return {
+              outline:
+                style.outlineStyle === "none"
+                  ? "none"
+                  : `${style.outlineWidth}/${style.outlineStyle}`,
+              boxShadow: style.boxShadow,
+            };
+          });
+        }
+        const nodes = chain(el);
+        const focusedSnapshot = snapshot(nodes);
+        el.blur();
+        const blurredSnapshot = snapshot(nodes);
+        el.focus();
+        const hasVisibleFocus = focusedSnapshot.some(
+          (focused, i) =>
+            focused.outline !== blurredSnapshot[i].outline ||
+            focused.boxShadow !== blurredSnapshot[i].boxShadow,
+        );
+
+        return {
+          tag: el.tagName.toLowerCase(),
+          className: typeof el.className === "string" ? el.className : "",
+          ariaLabel: el.getAttribute("aria-label"),
+          text: (el.textContent ?? "").trim().slice(0, 60),
+          hasVisibleFocus,
+        };
+      });
+      if (!info) break;
+      tabbed.push(info);
+    }
+
+    const nameOf = (item) => item.ariaLabel ?? item.text;
+    const reachedMainAction = tabbed.some(
+      (item) => nameOf(item) === "Start studying" || nameOf(item) === "Answer out loud",
+    );
+    const reachedLibraryAction = tabbed.some((item) => /^(Start|Resume) /.test(nameOf(item) ?? ""));
+    const reachedDeleteAction = tabbed.some((item) => /^Delete /.test(nameOf(item) ?? ""));
+    if (!reachedMainAction) {
+      failures.push("[/ keyboard] Tab order never reaches the main hero action");
+    }
+    if (!reachedLibraryAction) {
+      failures.push("[/ keyboard] Tab order never reaches a library Start/Resume action");
+    }
+    if (!reachedDeleteAction) {
+      failures.push("[/ keyboard] Tab order never reaches a delete decision control");
+    }
+    for (const item of tabbed.filter((entry) => !entry.hasVisibleFocus)) {
+      const selector = item.className
+        ? `${item.tag}.${item.className.split(/\s+/).join(".")}`
+        : item.tag;
+      failures.push(
+        `[/ keyboard] <${selector}> "${nameOf(item)}" has no visible focus indicator ` +
+          "(no outline and no box-shadow while focused)",
+      );
+    }
+
+    await page.emulateMedia({ forcedColors: "active" });
+    await page.evaluate(() => document.body.focus());
+    await page.keyboard.press("Tab");
+    const forcedColorsHasOutline = await page.evaluate(() => {
+      const el = document.activeElement;
+      if (!el || el === document.body) return false;
+      const style = getComputedStyle(el);
+      return style.outlineStyle !== "none" && style.outlineWidth !== "0px";
+    });
+    if (!forcedColorsHasOutline) {
+      failures.push(
+        "[/ keyboard, forced-colors: active] the first focused control has no outline under forced-colors emulation",
+      );
+    }
+  } finally {
+    await context.close();
+  }
+  return failures;
+}
+
+/**
+ * `--session-handoff --disclosure-scope all-live-content`: the Plan-10
+ * handoff RED. Mounts `/session` alone (it never needs the library-snapshot
+ * stub) and asserts the session landmark/skip target, Transcript button
+ * semantics, and D-08 Branch A's joint typed+voice gating. This mode is
+ * EXPECTED to fail until Plan 10 lands; Task 12 reruns this exact command
+ * on the combined tree and requires it to pass there.
+ *
+ * @param {{ disclosureScope: "all-live-content" }} options
+ */
+async function runSessionHandoffCheck({ disclosureScope }) {
+  const artifactDir = path.join(repoRoot, "artifacts/frontend-accessibility");
+  mkdirSync(artifactDir, { recursive: true });
+  const failures = [];
+  await withFrontendDevServer({ artifactDir }, async ({ baseUrl }) => {
+    const browser = await launchChromium();
+    try {
+      const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+      const page = await context.newPage();
+      try {
+        await gotoRouteReady(page, baseUrl, "/session");
+
+        // Item 1 (session half): exactly one <main>, plus a visible-on-focus
+        // skip link targeting the active question/answer region.
+        const mainCount = await page.evaluate(() => document.querySelectorAll("main").length);
+        if (mainCount !== 1) {
+          failures.push(
+            `/session must expose exactly one <main>, found ${mainCount} (Plan 10 handoff, FRONTEND-002 item 1)`,
+          );
+        }
+        const hasSkipLink = await page.evaluate(() =>
+          [...document.querySelectorAll('a[href^="#"]')].some((a) =>
+            /skip/i.test(a.textContent ?? ""),
+          ),
+        );
+        if (!hasSkipLink) {
+          failures.push(
+            "/session has no visible-on-focus skip link targeting the active question/answer region (Plan 10 handoff, FRONTEND-002 item 1)",
+          );
+        }
+
+        // FRONTEND-006: Transcript is a real button with aria-expanded and
+        // stable aria-controls, not a bare <details>/<summary> pair.
+        const transcript = await page.evaluate(() => {
+          const button = [...document.querySelectorAll("button")].find(
+            (el) => (el.textContent ?? "").trim() === "Transcript",
+          );
+          if (button) {
+            return {
+              kind: "button",
+              hasAriaExpanded: button.hasAttribute("aria-expanded"),
+              hasAriaControls: button.hasAttribute("aria-controls"),
+            };
+          }
+          const summary = [...document.querySelectorAll("summary")].find(
+            (el) => (el.textContent ?? "").trim() === "Transcript",
+          );
+          if (summary) return { kind: "details-summary" };
+          return { kind: "missing" };
+        });
+        if (
+          transcript.kind !== "button" ||
+          !transcript.hasAriaExpanded ||
+          !transcript.hasAriaControls
+        ) {
+          failures.push(
+            `Transcript is not a real button with aria-expanded/aria-controls semantics (found: ${JSON.stringify(
+              transcript,
+            )}) (Plan 10 handoff, FRONTEND-006)`,
+          );
+        }
+
+        // D-08 Branch A: acknowledgment must jointly gate typed and voice
+        // live content, not only the microphone. Proven here by observing
+        // that the question/answer stage stays fully reachable while the
+        // disclosure banner is still shown unacknowledged.
+        if (disclosureScope === "all-live-content") {
+          const gating = await page.evaluate(() => {
+            const consentShown = Boolean(document.querySelector(".session-consent"));
+            const stage = document.querySelector(".live-session__stage");
+            if (!stage) return { consentShown, stageBlocked: null };
+            const style = getComputedStyle(stage);
+            const stageBlocked =
+              style.display === "none" ||
+              style.visibility === "hidden" ||
+              stage.hasAttribute("inert") ||
+              stage.getAttribute("aria-hidden") === "true";
+            return { consentShown, stageBlocked };
+          });
+          if (gating.consentShown && gating.stageBlocked !== true) {
+            failures.push(
+              "D-08 Branch A requires both typed and voice live content to be blocked until the " +
+                "disclosure is acknowledged, but the question/answer stage remains reachable while " +
+                "the disclosure banner is still shown unacknowledged (Plan 10 handoff, " +
+                "FRONTEND-005/WEBSESSION-DISCLOSURE-01)",
+            );
+          }
+        }
+      } finally {
+        await context.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  });
+  return failures;
 }
 
 function fail(message) {

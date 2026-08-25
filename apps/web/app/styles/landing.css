@@ -1022,7 +1022,7 @@
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
-  height: 42px;
+  height: var(--viva-target-min);
   padding: 0 0.95rem;
   border-radius: 999px;
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.66), rgba(249, 242, 232, 0.46));
@@ -1094,6 +1094,7 @@
 .viva-library__inner {
   display: grid;
   gap: 1.2rem;
+  grid-template-columns: minmax(0, 1fr);
   margin: 0 auto;
   max-width: 72rem;
 }
@@ -1109,9 +1110,14 @@
   border: 1px solid rgba(64, 42, 82, 0.12);
   border-radius: 8px;
   display: flex;
+  flex-wrap: wrap;
   gap: 1rem;
   justify-content: space-between;
   padding: 0.9rem;
+}
+
+.viva-library__privacy > div {
+  min-width: 0;
 }
 
 .viva-library__privacy p,
@@ -1137,9 +1143,8 @@
   color: var(--viva-ink);
   cursor: pointer;
   font-weight: 750;
-  min-height: 2.2rem;
+  min-height: var(--viva-target-min);
   padding: 0.48rem 0.72rem;
-  white-space: nowrap;
 }
 
 .viva-library__privacy button:disabled {
@@ -1234,7 +1239,7 @@
   color: var(--viva-paper);
   cursor: pointer;
   font-weight: 750;
-  min-height: 2.2rem;
+  min-height: var(--viva-target-min);
   padding: 0.48rem 0.72rem;
 }
 
@@ -1441,7 +1446,6 @@
   }
 
   .viva-chip {
-    height: 44px;
     padding: 0 1rem;
     font-size: 0.88rem;
   }

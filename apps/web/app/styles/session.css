@@ -642,7 +642,7 @@
 
 .session-consent button {
   min-width: 120px;
-  min-height: 42px;
+  min-height: var(--viva-target-min);
   border: 1px solid rgba(77, 44, 98, 0.18);
   border-radius: 8px;
   background: var(--plum);
@@ -952,7 +952,7 @@
 .turn-taking__nudge span,
 .turn-captions__line span {
   flex: none;
-  color: var(--viva-ochre);
+  color: var(--viva-ochre-text);
   font-weight: 700;
 }
 
@@ -989,7 +989,9 @@
 .session-controls__btn {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 0.45rem;
+  min-height: var(--viva-target-min);
   padding: 0.4rem 0.7rem;
   border: 0;
   border-radius: 999px;
@@ -1262,7 +1264,7 @@
   font-size: 0.74rem;
   font-style: normal;
   line-height: 1.4;
-  color: var(--viva-ochre);
+  color: var(--viva-ochre-text);
 }
 
 .marginalia__body > .student-hand {
@@ -1606,7 +1608,7 @@
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--viva-ochre);
+  color: var(--viva-ochre-text);
 }
 
 @keyframes retryCueSettle {
@@ -1648,7 +1650,7 @@
 .status-chip {
   background: rgba(200, 139, 72, 0.13);
   border: 1px solid rgba(200, 139, 72, 0.3);
-  color: #8a571f;
+  color: var(--viva-ochre-text);
 }
 
 .status-chip__dot {
@@ -1664,6 +1666,7 @@
   gap: 0.55rem;
   width: 100%;
   min-width: 0;
+  min-height: var(--viva-target-min);
   padding: 0.62rem 0.85rem;
   border-radius: 14px;
   border: 1px solid var(--viva-border);
@@ -1798,7 +1801,7 @@
 
 .source-folio .status-chip {
   background: rgba(200, 139, 72, 0.18);
-  color: #80511e;
+  color: var(--viva-ochre-text);
 }
 
 .source-folio__facts {
@@ -1918,7 +1921,7 @@
 .source-folio[data-source-state="low_confidence"] .source-folio__caveat,
 .source-folio[data-source-state="conflicting"] .source-folio__caveat,
 .source-folio[data-source-state="unavailable"] .source-folio__caveat {
-  color: #8a571f;
+  color: var(--viva-ochre-text);
 }
 
 .folio__excerpt {

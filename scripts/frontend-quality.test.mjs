@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { vivaContrastPairs } from "../packages/tokens/src/index.ts";
 
 /**
  * Frontend quality: static, source-level checks over the frontend's CSS
@@ -10,9 +11,10 @@ import { fileURLToPath } from "node:url";
  * plain Node — no build step, no DOM.
  *
  * `checkTokenAuthority` is the one-token-authority checker
- * (`FRONTEND-001`): it rejects a `:root` block that declares the same
- * custom property with more than one literal (non-`var()`) value, and it
- * rejects insufficient contrast for the ochre-on-paper text role.
+ * (`FRONTEND-001`/`FRONTEND-002`): it rejects a `:root` block that declares
+ * the same custom property with more than one literal (non-`var()`) value,
+ * and it rejects insufficient contrast for every pair declared in
+ * `@viva/tokens`'s `vivaContrastPairs`.
  *
  * `checkCssOwnership` (added by Task 2) is the CSS-ownership checker: it
  * rejects a `globals.css` that still contains a selector block or the
@@ -22,12 +24,17 @@ import { fileURLToPath } from "node:url";
  * `.live-session`/`.session-`/`.question-`/`.marginalia`/`.source-`/`.voice-`-
  * named selector authored outside its assigned landing/session sheet (the
  * plan's Step 1 partition), and rejects a `@viva/ui-web` primitive class
- * with no selector in the package's own `styles.css`. Later tasks extend
- * this file with asset checks; they must keep reusing these checkers
- * rather than re-implementing their parsing.
+ * with no selector in the package's own `styles.css`.
+ *
+ * `checkOchreTextRole` (added by Task 3) is the ochre semantic-text-role
+ * checker (`FRONTEND-002`): the decorative `--viva-ochre` custom property
+ * may be used for non-text declarations (`background`, `border*`, etc.),
+ * but the `color` (text) property may only ever resolve through the
+ * AA-contrast `--viva-ochre-text` token.
+ *
+ * Later tasks extend this file with asset checks; they must keep reusing
+ * these checkers rather than re-implementing their parsing.
  */
-
-const MINIMUM_OCHRE_TEXT_CONTRAST = 4.5;
 
 /** @typedef {{ name: string, value: string }} Declaration */
 
@@ -120,7 +127,14 @@ function contrastRatio(hexA, hexB) {
 /**
  * Checks a `:root`-bearing CSS source string against the one-token-authority
  * invariants this task owns: at most one literal declaration per custom
- * property, and sufficient ochre-text/paper contrast.
+ * property, and sufficient contrast for every pair `@viva/tokens` declares
+ * in `vivaContrastPairs` (FRONTEND-002) — the same array
+ * `packages/tokens/src/index.test.ts` resolves against the real `theme.css`,
+ * imported here directly rather than duplicated, so the two checkers can
+ * never drift apart. A fixture that omits one pair's custom properties
+ * (most of this file's synthetic fixtures declare only the properties they
+ * care about) simply skips that pair rather than erroring, so this
+ * generalization stays backward-compatible with every existing fixture.
  *
  * @param {string} cssText
  */
@@ -143,16 +157,18 @@ function checkTokenAuthority(cssText) {
     }
   }
 
-  const ochreText = byName.get("--viva-ochre-text")?.[0];
-  const paper = byName.get("--viva-paper")?.[0];
-  if (ochreText && paper && isLiteralValue(ochreText.value) && isLiteralValue(paper.value)) {
-    const ratio = contrastRatio(ochreText.value, paper.value);
-    contrastRatios["--viva-ochre-text on --viva-paper"] = ratio;
-    if (ratio < MINIMUM_OCHRE_TEXT_CONTRAST) {
+  for (const pair of vivaContrastPairs) {
+    const foreground = byName.get(pair.foreground)?.[0];
+    const background = byName.get(pair.background)?.[0];
+    if (!foreground || !background) continue;
+    if (!isLiteralValue(foreground.value) || !isLiteralValue(background.value)) continue;
+    const ratio = contrastRatio(foreground.value, background.value);
+    contrastRatios[`${pair.foreground} on ${pair.background}`] = ratio;
+    if (ratio < pair.minimumRatio) {
       errors.push(
-        `--viva-ochre-text (${ochreText.value}) on --viva-paper (${paper.value}) contrast is ${ratio.toFixed(
+        `${pair.foreground} (${foreground.value}) on ${pair.background} (${background.value}) contrast is ${ratio.toFixed(
           2,
-        )}:1, below the required ${MINIMUM_OCHRE_TEXT_CONTRAST}:1`,
+        )}:1, below the required ${pair.minimumRatio}:1`,
       );
     }
   }
@@ -245,6 +261,44 @@ test("does not let a comment containing literal ':root {' text hijack block pars
   assert.deepEqual(result.errors, []);
   assert.equal(result.ok, true);
   assert.ok(result.contrastRatios["--viva-ochre-text on --viva-paper"] >= 4.5);
+});
+
+test("checkTokenAuthority scans every declared vivaContrastPairs entry, not a one-off ochre assertion (FRONTEND-002)", () => {
+  // `vivaContrastPairs` is imported straight from @viva/tokens, so this is
+  // the exact array packages/tokens/src/index.test.ts resolves against the
+  // real theme.css — proving the two checkers can never drift apart, and
+  // that the scan generalizes to every declared pair (ink, ink-soft, muted),
+  // not only ochre-on-paper.
+  assert.ok(vivaContrastPairs.length >= 5, "expected at least 5 declared contrast pairs");
+  assert.ok(
+    vivaContrastPairs.some(
+      (pair) => pair.foreground === "--viva-ink" && pair.background === "--viva-paper",
+    ),
+    "expected --viva-ink vs --viva-paper to be a declared pair",
+  );
+
+  // A fixture with every declared pair's tokens present, but --viva-muted
+  // deliberately insufficient, must be rejected by name — proving the loop
+  // really checks a *non*-ochre pair, not only the two ochre ones.
+  const fixture = `
+    :root {
+      --viva-paper: #fffdf8;
+      --viva-bg-soft: #fbf6ee;
+      --viva-ochre-text: #8a5a23;
+      --viva-ink: #24182f;
+      --viva-ink-soft: #4e4259;
+      --viva-muted: #d8d2df;
+    }
+  `;
+  const result = checkTokenAuthority(fixture);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((error) => error.includes("--viva-muted") && error.includes("--viva-paper")),
+    `expected an error naming --viva-muted on --viva-paper, got: ${JSON.stringify(result.errors)}`,
+  );
+  // The other four declared pairs, all sufficient in this fixture, must
+  // still pass — a single insufficient pair does not mask the rest.
+  assert.equal(result.errors.length, 1);
 });
 
 /*
@@ -525,6 +579,64 @@ function checkCssOwnership({
 }
 
 /**
+ * Splits a normalized declaration-body string (semicolon-separated, as
+ * `extractSelectorRules` produces) into `{ property, value }` pairs.
+ *
+ * @param {string} body
+ * @returns {{ property: string, value: string }[]}
+ */
+function splitDeclarations(body) {
+  const declarations = [];
+  for (const raw of body.split(";")) {
+    const statement = raw.trim();
+    if (!statement) continue;
+    const colonIndex = statement.indexOf(":");
+    if (colonIndex === -1) continue;
+    declarations.push({
+      property: statement.slice(0, colonIndex).trim(),
+      value: statement.slice(colonIndex + 1).trim(),
+    });
+  }
+  return declarations;
+}
+
+// Matches `var(--viva-ochre)` or `var(--viva-ochre, <fallback>)` exactly —
+// never `var(--viva-ochre-text)`, whose "-text" suffix is not immediately
+// followed by "," or ")", so it can never satisfy this pattern.
+const BARE_OCHRE_VAR_PATTERN = /var\(\s*--viva-ochre\s*(?:,[^)]*)?\)/;
+
+/**
+ * Checks the ochre semantic-text-role invariant (`FRONTEND-002`, mounted
+ * item 3): the decorative `--viva-ochre` custom property carries borders,
+ * fills, and other non-text decoration, but real text — the `color`
+ * property specifically — may only ever resolve through the AA-contrast
+ * `--viva-ochre-text` token. `background`/`background-color`/`border*`/
+ * `box-shadow`/`fill` declarations naming `--viva-ochre` are unaffected;
+ * only the `color` property is checked, since that is what determines
+ * rendered text color.
+ *
+ * @param {[string, string][]} cssSources array of `[ownerName, cssText]`
+ */
+function checkOchreTextRole(cssSources) {
+  const errors = [];
+  for (const [ownerName, cssText] of cssSources) {
+    for (const { selector, body } of extractSelectorRules(cssText)) {
+      for (const declaration of splitDeclarations(body)) {
+        if (declaration.property !== "color") continue;
+        if (BARE_OCHRE_VAR_PATTERN.test(declaration.value)) {
+          errors.push(
+            `${ownerName} selector "${selector}" sets text color: var(--viva-ochre), which is ` +
+              "below AA contrast for text; use var(--viva-ochre-text) for the color property " +
+              "(the brighter, decorative --viva-ochre stays valid for background/border/fill)",
+          );
+        }
+      }
+    }
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+/**
  * Prop-driven template-literal variants (`` `action-card--${accent}` ``
  * and similar) in `packages/ui-web/src/index.tsx` that a static regex
  * scan cannot resolve to a literal string. Each is cross-referenced
@@ -796,6 +908,71 @@ test("checkCssOwnership accepts the real, split repository CSS", () => {
     sessionCss: readRepo("apps/web/app/styles/session.css"),
     requiredUiWebSelectors: requiredUiWebSelectorsFromSource(indexTsxSource),
   });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
+});
+
+/*
+ * Ochre semantic-text-role checker (`FRONTEND-002`, Task 3): the decorative
+ * `--viva-ochre` custom property may style borders/fills/backgrounds, but
+ * real (`color`) text must resolve through the AA-contrast
+ * `--viva-ochre-text` token instead.
+ */
+
+function readRepoFile(relativePath) {
+  return fs.readFileSync(fileURLToPath(new URL(`../${relativePath}`, import.meta.url)), "utf8");
+}
+
+test("checkOchreTextRole rejects a selector that sets text color to the decorative --viva-ochre", () => {
+  const result = checkOchreTextRole([
+    [
+      "apps/web/app/styles/session.css",
+      ".student-hand__caveat {\n  color: var(--viva-ochre);\n}\n",
+    ],
+  ]);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some(
+      (error) => error.includes(".student-hand__caveat") && error.includes("--viva-ochre"),
+    ),
+    `expected an error naming .student-hand__caveat, got: ${JSON.stringify(result.errors)}`,
+  );
+});
+
+test("checkOchreTextRole does not let --viva-ochre-text's shared prefix escape the bare-token match", () => {
+  // A naive `.includes("--viva-ochre")` check would false-positive on
+  // "--viva-ochre-text" too, since it is a textual prefix of it. This proves
+  // the checker distinguishes the two tokens correctly in both directions.
+  const result = checkOchreTextRole([
+    [
+      "apps/web/app/styles/session.css",
+      ".student-hand__caveat {\n  color: var(--viva-ochre-text);\n}\n",
+    ],
+  ]);
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
+});
+
+test("checkOchreTextRole accepts --viva-ochre used for non-text (background/border) declarations", () => {
+  const result = checkOchreTextRole([
+    [
+      "apps/web/app/styles/session.css",
+      '.turn-taking[data-phase="thinking"]::before {\n  background: var(--viva-ochre);\n}\n' +
+        ".checklist__ring--partial {\n  border-color: var(--viva-ochre);\n}\n" +
+        ".correction__retry-cue {\n  border-left: 2px solid var(--viva-ochre);\n}\n",
+    ],
+  ]);
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
+});
+
+test("checkOchreTextRole accepts the real, split repository CSS", () => {
+  const result = checkOchreTextRole([
+    ["packages/ui-web/src/styles.css", readRepoFile("packages/ui-web/src/styles.css")],
+    ["apps/web/app/styles/base.css", readRepoFile("apps/web/app/styles/base.css")],
+    ["apps/web/app/styles/landing.css", readRepoFile("apps/web/app/styles/landing.css")],
+    ["apps/web/app/styles/session.css", readRepoFile("apps/web/app/styles/session.css")],
+  ]);
   assert.deepEqual(result.errors, []);
   assert.equal(result.ok, true);
 });

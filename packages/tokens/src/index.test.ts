@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   vivaColorTokens,
+  vivaContrastPairs,
   vivaRadiusTokens,
   vivaTargetMinToken,
   vivaTypographyTokens,
@@ -134,6 +135,24 @@ describe("@viva/tokens theme.css authority", () => {
     const bgSoft = literalValueOf("--viva-bg-soft");
     expect(contrastRatio(ochreText, paper)).toBeGreaterThanOrEqual(4.5);
     expect(contrastRatio(ochreText, bgSoft)).toBeGreaterThanOrEqual(4.5);
+  });
+
+  test("every declared vivaContrastPairs entry meets its minimum ratio against the real theme.css literals", () => {
+    // Generalizes the single ochre-vs-paper assertion above: every semantic
+    // text/background pair FRONTEND-002 requires is declared once, by CSS
+    // custom-property name, in `vivaContrastPairs`, and this loop is the
+    // single place that resolves and checks every one of them — so a new
+    // pair only needs to be added to the array, never to a second bespoke
+    // test. `scripts/frontend-quality.test.mjs`'s `checkTokenAuthority`
+    // imports this same array and performs the identical scan at the
+    // CSS-source level, so the two checkers can never drift apart.
+    expect(vivaContrastPairs.length).toBeGreaterThanOrEqual(5);
+    for (const pair of vivaContrastPairs) {
+      const foreground = literalValueOf(pair.foreground);
+      const background = literalValueOf(pair.background);
+      const ratio = contrastRatio(foreground, background);
+      expect(ratio).toBeGreaterThanOrEqual(pair.minimumRatio);
+    }
   });
 
   test("--viva-target-min is exactly 44px", () => {
