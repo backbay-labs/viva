@@ -18,6 +18,8 @@ import {
   drainSessionPlayback,
   orbStateForSession,
   RECAP_PLAYBACK_MAX_WAIT_MS,
+  type RetryAttemptState,
+  retryAttemptResolution,
   type SessionCorrectionModel,
   shouldNavigateToRecap,
   stageCopyForConnection,
@@ -144,16 +146,16 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   const [captureMessage, setCaptureMessage] = useState<string>();
   const [ending, setEnding] = useState(false);
   const [orbLevel, setOrbLevel] = useState(0);
-  const [retrying, setRetrying] = useState(false);
-  const [retrySubmitted, setRetrySubmitted] = useState(false);
+  const [retryAttempt, setRetryAttempt] = useState<RetryAttemptState>();
   const [recapPlaybackWaitExpired, setRecapPlaybackWaitExpired] = useState(false);
   const endingRef = useRef(false);
   const handledCancelRef = useRef(0);
   const handledGenerationRef = useRef<string | undefined>(undefined);
   const playbackUnlockedRef = useRef(false);
-  const sawRetryPendingRef = useRef(false);
   const previousQuestionRef = useRef<string | undefined>(undefined);
   const hasRecap = Boolean(agent.derived.recap);
+  const retrying = retryAttempt !== undefined;
+  const retrySubmitted = retryAttempt?.phase === "submitted";
 
   useEffect(() => {
     if (agent.status !== "open" || agent.derived.recap) return;
@@ -215,29 +217,24 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     const questionId = agent.derived.question?.id;
     if (!questionId || questionId === previousQuestionRef.current) return;
     previousQuestionRef.current = questionId;
-    sawRetryPendingRef.current = false;
     setCaptureMessage(undefined);
     setCaptureState("idle");
     setHintVisible(false);
-    setRetrySubmitted(false);
-    setRetrying(false);
+    setRetryAttempt(undefined);
     setSourceVisible(false);
     setTypedAnswer("");
   }, [agent.derived.question?.id]);
 
   useEffect(() => {
-    if (!retrying || !retrySubmitted) return;
-    if (agent.agentState.pendingSubmission) sawRetryPendingRef.current = true;
-    if (
-      sawRetryPendingRef.current &&
-      !agent.agentState.pendingSubmission &&
-      agent.derived.evaluation
-    ) {
-      sawRetryPendingRef.current = false;
-      setRetrySubmitted(false);
-      setRetrying(false);
-    }
-  }, [agent.agentState.pendingSubmission, agent.derived.evaluation, retrySubmitted, retrying]);
+    if (!retryAttempt) return;
+    const resolution = retryAttemptResolution({
+      attempt: retryAttempt,
+      currentEvaluation: agent.agentState.evaluation,
+      generationId: agent.agentState.generation?.id,
+      status: agent.status,
+    });
+    if (resolution !== "keep") setRetryAttempt(undefined);
+  }, [agent.agentState.evaluation, agent.agentState.generation?.id, agent.status, retryAttempt]);
 
   useEffect(() => {
     if (!hasRecap) {
@@ -355,6 +352,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
       return;
     }
     if (endingRef.current || !agent.derived.canSubmitAnswer || !agent.sendText(answer)) {
+      if (retryAttempt) setRetryAttempt(undefined);
       AccessibilityInfo.announceForAccessibility(
         "The agent is not ready for an answer. Wait for the question or retry the connection.",
       );
@@ -364,9 +362,8 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     setCaptureMessage(undefined);
     setSourceVisible(false);
     setTyping(false);
-    if (retrying) {
-      sawRetryPendingRef.current = false;
-      setRetrySubmitted(true);
+    if (retryAttempt) {
+      setRetryAttempt({ ...retryAttempt, phase: "submitted" });
     }
   };
 
@@ -386,8 +383,11 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     setTypedAnswer("");
     setHintVisible(false);
     setSourceVisible(false);
-    setRetrySubmitted(false);
-    setRetrying(true);
+    setRetryAttempt({
+      baselineEvaluation: agent.agentState.evaluation,
+      generationId: agent.agentState.generation?.id,
+      phase: "editing",
+    });
     setTyping(true);
   };
 
@@ -396,6 +396,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     handledCancelRef.current = 0;
     setCaptureMessage(undefined);
     setCaptureState("idle");
+    setRetryAttempt(undefined);
     endingRef.current = false;
     setEnding(false);
     agent.refreshSession({ reason: "socket_retry" });
@@ -434,9 +435,10 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   const busy =
     ending ||
     disconnected ||
+    retrySubmitted ||
     Boolean(agent.agentState.pendingSubmission) ||
     agent.derived.phase === "thinking";
-  const showCorrection = Boolean(correction) && !retrying;
+  const showCorrection = Boolean(correction) && !retrying && !disconnected;
   const webInstrumentation = {
     dataSet: { vivaSpeaking: agent.speaking ? "true" : "false" },
   };

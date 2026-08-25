@@ -1,4 +1,5 @@
 import {
+  type AgentAnswerEvaluation,
   type AgentTerminalSessionReason,
   type AnswerEvaluation,
   learnerRecoveryCopyForState,
@@ -30,6 +31,14 @@ export type SessionStageCopy = {
   terminal: boolean;
   title: string;
 };
+
+export type RetryAttemptState = {
+  baselineEvaluation?: AgentAnswerEvaluation;
+  generationId?: string;
+  phase: "editing" | "submitted";
+};
+
+export type RetryAttemptResolution = "clear" | "complete" | "keep";
 
 // The agent's submitted-turn contract is capped at 45 seconds and the examiner
 // is instructed to speak concisely. Two minutes after recap_ready leaves ample
@@ -66,12 +75,34 @@ export function shouldNavigateToRecap(input: {
   terminalReason?: AgentTerminalSessionReason;
 }): boolean {
   if (!input.hasRecap) {
-    return (
-      input.terminalReason !== undefined && (input.status === "closed" || input.status === "error")
-    );
+    return input.terminalReason !== undefined;
   }
 
   return input.playbackWaitExpired || (!input.hasPendingAudio && !input.playbackActive);
+}
+
+/**
+ * Resolve one learner-initiated retry without depending on the controller's
+ * transient pending flag. `question_started` intentionally clears both that
+ * flag and the current evaluation. The captured baseline identity therefore
+ * remains authoritative until `answer_evaluated` supplies a distinct result.
+ */
+export function retryAttemptResolution(input: {
+  attempt: RetryAttemptState;
+  currentEvaluation?: AgentAnswerEvaluation;
+  generationId?: string;
+  status: VivaAgentSessionState["status"];
+}): RetryAttemptResolution {
+  if (input.status === "closed" || input.status === "error") return "clear";
+  if (input.generationId !== input.attempt.generationId) return "clear";
+  if (
+    input.attempt.phase === "submitted" &&
+    input.currentEvaluation !== undefined &&
+    input.currentEvaluation !== input.attempt.baselineEvaluation
+  ) {
+    return "complete";
+  }
+  return "keep";
 }
 
 export function orbStateForSession(input: {

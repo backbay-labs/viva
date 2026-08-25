@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import type { AnswerEvaluation } from "@viva/core";
+import type { AgentAnswerEvaluation, AnswerEvaluation } from "@viva/core";
 import {
   correctionModelFromEvaluation,
   drainSessionPlayback,
   orbStateForSession,
   RECAP_PLAYBACK_MAX_WAIT_MS,
+  retryAttemptResolution,
   shouldNavigateToRecap,
   stageCopyForConnection,
 } from "@/agent/session-view-model";
@@ -194,7 +195,7 @@ describe("terminal session lifecycle", () => {
     ).toBe(true);
   });
 
-  test("opens a closed terminal-only result immediately without waiting for playback", () => {
+  test("opens a terminal-only result immediately without waiting for socket close or playback", () => {
     expect(
       shouldNavigateToRecap({
         hasPendingAudio: true,
@@ -224,7 +225,7 @@ describe("terminal session lifecycle", () => {
         status: "open",
         terminalReason: "turn_cap",
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       shouldNavigateToRecap({
         hasPendingAudio: false,
@@ -234,5 +235,98 @@ describe("terminal session lifecycle", () => {
         status: "closed",
       }),
     ).toBe(false);
+  });
+});
+
+describe("retry attempt lifecycle", () => {
+  const baselineEvaluation: AgentAnswerEvaluation = {
+    answer_text: "ATP is made by respiration.",
+    concise_feedback: "Name the proton-gradient mechanism.",
+    concept_status: "shaky",
+    confidence_score: 0.55,
+    label: "partially correct",
+    question_id: "question-1",
+    retry_prompt: "Connect electron flow to ATP synthase.",
+    source: {
+      confidence: "high",
+      document_id: "lec-5",
+      excerpt: "The proton gradient drives ATP synthase.",
+      retrieval_reason: "Ground the correction in the selected study set.",
+      source_id: "src-lecture-5-slide-18",
+      span: "slide:18",
+    },
+  };
+  const attempt = {
+    baselineEvaluation,
+    generationId: "generation-1",
+    phase: "submitted" as const,
+  };
+
+  test("does not mistake a cleared pending flag or the baseline correction for a retry result", () => {
+    expect(
+      retryAttemptResolution({
+        attempt,
+        currentEvaluation: baselineEvaluation,
+        generationId: "generation-1",
+        status: "open",
+      }),
+    ).toBe("keep");
+    expect(
+      retryAttemptResolution({
+        attempt,
+        currentEvaluation: undefined,
+        generationId: "generation-1",
+        status: "open",
+      }),
+    ).toBe("keep");
+  });
+
+  test("completes only when a new evaluation identity arrives for the same generation", () => {
+    expect(
+      retryAttemptResolution({
+        attempt,
+        currentEvaluation: { ...baselineEvaluation },
+        generationId: "generation-1",
+        status: "open",
+      }),
+    ).toBe("complete");
+  });
+
+  test("clears retry state on connection failure or generation replacement", () => {
+    expect(
+      retryAttemptResolution({
+        attempt,
+        currentEvaluation: baselineEvaluation,
+        generationId: "generation-2",
+        status: "open",
+      }),
+    ).toBe("clear");
+    expect(
+      retryAttemptResolution({
+        attempt,
+        currentEvaluation: baselineEvaluation,
+        generationId: "generation-1",
+        status: "error",
+      }),
+    ).toBe("clear");
+    expect(
+      retryAttemptResolution({
+        attempt,
+        currentEvaluation: baselineEvaluation,
+        generationId: "generation-1",
+        status: "closed",
+      }),
+    ).toBe("clear");
+  });
+
+  test("keeps an editing retry until it is submitted or explicitly cleared", () => {
+    expect(
+      retryAttemptResolution({
+        attempt: { ...attempt, phase: "editing" },
+        currentEvaluation: { ...baselineEvaluation, answer_text: "A newer draft answer." },
+        generationId: "generation-1",
+        status: "open",
+      }),
+    ).toBe("keep");
   });
 });
