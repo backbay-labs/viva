@@ -17,6 +17,7 @@ import {
   correctionModelFromEvaluation,
   drainSessionPlayback,
   orbStateForSession,
+  RECAP_PLAYBACK_MAX_WAIT_MS,
   type SessionCorrectionModel,
   shouldNavigateToRecap,
   stageCopyForConnection,
@@ -144,12 +145,14 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   const [orbLevel, setOrbLevel] = useState(0);
   const [retrying, setRetrying] = useState(false);
   const [retrySubmitted, setRetrySubmitted] = useState(false);
+  const [recapPlaybackWaitExpired, setRecapPlaybackWaitExpired] = useState(false);
   const endingRef = useRef(false);
   const handledCancelRef = useRef(0);
   const handledGenerationRef = useRef<string | undefined>(undefined);
   const playbackUnlockedRef = useRef(false);
   const sawRetryPendingRef = useRef(false);
   const previousQuestionRef = useRef<string | undefined>(undefined);
+  const hasRecap = Boolean(agent.derived.recap);
 
   useEffect(() => {
     if (agent.status !== "open" || agent.derived.recap) return;
@@ -236,16 +239,36 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   }, [agent.agentState.pendingSubmission, agent.derived.evaluation, retrySubmitted, retrying]);
 
   useEffect(() => {
+    if (!hasRecap) {
+      setRecapPlaybackWaitExpired(false);
+      return;
+    }
+    const timer = setTimeout(() => setRecapPlaybackWaitExpired(true), RECAP_PLAYBACK_MAX_WAIT_MS);
+    return () => clearTimeout(timer);
+  }, [hasRecap]);
+
+  useEffect(() => {
     if (
       shouldNavigateToRecap({
-        hasRecap: Boolean(agent.derived.recap),
+        hasRecap,
+        hasPendingAudio: agent.agentState.audio.length > 0,
+        playbackActive: agent.speaking,
+        playbackWaitExpired: recapPlaybackWaitExpired,
         status: agent.status,
         terminalReason: agent.derived.terminalReason,
       })
     ) {
       router.replace("/recap");
     }
-  }, [agent.derived.recap, agent.derived.terminalReason, agent.status, router]);
+  }, [
+    agent.agentState.audio.length,
+    agent.derived.terminalReason,
+    agent.speaking,
+    agent.status,
+    hasRecap,
+    recapPlaybackWaitExpired,
+    router,
+  ]);
 
   useEffect(() => {
     if (!agent.captureIssue || (captureState !== "listening" && captureState !== "requesting")) {

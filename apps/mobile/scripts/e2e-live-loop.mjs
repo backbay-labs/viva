@@ -242,19 +242,11 @@ async function runProviderPhase(provider) {
       const returnedToIdle = transitions
         .slice(speakingIndex + 1)
         .some((state) => state === "false" || state === "absent");
-      if (fakeSpeakingObserved) {
-        assert(
-          speakingIndex >= 0 && returnedToIdle,
-          `[${provider}] playback did not transition speaking -> idle/teardown: ${JSON.stringify(transitions)}`,
-        );
-        console.log(`[${provider}] fake_playback_speaking_observable=true`);
-      } else {
-        assert(
-          transitions[0] === "false" && transitions.includes("absent"),
-          `[${provider}] playback baseline/teardown was not observable: ${JSON.stringify(transitions)}`,
-        );
-        console.log(`[${provider}] fake_playback_speaking_observable=false reason=recap_same_turn`);
-      }
+      assert(
+        fakeSpeakingObserved && speakingIndex >= 0 && returnedToIdle,
+        `[${provider}] playback did not transition speaking -> idle/teardown: ${JSON.stringify(transitions)}`,
+      );
+      console.log(`[${provider}] fake_playback_speaking_observable=true`);
     }
 
     assertAgentWebSocketFrames(sentFrames, provider, expected.answer);

@@ -86,9 +86,10 @@ bun run validate:ts
 the `synthetic` and `fake_cartesia_gemini` providers. It asserts the canonical question,
 evaluation, retry submission, recap, permitted outbound frame types, absence of audio input, and
 receipt of the fake examiner-audio delta. This is browser integration evidence. The fake provider
-finishes and navigates to Recap in the same turn, so React may tear down the session before a
-`speaking=true` DOM state is observable. The gate does not claim native playback, native capture,
-or human audibility evidence.
+emits only two PCM16 samples before its recap; the gate proves the browser sink transitions from
+idle to speaking and back to idle/teardown, and the session defers recap navigation until queued
+playback is idle. A two-minute fail-safe covers a stuck native completion callback. This does not
+prove native playback, native capture, or human audibility.
 
 ## Stage-0 boundaries
 

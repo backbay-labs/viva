@@ -31,6 +31,12 @@ export type SessionStageCopy = {
   title: string;
 };
 
+// The agent's submitted-turn contract is capped at 45 seconds and the examiner
+// is instructed to speak concisely. Two minutes after recap_ready leaves ample
+// room for normal queued playback while bounding a failed unlock or missing
+// native completion callback so the learner cannot be stranded on the session.
+export const RECAP_PLAYBACK_MAX_WAIT_MS = 2 * 60_000;
+
 export function drainSessionPlayback(input: {
   acknowledgeAudio: (audio: readonly VivaAgentAudioOutput[]) => void;
   audio: readonly VivaAgentAudioOutput[];
@@ -53,13 +59,19 @@ export function drainSessionPlayback(input: {
 
 export function shouldNavigateToRecap(input: {
   hasRecap: boolean;
+  hasPendingAudio: boolean;
+  playbackActive: boolean;
+  playbackWaitExpired: boolean;
   status: VivaAgentSessionState["status"];
   terminalReason?: AgentTerminalSessionReason;
 }): boolean {
-  return (
-    input.hasRecap ||
-    (input.terminalReason !== undefined && (input.status === "closed" || input.status === "error"))
-  );
+  if (!input.hasRecap) {
+    return (
+      input.terminalReason !== undefined && (input.status === "closed" || input.status === "error")
+    );
+  }
+
+  return input.playbackWaitExpired || (!input.hasPendingAudio && !input.playbackActive);
 }
 
 export function orbStateForSession(input: {

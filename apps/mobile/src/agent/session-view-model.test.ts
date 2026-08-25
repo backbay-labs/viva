@@ -4,6 +4,7 @@ import {
   correctionModelFromEvaluation,
   drainSessionPlayback,
   orbStateForSession,
+  RECAP_PLAYBACK_MAX_WAIT_MS,
   shouldNavigateToRecap,
   stageCopyForConnection,
 } from "@/agent/session-view-model";
@@ -149,22 +150,89 @@ describe("terminal session lifecycle", () => {
     expect(drainCalls).toBe(0);
   });
 
-  test("opens recap for a real recap or a closed terminal-only result", () => {
-    expect(shouldNavigateToRecap({ hasRecap: true, status: "open" })).toBe(true);
+  test("waits for both pending frames and active playback before opening a real recap", () => {
     expect(
       shouldNavigateToRecap({
+        hasPendingAudio: true,
+        hasRecap: true,
+        playbackActive: false,
+        playbackWaitExpired: false,
+        status: "open",
+      }),
+    ).toBe(false);
+    expect(
+      shouldNavigateToRecap({
+        hasPendingAudio: false,
+        hasRecap: true,
+        playbackActive: true,
+        playbackWaitExpired: false,
+        status: "closed",
+        terminalReason: "turn_cap",
+      }),
+    ).toBe(false);
+    expect(
+      shouldNavigateToRecap({
+        hasPendingAudio: false,
+        hasRecap: true,
+        playbackActive: false,
+        playbackWaitExpired: false,
+        status: "open",
+      }),
+    ).toBe(true);
+  });
+
+  test("bounds a stuck recap playback wait after the two-minute safety window", () => {
+    expect(RECAP_PLAYBACK_MAX_WAIT_MS).toBe(120_000);
+    expect(
+      shouldNavigateToRecap({
+        hasPendingAudio: true,
+        hasRecap: true,
+        playbackActive: true,
+        playbackWaitExpired: true,
+        status: "open",
+      }),
+    ).toBe(true);
+  });
+
+  test("opens a closed terminal-only result immediately without waiting for playback", () => {
+    expect(
+      shouldNavigateToRecap({
+        hasPendingAudio: true,
         hasRecap: false,
+        playbackActive: true,
+        playbackWaitExpired: false,
         status: "closed",
         terminalReason: "turn_cap",
       }),
     ).toBe(true);
     expect(
       shouldNavigateToRecap({
+        hasPendingAudio: true,
         hasRecap: false,
+        playbackActive: true,
+        playbackWaitExpired: false,
+        status: "error",
+        terminalReason: "provider_timeout",
+      }),
+    ).toBe(true);
+    expect(
+      shouldNavigateToRecap({
+        hasPendingAudio: false,
+        hasRecap: false,
+        playbackActive: false,
+        playbackWaitExpired: false,
         status: "open",
         terminalReason: "turn_cap",
       }),
     ).toBe(false);
-    expect(shouldNavigateToRecap({ hasRecap: false, status: "closed" })).toBe(false);
+    expect(
+      shouldNavigateToRecap({
+        hasPendingAudio: false,
+        hasRecap: false,
+        playbackActive: false,
+        playbackWaitExpired: false,
+        status: "closed",
+      }),
+    ).toBe(false);
   });
 });
