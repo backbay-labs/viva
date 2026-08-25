@@ -40,6 +40,13 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+/// `DATA-015`: the one shared memory/Postgres characterization suite.
+///
+/// It is declared here, not in `lib.rs`, so the crate's public surface is
+/// untouched; it is not memory-specific and imports both backends.
+#[cfg(test)]
+mod store_conformance;
+
 const MAX_PASTE_SOURCE_EXCERPT_CHARS: usize = 360;
 const MAX_PASTE_SOURCE_SPANS: usize = 4;
 
@@ -8316,7 +8323,7 @@ mod review_schedule_decision_tests {
 /// published vectors below; nothing outside this module may use them, and no
 /// production dependency was added for a fixture.
 #[cfg(test)]
-mod pdf_ingestion_tests {
+pub(crate) mod pdf_ingestion_tests {
     use super::*;
     use agent_domain::{CreateFileStudySet, PortErrorKind, StudyMemoryStore};
 
@@ -8671,7 +8678,7 @@ mod pdf_ingestion_tests {
     }
 
     /// A real one-page text PDF: catalog, page tree, page, font, content stream.
-    fn generated_text_pdf() -> Vec<u8> {
+    pub(crate) fn generated_text_pdf() -> Vec<u8> {
         let mut pdf = PdfBuilder::new();
         let catalog = pdf.object(b"<< /Type /Catalog /Pages 2 0 R >>");
         let _pages = pdf.object(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -8693,7 +8700,7 @@ mod pdf_ingestion_tests {
     }
 
     /// The same page with its content stream really deflated.
-    fn generated_flate_pdf() -> Vec<u8> {
+    pub(crate) fn generated_flate_pdf() -> Vec<u8> {
         let content =
             b"BT /F1 12 Tf 72 720 Td (ATP synthase converts the gradient into ATP.) Tj ET";
         let deflated = zlib_stored(content);
@@ -8730,7 +8737,7 @@ mod pdf_ingestion_tests {
     }
 
     /// A scanned page: one image XObject, no text operators anywhere.
-    fn generated_scanned_pdf() -> Vec<u8> {
+    pub(crate) fn generated_scanned_pdf() -> Vec<u8> {
         // 8x8 greyscale, deliberately not text.
         let image: Vec<u8> = (0..64u16).map(|value| (value * 4) as u8).collect();
         let mut pdf = PdfBuilder::new();
@@ -8771,7 +8778,7 @@ mod pdf_ingestion_tests {
 
     /// PDF Standard Security Handler, revision 2 (40-bit RC4), with deterministic
     /// test passwords. Algorithms 2, 3, 4 and 1 from the PDF specification.
-    fn generated_encrypted_pdf() -> Vec<u8> {
+    pub(crate) fn generated_encrypted_pdf() -> Vec<u8> {
         const USER_PASSWORD: &[u8] = b"viva-user";
         const OWNER_PASSWORD: &[u8] = b"viva-owner";
         const PERMISSIONS: i32 = -1;
@@ -8845,7 +8852,7 @@ mod pdf_ingestion_tests {
     }
 
     /// A PDF whose xref table and trailer are cut off mid-file.
-    fn generated_malformed_pdf() -> Vec<u8> {
+    pub(crate) fn generated_malformed_pdf() -> Vec<u8> {
         let complete = generated_text_pdf();
         let xref_start = find(&complete, b"xref\n").expect("xref keyword present");
         let mut truncated = complete[..xref_start + 12].to_vec();
@@ -8862,7 +8869,7 @@ mod pdf_ingestion_tests {
     }
 
     /// UTF-8 study prose wearing a `%PDF-1.7` header and nothing else.
-    fn magic_prefixed_plaintext() -> Vec<u8> {
+    pub(crate) fn magic_prefixed_plaintext() -> Vec<u8> {
         let text = "%PDF-1.7\nMitochondria transfer electrons from NADH to oxygen. \
              The proton gradient powers ATP synthase during oxidative phosphorylation. \
              Chemiosmosis couples the gradient to ADP phosphorylation.";
