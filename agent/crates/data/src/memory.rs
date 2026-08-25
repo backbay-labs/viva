@@ -5,17 +5,27 @@ use std::{
 };
 
 use agent_domain::{
-    format_rfc3339_millis, parse_utc_instant, AnswerAttemptEnvelope, AnswerCaptureMode,
-    AnswerCaptureStatus, AnswerContentPolicy, AnswerEvaluation, ConceptStatus, CreateFileStudySet,
-    CreatePasteStudySet, LibraryNextReviewSummary, LibrarySessionRecapSummary,
-    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
+    format_rfc3339_millis, parse_utc_instant,
+    learning_outcome::{VIVA_CHALLENGE_RESOLUTION_SCHEMA, VIVA_TURN_OUTCOME_RECORD_SCHEMA,
+        VIVA_TURN_OUTCOME_SCHEMA},
+    learning_recap::{ConceptLabel, ReviewScheduleAuthority, ReviewScheduleSummary,
+        SessionLearningEvidence},
+    study_projection::{StudyProjectionActiveQuestionV1, StudyProjectionConceptV1,
+        StudyProjectionQuestionProgressV1, StudyProjectionReviewItemV1, StudyProjectionSessionV1,
+        StudyProjectionSourceCitationV1, StudyProjectionStudySetV1, StudyProjectionVersionV1},
+    AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
+    AnswerEvaluation, AuthenticatedStudyProjectionV1, ChallengeDisposition, ChallengeResolution,
+    ConceptStatus, ConceptStatusTransition, CreateFileStudySet, CreatePasteStudySet,
+    LibraryNextReviewSummary, LibrarySessionRecapSummary, LibrarySessionSummary,
+    LibraryStudyDocumentSummary, LibraryStudySetSummary, PersistedTurnOutcome, PortError,
+    ProgressionPolicyId, QuestionDisposition, QuestionProgressionCursor, QuestionProgressionResult,
     ReviewScheduleCapReasonV1, ReviewScheduleDecisionV1, ReviewSchedulingContextV1, SessionConfig,
     SessionStore, SessionTokenNonceClaim, SourceConfidence, StudyConceptSummary,
     StudyDocumentSummary, StudyLibrarySnapshot, StudyMemoryStore, StudyMode, StudyQuestion,
     StudySessionDurableCounts, StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus,
     StudySetSummary, StudySourceReference, StudySourceSpanSummary, StudyStoreBackend,
-    StudyStoreCapabilities, StudyStoreWriteCounts, StudyStoreWriteOutcome,
-    VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+    StudyStoreCapabilities, StudyStoreWriteCounts, StudyStoreWriteOutcome, TurnOutcome,
+    TurnOutcomeRecordReceipt, TurnResolution, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -410,6 +420,47 @@ pub struct RecapRecord {
     pub recap: PersistedSessionRecap,
 }
 
+
+/// One persisted Plan 04 [`TurnOutcome`], stored as the canonical typed object.
+///
+/// `payload_sha256` is the same canonical digest the durable backend stores, so
+/// insert-versus-replay truth and divergence detection are decided identically on
+/// both backends.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TurnOutcomeRecord {
+    pub user_id: String,
+    pub study_set_id: String,
+    pub voice_session_id: String,
+    pub response_id: String,
+    pub payload_sha256: String,
+    pub outcome: TurnOutcome,
+}
+
+/// One persisted Plan 04 [`ChallengeResolution`], keyed by its correction id.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChallengeResolutionRecord {
+    pub user_id: String,
+    pub study_set_id: String,
+    pub voice_session_id: String,
+    pub payload_sha256: String,
+    pub resolution: ChallengeResolution,
+}
+
+/// The one session-scoped progression cursor, plus the responses already applied
+/// to it.
+///
+/// `applied_response_ids` is what makes a replay a replay: selecting again under
+/// an already-authorized response returns the stored selection and does not
+/// advance `cursor.revision`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuestionProgressionRecord {
+    pub user_id: String,
+    pub study_set_id: String,
+    pub voice_session_id: String,
+    pub cursor: QuestionProgressionCursor,
+    pub applied_response_ids: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventAuthorizationKind {
@@ -491,6 +542,13 @@ pub struct InMemoryStudyState {
     #[serde(default)]
     pub review_schedule_decisions: Vec<ReviewScheduleDecisionRecord>,
     pub recaps: Vec<RecapRecord>,
+    /// Plan 04's canonical learning persistence (Task 6).
+    #[serde(default)]
+    pub turn_outcomes: Vec<TurnOutcomeRecord>,
+    #[serde(default)]
+    pub challenge_resolutions: Vec<ChallengeResolutionRecord>,
+    #[serde(default)]
+    pub question_progressions: Vec<QuestionProgressionRecord>,
     /// `DATA-005`: a set, not a log. Authorization is only ever consulted by
     /// membership, so an identical replay carries no new information and must
     /// not cost another entry; the bound is structural rather than a cap.
@@ -503,6 +561,43 @@ pub struct FixtureIdTranslation {
     pub logical_id: String,
     pub storage_uuid: Uuid,
 }
+
+/// Fixture logical id to durable storage UUID, in both directions.
+///
+/// Every id below names a checked-in fixture, never learner data: the seeded
+/// development study set, and Plan 04's canonical learning-core study set,
+/// documents, source spans, and voice sessions. The durable schema keys those
+/// entities by UUID, so without this table the Postgres backend could not return
+/// a canonical fixture under the same identifier the in-memory backend uses and
+/// no cross-backend fixture comparison would be possible at all.
+const FIXTURE_ID_TRANSLATIONS: &[(&str, &str)] = &[
+    // Seeded development fixture.
+    ("biology-midterm", "11111111-1111-4111-8111-111111111111"),
+    ("lec-5", "22222222-2222-4222-8222-222222222222"),
+    ("src-lecture-5-slide-18", "33333333-3333-4333-8333-333333333333"),
+    ("voice-session-1", "44444444-4444-4444-8444-444444444444"),
+    // Plan 04 learning-core fixtures (`agent/fixtures/learning-core/*.json`).
+    ("set-cellular-respiration", "5e700001-0000-4000-8000-000000000001"),
+    ("lec5", "5e700001-0000-4000-8000-000000000002"),
+    ("lec3", "5e700001-0000-4000-8000-000000000003"),
+    ("src-lec5-slide-18", "5e700001-0000-4000-8000-000000000004"),
+    ("src-lec5-slide-19", "5e700001-0000-4000-8000-000000000005"),
+    ("src-lec5-slide-20", "5e700001-0000-4000-8000-000000000006"),
+    ("src-lec3-slide-04", "5e700001-0000-4000-8000-000000000007"),
+    ("lec4", "5e700001-0000-4000-8000-000000000008"),
+    ("src-lec4-slide-11", "5e700001-0000-4000-8000-000000000009"),
+    ("src-lec5-slide-22", "5e700001-0000-4000-8000-00000000000a"),
+    ("vs-0001", "5e700001-0000-4000-8000-000000000011"),
+    ("vs-0002", "5e700001-0000-4000-8000-000000000012"),
+    ("vs-0003", "5e700001-0000-4000-8000-000000000013"),
+    ("vs-0004", "5e700001-0000-4000-8000-000000000014"),
+    ("vs-0005", "5e700001-0000-4000-8000-000000000015"),
+    ("vs-0006", "5e700001-0000-4000-8000-000000000016"),
+    ("vs-0007", "5e700001-0000-4000-8000-000000000017"),
+    ("vs-0008", "5e700001-0000-4000-8000-000000000018"),
+    ("vs-0009", "5e700001-0000-4000-8000-000000000019"),
+    ("vs-1001", "5e700001-0000-4000-8000-000000000021"),
+];
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStudyStore {
@@ -582,32 +677,43 @@ impl InMemoryStudyStore {
     }
 
     pub fn fixture_id_translation(logical_id: &str) -> Result<FixtureIdTranslation, PortError> {
-        let storage_uuid = match logical_id {
-            "biology-midterm" => "11111111-1111-4111-8111-111111111111",
-            "lec-5" => "22222222-2222-4222-8222-222222222222",
-            "src-lecture-5-slide-18" => "33333333-3333-4333-8333-333333333333",
-            "voice-session-1" => "44444444-4444-4444-8444-444444444444",
-            _ => {
-                return Err(PortError::unavailable(
+        let storage_uuid = FIXTURE_ID_TRANSLATIONS
+            .iter()
+            .find_map(|(fixture_id, uuid)| (*fixture_id == logical_id).then_some(*uuid))
+            .ok_or_else(|| {
+                PortError::unavailable(
                     "memory",
                     logical_id,
                     "fixture logical id has no UUID storage mapping",
-                ));
-            }
-        }
-        .parse()
-        .map_err(|error| {
-            PortError::internal(
-                "memory",
-                logical_id,
-                format!("invalid fixture UUID: {error}"),
-            )
-        })?;
+                )
+            })?
+            .parse()
+            .map_err(|error| {
+                PortError::internal(
+                    "memory",
+                    logical_id,
+                    format!("invalid fixture UUID: {error}"),
+                )
+            })?;
 
         Ok(FixtureIdTranslation {
             logical_id: logical_id.to_owned(),
             storage_uuid,
         })
+    }
+
+    /// The reverse of [`Self::fixture_id_translation`].
+    ///
+    /// The durable backend stores UUIDs, so this is how it hands a fixture id back
+    /// under the same name the in-memory backend uses. One table drives both
+    /// directions: a mapping that existed in only one of them would make the two
+    /// backends disagree about an id, which is exactly the class of drift
+    /// `DATA-011` exists to prevent.
+    pub fn fixture_logical_id_for_uuid(storage_uuid: Uuid) -> Option<&'static str> {
+        let rendered = storage_uuid.to_string();
+        FIXTURE_ID_TRANSLATIONS
+            .iter()
+            .find_map(|(fixture_id, uuid)| (*uuid == rendered).then_some(*fixture_id))
     }
 
     pub fn upsert_study_set(&self, record: StudySetRecord) {
@@ -715,6 +821,17 @@ impl InMemoryStudyStore {
             state
                 .event_authorizations
                 .retain(|authorization| authorization.study_set_id != study_set_id);
+            // A retry replaces the question bank, so the cursor into it and the
+            // outcomes bound to the replaced questions cannot survive it.
+            state
+                .turn_outcomes
+                .retain(|record| record.study_set_id != study_set_id);
+            state
+                .challenge_resolutions
+                .retain(|record| record.study_set_id != study_set_id);
+            state
+                .question_progressions
+                .retain(|record| record.study_set_id != study_set_id);
         }
         state.study_sets.insert(
             study_set_id.clone(),
@@ -917,6 +1034,297 @@ impl InMemoryStudyStore {
         ))
     }
 
+
+    /// A session that can still be read: the tenant owns it and it is not deleted.
+    ///
+    /// Evidence and recaps outlive the live session, so a closed session must
+    /// still answer; a deleted one must not.
+    fn ensure_readable_session_locked(
+        state: &InMemoryStudyState,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<(), PortError> {
+        if state.sessions.iter().any(|session| {
+            session.user_id == user_id
+                && session.study_set_id == study_set_id
+                && session.voice_session_id == voice_session_id
+                && session.status != "deleted"
+        }) {
+            return Ok(());
+        }
+        Err(PortError::unavailable(
+            "memory",
+            voice_session_id,
+            "voice session is not available for this user and study set",
+        ))
+    }
+
+    /// The set's active questions in committed ingestion order.
+    ///
+    /// `StudySetRecord::question_ids` is the in-memory ingestion ordinal; the
+    /// durable backend orders by the `ingestion_ordinal` column migration `0018`
+    /// allocates. Both are the order the questions were committed in.
+    fn active_questions_locked(
+        state: &InMemoryStudyState,
+        study_set_id: &str,
+    ) -> Vec<StudyQuestion> {
+        let Some(study_set) = state.study_sets.get(study_set_id) else {
+            return Vec::new();
+        };
+        study_set
+            .question_ids
+            .iter()
+            .filter_map(|question_id| state.questions.get(&question_key(study_set_id, question_id)))
+            .filter(|record| record.active)
+            .map(|record| record.question.clone())
+            .collect()
+    }
+
+    /// The one progression cursor for this session, created at revision `0` if it
+    /// does not exist yet.
+    fn progression_record_locked<'a>(
+        state: &'a mut InMemoryStudyState,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> &'a mut QuestionProgressionRecord {
+        let existing = state.question_progressions.iter().position(|record| {
+            record.user_id == user_id
+                && record.study_set_id == study_set_id
+                && record.voice_session_id == voice_session_id
+        });
+        let index = match existing {
+            Some(index) => index,
+            None => {
+                state.question_progressions.push(QuestionProgressionRecord {
+                    user_id: user_id.to_owned(),
+                    study_set_id: study_set_id.to_owned(),
+                    voice_session_id: voice_session_id.to_owned(),
+                    cursor: QuestionProgressionCursor {
+                        voice_session_id: voice_session_id.to_owned(),
+                        policy: ProgressionPolicyId::OrderedV1,
+                        current_question_id: None,
+                        completed_question_ids: Vec::new(),
+                        attempt_counts: std::collections::BTreeMap::new(),
+                        revision: 0,
+                    },
+                    applied_response_ids: Vec::new(),
+                });
+                state.question_progressions.len() - 1
+            }
+        };
+        &mut state.question_progressions[index]
+    }
+
+    /// The one selection rule for `D-02B` ordered progression, shared by both
+    /// backends through this module's semantics.
+    ///
+    /// A result is a pure function of the committed cursor: `current_question_id`
+    /// with one recorded attempt is a fresh selection, the same question with more
+    /// than one is a retry, and no current question with every active question
+    /// completed is exhaustion. Nothing is inferred from the caller.
+    pub(crate) fn ordered_progression_result(
+        cursor: &QuestionProgressionCursor,
+        active: &[StudyQuestion],
+    ) -> QuestionProgressionResult {
+        let total = u32::try_from(active.len()).unwrap_or(u32::MAX);
+        let Some(current) = cursor.current_question_id.as_deref() else {
+            return QuestionProgressionResult::Exhausted {
+                completed: u32::try_from(cursor.completed_question_ids.len())
+                    .unwrap_or(u32::MAX),
+                total,
+                revision: cursor.revision,
+            };
+        };
+        let position = active
+            .iter()
+            .position(|question| question.question_id == current)
+            .unwrap_or(0);
+        let ordinal = u32::try_from(position + 1).unwrap_or(u32::MAX);
+        let question = active[position].clone();
+        let attempt = cursor.attempt_counts.get(current).copied().unwrap_or(1);
+        if attempt <= 1 {
+            QuestionProgressionResult::Selected {
+                question,
+                ordinal,
+                total,
+                selection_reason: ORDERED_PROGRESSION_SELECTION_REASON.to_owned(),
+                revision: cursor.revision,
+            }
+        } else {
+            QuestionProgressionResult::Retry {
+                question,
+                ordinal,
+                total,
+                attempt,
+                revision: cursor.revision,
+            }
+        }
+    }
+
+    /// Advance the cursor for one newly authorized response, in place.
+    ///
+    /// Returns `true` when the caller must persist the mutation. A response that
+    /// has already been applied mutates nothing at all — replay is not a second
+    /// selection, and it does not advance the revision.
+    pub(crate) fn apply_ordered_selection(
+        record: &mut QuestionProgressionRecord,
+        response_id: &str,
+        active: &[StudyQuestion],
+    ) -> bool {
+        if record
+            .applied_response_ids
+            .iter()
+            .any(|applied| applied == response_id)
+        {
+            return false;
+        }
+        if record.cursor.current_question_id.is_none() {
+            let next = active.iter().find(|question| {
+                !record
+                    .cursor
+                    .completed_question_ids
+                    .iter()
+                    .any(|completed| completed == &question.question_id)
+            });
+            if let Some(next) = next {
+                record.cursor.current_question_id = Some(next.question_id.clone());
+                *record
+                    .cursor
+                    .attempt_counts
+                    .entry(next.question_id.clone())
+                    .or_insert(0) += 1;
+            }
+        } else if let Some(current) = record.cursor.current_question_id.clone() {
+            *record.cursor.attempt_counts.entry(current).or_insert(0) += 1;
+        }
+        record.cursor.revision += 1;
+        record.applied_response_ids.push(response_id.to_owned());
+        true
+    }
+
+    /// Apply one recorded turn outcome's disposition to the cursor.
+    ///
+    /// `Advance` completes the question the cursor is actually on; `RetryCurrent`
+    /// and `Deferred` keep it, and `Deferred` never adds it to
+    /// `completed_question_ids`. The revision counts selections, not outcomes, so
+    /// this never advances it.
+    pub(crate) fn apply_outcome_disposition(
+        record: &mut QuestionProgressionRecord,
+        question_id: &str,
+        disposition: QuestionDisposition,
+    ) {
+        if disposition != QuestionDisposition::Advance {
+            return;
+        }
+        if record.cursor.current_question_id.as_deref() != Some(question_id) {
+            return;
+        }
+        if !record
+            .cursor
+            .completed_question_ids
+            .iter()
+            .any(|completed| completed == question_id)
+        {
+            record
+                .cursor
+                .completed_question_ids
+                .push(question_id.to_owned());
+        }
+        record.cursor.current_question_id = None;
+    }
+
+
+    /// The selected D-01 v1 schedule write, under a caller-held state write lock.
+    ///
+    /// Returns the authoritative decision and whether this call was the one that
+    /// wrote it. A replay is identified by the graded outcome, never by the
+    /// schedule it produced: the wall clock has moved, so a recomputed `due_at`
+    /// differs. The first decision stays authoritative.
+    fn persist_review_schedule_decision_locked(
+        state: &mut InMemoryStudyState,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        decision: ReviewScheduleDecisionV1,
+    ) -> Result<(ReviewScheduleDecisionV1, bool), PortError> {
+        decision
+            .validate()
+            .map_err(|error| PortError::invalid_input("memory", concept_id, error.to_string()))?;
+        let authorization = event_authorization_record(
+            "memory",
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            EventAuthorizationKind::ReviewSchedule,
+            &ReviewScheduleEventPayload::new(concept_id, &decision),
+        )?;
+        let review_item = ReviewItemRecord {
+            user_id: user_id.to_owned(),
+            study_set_id: study_set_id.to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            concept_id: concept_id.to_owned(),
+            due_at: format_rfc3339_millis(decision.due_at),
+        };
+        let decision_record = ReviewScheduleDecisionRecord {
+            user_id: user_id.to_owned(),
+            study_set_id: study_set_id.to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            response_id: response_id.to_owned(),
+            concept_id: concept_id.to_owned(),
+            payload_sha256: authorization.payload_sha256.clone(),
+            decision,
+        };
+        if let Some(persisted) = state
+            .review_schedule_decisions
+            .iter()
+            .find(|record| record.is_replay_of(&decision_record))
+        {
+            return Ok((persisted.decision.clone(), false));
+        }
+        if !state.review_items.contains(&review_item) {
+            state.review_items.push(review_item);
+        }
+        let persisted = decision_record.decision.clone();
+        state.review_schedule_decisions.push(decision_record);
+        // The authorization ledger stays complete across every authorized write kind.
+        state.event_authorizations.insert(authorization);
+        Ok((persisted, true))
+    }
+
+    /// The authoritative scheduling inputs for one concept, under a caller-held
+    /// lock. D-01 forbids taking either from tool arguments.
+    fn review_scheduling_context_locked(
+        state: &InMemoryStudyState,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> ReviewSchedulingContextV1 {
+        let exam_at = state
+            .study_set_exam_dates
+            .get(study_set_id)
+            .and_then(|recorded| parse_utc_instant(recorded));
+        let card = state
+            .review_schedule_decisions
+            .iter()
+            .filter(|record| {
+                record.user_id == user_id
+                    && record.study_set_id == study_set_id
+                    && record.concept_id == concept_id
+            })
+            .max_by_key(|record| record.decision.generated_at)
+            .map(|record| record.decision.card.clone());
+        ReviewSchedulingContextV1 {
+            schema_version: VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+            exam_at,
+            card,
+        }
+    }
+
     fn ensure_question_locked(
         study_set: &StudySetRecord,
         state: &InMemoryStudyState,
@@ -1012,6 +1420,286 @@ impl InMemoryStudyStore {
     }
 }
 
+
+/// The one `selection_reason` `D-02B` ordered progression ever reports.
+pub(crate) const ORDERED_PROGRESSION_SELECTION_REASON: &str = "ordered_v1:first_active_uncompleted";
+
+/// `D-02B` is the recorded selection, so `AdaptiveV1` has no store implementation
+/// and no store artifact. It is refused as typed invalid input rather than
+/// silently answered with the ordered rule under another name.
+pub(crate) fn require_selected_progression_policy(
+    port: &'static str,
+    policy: ProgressionPolicyId,
+) -> Result<(), PortError> {
+    match policy {
+        ProgressionPolicyId::OrderedV1 => Ok(()),
+        ProgressionPolicyId::AdaptiveV1 => Err(PortError::invalid_input(
+            port,
+            "adaptive_v1",
+            "the recorded progression decision is ordered_v1",
+        )),
+    }
+}
+
+/// The learner-payload field names no persisted schema and no persisted document
+/// may carry.
+///
+/// Migration SQL is checked against this list at build time by
+/// [`crate::assert_schema_has_no_raw_payload_columns`]; canonical learning
+/// documents are checked against the same list at run time, because a JSONB
+/// column's shape is the type's shape and a column check cannot see inside it.
+pub(crate) const FORBIDDEN_RAW_LEARNER_PAYLOAD_FIELDS: &[&str] = &[
+    "raw_audio",
+    "audio_blob",
+    "audio_bytes",
+    "document_blob",
+    "document_bytes",
+    "source_file_bytes",
+    "answer_text",
+    "prompt_text",
+    "raw_prompt",
+    "raw_transcript",
+    "transcript_text",
+    "answer_transcript",
+    "source_excerpt",
+    "recap_text",
+];
+
+/// The first forbidden field name anywhere in a serialized document, if any.
+///
+/// Keys are compared case-insensitively and at every depth: a raw payload nested
+/// inside a resolution is still a raw payload.
+pub(crate) fn raw_learner_payload_field(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Object(fields) => {
+            for (key, nested) in fields {
+                let lowered = key.to_ascii_lowercase();
+                if let Some(forbidden) = FORBIDDEN_RAW_LEARNER_PAYLOAD_FIELDS
+                    .iter()
+                    .find(|forbidden| lowered == **forbidden)
+                {
+                    return Some(forbidden);
+                }
+                if let Some(found) = raw_learner_payload_field(nested) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(raw_learner_payload_field),
+        _ => None,
+    }
+}
+
+fn reject_raw_learner_payload<T: Serialize>(
+    port: &'static str,
+    id: &str,
+    payload: &T,
+) -> Result<(), PortError> {
+    let value = serde_json::to_value(payload)
+        .map_err(|error| PortError::internal(port, "canonical_payload_json", error.to_string()))?;
+    if let Some(field) = raw_learner_payload_field(&value) {
+        return Err(PortError::invalid_input(
+            port,
+            id,
+            format!("canonical payload carries a raw learner field: {field}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Shape checks a store owes the canonical type before it stores it.
+///
+/// These are the invariants the durable schema also enforces, restated here so
+/// both backends refuse the same value: an outcome that only one of them accepts
+/// is a learner fact that exists on exactly one deployment.
+pub(crate) fn validate_turn_outcome(
+    port: &'static str,
+    outcome: &TurnOutcome,
+) -> Result<(), PortError> {
+    if outcome.schema != VIVA_TURN_OUTCOME_SCHEMA {
+        return Err(PortError::invalid_input(
+            port,
+            &outcome.response_id,
+            "turn outcome schema is not viva.turn_outcome.v1",
+        ));
+    }
+    if outcome.response_id.trim().is_empty() {
+        return Err(PortError::invalid_input(
+            port,
+            "<missing>",
+            "turn outcome is missing response_id",
+        ));
+    }
+    if outcome.question_id.trim().is_empty() {
+        return Err(PortError::invalid_input(
+            port,
+            &outcome.response_id,
+            "turn outcome is missing question_id",
+        ));
+    }
+    if parse_utc_instant(&outcome.recorded_at).is_none() {
+        return Err(PortError::invalid_input(
+            port,
+            &outcome.response_id,
+            "turn outcome recorded_at is not an RFC3339 UTC instant",
+        ));
+    }
+    if outcome
+        .supersedes_response_id
+        .as_deref()
+        .is_some_and(|superseded| superseded == outcome.response_id)
+    {
+        return Err(PortError::invalid_input(
+            port,
+            &outcome.response_id,
+            "a turn outcome cannot supersede itself",
+        ));
+    }
+    reject_raw_learner_payload(port, &outcome.response_id, outcome)
+}
+
+pub(crate) fn validate_challenge_resolution(
+    port: &'static str,
+    resolution: &ChallengeResolution,
+) -> Result<(), PortError> {
+    if resolution.schema != VIVA_CHALLENGE_RESOLUTION_SCHEMA {
+        return Err(PortError::invalid_input(
+            port,
+            &resolution.correction_id,
+            "challenge resolution schema is not viva.challenge_resolution.v1",
+        ));
+    }
+    if resolution.correction_id.trim().is_empty() {
+        return Err(PortError::invalid_input(
+            port,
+            "<missing>",
+            "challenge resolution is missing correction_id",
+        ));
+    }
+    if resolution.challenged_response_id.trim().is_empty() {
+        return Err(PortError::invalid_input(
+            port,
+            &resolution.correction_id,
+            "challenge resolution is missing challenged_response_id",
+        ));
+    }
+    if resolution
+        .replacement_response_id
+        .as_deref()
+        .is_some_and(|replacement| replacement == resolution.challenged_response_id)
+    {
+        return Err(PortError::invalid_input(
+            port,
+            &resolution.correction_id,
+            "a replacement response cannot be the response it replaces",
+        ));
+    }
+    reject_raw_learner_payload(port, &resolution.correction_id, resolution)
+}
+
+/// The concept transitions an outcome claims. A deferred turn claims none — the
+/// canonical type has no field for them, so an empty list is structural.
+pub(crate) fn turn_outcome_transitions(outcome: &TurnOutcome) -> &[ConceptStatusTransition] {
+    match &outcome.resolution {
+        TurnResolution::Evaluated {
+            concept_transitions,
+            ..
+        } => concept_transitions,
+        TurnResolution::Deferred { .. } => &[],
+    }
+}
+
+pub(crate) fn turn_outcome_disposition(outcome: &TurnOutcome) -> QuestionDisposition {
+    match &outcome.resolution {
+        TurnResolution::Evaluated { disposition, .. }
+        | TurnResolution::Deferred { disposition, .. } => *disposition,
+    }
+}
+
+/// The learner-visible review schedule for one session, under the selected D-01
+/// authority.
+///
+/// A decision capped by `past_exam` is persisted fail-closed but is not a review
+/// the learner can act on, so D-01 excludes it from the authenticated read model;
+/// this is the one place both backends apply that rule. Ordering is
+/// `due_at ASC, concept_id ASC`, and a concept's latest decision is the one that
+/// counts.
+pub(crate) fn review_schedule_summaries<'a>(
+    decisions: impl Iterator<Item = (&'a str, &'a ReviewScheduleDecisionV1)>,
+) -> Vec<ReviewScheduleSummary> {
+    let mut latest: std::collections::BTreeMap<String, &ReviewScheduleDecisionV1> =
+        std::collections::BTreeMap::new();
+    for (concept_id, decision) in decisions {
+        if decision.cap_reason == Some(ReviewScheduleCapReasonV1::PastExam) {
+            continue;
+        }
+        latest
+            .entry(concept_id.to_owned())
+            .and_modify(|existing| {
+                if decision.generated_at > existing.generated_at {
+                    *existing = decision;
+                }
+            })
+            .or_insert(decision);
+    }
+    let mut summaries = latest
+        .into_iter()
+        .map(|(concept_id, decision)| ReviewScheduleSummary {
+            concept_id,
+            due_at: format_rfc3339_millis(decision.due_at),
+            authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| {
+        left.due_at
+            .cmp(&right.due_at)
+            .then_with(|| left.concept_id.cmp(&right.concept_id))
+    });
+    summaries
+}
+
+/// The latest instant this session recorded a status transition for one concept.
+///
+/// It is read from the session's own persisted outcomes, so both backends answer
+/// from the same evidence rather than from a row timestamp only one of them has.
+pub(crate) fn last_reviewed_at(outcomes: &[TurnOutcome], concept_id: &str) -> Option<String> {
+    outcomes
+        .iter()
+        .filter(|outcome| {
+            turn_outcome_transitions(outcome)
+                .iter()
+                .any(|transition| transition.concept_id == concept_id)
+        })
+        .map(|outcome| outcome.recorded_at.clone())
+        .max()
+}
+
+/// The projection's active question.
+///
+/// `LEARN-008` excludes expected terms, rubric answers, and source excerpts: a
+/// citation carries identifiers, span, label, and confidence and nothing else.
+/// The label is the citing document's stored display name — a fact the store
+/// holds, never a calendar or prose string it invents.
+pub(crate) fn projection_active_question(
+    question: &StudyQuestion,
+    document_title: impl Fn(&str) -> Option<String>,
+) -> StudyProjectionActiveQuestionV1 {
+    StudyProjectionActiveQuestionV1 {
+        id: question.question_id.clone(),
+        concept_id: question.concept_id.clone(),
+        prompt: question.prompt.clone(),
+        source_citations: vec![StudyProjectionSourceCitationV1 {
+            source_id: question.source.source_id.clone(),
+            document_id: question.source.document_id.clone(),
+            span: question.source.span.clone(),
+            label: document_title(&question.source.document_id)
+                .unwrap_or_else(|| question.source.document_id.clone()),
+            confidence: question.source.confidence.clone(),
+        }],
+    }
+}
+
 fn concept_key(study_set_id: &str, concept_id: &str) -> String {
     format!("{study_set_id}::{concept_id}")
 }
@@ -1053,6 +1741,21 @@ fn remove_session_artifacts(
         .answer_attempts
         .retain(|record| !voice_session_ids.contains(&record.voice_session_id));
     state.event_authorizations.retain(|record| {
+        record.user_id != user_id
+            || record.study_set_id != study_set_id
+            || !voice_session_ids.contains(&record.voice_session_id)
+    });
+    state.turn_outcomes.retain(|record| {
+        record.user_id != user_id
+            || record.study_set_id != study_set_id
+            || !voice_session_ids.contains(&record.voice_session_id)
+    });
+    state.challenge_resolutions.retain(|record| {
+        record.user_id != user_id
+            || record.study_set_id != study_set_id
+            || !voice_session_ids.contains(&record.voice_session_id)
+    });
+    state.question_progressions.retain(|record| {
         record.user_id != user_id
             || record.study_set_id != study_set_id
             || !voice_session_ids.contains(&record.voice_session_id)
@@ -3297,62 +4000,25 @@ impl StudyMemoryStore for InMemoryStudyStore {
         concept_id: &str,
         decision: ReviewScheduleDecisionV1,
     ) -> Result<Value, PortError> {
-        decision
-            .validate()
-            .map_err(|error| PortError::invalid_input("memory", concept_id, error.to_string()))?;
-
-        let authorization = event_authorization_record(
-            "memory",
-            user_id,
-            study_set_id,
-            voice_session_id,
-            response_id,
-            EventAuthorizationKind::ReviewSchedule,
-            &ReviewScheduleEventPayload::new(concept_id, &decision),
-        )?;
-        let review_item = ReviewItemRecord {
-            user_id: user_id.to_owned(),
-            study_set_id: study_set_id.to_owned(),
-            voice_session_id: voice_session_id.to_owned(),
-            concept_id: concept_id.to_owned(),
-            due_at: format_rfc3339_millis(decision.due_at),
-        };
-        let decision_record = ReviewScheduleDecisionRecord {
-            user_id: user_id.to_owned(),
-            study_set_id: study_set_id.to_owned(),
-            voice_session_id: voice_session_id.to_owned(),
-            response_id: response_id.to_owned(),
-            concept_id: concept_id.to_owned(),
-            payload_sha256: authorization.payload_sha256.clone(),
-            decision,
-        };
-
-        // One critical section: scoping, the due date and the v1 decision land
-        // together or not at all, and a replay writes neither a second time.
+        // The lock-owning wrapper. The write itself lives in the `_locked` helper so
+        // Task 6's outcome mutation can perform the same write under the same single
+        // state write lock, with the same replay key and the same v1 checks.
         let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
         {
             let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
             Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
             Self::ensure_concept_locked(study_set, &state, concept_id)?;
         }
-        // A replay is identified by the graded outcome, never by the schedule it
-        // produced: the wall clock has moved, so the recomputed `due_at` differs. The
-        // first decision stays authoritative and is what the caller reports back.
-        if let Some(persisted) = state
-            .review_schedule_decisions
-            .iter()
-            .find(|record| record.is_replay_of(&decision_record))
-        {
-            return Ok(persisted.decision.public_summary(concept_id));
-        }
-        if !state.review_items.contains(&review_item) {
-            state.review_items.push(review_item);
-        }
-        let result = decision_record.decision.public_summary(concept_id);
-        state.review_schedule_decisions.push(decision_record);
-        // The authorization ledger stays complete across every authorized write kind.
-        state.event_authorizations.insert(authorization);
-        Ok(result)
+        let (persisted, _inserted) = Self::persist_review_schedule_decision_locked(
+            &mut state,
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            concept_id,
+            decision,
+        )?;
+        Ok(persisted.public_summary(concept_id))
     }
 
     async fn record_recap(
@@ -3414,6 +4080,504 @@ impl StudyMemoryStore for InMemoryStudyStore {
             state.event_authorizations.insert(authorization);
         }
         Ok(result)
+    }
+
+    /// `LEARN-003`/Task 6: the canonical outcome, its concept transitions, its
+    /// progression effect, and its browser authorization digests, all under one
+    /// state write lock.
+    ///
+    /// Every validation reads the same locked state the mutation writes, so there
+    /// is no window in which a deletion or a close can slip between them. A
+    /// divergent payload under an already-recorded response identity is a
+    /// `Conflict` that changes nothing.
+    async fn record_turn_outcome(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        outcome: TurnOutcome,
+    ) -> Result<PersistedTurnOutcome, PortError> {
+        validate_turn_outcome("memory", &outcome)?;
+        let digest = payload_sha256(
+            "memory",
+            EventAuthorizationKind::AnswerEvaluation,
+            &outcome.response_id,
+            &outcome,
+        )?;
+
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        {
+            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+            if !study_set
+                .question_ids
+                .iter()
+                .any(|known| known == &outcome.question_id)
+            {
+                return Err(PortError::unavailable(
+                    "memory",
+                    &outcome.question_id,
+                    "question is not available for this study set",
+                ));
+            }
+            for source_id in &outcome.source_ids {
+                if Self::source_reference_locked(&state, user_id, study_set_id, source_id).is_none()
+                {
+                    return Err(PortError::unavailable(
+                        "memory",
+                        source_id,
+                        "source is not available for this study set",
+                    ));
+                }
+            }
+            for transition in turn_outcome_transitions(&outcome) {
+                Self::ensure_concept_locked(study_set, &state, &transition.concept_id)?;
+            }
+        }
+
+        // Replay or conflict, decided on the canonical digest.
+        if let Some(existing) = state.turn_outcomes.iter().find(|record| {
+            record.user_id == user_id
+                && record.study_set_id == study_set_id
+                && record.voice_session_id == voice_session_id
+                && record.response_id == outcome.response_id
+        }) {
+            if existing.payload_sha256 != digest || existing.outcome != outcome {
+                return Err(PortError::conflict(
+                    "memory",
+                    &outcome.response_id,
+                    "turn outcome does not match the outcome already recorded for this response",
+                ));
+            }
+            return Ok(PersistedTurnOutcome {
+                turn_outcome: existing.outcome.clone(),
+                record: TurnOutcomeRecordReceipt {
+                    schema: VIVA_TURN_OUTCOME_RECORD_SCHEMA.to_owned(),
+                    response_id: existing.outcome.response_id.clone(),
+                    replayed: true,
+                },
+            });
+        }
+
+        // A replacement may only claim mastery behind a resolution that asked for
+        // reevaluation.
+        if let Some(challenged) = outcome.supersedes_response_id.as_deref() {
+            let challenged_exists = state.turn_outcomes.iter().any(|record| {
+                record.user_id == user_id
+                    && record.study_set_id == study_set_id
+                    && record.voice_session_id == voice_session_id
+                    && record.response_id == challenged
+            });
+            if !challenged_exists {
+                return Err(PortError::conflict(
+                    "memory",
+                    &outcome.response_id,
+                    "superseded response has no recorded outcome in this session",
+                ));
+            }
+            let permitted = state.challenge_resolutions.iter().any(|record| {
+                record.user_id == user_id
+                    && record.study_set_id == study_set_id
+                    && record.voice_session_id == voice_session_id
+                    && record.resolution.challenged_response_id == challenged
+                    && record.resolution.disposition == ChallengeDisposition::ReevaluationRequired
+                    && record
+                        .resolution
+                        .replacement_response_id
+                        .as_deref()
+                        .is_none_or(|replacement| replacement == outcome.response_id)
+            });
+            if !permitted {
+                return Err(PortError::conflict(
+                    "memory",
+                    &outcome.response_id,
+                    "supersession requires a challenge resolution that permits reevaluation",
+                ));
+            }
+        }
+
+        let recorded_at = parse_utc_instant(&outcome.recorded_at).ok_or_else(|| {
+            PortError::invalid_input(
+                "memory",
+                &outcome.response_id,
+                "turn outcome recorded_at is not an RFC3339 UTC instant",
+            )
+        })?;
+        for transition in turn_outcome_transitions(&outcome).to_vec() {
+            if let Some(concept) = state
+                .concepts
+                .get_mut(&concept_key(study_set_id, &transition.concept_id))
+            {
+                concept.status = transition.to_status.clone();
+            }
+            let authorization = event_authorization_record(
+                "memory",
+                user_id,
+                study_set_id,
+                voice_session_id,
+                &outcome.response_id,
+                EventAuthorizationKind::ConceptStatus,
+                &ConceptStatusEventPayload {
+                    concept_id: &transition.concept_id,
+                    status: &transition.to_status,
+                },
+            )?;
+            state.event_authorizations.insert(authorization);
+
+            // D-01 `SERVER_PERSISTED_FSRS`: an evaluated turn is the graded outcome,
+            // so its transition schedules the concept's next review under the same
+            // lock. `LEARN-009` removed the separate scheduling tool, so this is the
+            // only path that creates one.
+            let context = Self::review_scheduling_context_locked(
+                &state,
+                user_id,
+                study_set_id,
+                &transition.concept_id,
+            );
+            let decision = agent_domain::decide_review_schedule(
+                recorded_at,
+                &agent_domain::ReviewOutcomeV1 {
+                    status: transition.to_status.clone(),
+                    hint_count: None,
+                    miss_count: None,
+                },
+                &context,
+            )
+            .map_err(|error| {
+                PortError::invalid_input("memory", &transition.concept_id, error.to_string())
+            })?;
+            Self::persist_review_schedule_decision_locked(
+                &mut state,
+                user_id,
+                study_set_id,
+                voice_session_id,
+                &outcome.response_id,
+                &transition.concept_id,
+                decision,
+            )?;
+        }
+
+        let disposition = turn_outcome_disposition(&outcome);
+        let question_id = outcome.question_id.clone();
+        let progression = Self::progression_record_locked(
+            &mut state,
+            user_id,
+            study_set_id,
+            voice_session_id,
+        );
+        Self::apply_outcome_disposition(progression, &question_id, disposition);
+
+        state.turn_outcomes.push(TurnOutcomeRecord {
+            user_id: user_id.to_owned(),
+            study_set_id: study_set_id.to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            response_id: outcome.response_id.clone(),
+            payload_sha256: digest,
+            outcome: outcome.clone(),
+        });
+
+        Ok(PersistedTurnOutcome {
+            record: TurnOutcomeRecordReceipt {
+                schema: VIVA_TURN_OUTCOME_RECORD_SCHEMA.to_owned(),
+                response_id: outcome.response_id.clone(),
+                replayed: false,
+            },
+            turn_outcome: outcome,
+        })
+    }
+
+    async fn session_learning_evidence(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<SessionLearningEvidence, PortError> {
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
+        let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+        Self::ensure_readable_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+
+        let mut outcomes = state
+            .turn_outcomes
+            .iter()
+            .filter(|record| {
+                record.user_id == user_id
+                    && record.study_set_id == study_set_id
+                    && record.voice_session_id == voice_session_id
+            })
+            .map(|record| record.outcome.clone())
+            .collect::<Vec<_>>();
+        outcomes.sort_by(|left, right| {
+            left.recorded_at
+                .cmp(&right.recorded_at)
+                .then_with(|| left.response_id.cmp(&right.response_id))
+        });
+
+        let mut concept_ids = outcomes
+            .iter()
+            .flat_map(turn_outcome_transitions)
+            .map(|transition| transition.concept_id.clone())
+            .collect::<Vec<_>>();
+        concept_ids.sort();
+        concept_ids.dedup();
+        let mut concept_labels = Vec::with_capacity(concept_ids.len());
+        for concept_id in concept_ids {
+            let label = state
+                .concepts
+                .get(&concept_key(study_set_id, &concept_id))
+                .map(|concept| concept.label.clone())
+                .ok_or_else(|| {
+                    PortError::unavailable(
+                        "memory",
+                        &concept_id,
+                        "concept is not available for this study set",
+                    )
+                })?;
+            concept_labels.push(ConceptLabel { concept_id, label });
+        }
+        let _ = study_set;
+
+        let review_decisions = review_schedule_summaries(
+            state
+                .review_schedule_decisions
+                .iter()
+                .filter(|record| {
+                    record.user_id == user_id
+                        && record.study_set_id == study_set_id
+                        && record.voice_session_id == voice_session_id
+                })
+                .map(|record| (record.concept_id.as_str(), &record.decision)),
+        );
+
+        Ok(SessionLearningEvidence {
+            user_id: user_id.to_owned(),
+            study_set_id: study_set_id.to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            outcomes,
+            concept_labels,
+            review_decisions,
+        })
+    }
+
+    async fn record_challenge_resolution(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        resolution: ChallengeResolution,
+    ) -> Result<ChallengeResolution, PortError> {
+        validate_challenge_resolution("memory", &resolution)?;
+        let digest = payload_sha256(
+            "memory",
+            EventAuthorizationKind::AnswerEvaluation,
+            &resolution.correction_id,
+            &resolution,
+        )?;
+
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        Self::study_set_locked(&state, user_id, study_set_id)?;
+        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+        if Self::source_reference_locked(&state, user_id, study_set_id, &resolution.source_id)
+            .is_none()
+        {
+            return Err(PortError::unavailable(
+                "memory",
+                &resolution.source_id,
+                "source is not available for this study set",
+            ));
+        }
+        let challenged_exists = state.turn_outcomes.iter().any(|record| {
+            record.user_id == user_id
+                && record.study_set_id == study_set_id
+                && record.voice_session_id == voice_session_id
+                && record.response_id == resolution.challenged_response_id
+        });
+        if !challenged_exists {
+            return Err(PortError::unavailable(
+                "memory",
+                &resolution.challenged_response_id,
+                "challenged response has no recorded outcome in this session",
+            ));
+        }
+
+        if let Some(existing) = state.challenge_resolutions.iter().find(|record| {
+            record.user_id == user_id
+                && record.study_set_id == study_set_id
+                && record.voice_session_id == voice_session_id
+                && record.resolution.correction_id == resolution.correction_id
+        }) {
+            if existing.payload_sha256 != digest || existing.resolution != resolution {
+                return Err(PortError::conflict(
+                    "memory",
+                    &resolution.correction_id,
+                    "challenge resolution does not match the one already recorded",
+                ));
+            }
+            return Ok(existing.resolution.clone());
+        }
+
+        state.challenge_resolutions.push(ChallengeResolutionRecord {
+            user_id: user_id.to_owned(),
+            study_set_id: study_set_id.to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            payload_sha256: digest,
+            resolution: resolution.clone(),
+        });
+        Ok(resolution)
+    }
+
+    async fn select_next_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        policy: ProgressionPolicyId,
+    ) -> Result<QuestionProgressionResult, PortError> {
+        require_selected_progression_policy("memory", policy)?;
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        Self::study_set_locked(&state, user_id, study_set_id)?;
+        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+        let active = Self::active_questions_locked(&state, study_set_id);
+        let progression = Self::progression_record_locked(
+            &mut state,
+            user_id,
+            study_set_id,
+            voice_session_id,
+        );
+        Self::apply_ordered_selection(progression, response_id, &active);
+        Ok(Self::ordered_progression_result(
+            &progression.cursor,
+            &active,
+        ))
+    }
+
+    async fn authenticated_study_projection(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<AuthenticatedStudyProjectionV1, PortError> {
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
+        let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+        let session = state
+            .sessions
+            .iter()
+            .find(|session| {
+                session.user_id == user_id
+                    && session.study_set_id == study_set_id
+                    && session.voice_session_id == voice_session_id
+                    && session.status != "deleted"
+            })
+            .ok_or_else(|| {
+                PortError::unavailable(
+                    "memory",
+                    voice_session_id,
+                    "voice session is not available for this user and study set",
+                )
+            })?;
+
+        let outcomes = state
+            .turn_outcomes
+            .iter()
+            .filter(|record| {
+                record.user_id == user_id
+                    && record.study_set_id == study_set_id
+                    && record.voice_session_id == voice_session_id
+            })
+            .map(|record| record.outcome.clone())
+            .collect::<Vec<_>>();
+        let review_schedule = review_schedule_summaries(
+            state
+                .review_schedule_decisions
+                .iter()
+                .filter(|record| {
+                    record.user_id == user_id
+                        && record.study_set_id == study_set_id
+                        && record.voice_session_id == voice_session_id
+                })
+                .map(|record| (record.concept_id.as_str(), &record.decision)),
+        );
+
+        let mut concept_ids = study_set.concept_ids.clone();
+        concept_ids.sort();
+        let concepts = concept_ids
+            .iter()
+            .filter_map(|concept_id| {
+                state
+                    .concepts
+                    .get(&concept_key(study_set_id, concept_id))
+                    .map(|concept| StudyProjectionConceptV1 {
+                        id: concept.concept_id.clone(),
+                        label: concept.label.clone(),
+                        status: concept.status.clone(),
+                        last_reviewed_at: last_reviewed_at(&outcomes, concept_id),
+                        due_at: review_schedule
+                            .iter()
+                            .find(|item| &item.concept_id == concept_id)
+                            .map(|item| item.due_at.clone()),
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        let active = Self::active_questions_locked(&state, study_set_id);
+        let cursor = state
+            .question_progressions
+            .iter()
+            .find(|record| {
+                record.user_id == user_id
+                    && record.study_set_id == study_set_id
+                    && record.voice_session_id == voice_session_id
+            })
+            .map(|record| record.cursor.clone());
+        let active_question = cursor
+            .as_ref()
+            .and_then(|cursor| cursor.current_question_id.clone())
+            .filter(|_| study_set.ingestion_status == StudySetIngestionStatus::Ready)
+            .and_then(|question_id| {
+                active
+                    .iter()
+                    .find(|question| question.question_id == question_id)
+                    .map(|question| {
+                        projection_active_question(question, |document_id| {
+                            state
+                                .documents
+                                .get(document_id)
+                                .map(|document| document.title.clone())
+                        })
+                    })
+            });
+
+        Ok(AuthenticatedStudyProjectionV1 {
+            version: StudyProjectionVersionV1,
+            study_set: StudyProjectionStudySetV1 {
+                id: study_set.study_set_id.clone(),
+                title: study_set.title.clone(),
+                course: study_set.course.clone(),
+                exam_label: state.study_set_exam_dates.get(study_set_id).cloned(),
+                ingestion_status: study_set.ingestion_status.clone(),
+            },
+            session: StudyProjectionSessionV1 {
+                id: session.voice_session_id.clone(),
+                mode: session.mode.clone(),
+                goal: None,
+            },
+            concepts,
+            active_question,
+            question_progress: StudyProjectionQuestionProgressV1 {
+                completed: cursor.as_ref().map_or(0, |cursor| {
+                    u32::try_from(cursor.completed_question_ids.len()).unwrap_or(u32::MAX)
+                }),
+                total: u32::try_from(active.len()).unwrap_or(u32::MAX),
+            },
+            review_schedule: review_schedule
+                .into_iter()
+                .map(|item| StudyProjectionReviewItemV1 {
+                    concept_id: item.concept_id,
+                    due_at: item.due_at,
+                    authority: item.authority,
+                })
+                .collect(),
+        })
     }
 }
 

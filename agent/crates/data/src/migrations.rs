@@ -74,6 +74,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0017_privacy_tombstone_and_schema_cleanup.sql",
         include_str!("../../../migrations/0017_privacy_tombstone_and_schema_cleanup.sql"),
     ),
+    (
+        "0018_learning_turn_outcomes.sql",
+        include_str!("../../../migrations/0018_learning_turn_outcomes.sql"),
+    ),
 ];
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
@@ -192,7 +196,10 @@ pub async fn seed_postgres_fixture(pool: &PgPool) -> Result<(), FixtureSeedError
 
     let question = agent_domain::fixture_question();
     sqlx::query(
-        "INSERT INTO study_questions (id, study_set_id, question_id, source_span_id, prompt, expected_terms, follow_up, active)
+        "INSERT INTO study_questions (
+             id, study_set_id, question_id, source_span_id, prompt, expected_terms, follow_up,
+             active, ingestion_ordinal, concept_id, rubric_json
+         )
          VALUES (
              '99999999-9999-4999-8999-999999999999',
              $1,
@@ -201,20 +208,39 @@ pub async fn seed_postgres_fixture(pool: &PgPool) -> Result<(), FixtureSeedError
              $3,
              $4,
              $5,
-             TRUE
+             TRUE,
+             1,
+             $6,
+             $7
          )
          ON CONFLICT (study_set_id, question_id) DO UPDATE
          SET source_span_id = EXCLUDED.source_span_id,
              prompt = EXCLUDED.prompt,
              expected_terms = EXCLUDED.expected_terms,
              follow_up = EXCLUDED.follow_up,
-             active = TRUE",
+             active = TRUE,
+             ingestion_ordinal = EXCLUDED.ingestion_ordinal,
+             concept_id = EXCLUDED.concept_id,
+             rubric_json = EXCLUDED.rubric_json",
     )
     .bind(study_set_id)
     .bind(source_id)
     .bind(question.prompt)
     .bind(question.expected_terms)
     .bind(question.follow_up)
+    .bind(question.concept_id)
+    .bind(serde_json::to_value(question.rubric).map_err(FixtureSeedError::Json)?)
+    .execute(&mut *tx)
+    .await?;
+
+    // The fixture's single question owns ordinal 1, so the next generated question
+    // for this set is numbered 2.
+    sqlx::query(
+        "INSERT INTO study_question_ingestion_cursors (study_set_id, next_ordinal)
+         VALUES ($1, 2)
+         ON CONFLICT (study_set_id) DO UPDATE SET next_ordinal = 2",
+    )
+    .bind(study_set_id)
     .execute(&mut *tx)
     .await?;
 
@@ -238,6 +264,8 @@ pub enum FixtureSeedError {
     Uuid(#[from] uuid::Error),
     #[error("fixture seed SQL failed: {0}")]
     Sql(#[from] sqlx::Error),
+    #[error("fixture seed JSON failed: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 /// Accepts either a fixture logical id or an already-real UUID, exactly as the
@@ -295,6 +323,7 @@ pub fn assert_schema_has_no_raw_payload_columns() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{validate_challenge_resolution, validate_turn_outcome};
     use crate::PostgresStudyStore;
     use agent_domain::{
         fixture_question, fixture_source_reference,
@@ -303,9 +332,12 @@ mod tests {
             VIVA_STUDY_SESSION_RECAP_SCHEMA,
         },
         AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
-        AnswerEvaluation, ConceptStatus, PortErrorKind, SessionConfig, SessionId,
-        SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudySessionRecap,
-        StudyStoreWriteCounts, StudyStoreWriteOutcome, VoiceUsageRecord,
+        AnswerEvaluation, ChallengeResolution, ConceptStatus, PersistedTurnOutcome, PortErrorKind,
+        ProgressionPolicyId, QuestionProgressionCursor, QuestionProgressionResult,
+        ReviewScheduleDecisionV1, SessionConfig, SessionId, SessionLearningEvidence,
+        SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap,
+        StudySourceReference, StudyStoreWriteCounts, StudyStoreWriteOutcome, TurnOutcome,
+        TurnResolution, VoiceUsageRecord,
     };
     use serde::Deserialize;
     use std::sync::Arc;
@@ -2122,6 +2154,49 @@ mod tests {
             .expect("isolated test schema drops cleanly");
     }
 
+    /// The minimum the 0014 recap backfill needs, written with pre-0014 columns
+    /// only: a study set, its document, and the source span its recaps cite.
+    async fn seed_pre_0014_recap_fixture(pool: &sqlx::PgPool) {
+        let study_set_id = fixture_uuid("biology-midterm").expect("study set fixture UUID");
+        let document_id = fixture_uuid("lec-5").expect("document fixture UUID");
+        let source_id = fixture_uuid("src-lecture-5-slide-18").expect("source fixture UUID");
+        let source = agent_domain::fixture_source_reference();
+        sqlx::query(
+            "INSERT INTO study_sets (id, user_id, title, course, ingestion_status, ingestion_error)
+             VALUES ($1, 'user-1', 'Biology Midterm', 'Biology 201', 'ready', NULL)",
+        )
+        .bind(study_set_id)
+        .execute(pool)
+        .await
+        .expect("pre-0014 study set seeds");
+        sqlx::query(
+            "INSERT INTO study_documents (
+                 id, study_set_id, display_name, source_kind, processing_status, deleted_at
+             )
+             VALUES ($1, $2, 'Lecture 5 - Electron Transport.pdf', 'pdf', 'ready', NULL)",
+        )
+        .bind(document_id)
+        .bind(study_set_id)
+        .execute(pool)
+        .await
+        .expect("pre-0014 document seeds");
+        sqlx::query(
+            "INSERT INTO source_spans (
+                 id, document_id, locator, excerpt, confidence, retrieval_reason, deleted_at
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, NULL)",
+        )
+        .bind(source_id)
+        .bind(document_id)
+        .bind(serde_json::json!({ "span": source.span }))
+        .bind(source.excerpt)
+        .bind(source_confidence_str(&source.confidence))
+        .bind(source.retrieval_reason)
+        .execute(pool)
+        .await
+        .expect("pre-0014 source span seeds");
+    }
+
     #[tokio::test]
     #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
     async fn postgres_session_recap_backfill_dedupes_existing_session_rows() {
@@ -2130,9 +2205,9 @@ mod tests {
         run_migrations_until(&pool, "0014_session_recaps_one_row_per_session.sql")
             .await
             .expect("pre-0014 migrations apply");
-        seed_postgres_fixture(&pool)
-            .await
-            .expect("fixture seed applies");
+        // Seeded against the *pre-0014* schema, so this historical-path test cannot
+        // be broken by a column a later migration adds to the production seed.
+        seed_pre_0014_recap_fixture(&pool).await;
         let store = PostgresStudyStore::new(pool.clone());
         let session_id = Uuid::new_v4().to_string();
         record_count_table_session(&store, &session_id).await;
@@ -3912,6 +3987,1419 @@ mod tests {
         );
 
         fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 6 — Plan 04's canonical learning persistence.
+    //
+    // Every fixture below is deserialized from `agent/fixtures/learning-core/`
+    // and seeded identically into both backends, so a difference between the two
+    // is a difference in the store and never in the test data.
+    // ------------------------------------------------------------------
+
+    const LEARNING_USER_ID: &str = "user-101";
+    const LEARNING_SET_ID: &str = "set-cellular-respiration";
+
+    #[derive(Deserialize)]
+    struct LearningProgressionFixture {
+        policy: ProgressionPolicyId,
+        voice_session_id: String,
+        active_question_ids: Vec<String>,
+        inactive_question_ids: Vec<String>,
+        questions: std::collections::BTreeMap<String, StudyQuestion>,
+        cursors: std::collections::BTreeMap<String, QuestionProgressionCursor>,
+        results: std::collections::BTreeMap<String, QuestionProgressionResult>,
+    }
+
+    #[derive(Deserialize)]
+    struct LearningTurnOutcomeFixture {
+        outcomes: std::collections::BTreeMap<String, TurnOutcome>,
+        persisted: std::collections::BTreeMap<String, PersistedTurnOutcome>,
+        challenges: std::collections::BTreeMap<String, ChallengeResolution>,
+    }
+
+    #[derive(Deserialize)]
+    struct LearningEvidenceFixture {
+        evidence: std::collections::BTreeMap<String, SessionLearningEvidence>,
+        recaps: std::collections::BTreeMap<String, StudySessionRecap>,
+    }
+
+    fn progression_fixture() -> LearningProgressionFixture {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/learning-core/question-progression-v1.json"
+        ))
+        .expect("learning-core progression fixture is valid")
+    }
+
+    fn turn_outcome_fixture() -> LearningTurnOutcomeFixture {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/learning-core/turn-outcomes-v1.json"
+        ))
+        .expect("learning-core turn outcome fixture is valid")
+    }
+
+    fn evidence_fixture() -> LearningEvidenceFixture {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/learning-core/recaps-v1.json"
+        ))
+        .expect("learning-core evidence fixture is valid")
+    }
+
+    /// The one study set both backends are seeded with.
+    ///
+    /// Questions and their bound sources come straight from Plan 04's progression
+    /// fixture. Two extra inactive questions and two extra source spans exist only
+    /// because the evidence fixtures cite them; they carry no fixture-pinned
+    /// content and are never part of a compared value.
+    struct LearningCoreSeed {
+        documents: Vec<(String, String)>,
+        sources: Vec<StudySourceReference>,
+        concepts: Vec<(String, String, ConceptStatus)>,
+        /// `(question, active, ingestion ordinal)`.
+        questions: Vec<(StudyQuestion, bool, i64)>,
+    }
+
+    fn extra_source(source_id: &str, document_id: &str, span: &str) -> StudySourceReference {
+        StudySourceReference {
+            source_id: source_id.to_owned(),
+            document_id: document_id.to_owned(),
+            span: span.to_owned(),
+            excerpt: "Cited by a canonical turn outcome fixture.".to_owned(),
+            confidence: agent_domain::SourceConfidence::Medium,
+            retrieval_reason: "ordered progression source bound by the server".to_owned(),
+        }
+    }
+
+    fn extra_question(question_id: &str, concept_id: &str, source: &StudySourceReference) -> StudyQuestion {
+        StudyQuestion {
+            question_id: question_id.to_owned(),
+            concept_id: concept_id.to_owned(),
+            prompt: format!("Recall the ATP yield bound to {concept_id}."),
+            expected_terms: vec!["ATP".to_owned()],
+            follow_up: "Say the number and the stage in one sentence.".to_owned(),
+            rubric: agent_domain::EvaluationRubricV1 {
+                policy_version: agent_domain::learning_outcome::VIVA_SEMANTIC_RUBRIC_POLICY_VERSION
+                    .to_owned(),
+                criteria: vec![agent_domain::RubricCriterionV1 {
+                    criterion_id: format!("crit-{concept_id}"),
+                    concept_id: concept_id.to_owned(),
+                    claim: format!("The learner states the ATP yield for {concept_id}."),
+                    source_id: source.source_id.clone(),
+                    required: true,
+                }],
+            },
+            source: source.clone(),
+        }
+    }
+
+    fn learning_core_seed() -> LearningCoreSeed {
+        let fixture = progression_fixture();
+        let mut questions = Vec::new();
+        let mut sources = Vec::new();
+        let mut ordinal = 0_i64;
+        for question_id in fixture
+            .active_question_ids
+            .iter()
+            .chain(fixture.inactive_question_ids.iter())
+        {
+            let question = fixture
+                .questions
+                .get(question_id)
+                .unwrap_or_else(|| panic!("progression fixture is missing question {question_id}"))
+                .clone();
+            let active = fixture.active_question_ids.contains(question_id);
+            ordinal += 1;
+            sources.push(question.source.clone());
+            questions.push((question, active, ordinal));
+        }
+
+        let glycolysis_source = extra_source("src-lec3-slide-04", "lec3", "slide:04");
+        let krebs_source = extra_source("src-lec4-slide-11", "lec4", "slide:11");
+        let coupling_source = extra_source("src-lec5-slide-22", "lec5", "slide:22");
+        sources.push(krebs_source.clone());
+        sources.push(coupling_source);
+        sources.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+        sources.dedup_by(|left, right| left.source_id == right.source_id);
+
+        ordinal += 1;
+        questions.push((
+            extra_question("q-glycolysis-net-atp", "concept-glycolysis-atp", &glycolysis_source),
+            false,
+            ordinal,
+        ));
+        ordinal += 1;
+        questions.push((
+            extra_question("q-krebs-net-atp", "concept-krebs-atp", &krebs_source),
+            false,
+            ordinal,
+        ));
+
+        LearningCoreSeed {
+            documents: vec![
+                ("lec5".to_owned(), "Lecture 5".to_owned()),
+                ("lec4".to_owned(), "Lecture 4".to_owned()),
+                ("lec3".to_owned(), "Lecture 3".to_owned()),
+            ],
+            sources,
+            concepts: vec![
+                (
+                    "concept-electron-transport-chain".to_owned(),
+                    "Electron transport chain".to_owned(),
+                    ConceptStatus::Review,
+                ),
+                (
+                    "concept-proton-gradient".to_owned(),
+                    "Proton gradient".to_owned(),
+                    ConceptStatus::Review,
+                ),
+                (
+                    "concept-atp-synthesis".to_owned(),
+                    "ATP synthesis".to_owned(),
+                    ConceptStatus::Review,
+                ),
+                (
+                    "concept-glycolysis-atp".to_owned(),
+                    "ATP yield".to_owned(),
+                    ConceptStatus::Review,
+                ),
+                (
+                    "concept-krebs-atp".to_owned(),
+                    "ATP yield".to_owned(),
+                    ConceptStatus::Review,
+                ),
+            ],
+            questions,
+        }
+    }
+
+    fn seed_learning_core_memory(seed: &LearningCoreSeed) -> crate::InMemoryStudyStore {
+        let store = crate::InMemoryStudyStore::new();
+        store.upsert_study_set(crate::StudySetRecord {
+            study_set_id: LEARNING_SET_ID.to_owned(),
+            user_id: LEARNING_USER_ID.to_owned(),
+            title: "Cellular respiration".to_owned(),
+            course: Some("BIO 201".to_owned()),
+            ingestion_status: agent_domain::StudySetIngestionStatus::Ready,
+            ingestion_error: None,
+            concept_ids: seed
+                .concepts
+                .iter()
+                .map(|(concept_id, _, _)| concept_id.clone())
+                .collect(),
+            question_ids: seed
+                .questions
+                .iter()
+                .map(|(question, _, _)| question.question_id.clone())
+                .collect(),
+        });
+        for (document_id, title) in &seed.documents {
+            store.upsert_document(crate::StudyDocumentRecord {
+                study_set_id: LEARNING_SET_ID.to_owned(),
+                document_id: document_id.clone(),
+                title: title.clone(),
+                source_kind: "pdf".to_owned(),
+                processing_status: agent_domain::StudySetIngestionStatus::Ready,
+                tombstoned: false,
+            });
+        }
+        for source in &seed.sources {
+            store.upsert_source_span(crate::SourceSpanRecord {
+                study_set_id: LEARNING_SET_ID.to_owned(),
+                source: source.clone(),
+                tombstoned: false,
+            });
+        }
+        for (concept_id, label, status) in &seed.concepts {
+            store.upsert_concept(crate::ConceptRecord {
+                study_set_id: LEARNING_SET_ID.to_owned(),
+                concept_id: concept_id.clone(),
+                label: label.clone(),
+                status: status.clone(),
+                source_span_id: seed.sources[0].source_id.clone(),
+            });
+        }
+        for (question, active, _) in &seed.questions {
+            store.upsert_question(crate::StudyQuestionRecord {
+                study_set_id: LEARNING_SET_ID.to_owned(),
+                question: question.clone(),
+                active: *active,
+            });
+        }
+        store
+    }
+
+    async fn open_learning_session(store: &dyn StudyMemoryStore, voice_session_id: &str) {
+        let outcome = store
+            .record_voice_session(&SessionConfig {
+                session_id: Some(SessionId::new(voice_session_id)),
+                user_id: Some(LEARNING_USER_ID.to_owned()),
+                study_set_id: Some(LEARNING_SET_ID.to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .expect("learning-core session opens");
+        assert_eq!(outcome, StudyStoreWriteOutcome::Inserted);
+    }
+
+    async fn seed_learning_core_postgres(pool: &sqlx::PgPool, seed: &LearningCoreSeed) {
+        sqlx::query(
+            "INSERT INTO study_sets (id, user_id, title, course, ingestion_status, ingestion_error)
+             VALUES ($1, $2, 'Cellular respiration', 'BIO 201', 'ready', NULL)",
+        )
+        .bind(fixture_uuid(LEARNING_SET_ID).expect("learning set UUID"))
+        .bind(LEARNING_USER_ID)
+        .execute(pool)
+        .await
+        .expect("learning-core study set seeds");
+
+        for (document_id, title) in &seed.documents {
+            sqlx::query(
+                "INSERT INTO study_documents (
+                     id, study_set_id, display_name, source_kind, processing_status, deleted_at
+                 )
+                 VALUES ($1, $2, $3, 'pdf', 'ready', NULL)",
+            )
+            .bind(fixture_uuid(document_id).expect("document UUID"))
+            .bind(fixture_uuid(LEARNING_SET_ID).expect("learning set UUID"))
+            .bind(title)
+            .execute(pool)
+            .await
+            .expect("learning-core document seeds");
+        }
+
+        for source in &seed.sources {
+            sqlx::query(
+                "INSERT INTO source_spans (
+                     id, document_id, locator, excerpt, confidence, retrieval_reason, deleted_at
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6, NULL)",
+            )
+            .bind(fixture_uuid(&source.source_id).expect("source UUID"))
+            .bind(fixture_uuid(&source.document_id).expect("document UUID"))
+            .bind(serde_json::json!({ "span": source.span }))
+            .bind(&source.excerpt)
+            .bind(source_confidence_str(&source.confidence))
+            .bind(&source.retrieval_reason)
+            .execute(pool)
+            .await
+            .expect("learning-core source span seeds");
+        }
+
+        for (concept_id, label, status) in &seed.concepts {
+            sqlx::query(
+                "INSERT INTO concepts (id, study_set_id, label, status, source_span_id, public_id)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(fixture_uuid(LEARNING_SET_ID).expect("learning set UUID"))
+            .bind(label)
+            .bind(match status {
+                ConceptStatus::Strong => "strong",
+                ConceptStatus::Shaky => "shaky",
+                ConceptStatus::Missed => "missed",
+                ConceptStatus::Review => "review",
+            })
+            .bind(fixture_uuid(&seed.sources[0].source_id).expect("source UUID"))
+            .bind(concept_id)
+            .execute(pool)
+            .await
+            .expect("learning-core concept seeds");
+        }
+
+        for (question, active, ordinal) in &seed.questions {
+            sqlx::query(
+                "INSERT INTO study_questions (
+                     id, study_set_id, question_id, source_span_id, prompt, expected_terms,
+                     follow_up, active, ingestion_ordinal, concept_id, rubric_json
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(fixture_uuid(LEARNING_SET_ID).expect("learning set UUID"))
+            .bind(&question.question_id)
+            .bind(fixture_uuid(&question.source.source_id).expect("source UUID"))
+            .bind(&question.prompt)
+            .bind(&question.expected_terms)
+            .bind(&question.follow_up)
+            .bind(active)
+            .bind(ordinal)
+            .bind(&question.concept_id)
+            .bind(serde_json::to_value(&question.rubric).expect("rubric serializes"))
+            .execute(pool)
+            .await
+            .expect("learning-core question seeds");
+        }
+
+        sqlx::query(
+            "INSERT INTO study_question_ingestion_cursors (study_set_id, next_ordinal)
+             VALUES ($1, $2)
+             ON CONFLICT (study_set_id) DO UPDATE SET next_ordinal = EXCLUDED.next_ordinal",
+        )
+        .bind(fixture_uuid(LEARNING_SET_ID).expect("learning set UUID"))
+        .bind(seed.questions.len() as i64 + 1)
+        .execute(pool)
+        .await
+        .expect("learning-core ingestion cursor seeds");
+    }
+
+    /// An independent oracle for the review schedule a session's outcomes produce.
+    ///
+    /// `LEARN-009` removed the separate scheduling tool, so under D-01
+    /// `SERVER_PERSISTED_FSRS` the only thing that schedules a review is an
+    /// evaluated turn's concept transition. This recomputes that from Plan 04's
+    /// published `decide_review_schedule`, chaining each concept's card exactly as
+    /// a store must, so the assertion is against the decision function and not
+    /// against whatever the store happened to write.
+    fn expected_review_decisions(outcomes: &[TurnOutcome]) -> Vec<ReviewScheduleSummary> {
+        let mut cards: std::collections::BTreeMap<String, agent_domain::PersistedFsrsCardV1> =
+            std::collections::BTreeMap::new();
+        let mut latest: std::collections::BTreeMap<String, ReviewScheduleDecisionV1> =
+            std::collections::BTreeMap::new();
+        for outcome in outcomes {
+            let recorded_at =
+                agent_domain::parse_utc_instant(&outcome.recorded_at).expect("instant parses");
+            let TurnResolution::Evaluated {
+                concept_transitions,
+                ..
+            } = &outcome.resolution
+            else {
+                continue;
+            };
+            for transition in concept_transitions {
+                let decision = agent_domain::decide_review_schedule(
+                    recorded_at,
+                    &agent_domain::ReviewOutcomeV1 {
+                        status: transition.to_status.clone(),
+                        hint_count: None,
+                        miss_count: None,
+                    },
+                    &agent_domain::ReviewSchedulingContextV1 {
+                        schema_version: agent_domain::VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+                        exam_at: None,
+                        card: cards.get(&transition.concept_id).cloned(),
+                    },
+                )
+                .expect("authoritative decision");
+                cards.insert(transition.concept_id.clone(), decision.card.clone());
+                latest
+                    .entry(transition.concept_id.clone())
+                    .and_modify(|existing| {
+                        if decision.generated_at >= existing.generated_at {
+                            *existing = decision.clone();
+                        }
+                    })
+                    .or_insert(decision);
+            }
+        }
+        let mut summaries = latest
+            .into_iter()
+            .filter(|(_, decision)| {
+                decision.cap_reason != Some(agent_domain::ReviewScheduleCapReasonV1::PastExam)
+            })
+            .map(|(concept_id, decision)| ReviewScheduleSummary {
+                concept_id,
+                due_at: agent_domain::format_rfc3339_millis(decision.due_at),
+                authority: agent_domain::learning_recap::ReviewScheduleAuthority::ServerPersistedFsrs,
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| {
+            left.due_at
+                .cmp(&right.due_at)
+                .then_with(|| left.concept_id.cmp(&right.concept_id))
+        });
+        summaries
+    }
+
+    fn outcome_named(name: &str) -> TurnOutcome {
+        turn_outcome_fixture()
+            .outcomes
+            .remove(name)
+            .unwrap_or_else(|| panic!("turn outcome fixture is missing {name}"))
+    }
+
+    fn challenge_named(name: &str) -> ChallengeResolution {
+        turn_outcome_fixture()
+            .challenges
+            .remove(name)
+            .unwrap_or_else(|| panic!("challenge fixture is missing {name}"))
+    }
+
+    async fn concept_status_of(pool: &sqlx::PgPool, concept_id: &str) -> String {
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM concepts WHERE study_set_id = $1 AND public_id = $2",
+        )
+        .bind(fixture_uuid(LEARNING_SET_ID).expect("learning set UUID"))
+        .bind(concept_id)
+        .fetch_one(pool)
+        .await
+        .expect("concept status query succeeds")
+    }
+
+    async fn learning_row_counts(pool: &sqlx::PgPool) -> (i64, i64, i64, i64, i64) {
+        let row = sqlx::query(
+            "SELECT
+                 (SELECT COUNT(*) FROM learning_turn_outcomes) AS outcomes,
+                 (SELECT COUNT(*) FROM learning_challenge_resolutions) AS challenges,
+                 (SELECT COUNT(*) FROM question_progression_cursors) AS cursors,
+                 (SELECT COUNT(*) FROM review_items) AS reviews,
+                 (SELECT COUNT(*) FROM event_authorization_digests) AS digests",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("learning row count query succeeds");
+        use sqlx::Row as _;
+        (
+            row.get("outcomes"),
+            row.get("challenges"),
+            row.get("cursors"),
+            row.get("reviews"),
+            row.get("digests"),
+        )
+    }
+
+    /// `assert_schema_has_no_raw_payload_columns` guards migration SQL, but a JSONB
+    /// column's shape is the stored type's shape. This is the run-time half: every
+    /// canonical learning document is checked against the same forbidden-field list
+    /// before either backend accepts it.
+    #[test]
+    fn learning_payload_serialization_has_no_raw_payload_columns() {
+        assert!(assert_schema_has_no_raw_payload_columns().is_ok());
+
+        let outcomes = turn_outcome_fixture();
+        for (name, outcome) in &outcomes.outcomes {
+            let value = serde_json::to_value(outcome).expect("outcome serializes");
+            assert_eq!(
+                crate::memory::raw_learner_payload_field(&value),
+                None,
+                "{name}"
+            );
+            validate_turn_outcome("memory", outcome)
+                .unwrap_or_else(|error| panic!("{name} is accepted: {error:?}"));
+        }
+        for (name, challenge) in &outcomes.challenges {
+            let value = serde_json::to_value(challenge).expect("challenge serializes");
+            assert_eq!(
+                crate::memory::raw_learner_payload_field(&value),
+                None,
+                "{name}"
+            );
+            validate_challenge_resolution("memory", challenge)
+                .unwrap_or_else(|error| panic!("{name} is accepted: {error:?}"));
+        }
+        for (name, evidence) in &evidence_fixture().evidence {
+            let value = serde_json::to_value(evidence).expect("evidence serializes");
+            assert_eq!(
+                crate::memory::raw_learner_payload_field(&value),
+                None,
+                "{name}"
+            );
+        }
+
+        // Negative control: the check has to see a forbidden name at any depth, and
+        // it must see every name the schema check guards.
+        for forbidden in crate::memory::FORBIDDEN_RAW_LEARNER_PAYLOAD_FIELDS {
+            let nested = serde_json::json!({
+                "schema": "viva.turn_outcome.v1",
+                "resolution": { "kind": "evaluated", (*forbidden): "the learner said this" }
+            });
+            assert_eq!(
+                crate::memory::raw_learner_payload_field(&nested),
+                Some(*forbidden)
+            );
+        }
+        // Case is not an escape hatch.
+        assert_eq!(
+            crate::memory::raw_learner_payload_field(&serde_json::json!({
+                "resolution": { "Answer_Text": "the learner said this" }
+            })),
+            Some("answer_text")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_record_turn_outcome_is_atomic_and_replay_safe() {
+        let seed = learning_core_seed();
+        let store = seed_learning_core_memory(&seed);
+        open_learning_session(&store, "vs-0004").await;
+        let fixture = turn_outcome_fixture();
+        let outcome = outcome_named("evaluated_strong");
+
+        let first = store
+            .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004", outcome.clone())
+            .await
+            .expect("first outcome persists");
+        assert_eq!(first, fixture.persisted["first_record"]);
+
+        let replay = store
+            .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004", outcome.clone())
+            .await
+            .expect("identical replay is accepted");
+        assert_eq!(replay, fixture.persisted["replay_record"]);
+
+        // One row, one set of transitions, one authorization — a replay adds none.
+        let evidence = store
+            .session_learning_evidence(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004")
+            .await
+            .expect("evidence reads back");
+        assert_eq!(evidence.outcomes, vec![outcome.clone()]);
+        // One browser authorization digest per recorded concept transition, plus
+        // the replay key of the D-01 decision each transition scheduled, and
+        // nothing for anything the outcome did not claim.
+        let ledger = store.snapshot().event_authorizations;
+        assert_eq!(
+            ledger
+                .iter()
+                .filter(|record| record.kind == crate::memory::EventAuthorizationKind::ConceptStatus)
+                .count(),
+            2
+        );
+        assert_eq!(
+            ledger
+                .iter()
+                .filter(|record| record.kind
+                    == crate::memory::EventAuthorizationKind::ReviewSchedule)
+                .count(),
+            2
+        );
+        assert_eq!(ledger.len(), 4);
+        let state = store.snapshot();
+        assert_eq!(
+            state.concepts[&format!("{LEARNING_SET_ID}::concept-electron-transport-chain")].status,
+            ConceptStatus::Strong
+        );
+
+        // A one-field change under the same response identity is a conflict, and
+        // it changes nothing.
+        let mut divergent = outcome.clone();
+        divergent.rubric_policy_version = "viva.semantic-rubric.v0".to_owned();
+        let error = store
+            .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004", divergent)
+            .await
+            .expect_err("a divergent replay is refused");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+        let after = store
+            .session_learning_evidence(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004")
+            .await
+            .expect("evidence still reads back");
+        assert_eq!(after, evidence);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_record_turn_outcome_is_atomic_and_replay_safe() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        let seed = learning_core_seed();
+        seed_learning_core_postgres(&pool, &seed).await;
+        let store = PostgresStudyStore::new(pool.clone());
+        open_learning_session(&store, "vs-0004").await;
+        let fixture = turn_outcome_fixture();
+        let outcome = outcome_named("evaluated_strong");
+
+        let first = store
+            .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004", outcome.clone())
+            .await
+            .expect("first outcome persists");
+        assert_eq!(first, fixture.persisted["first_record"]);
+        assert_eq!(
+            concept_status_of(&pool, "concept-electron-transport-chain").await,
+            "strong"
+        );
+        let (outcomes, _, cursors, reviews, digests) = learning_row_counts(&pool).await;
+        assert_eq!(outcomes, 1);
+        assert_eq!(cursors, 1);
+        // One browser authorization digest and one scheduled review per recorded
+        // concept transition: `LEARN-009` made the evaluated turn the only thing
+        // that schedules a review.
+        assert_eq!(digests, 2);
+        assert_eq!(reviews, 2);
+
+        let replay = store
+            .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004", outcome.clone())
+            .await
+            .expect("identical replay is accepted");
+        assert_eq!(replay, fixture.persisted["replay_record"]);
+        assert_eq!(learning_row_counts(&pool).await, (1, 0, 1, 2, 2));
+
+        let mut divergent = outcome.clone();
+        divergent.rubric_policy_version = "viva.semantic-rubric.v0".to_owned();
+        let error = store
+            .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004", divergent)
+            .await
+            .expect_err("a divergent replay is refused");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+        assert_eq!(learning_row_counts(&pool).await, (1, 0, 1, 2, 2));
+        let stored = store
+            .session_learning_evidence(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004")
+            .await
+            .expect("evidence reads back");
+        assert_eq!(stored.outcomes, vec![outcome]);
+
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_record_turn_outcome_rolls_back_every_transition_on_failure() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        let seed = learning_core_seed();
+        seed_learning_core_postgres(&pool, &seed).await;
+        let store = PostgresStudyStore::new(pool.clone());
+        open_learning_session(&store, "vs-0004").await;
+
+        let before_status = concept_status_of(&pool, "concept-electron-transport-chain").await;
+        let before_counts = learning_row_counts(&pool).await;
+
+        // One injected invalid transition: a concept this tenant does not own.
+        let mut outcome = outcome_named("evaluated_strong");
+        if let TurnResolution::Evaluated {
+            concept_transitions,
+            ..
+        } = &mut outcome.resolution
+        {
+            concept_transitions.push(agent_domain::ConceptStatusTransition {
+                concept_id: "concept-not-in-this-study-set".to_owned(),
+                from_status: ConceptStatus::Review,
+                to_status: ConceptStatus::Strong,
+                criterion_ids: vec!["crit-etc-donor".to_owned()],
+            });
+        } else {
+            panic!("evaluated_strong is an evaluated outcome");
+        }
+
+        let error = store
+            .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004", outcome)
+            .await
+            .expect_err("an invalid transition refuses the whole outcome");
+        assert!(matches!(
+            error.kind(),
+            PortErrorKind::InvalidInput | PortErrorKind::Unavailable
+        ));
+
+        // Outcome, transitions, progression, schedule, and authorization digest are
+        // all exactly as they were.
+        assert_eq!(
+            concept_status_of(&pool, "concept-electron-transport-chain").await,
+            before_status
+        );
+        assert_eq!(
+            concept_status_of(&pool, "concept-proton-gradient").await,
+            "review"
+        );
+        assert_eq!(learning_row_counts(&pool).await, before_counts);
+
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_record_challenge_resolution_binds_existing_outcome_and_source() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        let seed = learning_core_seed();
+        seed_learning_core_postgres(&pool, &seed).await;
+        let store = PostgresStudyStore::new(pool.clone());
+        open_learning_session(&store, "vs-0006").await;
+
+        // A challenge against an outcome that does not exist is refused.
+        let orphan = challenge_named("source_confirmed");
+        let error = store
+            .record_challenge_resolution(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0006", orphan.clone())
+            .await
+            .expect_err("a challenge cannot bind a missing outcome");
+        assert!(matches!(
+            error.kind(),
+            PortErrorKind::Unavailable | PortErrorKind::Conflict
+        ));
+
+        store
+            .record_turn_outcome(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                "vs-0006",
+                outcome_named("evaluated_required_contradiction_is_wrong"),
+            )
+            .await
+            .expect("challenged outcome persists");
+
+        let stored = store
+            .record_challenge_resolution(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0006", orphan.clone())
+            .await
+            .expect("challenge binds its outcome and source");
+        assert_eq!(stored, orphan);
+        let replay = store
+            .record_challenge_resolution(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0006", orphan.clone())
+            .await
+            .expect("identical challenge replay returns the stored value");
+        assert_eq!(replay, orphan);
+
+        let mut divergent = orphan.clone();
+        divergent.disposition = agent_domain::ChallengeDisposition::Deferred;
+        let error = store
+            .record_challenge_resolution(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0006", divergent)
+            .await
+            .expect_err("a changed challenge field is refused");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+
+        // An unknown source is refused.
+        let mut forged = challenge_named("deferred");
+        forged.correction_id = "corr-forged".to_owned();
+        forged.challenged_response_id = "resp-0008".to_owned();
+        forged.source_id = "src-not-owned".to_owned();
+        let error = store
+            .record_challenge_resolution(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0006", forged)
+            .await
+            .expect_err("a challenge cannot cite a source this tenant does not own");
+        assert!(matches!(
+            error.kind(),
+            PortErrorKind::Unavailable | PortErrorKind::InvalidInput
+        ));
+
+        // Supersession is only legal behind a resolution that permits reevaluation.
+        let replacement = outcome_named("evaluated_replacement_supersedes_challenged");
+        let error = store
+            .record_turn_outcome(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                "vs-0006",
+                replacement.clone(),
+            )
+            .await
+            .expect_err("supersession without a reevaluation resolution is refused");
+        assert!(matches!(
+            error.kind(),
+            PortErrorKind::Conflict | PortErrorKind::InvalidInput
+        ));
+
+        store
+            .record_challenge_resolution(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                "vs-0006",
+                challenge_named("reevaluation_required"),
+            )
+            .await
+            .expect("reevaluation resolution persists");
+        store
+            .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0006", replacement)
+            .await
+            .expect("supersession is legal behind a reevaluation resolution");
+
+        let (_, challenges, _, _, _) = learning_row_counts(&pool).await;
+        assert_eq!(challenges, 2);
+
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// Drives the canonical D-02B sequence against one store and returns every
+    /// observed `(result, cursor)` pair, keyed by the fixture case it should equal.
+    async fn drive_ordered_progression(
+        store: &dyn StudyMemoryStore,
+        session_id: &str,
+    ) -> Vec<(&'static str, QuestionProgressionResult)> {
+        let steps: [(&str, &str, Option<&str>); 6] = [
+            ("selected_first", "resp-p1", None),
+            (
+                "retry_current_increments_attempt",
+                "resp-p2",
+                Some("evaluated_required_contradiction_is_wrong"),
+            ),
+            (
+                "deferred_keeps_current_question",
+                "resp-p3",
+                Some("deferred_evaluator_unavailable"),
+            ),
+            (
+                "selected_second_after_advance",
+                "resp-p4",
+                Some("evaluated_strong"),
+            ),
+            (
+                "selected_third_after_advance",
+                "resp-p5",
+                Some("evaluated_synonym_accepted"),
+            ),
+            (
+                "exhausted_emits_no_question",
+                "resp-p6",
+                Some("evaluated_mostly_correct"),
+            ),
+        ];
+        // The question each selection returns, in order. Step `n` records the
+        // outcome of selection `n - 1`, so it names `selected_question[n - 1]`.
+        let selected_question = [
+            "q-etc-electron-flow",
+            "q-etc-electron-flow",
+            "q-etc-electron-flow",
+            "q-gradient-direction",
+            "q-atp-synthase-coupling",
+        ];
+
+        let mut observed = Vec::new();
+        for (index, (case, response_id, outcome_name)) in steps.iter().enumerate() {
+            if let Some(outcome_name) = outcome_name {
+                // The disposition of the *previous* selection's response is what
+                // moves the cursor; the selection itself then reports the move.
+                let mut outcome = outcome_named(outcome_name);
+                outcome.response_id = format!("{response_id}-prior");
+                outcome.question_id = selected_question[index - 1].to_owned();
+                if let TurnResolution::Evaluated {
+                    concept_transitions,
+                    ..
+                } = &mut outcome.resolution
+                {
+                    concept_transitions.clear();
+                }
+                store
+                    .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, session_id, outcome)
+                    .await
+                    .expect("progression outcome persists");
+                let result = store
+                    .select_next_question(
+                        LEARNING_USER_ID,
+                        LEARNING_SET_ID,
+                        session_id,
+                        &format!("{response_id}-prior"),
+                        ProgressionPolicyId::OrderedV1,
+                    )
+                    .await
+                    .expect("selection succeeds");
+                observed.push((
+                    match *case {
+                        "retry_current_increments_attempt" => "retry_current_increments_attempt",
+                        "deferred_keeps_current_question" => "deferred_keeps_current_question",
+                        "selected_second_after_advance" => "selected_second_after_advance",
+                        "selected_third_after_advance" => "selected_third_after_advance",
+                        "exhausted_emits_no_question" => "exhausted_emits_no_question",
+                        other => panic!("unexpected progression case {other}"),
+                    },
+                    result,
+                ));
+            } else {
+                let result = store
+                    .select_next_question(
+                        LEARNING_USER_ID,
+                        LEARNING_SET_ID,
+                        session_id,
+                        response_id,
+                        ProgressionPolicyId::OrderedV1,
+                    )
+                    .await
+                    .expect("first selection succeeds");
+                observed.push(("selected_first", result));
+            }
+        }
+        observed
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_select_next_question_reconnect_and_replay_share_one_cursor() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        let seed = learning_core_seed();
+        seed_learning_core_postgres(&pool, &seed).await;
+        let fixture = progression_fixture();
+        let store = PostgresStudyStore::new(pool.clone());
+        open_learning_session(&store, &fixture.voice_session_id).await;
+
+        let first = store
+            .select_next_question(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                &fixture.voice_session_id,
+                "resp-cursor-1",
+                fixture.policy,
+            )
+            .await
+            .expect("first selection succeeds");
+        assert_eq!(first, fixture.results["selected_first"]);
+
+        // Replay of the same authorized response returns the stored selection and
+        // the unchanged revision.
+        let replay = store
+            .select_next_question(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                &fixture.voice_session_id,
+                "resp-cursor-1",
+                fixture.policy,
+            )
+            .await
+            .expect("replay succeeds");
+        assert_eq!(replay, first);
+
+        // Reconnect: a second store instance over the same pool resumes the cursor
+        // rather than restarting it.
+        let reconnected = PostgresStudyStore::new(pool.clone());
+        let after_reconnect = reconnected
+            .select_next_question(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                &fixture.voice_session_id,
+                "resp-cursor-1",
+                fixture.policy,
+            )
+            .await
+            .expect("reconnect resumes the cursor");
+        assert_eq!(after_reconnect, first);
+
+        // Exactly one cursor row, at the revision the fixture pins.
+        let (_, _, cursors, _, _) = learning_row_counts(&pool).await;
+        assert_eq!(cursors, 1);
+        let revision = sqlx::query_scalar::<_, i64>(
+            "SELECT revision FROM question_progression_cursors WHERE voice_session_id = $1",
+        )
+        .bind(fixture_uuid(&fixture.voice_session_id).expect("session UUID"))
+        .fetch_one(&pool)
+        .await
+        .expect("cursor revision query succeeds");
+        assert_eq!(revision, 1);
+
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// The five Plan 06 learning methods, exercised on a production store against a
+    /// canonical seeded session. None may answer `Unavailable`.
+    async fn assert_learning_ports_are_implemented(store: &dyn StudyMemoryStore) {
+        let session_id = "vs-0002";
+        open_learning_session(store, session_id).await;
+        let fixture = evidence_fixture();
+        let seeded = fixture.evidence["mixed_strong_shaky_missed"].clone();
+
+        for outcome in &seeded.outcomes {
+            let persisted = store
+                .record_turn_outcome(
+                    LEARNING_USER_ID,
+                    LEARNING_SET_ID,
+                    session_id,
+                    outcome.clone(),
+                )
+                .await
+                .expect("record_turn_outcome is implemented");
+            assert_eq!(persisted.turn_outcome, *outcome);
+            assert!(!persisted.record.replayed);
+            assert_eq!(persisted.record.response_id, outcome.response_id);
+            assert_eq!(
+                persisted.record.schema,
+                agent_domain::learning_outcome::VIVA_TURN_OUTCOME_RECORD_SCHEMA
+            );
+        }
+        // Replay reports the replay, and reports the same outcome.
+        let replayed = store
+            .record_turn_outcome(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                session_id,
+                seeded.outcomes[0].clone(),
+            )
+            .await
+            .expect("replay is implemented");
+        assert!(replayed.record.replayed);
+        assert_eq!(replayed.turn_outcome, seeded.outcomes[0]);
+
+        let evidence = store
+            .session_learning_evidence(LEARNING_USER_ID, LEARNING_SET_ID, session_id)
+            .await
+            .expect("session_learning_evidence is implemented");
+        assert_eq!(evidence.user_id, LEARNING_USER_ID);
+        assert_eq!(evidence.study_set_id, LEARNING_SET_ID);
+        assert_eq!(evidence.voice_session_id, session_id);
+        assert_eq!(evidence.outcomes, seeded.outcomes);
+        let mut expected_labels = seeded.concept_labels.clone();
+        expected_labels.sort_by(|left, right| left.concept_id.cmp(&right.concept_id));
+        assert_eq!(evidence.concept_labels, expected_labels);
+        // The schedule is the one D-01 computes from these outcomes — every entry
+        // under the selected `server_persisted_fsrs` authority, one per transitioned
+        // concept, and never the rejected read-time authority.
+        assert_eq!(
+            evidence.review_decisions,
+            expected_review_decisions(&seeded.outcomes)
+        );
+        assert_eq!(evidence.review_decisions.len(), 3);
+
+        let challenge = ChallengeResolution {
+            schema: agent_domain::learning_outcome::VIVA_CHALLENGE_RESOLUTION_SCHEMA.to_owned(),
+            correction_id: "corr-override-1".to_owned(),
+            challenged_response_id: seeded.outcomes[0].response_id.clone(),
+            source_id: "src-lec5-slide-19".to_owned(),
+            disposition: agent_domain::ChallengeDisposition::SourceConfirmed,
+            replacement_response_id: None,
+        };
+        let stored_challenge = store
+            .record_challenge_resolution(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                session_id,
+                challenge.clone(),
+            )
+            .await
+            .expect("record_challenge_resolution is implemented");
+        assert_eq!(stored_challenge, challenge);
+
+        let selection = store
+            .select_next_question(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                session_id,
+                &seeded.outcomes[0].response_id,
+                ProgressionPolicyId::OrderedV1,
+            )
+            .await
+            .expect("select_next_question is implemented");
+        match selection {
+            QuestionProgressionResult::Selected { total, .. }
+            | QuestionProgressionResult::Retry { total, .. }
+            | QuestionProgressionResult::Exhausted { total, .. } => assert_eq!(total, 3),
+        }
+
+        let projection = store
+            .authenticated_study_projection(LEARNING_USER_ID, LEARNING_SET_ID, session_id)
+            .await
+            .expect("authenticated_study_projection is implemented");
+        assert_eq!(projection.study_set.id, LEARNING_SET_ID);
+        assert_eq!(projection.study_set.title, "Cellular respiration");
+        assert_eq!(projection.study_set.course.as_deref(), Some("BIO 201"));
+        assert_eq!(
+            projection.study_set.ingestion_status,
+            agent_domain::StudySetIngestionStatus::Ready
+        );
+        assert_eq!(projection.session.id, session_id);
+        assert_eq!(projection.session.mode, StudyMode::Quiz);
+        assert_eq!(projection.concepts.len(), 5);
+        assert_eq!(projection.question_progress.total, 3);
+        assert_eq!(projection.review_schedule.len(), 3);
+        for item in &projection.review_schedule {
+            assert_eq!(
+                item.authority,
+                agent_domain::learning_recap::ReviewScheduleAuthority::ServerPersistedFsrs
+            );
+            assert!(projection
+                .concepts
+                .iter()
+                .any(|concept| concept.id == item.concept_id));
+        }
+        for concept in &projection.concepts {
+            let scheduled = projection
+                .review_schedule
+                .iter()
+                .find(|item| item.concept_id == concept.id)
+                .map(|item| item.due_at.clone());
+            assert_eq!(concept.due_at, scheduled);
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_learning_ports_override_fail_closed_defaults() {
+        let seed = learning_core_seed();
+        let store = seed_learning_core_memory(&seed);
+        assert_learning_ports_are_implemented(&store).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_learning_ports_override_fail_closed_defaults() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        let seed = learning_core_seed();
+        seed_learning_core_postgres(&pool, &seed).await;
+        let store = PostgresStudyStore::new(pool.clone());
+        assert_learning_ports_are_implemented(&store).await;
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_memory_backend_session_learning_evidence_matches_fixture_bytes() {
+        let fixture = evidence_fixture();
+        let seed = learning_core_seed();
+
+        // Each fixture case runs on its own schema and its own in-memory store: a
+        // persisted FSRS card is per concept and outlives a session, so sharing one
+        // study set between cases would let one case's grading move another's due
+        // dates. `reconnect_rebuild` is `mixed_strong_shaky_missed` read a second
+        // time on the same session and is covered by re-reading it below.
+        for case in [
+            "all_missed",
+            "mixed_strong_shaky_missed",
+            "deferred_only",
+            "evaluated_then_idempotent_replay",
+            "superseded_challenged_outcome",
+            "no_outcomes",
+            "same_label_distinct_concepts",
+            "source_moment_outside_outcome",
+        ] {
+            let fixture_schema = PostgresSchemaFixture::migrated().await;
+            let pool = fixture_schema.pool().clone();
+            seed_learning_core_postgres(&pool, &seed).await;
+            let durable = PostgresStudyStore::new(pool.clone());
+            let volatile = seed_learning_core_memory(&seed);
+            let seeded = fixture.evidence[case].clone();
+            let session_id = seeded.voice_session_id.clone();
+            for store in [&durable as &dyn StudyMemoryStore, &volatile] {
+                open_learning_session(store, &session_id).await;
+                for outcome in &seeded.outcomes {
+                    if outcome.supersedes_response_id.is_some() {
+                        let challenged = outcome
+                            .supersedes_response_id
+                            .clone()
+                            .expect("supersession names a challenged response");
+                        store
+                            .record_challenge_resolution(
+                                LEARNING_USER_ID,
+                                LEARNING_SET_ID,
+                                &session_id,
+                                ChallengeResolution {
+                                    schema: agent_domain::learning_outcome::VIVA_CHALLENGE_RESOLUTION_SCHEMA
+                                        .to_owned(),
+                                    correction_id: format!("corr-{case}"),
+                                    challenged_response_id: challenged,
+                                    source_id: "src-lec5-slide-19".to_owned(),
+                                    disposition: agent_domain::ChallengeDisposition::ReevaluationRequired,
+                                    replacement_response_id: Some(outcome.response_id.clone()),
+                                },
+                            )
+                            .await
+                            .expect("reevaluation resolution persists");
+                    }
+                    store
+                        .record_turn_outcome(
+                            LEARNING_USER_ID,
+                            LEARNING_SET_ID,
+                            &session_id,
+                            outcome.clone(),
+                        )
+                        .await
+                        .unwrap_or_else(|error| panic!("{case} outcome persists: {error:?}"));
+                }
+            }
+
+            let durable_evidence = durable
+                .session_learning_evidence(LEARNING_USER_ID, LEARNING_SET_ID, &session_id)
+                .await
+                .unwrap_or_else(|error| panic!("{case} durable evidence: {error:?}"));
+            let volatile_evidence = volatile
+                .session_learning_evidence(LEARNING_USER_ID, LEARNING_SET_ID, &session_id)
+                .await
+                .unwrap_or_else(|error| panic!("{case} volatile evidence: {error:?}"));
+
+            // Byte equality across backends, not just typed equality.
+            assert_eq!(
+                serde_json::to_string(&durable_evidence).expect("evidence serializes"),
+                serde_json::to_string(&volatile_evidence).expect("evidence serializes"),
+                "{case}"
+            );
+
+            // The stored outcomes come back as the fixture's canonical bytes.
+            let mut expected_outcomes = seeded.outcomes.clone();
+            expected_outcomes.dedup_by(|left, right| left.response_id == right.response_id);
+            assert_eq!(
+                serde_json::to_string(&durable_evidence.outcomes).expect("outcomes serialize"),
+                serde_json::to_string(&expected_outcomes).expect("outcomes serialize"),
+                "{case}"
+            );
+
+            // The schedule is server-computed, so the fixture's authored due dates
+            // are the one thing a store cannot reproduce. Every other byte of the
+            // fixture recap must match, including which concepts are scheduled at
+            // all and in what order.
+            assert_eq!(
+                durable_evidence.review_decisions,
+                expected_review_decisions(&expected_outcomes),
+                "{case}"
+            );
+            let mut expected_recap = fixture.recaps[case].clone();
+            expected_recap.voice_session_id.clone_from(&session_id);
+            let mut fixture_scheduled = expected_recap
+                .review_schedule
+                .iter()
+                .map(|item| item.concept_id.clone())
+                .collect::<Vec<_>>();
+            fixture_scheduled.sort();
+            let mut stored_scheduled = durable_evidence
+                .review_decisions
+                .iter()
+                .map(|item| item.concept_id.clone())
+                .collect::<Vec<_>>();
+            stored_scheduled.sort();
+            assert_eq!(stored_scheduled, fixture_scheduled, "{case}");
+            for item in &mut expected_recap.review_schedule {
+                item.due_at = durable_evidence
+                    .review_decisions
+                    .iter()
+                    .find(|decision| decision.concept_id == item.concept_id)
+                    .unwrap_or_else(|| panic!("{case} schedules {}", item.concept_id))
+                    .due_at
+                    .clone();
+            }
+            let rebuilt = agent_domain::build_session_recap(&durable_evidence)
+                .unwrap_or_else(|error| panic!("{case} recap folds: {error:?}"));
+            assert_eq!(rebuilt, expected_recap, "{case}");
+
+            // A reconnect rebuilds the identical evidence from the same rows.
+            let reread = PostgresStudyStore::new(pool.clone())
+                .session_learning_evidence(LEARNING_USER_ID, LEARNING_SET_ID, &session_id)
+                .await
+                .unwrap_or_else(|error| panic!("{case} reconnect evidence: {error:?}"));
+            assert_eq!(reread, durable_evidence, "{case}");
+
+            fixture_schema
+                .cleanup()
+                .await
+                .expect("isolated test schema drops cleanly");
+        }
+    }
+
+    /// The stored cursor, as Plan 04's canonical type.
+    ///
+    /// `progression_json` carries the cursor's own fields at the top level — so
+    /// that the row's `revision` column and `progression_json.revision` are the
+    /// same field — plus the store-owned `applied_response_ids` replay set, which
+    /// is not part of Plan 04's published cursor and is dropped here.
+    async fn stored_progression_cursor(
+        pool: &sqlx::PgPool,
+        voice_session_id: &str,
+    ) -> QuestionProgressionCursor {
+        let mut json = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT progression_json
+             FROM question_progression_cursors
+             WHERE voice_session_id = $1",
+        )
+        .bind(fixture_uuid(voice_session_id).expect("session UUID"))
+        .fetch_one(pool)
+        .await
+        .expect("cursor query succeeds");
+        json.as_object_mut()
+            .expect("progression_json is an object")
+            .remove("applied_response_ids");
+        serde_json::from_value(json).expect("stored cursor is Plan 04's canonical cursor")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_memory_backend_progression_cursor_matches_selected_d02_contract() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        let seed = learning_core_seed();
+        seed_learning_core_postgres(&pool, &seed).await;
+        let durable = PostgresStudyStore::new(pool.clone());
+        let volatile = seed_learning_core_memory(&seed);
+        let fixture = progression_fixture();
+        assert_eq!(fixture.policy, ProgressionPolicyId::OrderedV1);
+
+        let mut per_backend = Vec::new();
+        for store in [&durable as &dyn StudyMemoryStore, &volatile] {
+            open_learning_session(store, &fixture.voice_session_id).await;
+            per_backend.push(drive_ordered_progression(store, &fixture.voice_session_id).await);
+        }
+        assert_eq!(per_backend[0], per_backend[1]);
+        for (case, observed) in &per_backend[0] {
+            assert_eq!(observed, &fixture.results[*case], "{case}");
+        }
+
+        // The durable cursor itself, not just the results it produced.
+        assert_eq!(
+            stored_progression_cursor(&pool, &fixture.voice_session_id).await,
+            fixture.cursors["after_exhaustion"]
+        );
+
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_memory_backend_review_authority_matches_selected_d01_contract() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        let seed = learning_core_seed();
+        seed_learning_core_postgres(&pool, &seed).await;
+        let durable = PostgresStudyStore::new(pool.clone());
+        let volatile = seed_learning_core_memory(&seed);
+        let fixture = evidence_fixture();
+        let seeded = fixture.evidence["mixed_strong_shaky_missed"].clone();
+        let session_id = seeded.voice_session_id.clone();
+
+        for store in [&durable as &dyn StudyMemoryStore, &volatile] {
+            open_learning_session(store, &session_id).await;
+            for outcome in &seeded.outcomes {
+                store
+                    .record_turn_outcome(
+                        LEARNING_USER_ID,
+                        LEARNING_SET_ID,
+                        &session_id,
+                        outcome.clone(),
+                    )
+                    .await
+                    .expect("outcome persists");
+            }
+        }
+
+        let durable_evidence = durable
+            .session_learning_evidence(LEARNING_USER_ID, LEARNING_SET_ID, &session_id)
+            .await
+            .expect("durable evidence");
+        let volatile_evidence = volatile
+            .session_learning_evidence(LEARNING_USER_ID, LEARNING_SET_ID, &session_id)
+            .await
+            .expect("volatile evidence");
+        assert_eq!(
+            durable_evidence.review_decisions,
+            volatile_evidence.review_decisions
+        );
+        // D-01 selected `SERVER_PERSISTED_FSRS`; no store may report the rejected
+        // read-time authority.
+        for decision in &durable_evidence.review_decisions {
+            assert_eq!(
+                decision.authority,
+                agent_domain::learning_recap::ReviewScheduleAuthority::ServerPersistedFsrs
+            );
+        }
+        // Against the published decision function, not against the store's own
+        // output: a store that scheduled from its own clock would not match.
+        assert_eq!(
+            durable_evidence.review_decisions,
+            expected_review_decisions(&seeded.outcomes)
+        );
+        // Exactly the concepts the fixture's evidence schedules, in the store's
+        // published order.
+        let mut fixture_concepts = seeded
+            .review_decisions
+            .iter()
+            .map(|decision| decision.concept_id.clone())
+            .collect::<Vec<_>>();
+        fixture_concepts.sort();
+        let mut stored_concepts = durable_evidence
+            .review_decisions
+            .iter()
+            .map(|decision| decision.concept_id.clone())
+            .collect::<Vec<_>>();
+        stored_concepts.sort();
+        assert_eq!(stored_concepts, fixture_concepts);
+
+        fixture_schema
             .cleanup()
             .await
             .expect("isolated test schema drops cleanly");
