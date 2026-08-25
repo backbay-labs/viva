@@ -717,7 +717,36 @@ describe("Viva voice agent contract", () => {
   });
 });
 
+/**
+ * `VOICE-READY-001`'s canonical ready frame, transcribed here from the contract rather
+ * than read back from `server-ready.json`. Comparing a parse result only against the
+ * fixture it just parsed would let a drifted canonical value round-trip undetected on
+ * this side; Rust pins the same values from the other direction.
+ */
+const CANONICAL_V5_READY = {
+  type: "ready",
+  version: 5,
+  protocol: { preferred_version: 5, supported_versions: [5] },
+  sample_rate_hz: 24000,
+  input_encoding: "pcm_s16le",
+  brain: { provider: "synthetic", configured: true, selectable: true, live_runtime: false },
+  store: {
+    backend: "in_memory",
+    available: true,
+    durable: false,
+    nonce_replay_protection: true,
+    raw_audio_persistence: false,
+    transcript_persistence: false,
+    uuid_schema_translation: true,
+  },
+} as const;
+
 describe("Viva voice v5 protocol negotiation and the single ready representation", () => {
+  test("pins the canonical v5 ready fixture to the contract values", () => {
+    expect(readyV5Fixture).toEqual(CANONICAL_V5_READY);
+    expect(JSON.stringify(readyV5Fixture)).toBe(JSON.stringify(CANONICAL_V5_READY));
+  });
+
   test("advertises protocol v5 as the only supported version", () => {
     expect(VIVA_VOICE_PROTOCOL_VERSION).toBe(5);
     expect(VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS).toEqual([5]);
@@ -786,8 +815,11 @@ describe("Viva voice v5 protocol negotiation and the single ready representation
     const parsed = parseVivaServerFrame(source);
 
     expect(parsed).not.toBe(source);
+    // Pinned against the independently transcribed contract values, not against the
+    // fixture this very call parsed.
+    expect(parsed).toEqual(CANONICAL_V5_READY);
+    expect(JSON.stringify(parsed)).toBe(JSON.stringify(CANONICAL_V5_READY));
     expect(parsed).toEqual(readyV5Fixture);
-    expect(JSON.stringify(parsed)).toBe(JSON.stringify(readyV5Fixture));
     expect(Object.keys(parsed)).toEqual([
       "type",
       "version",
