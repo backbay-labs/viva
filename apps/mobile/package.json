@@ -12,6 +12,7 @@
   "dependencies": {
     "@expo-google-fonts/cormorant": "^0.4.2",
     "@expo-google-fonts/hanken-grotesk": "^0.4.3",
+    "@viva/core": "workspace:*",
     "@viva/tokens": "workspace:*",
     "expo": "~57.0.16",
     "expo-asset": "~57.0.14",
