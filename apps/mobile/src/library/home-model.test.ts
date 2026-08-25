@@ -127,6 +127,52 @@ describe("homeModelFromLibrary", () => {
     });
   });
 
+  test("prefers the configured study set when multiple rows can start", () => {
+    const chemistry = cannedLibrarySnapshot.study_sets.find(
+      (studySet) => studySet.id === "chemistry-final",
+    );
+    if (!chemistry) throw new Error("canned chemistry study set is missing");
+    const snapshot = {
+      ...cannedLibrarySnapshot,
+      study_sets: [
+        {
+          ...chemistry,
+          actions: {
+            ...chemistry.actions,
+            start: {
+              available: true as const,
+              session_id: "chemistry-session",
+              session_token: "viva1.chemistry-session",
+            },
+          },
+          concept_count: 1,
+          documents: [
+            {
+              deleted: false,
+              display_name: "Chemistry notes.txt",
+              id: "chemistry-notes",
+              processing_status: "ready" as const,
+              source_kind: "file",
+            },
+          ],
+          question_count: 1,
+        },
+        ...cannedLibrarySnapshot.study_sets.filter((studySet) => studySet.id !== "chemistry-final"),
+      ],
+    };
+
+    expect(
+      homeModelFromLibrary(projectLibrarySnapshot(snapshot), snapshot, {
+        ...config,
+        studySetId: "biology-midterm",
+      }),
+    ).toMatchObject({
+      canStart: true,
+      studySetId: "biology-midterm",
+      studySetTitle: "Biology Midterm",
+    });
+  });
+
   test("enables the explicit trusted-loopback unsigned row even when web projection rejects it", () => {
     const first = cannedLibrarySnapshot.study_sets[0];
     if (!first) throw new Error("canned biology study set is missing");

@@ -40,13 +40,17 @@ export type RetryAttemptState = {
 
 export type RetryAttemptResolution = "clear" | "complete" | "keep";
 
-export type SessionCaptureState = "blocked" | "idle" | "listening" | "requesting";
+export type SessionCaptureState = "blocked" | "idle" | "listening" | "requesting" | "stopping";
 
 // The agent's submitted-turn contract is capped at 45 seconds and the examiner
 // is instructed to speak concisely. Two minutes after recap_ready leaves ample
 // room for normal queued playback while bounding a failed unlock or missing
 // native completion callback so the learner cannot be stranded on the session.
 export const RECAP_PLAYBACK_MAX_WAIT_MS = 2 * 60_000;
+
+export function sessionAnswerControlsBusy(input: { busy: boolean; speaking: boolean }): boolean {
+  return input.busy || input.speaking;
+}
 
 export function drainSessionPlayback(input: {
   acknowledgeAudio: (audio: readonly VivaAgentAudioOutput[]) => void;
@@ -154,6 +158,7 @@ export function sessionProviderStatusLabel(input: {
   speaking: boolean;
 }): string {
   if (input.captureState === "requesting") return "Opening microphone…";
+  if (input.captureState === "stopping") return "Stopping microphone…";
   if (input.captureState === "listening") return "Listening locally";
   if (input.disconnected) return input.connectionStatusLabel;
   if (input.busy) return "Reading your answer…";

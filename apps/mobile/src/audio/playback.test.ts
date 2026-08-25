@@ -52,6 +52,7 @@ describe("createMobilePlaybackSession", () => {
     expect(fake.sources).toHaveLength(1);
     expect(fake.calls.startArguments).toHaveLength(1);
     expect(speakingChanges.at(-1)).toBe(true);
+    expect(session.isActive()).toBe(true);
 
     fake.analyser.samples.fill(0.1);
     expect(session.getOutputLevel()).toBeCloseTo((0.1 - 0.02) / (0.2 - 0.02), 5);
@@ -61,6 +62,7 @@ describe("createMobilePlaybackSession", () => {
     // Task 5's adapter maps the native member to the shared sink's onended.
     fake.sources[0]?.onEnded?.();
     expect(speakingChanges.at(-1)).toBe(false);
+    expect(session.isActive()).toBe(false);
 
     await session.close();
     expect(fake.calls.close).toBe(1);

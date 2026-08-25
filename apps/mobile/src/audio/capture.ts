@@ -149,6 +149,16 @@ export function createMobileCaptureSession(
 
   const session: MobileCaptureSession = {
     async start() {
+      if (!active && startupPromise) {
+        // Cancellation makes the public session inactive synchronously, but a
+        // permission/native start can still be unwinding. Do not replace its
+        // shared resolver or controller until both startup and stop settle.
+        const previousStartup = startupPromise;
+        await previousStartup.catch(() => undefined);
+        const previousStop = stopPromise;
+        await previousStop;
+        if (startupPromise === previousStartup) startupPromise = null;
+      }
       if (active && startupPromise) return startupPromise;
       if (active) return;
       // A new start begins a new turn. The previous normal stop remains
@@ -156,10 +166,11 @@ export function createMobileCaptureSession(
       clearLedger();
       const source = wrappedSource(sourceFactory());
       startupSettled = false;
-      startupPromise = new Promise<void>((resolve, reject) => {
+      const nextStartup = new Promise<void>((resolve, reject) => {
         resolveStartup = resolve;
         rejectStartup = reject;
       });
+      startupPromise = nextStartup;
       active = true;
 
       try {
@@ -203,7 +214,7 @@ export function createMobileCaptureSession(
         reportError(error);
       }
 
-      await startupPromise;
+      await nextStartup;
     },
     cancel() {
       return finishUnderlying("cancel");

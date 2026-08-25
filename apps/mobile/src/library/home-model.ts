@@ -86,10 +86,17 @@ export function homeModelFromLibrary(
   config: AppConfig,
   platform: MobileRuntimePlatform = "unknown",
 ): HomeLibraryModel {
+  const preferredRow = projection.libraryRows.find(
+    (candidate) =>
+      candidate.id === config.studySetId &&
+      decideMobileLibraryStart(config, snapshot, candidate.id, platform).canStart,
+  );
   const row =
+    preferredRow ??
     projection.libraryRows.find(
       (candidate) => decideMobileLibraryStart(config, snapshot, candidate.id, platform).canStart,
-    ) ?? projection.libraryRows[0];
+    ) ??
+    projection.libraryRows[0];
   if (!row) {
     return {
       canStart: false,

@@ -3,6 +3,7 @@ import type { AgentSessionConfig, StudySet } from "@viva/core";
 import type { VivaLibrarySnapshot } from "@/agent/shared-web";
 import {
   applyMobileAppStateChange,
+  coordinateMobilePlaybackState,
   createGuardedWebSocketImplementation,
   createMobileSessionController,
   foregroundReconnectAction,
@@ -370,5 +371,22 @@ describe("foregroundReconnectAction", () => {
       ),
     ).toBe(true);
     expect(sent.some((value) => JSON.parse(String(value)).type === "audio")).toBe(false);
+  });
+});
+
+describe("coordinateMobilePlaybackState", () => {
+  test("synchronously publishes playback state and cancels active local capture", () => {
+    const events: string[] = [];
+    coordinateMobilePlaybackState({
+      capture: {
+        cancel: async () => {
+          events.push("capture-cancelled");
+        },
+      },
+      onSpeakingChange: (speaking) => events.push(`speaking-${speaking}`),
+      speaking: true,
+    });
+
+    expect(events).toEqual(["speaking-true", "capture-cancelled"]);
   });
 });

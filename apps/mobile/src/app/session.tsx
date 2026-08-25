@@ -21,6 +21,7 @@ import {
   type RetryAttemptState,
   retryAttemptResolution,
   type SessionCorrectionModel,
+  sessionAnswerControlsBusy,
   sessionProviderStatusLabel,
   shouldNavigateToRecap,
   stageCopyForConnection,
@@ -42,7 +43,7 @@ import { colors, fonts, layout, radius, space } from "@/theme/tokens";
 // must not become a transport capability until the protocol-v5 milestone.
 const voiceTurnsEnabled = false as const;
 
-type CaptureState = "blocked" | "idle" | "listening" | "requesting";
+type CaptureState = "blocked" | "idle" | "listening" | "requesting" | "stopping";
 type SessionLoadState =
   | { kind: "loading" }
   | { kind: "ready"; studySet: StudySet }
@@ -154,6 +155,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   const [retryAttempt, setRetryAttempt] = useState<RetryAttemptState>();
   const [recapPlaybackWaitExpired, setRecapPlaybackWaitExpired] = useState(false);
   const endingRef = useRef(false);
+  const captureCancellationRef = useRef<Promise<void> | null>(null);
   const handledCancelRef = useRef(0);
   const handledGenerationRef = useRef<string | undefined>(undefined);
   const playbackUnlockedRef = useRef(false);
@@ -171,6 +173,8 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   useEffect(() => {
     if (captureState === "requesting") {
       AccessibilityInfo.announceForAccessibility("Requesting microphone access");
+    } else if (captureState === "stopping") {
+      AccessibilityInfo.announceForAccessibility("Stopping local microphone capture");
     } else if (captureState === "listening") {
       AccessibilityInfo.announceForAccessibility("Viva is listening locally");
     } else if (captureState === "blocked") {
@@ -179,6 +183,13 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
       AccessibilityInfo.announceForAccessibility("Correction ready");
     }
   }, [agent.derived.evaluation, captureState, retrying]);
+
+  useEffect(
+    () => () => {
+      captureCancellationRef.current = null;
+    },
+    [],
+  );
 
   useEffect(() => {
     const generationId = agent.agentState.generation?.id;
@@ -276,7 +287,10 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   ]);
 
   useEffect(() => {
-    if (!agent.captureIssue || (captureState !== "listening" && captureState !== "requesting")) {
+    if (
+      !agent.captureIssue ||
+      (captureState !== "listening" && captureState !== "requesting" && captureState !== "stopping")
+    ) {
       return;
     }
     setCaptureState("blocked");
@@ -288,6 +302,23 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     );
   }, [agent.captureIssue, captureState]);
 
+  useEffect(() => {
+    if (!agent.speaking || (captureState !== "listening" && captureState !== "requesting")) {
+      return;
+    }
+    if (captureCancellationRef.current) return;
+    setCaptureState("stopping");
+    setCaptureMessage("Examiner playback started, so local microphone capture was stopped.");
+    const cancellation = agent.capture.cancel();
+    captureCancellationRef.current = cancellation;
+    const settleCancellation = () => {
+      if (captureCancellationRef.current !== cancellation) return;
+      captureCancellationRef.current = null;
+      setCaptureState((state) => (state === "stopping" ? "idle" : state));
+    };
+    void cancellation.then(settleCancellation, settleCancellation);
+  }, [agent.capture, agent.speaking, captureState]);
+
   const unlockPlayback = () => {
     if (playbackUnlockedRef.current) return;
     playbackUnlockedRef.current = true;
@@ -297,7 +328,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   };
 
   const startListening = async () => {
-    if (endingRef.current) return;
+    if (endingRef.current || agent.playback.isActive()) return;
     unlockPlayback();
     agent.clearCaptureIssue();
     setCaptureMessage(undefined);
@@ -321,6 +352,18 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
       await agent.capture.start();
       if (outcome !== "pending") {
         await agent.capture.cancel();
+        return;
+      }
+      const playbackActive = agent.playback.isActive();
+      if (playbackActive || !agent.capture.isActive()) {
+        outcome = "failed";
+        await agent.capture.cancel();
+        setCaptureMessage(
+          playbackActive
+            ? "Wait for the examiner to finish, then start your answer."
+            : "Microphone capture was interrupted. Start listening again when you are ready.",
+        );
+        setCaptureState("idle");
         return;
       }
       outcome = "recording";
@@ -358,7 +401,12 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
       AccessibilityInfo.announceForAccessibility("Write an answer before submitting.");
       return;
     }
-    if (endingRef.current || !agent.derived.canSubmitAnswer || !agent.sendText(answer)) {
+    if (
+      endingRef.current ||
+      agent.playback.isActive() ||
+      !agent.derived.canSubmitAnswer ||
+      !agent.sendText(answer)
+    ) {
       if (retryAttempt) setRetryAttempt(undefined);
       AccessibilityInfo.announceForAccessibility(
         "The agent is not ready for an answer. Wait for the question or retry the connection.",
@@ -428,9 +476,10 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     retrying && correction
       ? correction.retryPrompt
       : (agent.derived.question?.prompt ?? connectionCopy.title);
+  const captureTransitioning = captureState === "requesting" || captureState === "stopping";
   const localPhase = retrying
     ? "listening"
-    : captureState === "requesting"
+    : captureTransitioning
       ? "thinking"
       : captureState === "listening"
         ? "listening"
@@ -446,6 +495,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     retrySubmitted ||
     Boolean(agent.agentState.pendingSubmission) ||
     agent.derived.phase === "thinking";
+  const answerControlsBusy = sessionAnswerControlsBusy({ busy, speaking: agent.speaking });
   const showCorrection = Boolean(correction) && !retrying && !disconnected;
   const webInstrumentation = {
     dataSet: { vivaSpeaking: agent.speaking ? "true" : "false" },
@@ -603,7 +653,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                   <TextInput
                     accessibilityLabelledBy="answer-label"
                     autoFocus={captureState === "blocked" || retrying}
-                    editable={!busy}
+                    editable={!answerControlsBusy}
                     multiline
                     onChangeText={setTypedAnswer}
                     placeholder="Explain it from memory…"
@@ -614,7 +664,9 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                     value={typedAnswer}
                   />
                   <ActionButton
-                    disabled={busy || !agent.derived.canSubmitAnswer || !typedAnswer.trim()}
+                    disabled={
+                      answerControlsBusy || !agent.derived.canSubmitAnswer || !typedAnswer.trim()
+                    }
                     onPress={submitTypedAnswer}
                     testID="session-submit"
                   >
@@ -626,7 +678,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
               <View style={styles.actionDock}>
                 {agent.derived.question && captureState === "idle" && !typing ? (
                   <ActionButton
-                    disabled={!agent.derived.canSubmitAnswer || busy}
+                    disabled={!agent.derived.canSubmitAnswer || answerControlsBusy}
                     icon={<SparkIcon color={colors.plumSoft} size={15} />}
                     onPress={() => void startListening()}
                   >
@@ -636,14 +688,20 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                 {captureState === "requesting" ? (
                   <ActionButton loading>Opening microphone</ActionButton>
                 ) : null}
+                {captureState === "stopping" ? (
+                  <ActionButton loading>Stopping microphone</ActionButton>
+                ) : null}
                 {captureState === "listening" ? (
-                  <ActionButton disabled={busy} onPress={() => void finishSpokenAnswer()}>
+                  <ActionButton
+                    disabled={answerControlsBusy}
+                    onPress={() => void finishSpokenAnswer()}
+                  >
                     Finish answer
                   </ActionButton>
                 ) : null}
                 <View style={styles.secondaryActions}>
                   <ActionButton
-                    disabled={!agent.derived.question || captureState === "requesting" || busy}
+                    disabled={!agent.derived.question || captureTransitioning || answerControlsBusy}
                     onPress={() => {
                       unlockPlayback();
                       setHintVisible((value) => !value);
@@ -654,7 +712,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                     {hintVisible ? "Hide hint" : "Hint"}
                   </ActionButton>
                   <ActionButton
-                    disabled={!agent.derived.question || captureState === "requesting" || busy}
+                    disabled={!agent.derived.question || captureTransitioning || answerControlsBusy}
                     onPress={() => {
                       unlockPlayback();
                       setTyping((value) => !value);
@@ -667,7 +725,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                   </ActionButton>
                 </View>
                 <ActionButton
-                  disabled={!agent.derived.question || captureState === "requesting" || busy}
+                  disabled={!agent.derived.question || captureTransitioning || answerControlsBusy}
                   onPress={() => {
                     unlockPlayback();
                     setSourceVisible((value) => !value);
