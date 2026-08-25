@@ -1,8 +1,10 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{ConceptStatus, SourceConfidence};
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StudySessionPhase {
     #[default]
@@ -14,68 +16,89 @@ pub enum StudySessionPhase {
     Recap,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminalSessionReason {
-    Drained,
-    SessionCap,
-    TurnCap,
-    RateLimit,
-    CostBudget,
-    ProviderAuthFailed,
-    ProviderRateLimited,
-    ProviderTimeout,
-    ProviderMalformedStream,
-    ProviderNetworkDisconnect,
-    SlowClient,
-    ProviderCancelled,
-    PartialStageSuccess,
-    DurabilityDegraded,
-    ToolExecutorFailure,
-    Rollback,
+/// Compile-time proof that a close reason is exactly its wire token with each
+/// underscore replaced by a space, so the two strings generated from one
+/// declaration can never drift apart.
+const fn close_text_matches_wire(wire: &str, close: &str) -> bool {
+    let wire = wire.as_bytes();
+    let close = close.as_bytes();
+    if wire.len() != close.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < wire.len() {
+        let expected = if wire[index] == b'_' {
+            b' '
+        } else {
+            wire[index]
+        };
+        if close[index] != expected {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
-impl TerminalSessionReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Drained => "drained",
-            Self::SessionCap => "session_cap",
-            Self::TurnCap => "turn_cap",
-            Self::RateLimit => "rate_limit",
-            Self::CostBudget => "cost_budget",
-            Self::ProviderAuthFailed => "provider_auth_failed",
-            Self::ProviderRateLimited => "provider_rate_limited",
-            Self::ProviderTimeout => "provider_timeout",
-            Self::ProviderMalformedStream => "provider_malformed_stream",
-            Self::ProviderNetworkDisconnect => "provider_network_disconnect",
-            Self::SlowClient => "slow_client",
-            Self::ProviderCancelled => "provider_cancelled",
-            Self::PartialStageSuccess => "partial_stage_success",
-            Self::DurabilityDegraded => "durability_degraded",
-            Self::ToolExecutorFailure => "tool_executor_failure",
-            Self::Rollback => "rollback",
+/// The single terminal-reason declaration. One variant list generates the enum,
+/// its serde token, [`TerminalSessionReason::ALL`], `as_str`, `close_reason`,
+/// and `Display`, so no consumer may keep a second enum or string table.
+macro_rules! define_terminal_session_reasons {
+    ($( $variant:ident => $wire:literal, $close:literal ),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        pub enum TerminalSessionReason {
+            $(#[serde(rename = $wire)] $variant),+
         }
-    }
 
-    pub fn close_reason(self) -> &'static str {
-        match self {
-            Self::Drained => "drained",
-            Self::SessionCap => "session cap",
-            Self::TurnCap => "turn cap",
-            Self::RateLimit => "rate limit",
-            Self::CostBudget => "cost budget",
-            Self::ProviderAuthFailed => "provider auth failed",
-            Self::ProviderRateLimited => "provider rate limited",
-            Self::ProviderTimeout => "provider timeout",
-            Self::ProviderMalformedStream => "provider malformed stream",
-            Self::ProviderNetworkDisconnect => "provider network disconnect",
-            Self::SlowClient => "slow client",
-            Self::ProviderCancelled => "provider cancelled",
-            Self::PartialStageSuccess => "partial stage success",
-            Self::DurabilityDegraded => "durability degraded",
-            Self::ToolExecutorFailure => "tool executor failure",
-            Self::Rollback => "rollback",
+        impl TerminalSessionReason {
+            pub const ALL: [Self; define_terminal_session_reasons!(@count $($variant),+)] =
+                [$(Self::$variant),+];
+
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire),+
+                }
+            }
+
+            pub fn close_reason(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $close),+
+                }
+            }
         }
+
+        $(const _: () = assert!(close_text_matches_wire($wire, $close));)+
+    };
+    (@count $($variant:ident),+) => {
+        <[()]>::len(&[$(define_terminal_session_reasons!(@one $variant)),+])
+    };
+    (@one $variant:ident) => { () };
+}
+
+define_terminal_session_reasons! {
+    Drained => "drained", "drained",
+    SessionCap => "session_cap", "session cap",
+    TurnCap => "turn_cap", "turn cap",
+    RateLimit => "rate_limit", "rate limit",
+    CostBudget => "cost_budget", "cost budget",
+    ProviderAuthFailed => "provider_auth_failed", "provider auth failed",
+    ProviderRateLimited => "provider_rate_limited", "provider rate limited",
+    ProviderTimeout => "provider_timeout", "provider timeout",
+    ProviderMalformedStream => "provider_malformed_stream", "provider malformed stream",
+    ProviderNetworkDisconnect => "provider_network_disconnect", "provider network disconnect",
+    SlowClient => "slow_client", "slow client",
+    ProviderCancelled => "provider_cancelled", "provider cancelled",
+    PartialStageSuccess => "partial_stage_success", "partial stage success",
+    DurabilityDegraded => "durability_degraded", "durability degraded",
+    ToolExecutorFailure => "tool_executor_failure", "tool executor failure",
+    Rollback => "rollback", "rollback",
+}
+
+const _: () = assert!(TerminalSessionReason::ALL.len() == 16);
+
+impl fmt::Display for TerminalSessionReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
