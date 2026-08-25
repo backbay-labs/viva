@@ -5,7 +5,6 @@ import {
   type ConceptStatus,
   type EvaluationLabel,
   type RuntimeCopyCause,
-  reviewIntervalForStatus,
   type SourceReference,
   VIVA_LEARNER_LOOP_CONTRACT,
   type VivaReadyFrame,
@@ -790,8 +789,11 @@ function statusLabel(status: ConceptStatus): string {
   }
 }
 
-export function conceptStatusVerdict(status: ConceptStatus, now: Date): string {
-  return `${statusLabel(status)} · review ${reviewIntervalForStatus(status, now)}`;
+export function conceptStatusVerdict(status: ConceptStatus): string {
+  // Interim A-08 bridge: the client-side FSRS interval fabrication was removed
+  // with D-01A (packages/core no longer exports it). The authoritative in-session
+  // review verdict arrives with Plan 10's node-10 rewrite of this projection.
+  return statusLabel(status);
 }
 
 /** The three marking families the margin uses (collapsing the 7 eval labels). */
@@ -928,7 +930,7 @@ export function projectSessionQuestion(
     sourceSubtitle: source.retrievalReason ?? "",
     excerpt: source.excerpt,
     sourceFooter: source.label,
-    status: evaluation ? conceptStatusVerdict(evaluation.conceptStatus, now) : "",
+    status: evaluation ? conceptStatusVerdict(evaluation.conceptStatus) : "",
     highlights: agentQuestion.expectedTerms,
     correctionFamily: evaluation ? correctionFamily(evaluation.label) : undefined,
     correctionEmphasis: evaluation
@@ -1053,7 +1055,7 @@ function sourceFolioCaveat(source: SourceReference, state: SourceFolioState): st
 
 function projectedFolioConceptStatus(derived: VivaAgentDerivedState, now: Date): string {
   const status = derived.currentConceptStatus ?? derived.evaluation?.conceptStatus;
-  return status ? conceptStatusVerdict(status, now) : "Awaiting concept status";
+  return status ? conceptStatusVerdict(status) : "Awaiting concept status";
 }
 
 function boundedSourceExcerpt(excerpt: string): string {

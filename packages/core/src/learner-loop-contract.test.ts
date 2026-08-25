@@ -1,11 +1,19 @@
 import { describe, expect, test } from "bun:test";
+import { VIVA_AGENT_TERMINAL_SESSION_REASONS } from "./agent-contract";
 import {
+  deepFreeze,
+  VIVA_LEARNER_LOOP_ACTION_INTENTS,
+  VIVA_LEARNER_LOOP_AUTHORITIES,
   VIVA_LEARNER_LOOP_CONTRACT,
   VIVA_LEARNER_LOOP_EVIDENCE_FIELDS,
   VIVA_LEARNER_LOOP_MAX_TURN_MS,
+  VIVA_LEARNER_LOOP_RESOLUTION_KINDS,
+  VIVA_LEARNER_LOOP_TERMINAL_REASONS,
+  VIVA_PRE_LOOP_TERMINAL_REASONS,
   VIVA_RUNTIME_COPY_CAUSES,
   validateLearnerLoopContract,
 } from "./learner-loop-contract";
+import contractJson from "./learner-loop-contract.json" with { type: "json" };
 
 const REQUIRED_STATE_IDS = Object.freeze([
   "pre_loop_upload",
@@ -220,5 +228,536 @@ describe("BAC-510 learner loop contract", () => {
     for (const cause of VIVA_RUNTIME_COPY_CAUSES) {
       expect(contractCauses.has(cause)).toBe(true);
     }
+  });
+});
+
+/**
+ * `LEARN-006` — the learner-loop JSON is untrusted input.
+ *
+ * Every case below clones the raw JSON, mutates exactly one field, and requires a
+ * field-specific validation error. A mutation that only produced a wrong-shaped
+ * `LearnerLoopContract` at the type level would prove nothing: the validator is
+ * the only thing standing between a hand-edited JSON file and learner-visible
+ * copy, so it has to reject each drift on its own.
+ */
+type JsonRecord = Record<string, unknown>;
+
+function rawContract(): JsonRecord {
+  return JSON.parse(JSON.stringify(contractJson)) as JsonRecord;
+}
+
+function rawStates(contract: JsonRecord): JsonRecord[] {
+  return contract.states as JsonRecord[];
+}
+
+function rawState(contract: JsonRecord, id: string): JsonRecord {
+  const state = rawStates(contract).find((candidate) => candidate.id === id);
+  if (!state) {
+    throw new Error(`learner loop fixture is missing state ${id}`);
+  }
+  return state;
+}
+
+function rawCopy(contract: JsonRecord, id: string): JsonRecord {
+  return rawState(contract, id).copy as JsonRecord;
+}
+
+function rawStrings(record: JsonRecord, key: string): string[] {
+  return record[key] as string[];
+}
+
+const SCHEMA_DRIFT_CASES: ReadonlyArray<{
+  readonly name: string;
+  readonly mutate: (contract: JsonRecord) => void;
+  readonly message: string;
+}> = Object.freeze([
+  {
+    name: "schema",
+    mutate: (contract) => {
+      contract.schema = "viva.learner_loop_contract.v2";
+    },
+    message: "Invalid learner loop contract schema",
+  },
+  {
+    name: "authority",
+    mutate: (contract) => {
+      rawState(contract, "durability_degraded").authority = "optimistic_ui";
+    },
+    message: "Unknown learner loop authority optimistic_ui",
+  },
+  {
+    name: "resolution kind",
+    mutate: (contract) => {
+      rawState(contract, "happy_feedback").resolution_kind = "probably_fine";
+    },
+    message: "Unknown learner loop resolution kind probably_fine",
+  },
+  {
+    name: "primary action intent",
+    mutate: (contract) => {
+      rawCopy(contract, "retry_prompt").primary_action_intent = "open_provider_console";
+    },
+    message: "Unknown learner loop primary action intent open_provider_console",
+  },
+  {
+    name: "next action intent",
+    mutate: (contract) => {
+      rawCopy(contract, "retry_prompt").next_action_intent = "open_provider_console";
+    },
+    message: "Unknown learner loop next action intent open_provider_console",
+  },
+  {
+    name: "learner_safe",
+    mutate: (contract) => {
+      rawState(contract, "turn_cap").learner_safe = false;
+    },
+    message: "Learner loop state turn_cap must declare learner_safe true",
+  },
+  {
+    name: "sanitized_evidence",
+    mutate: (contract) => {
+      rawState(contract, "turn_cap").sanitized_evidence = false;
+    },
+    message: "Learner loop state turn_cap must declare sanitized_evidence true",
+  },
+  {
+    name: "evidence incident sanitized_evidence",
+    mutate: (contract) => {
+      (contract.evidence_incident as JsonRecord).sanitized_evidence = false;
+    },
+    message: "Learner loop evidence_incident must declare sanitized_evidence true",
+  },
+  {
+    name: "terminal reason",
+    mutate: (contract) => {
+      rawState(contract, "rollback").terminal_reason = "roll_back";
+    },
+    message: "Unknown learner loop terminal reason roll_back",
+  },
+  {
+    name: "runtime copy cause",
+    mutate: (contract) => {
+      rawStrings(rawState(contract, "provider_rate_limit"), "runtime_copy_causes")[0] =
+        "provider_quota";
+    },
+    message: "Unknown runtime copy cause provider_quota",
+  },
+  {
+    name: "evidence field",
+    mutate: (contract) => {
+      rawStrings(rawState(contract, "deploy_drain"), "operator_diagnostics").push("response_body");
+    },
+    message: "Unknown learner loop evidence field response_body",
+  },
+  {
+    name: "contract max bound",
+    mutate: (contract) => {
+      contract.max_submitted_answer_resolution_ms = 60_000;
+    },
+    message: "Invalid learner loop max submitted-answer resolution",
+  },
+  {
+    name: "state max bound",
+    mutate: (contract) => {
+      rawState(contract, "turn_cap").max_resolution_ms = 60_000;
+    },
+    message: "Invalid submitted-answer bound for turn_cap",
+  },
+  {
+    name: "duplicate state id",
+    mutate: (contract) => {
+      const states = rawStates(contract);
+      states.push(JSON.parse(JSON.stringify(states[0])) as JsonRecord);
+    },
+    message: "Duplicate learner loop state id pre_loop_upload",
+  },
+  {
+    name: "duplicate resolution key",
+    mutate: (contract) => {
+      rawState(contract, "turn_cap").terminal_reason = "rollback";
+    },
+    message: "Duplicate submitted-answer resolution key rollback",
+  },
+  {
+    name: "duplicate runtime cause",
+    mutate: (contract) => {
+      rawStrings(rawState(contract, "provider_timeout"), "runtime_copy_causes").push(
+        "provider_timeout",
+      );
+    },
+    message: "Duplicate runtime copy cause provider_timeout",
+  },
+  {
+    name: "duplicate operator diagnostic",
+    mutate: (contract) => {
+      rawStrings(rawState(contract, "deploy_drain"), "operator_diagnostics").push("stage");
+    },
+    message: "Duplicate learner loop evidence field stage",
+  },
+  {
+    name: "unmapped runtime cause",
+    mutate: (contract) => {
+      rawState(contract, "rollback").runtime_copy_causes = [];
+    },
+    message: "Unmapped runtime copy cause rollback",
+  },
+  {
+    name: "missing success mapping",
+    mutate: (contract) => {
+      for (const state of rawStates(contract)) {
+        if (state.resolution_kind === "success") {
+          state.resolution_kind = "recoverable";
+        }
+      }
+    },
+    message: "Learner loop contract has no success resolution state",
+  },
+  {
+    name: "unknown contract field",
+    mutate: (contract) => {
+      contract.owner_override = "ops";
+    },
+    message: "Unknown learner loop contract field owner_override",
+  },
+  {
+    name: "missing state field",
+    mutate: (contract) => {
+      delete rawState(contract, "refresh").stage;
+    },
+    message: "Learner loop state refresh is missing stage",
+  },
+  {
+    name: "unknown copy field",
+    mutate: (contract) => {
+      rawCopy(contract, "refresh").provider_message = "429 from upstream";
+    },
+    message: "Unknown learner loop copy field provider_message",
+  },
+  {
+    name: "evidence field list",
+    mutate: (contract) => {
+      rawStrings(contract, "evidence_fields").pop();
+    },
+    message: "Invalid learner loop evidence fields",
+  },
+]);
+
+describe("LEARN-006 learner loop contract validates unknown input", () => {
+  test("accepts the canonical JSON handed in as unknown", () => {
+    const parsed = validateLearnerLoopContract(rawContract() as unknown);
+
+    expect(parsed.schema).toBe("viva.learner_loop_contract.v1");
+    expect(parsed.states.length).toBe(VIVA_LEARNER_LOOP_CONTRACT.states.length);
+    expect(parsed.states.map((state) => state.id)).toEqual(
+      VIVA_LEARNER_LOOP_CONTRACT.states.map((state) => state.id),
+    );
+  });
+
+  test("rejects values that are not a contract object at all", () => {
+    for (const value of [null, undefined, 7, "contract", true, [], () => undefined]) {
+      expect(() => validateLearnerLoopContract(value)).toThrow(
+        "Learner loop contract must be an object",
+      );
+    }
+  });
+
+  for (const drift of SCHEMA_DRIFT_CASES) {
+    test(`rejects drift in ${drift.name}`, () => {
+      const contract = rawContract();
+      drift.mutate(contract);
+
+      expect(() => validateLearnerLoopContract(contract)).toThrow(drift.message);
+    });
+  }
+
+  test("publishes the closed allowlists the validator enforces", () => {
+    expect([...VIVA_LEARNER_LOOP_RESOLUTION_KINDS].sort()).toEqual([
+      "deferred",
+      "recoverable",
+      "success",
+      "terminal",
+    ]);
+    expect([...VIVA_LEARNER_LOOP_AUTHORITIES].sort()).toEqual([
+      "agent_event",
+      "client_lifecycle_event",
+      "durable_store_event",
+      "pre_loop_service_event",
+      "server_control_event",
+      "session_event",
+    ]);
+    expect([...VIVA_LEARNER_LOOP_ACTION_INTENTS].sort()).toEqual([
+      "disabled",
+      "refresh_session",
+      "retry_agent",
+      "start_session",
+      "submit_turn",
+    ]);
+
+    const resolutionKinds = new Set<string>(VIVA_LEARNER_LOOP_RESOLUTION_KINDS);
+    const authorities = new Set<string>(VIVA_LEARNER_LOOP_AUTHORITIES);
+    const intents = new Set<string>(VIVA_LEARNER_LOOP_ACTION_INTENTS);
+    for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {
+      expect(resolutionKinds.has(state.resolution_kind)).toBe(true);
+      expect(authorities.has(state.authority)).toBe(true);
+      expect(intents.has(state.copy.primary_action_intent)).toBe(true);
+      expect(intents.has(state.copy.next_action_intent)).toBe(true);
+    }
+  });
+
+  test("gives every state an explicit next action intent", () => {
+    for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {
+      expect(state.copy.next_action_label.length).toBeGreaterThan(0);
+      expect(state.copy.next_action_intent.length).toBeGreaterThan(0);
+    }
+  });
+
+  test("returns a reconstructed contract, not the caller's object", () => {
+    const contract = rawContract();
+    const parsed = validateLearnerLoopContract(contract);
+
+    expect(parsed).not.toBe(contract);
+    expect(Object.isFrozen(parsed)).toBe(true);
+    expect(Object.isFrozen(parsed.states)).toBe(true);
+    expect(Object.isFrozen(parsed.states[0]?.copy)).toBe(true);
+  });
+});
+
+/**
+ * `LEARN-006A` — one terminal-reason authority.
+ *
+ * The learner loop must not keep its own copy of a terminal reason. Every value
+ * it accepts comes from the agent protocol's terminal vocabulary or from the
+ * pre-loop vocabulary; a literal repeated here is a second declaration that can
+ * silently outlive the arm it duplicates.
+ */
+const NON_TERMINAL_REASON_CANDIDATES = Object.freeze([
+  "roll_back",
+  "store_unavailable",
+  "session_disconnected",
+  "pre_loop_upload",
+  "recap_success",
+]);
+
+describe("LEARN-006A composes the terminal-reason allowlist once", () => {
+  test("equals the two authoritative arrays in order and has no duplicates", () => {
+    expect([...VIVA_LEARNER_LOOP_TERMINAL_REASONS]).toEqual([
+      ...VIVA_AGENT_TERMINAL_SESSION_REASONS,
+      ...VIVA_PRE_LOOP_TERMINAL_REASONS,
+    ]);
+    expect(new Set(VIVA_LEARNER_LOOP_TERMINAL_REASONS).size).toBe(
+      VIVA_LEARNER_LOOP_TERMINAL_REASONS.length,
+    );
+  });
+
+  test("carries durability_degraded exactly once, through the agent vocabulary", () => {
+    expect(
+      VIVA_LEARNER_LOOP_TERMINAL_REASONS.filter((reason) => reason === "durability_degraded"),
+    ).toEqual(["durability_degraded"]);
+    expect([...VIVA_AGENT_TERMINAL_SESSION_REASONS]).toContain("durability_degraded");
+    expect([...VIVA_PRE_LOOP_TERMINAL_REASONS]).not.toContain("durability_degraded");
+  });
+
+  test("is the only set validateLearnerLoopContract accepts terminal reasons from", () => {
+    // `session_cap` is terminal and is not a submitted-answer resolution, so
+    // retargeting its terminal reason exercises the allowlist without colliding
+    // with another state's resolution key.
+    for (const reason of VIVA_LEARNER_LOOP_TERMINAL_REASONS) {
+      const contract = rawContract();
+      rawState(contract, "session_cap").terminal_reason = reason;
+
+      const parsed = validateLearnerLoopContract(contract as unknown);
+      const session = parsed.states.find((state) => state.id === "session_cap");
+      expect(session?.terminal_reason).toBe(reason);
+    }
+
+    const allowed = new Set<string>(VIVA_LEARNER_LOOP_TERMINAL_REASONS);
+    for (const reason of NON_TERMINAL_REASON_CANDIDATES) {
+      expect(allowed.has(reason)).toBe(false);
+
+      const contract = rawContract();
+      rawState(contract, "session_cap").terminal_reason = reason;
+
+      expect(() => validateLearnerLoopContract(contract as unknown)).toThrow(
+        `Unknown learner loop terminal reason ${reason}`,
+      );
+    }
+  });
+
+  test("covers every terminal reason the canonical contract declares", () => {
+    const allowed = new Set<string>(VIVA_LEARNER_LOOP_TERMINAL_REASONS);
+    const declared = VIVA_LEARNER_LOOP_CONTRACT.states
+      .map((state) => state.terminal_reason)
+      .filter((reason): reason is NonNullable<typeof reason> => reason !== undefined);
+
+    expect(declared.length).toBeGreaterThan(0);
+    for (const reason of declared) {
+      expect(allowed.has(reason)).toBe(true);
+    }
+    expect(declared).toContain("durability_degraded");
+  });
+});
+
+/**
+ * `LEARN-007` — a persisted recap is a learner outcome, not a disconnect.
+ *
+ * A session whose recap was saved has succeeded. Without its own success state
+ * the surface has nothing to show but the transport's terminal copy, so a clean
+ * or unclean close after `recap_ready` reads as a failure. `session_completed`
+ * is that outcome: non-terminal, holding its own submitted-answer resolution
+ * key, and reached only through the `recap_success` runtime cause.
+ */
+const SESSION_COMPLETED_COPY = Object.freeze({
+  capsule_label: "Session complete",
+  marginalia_title: "Session recap ready.",
+  marginalia_text: "Viva saved the evidence-backed recap and review plan.",
+  next_action_label: "Start a new session",
+  next_action_intent: "start_session",
+  primary_action_label: "Start a new session",
+  primary_action_intent: "start_session",
+  status_label: "session complete",
+});
+
+describe("LEARN-007 successful session completion", () => {
+  test("declares the exact session_completed state", () => {
+    const state = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+      (candidate) => candidate.id === "session_completed",
+    );
+
+    expect(state).not.toBeUndefined();
+    expect(state?.label).toBe("Session completed");
+    expect(state?.stage).toBe("recap");
+    expect(state?.resolution_kind).toBe("success");
+    expect(state?.submitted_answer_resolution).toBe(true);
+    expect(state?.max_resolution_ms).toBe(45_000);
+    expect(state?.learner_safe).toBe(true);
+    expect(state?.authority).toBe("durable_store_event");
+    expect(state?.sanitized_evidence).toBe(true);
+    expect(state?.runtime_copy_causes).toEqual(["recap_success"]);
+    expect(state?.copy).toEqual({ ...SESSION_COMPLETED_COPY });
+    expect(state?.operator_diagnostics).toEqual(["stage", "deploy_sha", "recap_success"]);
+  });
+
+  test("is not terminal and names no terminal reason", () => {
+    const state = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+      (candidate) => candidate.id === "session_completed",
+    );
+
+    expect(state).not.toBeUndefined();
+    expect(state?.resolution_kind).not.toBe("terminal");
+    expect(state?.terminal_reason).toBeUndefined();
+    expect(state?.failure_class).toBeUndefined();
+    expect(state?.failure_matrix).toBeUndefined();
+  });
+
+  test("holds its own submitted-answer resolution key", () => {
+    const keys = VIVA_LEARNER_LOOP_CONTRACT.states
+      .filter((state) => state.submitted_answer_resolution)
+      .map((state) => state.terminal_reason ?? state.failure_class ?? state.id);
+
+    expect(keys.filter((key) => key === "session_completed")).toEqual(["session_completed"]);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  test("maps the new recap_success runtime copy cause exactly once", () => {
+    expect([...VIVA_RUNTIME_COPY_CAUSES]).toContain("recap_success");
+
+    const mapped = VIVA_LEARNER_LOOP_CONTRACT.states
+      .filter((state) => (state.runtime_copy_causes as readonly string[]).includes("recap_success"))
+      .map((state) => state.id);
+
+    expect(mapped).toEqual(["session_completed"]);
+  });
+
+  test("does not turn recap_success into a terminal reason", () => {
+    expect([...VIVA_LEARNER_LOOP_TERMINAL_REASONS]).not.toContain("recap_success");
+
+    const contract = rawContract();
+    rawState(contract, "session_completed").terminal_reason = "recap_success";
+
+    expect(() => validateLearnerLoopContract(contract as unknown)).toThrow(
+      "Unknown learner loop terminal reason recap_success",
+    );
+  });
+});
+
+/**
+ * Assert that a write to deep-frozen data fails instead of silently succeeding.
+ *
+ * ES modules are always strict mode, so assigning to a frozen property — or
+ * extending a frozen array — throws a `TypeError`. The engine's message differs
+ * between assignment and extension, so the assertion is on the error type.
+ */
+function expectFrozenWrite(mutate: () => void): void {
+  let thrown: unknown;
+  try {
+    mutate();
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown instanceof TypeError ? "TypeError" : String(thrown)).toBe("TypeError");
+}
+
+/**
+ * `LEARN-010` — the validated contract is data, not a mutable scratch object.
+ *
+ * Every consumer (the recovery-copy projection, the web session projection, the
+ * four raw-JSON script consumers) reads the same single validated instance. A
+ * shallow freeze leaves the interesting state — a state's learner copy, its
+ * runtime causes, its operator diagnostics — writable, so one surface could
+ * quietly rewrite the copy every other surface then renders. These tests assert
+ * the freeze reaches those nested values, and that the one freeze utility
+ * terminates on a self-referential value instead of overflowing the stack.
+ */
+describe("LEARN-010 deep-frozen learner loop contract", () => {
+  test("the one deep-freeze utility terminates on a self-referential value", () => {
+    type SelfReferential = { name: string; self?: SelfReferential; children: SelfReferential[] };
+    const node: SelfReferential = { name: "root", children: [] };
+    node.self = node;
+    node.children.push(node);
+
+    expect(deepFreeze(node)).toBe(node);
+    expect(Object.isFrozen(node)).toBe(true);
+    expect(Object.isFrozen(node.children)).toBe(true);
+    expectFrozenWrite(() => {
+      node.name = "rewritten";
+    });
+  });
+
+  test("freezes nested state copy, runtime causes, and operator diagnostics", () => {
+    const before = JSON.stringify(VIVA_LEARNER_LOOP_CONTRACT);
+    const state = VIVA_LEARNER_LOOP_CONTRACT.states[0];
+
+    expect(Object.isFrozen(VIVA_LEARNER_LOOP_CONTRACT)).toBe(true);
+    expect(Object.isFrozen(VIVA_LEARNER_LOOP_CONTRACT.states)).toBe(true);
+    expect(Object.isFrozen(state)).toBe(true);
+    expectFrozenWrite(() => {
+      VIVA_LEARNER_LOOP_CONTRACT.states.push(state);
+    });
+    expectFrozenWrite(() => {
+      state.copy.capsule_label = "rewritten";
+    });
+    expectFrozenWrite(() => {
+      state.copy.next_action_intent = "disabled";
+    });
+    expectFrozenWrite(() => {
+      state.runtime_copy_causes.push("recap_success");
+    });
+    expectFrozenWrite(() => {
+      state.operator_diagnostics.push("stage");
+    });
+
+    expect(JSON.stringify(VIVA_LEARNER_LOOP_CONTRACT)).toBe(before);
+  });
+
+  test("a separately validated contract is frozen the same way", () => {
+    const contract = validateLearnerLoopContract(rawContract() as unknown);
+    const state = contract.states[0];
+
+    expect(contract).not.toBe(VIVA_LEARNER_LOOP_CONTRACT);
+    expect(Object.isFrozen(contract)).toBe(true);
+    expect(Object.isFrozen(state.copy)).toBe(true);
+    expectFrozenWrite(() => {
+      state.stage = "rewritten";
+    });
   });
 });

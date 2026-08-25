@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  type LearnerLoopState,
   VIVA_LEARNER_LOOP_CONTRACT,
   VIVA_LEARNER_LOOP_EVIDENCE_FIELDS,
 } from "./learner-loop-contract";
 import {
+  learnerRecoveryCopyEntry,
   learnerRecoveryCopyForState,
   VIVA_LEARNER_RECOVERY_COPY_CONTRACT,
 } from "./learner-recovery-copy";
@@ -154,5 +156,225 @@ describe("BAC-523 learner recovery copy contract", () => {
       expect(entry?.learner.secondary_action.label).toBe("Refresh session");
       expect(entry?.learner.secondary_action.intent).toBe("refresh_session");
     }
+  });
+});
+
+/**
+ * `LEARN-006` — the secondary action carries the state's own next-action intent.
+ *
+ * Reusing `primary_action_intent` for both buttons silently rewrites what the
+ * second button does. The synthetic entry below is the only honest way to see
+ * that: it is the one state whose two intents differ, so a validator that reads
+ * the wrong field cannot pass by coincidence.
+ */
+describe("LEARN-006 recovery actions keep distinct intents", () => {
+  test("derives every secondary action from next_action_label and next_action_intent", () => {
+    for (const state of VIVA_LEARNER_LOOP_CONTRACT.states) {
+      const entry = learnerRecoveryCopyForState(state.id);
+      expect(entry?.learner.primary_action.label).toBe(state.copy.primary_action_label);
+      expect(entry?.learner.primary_action.intent).toBe(state.copy.primary_action_intent);
+      expect(entry?.learner.secondary_action.label).toBe(state.copy.next_action_label);
+      expect(entry?.learner.secondary_action.intent).toBe(state.copy.next_action_intent);
+    }
+  });
+
+  test("keeps a retry_agent primary and a disabled next action distinct", () => {
+    const source = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+      (state) => state.id === "provider_timeout",
+    );
+    expect(source).not.toBeUndefined();
+    if (!source) return;
+
+    const entry = learnerRecoveryCopyEntry({
+      ...source,
+      copy: {
+        ...source.copy,
+        next_action_label: "Wait for result",
+        next_action_intent: "disabled",
+        primary_action_label: "Retry agent",
+        primary_action_intent: "retry_agent",
+      },
+    });
+
+    expect(entry.learner.primary_action).toEqual({ label: "Retry agent", intent: "retry_agent" });
+    expect(entry.learner.secondary_action).toEqual({
+      label: "Wait for result",
+      intent: "disabled",
+    });
+    expect(entry.learner.secondary_action.intent).not.toBe(entry.learner.primary_action.intent);
+  });
+});
+
+/**
+ * `LEARN-007` — completion copy is a success, not a recovery from a disconnect.
+ */
+describe("LEARN-007 session completion recovery copy", () => {
+  test("offers a new session and never reads as a failure", () => {
+    const entry = learnerRecoveryCopyForState("session_completed");
+
+    expect(entry).not.toBeUndefined();
+    expect(entry?.resolution_kind).toBe("success");
+    expect(entry?.submitted_answer_resolution).toBe(true);
+    expect(entry?.runtime_copy_causes).toEqual(["recap_success"]);
+    expect(entry?.learner.capsule_label).toBe("Session complete");
+    expect(entry?.learner.marginalia_title).toBe("Session recap ready.");
+    expect(entry?.learner.status_label).toBe("session complete");
+    expect(entry?.learner.primary_action).toEqual({
+      label: "Start a new session",
+      intent: "start_session",
+    });
+    expect(entry?.learner.secondary_action).toEqual({
+      label: "Start a new session",
+      intent: "start_session",
+    });
+    expect(entry?.operator.stage).toBe("recap");
+    expect(entry?.operator.diagnostic_fields).toEqual(["stage", "deploy_sha", "recap_success"]);
+    expect(entry?.operator.terminal_reason).toBeUndefined();
+    expect(entry?.operator.failure_class).toBeUndefined();
+
+    const text = learnerCopyText("session_completed");
+    expect(text.length).toBeGreaterThan(0);
+    expect(/disconnect|lost|failed|error|try again/i.test(text)).toBe(false);
+    for (const forbidden of FORBIDDEN_LEARNER_COPY_PATTERNS) {
+      expect(forbidden.test(text)).toBe(false);
+    }
+  });
+});
+
+/**
+ * Assert that a write to deep-frozen data fails instead of silently succeeding.
+ *
+ * ES modules are always strict mode, so assigning to a frozen property — or
+ * extending a frozen array — throws a `TypeError`. The engine's message differs
+ * between assignment and extension, so the assertion is on the error type.
+ */
+function expectFrozenWrite(mutate: () => void): void {
+  let thrown: unknown;
+  try {
+    mutate();
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown instanceof TypeError ? "TypeError" : String(thrown)).toBe("TypeError");
+}
+
+/**
+ * `LEARN-010` — the recovery copy contract is derived, validated data.
+ *
+ * `Object.freeze` on the contract object alone left `states`, each entry, and
+ * each learner action writable, so a consumer could rewrite the button label or
+ * intent that every other consumer then renders. The copy is generated once from
+ * the validated learner-loop contract; nothing downstream may edit it in place.
+ */
+describe("LEARN-010 the recovery copy contract is deeply immutable", () => {
+  test("states, learner actions, and operator diagnostics cannot be rewritten", () => {
+    const contract = VIVA_LEARNER_RECOVERY_COPY_CONTRACT;
+    const before = JSON.stringify(contract);
+    const first = contract.states[0];
+
+    expect(Object.isFrozen(contract)).toBe(true);
+    expect(Object.isFrozen(contract.states)).toBe(true);
+    expect(Object.isFrozen(first)).toBe(true);
+    expectFrozenWrite(() => {
+      contract.states.push(first);
+    });
+    expectFrozenWrite(() => {
+      first.learner.capsule_label = "rewritten";
+    });
+    expectFrozenWrite(() => {
+      first.learner.primary_action.label = "rewritten";
+    });
+    expectFrozenWrite(() => {
+      first.learner.secondary_action.intent = "disabled";
+    });
+    expectFrozenWrite(() => {
+      first.operator.diagnostic_fields.push("stage");
+    });
+    expectFrozenWrite(() => {
+      first.runtime_copy_causes.push("recap_success");
+    });
+
+    expect(JSON.stringify(contract)).toBe(before);
+  });
+
+  test("a freshly projected entry is frozen the same way", () => {
+    const entry = learnerRecoveryCopyEntry(VIVA_LEARNER_LOOP_CONTRACT.states[0]);
+    const before = JSON.stringify(entry);
+
+    expect(Object.isFrozen(entry)).toBe(true);
+    expect(Object.isFrozen(entry.learner)).toBe(true);
+    expect(Object.isFrozen(entry.operator)).toBe(true);
+    expectFrozenWrite(() => {
+      entry.state_label = "rewritten";
+    });
+    expectFrozenWrite(() => {
+      entry.learner.primary_action.intent = "disabled";
+    });
+
+    expect(JSON.stringify(entry)).toBe(before);
+  });
+
+  test("the looked-up entry is the frozen contract entry, not a mutable copy", () => {
+    const entry = learnerRecoveryCopyForState("durability_degraded");
+
+    expect(entry).not.toBeUndefined();
+    expect(Object.isFrozen(entry)).toBe(true);
+  });
+
+  /**
+   * `LEARN-010` — the deep freeze is applied to reconstructed data only.
+   *
+   * `deepFreeze` documents that it "is never applied to caller-owned input",
+   * and Step 3 scopes it to "only reconstructed validated data". Every other
+   * field of the projected entry is rebuilt from scalars, but
+   * `runtime_copy_causes` and `diagnostic_fields` were handed straight through
+   * from the argument, so projecting a caller's state froze two arrays the
+   * caller still owned. That is invisible while every in-repo caller passes an
+   * already-frozen contract state, and a surprise the first time a caller
+   * builds its own state and then cannot append to it.
+   */
+  test("projecting a caller-owned state does not freeze the caller's arrays", () => {
+    const callerCauses: LearnerLoopState["runtime_copy_causes"] = ["live_runtime"];
+    const callerDiagnostics: LearnerLoopState["operator_diagnostics"] = ["stage"];
+    const callerState: LearnerLoopState = {
+      id: "caller_owned_state",
+      label: "Caller owned state",
+      stage: "session_active",
+      resolution_kind: "recoverable",
+      submitted_answer_resolution: false,
+      max_resolution_ms: 1_000,
+      learner_safe: true,
+      authority: "session_event",
+      sanitized_evidence: true,
+      runtime_copy_causes: callerCauses,
+      copy: {
+        capsule_label: "Caller capsule",
+        marginalia_title: "Caller title",
+        marginalia_text: "Caller text",
+        next_action_label: "Caller next",
+        next_action_intent: "disabled",
+        primary_action_label: "Caller primary",
+        primary_action_intent: "retry_agent",
+        status_label: "Caller status",
+      },
+      operator_diagnostics: callerDiagnostics,
+    };
+
+    const entry = learnerRecoveryCopyEntry(callerState);
+
+    expect(Object.isFrozen(callerCauses)).toBe(false);
+    expect(Object.isFrozen(callerDiagnostics)).toBe(false);
+    expect(entry.runtime_copy_causes).not.toBe(callerCauses);
+    expect(entry.operator.diagnostic_fields).not.toBe(callerDiagnostics);
+    expect(Object.isFrozen(entry.runtime_copy_causes)).toBe(true);
+    expect(Object.isFrozen(entry.operator.diagnostic_fields)).toBe(true);
+    expect([...entry.runtime_copy_causes]).toEqual(["live_runtime"]);
+    expect([...entry.operator.diagnostic_fields]).toEqual(["stage"]);
+
+    callerCauses.push("agent_offline");
+    callerDiagnostics.push("provider");
+
+    expect([...entry.runtime_copy_causes]).toEqual(["live_runtime"]);
+    expect([...entry.operator.diagnostic_fields]).toEqual(["stage"]);
   });
 });

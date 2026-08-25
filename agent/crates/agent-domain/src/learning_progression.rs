@@ -41,6 +41,7 @@ pub enum ProgressionPolicyId {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuestionProgressionCursor {
     pub voice_session_id: String,
     pub policy: ProgressionPolicyId,
@@ -52,6 +53,7 @@ pub struct QuestionProgressionCursor {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum QuestionProgressionResult {
     Selected {
         question: StudyQuestion,

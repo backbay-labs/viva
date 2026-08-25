@@ -59,6 +59,7 @@ impl From<StudyProjectionVersionV1> for u64 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticatedStudyProjectionV1 {
     pub version: StudyProjectionVersionV1,
     pub study_set: StudyProjectionStudySetV1,
@@ -71,6 +72,7 @@ pub struct AuthenticatedStudyProjectionV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct StudyProjectionStudySetV1 {
     pub id: String,
     pub title: String,
@@ -81,6 +83,7 @@ pub struct StudyProjectionStudySetV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct StudyProjectionSessionV1 {
     pub id: String,
     pub mode: StudyMode,
@@ -89,6 +92,7 @@ pub struct StudyProjectionSessionV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct StudyProjectionConceptV1 {
     pub id: String,
     pub label: String,
@@ -99,6 +103,7 @@ pub struct StudyProjectionConceptV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct StudyProjectionActiveQuestionV1 {
     pub id: String,
     pub concept_id: String,
@@ -108,6 +113,7 @@ pub struct StudyProjectionActiveQuestionV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct StudyProjectionSourceCitationV1 {
     pub source_id: String,
     pub document_id: String,
@@ -118,6 +124,7 @@ pub struct StudyProjectionSourceCitationV1 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct StudyProjectionQuestionProgressV1 {
     pub completed: u32,
     pub total: u32,
@@ -125,6 +132,7 @@ pub struct StudyProjectionQuestionProgressV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct StudyProjectionReviewItemV1 {
     pub concept_id: String,
     pub due_at: String,

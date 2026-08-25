@@ -26,12 +26,14 @@ pub const VIVA_TURN_OUTCOME_RECORD_SCHEMA: &str = "viva.turn_outcome_record.v1";
 pub const VIVA_CHALLENGE_RESOLUTION_SCHEMA: &str = "viva.challenge_resolution.v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluationRubricV1 {
     pub policy_version: String, // exactly "viva.semantic-rubric.v1"
     pub criteria: Vec<RubricCriterionV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RubricCriterionV1 {
     pub criterion_id: String,
     pub concept_id: String,
@@ -41,6 +43,7 @@ pub struct RubricCriterionV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluationRequest {
     pub response_id: String,
     pub question: StudyQuestion,
@@ -57,6 +60,7 @@ pub enum CriterionAssessmentKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CriterionAssessment {
     pub criterion_id: String,
     pub assessment: CriterionAssessmentKind,
@@ -95,6 +99,7 @@ pub enum EvaluationError {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum EvaluationDecision {
     Evaluated {
         assessments: Vec<CriterionAssessment>,
@@ -116,6 +121,7 @@ pub trait AnswerEvaluator: Send + Sync {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConceptStatusTransition {
     pub concept_id: String,
     pub from_status: ConceptStatus,
@@ -133,6 +139,7 @@ pub enum QuestionDisposition {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum TurnResolution {
     Evaluated {
         label: EvaluationLabel,
@@ -151,6 +158,7 @@ pub enum TurnResolution {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TurnOutcome {
     pub schema: String, // exactly "viva.turn_outcome.v1"
     pub response_id: String,
@@ -163,6 +171,7 @@ pub struct TurnOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TurnOutcomeRecordReceipt {
     pub schema: String, // exactly "viva.turn_outcome_record.v1"
     pub response_id: String,
@@ -170,6 +179,7 @@ pub struct TurnOutcomeRecordReceipt {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PersistedTurnOutcome {
     pub turn_outcome: TurnOutcome,
     pub record: TurnOutcomeRecordReceipt,
@@ -184,6 +194,7 @@ pub enum ChallengeDisposition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChallengeResolution {
     pub schema: String, // exactly "viva.challenge_resolution.v1"
     pub correction_id: String,

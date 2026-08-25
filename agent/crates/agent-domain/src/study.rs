@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ConceptStatus, SourceConfidence};
+use crate::{learning_outcome::EvaluationRubricV1, ConceptStatus, SourceConfidence};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,12 +112,21 @@ pub struct StudySourceReference {
     pub retrieval_reason: String,
 }
 
+/// One server-owned question.
+///
+/// `LEARN-002` added `concept_id` and `rubric`: the concept a question is bound
+/// to and the criteria an answer is graded against are server facts carried with
+/// the question, never values a provider may choose at evaluation time.
+/// `expected_terms` remains a retrieval/authoring aid; nothing in the learning
+/// authority grades against it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StudyQuestion {
     pub question_id: String,
+    pub concept_id: String,
     pub prompt: String,
     pub expected_terms: Vec<String>,
     pub follow_up: String,
+    pub rubric: EvaluationRubricV1,
     pub source: StudySourceReference,
 }
 
@@ -184,6 +193,56 @@ pub struct StudySessionRecap {
     pub source_moments: Vec<RecapSourceMoment>,
 }
 
+impl StudySessionRecap {
+    /// The V1 projection of the one evidence-derived v2 recap.
+    ///
+    /// `StudyMemoryStore::record_recap` still takes this V1 shape, because the
+    /// crate-root `StudySessionRecap` name is swapped to
+    /// [`crate::learning_recap::StudySessionRecap`] in Plan 06's second PR. Until
+    /// then, this is how the v2 fold reaches the store.
+    ///
+    /// Every value below is read off that single fold — there is no second recap
+    /// fold, no re-grading, and no invented fact. V1 cannot represent a v2
+    /// `(response_id, source_id)` moment, which carries no excerpt, confidence, or
+    /// status, so `source_moments` is empty rather than fabricated, and concepts
+    /// in the `Review` band appear only through `review_later`.
+    ///
+    /// This function and the four bucket arrays are a recorded LEARN-011-window
+    /// cleanup: when the root name swaps, its return type becomes the v2 recap and
+    /// the body stops compiling, which is the intended forcing function.
+    pub fn from_evidence_recap(recap: &crate::learning_recap::StudySessionRecap) -> Self {
+        let labels_with_status = |wanted: ConceptStatus| {
+            recap
+                .concepts
+                .iter()
+                .filter(|concept| concept.status == wanted)
+                .map(|concept| concept.label.clone())
+                .collect::<Vec<_>>()
+        };
+        Self {
+            voice_session_id: recap.voice_session_id.clone(),
+            headline: recap.headline.clone(),
+            summary: recap.summary.clone(),
+            strong_concepts: labels_with_status(ConceptStatus::Strong),
+            shaky_concepts: labels_with_status(ConceptStatus::Shaky),
+            missed_concepts: labels_with_status(ConceptStatus::Missed),
+            review_later: recap
+                .review_schedule
+                .iter()
+                .filter_map(|item| {
+                    recap
+                        .concepts
+                        .iter()
+                        .find(|concept| concept.concept_id == item.concept_id)
+                })
+                .map(|concept| concept.label.clone())
+                .collect(),
+            next_action: recap.next_action.clone(),
+            source_moments: Vec::new(),
+        }
+    }
+}
+
 pub fn fixture_source_reference() -> StudySourceReference {
     StudySourceReference {
         source_id: "src-lecture-5-slide-18".to_owned(),
@@ -198,6 +257,7 @@ pub fn fixture_source_reference() -> StudySourceReference {
 pub fn fixture_question() -> StudyQuestion {
     StudyQuestion {
         question_id: "q-oxidative-phosphorylation-nadh".to_owned(),
+        concept_id: "concept-oxidative-phosphorylation".to_owned(),
         prompt: "Explain the role of NADH in oxidative phosphorylation.".to_owned(),
         expected_terms: vec![
             "electron donor".to_owned(),
@@ -207,6 +267,31 @@ pub fn fixture_question() -> StudyQuestion {
         ],
         follow_up: "Now connect that electron flow to ATP synthase in one precise sentence."
             .to_owned(),
+        rubric: fixture_rubric(),
         source: fixture_source_reference(),
+    }
+}
+
+pub fn fixture_rubric() -> EvaluationRubricV1 {
+    EvaluationRubricV1 {
+        policy_version: crate::learning_outcome::VIVA_SEMANTIC_RUBRIC_POLICY_VERSION.to_owned(),
+        criteria: vec![
+            crate::learning_outcome::RubricCriterionV1 {
+                criterion_id: "crit-oxphos-donor".to_owned(),
+                concept_id: "concept-oxidative-phosphorylation".to_owned(),
+                claim: "NADH donates high-energy electrons to the electron transport chain."
+                    .to_owned(),
+                source_id: "src-lecture-5-slide-18".to_owned(),
+                required: true,
+            },
+            crate::learning_outcome::RubricCriterionV1 {
+                criterion_id: "crit-oxphos-gradient".to_owned(),
+                concept_id: "concept-oxidative-phosphorylation".to_owned(),
+                claim: "Electron flow pumps protons across the inner mitochondrial membrane."
+                    .to_owned(),
+                source_id: "src-lecture-5-slide-18".to_owned(),
+                required: true,
+            },
+        ],
     }
 }

@@ -79,7 +79,7 @@ describe("Viva display state", () => {
     expect(plan[0]?.intervalLabel).toBe("tomorrow");
   });
 
-  test("passes hint, exam proximity, and recency signals into recap review scheduling", () => {
+  test("names only the binding cap when hint, exam proximity, and recency signals compete", () => {
     const recap: SessionRecap = {
       durationLabel: "Agent session",
       headline: "Recap",
@@ -101,7 +101,9 @@ describe("Viva display state", () => {
     expect(plan[0]?.label).toBe("NADH");
     expect(plan[0]?.explanation.join(" ")).toContain("hint-assisted");
     expect(plan[0]?.explanation.join(" ")).toContain("exam-near cap");
-    expect(plan[0]?.explanation.join(" ")).toContain("session recency cap");
+    // D-01A truthful explanations: a cap is named only when it actually bound
+    // the displayed date; the non-binding recency signal must not be claimed.
+    expect(plan[0]?.explanation.join(" ")).not.toContain("session recency cap");
   });
 
   test("does not fuzzy-match recap labels into FSRS cards", () => {

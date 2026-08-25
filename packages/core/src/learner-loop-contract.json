@@ -52,6 +52,7 @@
         "marginalia_title": "The material is not ready yet.",
         "marginalia_text": "Viva must finish receiving the study material before it opens a live loop.",
         "next_action_label": "Review upload",
+        "next_action_intent": "start_session",
         "primary_action_label": "Review upload",
         "primary_action_intent": "start_session",
         "status_label": "upload"
@@ -82,6 +83,7 @@
         "marginalia_title": "The study set is not ready.",
         "marginalia_text": "Viva is still preparing the study material or needs the ingestion issue reviewed.",
         "next_action_label": "Refresh ingestion",
+        "next_action_intent": "retry_agent",
         "primary_action_label": "Refresh ingestion",
         "primary_action_intent": "retry_agent",
         "status_label": "ingestion"
@@ -112,6 +114,7 @@
         "marginalia_title": "Viva cannot open the session yet.",
         "marginalia_text": "The session bootstrap path or agent service is unavailable before the learner loop starts.",
         "next_action_label": "Retry agent",
+        "next_action_intent": "retry_agent",
         "primary_action_label": "Retry agent",
         "primary_action_intent": "retry_agent",
         "status_label": "session bootstrap"
@@ -141,6 +144,7 @@
         "marginalia_title": "Live tutor is listening.",
         "marginalia_text": "The selected live runtime is ready for a trusted turn.",
         "next_action_label": "Answer when ready",
+        "next_action_intent": "submit_turn",
         "primary_action_label": "I'm ready - check it",
         "primary_action_intent": "submit_turn",
         "status_label": "live runtime"
@@ -163,6 +167,7 @@
         "marginalia_title": "Non-live examiner is listening.",
         "marginalia_text": "The no-key or test provider path is ready without claiming live tutoring.",
         "next_action_label": "Answer when ready",
+        "next_action_intent": "submit_turn",
         "primary_action_label": "I'm ready - check it",
         "primary_action_intent": "submit_turn",
         "status_label": "non-live provider"
@@ -185,6 +190,7 @@
         "marginalia_title": "Viva checked the answer.",
         "marginalia_text": "The agent produced grounded feedback and the learner can continue.",
         "next_action_label": "Continue",
+        "next_action_intent": "submit_turn",
         "primary_action_label": "Continue",
         "primary_action_intent": "submit_turn",
         "status_label": "feedback"
@@ -207,6 +213,7 @@
         "marginalia_title": "Viva needs one more attempt.",
         "marginalia_text": "The agent returned a learner-safe retry instruction for the same concept.",
         "next_action_label": "Try again",
+        "next_action_intent": "submit_turn",
         "primary_action_label": "Try again",
         "primary_action_intent": "submit_turn",
         "status_label": "retry"
@@ -230,6 +237,7 @@
         "marginalia_title": "Your attempt is saved.",
         "marginalia_text": "Viva saved the attempt envelope and will not invent feedback while evaluation is unavailable. Start a fresh question now; the saved attempt can be evaluated when service recovers.",
         "next_action_label": "Start a fresh question",
+        "next_action_intent": "start_session",
         "primary_action_label": "Start a fresh question",
         "primary_action_intent": "start_session",
         "status_label": "pending evaluation"
@@ -241,6 +249,29 @@
         "latency_ms",
         "token_refresh_outcome"
       ]
+    },
+    {
+      "id": "session_completed",
+      "label": "Session completed",
+      "stage": "recap",
+      "resolution_kind": "success",
+      "submitted_answer_resolution": true,
+      "max_resolution_ms": 45000,
+      "learner_safe": true,
+      "authority": "durable_store_event",
+      "sanitized_evidence": true,
+      "runtime_copy_causes": ["recap_success"],
+      "copy": {
+        "capsule_label": "Session complete",
+        "marginalia_title": "Session recap ready.",
+        "marginalia_text": "Viva saved the evidence-backed recap and review plan.",
+        "next_action_label": "Start a new session",
+        "next_action_intent": "start_session",
+        "primary_action_label": "Start a new session",
+        "primary_action_intent": "start_session",
+        "status_label": "session complete"
+      },
+      "operator_diagnostics": ["stage", "deploy_sha", "recap_success"]
     },
     {
       "id": "deterministic_partial_recap",
@@ -264,6 +295,7 @@
         "marginalia_title": "Live provider reached only part of the turn.",
         "marginalia_text": "Viva can show a bounded recap from durable progress without inventing a model result.",
         "next_action_label": "Review partial recap",
+        "next_action_intent": "start_session",
         "primary_action_label": "Review partial recap",
         "primary_action_intent": "start_session",
         "status_label": "partial live result"
@@ -299,6 +331,7 @@
         "marginalia_title": "Viva could not save this turn.",
         "marginalia_text": "Viva could not save durable progress, so it closed the turn without inventing a result.",
         "next_action_label": "Start a fresh turn",
+        "next_action_intent": "start_session",
         "primary_action_label": "Start a fresh turn",
         "primary_action_intent": "start_session",
         "status_label": "durability degraded"
@@ -338,6 +371,7 @@
         "marginalia_title": "Live provider access was denied.",
         "marginalia_text": "The live provider rejected access before the manuscript could open a trusted turn.",
         "next_action_label": "Check provider access",
+        "next_action_intent": "retry_agent",
         "primary_action_label": "Check provider access",
         "primary_action_intent": "retry_agent",
         "status_label": "provider auth failed"
@@ -380,6 +414,7 @@
         "marginalia_title": "This turn needs a short wait.",
         "marginalia_text": "The live response paused before completion. Retry after the wait window clears.",
         "next_action_label": "Retry when available",
+        "next_action_intent": "retry_agent",
         "primary_action_label": "Retry when available",
         "primary_action_intent": "retry_agent",
         "status_label": "waiting to retry"
@@ -418,6 +453,7 @@
         "marginalia_title": "The cost budget closed this manuscript.",
         "marginalia_text": "The Conductor reached the live-provider cost budget and closed the manuscript after a terminal phase.",
         "next_action_label": "Start a new session",
+        "next_action_intent": "start_session",
         "primary_action_label": "Start again",
         "primary_action_intent": "start_session",
         "status_label": "budget cap"
@@ -452,6 +488,7 @@
         "marginalia_title": "The rate limit closed this manuscript.",
         "marginalia_text": "The Conductor reached the voice rate limit and closed the manuscript after a terminal phase.",
         "next_action_label": "Start a new session",
+        "next_action_intent": "start_session",
         "primary_action_label": "Start again",
         "primary_action_intent": "start_session",
         "status_label": "rate limit"
@@ -493,6 +530,7 @@
         "marginalia_title": "Live provider timed out.",
         "marginalia_text": "The live stream did not reach the next required stage within the configured cap.",
         "next_action_label": "Retry agent",
+        "next_action_intent": "retry_agent",
         "primary_action_label": "Retry agent",
         "primary_action_intent": "retry_agent",
         "status_label": "provider timeout"
@@ -534,6 +572,7 @@
         "marginalia_title": "Live provider stream was malformed.",
         "marginalia_text": "The stream produced an invalid or structured error frame, so Viva closed it without retaining provider contents.",
         "next_action_label": "Retry agent",
+        "next_action_intent": "retry_agent",
         "primary_action_label": "Retry agent",
         "primary_action_intent": "retry_agent",
         "status_label": "provider stream failed"
@@ -570,6 +609,7 @@
         "marginalia_title": "Viva could not finish the tool stage.",
         "marginalia_text": "The server-side source, status, or recap tool failed after the live answer was submitted, so Viva closed the turn without retaining provider contents.",
         "next_action_label": "Retry agent",
+        "next_action_intent": "retry_agent",
         "primary_action_label": "Retry agent",
         "primary_action_intent": "retry_agent",
         "status_label": "tool stage failed"
@@ -615,6 +655,7 @@
         "marginalia_title": "Live provider connection dropped.",
         "marginalia_text": "The provider transport disconnected before the manuscript received a complete terminal phase.",
         "next_action_label": "Retry agent",
+        "next_action_intent": "retry_agent",
         "primary_action_label": "Retry agent",
         "primary_action_intent": "retry_agent",
         "status_label": "provider disconnected"
@@ -651,6 +692,7 @@
         "marginalia_title": "The client missed the live-turn cap.",
         "marginalia_text": "The client did not finish the live turn within the configured turn or audio cap.",
         "next_action_label": "Start a new session",
+        "next_action_intent": "start_session",
         "primary_action_label": "Start again",
         "primary_action_intent": "start_session",
         "status_label": "client too slow"
@@ -685,6 +727,7 @@
         "marginalia_title": "Live provider cancelled the turn.",
         "marginalia_text": "The live response was cancelled before Viva could produce a complete recap.",
         "next_action_label": "Start a new session",
+        "next_action_intent": "start_session",
         "primary_action_label": "Start again",
         "primary_action_intent": "start_session",
         "status_label": "provider cancelled"
@@ -715,6 +758,7 @@
         "marginalia_title": "Session identity needs refresh.",
         "marginalia_text": "Viva must refresh the signed session identity before another trusted turn starts.",
         "next_action_label": "Refresh session",
+        "next_action_intent": "refresh_session",
         "primary_action_label": "Refresh session",
         "primary_action_intent": "refresh_session",
         "status_label": "auth failed"
@@ -744,6 +788,7 @@
         "marginalia_title": "This browser entry is stale.",
         "marginalia_text": "Viva should refresh server session state instead of replaying an old browser phase.",
         "next_action_label": "Refresh session",
+        "next_action_intent": "refresh_session",
         "primary_action_label": "Refresh session",
         "primary_action_intent": "refresh_session",
         "status_label": "stale session"
@@ -767,6 +812,7 @@
         "marginalia_title": "Viva is refreshing session state.",
         "marginalia_text": "The client must reconnect from fresh server state before showing a live loop state.",
         "next_action_label": "Refresh session",
+        "next_action_intent": "refresh_session",
         "primary_action_label": "Refresh session",
         "primary_action_intent": "refresh_session",
         "status_label": "refresh"
@@ -790,6 +836,7 @@
         "marginalia_title": "This tab resumed from frozen state.",
         "marginalia_text": "Viva must reconcile the active generation before accepting another turn.",
         "next_action_label": "Refresh session",
+        "next_action_intent": "refresh_session",
         "primary_action_label": "Refresh session",
         "primary_action_intent": "refresh_session",
         "status_label": "tab restored"
@@ -813,6 +860,7 @@
         "marginalia_title": "Viva is already checking that turn.",
         "marginalia_text": "The second submit is ignored or joined to the active attempt so the learner gets one result.",
         "next_action_label": "Wait for result",
+        "next_action_intent": "disabled",
         "primary_action_label": "Wait for result",
         "primary_action_intent": "disabled",
         "status_label": "duplicate submit"
@@ -836,6 +884,7 @@
         "marginalia_title": "Mic unavailable; write in the margin.",
         "marginalia_text": "Browser microphone capture is unavailable, so the learner can use the same server-evaluated text path.",
         "next_action_label": "Use text fallback",
+        "next_action_intent": "submit_turn",
         "primary_action_label": "Use text fallback",
         "primary_action_intent": "submit_turn",
         "status_label": "mic unavailable"
@@ -858,6 +907,7 @@
         "marginalia_title": "Viva is using typed fallback.",
         "marginalia_text": "The typed path uses the same authoritative agent events once the learner submits.",
         "next_action_label": "Use text fallback",
+        "next_action_intent": "submit_turn",
         "primary_action_label": "Use text fallback",
         "primary_action_intent": "submit_turn",
         "status_label": "typed fallback"
@@ -882,6 +932,7 @@
         "marginalia_title": "The deploy drain closed this manuscript.",
         "marginalia_text": "The Conductor entered deploy drain and closed the manuscript after a terminal phase.",
         "next_action_label": "Start a new session",
+        "next_action_intent": "start_session",
         "primary_action_label": "Start again",
         "primary_action_intent": "start_session",
         "status_label": "drained"
@@ -912,6 +963,7 @@
         "marginalia_title": "The turn cap closed this manuscript.",
         "marginalia_text": "The Conductor reached the configured outer turn bound and closed the manuscript.",
         "next_action_label": "Start a new session",
+        "next_action_intent": "start_session",
         "primary_action_label": "Start again",
         "primary_action_intent": "start_session",
         "status_label": "turn cap"
@@ -942,6 +994,7 @@
         "marginalia_title": "The session cap closed this manuscript.",
         "marginalia_text": "The Conductor reached the session cap and closed the manuscript after a terminal phase.",
         "next_action_label": "Start a new session",
+        "next_action_intent": "start_session",
         "primary_action_label": "Start again",
         "primary_action_intent": "start_session",
         "status_label": "session cap"
@@ -972,6 +1025,7 @@
         "marginalia_title": "Viva paused this loop during rollback.",
         "marginalia_text": "The service stopped admitting live work and moved the learner to a terminal recovery state.",
         "next_action_label": "Start after rollback",
+        "next_action_intent": "start_session",
         "primary_action_label": "Start after rollback",
         "primary_action_intent": "start_session",
         "status_label": "rollback"

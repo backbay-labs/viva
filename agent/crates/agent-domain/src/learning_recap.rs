@@ -40,14 +40,20 @@
 //!     when concepts were graded without a schedule, and
 //!     `"Answer one question to start building evidence."` otherwise.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
-use crate::{learning_outcome::TurnOutcome, ConceptStatus};
+use crate::{
+    learning_outcome::{TurnOutcome, TurnResolution},
+    parse_utc_instant, ConceptStatus,
+};
 
 /// Exact `StudySessionRecap::schema` value.
 pub const VIVA_STUDY_SESSION_RECAP_SCHEMA: &str = "viva.study_session_recap.v2";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionLearningEvidence {
     pub user_id: String,
     pub study_set_id: String,
@@ -58,6 +64,7 @@ pub struct SessionLearningEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConceptLabel {
     pub concept_id: String,
     pub label: String,
@@ -71,6 +78,7 @@ pub enum ReviewScheduleAuthority {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewScheduleSummary {
     pub concept_id: String,
     pub due_at: String,
@@ -78,6 +86,7 @@ pub struct ReviewScheduleSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecapConceptOutcome {
     pub concept_id: String,
     pub label: String,
@@ -85,6 +94,7 @@ pub struct RecapConceptOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecapSourceMoment {
     pub response_id: String,
     pub source_id: String,
@@ -100,6 +110,7 @@ pub enum RecapBuildError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StudySessionRecap {
     pub schema: String, // exactly "viva.study_session_recap.v2"
     pub voice_session_id: String,
@@ -110,4 +121,169 @@ pub struct StudySessionRecap {
     pub next_action: String,
     pub source_moments: Vec<RecapSourceMoment>,
     pub deferred_turns: u32,
+}
+
+/// Fold persisted session evidence into the one recap the learner sees.
+///
+/// This function is total over its input and reads nothing else: no clock, no
+/// store, no question, and no expected-term list. Given the same persisted rows
+/// it returns the same recap, which is what makes a replay and a reconnect
+/// produce identical output.
+pub fn build_session_recap(
+    evidence: &SessionLearningEvidence,
+) -> Result<StudySessionRecap, RecapBuildError> {
+    if evidence.user_id.trim().is_empty()
+        || evidence.study_set_id.trim().is_empty()
+        || evidence.voice_session_id.trim().is_empty()
+    {
+        return Err(RecapBuildError::EvidenceIdentityMismatch);
+    }
+
+    // A superseded outcome contributes nothing, and idempotent replay rows for one
+    // response collapse to a single contribution.
+    let superseded = evidence
+        .outcomes
+        .iter()
+        .filter_map(|outcome| outcome.supersedes_response_id.as_deref())
+        .collect::<BTreeSet<_>>();
+    let mut counted = BTreeSet::new();
+    let effective = evidence
+        .outcomes
+        .iter()
+        .filter(|outcome| !superseded.contains(outcome.response_id.as_str()))
+        .filter(|outcome| counted.insert(outcome.response_id.as_str()))
+        .collect::<Vec<_>>();
+
+    let mut labels = BTreeMap::new();
+    for label in &evidence.concept_labels {
+        if labels
+            .insert(label.concept_id.as_str(), label.label.as_str())
+            .is_some()
+        {
+            return Err(RecapBuildError::DuplicateConceptLabel {
+                concept_id: label.concept_id.clone(),
+            });
+        }
+    }
+
+    let mut evaluated_turns = 0_u32;
+    let mut deferred_turns = 0_u32;
+    let mut first_evaluated: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut final_status: BTreeMap<&str, ConceptStatus> = BTreeMap::new();
+    let mut source_moments = Vec::new();
+    for (index, outcome) in effective.iter().enumerate() {
+        match &outcome.resolution {
+            TurnResolution::Evaluated {
+                concept_transitions,
+                ..
+            } => {
+                evaluated_turns += 1;
+                for transition in concept_transitions {
+                    first_evaluated
+                        .entry(transition.concept_id.as_str())
+                        .or_insert(index);
+                    final_status
+                        .insert(transition.concept_id.as_str(), transition.to_status.clone());
+                }
+                // A source moment exists only because an evaluated outcome cited
+                // that source, so a source belonging to no outcome cannot appear.
+                for source_id in &outcome.source_ids {
+                    source_moments.push(RecapSourceMoment {
+                        response_id: outcome.response_id.clone(),
+                        source_id: source_id.clone(),
+                    });
+                }
+            }
+            // Counted, never graded: a deferral assigns no status.
+            TurnResolution::Deferred { .. } => deferred_turns += 1,
+        }
+    }
+
+    let mut ordered = first_evaluated.keys().copied().collect::<Vec<_>>();
+    ordered.sort_by_key(|concept_id| (first_evaluated[concept_id], *concept_id));
+
+    let mut concepts = Vec::with_capacity(ordered.len());
+    for concept_id in ordered {
+        // Labels join by exact concept ID. Two concepts may share a label, and a
+        // missing label is an error rather than a fuzzy match or a bare ID.
+        let label = labels
+            .get(concept_id)
+            .ok_or_else(|| RecapBuildError::MissingConceptLabel {
+                concept_id: concept_id.to_owned(),
+            })?;
+        concepts.push(RecapConceptOutcome {
+            concept_id: concept_id.to_owned(),
+            label: (*label).to_owned(),
+            status: final_status[concept_id].clone(),
+        });
+    }
+
+    // Review entries come from the selected D-01 decisions only; this fold never
+    // computes, adjusts, or invents a due date. Under D-01B the decision list is
+    // exactly empty and the authenticated read layer attaches the schedule.
+    let mut decisions = BTreeMap::new();
+    for decision in &evidence.review_decisions {
+        if decisions
+            .insert(decision.concept_id.as_str(), decision)
+            .is_some()
+        {
+            return Err(RecapBuildError::DuplicateReviewDecision {
+                concept_id: decision.concept_id.clone(),
+            });
+        }
+        let graded = concepts
+            .iter()
+            .any(|concept| concept.concept_id == decision.concept_id);
+        if !graded || parse_utc_instant(&decision.due_at).is_none() {
+            return Err(RecapBuildError::InvalidReviewDecision {
+                concept_id: decision.concept_id.clone(),
+            });
+        }
+    }
+    let review_schedule = concepts
+        .iter()
+        .filter_map(|concept| decisions.get(concept.concept_id.as_str()))
+        .map(|decision| (*decision).clone())
+        .collect::<Vec<_>>();
+
+    let graded = concepts.len();
+    let strong = concepts
+        .iter()
+        .filter(|concept| concept.status == ConceptStatus::Strong)
+        .count();
+    let (headline, summary) = if graded == 0 {
+        (
+            "No graded concepts this session.".to_owned(),
+            // Claims no strength, no weakness, and no review date.
+            "No graded outcome was saved for this session.".to_owned(),
+        )
+    } else {
+        (
+            format!("Strong concepts: {strong} of {graded}."),
+            format!(
+                "Graded concepts: {graded}. Evaluated turns: {evaluated_turns}. \
+                 Deferred turns: {deferred_turns}."
+            ),
+        )
+    };
+    let next_action = if !review_schedule.is_empty() {
+        "Review the scheduled concepts on their due dates."
+    } else if graded > 0 {
+        "Keep answering to build more evidence."
+    } else {
+        "Answer one question to start building evidence."
+    }
+    .to_owned();
+
+    Ok(StudySessionRecap {
+        schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+        voice_session_id: evidence.voice_session_id.clone(),
+        headline,
+        summary,
+        concepts,
+        review_schedule,
+        next_action,
+        source_moments,
+        deferred_turns,
+    })
 }

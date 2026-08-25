@@ -973,13 +973,13 @@ describe("checklistFromExpectedTerms", () => {
 });
 
 describe("conceptStatusVerdict", () => {
-  test("pairs the status label with a real FSRS review interval", () => {
-    const strong = conceptStatusVerdict("strong", NOW);
-    expect(strong).toContain("Strong");
-    expect(/today|tomorrow|day/.test(strong)).toBe(true);
-    expect(conceptStatusVerdict("shaky", NOW)).toContain("Shaky");
-    expect(conceptStatusVerdict("missed", NOW)).toContain("Missed");
-    expect(conceptStatusVerdict("review", NOW)).toContain("Review");
+  test("renders the status label without a fabricated client-side interval", () => {
+    const strong = conceptStatusVerdict("strong");
+    expect(strong).toBe("Strong");
+    expect(/today|tomorrow|day/.test(strong)).toBe(false);
+    expect(conceptStatusVerdict("shaky")).toBe("Shaky");
+    expect(conceptStatusVerdict("missed")).toBe("Missed");
+    expect(conceptStatusVerdict("review")).toBe("Review");
   });
 });
 
