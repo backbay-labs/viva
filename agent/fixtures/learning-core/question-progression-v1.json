@@ -1,0 +1,369 @@
+{
+  "schema": "viva.learning_core.question_progression.v1",
+  "policy": "ordered_v1",
+  "voice_session_id": "vs-1001",
+  "active_question_ids": [
+    "q-etc-electron-flow",
+    "q-gradient-direction",
+    "q-atp-synthase-coupling"
+  ],
+  "inactive_question_ids": [
+    "q-archived-glycolysis"
+  ],
+  "questions": {
+    "q-etc-electron-flow": {
+      "question_id": "q-etc-electron-flow",
+      "prompt": "Explain how NADH starts electron flow through the chain.",
+      "expected_terms": [
+        "electron donor",
+        "complex I"
+      ],
+      "follow_up": "Now connect that flow to the proton gradient in one sentence.",
+      "source": {
+        "source_id": "src-lec5-slide-18",
+        "document_id": "lec5",
+        "span": "slide:18",
+        "excerpt": "NADH donates high-energy electrons to complex I of the electron transport chain.",
+        "confidence": "high",
+        "retrieval_reason": "ordered progression source bound by the server"
+      }
+    },
+    "q-gradient-direction": {
+      "question_id": "q-gradient-direction",
+      "prompt": "Which way do protons move as electrons pass down the chain?",
+      "expected_terms": [
+        "intermembrane space",
+        "proton gradient"
+      ],
+      "follow_up": "State exactly where the protons accumulate.",
+      "source": {
+        "source_id": "src-lec5-slide-19",
+        "document_id": "lec5",
+        "span": "slide:19",
+        "excerpt": "Electron flow pumps protons from the matrix into the intermembrane space.",
+        "confidence": "high",
+        "retrieval_reason": "ordered progression source bound by the server"
+      }
+    },
+    "q-atp-synthase-coupling": {
+      "question_id": "q-atp-synthase-coupling",
+      "prompt": "How does the proton gradient drive ATP synthesis?",
+      "expected_terms": [
+        "chemiosmosis",
+        "synthase"
+      ],
+      "follow_up": "Name the enzyme that couples the gradient to synthesis.",
+      "source": {
+        "source_id": "src-lec5-slide-20",
+        "document_id": "lec5",
+        "span": "slide:20",
+        "excerpt": "Protons flow back through the synthase, and that flow drives ATP synthesis.",
+        "confidence": "medium",
+        "retrieval_reason": "ordered progression source bound by the server"
+      }
+    },
+    "q-archived-glycolysis": {
+      "question_id": "q-archived-glycolysis",
+      "prompt": "What is the net ATP yield of the glycolysis stage?",
+      "expected_terms": [
+        "net two",
+        "substrate-level"
+      ],
+      "follow_up": "Separate the gross yield from the net yield.",
+      "source": {
+        "source_id": "src-lec3-slide-04",
+        "document_id": "lec3",
+        "span": "slide:04",
+        "excerpt": "The glycolysis stage nets two ATP per glucose by substrate-level transfer.",
+        "confidence": "low",
+        "retrieval_reason": "ordered progression source bound by the server"
+      }
+    }
+  },
+  "cursors": {
+    "initial": {
+      "voice_session_id": "vs-1001",
+      "policy": "ordered_v1",
+      "current_question_id": null,
+      "completed_question_ids": [],
+      "attempt_counts": {},
+      "revision": 0
+    },
+    "after_first_selection": {
+      "voice_session_id": "vs-1001",
+      "policy": "ordered_v1",
+      "current_question_id": "q-etc-electron-flow",
+      "completed_question_ids": [],
+      "attempt_counts": {
+        "q-etc-electron-flow": 1
+      },
+      "revision": 1
+    },
+    "after_retry_current": {
+      "voice_session_id": "vs-1001",
+      "policy": "ordered_v1",
+      "current_question_id": "q-etc-electron-flow",
+      "completed_question_ids": [],
+      "attempt_counts": {
+        "q-etc-electron-flow": 2
+      },
+      "revision": 2
+    },
+    "after_deferred_retry": {
+      "voice_session_id": "vs-1001",
+      "policy": "ordered_v1",
+      "current_question_id": "q-etc-electron-flow",
+      "completed_question_ids": [],
+      "attempt_counts": {
+        "q-etc-electron-flow": 3
+      },
+      "revision": 3
+    },
+    "after_advance_to_second": {
+      "voice_session_id": "vs-1001",
+      "policy": "ordered_v1",
+      "current_question_id": "q-gradient-direction",
+      "completed_question_ids": [
+        "q-etc-electron-flow"
+      ],
+      "attempt_counts": {
+        "q-etc-electron-flow": 3,
+        "q-gradient-direction": 1
+      },
+      "revision": 4
+    },
+    "reconnect_resumes_cursor": {
+      "voice_session_id": "vs-1001",
+      "policy": "ordered_v1",
+      "current_question_id": "q-gradient-direction",
+      "completed_question_ids": [
+        "q-etc-electron-flow"
+      ],
+      "attempt_counts": {
+        "q-etc-electron-flow": 3,
+        "q-gradient-direction": 1
+      },
+      "revision": 4
+    },
+    "concurrent_selection_single_revision": {
+      "voice_session_id": "vs-1001",
+      "policy": "ordered_v1",
+      "current_question_id": "q-gradient-direction",
+      "completed_question_ids": [
+        "q-etc-electron-flow"
+      ],
+      "attempt_counts": {
+        "q-etc-electron-flow": 3,
+        "q-gradient-direction": 1
+      },
+      "revision": 4
+    },
+    "after_advance_to_third": {
+      "voice_session_id": "vs-1001",
+      "policy": "ordered_v1",
+      "current_question_id": "q-atp-synthase-coupling",
+      "completed_question_ids": [
+        "q-etc-electron-flow",
+        "q-gradient-direction"
+      ],
+      "attempt_counts": {
+        "q-etc-electron-flow": 3,
+        "q-gradient-direction": 1,
+        "q-atp-synthase-coupling": 1
+      },
+      "revision": 5
+    },
+    "after_exhaustion": {
+      "voice_session_id": "vs-1001",
+      "policy": "ordered_v1",
+      "current_question_id": null,
+      "completed_question_ids": [
+        "q-etc-electron-flow",
+        "q-gradient-direction",
+        "q-atp-synthase-coupling"
+      ],
+      "attempt_counts": {
+        "q-etc-electron-flow": 3,
+        "q-gradient-direction": 1,
+        "q-atp-synthase-coupling": 1
+      },
+      "revision": 6
+    }
+  },
+  "results": {
+    "selected_first": {
+      "result": "selected",
+      "question": {
+        "question_id": "q-etc-electron-flow",
+        "prompt": "Explain how NADH starts electron flow through the chain.",
+        "expected_terms": [
+          "electron donor",
+          "complex I"
+        ],
+        "follow_up": "Now connect that flow to the proton gradient in one sentence.",
+        "source": {
+          "source_id": "src-lec5-slide-18",
+          "document_id": "lec5",
+          "span": "slide:18",
+          "excerpt": "NADH donates high-energy electrons to complex I of the electron transport chain.",
+          "confidence": "high",
+          "retrieval_reason": "ordered progression source bound by the server"
+        }
+      },
+      "ordinal": 1,
+      "total": 3,
+      "selection_reason": "ordered_v1:first_active_uncompleted",
+      "revision": 1
+    },
+    "retry_current_increments_attempt": {
+      "result": "retry",
+      "question": {
+        "question_id": "q-etc-electron-flow",
+        "prompt": "Explain how NADH starts electron flow through the chain.",
+        "expected_terms": [
+          "electron donor",
+          "complex I"
+        ],
+        "follow_up": "Now connect that flow to the proton gradient in one sentence.",
+        "source": {
+          "source_id": "src-lec5-slide-18",
+          "document_id": "lec5",
+          "span": "slide:18",
+          "excerpt": "NADH donates high-energy electrons to complex I of the electron transport chain.",
+          "confidence": "high",
+          "retrieval_reason": "ordered progression source bound by the server"
+        }
+      },
+      "ordinal": 1,
+      "total": 3,
+      "attempt": 2,
+      "revision": 2
+    },
+    "deferred_keeps_current_question": {
+      "result": "retry",
+      "question": {
+        "question_id": "q-etc-electron-flow",
+        "prompt": "Explain how NADH starts electron flow through the chain.",
+        "expected_terms": [
+          "electron donor",
+          "complex I"
+        ],
+        "follow_up": "Now connect that flow to the proton gradient in one sentence.",
+        "source": {
+          "source_id": "src-lec5-slide-18",
+          "document_id": "lec5",
+          "span": "slide:18",
+          "excerpt": "NADH donates high-energy electrons to complex I of the electron transport chain.",
+          "confidence": "high",
+          "retrieval_reason": "ordered progression source bound by the server"
+        }
+      },
+      "ordinal": 1,
+      "total": 3,
+      "attempt": 3,
+      "revision": 3
+    },
+    "selected_second_after_advance": {
+      "result": "selected",
+      "question": {
+        "question_id": "q-gradient-direction",
+        "prompt": "Which way do protons move as electrons pass down the chain?",
+        "expected_terms": [
+          "intermembrane space",
+          "proton gradient"
+        ],
+        "follow_up": "State exactly where the protons accumulate.",
+        "source": {
+          "source_id": "src-lec5-slide-19",
+          "document_id": "lec5",
+          "span": "slide:19",
+          "excerpt": "Electron flow pumps protons from the matrix into the intermembrane space.",
+          "confidence": "high",
+          "retrieval_reason": "ordered progression source bound by the server"
+        }
+      },
+      "ordinal": 2,
+      "total": 3,
+      "selection_reason": "ordered_v1:first_active_uncompleted",
+      "revision": 4
+    },
+    "replay_returns_same_selection": {
+      "result": "selected",
+      "question": {
+        "question_id": "q-gradient-direction",
+        "prompt": "Which way do protons move as electrons pass down the chain?",
+        "expected_terms": [
+          "intermembrane space",
+          "proton gradient"
+        ],
+        "follow_up": "State exactly where the protons accumulate.",
+        "source": {
+          "source_id": "src-lec5-slide-19",
+          "document_id": "lec5",
+          "span": "slide:19",
+          "excerpt": "Electron flow pumps protons from the matrix into the intermembrane space.",
+          "confidence": "high",
+          "retrieval_reason": "ordered progression source bound by the server"
+        }
+      },
+      "ordinal": 2,
+      "total": 3,
+      "selection_reason": "ordered_v1:first_active_uncompleted",
+      "revision": 4
+    },
+    "concurrent_selection_single_revision": {
+      "result": "selected",
+      "question": {
+        "question_id": "q-gradient-direction",
+        "prompt": "Which way do protons move as electrons pass down the chain?",
+        "expected_terms": [
+          "intermembrane space",
+          "proton gradient"
+        ],
+        "follow_up": "State exactly where the protons accumulate.",
+        "source": {
+          "source_id": "src-lec5-slide-19",
+          "document_id": "lec5",
+          "span": "slide:19",
+          "excerpt": "Electron flow pumps protons from the matrix into the intermembrane space.",
+          "confidence": "high",
+          "retrieval_reason": "ordered progression source bound by the server"
+        }
+      },
+      "ordinal": 2,
+      "total": 3,
+      "selection_reason": "ordered_v1:first_active_uncompleted",
+      "revision": 4
+    },
+    "selected_third_after_advance": {
+      "result": "selected",
+      "question": {
+        "question_id": "q-atp-synthase-coupling",
+        "prompt": "How does the proton gradient drive ATP synthesis?",
+        "expected_terms": [
+          "chemiosmosis",
+          "synthase"
+        ],
+        "follow_up": "Name the enzyme that couples the gradient to synthesis.",
+        "source": {
+          "source_id": "src-lec5-slide-20",
+          "document_id": "lec5",
+          "span": "slide:20",
+          "excerpt": "Protons flow back through the synthase, and that flow drives ATP synthesis.",
+          "confidence": "medium",
+          "retrieval_reason": "ordered progression source bound by the server"
+        }
+      },
+      "ordinal": 3,
+      "total": 3,
+      "selection_reason": "ordered_v1:first_active_uncompleted",
+      "revision": 5
+    },
+    "exhausted_emits_no_question": {
+      "result": "exhausted",
+      "completed": 3,
+      "total": 3,
+      "revision": 6
+    }
+  }
+}
