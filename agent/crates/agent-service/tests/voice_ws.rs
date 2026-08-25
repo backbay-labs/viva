@@ -3903,6 +3903,7 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
             ..VoiceLimitConfig::default()
         },
     );
+    let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
         return;
     };
@@ -3967,7 +3968,6 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
         },
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
     send_client_frame(
         &mut second_socket,
         &ClientFrame::Cancel {
@@ -3975,6 +3975,11 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
         },
     )
     .await;
+    let cancel_events =
+        wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::CancelReceived).await;
+    assert!(cancel_events
+        .iter()
+        .any(|event| { event.voice_session_id.as_deref() == Some("voice-session-2") }));
 
     first_socket.close(None).await.unwrap();
     let _ = read_server_frames_until_close(&mut first_socket).await;
@@ -4013,9 +4018,10 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
     )
     .with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
-        idle: Duration::from_millis(40),
+        idle: Duration::from_millis(500),
         session: Duration::from_secs(5),
     });
+    let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
         return;
     };
@@ -4080,7 +4086,6 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
         },
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
     send_client_frame(
         &mut second_socket,
         &ClientFrame::Cancel {
@@ -4088,6 +4093,11 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
         },
     )
     .await;
+    let cancel_events =
+        wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::CancelReceived).await;
+    assert!(cancel_events
+        .iter()
+        .any(|event| { event.voice_session_id.as_deref() == Some("voice-session-2") }));
 
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -7421,7 +7431,10 @@ async fn websocket_provider_drains_queued_usage_before_next_admission() {
     .expect("first answer evaluation should arrive");
     assert_eq!(text_inputs.load(Ordering::SeqCst), 1);
 
-    usage_gate.notify_waiters();
+    // Store a permit when the probe has emitted its evaluation but has not yet
+    // registered its usage waiter. notify_waiters would lose that wake-up and
+    // make the next admission race the unresolved first provider turn.
+    usage_gate.notify_one();
     send_client_frame(
         &mut socket,
         &ClientFrame::Text {
