@@ -143,6 +143,16 @@ impl PostgresStudyStore {
         }
     }
 
+    /// Test seam: the ledger is private and is only ever consulted by membership, so
+    /// nothing else can observe how many entries a replay leaves behind.
+    #[cfg(test)]
+    pub(crate) fn event_authorization_ledger_len(&self) -> usize {
+        self.event_authorizations
+            .read()
+            .expect("event authorization lock poisoned")
+            .len()
+    }
+
     fn record_event_authorization<T: Serialize>(
         &self,
         user_id: &str,
@@ -160,10 +170,17 @@ impl PostgresStudyStore {
             kind,
             payload,
         )?;
-        self.event_authorizations
+        let mut ledger = self
+            .event_authorizations
             .write()
-            .map_err(|_| PortError::adapter("postgres", "event authorization lock poisoned"))?
-            .push(record);
+            .map_err(|_| PortError::adapter("postgres", "event authorization lock poisoned"))?;
+        // The ledger records that one authorized outcome was written, and it is only
+        // ever consulted by membership. A replay writes nothing, so it must not
+        // append a second entry either — which is what the in-memory backend already
+        // does, and the two backends have to agree.
+        if !ledger.contains(&record) {
+            ledger.push(record);
+        }
         Ok(())
     }
 
@@ -525,15 +542,21 @@ impl PostgresStudyStore {
     /// The v1 decision already on record for one graded outcome, if any. The lookup key
     /// is the scope plus `(response_id, payload_sha256)` — deliberately not the
     /// computed `due_at`, which moves with the clock on every replay.
-    async fn persisted_review_schedule_decision(
-        &self,
+    ///
+    /// Takes the executor so the replay read can run inside the same transaction, and
+    /// behind the same advisory lock, as the write it guards.
+    async fn persisted_review_schedule_decision<'e, E>(
+        executor: E,
         user_id: &str,
         study_set_uuid: Uuid,
         voice_session_uuid: Uuid,
         concept_uuid: Uuid,
         response_id: &str,
         payload_sha256: &str,
-    ) -> Result<Option<ReviewScheduleDecisionV1>, PortError> {
+    ) -> Result<Option<ReviewScheduleDecisionV1>, PortError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         sqlx::query_scalar::<_, Value>(
             "SELECT schedule_decision FROM review_items
              WHERE user_id = $1
@@ -553,7 +576,7 @@ impl PostgresStudyStore {
         .bind(concept_uuid)
         .bind(response_id)
         .bind(payload_sha256)
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await
         .map_err(pg_error)?
         .map(|value| {
@@ -809,13 +832,16 @@ impl StudyMemoryStore for PostgresStudyStore {
         &self,
         input: CreatePasteStudySet,
     ) -> Result<StudySetIngestionRecord, PortError> {
+        let exam_at = crate::ingestion_exam_instant("postgres", input.exam_date.as_deref())?;
         let generated = generate_paste_study_set(input)?;
         let study_set_uuid = Self::uuid_for(&generated.study_set.id)?;
         let mut tx = self.pool.begin().await.map_err(pg_error)?;
 
         sqlx::query(
-            "INSERT INTO study_sets (id, user_id, title, course, ingestion_status, ingestion_error)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO study_sets (
+                 id, user_id, title, course, ingestion_status, ingestion_error, exam_at, exam_date
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, ($7 AT TIME ZONE 'UTC')::date)",
         )
         .bind(study_set_uuid)
         .bind(&generated.study_set.user_id)
@@ -823,6 +849,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(&generated.study_set.course)
         .bind(generated.study_set.ingestion_status.as_str())
         .bind(&generated.study_set.ingestion_error)
+        .bind(exam_at)
         .execute(&mut *tx)
         .await
         .map_err(pg_error)?;
@@ -903,13 +930,16 @@ impl StudyMemoryStore for PostgresStudyStore {
         &self,
         input: CreateFileStudySet,
     ) -> Result<StudySetIngestionRecord, PortError> {
+        let exam_at = crate::ingestion_exam_instant("postgres", input.exam_date.as_deref())?;
         let generated = generate_file_study_set(input)?;
         let study_set_uuid = Self::uuid_for(&generated.study_set.id)?;
         let mut tx = self.pool.begin().await.map_err(pg_error)?;
 
         sqlx::query(
-            "INSERT INTO study_sets (id, user_id, title, course, ingestion_status, ingestion_error)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO study_sets (
+                 id, user_id, title, course, ingestion_status, ingestion_error, exam_at, exam_date
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, ($7 AT TIME ZONE 'UTC')::date)",
         )
         .bind(study_set_uuid)
         .bind(&generated.study_set.user_id)
@@ -917,6 +947,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(&generated.study_set.course)
         .bind(generated.study_set.ingestion_status.as_str())
         .bind(&generated.study_set.ingestion_error)
+        .bind(exam_at)
         .execute(&mut *tx)
         .await
         .map_err(pg_error)?;
@@ -941,6 +972,7 @@ impl StudyMemoryStore for PostgresStudyStore {
             })?
             .to_owned();
         let study_set_uuid = Self::uuid_for(&study_set_id)?;
+        let exam_at = crate::ingestion_exam_instant("postgres", input.exam_date.as_deref())?;
         let row =
             sqlx::query("SELECT title, course FROM study_sets WHERE id = $1 AND user_id = $2")
                 .bind(study_set_uuid)
@@ -992,9 +1024,19 @@ impl StudyMemoryStore for PostgresStudyStore {
             .execute(&mut *tx)
             .await
             .map_err(pg_error)?;
+        // A retry re-ingests the file; it never re-asks the learner for the exam
+        // date, and the production retry route always sends none. Writing that
+        // absence verbatim would erase the only authoritative input D-01's exam cap
+        // has, so an absent exam date leaves the recorded instant untouched — the
+        // same rule title and course already follow.
         sqlx::query(
             "UPDATE study_sets
-             SET title = $2, course = $3, ingestion_status = $4, ingestion_error = $5
+             SET title = $2,
+                 course = $3,
+                 ingestion_status = $4,
+                 ingestion_error = $5,
+                 exam_at = COALESCE($6, exam_at),
+                 exam_date = COALESCE(($6 AT TIME ZONE 'UTC')::date, exam_date)
              WHERE id = $1",
         )
         .bind(study_set_uuid)
@@ -1002,6 +1044,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(&generated.study_set.course)
         .bind(generated.study_set.ingestion_status.as_str())
         .bind(&generated.study_set.ingestion_error)
+        .bind(exam_at)
         .execute(&mut *tx)
         .await
         .map_err(pg_error)?;
@@ -2318,9 +2361,12 @@ impl StudyMemoryStore for PostgresStudyStore {
         let concept_uuid = self.concept_uuid_for(study_set_uuid, concept_id).await?;
 
         // D-01: the exam instant is authoritative store context, never a tool
-        // argument. `study_sets.exam_date` is a calendar DATE, read as midnight UTC.
+        // argument, and it is compared as the exact stored UTC instant. The legacy
+        // `study_sets.exam_date` DATE (migration 0001) is never read here: reading a
+        // calendar day as midnight UTC is exactly the rounding D-01's UTC rule
+        // forbids, and it would silently move every capped due date.
         let exam_at = sqlx::query_scalar::<sqlx::Postgres, Option<DateTime<Utc>>>(
-            "SELECT (exam_date::timestamp AT TIME ZONE 'UTC')
+            "SELECT exam_at
              FROM study_sets
              WHERE id = $1 AND user_id = $2",
         )
@@ -2388,21 +2434,43 @@ impl StudyMemoryStore for PostgresStudyStore {
             &payload,
         )?;
 
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
+
+        // Serialize every schedule write for this concept in this session. Without
+        // it the replay read below and the insert are two statements with a gap: two
+        // racers both read nothing and both insert. `ON CONFLICT` cannot close that
+        // gap, because a single statement has exactly one arbiter and the two guards
+        // need different ones — under the D-01 exam cap every decision for a concept
+        // clamps to the *same* `due_at`, so the racer lands on migration 0012's
+        // due-date index, takes `DO UPDATE`, counts a second review write and
+        // overwrites the authoritative first decision. A hash collision between two
+        // different keys can only make an unrelated pair serialize; it can never make
+        // this guard wrong.
+        let replay_lock_key = format!(
+            "viva.review_schedule:{user_id}:{study_set_uuid}:{voice_session_uuid}:{concept_uuid}"
+        );
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&replay_lock_key)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_error)?;
+
         // A replay reads a later clock and so recomputes a different `due_at`; keying
         // the guard on the schedule would let it write a second scheduled review and
         // advance the persisted FSRS card. The first decision for this graded outcome
         // stays authoritative and is what the caller reports back.
-        if let Some(persisted) = self
-            .persisted_review_schedule_decision(
-                user_id,
-                study_set_uuid,
-                voice_session_uuid,
-                concept_uuid,
-                response_id,
-                &payload_digest,
-            )
-            .await?
+        if let Some(persisted) = Self::persisted_review_schedule_decision(
+            &mut *tx,
+            user_id,
+            study_set_uuid,
+            voice_session_uuid,
+            concept_uuid,
+            response_id,
+            &payload_digest,
+        )
+        .await?
         {
+            tx.commit().await.map_err(pg_error)?;
             self.record_event_authorization(
                 user_id,
                 study_set_id,
@@ -2425,7 +2493,7 @@ impl StudyMemoryStore for PostgresStudyStore {
 
         // One statement: the due date and the versioned decision/card land together
         // or neither does. `review_items_schedule_response_replay_idx` (migration 0015)
-        // makes the guard above hold under a concurrent replay too, and its unique
+        // is the belt-and-braces backstop behind the advisory lock, and its unique
         // violation routes back through the same read.
         let inserted = sqlx::query(
             "INSERT INTO review_items (
@@ -2464,30 +2532,36 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(cap_reason)
         .bind(response_id)
         .bind(&payload_digest)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await;
 
         let result = match inserted {
-            Ok(result) => result,
+            Ok(result) => {
+                tx.commit().await.map_err(pg_error)?;
+                result
+            }
             Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
                 // A concurrent replay won the race. Report what it persisted; never
-                // let this call become a second scheduled review.
-                let persisted = self
-                    .persisted_review_schedule_decision(
-                        user_id,
-                        study_set_uuid,
-                        voice_session_uuid,
-                        concept_uuid,
-                        response_id,
-                        &payload_digest,
+                // let this call become a second scheduled review. The unique
+                // violation has already aborted this transaction, so the re-read runs
+                // on a fresh connection.
+                tx.rollback().await.map_err(pg_error)?;
+                let persisted = Self::persisted_review_schedule_decision(
+                    &self.pool,
+                    user_id,
+                    study_set_uuid,
+                    voice_session_uuid,
+                    concept_uuid,
+                    response_id,
+                    &payload_digest,
+                )
+                .await?
+                .ok_or_else(|| {
+                    PortError::adapter(
+                        "postgres",
+                        "review schedule write conflicted with an unrelated scheduled row",
                     )
-                    .await?
-                    .ok_or_else(|| {
-                        PortError::adapter(
-                            "postgres",
-                            "review schedule write conflicted with an unrelated scheduled row",
-                        )
-                    })?;
+                })?;
                 self.record_event_authorization(
                     user_id,
                     study_set_id,

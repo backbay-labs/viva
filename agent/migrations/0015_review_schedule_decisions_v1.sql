@@ -2,6 +2,16 @@
 -- the review item, so a due date can never exist without the versioned decision
 -- that produced it. Additive only; there is no destructive down-migration.
 
+-- The exam instant is the other authoritative input to a D-01 decision, and it is
+-- the one input the learner supplies. `study_sets.exam_date` (migration 0001) is a
+-- calendar DATE, and D-01 states the UTC rule as "an exact UTC instant ... there is
+-- no calendar-day rounding"; a DATE cannot hold that value, and nothing in the
+-- repository ever wrote to it. `exam_at` is the authoritative column from here on.
+-- `exam_date` is kept, still written as the calendar-day projection of `exam_at`,
+-- and is never read back as a scheduling input. Plan 09 owns any later removal.
+ALTER TABLE study_sets
+    ADD COLUMN IF NOT EXISTS exam_at TIMESTAMPTZ;
+
 ALTER TABLE review_items
     ADD COLUMN IF NOT EXISTS schedule_schema_version SMALLINT,
     ADD COLUMN IF NOT EXISTS schedule_policy_id TEXT,

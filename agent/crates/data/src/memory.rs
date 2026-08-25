@@ -17,6 +17,7 @@ use agent_domain::{
     StudyStoreCapabilities, StudyStoreWriteCounts, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -628,26 +629,24 @@ impl InMemoryStudyStore {
     }
 
     /// Capture the study set's exam instant at ingestion so D-01's exam cap has the
-    /// same authoritative input on this backend as the `study_sets.exam_date` column
-    /// gives the Postgres backend. It is store context, never a tool argument.
-    fn persist_exam_date_locked(
+    /// same authoritative input on this backend as `study_sets.exam_at` gives the
+    /// Postgres backend. It is store context, never a tool argument.
+    ///
+    /// An absent exam date leaves the recorded instant untouched. A retry re-ingests
+    /// the file without re-asking the learner for the exam date — the production
+    /// retry route sends none every time — so writing that absence verbatim would
+    /// erase the only authoritative input the cap has. Title and course already
+    /// follow the same rule; clearing a recorded exam date is a separate, explicit
+    /// operation (`set_study_set_exam_date`).
+    fn capture_exam_instant_locked(
         state: &mut InMemoryStudyState,
         study_set_id: &str,
-        exam_date: Option<String>,
+        exam_at: Option<DateTime<Utc>>,
     ) {
-        match exam_date
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            Some(value) => {
-                state
-                    .study_set_exam_dates
-                    .insert(study_set_id.to_owned(), value.to_owned());
-            }
-            None => {
-                state.study_set_exam_dates.remove(study_set_id);
-            }
+        if let Some(instant) = exam_at {
+            state
+                .study_set_exam_dates
+                .insert(study_set_id.to_owned(), format_rfc3339_millis(instant));
         }
     }
 
@@ -2210,7 +2209,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         &self,
         input: CreatePasteStudySet,
     ) -> Result<StudySetIngestionRecord, PortError> {
-        let exam_date = input.exam_date.clone();
+        let exam_at = crate::ingestion_exam_instant("memory", input.exam_date.as_deref())?;
         let generated = generate_paste_study_set(input)?;
         {
             let mut state = self
@@ -2218,7 +2217,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 .write()
                 .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
             Self::persist_ingestion_record_locked(&mut state, &generated, false);
-            Self::persist_exam_date_locked(&mut state, &generated.study_set.id, exam_date);
+            Self::capture_exam_instant_locked(&mut state, &generated.study_set.id, exam_at);
         }
         Ok(generated)
     }
@@ -2227,7 +2226,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         &self,
         input: CreateFileStudySet,
     ) -> Result<StudySetIngestionRecord, PortError> {
-        let exam_date = input.exam_date.clone();
+        let exam_at = crate::ingestion_exam_instant("memory", input.exam_date.as_deref())?;
         let generated = generate_file_study_set(input)?;
         {
             let mut state = self
@@ -2235,7 +2234,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 .write()
                 .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
             Self::persist_ingestion_record_locked(&mut state, &generated, false);
-            Self::persist_exam_date_locked(&mut state, &generated.study_set.id, exam_date);
+            Self::capture_exam_instant_locked(&mut state, &generated.study_set.id, exam_at);
         }
         Ok(generated)
     }
@@ -2261,7 +2260,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             let existing = Self::study_set_locked(&state, &input.user_id, &study_set_id)?;
             (existing.title.clone(), existing.course.clone())
         };
-        let exam_date = input.exam_date.clone();
+        let exam_at = crate::ingestion_exam_instant("memory", input.exam_date.as_deref())?;
         let generated = generate_file_study_set(CreateFileStudySet {
             user_id: input.user_id,
             study_set_id: Some(study_set_id),
@@ -2279,7 +2278,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 .write()
                 .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
             Self::persist_ingestion_record_locked(&mut state, &generated, true);
-            Self::persist_exam_date_locked(&mut state, &generated.study_set.id, exam_date);
+            Self::capture_exam_instant_locked(&mut state, &generated.study_set.id, exam_at);
         }
         Ok(generated)
     }
@@ -5855,6 +5854,136 @@ mod review_schedule_decision_tests {
             .review_scheduling_context("user-1", "biology-midterm", "nadh")
             .await
             .is_err());
+    }
+
+    /// Long enough for the paste/file ingestion heuristics to derive real source
+    /// spans and concepts.
+    fn ingestible_text() -> String {
+        let sentences = [
+            "Mitochondria electron transport builds a proton gradient across the inner membrane for ATP synthase.",
+            "NADH transfers electrons through Complex I while oxygen accepts them at the end of the chain.",
+            "Chemiosmosis couples proton flow to ATP production during oxidative phosphorylation.",
+        ]
+        .join(" ");
+        format!("{sentences} {}", sentences.repeat(8))
+    }
+
+    /// A retry re-ingests the file; it never re-asks the learner for the exam date,
+    /// and the production HTTP retry route sends `exam_date: None` every time
+    /// (`agent-service/src/app.rs`). An ingestion path that writes that `None`
+    /// verbatim erases the only authoritative input D-01's exam cap has, so the cap
+    /// silently stops firing for every retried study set.
+    #[tokio::test]
+    async fn review_schedule_decision_file_retry_keeps_the_exam_date_the_learner_recorded() {
+        let store = InMemoryStudyStore::new();
+        let ingested = store
+            .create_file_study_set(CreateFileStudySet {
+                user_id: "user-1".to_owned(),
+                study_set_id: None,
+                title: "Bio PDF".to_owned(),
+                course: Some("Biology 201".to_owned()),
+                exam_date: Some(CLOSE_EXAM_AT.to_owned()),
+                file_name: "Lecture 9.pdf".to_owned(),
+                content_type: Some("application/pdf".to_owned()),
+                file_bytes: ingestible_text().into_bytes(),
+                session_id: Some("file-session-exam".to_owned()),
+            })
+            .await
+            .expect("file ingestion succeeds");
+        let study_set_id = ingested.study_set.id.clone();
+        let ingested_concept = ingested
+            .concepts
+            .first()
+            .expect("ingestion produced a concept")
+            .public_id
+            .clone();
+        assert_eq!(
+            store
+                .review_scheduling_context("user-1", &study_set_id, &ingested_concept)
+                .await
+                .expect("context")
+                .exam_at,
+            Some(parse_utc_instant(CLOSE_EXAM_AT).expect("exam instant")),
+            "ingestion must capture the exam instant before the retry can be judged"
+        );
+
+        // Exactly what the production retry route sends: no title, no course, no
+        // exam date.
+        let retried = store
+            .retry_file_study_set(CreateFileStudySet {
+                user_id: "user-1".to_owned(),
+                study_set_id: Some(study_set_id.clone()),
+                title: String::new(),
+                course: None,
+                exam_date: None,
+                file_name: "Lecture 9 rescan.pdf".to_owned(),
+                content_type: Some("application/pdf".to_owned()),
+                file_bytes: ingestible_text().into_bytes(),
+                session_id: Some("file-session-exam-retry".to_owned()),
+            })
+            .await
+            .expect("retry succeeds");
+        let retried_concept = retried
+            .concepts
+            .first()
+            .expect("retry produced a concept")
+            .public_id
+            .clone();
+
+        assert_eq!(
+            store
+                .review_scheduling_context("user-1", &study_set_id, &retried_concept)
+                .await
+                .expect("context")
+                .exam_at,
+            Some(parse_utc_instant(CLOSE_EXAM_AT).expect("exam instant")),
+            "a file retry must not erase the exam date the learner already recorded"
+        );
+    }
+
+    /// Fail closed at the boundary that accepts learner input, on both backends: a
+    /// `study_sets` exam column that cannot hold the value is a scheduling input that
+    /// silently disappears, and D-01 forbids a silently missing authoritative input.
+    #[tokio::test]
+    async fn review_schedule_decision_ingestion_rejects_an_unparseable_exam_date() {
+        let store = InMemoryStudyStore::new();
+        store
+            .create_paste_study_set(CreatePasteStudySet {
+                user_id: "user-1".to_owned(),
+                title: "Bio paste".to_owned(),
+                course: None,
+                exam_date: Some("sometime next week".to_owned()),
+                pasted_text: ingestible_text(),
+                session_id: Some("paste-session-bad-exam".to_owned()),
+            })
+            .await
+            .expect_err("an unparseable exam date is rejected where the learner supplies it");
+    }
+
+    /// Both backends must leave the same authorization ledger behind. A replay
+    /// performs no write, so it must not append a second authorization either.
+    #[tokio::test]
+    async fn review_schedule_decision_replay_records_exactly_one_authorization() {
+        let store = seeded_session_store().await;
+        let decision = decision_at(GRADED_AT, ConceptStatus::Shaky, None);
+        for _ in 0..3 {
+            store
+                .persist_review_schedule_decision(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    "response-1",
+                    "nadh",
+                    decision.clone(),
+                )
+                .await
+                .expect("decision persists");
+        }
+        assert_eq!(
+            store.snapshot().event_authorizations.len(),
+            1,
+            "a replay writes nothing, so it appends no second authorization"
+        );
     }
 
     #[tokio::test]
