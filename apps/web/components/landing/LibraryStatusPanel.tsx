@@ -8,7 +8,15 @@ import {
   exportVivaLibraryData,
   fetchVivaLibrarySnapshot,
 } from "../../lib/viva-agent-client";
-import { projectLibrarySnapshot, type VivaLibrarySnapshot } from "../../lib/viva-library";
+import {
+  type BrowserSessionCredentialVault,
+  browserSessionCredentialVaultInputFromStartResponse,
+  fetchWithVivaSessionStartTimeout,
+  pendingBrowserSessionCredentialVault,
+  projectLibrarySnapshot,
+  type VivaLibrarySnapshot,
+  type VivaSessionStartResponse,
+} from "../../lib/viva-library";
 import { librarySessionTarget } from "../../lib/viva-session-entry";
 
 type LibraryProjection = ReturnType<typeof projectLibrarySnapshot>;
@@ -28,11 +36,18 @@ export type LibraryActionSessionTargetAction = {
 };
 
 export function LibraryStatusPanel({
-  snapshot,
+  navigate,
   now,
+  sessionCredentialVault,
+  snapshot,
+  startFetchTimeoutMs,
 }: {
-  snapshot?: VivaLibrarySnapshot | null;
+  navigate?: (target: string) => void;
   now?: Date;
+  sessionCredentialVault?: BrowserSessionCredentialVault;
+  snapshot?: VivaLibrarySnapshot | null;
+  /** Test-only override for the D-07 Branch A same-origin start fetch's abort bound; production always uses the locked `VIVA_SESSION_START_FETCH_TIMEOUT_MS` default. */
+  startFetchTimeoutMs?: number;
 }) {
   const [currentSnapshot, setCurrentSnapshot] = useState(snapshot ?? null);
   const [status, setStatus] = useState("");
@@ -95,8 +110,13 @@ export function LibraryStatusPanel({
     setBusyAction(`${actionName}:${row.id}`);
     setStatus("");
     try {
-      const started = await startServerSession(row, actionName, action, { refreshLibrary });
-      if (!started) setStatus("Session start failed.");
+      const outcome = await startServerSession(row, actionName, action, {
+        navigate,
+        refreshLibrary,
+        sessionCredentialVault,
+        timeoutMs: startFetchTimeoutMs,
+      });
+      if (!outcome.ok) setStatus(sessionStartFailureStatus(outcome.reason));
     } catch {
       setStatus("Session start failed.");
     } finally {
@@ -286,6 +306,19 @@ export function libraryActionSessionTarget(
   });
 }
 
+/**
+ * Why a start attempt did not reach `/session`: `"unavailable"` means the
+ * row's action was never available at all; `"start_failed"` covers a
+ * rejected/malformed mint (including a bootstrap-expiry retry that still
+ * failed, or one with no `refreshLibrary` to retry through); `"timed_out"`
+ * is the D-07 Branch A 6000ms fetch bound firing on a hung mint — kept
+ * distinct so the UI can surface an honest, explicit status instead of
+ * folding a hang into the same generic failure message.
+ */
+export type StartServerSessionOutcome =
+  | { ok: true }
+  | { ok: false; reason: "unavailable" | "start_failed" | "timed_out" };
+
 export async function startServerSession(
   row: LibraryRow,
   actionName: "resume" | "start",
@@ -293,86 +326,127 @@ export async function startServerSession(
   options: {
     navigate?: (target: string) => void;
     refreshLibrary?: () => Promise<VivaLibrarySnapshot>;
+    sessionCredentialVault?: BrowserSessionCredentialVault;
+    timeoutMs?: number;
   } = {},
-): Promise<boolean> {
-  if (!action.available) return false;
+): Promise<StartServerSessionOutcome> {
+  if (!action.available) return { ok: false, reason: "unavailable" };
   const navigate = options.navigate ?? navigateToSession;
+  const vault = options.sessionCredentialVault ?? pendingBrowserSessionCredentialVault;
   if (action.sessionToken?.trim()) {
+    // A direct session token already available on the snapshot (the D-06/
+    // trust-contract fast path) never mints through `/api/viva-session/
+    // start`, so it has no start response to hand the vault seam.
     navigate(
       libraryActionSessionTarget(row, action, {
         includeSessionToken: true,
       }),
     );
-    return true;
+    return { ok: true };
   }
-  const firstAttempt = await requestServerSession(row, actionName, action);
+  const firstAttempt = await requestServerSession(row, actionName, action, options.timeoutMs);
   if (firstAttempt.ok) {
-    navigate(firstAttempt.target);
-    return true;
+    completeServerSessionStart(vault, firstAttempt.startResponse, navigate, firstAttempt.target);
+    return { ok: true };
   }
-  if (!firstAttempt.bootstrapCapabilityExpired || !options.refreshLibrary) return false;
+  if (firstAttempt.timedOut) return { ok: false, reason: "timed_out" };
+  if (!firstAttempt.bootstrapCapabilityExpired || !options.refreshLibrary) {
+    return { ok: false, reason: "start_failed" };
+  }
 
   const refreshedSnapshot = await options.refreshLibrary();
   const refreshedProjection = projectLibrarySnapshot(refreshedSnapshot);
   const refreshedRow = refreshedProjection.libraryRows.find((candidate) => candidate.id === row.id);
   const refreshedAction = refreshedRow?.[actionName];
-  if (!refreshedRow || !refreshedAction?.available) return false;
+  if (!refreshedRow || !refreshedAction?.available) return { ok: false, reason: "start_failed" };
   if (refreshedAction.sessionToken?.trim()) {
     navigate(
       libraryActionSessionTarget(refreshedRow, refreshedAction, {
         includeSessionToken: true,
       }),
     );
-    return true;
+    return { ok: true };
   }
-  const retryAttempt = await requestServerSession(refreshedRow, actionName, refreshedAction);
-  if (!retryAttempt.ok) return false;
-  navigate(retryAttempt.target);
-  return true;
+  const retryAttempt = await requestServerSession(
+    refreshedRow,
+    actionName,
+    refreshedAction,
+    options.timeoutMs,
+  );
+  if (!retryAttempt.ok) {
+    return { ok: false, reason: retryAttempt.timedOut ? "timed_out" : "start_failed" };
+  }
+  completeServerSessionStart(vault, retryAttempt.startResponse, navigate, retryAttempt.target);
+  return { ok: true };
+}
+
+/**
+ * Hands the complete start response to the credential-vault seam — Plan
+ * 10's not-yet-published `replaceBrowserSessionCredential`, stood in for by
+ * `pendingBrowserSessionCredentialVault` until it lands — strictly before
+ * navigating away, exactly once per successful mint.
+ */
+function completeServerSessionStart(
+  vault: BrowserSessionCredentialVault,
+  startResponse: VivaSessionStartResponse,
+  navigate: (target: string) => void,
+  target: string,
+) {
+  const vaultInput = browserSessionCredentialVaultInputFromStartResponse(startResponse);
+  if (vaultInput) vault.replaceBrowserSessionCredential(vaultInput);
+  navigate(target);
 }
 
 async function requestServerSession(
   row: LibraryRow,
   actionName: "resume" | "start",
   action: LibraryRow["start"],
-): Promise<{ ok: true; target: string } | { bootstrapCapabilityExpired: boolean; ok: false }> {
-  const response = await fetch("/api/viva-session/start", {
-    body: JSON.stringify({
-      session_id: actionName === "resume" ? action.sessionId : undefined,
-      session_bootstrap_token: action.sessionBootstrapToken,
-      study_set_id: row.id,
-      user_id: row.userId,
-    }),
-    cache: "no-store",
-    headers: { "content-type": "application/json" },
-    method: "POST",
-  });
+  timeoutMs?: number,
+): Promise<
+  | { ok: true; startResponse: VivaSessionStartResponse; target: string }
+  | { bootstrapCapabilityExpired: boolean; ok: false; timedOut: boolean }
+> {
+  const bounded = await fetchWithVivaSessionStartTimeout(
+    fetch,
+    "/api/viva-session/start",
+    {
+      body: JSON.stringify({
+        session_id: actionName === "resume" ? action.sessionId : undefined,
+        session_bootstrap_token: action.sessionBootstrapToken,
+        study_set_id: row.id,
+        user_id: row.userId,
+      }),
+      cache: "no-store",
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    },
+    { timeoutMs },
+  );
+  if (!bounded.ok) {
+    return { bootstrapCapabilityExpired: false, ok: false, timedOut: true };
+  }
+  const response = bounded.response;
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as { error?: unknown } | null;
     return {
       bootstrapCapabilityExpired:
         response.status === 403 && body?.error === "session_bootstrap_capability_required",
       ok: false,
+      timedOut: false,
     };
   }
-  const payload = (await response.json()) as {
-    session?: {
-      session_id?: string;
-      study_set_id?: string;
-      user_id?: string;
-    };
-    session_token?: string;
-  };
+  const payload = (await response.json()) as VivaSessionStartResponse;
   if (
     !payload.session?.session_id ||
     !payload.session.study_set_id ||
     !payload.session.user_id ||
     !payload.session_token
   ) {
-    return { bootstrapCapabilityExpired: false, ok: false };
+    return { bootstrapCapabilityExpired: false, ok: false, timedOut: false };
   }
   return {
     ok: true,
+    startResponse: payload,
     target: librarySessionTarget({
       sessionId: payload.session.session_id,
       sessionToken: payload.session_token,
@@ -384,6 +458,10 @@ async function requestServerSession(
 
 function navigateToSession(target: string) {
   if (typeof window !== "undefined") window.location.assign(target);
+}
+
+function sessionStartFailureStatus(reason: "unavailable" | "start_failed" | "timed_out"): string {
+  return reason === "timed_out" ? "Session start timed out." : "Session start failed.";
 }
 
 function downloadJson(filename: string, value: unknown) {

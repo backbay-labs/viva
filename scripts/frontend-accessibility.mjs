@@ -71,9 +71,40 @@ import {
  *   44x44 CSS px;
  * - clicking it navigates the main frame to `/session` exactly once.
  *
- * Later tasks add the remaining deletion/bootstrap/static-export modes
- * named in their own RED commands; this file's mode dispatch is written so
- * those are additive.
+ * Task 6 adds `--session-bootstrap` (`FRONTEND-011`, D-07 Branch A —
+ * `retain-token-only`, the only recorded D-07 branch in this program):
+ * mounts `/` with a seeded `session_bootstrap_token` sentinel (reusing
+ * `LIBRARY_SNAPSHOT_FIXTURE`) and proves, against real browser/network
+ * state —
+ *
+ * - the sentinel is absent from the rendered DOM (text and attributes,
+ *   excluding Next's own `<script>`-embedded RSC hydration payload, which
+ *   necessarily carries the client component's props and is not rendered,
+ *   queryable markup) both before and after clicking Start;
+ * - a real click sends the sentinel exactly once, only in the same-origin
+ *   `POST /api/viva-session/start` JSON body — a real request, intercepted
+ *   and fulfilled with a synthetic complete start response so this check
+ *   does not depend on Plan 11's unrelated route-level bootstrap-secret
+ *   configuration;
+ * - the minted session token never appears in any request URL, in the URL
+ *   query string, in a request referrer, or in a browser console message —
+ *   only in the post-navigation URL fragment;
+ * - a same-origin start request that never resolves surfaces an explicit
+ *   "Session start timed out." status within the bound (proving the
+ *   client-side 6000ms abort/timeout policy is real, not merely unit-level)
+ *   and never navigates.
+ *
+ * The complementary proof that a successful start hands Plan 10's
+ * not-yet-published `replaceBrowserSessionCredential` vault seam the
+ * complete start response, strictly before navigation, is a Bun-test/
+ * happy-dom-mounted concern (`apps/web/lib/viva-library.test.ts`,
+ * `apps/web/components/landing/LandingEntry.test.tsx`) rather than this
+ * script's: observing an in-page JS call's exact arguments has no natural
+ * black-box browser signal, whereas a real DOM mount gives direct access.
+ *
+ * Later tasks add the remaining deletion/static-export modes named in their
+ * own RED commands; this file's mode dispatch is written so those are
+ * additive.
  */
 
 const ALLOWLISTED_COMPUTED_PROPERTIES = [
@@ -288,6 +319,18 @@ async function main() {
     return;
   }
 
+  if (args.includes("--session-bootstrap")) {
+    const failures = await runSessionBootstrapCheck();
+    if (failures.length > 0) {
+      console.error(`--session-bootstrap FAILED: ${failures.length} issue(s)`);
+      for (const line of failures) console.error(`  - ${line}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log("--session-bootstrap OK: 0 issues");
+    return;
+  }
+
   if (args.includes("--session-handoff")) {
     const scopeFlagIndex = args.indexOf("--disclosure-scope");
     const disclosureScope = scopeFlagIndex !== -1 ? args[scopeFlagIndex + 1] : undefined;
@@ -348,8 +391,8 @@ async function main() {
   fail(
     "no recognized mode flag. Supported: --write-computed-style-baseline <path>, " +
       "--compare-computed-style-baseline <path>, --owned-surfaces, --session-handoff " +
-      "--disclosure-scope all-live-content, --assets, --landing-affordance; later tasks add " +
-      "more modes.",
+      "--disclosure-scope all-live-content, --assets, --landing-affordance, " +
+      "--session-bootstrap; later tasks add more modes.",
   );
 }
 
@@ -1140,6 +1183,283 @@ async function checkBeginButtonNavigatesOnce(page, baseUrl) {
       `[landing-affordance] expected the begin button to navigate to /session, landed on ` +
         `${finalUrl.pathname}${finalUrl.search}${finalUrl.hash}`,
     );
+  }
+  return failures;
+}
+
+/* --------------------------------------------------------------------- *
+ * Task 6 (`FRONTEND-011`): `--session-bootstrap`.
+ * -------------------------------------------------------------------- */
+
+/** The seeded bootstrap sentinel `LIBRARY_SNAPSHOT_FIXTURE` already carries (see its own header comment). */
+const SESSION_BOOTSTRAP_SENTINEL = LIBRARY_SNAPSHOT_FIXTURE.study_sets[0].actions.start.session_bootstrap_token;
+const SESSION_BOOTSTRAP_ACCESSIBLE_NAME = `Start ${LIBRARY_SNAPSHOT_FIXTURE.study_sets[0].title}`;
+const SYNTHETIC_SESSION_TOKEN = "synthetic-session-token-for-frontend-accessibility-check";
+const SYNTHETIC_REFRESH_TOKEN = "synthetic-refresh-token-for-frontend-accessibility-check";
+
+/** A synthetic, complete `/api/viva-session/start` response body, matching the fixture's identity. */
+function syntheticStartResponseBody() {
+  return JSON.stringify({
+    failure_class: null,
+    refresh_expires_at: "2026-08-31T00:00:00Z",
+    refresh_token: SYNTHETIC_REFRESH_TOKEN,
+    session: {
+      session_id: LIBRARY_SNAPSHOT_FIXTURE.study_sets[0].actions.start.session_id,
+      study_set_id: LIBRARY_SNAPSHOT_FIXTURE.study_sets[0].id,
+      user_id: LIBRARY_SNAPSHOT_FIXTURE.user_id,
+    },
+    session_absolute_expires_at: "2026-09-23T00:00:00Z",
+    session_token: SYNTHETIC_SESSION_TOKEN,
+    token_refresh_outcome: "issued",
+  });
+}
+
+/**
+ * Serializes `document.body` with every `<script>`/`<style>`/`<template>`
+ * element removed first — the rendered, queryable markup surface a user, an
+ * assistive technology, or a DOM-scraping log/analytics integration could
+ * actually observe. This deliberately excludes Next.js's own inline RSC
+ * flight-data `<script>` payload, which necessarily carries this client
+ * component's props (including `session_bootstrap_token`, so client JS can
+ * echo it back in the start POST body) but is neither rendered text nor an
+ * element attribute in the sense `FRONTEND-011` cares about.
+ *
+ * @param {import("playwright").Page} page
+ */
+async function visibleBodyMarkup(page) {
+  return page.evaluate(() => {
+    const clone = document.body.cloneNode(true);
+    for (const el of Array.from(clone.querySelectorAll("script, style, template"))) el.remove();
+    return clone.outerHTML;
+  });
+}
+
+/**
+ * Mounts `/`, seeds the library-snapshot fixture's `session_bootstrap_token`
+ * sentinel, and runs both `--session-bootstrap` scenarios: normal secrecy/
+ * fragment-placement (`checkSessionBootstrapSecrecyAndFragment`) and the
+ * bounded-fetch timeout proof (`checkSessionBootstrapFetchBound`).
+ */
+async function runSessionBootstrapCheck() {
+  const artifactDir = path.join(repoRoot, "artifacts/frontend-accessibility");
+  mkdirSync(artifactDir, { recursive: true });
+  const stub = await startLibrarySnapshotStub(LIBRARY_SNAPSHOT_FIXTURE);
+  const failures = [];
+  try {
+    await withFrontendDevServer(
+      { artifactDir, extraEnv: harnessExtraEnv(stub.url) },
+      async ({ baseUrl }) => {
+        const hydratableBaseUrl = toHydratableUrl(baseUrl);
+        const browser = await launchChromium();
+        try {
+          failures.push(
+            ...(await checkSessionBootstrapSecrecyAndFragment(browser, hydratableBaseUrl)),
+          );
+          failures.push(...(await checkSessionBootstrapFetchBound(browser, hydratableBaseUrl)));
+        } finally {
+          await browser.close();
+        }
+      },
+    );
+  } finally {
+    await stub.close();
+  }
+  return failures;
+}
+
+/**
+ * D-07 Branch A's capability-location proof: the seeded bootstrap sentinel
+ * never reaches rendered DOM text/attributes, a request URL, or a request
+ * referrer; a real click sends it exactly once, only in the same-origin
+ * start POST body (a real request, intercepted and fulfilled with a
+ * synthetic complete response so this does not depend on Plan 11's
+ * bootstrap-secret route configuration); and the minted session token
+ * afterward appears only in the navigation fragment, never the query string,
+ * a request URL, a referrer, or a browser console message.
+ *
+ * @param {import("playwright").Browser} browser
+ * @param {string} baseUrl
+ */
+async function checkSessionBootstrapSecrecyAndFragment(browser, baseUrl) {
+  const failures = [];
+  const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const page = await context.newPage();
+  const consoleTexts = [];
+  page.on("console", (msg) => consoleTexts.push(msg.text()));
+  // An uncaught exception or unhandled promise rejection is a distinct
+  // Playwright event from `console` — Chromium's own error printer, not an
+  // explicit `console.*` call — so "logs" covers both.
+  page.on("pageerror", (error) => consoleTexts.push(String(error?.message ?? error)));
+  const requestRecords = [];
+  page.on("request", (request) => {
+    const headers = request.headers();
+    requestRecords.push({ referer: headers.referer ?? headers.referrer ?? null, url: request.url() });
+  });
+  const capturedStartRequests = [];
+  await page.route("**/api/viva-session/start", async (route) => {
+    capturedStartRequests.push({ body: route.request().postData() });
+    await route.fulfill({
+      body: syntheticStartResponseBody(),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+
+  try {
+    await gotoRouteReady(page, baseUrl, "/");
+
+    const beforeClickMarkup = await visibleBodyMarkup(page);
+    if (beforeClickMarkup.includes(SESSION_BOOTSTRAP_SENTINEL)) {
+      failures.push(
+        "[session-bootstrap] the bootstrap sentinel is present in the rendered DOM before any click",
+      );
+    }
+
+    await page.getByRole("button", { name: SESSION_BOOTSTRAP_ACCESSIBLE_NAME, exact: true }).click();
+    await page
+      .waitForFunction(() => location.hash.includes("session_token="), undefined, { timeout: 10_000 })
+      .catch(() => {});
+
+    const afterClickMarkup = await visibleBodyMarkup(page);
+    if (afterClickMarkup.includes(SESSION_BOOTSTRAP_SENTINEL)) {
+      failures.push(
+        "[session-bootstrap] the bootstrap sentinel is present in the rendered DOM after clicking Start",
+      );
+    }
+    if (afterClickMarkup.includes(SYNTHETIC_SESSION_TOKEN)) {
+      failures.push(
+        "[session-bootstrap] the minted session token is present in the rendered DOM after navigation",
+      );
+    }
+
+    if (capturedStartRequests.length !== 1) {
+      failures.push(
+        `[session-bootstrap] expected exactly one /api/viva-session/start request, saw ` +
+          `${capturedStartRequests.length}`,
+      );
+    } else {
+      let parsedBody = null;
+      try {
+        parsedBody = JSON.parse(capturedStartRequests[0].body ?? "");
+      } catch {
+        // handled by the null-body check below
+      }
+      if (parsedBody?.session_bootstrap_token !== SESSION_BOOTSTRAP_SENTINEL) {
+        failures.push(
+          "[session-bootstrap] the /api/viva-session/start POST body did not carry the " +
+            `bootstrap sentinel exactly once (got ${JSON.stringify(parsedBody?.session_bootstrap_token)})`,
+        );
+      }
+    }
+
+    const currentUrl = new URL(page.url());
+    if (currentUrl.pathname !== "/session") {
+      failures.push(
+        `[session-bootstrap] expected navigation to /session after a successful start, landed on ` +
+          `${currentUrl.pathname}`,
+      );
+    }
+    if (currentUrl.searchParams.has("session_token") || currentUrl.searchParams.has("token")) {
+      failures.push("[session-bootstrap] the minted session token leaked into the URL query string");
+    }
+    if (!currentUrl.hash.includes("session_token=")) {
+      failures.push(
+        "[session-bootstrap] the minted session token did not appear in the navigation fragment",
+      );
+    }
+
+    for (const record of requestRecords) {
+      if (record.url.includes(SESSION_BOOTSTRAP_SENTINEL) || record.url.includes(SYNTHETIC_SESSION_TOKEN)) {
+        failures.push(`[session-bootstrap] a request URL leaked a session credential: ${record.url}`);
+      }
+      if (
+        (record.referer && record.referer.includes(SESSION_BOOTSTRAP_SENTINEL)) ||
+        (record.referer && record.referer.includes(SYNTHETIC_SESSION_TOKEN))
+      ) {
+        failures.push(
+          `[session-bootstrap] a request referrer leaked a session credential: ${record.referer}`,
+        );
+      }
+    }
+    for (const text of consoleTexts) {
+      if (
+        text.includes(SESSION_BOOTSTRAP_SENTINEL) ||
+        text.includes(SYNTHETIC_SESSION_TOKEN) ||
+        text.includes(SYNTHETIC_REFRESH_TOKEN)
+      ) {
+        failures.push(`[session-bootstrap] a browser console message leaked a session credential: ${text}`);
+      }
+    }
+  } finally {
+    await context.close();
+  }
+  return failures;
+}
+
+/**
+ * D-07 Branch A's fetch-bound proof: a same-origin start request that never
+ * resolves must abort at the 6000ms bound and surface an explicit status
+ * (`"Session start timed out."`) rather than leaving the UI hung
+ * indefinitely, and must never navigate or leak the sentinel while pending.
+ *
+ * @param {import("playwright").Browser} browser
+ * @param {string} baseUrl
+ */
+async function checkSessionBootstrapFetchBound(browser, baseUrl) {
+  const failures = [];
+  const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const page = await context.newPage();
+  const consoleTexts = [];
+  page.on("console", (msg) => consoleTexts.push(msg.text()));
+  // An uncaught exception or unhandled promise rejection is a distinct
+  // Playwright event from `console` — Chromium's own error printer, not an
+  // explicit `console.*` call — so "logs" covers both.
+  page.on("pageerror", (error) => consoleTexts.push(String(error?.message ?? error)));
+  // Never fulfill, continue, or abort: the request stays pending until the
+  // client's own AbortController fires at the bound.
+  await page.route("**/api/viva-session/start", () => {});
+
+  try {
+    await gotoRouteReady(page, baseUrl, "/");
+    await page.getByRole("button", { name: SESSION_BOOTSTRAP_ACCESSIBLE_NAME, exact: true }).click();
+
+    const startedAt = Date.now();
+    const surfaced = await page
+      .waitForFunction(
+        () => (document.querySelector(".viva-library__status")?.textContent ?? "").includes("timed out"),
+        undefined,
+        { timeout: 8_000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+    const elapsedMs = Date.now() - startedAt;
+
+    if (!surfaced) {
+      failures.push(
+        "[session-bootstrap] a hung /api/viva-session/start request never surfaced an explicit " +
+          "timed-out status within 8000ms",
+      );
+    } else if (elapsedMs > 7_000) {
+      failures.push(
+        `[session-bootstrap] the start fetch's abort bound took ${elapsedMs}ms to surface, expected ` +
+          "close to the 6000ms policy",
+      );
+    }
+
+    const currentUrl = new URL(page.url());
+    if (currentUrl.pathname === "/session") {
+      failures.push("[session-bootstrap] a timed-out start request still navigated to /session");
+    }
+    for (const text of consoleTexts) {
+      if (text.includes(SESSION_BOOTSTRAP_SENTINEL)) {
+        failures.push(
+          `[session-bootstrap] a browser console message leaked the bootstrap sentinel during a ` +
+            `timeout: ${text}`,
+        );
+      }
+    }
+  } finally {
+    await context.close();
   }
   return failures;
 }

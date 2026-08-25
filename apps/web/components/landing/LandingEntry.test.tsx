@@ -1,11 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { Children, type ReactElement } from "react";
+import { GlobalRegistrator } from "@happy-dom/global-registrator";
+import { act, Children, type ReactElement } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import Page, { dynamic } from "../../app/page";
 import { projectLibrarySnapshot, type VivaLibrarySnapshot } from "../../lib/viva-library";
 import { LandingEntry, landingEntryTarget } from "./LandingEntry";
 import { LandingHero } from "./LandingHero";
-import { libraryActionSessionTarget, startServerSession } from "./LibraryStatusPanel";
+import {
+  LibraryStatusPanel,
+  libraryActionSessionTarget,
+  startServerSession,
+} from "./LibraryStatusPanel";
 
 type LandingHeroProps = Parameters<typeof LandingHero>[0];
 
@@ -360,7 +366,456 @@ describe("LandingEntry", () => {
     // The study-set primary action keeps its emphasis.
     expect(markup).toContain("viva-library__action--primary");
   });
+
+  test("never logs the bootstrap or session token while refreshing an expired bootstrap capability and retrying", async () => {
+    const staleSnapshot = librarySnapshotWithBootstrap("stale-bootstrap-capability");
+    const freshSnapshot = librarySnapshotWithBootstrap("fresh-bootstrap-capability");
+    const row = projectLibrarySnapshot(staleSnapshot).libraryRows[0];
+    if (!row) throw new Error("fixture must include a library row");
+    const order: string[] = [];
+    const vaultCalls: unknown[] = [];
+    const navigations: string[] = [];
+    const loggedText: string[] = [];
+    const originalConsole = { error: console.error, log: console.log, warn: console.warn };
+    console.log = (...args: unknown[]) => loggedText.push(args.map(String).join(" "));
+    console.warn = (...args: unknown[]) => loggedText.push(args.map(String).join(" "));
+    console.error = (...args: unknown[]) => loggedText.push(args.map(String).join(" "));
+    try {
+      globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+        if (String(init?.body ?? "").includes("stale-bootstrap-capability")) {
+          return new Response(JSON.stringify({ error: "session_bootstrap_capability_required" }), {
+            headers: { "content-type": "application/json" },
+            status: 403,
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            session: {
+              session_id: "server-session",
+              study_set_id: "biology-midterm",
+              user_id: "user-1",
+            },
+            session_token: "redacted-session-token",
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        );
+      }) as typeof fetch;
+
+      const outcome = await startServerSession(row, "start", row.start, {
+        navigate: (target) => {
+          order.push("navigate");
+          navigations.push(target);
+        },
+        refreshLibrary: async () => freshSnapshot,
+        sessionCredentialVault: {
+          replaceBrowserSessionCredential: (input) => {
+            order.push("vault");
+            vaultCalls.push(input);
+          },
+        },
+      });
+
+      expect(outcome).toEqual({ ok: true });
+      expect(navigations).toEqual([
+        "/session?user_id=user-1&study_set_id=biology-midterm&session_id=server-session#session_token=redacted-session-token",
+      ]);
+      // The vault is only ever called once — on the successful retry — and
+      // strictly before navigation, never on the 403 attempt.
+      expect(vaultCalls).toEqual([
+        {
+          mode: "retain-token-only",
+          refresh_expires_at: null,
+          refresh_token: null,
+          session_absolute_expires_at: null,
+          session_id: "server-session",
+          session_token: "redacted-session-token",
+          study_set_id: "biology-midterm",
+          user_id: "user-1",
+        },
+      ]);
+      expect(order).toEqual(["vault", "navigate"]);
+
+      for (const line of loggedText) {
+        expect(line).not.toContain("stale-bootstrap-capability");
+        expect(line).not.toContain("fresh-bootstrap-capability");
+        expect(line).not.toContain("redacted-session-token");
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      console.error = originalConsole.error;
+      console.log = originalConsole.log;
+      console.warn = originalConsole.warn;
+    }
+  });
 });
+
+/**
+ * D-07 Branch A (`retain-token-only`, `FRONTEND-011`): function-level proof
+ * that `startServerSession` composes the "small local indirection" this task
+ * owns in place of Plan 10's not-yet-published `replaceBrowserSessionCredential`
+ * (confirmed absent from `apps/web/lib/use-viva-agent-session.ts` in this
+ * tree before writing this test) — it must be handed the complete start
+ * response and invoked strictly before navigation — and that the same-origin
+ * start fetch is bounded so a hung mint can never hang the UI forever.
+ */
+describe("D-07 Branch A session-bootstrap composition: vault seam and fetch bound (FRONTEND-011)", () => {
+  test("calls the session credential vault with the complete start response before navigating", async () => {
+    const order: string[] = [];
+    const vaultCalls: unknown[] = [];
+    const navigations: string[] = [];
+    const row = projectLibrarySnapshot(librarySnapshotWithBootstrap("full-response-sentinel"))
+      .libraryRows[0];
+    if (!row) throw new Error("fixture must include a library row");
+    try {
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({
+            refresh_expires_at: "2026-09-01T00:00:00Z",
+            refresh_token: "viva1.full-refresh-token",
+            session: {
+              session_id: "server-session",
+              study_set_id: "biology-midterm",
+              user_id: "user-1",
+            },
+            session_absolute_expires_at: "2026-09-23T00:00:00Z",
+            session_token: "viva1.full-session-token",
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        )) as typeof fetch;
+
+      const outcome = await startServerSession(row, "start", row.start, {
+        navigate: (target) => {
+          order.push("navigate");
+          navigations.push(target);
+        },
+        sessionCredentialVault: {
+          replaceBrowserSessionCredential: (input) => {
+            order.push("vault");
+            vaultCalls.push(input);
+          },
+        },
+      });
+
+      expect(outcome).toEqual({ ok: true });
+      expect(vaultCalls).toEqual([
+        {
+          mode: "retain-token-only",
+          refresh_expires_at: "2026-09-01T00:00:00Z",
+          refresh_token: "viva1.full-refresh-token",
+          session_absolute_expires_at: "2026-09-23T00:00:00Z",
+          session_id: "server-session",
+          session_token: "viva1.full-session-token",
+          study_set_id: "biology-midterm",
+          user_id: "user-1",
+        },
+      ]);
+      expect(navigations).toEqual([
+        "/session?user_id=user-1&study_set_id=biology-midterm&session_id=server-session#session_token=viva1.full-session-token",
+      ]);
+      expect(order).toEqual(["vault", "navigate"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("passes null refresh/expiry fields to the vault when today's real start response omits them", async () => {
+    const vaultCalls: unknown[] = [];
+    const row = projectLibrarySnapshot(librarySnapshotWithBootstrap("today-shape-sentinel"))
+      .libraryRows[0];
+    if (!row) throw new Error("fixture must include a library row");
+    try {
+      // Exactly today's real `handleVivaSessionStart` response shape
+      // (`apps/web/app/api/viva-session/shared.ts`, not owned by this task).
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({
+            failure_class: null,
+            session: {
+              session_id: "server-session",
+              study_set_id: "biology-midterm",
+              user_id: "user-1",
+            },
+            session_token: "viva1.today-session-token",
+            token_refresh_outcome: "issued",
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        )) as typeof fetch;
+
+      const outcome = await startServerSession(row, "start", row.start, {
+        navigate: () => {},
+        sessionCredentialVault: {
+          replaceBrowserSessionCredential: (input) => vaultCalls.push(input),
+        },
+      });
+
+      expect(outcome).toEqual({ ok: true });
+      expect(vaultCalls).toEqual([
+        {
+          mode: "retain-token-only",
+          refresh_expires_at: null,
+          refresh_token: null,
+          session_absolute_expires_at: null,
+          session_id: "server-session",
+          session_token: "viva1.today-session-token",
+          study_set_id: "biology-midterm",
+          user_id: "user-1",
+        },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("defaults to the inert Phase-13A vault placeholder without throwing when the caller supplies none", async () => {
+    const navigations: string[] = [];
+    const row = projectLibrarySnapshot(librarySnapshotWithBootstrap("default-vault-sentinel"))
+      .libraryRows[0];
+    if (!row) throw new Error("fixture must include a library row");
+    try {
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({
+            session: {
+              session_id: "server-session",
+              study_set_id: "biology-midterm",
+              user_id: "user-1",
+            },
+            session_token: "viva1.default-vault-token",
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        )) as typeof fetch;
+
+      const outcome = await startServerSession(row, "start", row.start, {
+        navigate: (target) => navigations.push(target),
+      });
+
+      expect(outcome).toEqual({ ok: true });
+      expect(navigations).toEqual([
+        "/session?user_id=user-1&study_set_id=biology-midterm&session_id=server-session#session_token=viva1.default-vault-token",
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("bounds the start fetch: a hung request neither navigates nor calls the vault, and surfaces a distinct timed_out outcome", async () => {
+    const navigations: string[] = [];
+    const vaultCalls: unknown[] = [];
+    const row = projectLibrarySnapshot(librarySnapshotWithBootstrap("timeout-sentinel"))
+      .libraryRows[0];
+    if (!row) throw new Error("fixture must include a library row");
+    try {
+      globalThis.fetch = ((_input: unknown, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        })) as typeof fetch;
+
+      const outcome = await startServerSession(row, "start", row.start, {
+        navigate: (target) => navigations.push(target),
+        sessionCredentialVault: {
+          replaceBrowserSessionCredential: (input) => vaultCalls.push(input),
+        },
+        timeoutMs: 5,
+      });
+
+      expect(outcome).toEqual({ ok: false, reason: "timed_out" });
+      expect(navigations).toEqual([]);
+      expect(vaultCalls).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+/**
+ * D-07 Branch A (`FRONTEND-011`) mounted proof, using the happy-dom runtime
+ * Plan 12's early manifest handoff makes available in this tree
+ * (`"happy-dom": "20.11.6"` / `"@happy-dom/global-registrator": "20.11.6"`
+ * in `apps/web/package.json`). Unlike the function-level tests above (which
+ * call `startServerSession` directly), these mount the real
+ * `LibraryStatusPanel` component into a real DOM and dispatch a genuine
+ * `click()` through React's own event system, proving the button's actual
+ * wiring — not only the underlying function's behavior.
+ */
+describe("LibraryStatusPanel mounted session-bootstrap composition (D-07 Branch A, happy-dom)", () => {
+  test("a real click on Start sends the sentinel exactly once in the POST body, calls the vault before navigating, and never renders any credential into the DOM", async () => {
+    GlobalRegistrator.register();
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const sentinel = "MOUNTED_BOOTSTRAP_SENTINEL";
+    const seededSnapshot = librarySnapshotWithBootstrap(sentinel);
+    const requests: Array<string | undefined> = [];
+    const order: string[] = [];
+    const navigations: string[] = [];
+    const vaultCalls: unknown[] = [];
+    let container: HTMLDivElement | null = null;
+    let root: ReturnType<typeof createRoot> | null = null;
+    try {
+      globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+        requests.push(init?.body as string | undefined);
+        return new Response(
+          JSON.stringify({
+            refresh_expires_at: "2026-09-01T00:00:00Z",
+            refresh_token: "viva1.mounted-refresh-token",
+            session: {
+              session_id: "server-session",
+              study_set_id: "biology-midterm",
+              user_id: "user-1",
+            },
+            session_absolute_expires_at: "2026-09-23T00:00:00Z",
+            session_token: "viva1.mounted-session-token",
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        );
+      }) as typeof fetch;
+
+      container = document.createElement("div");
+      document.body.appendChild(container);
+      root = createRoot(container);
+      const mountedContainer = container;
+
+      await act(async () => {
+        root?.render(
+          <LibraryStatusPanel
+            navigate={(target) => {
+              order.push("navigate");
+              navigations.push(target);
+            }}
+            sessionCredentialVault={{
+              replaceBrowserSessionCredential: (input) => {
+                order.push("vault");
+                vaultCalls.push(input);
+              },
+            }}
+            snapshot={seededSnapshot}
+          />,
+        );
+      });
+
+      expect(mountedContainer.innerHTML).not.toContain(sentinel);
+
+      const startButton = mountedContainer.querySelector('[aria-label="Start Biology Midterm"]');
+      if (!(startButton instanceof HTMLElement)) {
+        throw new Error("expected a real Start button in the mounted DOM");
+      }
+
+      await act(async () => {
+        startButton.click();
+        await waitForCondition(() => navigations.length > 0 || vaultCalls.length > 0);
+      });
+
+      expect(requests).toHaveLength(1);
+      const sentBody = requests[0] ? JSON.parse(requests[0]) : null;
+      expect(sentBody?.session_bootstrap_token).toBe(sentinel);
+
+      expect(vaultCalls).toEqual([
+        {
+          mode: "retain-token-only",
+          refresh_expires_at: "2026-09-01T00:00:00Z",
+          refresh_token: "viva1.mounted-refresh-token",
+          session_absolute_expires_at: "2026-09-23T00:00:00Z",
+          session_id: "server-session",
+          session_token: "viva1.mounted-session-token",
+          study_set_id: "biology-midterm",
+          user_id: "user-1",
+        },
+      ]);
+      expect(navigations).toEqual([
+        "/session?user_id=user-1&study_set_id=biology-midterm&session_id=server-session#session_token=viva1.mounted-session-token",
+      ]);
+      expect(order).toEqual(["vault", "navigate"]);
+
+      expect(mountedContainer.innerHTML).not.toContain(sentinel);
+      expect(mountedContainer.innerHTML).not.toContain("viva1.mounted-session-token");
+      expect(mountedContainer.innerHTML).not.toContain("viva1.mounted-refresh-token");
+    } finally {
+      if (root) {
+        act(() => {
+          root?.unmount();
+        });
+      }
+      container?.remove();
+      globalThis.fetch = originalFetch;
+      await GlobalRegistrator.unregister();
+    }
+  });
+
+  test("a hung start request surfaces an explicit timed-out status in the mounted UI rather than hanging forever", async () => {
+    GlobalRegistrator.register();
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const seededSnapshot = librarySnapshotWithBootstrap("hung-request-sentinel");
+    let container: HTMLDivElement | null = null;
+    let root: ReturnType<typeof createRoot> | null = null;
+    try {
+      globalThis.fetch = ((_input: unknown, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        })) as typeof fetch;
+
+      container = document.createElement("div");
+      document.body.appendChild(container);
+      root = createRoot(container);
+      const mountedContainer = container;
+
+      await act(async () => {
+        // A tiny `startFetchTimeoutMs` override keeps this real-DOM, real-click
+        // proof fast; the production default (`VIVA_SESSION_START_FETCH_TIMEOUT_MS`
+        // = 6000ms) is separately locked and proved with injected fake timers in
+        // `apps/web/lib/viva-library.test.ts`.
+        root?.render(
+          <LibraryStatusPanel
+            navigate={() => {}}
+            snapshot={seededSnapshot}
+            startFetchTimeoutMs={5}
+          />,
+        );
+      });
+
+      const startButton = mountedContainer.querySelector('[aria-label="Start Biology Midterm"]');
+      if (!(startButton instanceof HTMLElement)) {
+        throw new Error("expected a real Start button in the mounted DOM");
+      }
+
+      await act(async () => {
+        startButton.click();
+        await waitForCondition(
+          () =>
+            mountedContainer.querySelector(".viva-library__status")?.textContent ===
+            "Session start timed out.",
+        );
+      });
+
+      expect(mountedContainer.querySelector(".viva-library__status")?.textContent).toBe(
+        "Session start timed out.",
+      );
+    } finally {
+      if (root) {
+        act(() => {
+          root?.unmount();
+        });
+      }
+      container?.remove();
+      globalThis.fetch = originalFetch;
+      await GlobalRegistrator.unregister();
+    }
+  });
+});
+
+/**
+ * Polls `check` on a macrotask boundary (never real wall-clock waiting
+ * beyond scheduler yields) until it returns true or `maxIterations` elapses,
+ * so an `act(async () => ...)` block can deterministically wait out an async
+ * handler's promise chain without guessing a fixed number of microtask hops.
+ */
+async function waitForCondition(check: () => boolean, maxIterations = 50): Promise<void> {
+  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
 
 function librarySnapshotWithBootstrap(sessionBootstrapToken: string): VivaLibrarySnapshot {
   const readyStudySet = librarySnapshot.study_sets[0];

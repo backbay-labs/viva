@@ -1,9 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import {
   browserInitialLibrarySnapshot,
+  browserSessionCredentialVaultInputFromStartResponse,
+  fetchWithVivaSessionStartTimeout,
+  pendingBrowserSessionCredentialVault,
   projectLibrarySnapshot,
   redactVivaLibrarySessionTokens,
+  VIVA_SESSION_CREDENTIAL_VAULT_MODE,
+  VIVA_SESSION_START_FETCH_TIMEOUT_MS,
+  type VivaFetchTimers,
   type VivaLibrarySnapshot,
+  type VivaSessionStartResponse,
 } from "./viva-library";
 
 const snapshot: VivaLibrarySnapshot = {
@@ -489,3 +496,290 @@ describe("Viva library projection", () => {
     expect(projection.sessionRows[0]?.mastery).toBe(null);
   });
 });
+
+/**
+ * D-07 Branch A (`retain-token-only`, frontend session-bootstrap composition
+ * half, `FRONTEND-011`): the pure helpers `LibraryStatusPanel.tsx` composes
+ * around the same-origin `/api/viva-session/start` mint.
+ *
+ * `browserSessionCredentialVaultInputFromStartResponse` is the "small local
+ * indirection" this task owns in place of Plan 10's not-yet-published
+ * `replaceBrowserSessionCredential` (`apps/web/lib/use-viva-agent-session.ts`
+ * has no such export in this tree yet — confirmed by reading that file
+ * before writing this test). It shapes exactly the fields the plan names —
+ * `session_token`, `refresh_token`, `refresh_expires_at`,
+ * `session_absolute_expires_at`, identity, `mode: "retain-token-only"` —
+ * from a start response, tolerating the refresh fields' current absence from
+ * the real (Plan-11-owned, unmodified-by-this-task) route response so this
+ * task's own behavior is provable today, not only once those fields exist.
+ */
+describe("D-07 Branch A session bootstrap composition (FRONTEND-011)", () => {
+  describe("browserSessionCredentialVaultInputFromStartResponse", () => {
+    test("builds the complete retain-token-only vault input from a full start response", () => {
+      const response: VivaSessionStartResponse = {
+        refresh_expires_at: "2026-09-01T00:00:00Z",
+        refresh_token: "viva1.refresh-token",
+        session: {
+          session_id: "server-session",
+          study_set_id: "biology-midterm",
+          user_id: "user-1",
+        },
+        session_absolute_expires_at: "2026-09-23T00:00:00Z",
+        session_token: "viva1.session-token",
+      };
+
+      expect(browserSessionCredentialVaultInputFromStartResponse(response)).toEqual({
+        mode: "retain-token-only",
+        refresh_expires_at: "2026-09-01T00:00:00Z",
+        refresh_token: "viva1.refresh-token",
+        session_absolute_expires_at: "2026-09-23T00:00:00Z",
+        session_id: "server-session",
+        session_token: "viva1.session-token",
+        study_set_id: "biology-midterm",
+        user_id: "user-1",
+      });
+    });
+
+    test("carries null refresh/expiry fields when today's real start response omits them, rather than failing closed", () => {
+      // Exactly today's real `handleVivaSessionStart` response shape
+      // (`apps/web/app/api/viva-session/shared.ts`, not owned by this task):
+      // `{ failure_class, session, session_token, token_refresh_outcome }`
+      // only — no `refresh_token`/`refresh_expires_at`/
+      // `session_absolute_expires_at` yet.
+      const response: VivaSessionStartResponse = {
+        session: {
+          session_id: "server-session",
+          study_set_id: "biology-midterm",
+          user_id: "user-1",
+        },
+        session_token: "viva1.session-token",
+      };
+
+      expect(browserSessionCredentialVaultInputFromStartResponse(response)).toEqual({
+        mode: "retain-token-only",
+        refresh_expires_at: null,
+        refresh_token: null,
+        session_absolute_expires_at: null,
+        session_id: "server-session",
+        session_token: "viva1.session-token",
+        study_set_id: "biology-midterm",
+        user_id: "user-1",
+      });
+    });
+
+    test("returns null when session_token is missing", () => {
+      expect(
+        browserSessionCredentialVaultInputFromStartResponse({
+          session: { session_id: "s", study_set_id: "t", user_id: "u" },
+        }),
+      ).toBe(null);
+    });
+
+    test("returns null when session_token is blank", () => {
+      expect(
+        browserSessionCredentialVaultInputFromStartResponse({
+          session: { session_id: "s", study_set_id: "t", user_id: "u" },
+          session_token: "   ",
+        }),
+      ).toBe(null);
+    });
+
+    test("returns null when the session identity is missing entirely", () => {
+      expect(browserSessionCredentialVaultInputFromStartResponse({ session_token: "x" })).toBe(
+        null,
+      );
+    });
+
+    test("returns null when session.session_id is missing", () => {
+      expect(
+        browserSessionCredentialVaultInputFromStartResponse({
+          session: { study_set_id: "t", user_id: "u" },
+          session_token: "x",
+        }),
+      ).toBe(null);
+    });
+
+    test("returns null when session.study_set_id is missing", () => {
+      expect(
+        browserSessionCredentialVaultInputFromStartResponse({
+          session: { session_id: "s", user_id: "u" },
+          session_token: "x",
+        }),
+      ).toBe(null);
+    });
+
+    test("returns null when session.user_id is missing", () => {
+      expect(
+        browserSessionCredentialVaultInputFromStartResponse({
+          session: { session_id: "s", study_set_id: "t" },
+          session_token: "x",
+        }),
+      ).toBe(null);
+    });
+  });
+
+  describe("fetchWithVivaSessionStartTimeout", () => {
+    test("locks the shared abort bound at exactly 6000ms", () => {
+      expect(VIVA_SESSION_START_FETCH_TIMEOUT_MS).toBe(6000);
+    });
+
+    test("locks the vault mode constant at exactly retain-token-only", () => {
+      expect(VIVA_SESSION_CREDENTIAL_VAULT_MODE).toBe("retain-token-only");
+    });
+
+    test("aborts a never-resolving fetch at the bound, proved with injected fake timers rather than a real wait", async () => {
+      const timers = manualFakeTimers();
+      const seenSignals: AbortSignal[] = [];
+      const fetchImpl = ((_input: unknown, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal) {
+            seenSignals.push(signal);
+            signal.addEventListener("abort", () => {
+              reject(new DOMException("The operation was aborted.", "AbortError"));
+            });
+          }
+        })) as typeof fetch;
+
+      const resultPromise = fetchWithVivaSessionStartTimeout(
+        fetchImpl,
+        "/api/viva-session/start",
+        { method: "POST" },
+        { timers },
+      );
+
+      // The bound is scheduled synchronously, before any real time passes.
+      expect(timers.scheduled).toEqual([{ delayMs: 6000 }]);
+      expect(seenSignals).toHaveLength(1);
+      expect(seenSignals[0]?.aborted).toBe(false);
+
+      timers.fireAll();
+
+      expect(seenSignals[0]?.aborted).toBe(true);
+      expect(await resultPromise).toEqual({ ok: false, reason: "timeout" });
+    });
+
+    test("resolves normally and clears its timer when the fetch settles before the bound fires", async () => {
+      const timers = manualFakeTimers();
+      const response = new Response(JSON.stringify({ ok: true }), { status: 200 });
+      const fetchImpl = (async () => response) as typeof fetch;
+
+      const result = await fetchWithVivaSessionStartTimeout(
+        fetchImpl,
+        "/api/viva-session/start",
+        { method: "POST" },
+        { timers },
+      );
+
+      expect(result).toEqual({ ok: true, response });
+      expect(timers.scheduled).toEqual([{ delayMs: 6000 }]);
+      expect(timers.cleared).toBe(true);
+    });
+
+    test("lets a genuine non-timeout fetch rejection propagate rather than mislabeling it a timeout", async () => {
+      const timers = manualFakeTimers();
+      const networkError = new Error("network down");
+      const fetchImpl = (async () => {
+        throw networkError;
+      }) as typeof fetch;
+
+      let caught: unknown;
+      try {
+        await fetchWithVivaSessionStartTimeout(
+          fetchImpl,
+          "/api/viva-session/start",
+          { method: "POST" },
+          { timers },
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBe(networkError);
+      expect(timers.cleared).toBe(true);
+    });
+
+    test("honors an explicit timeoutMs override for callers that need a shorter bound", async () => {
+      const timers = manualFakeTimers();
+      const fetchImpl = ((_input: unknown, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        })) as typeof fetch;
+
+      const resultPromise = fetchWithVivaSessionStartTimeout(
+        fetchImpl,
+        "/api/viva-session/start",
+        { method: "POST" },
+        { timeoutMs: 25, timers },
+      );
+      expect(timers.scheduled).toEqual([{ delayMs: 25 }]);
+      timers.fireAll();
+      expect(await resultPromise).toEqual({ ok: false, reason: "timeout" });
+    });
+  });
+
+  describe("pendingBrowserSessionCredentialVault (Phase 13A local indirection placeholder)", () => {
+    test("never logs, pending Plan 10's real replaceBrowserSessionCredential export", () => {
+      const logCalls: unknown[][] = [];
+      const original = { error: console.error, log: console.log, warn: console.warn };
+      console.log = (...args: unknown[]) => logCalls.push(args);
+      console.warn = (...args: unknown[]) => logCalls.push(args);
+      console.error = (...args: unknown[]) => logCalls.push(args);
+      try {
+        expect(() =>
+          pendingBrowserSessionCredentialVault.replaceBrowserSessionCredential({
+            mode: "retain-token-only",
+            refresh_expires_at: null,
+            refresh_token: null,
+            session_absolute_expires_at: null,
+            session_id: "s",
+            session_token: "t",
+            study_set_id: "d",
+            user_id: "u",
+          }),
+        ).not.toThrow();
+      } finally {
+        console.error = original.error;
+        console.log = original.log;
+        console.warn = original.warn;
+      }
+      expect(logCalls).toEqual([]);
+    });
+  });
+});
+
+/**
+ * A manually-driven fake timer double for `fetchWithVivaSessionStartTimeout`:
+ * `setTimeout` records the callback and delay instead of scheduling real
+ * time, so `fireAll()` can deterministically trigger the abort bound in zero
+ * wall-clock time. `cleared` proves `clearTimeout` was actually invoked
+ * (the settle-before-bound and error-propagation paths must not leak a
+ * pending timer).
+ */
+function manualFakeTimers(): VivaFetchTimers & {
+  cleared: boolean;
+  fireAll: () => void;
+  scheduled: Array<{ delayMs: number }>;
+} {
+  const scheduled: Array<{ delayMs: number }> = [];
+  const pending: Array<() => void> = [];
+  let cleared = false;
+  return {
+    get cleared() {
+      return cleared;
+    },
+    clearTimeout: () => {
+      cleared = true;
+    },
+    fireAll: () => {
+      for (const callback of pending.splice(0)) callback();
+    },
+    scheduled,
+    setTimeout: (callback: () => void, delayMs: number) => {
+      scheduled.push({ delayMs });
+      pending.push(callback);
+      return pending.length as unknown as ReturnType<typeof setTimeout>;
+    },
+  };
+}
