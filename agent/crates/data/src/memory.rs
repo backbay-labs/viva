@@ -1172,6 +1172,14 @@ pub(crate) fn generate_file_study_set(
     let user_id = required_text(&input.user_id, "user_id")?.to_owned();
     let title = required_text(&input.title, "title")?.to_owned();
     let file_name = required_text(&input.file_name, "file_name")?.to_owned();
+    // Before normalization, source derivation, ID generation, or any state write: a
+    // rejected PDF must leave the store byte-identical, and the cheapest way to
+    // guarantee that is to have created nothing yet.
+    if classify_uploaded_file(&file_name, input.content_type.as_deref(), &input.file_bytes)
+        == UploadedFileKind::Pdf
+    {
+        return Err(unsupported_pdf_error());
+    }
     let course = input.course.and_then(non_empty_owned);
     let failure_status = if input
         .study_set_id
@@ -1200,7 +1208,7 @@ pub(crate) fn generate_file_study_set(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let source_kind = file_source_kind(&file_name, input.content_type.as_deref());
-    let normalized = normalize_file_bytes(&input.file_bytes);
+    let normalized = supported_text_from_bytes(&input.file_bytes)?;
     let source_candidates = derive_paste_source_spans(&normalized);
     if source_candidates.is_empty() {
         return Ok(failed_file_study_set(
@@ -1337,9 +1345,88 @@ fn normalize_whitespace(value: &str) -> String {
         .join(" ")
 }
 
-fn normalize_file_bytes(bytes: &[u8]) -> String {
-    let lossy = String::from_utf8_lossy(bytes);
-    let printable = lossy
+/// `COR-04`: what an upload actually is, decided before a single byte is decoded.
+///
+/// The name and the declared content type both come from the client, so neither can
+/// be the only signal; the `%PDF` magic is checked too. Nothing here inspects
+/// content beyond the leading marker, because this classifier runs before there is
+/// any decision to make about content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UploadedFileKind {
+    Pdf,
+    Utf8Text,
+}
+
+fn classify_uploaded_file(
+    file_name: &str,
+    content_type: Option<&str>,
+    bytes: &[u8],
+) -> UploadedFileKind {
+    if file_name.to_ascii_lowercase().ends_with(".pdf") {
+        return UploadedFileKind::Pdf;
+    }
+    if let Some(declared) = content_type {
+        let media_type = declared.split(';').next().unwrap_or_default().trim();
+        if media_type.eq_ignore_ascii_case("application/pdf") {
+            return UploadedFileKind::Pdf;
+        }
+    }
+    let mut rest = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    while let Some((first, tail)) = rest.split_first() {
+        if first.is_ascii_whitespace() {
+            rest = tail;
+        } else {
+            break;
+        }
+    }
+    if rest.starts_with(b"%PDF") {
+        return UploadedFileKind::Pdf;
+    }
+    UploadedFileKind::Utf8Text
+}
+
+/// `DATA-014`: the one typed refusal every PDF shape returns.
+///
+/// Viva has no page-aware extraction, so a PDF cannot be turned into grounded source
+/// spans. Accepting it anyway produced study material made of PDF syntax — concepts
+/// literally named "Catalog" and "Endobj" — which is worse than refusing, because
+/// the learner cannot tell that their material was never read.
+///
+/// # Handoff to Plan 08 (HTTP mapping is Plan 08's, not this crate's)
+///
+/// The contract is exactly `kind() == PortErrorKind::InvalidInput`,
+/// `port() == "study_store.file_ingestion"`, `id() == "unsupported_pdf"`, and this
+/// bounded reason literal. Plan 08 maps `InvalidInput` uniformly to a sanitized HTTP
+/// 400 with the fixed public message `"uploaded content is invalid or unsupported"`
+/// and the route's coarse `file_ingestion_failed` / `file_retry_failed` code. It must
+/// branch on `kind()`, never substring-match `reason()`, and must not add a
+/// data-specific route escape hatch: `reason()` is diagnostic text and a consumer
+/// that branches on it is one wording change away from failing open. Plan 08's
+/// handler test submits the generated text / flate-compressed / scanned / encrypted /
+/// malformed / magic-plus-plaintext matrix, asserts no raw bytes or error internals
+/// reach the response, and verifies zero persisted artifacts through the store.
+/// No new `PortErrorKind` is introduced for this, and this crate adds no PDF parser,
+/// no OCR, and no claim of PDF support.
+fn unsupported_pdf_error() -> PortError {
+    PortError::invalid_input(
+        "study_store.file_ingestion",
+        "unsupported_pdf",
+        "PDF ingestion requires page-aware extraction",
+    )
+}
+
+/// The supported-text path. Invalid UTF-8 is refused, never repaired: a replacement
+/// character is a fabricated learner fact, and every downstream artifact derived from
+/// it would inherit the fabrication.
+fn supported_text_from_bytes(bytes: &[u8]) -> Result<String, PortError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        PortError::invalid_input(
+            "study_store.file_ingestion",
+            "invalid_utf8_file",
+            "uploaded file is not valid UTF-8 text",
+        )
+    })?;
+    let printable = text
         .chars()
         .map(|ch| {
             if ch.is_control() && !ch.is_whitespace() {
@@ -1349,7 +1436,7 @@ fn normalize_file_bytes(bytes: &[u8]) -> String {
             }
         })
         .collect::<String>();
-    normalize_whitespace(&printable)
+    Ok(normalize_whitespace(&printable))
 }
 
 fn file_source_kind(file_name: &str, content_type: Option<&str>) -> String {
@@ -4173,10 +4260,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_ingestion_writes_pdf_artifacts_without_exact_region_provenance() {
+    async fn file_ingestion_writes_document_level_spans_without_exact_region_provenance() {
         let store = InMemoryStudyStore::new();
         let file_text = [
-            "%PDF-1.7",
             "Mitochondria electron transport builds a proton gradient across the inner membrane.",
             "NADH transfers electrons while oxygen accepts them at the end of the chain.",
             "ATP synthase uses chemiosmosis to make ATP from ADP.",
@@ -4187,11 +4273,11 @@ mod tests {
             .create_file_study_set(CreateFileStudySet {
                 user_id: "user-1".to_owned(),
                 study_set_id: None,
-                title: "Bio PDF".to_owned(),
+                title: "Bio notes".to_owned(),
                 course: Some("Biology 201".to_owned()),
                 exam_date: None,
-                file_name: "Lecture 9.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "Lecture 9.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: file_text.as_bytes().to_vec(),
                 session_id: Some("file-session-1".to_owned()),
             })
@@ -4202,8 +4288,8 @@ mod tests {
             record.study_set.ingestion_status,
             StudySetIngestionStatus::Ready
         );
-        assert_eq!(record.documents[0].display_name, "Lecture 9.pdf");
-        assert_eq!(record.documents[0].source_kind, "pdf");
+        assert_eq!(record.documents[0].display_name, "Lecture 9.txt");
+        assert_eq!(record.documents[0].source_kind, "file");
         assert!(!record.source_spans.is_empty());
         for source in &record.source_spans {
             assert!(locator_span(source).starts_with("document:chars:"));
@@ -4232,7 +4318,6 @@ mod tests {
     async fn file_ingested_study_set_flows_through_authorized_tools() {
         let store = Arc::new(InMemoryStudyStore::new());
         let file_text = [
-            "%PDF-1.7",
             "Electron transport in mitochondria transfers electrons from NADH to oxygen.",
             "The proton gradient powers ATP synthase during oxidative phosphorylation.",
         ]
@@ -4242,11 +4327,11 @@ mod tests {
             .create_file_study_set(CreateFileStudySet {
                 user_id: "user-1".to_owned(),
                 study_set_id: None,
-                title: "Tool Flow PDF".to_owned(),
+                title: "Tool Flow notes".to_owned(),
                 course: Some("Biology 201".to_owned()),
                 exam_date: None,
-                file_name: "tool-flow.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "notes.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: file_text.as_bytes().to_vec(),
                 session_id: Some("file-session-tool-flow".to_owned()),
             })
@@ -4324,11 +4409,11 @@ mod tests {
             .create_file_study_set(CreateFileStudySet {
                 user_id: "user-1".to_owned(),
                 study_set_id: None,
-                title: "Bad PDF".to_owned(),
+                title: "Bad upload".to_owned(),
                 course: None,
                 exam_date: None,
-                file_name: "empty.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "empty.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: b"!!! ??? ---".to_vec(),
                 session_id: Some("file-session-failed".to_owned()),
             })
@@ -4349,11 +4434,11 @@ mod tests {
             .retry_file_study_set(CreateFileStudySet {
                 user_id: "user-1".to_owned(),
                 study_set_id: Some(failed.study_set.id.clone()),
-                title: "Bad PDF".to_owned(),
+                title: "Bad upload".to_owned(),
                 course: None,
                 exam_date: None,
-                file_name: "still-empty.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "still-empty.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: b"??? --- !!!".to_vec(),
                 session_id: Some("file-session-retry-failed".to_owned()),
             })
@@ -4371,11 +4456,11 @@ mod tests {
             .retry_file_study_set(CreateFileStudySet {
                 user_id: "user-1".to_owned(),
                 study_set_id: Some(failed.study_set.id.clone()),
-                title: "Bad PDF".to_owned(),
+                title: "Bad upload".to_owned(),
                 course: None,
                 exam_date: None,
-                file_name: "replacement.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "replacement.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: retry_text.as_bytes().to_vec(),
                 session_id: Some("file-session-retry".to_owned()),
             })
@@ -5825,11 +5910,11 @@ mod review_schedule_decision_tests {
             .create_file_study_set(CreateFileStudySet {
                 user_id: "user-1".to_owned(),
                 study_set_id: None,
-                title: "Bio PDF".to_owned(),
+                title: "Bio notes".to_owned(),
                 course: Some("Biology 201".to_owned()),
                 exam_date: Some(CLOSE_EXAM_AT.to_owned()),
-                file_name: "Lecture 9.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "Lecture 9.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: ingestible_text().into_bytes(),
                 session_id: Some("file-session-exam".to_owned()),
             })
@@ -5861,8 +5946,8 @@ mod review_schedule_decision_tests {
                 title: String::new(),
                 course: None,
                 exam_date: None,
-                file_name: "Lecture 9 rescan.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "Lecture 9 rescan.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: ingestible_text().into_bytes(),
                 session_id: Some("file-session-exam-retry".to_owned()),
             })
@@ -6086,5 +6171,843 @@ mod review_schedule_decision_tests {
         }
         let encoded = serde_json::to_string(&store.snapshot()).expect("snapshot serializes");
         assert!(!encoded.contains("2026-06-"), "{encoded}");
+    }
+}
+
+/// `DATA-014`/`COR-04`: PDF uploads fail closed until real page-aware extraction
+/// exists.
+///
+/// The fixtures here are generated, not checked in, and each builder validates its
+/// own structure before the bytes reach ingestion — a fixture that silently stopped
+/// being a PDF would otherwise turn these into tests of nothing. The MD5 and RC4
+/// routines exist only to build the encrypted fixture and are checked against their
+/// published vectors below; nothing outside this module may use them, and no
+/// production dependency was added for a fixture.
+#[cfg(test)]
+mod pdf_ingestion_tests {
+    use super::*;
+    use agent_domain::{CreateFileStudySet, PortErrorKind, StudyMemoryStore};
+
+    // -----------------------------------------------------------------------
+    // Test-only primitives (RFC 1321 MD5, RC4, zlib stored-block DEFLATE).
+    // -----------------------------------------------------------------------
+
+    const MD5_SHIFTS: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+
+    const MD5_SINE: [u32; 64] = [
+        0xd76a_a478,
+        0xe8c7_b756,
+        0x2420_70db,
+        0xc1bd_ceee,
+        0xf57c_0faf,
+        0x4787_c62a,
+        0xa830_4613,
+        0xfd46_9501,
+        0x6980_98d8,
+        0x8b44_f7af,
+        0xffff_5bb1,
+        0x895c_d7be,
+        0x6b90_1122,
+        0xfd98_7193,
+        0xa679_438e,
+        0x49b4_0821,
+        0xf61e_2562,
+        0xc040_b340,
+        0x265e_5a51,
+        0xe9b6_c7aa,
+        0xd62f_105d,
+        0x0244_1453,
+        0xd8a1_e681,
+        0xe7d3_fbc8,
+        0x21e1_cde6,
+        0xc337_07d6,
+        0xf4d5_0d87,
+        0x455a_14ed,
+        0xa9e3_e905,
+        0xfcef_a3f8,
+        0x676f_02d9,
+        0x8d2a_4c8a,
+        0xfffa_3942,
+        0x8771_f681,
+        0x6d9d_6122,
+        0xfde5_380c,
+        0xa4be_ea44,
+        0x4bde_cfa9,
+        0xf6bb_4b60,
+        0xbebf_bc70,
+        0x289b_7ec6,
+        0xeaa1_27fa,
+        0xd4ef_3085,
+        0x0488_1d05,
+        0xd9d4_d039,
+        0xe6db_99e5,
+        0x1fa2_7cf8,
+        0xc4ac_5665,
+        0xf429_2244,
+        0x432a_ff97,
+        0xab94_23a7,
+        0xfc93_a039,
+        0x655b_59c3,
+        0x8f0c_cc92,
+        0xffef_f47d,
+        0x8584_5dd1,
+        0x6fa8_7e4f,
+        0xfe2c_e6e0,
+        0xa301_4314,
+        0x4e08_11a1,
+        0xf753_7e82,
+        0xbd3a_f235,
+        0x2ad7_d2bb,
+        0xeb86_d391,
+    ];
+
+    fn md5(input: &[u8]) -> [u8; 16] {
+        let mut message = input.to_vec();
+        let bit_length = (input.len() as u64).wrapping_mul(8);
+        message.push(0x80);
+        while message.len() % 64 != 56 {
+            message.push(0);
+        }
+        message.extend_from_slice(&bit_length.to_le_bytes());
+
+        let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+        for chunk in message.chunks_exact(64) {
+            let mut words = [0u32; 16];
+            for (index, word) in words.iter_mut().enumerate() {
+                let start = index * 4;
+                *word = u32::from_le_bytes([
+                    chunk[start],
+                    chunk[start + 1],
+                    chunk[start + 2],
+                    chunk[start + 3],
+                ]);
+            }
+            let [mut a, mut b, mut c, mut d] = state;
+            for round in 0..64usize {
+                let (mixed, word_index) = match round {
+                    0..=15 => ((b & c) | (!b & d), round),
+                    16..=31 => ((d & b) | (!d & c), (5 * round + 1) % 16),
+                    32..=47 => (b ^ c ^ d, (3 * round + 5) % 16),
+                    _ => (c ^ (b | !d), (7 * round) % 16),
+                };
+                let temp = d;
+                d = c;
+                c = b;
+                let sum = a
+                    .wrapping_add(mixed)
+                    .wrapping_add(MD5_SINE[round])
+                    .wrapping_add(words[word_index]);
+                b = b.wrapping_add(sum.rotate_left(MD5_SHIFTS[round]));
+                a = temp;
+            }
+            state[0] = state[0].wrapping_add(a);
+            state[1] = state[1].wrapping_add(b);
+            state[2] = state[2].wrapping_add(c);
+            state[3] = state[3].wrapping_add(d);
+        }
+
+        let mut digest = [0u8; 16];
+        for (index, word) in state.iter().enumerate() {
+            digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        digest
+    }
+
+    fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
+        assert!(!key.is_empty(), "RC4 needs a key");
+        let mut permutation: [u8; 256] = core::array::from_fn(|index| index as u8);
+        let mut swap_index = 0usize;
+        for index in 0..256usize {
+            swap_index = (swap_index
+                + usize::from(permutation[index])
+                + usize::from(key[index % key.len()]))
+                % 256;
+            permutation.swap(index, swap_index);
+        }
+        let (mut i, mut j) = (0usize, 0usize);
+        data.iter()
+            .map(|byte| {
+                i = (i + 1) % 256;
+                j = (j + usize::from(permutation[i])) % 256;
+                permutation.swap(i, j);
+                let keystream =
+                    permutation[(usize::from(permutation[i]) + usize::from(permutation[j])) % 256];
+                byte ^ keystream
+            })
+            .collect()
+    }
+
+    fn adler32(data: &[u8]) -> u32 {
+        let (mut low, mut high) = (1u32, 0u32);
+        for byte in data {
+            low = (low + u32::from(*byte)) % 65521;
+            high = (high + low) % 65521;
+        }
+        (high << 16) | low
+    }
+
+    /// zlib container around a single stored (uncompressed) DEFLATE block. This is a
+    /// real `/FlateDecode` stream: an extractor that inflates it recovers the page
+    /// content operators exactly.
+    fn zlib_stored(data: &[u8]) -> Vec<u8> {
+        assert!(data.len() <= 0xFFFF, "one stored block only");
+        let mut out = vec![0x78, 0x01];
+        out.push(0x01);
+        let length = u16::try_from(data.len()).expect("stored block length fits");
+        out.extend_from_slice(&length.to_le_bytes());
+        out.extend_from_slice(&(!length).to_le_bytes());
+        out.extend_from_slice(data);
+        out.extend_from_slice(&adler32(data).to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn test_only_md5_matches_rfc_1321_vectors() {
+        assert_eq!(hex(&md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(hex(&md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            hex(&md5(b"message digest")),
+            "f96b697d7cb7938d525a2f31aaf161d0"
+        );
+        assert_eq!(
+            hex(&md5(b"abcdefghijklmnopqrstuvwxyz")),
+            "c3fcd3d76192e4007dfb496cca67e13b"
+        );
+    }
+
+    #[test]
+    fn test_only_rc4_matches_its_published_vector() {
+        assert_eq!(hex(&rc4(b"Key", b"Plaintext")), "bbf316e8d940af0ad3");
+        assert_eq!(
+            hex(&rc4(b"Secret", b"Attack at dawn")),
+            "45a01f645fc35b383552544b9bf5"
+        );
+        // Symmetric: decrypting the ciphertext returns the plaintext.
+        assert_eq!(
+            rc4(b"Key", &rc4(b"Key", b"Plaintext")),
+            b"Plaintext".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_only_zlib_stored_block_round_trips_through_its_own_header() {
+        let stream = zlib_stored(b"BT /F1 12 Tf ET");
+        assert_eq!(&stream[0..2], &[0x78, 0x01], "zlib header");
+        assert_eq!(
+            (u32::from(stream[0]) * 256 + u32::from(stream[1])) % 31,
+            0,
+            "zlib header check bits"
+        );
+        assert_eq!(stream[2] & 0x07, 0x01, "final stored block");
+        let length = u16::from_le_bytes([stream[3], stream[4]]);
+        let inverse = u16::from_le_bytes([stream[5], stream[6]]);
+        assert_eq!(length, 15);
+        assert_eq!(inverse, !length);
+        assert_eq!(&stream[7..7 + 15], b"BT /F1 12 Tf ET");
+        assert_eq!(
+            u32::from_be_bytes([
+                stream[stream.len() - 4],
+                stream[stream.len() - 3],
+                stream[stream.len() - 2],
+                stream[stream.len() - 1],
+            ]),
+            adler32(b"BT /F1 12 Tf ET")
+        );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(&mut out, "{byte:02x}");
+        }
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // PDF fixture builder.
+    // -----------------------------------------------------------------------
+
+    struct PdfBuilder {
+        bytes: Vec<u8>,
+        offsets: Vec<usize>,
+    }
+
+    impl PdfBuilder {
+        fn new() -> Self {
+            Self {
+                bytes: b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec(),
+                offsets: Vec::new(),
+            }
+        }
+
+        /// Objects are emitted in order, so the object number is always
+        /// `offsets.len() + 1` and the recorded offset is the real byte position.
+        fn object(&mut self, body: &[u8]) -> usize {
+            let number = self.offsets.len() + 1;
+            self.offsets.push(self.bytes.len());
+            self.bytes
+                .extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            self.bytes.extend_from_slice(body);
+            self.bytes.extend_from_slice(b"\nendobj\n");
+            number
+        }
+
+        fn stream_object(&mut self, dictionary_extra: &str, payload: &[u8]) -> usize {
+            let mut body = format!(
+                "<< /Length {}{dictionary_extra} >>\nstream\n",
+                payload.len()
+            )
+            .into_bytes();
+            body.extend_from_slice(payload);
+            body.extend_from_slice(b"\nendstream");
+            self.object(&body)
+        }
+
+        fn finish(mut self, root: usize, trailer_extra: &str) -> Vec<u8> {
+            let xref_offset = self.bytes.len();
+            let count = self.offsets.len() + 1;
+            self.bytes
+                .extend_from_slice(format!("xref\n0 {count}\n").as_bytes());
+            self.bytes.extend_from_slice(b"0000000000 65535 f \n");
+            for offset in &self.offsets {
+                self.bytes
+                    .extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+            }
+            self.bytes.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {count} /Root {root} 0 R{trailer_extra} >>\nstartxref\n{xref_offset}\n%%EOF\n"
+                )
+                .as_bytes(),
+            );
+            assert_valid_pdf(&self.bytes, count, xref_offset, root);
+            self.bytes
+        }
+    }
+
+    /// Every builder proves its own output before ingestion sees it: header, exact
+    /// xref byte offsets, `startxref`, trailer, and root reference.
+    fn assert_valid_pdf(bytes: &[u8], count: usize, xref_offset: usize, root: usize) {
+        assert!(bytes.starts_with(b"%PDF-1.7"), "PDF header");
+        assert_eq!(
+            &bytes[xref_offset..xref_offset + 4],
+            b"xref",
+            "xref keyword"
+        );
+
+        // Byte operations only: this module must contain no lossy UTF-8 decoding at
+        // all, which is exactly the property the production gate scans for.
+        let marker = b"startxref\n";
+        let marker_start = rfind(bytes, marker).expect("startxref present");
+        let value_start = marker_start + marker.len();
+        let value_end = value_start
+            + bytes[value_start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .expect("startxref value ends");
+        let startxref: usize = std::str::from_utf8(&bytes[value_start..value_end])
+            .expect("startxref value is ascii")
+            .parse()
+            .expect("startxref parses");
+        assert_eq!(startxref, xref_offset, "startxref points at the xref table");
+        assert!(
+            find(bytes, format!("/Root {root} 0 R").as_bytes()).is_some(),
+            "trailer root"
+        );
+        assert!(bytes.ends_with(b"%%EOF\n"), "EOF marker");
+
+        // Each recorded offset must actually be where that object starts.
+        let table_start = xref_offset + format!("xref\n0 {count}\n").len();
+        for object_number in 1..count {
+            let entry_start = table_start + object_number * 20;
+            let entry = &bytes[entry_start..entry_start + 20];
+            assert_eq!(entry.len(), 20, "xref entries are exactly 20 bytes");
+            let offset: usize = std::str::from_utf8(&entry[0..10])
+                .expect("offset is ascii")
+                .parse()
+                .expect("offset parses");
+            let expected = format!("{object_number} 0 obj\n");
+            assert_eq!(
+                &bytes[offset..offset + expected.len()],
+                expected.as_bytes(),
+                "xref offset for object {object_number}"
+            );
+        }
+    }
+
+    /// A real one-page text PDF: catalog, page tree, page, font, content stream.
+    fn generated_text_pdf() -> Vec<u8> {
+        let mut pdf = PdfBuilder::new();
+        let catalog = pdf.object(b"<< /Type /Catalog /Pages 2 0 R >>");
+        let _pages = pdf.object(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        let _page = pdf.object(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        );
+        let _font = pdf.object(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        let content =
+            b"BT /F1 12 Tf 72 720 Td (Oxidative phosphorylation builds a proton gradient.) Tj ET";
+        let _contents = pdf.stream_object("", content);
+        assert_eq!(catalog, 1);
+        let bytes = pdf.finish(catalog, "");
+        assert!(
+            find(&bytes, b" Tj").is_some(),
+            "the text page must carry a real text-showing operator"
+        );
+        bytes
+    }
+
+    /// The same page with its content stream really deflated.
+    fn generated_flate_pdf() -> Vec<u8> {
+        let content =
+            b"BT /F1 12 Tf 72 720 Td (ATP synthase converts the gradient into ATP.) Tj ET";
+        let deflated = zlib_stored(content);
+        let mut pdf = PdfBuilder::new();
+        let catalog = pdf.object(b"<< /Type /Catalog /Pages 2 0 R >>");
+        pdf.object(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        pdf.object(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        );
+        pdf.object(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        pdf.stream_object(" /Filter /FlateDecode", &deflated);
+        let bytes = pdf.finish(catalog, "");
+        assert!(find(&bytes, b"/FlateDecode").is_some(), "declared filter");
+        // A stored DEFLATE block keeps its payload verbatim, so the operators appear
+        // inside the stream and only there: an extractor still has to inflate the
+        // declared filter to reach them, and a byte scan of the file is not
+        // extraction.
+        let stream_start = find(&bytes, b"stream\n").expect("content stream present") + 7;
+        assert_eq!(
+            &bytes[stream_start..stream_start + 2],
+            &[0x78, 0x01],
+            "the stream begins with the zlib header"
+        );
+        assert!(
+            find(&bytes[..stream_start], b" Tj").is_none(),
+            "no text operator exists outside the compressed stream"
+        );
+        assert!(
+            find(&bytes, deflated.as_slice()).is_some(),
+            "the deflated bytes are embedded verbatim"
+        );
+        bytes
+    }
+
+    /// A scanned page: one image XObject, no text operators anywhere.
+    fn generated_scanned_pdf() -> Vec<u8> {
+        // 8x8 greyscale, deliberately not text.
+        let image: Vec<u8> = (0..64u16).map(|value| (value * 4) as u8).collect();
+        let mut pdf = PdfBuilder::new();
+        let catalog = pdf.object(b"<< /Type /Catalog /Pages 2 0 R >>");
+        pdf.object(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        pdf.object(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>",
+        );
+        pdf.stream_object(
+            " /Type /XObject /Subtype /Image /Width 8 /Height 8 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &image,
+        );
+        pdf.stream_object("", b"q 612 0 0 792 0 0 cm /Im0 Do Q");
+        let bytes = pdf.finish(catalog, "");
+        assert!(find(&bytes, b"/Subtype /Image").is_some(), "image xobject");
+        assert!(
+            find(&bytes, b" Tj").is_none() && find(&bytes, b" TJ").is_none(),
+            "a scanned page carries no text-showing operator"
+        );
+        bytes
+    }
+
+    const PDF_PASSWORD_PADDING: [u8; 32] = [
+        0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01,
+        0x08, 0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53,
+        0x69, 0x7A,
+    ];
+
+    fn padded_password(password: &[u8]) -> [u8; 32] {
+        let mut padded = [0u8; 32];
+        let taken = password.len().min(32);
+        padded[..taken].copy_from_slice(&password[..taken]);
+        padded[taken..].copy_from_slice(&PDF_PASSWORD_PADDING[..32 - taken]);
+        padded
+    }
+
+    /// PDF Standard Security Handler, revision 2 (40-bit RC4), with deterministic
+    /// test passwords. Algorithms 2, 3, 4 and 1 from the PDF specification.
+    fn generated_encrypted_pdf() -> Vec<u8> {
+        const USER_PASSWORD: &[u8] = b"viva-user";
+        const OWNER_PASSWORD: &[u8] = b"viva-owner";
+        const PERMISSIONS: i32 = -1;
+        let document_id: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ];
+
+        // Algorithm 3: /O.
+        let owner_digest = md5(&padded_password(OWNER_PASSWORD));
+        let owner_entry = rc4(&owner_digest[..5], &padded_password(USER_PASSWORD));
+        assert_eq!(owner_entry.len(), 32, "/O is 32 bytes");
+
+        // Algorithm 2: the file encryption key.
+        let mut key_input = Vec::new();
+        key_input.extend_from_slice(&padded_password(USER_PASSWORD));
+        key_input.extend_from_slice(&owner_entry);
+        key_input.extend_from_slice(&PERMISSIONS.to_le_bytes());
+        key_input.extend_from_slice(&document_id);
+        let encryption_key = md5(&key_input)[..5].to_vec();
+
+        // Algorithm 4: /U for revision 2.
+        let user_entry = rc4(&encryption_key, &PDF_PASSWORD_PADDING);
+        assert_eq!(user_entry.len(), 32, "/U is 32 bytes");
+
+        // Algorithm 1: the per-object key for the content stream (object 5).
+        let mut object_key_input = encryption_key.clone();
+        object_key_input.extend_from_slice(&5u32.to_le_bytes()[..3]);
+        object_key_input.extend_from_slice(&0u32.to_le_bytes()[..2]);
+        let object_key = md5(&object_key_input)[..(encryption_key.len() + 5).min(16)].to_vec();
+        let plaintext_content =
+            b"BT /F1 12 Tf 72 720 Td (Encrypted lecture content.) Tj ET".to_vec();
+        let encrypted_content = rc4(&object_key, &plaintext_content);
+        assert_ne!(
+            encrypted_content, plaintext_content,
+            "the content stream must actually be encrypted"
+        );
+
+        let mut pdf = PdfBuilder::new();
+        let catalog = pdf.object(b"<< /Type /Catalog /Pages 2 0 R >>");
+        pdf.object(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        pdf.object(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        );
+        pdf.object(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        pdf.stream_object("", &encrypted_content);
+        let encrypt_dictionary = format!(
+            "<< /Filter /Standard /V 1 /R 2 /O <{}> /U <{}> /P {PERMISSIONS} >>",
+            hex(&owner_entry),
+            hex(&user_entry)
+        );
+        let encrypt = pdf.object(encrypt_dictionary.as_bytes());
+        let trailer_extra = format!(
+            " /Encrypt {encrypt} 0 R /ID [<{}> <{}>]",
+            hex(&document_id),
+            hex(&document_id)
+        );
+        let bytes = pdf.finish(catalog, &trailer_extra);
+        assert!(find(&bytes, b"/Filter /Standard").is_some(), "std handler");
+        assert!(find(&bytes, b"/R 2").is_some(), "revision 2");
+        assert!(
+            find(&bytes, format!("/Encrypt {encrypt} 0 R").as_bytes()).is_some(),
+            "the trailer references the encrypt dictionary"
+        );
+        assert!(
+            find(&bytes, b"Encrypted lecture content").is_none(),
+            "no plaintext content survives in the encrypted file"
+        );
+        bytes
+    }
+
+    /// A PDF whose xref table and trailer are cut off mid-file.
+    fn generated_malformed_pdf() -> Vec<u8> {
+        let complete = generated_text_pdf();
+        let xref_start = find(&complete, b"xref\n").expect("xref keyword present");
+        let mut truncated = complete[..xref_start + 12].to_vec();
+        truncated.extend_from_slice(b"000000");
+        assert!(
+            truncated.starts_with(b"%PDF-1.7"),
+            "still claims to be a PDF"
+        );
+        assert!(
+            find(&truncated, b"trailer").is_none() && find(&truncated, b"startxref").is_none(),
+            "the xref/trailer really is gone"
+        );
+        truncated
+    }
+
+    /// UTF-8 study prose wearing a `%PDF-1.7` header and nothing else.
+    fn magic_prefixed_plaintext() -> Vec<u8> {
+        let text = "%PDF-1.7\nMitochondria transfer electrons from NADH to oxygen. \
+             The proton gradient powers ATP synthase during oxidative phosphorylation. \
+             Chemiosmosis couples the gradient to ADP phosphorylation.";
+        let bytes = text.as_bytes().to_vec();
+        assert!(bytes.starts_with(b"%PDF"), "carries the magic prefix");
+        assert!(find(&bytes, b" obj").is_none(), "carries no PDF object");
+        assert!(find(&bytes, b"xref").is_none(), "carries no xref table");
+        assert!(std::str::from_utf8(&bytes).is_ok(), "is valid UTF-8 prose");
+        bytes
+    }
+
+    /// The whole persisted state as bytes. Comparing serialized state, not field by
+    /// field, is what makes "no artifact was created" mean every artifact.
+    fn state_bytes(state: &InMemoryStudyState) -> String {
+        serde_json::to_string(state).expect("in-memory state serializes")
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .rposition(|window| window == needle)
+    }
+
+    // -----------------------------------------------------------------------
+    // Fail-closed behaviour.
+    // -----------------------------------------------------------------------
+
+    fn assert_unsupported_pdf(error: &PortError) {
+        assert_eq!(error.kind(), PortErrorKind::InvalidInput);
+        assert_eq!(error.port(), "study_store.file_ingestion");
+        assert_eq!(error.id(), "unsupported_pdf");
+        assert_eq!(
+            error.reason(),
+            "PDF ingestion requires page-aware extraction"
+        );
+    }
+
+    fn file_input(
+        file_name: &str,
+        content_type: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> CreateFileStudySet {
+        CreateFileStudySet {
+            user_id: "user-1".to_owned(),
+            study_set_id: None,
+            title: "Lecture upload".to_owned(),
+            course: Some("Biology 201".to_owned()),
+            exam_date: None,
+            file_name: file_name.to_owned(),
+            content_type: content_type.map(ToOwned::to_owned),
+            file_bytes: bytes,
+            session_id: Some("file-session-pdf".to_owned()),
+        }
+    }
+
+    /// Reject the upload and prove nothing at all was written: not a study set, a
+    /// document, a source span, a concept, a question, a session, or a nonce.
+    async fn assert_rejected_without_artifacts(
+        file_name: &str,
+        content_type: Option<&str>,
+        bytes: Vec<u8>,
+    ) {
+        let store = InMemoryStudyStore::new();
+        let before = store.snapshot();
+        let before_counts = store.write_counts();
+
+        let error = store
+            .create_file_study_set(file_input(file_name, content_type, bytes))
+            .await
+            .expect_err("PDF ingestion must fail closed");
+        assert_unsupported_pdf(&error);
+
+        let after = store.snapshot();
+        assert_eq!(
+            state_bytes(&after),
+            state_bytes(&before),
+            "the store must be byte-identical after a rejected PDF"
+        );
+        assert_eq!(store.write_counts(), before_counts);
+        assert!(after.study_sets.is_empty());
+        assert!(after.documents.is_empty());
+        assert!(after.source_spans.is_empty());
+        assert!(after.concepts.is_empty());
+        assert!(after.questions.is_empty());
+        assert!(after.sessions.is_empty());
+        assert!(after.session_token_nonces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_text_page_without_artifacts() {
+        assert_rejected_without_artifacts(
+            "Lecture 9.pdf",
+            Some("application/pdf"),
+            generated_text_pdf(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_flate_compressed_text_without_artifacts() {
+        assert_rejected_without_artifacts(
+            "Lecture 9 compressed.pdf",
+            Some("application/pdf"),
+            generated_flate_pdf(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_scanned_image_only_without_artifacts() {
+        assert_rejected_without_artifacts(
+            "Scan 2026-08-24.pdf",
+            Some("application/pdf; charset=binary"),
+            generated_scanned_pdf(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_standard_encrypted_without_artifacts() {
+        assert_rejected_without_artifacts(
+            "Protected.pdf",
+            Some("application/pdf"),
+            generated_encrypted_pdf(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_malformed_without_artifacts() {
+        assert_rejected_without_artifacts(
+            "Truncated.PDF",
+            Some("APPLICATION/PDF"),
+            generated_malformed_pdf(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_magic_prefixed_plaintext_without_artifacts() {
+        assert_rejected_without_artifacts(
+            "notes.pdf",
+            Some("application/pdf"),
+            magic_prefixed_plaintext(),
+        )
+        .await;
+    }
+
+    /// The name and the declared type are both attacker-controlled, so neither may be
+    /// the only thing standing between a PDF and the extractor that cannot read it.
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_magic_even_without_pdf_name_or_mime() {
+        assert_rejected_without_artifacts("notes.txt", Some("text/plain"), generated_text_pdf())
+            .await;
+        assert_rejected_without_artifacts("notes.txt", None, generated_flate_pdf()).await;
+        // A UTF-8 BOM and leading whitespace do not hide the magic.
+        let mut disguised = vec![0xEF, 0xBB, 0xBF, b'\n', b' ', b'\t'];
+        disguised.extend_from_slice(&generated_text_pdf());
+        assert_rejected_without_artifacts("notes.txt", Some("text/plain"), disguised).await;
+    }
+
+    /// A rejected retry must leave the study set exactly as the successful ingestion
+    /// left it: same rows, same ids, same status.
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_retry_without_state_mutation() {
+        let store = InMemoryStudyStore::new();
+        let ready = store
+            .create_file_study_set(CreateFileStudySet {
+                file_name: "notes.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
+                file_bytes: ingestible_text().into_bytes(),
+                ..file_input("notes.txt", Some("text/plain"), Vec::new())
+            })
+            .await
+            .expect("plain text ingests");
+        assert_eq!(
+            ready.study_set.ingestion_status,
+            StudySetIngestionStatus::Ready
+        );
+
+        let before = store.snapshot();
+        let before_counts = store.write_counts();
+        let error = store
+            .retry_file_study_set(CreateFileStudySet {
+                study_set_id: Some(ready.study_set.id.clone()),
+                file_name: "rescan.pdf".to_owned(),
+                content_type: Some("application/pdf".to_owned()),
+                file_bytes: generated_text_pdf(),
+                session_id: Some("file-session-pdf-retry".to_owned()),
+                ..file_input("rescan.pdf", Some("application/pdf"), Vec::new())
+            })
+            .await
+            .expect_err("a PDF retry must fail closed");
+        assert_unsupported_pdf(&error);
+
+        assert_eq!(
+            state_bytes(&store.snapshot()),
+            state_bytes(&before),
+            "a rejected retry must leave byte-equivalent state"
+        );
+        assert_eq!(store.write_counts(), before_counts);
+        assert!(store
+            .active_question("user-1", &ready.study_set.id)
+            .await
+            .expect("active question read")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn non_pdf_utf8_file_still_ingests_and_becomes_ready() {
+        let store = InMemoryStudyStore::new();
+        let record = store
+            .create_file_study_set(file_input(
+                "notes.txt",
+                Some("text/plain"),
+                ingestible_text().into_bytes(),
+            ))
+            .await
+            .expect("valid non-PDF UTF-8 still ingests");
+
+        assert_eq!(
+            record.study_set.ingestion_status,
+            StudySetIngestionStatus::Ready
+        );
+        assert_eq!(record.documents[0].source_kind, "file");
+        assert!(!record.source_spans.is_empty());
+        assert!(!record.concepts.is_empty());
+        assert_eq!(record.questions.len(), record.concepts.len());
+        assert!(store
+            .active_question("user-1", &record.study_set.id)
+            .await
+            .expect("active question read")
+            .is_some());
+    }
+
+    /// Invalid UTF-8 is refused, not repaired. A replacement character is a
+    /// fabricated learner fact: it claims the file said something it did not.
+    #[tokio::test]
+    async fn non_pdf_invalid_utf8_fails_without_lossy_replacement() {
+        let store = InMemoryStudyStore::new();
+        let before = store.snapshot();
+
+        let mut bytes = ingestible_text().into_bytes();
+        bytes.extend_from_slice(&[0xFF, 0xFE, 0x80, 0x9F]);
+        let error = store
+            .create_file_study_set(file_input("notes.txt", Some("text/plain"), bytes))
+            .await
+            .expect_err("invalid UTF-8 must fail closed");
+
+        assert_eq!(error.kind(), PortErrorKind::InvalidInput);
+        assert_eq!(error.port(), "study_store.file_ingestion");
+        assert_eq!(error.id(), "invalid_utf8_file");
+
+        assert_eq!(
+            state_bytes(&store.snapshot()),
+            state_bytes(&before),
+            "nothing was written"
+        );
+        let persisted = serde_json::to_string(&store.snapshot()).expect("snapshot serializes");
+        assert!(
+            !persisted.contains('\u{FFFD}'),
+            "no replacement character may reach the store"
+        );
+    }
+
+    fn ingestible_text() -> String {
+        [
+            "Mitochondria electron transport builds a proton gradient across the inner membrane.",
+            "NADH transfers electrons while oxygen accepts them at the end of the chain.",
+            "ATP synthase uses chemiosmosis to make ATP from ADP.",
+        ]
+        .join("\n")
     }
 }

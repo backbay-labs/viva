@@ -1673,8 +1673,8 @@ mod tests {
                 title: "Bio PDF".to_owned(),
                 course: Some("Biology 201".to_owned()),
                 exam_date: Some(EXAM_AT.to_owned()),
-                file_name: "Lecture 9.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "Lecture 9.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: ingestible_text().into_bytes(),
                 session_id: Some(Uuid::new_v4().to_string()),
             })
@@ -1689,8 +1689,8 @@ mod tests {
                 title: String::new(),
                 course: None,
                 exam_date: None,
-                file_name: "Lecture 9 rescan.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "Lecture 9 rescan.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: ingestible_text().into_bytes(),
                 session_id: Some(Uuid::new_v4().to_string()),
             })
