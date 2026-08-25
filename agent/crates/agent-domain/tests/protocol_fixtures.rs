@@ -437,21 +437,26 @@ fn shared_study_projection_rejects_unpinned_version() {
         .expect_err("a projection version other than 1 must fail closed");
 }
 
+/// Two PCM16 samples. Plan 06 Task 5 (`DOMAIN-007`) deleted the text-as-PCM
+/// constructor, so audio fixtures name their bytes explicitly and can never be an
+/// odd-length buffer that only looks like audio.
+const PCM16_FIXTURE_BYTES: [u8; 4] = [0x00, 0x01, 0xff, 0xfe];
+
 #[test]
 fn audio_frame_serializes_to_base64_contract() {
-    let frame = AudioFrame::from_pcm16_text("Ready.");
+    let frame = AudioFrame::from_pcm16_bytes(PCM16_FIXTURE_BYTES.to_vec());
     let value = serde_json::to_value(&frame).expect("audio frame serializes");
 
-    assert_eq!(value, json!({ "pcm16_base64": "UmVhZHku" }));
+    assert_eq!(value, json!({ "pcm16_base64": "AAH//g==" }));
     let decoded: AudioFrame = serde_json::from_value(value).expect("audio frame deserializes");
-    assert_eq!(decoded.pcm16_bytes(), b"Ready.");
+    assert_eq!(decoded.pcm16_bytes(), PCM16_FIXTURE_BYTES);
 }
 
 #[test]
 fn brain_events_carry_response_ids_for_stale_suppression() {
     let event = BrainEvent::ResponseAudio {
         response_id: "response-1".to_owned(),
-        frame: AudioFrame::from_pcm16_text("hi"),
+        frame: AudioFrame::from_pcm16_bytes(PCM16_FIXTURE_BYTES.to_vec()),
     };
 
     assert_eq!(event.response_id(), Some("response-1"));

@@ -1,0 +1,21 @@
+error[E0599]: no function or associated item named `from_pcm16_text` found for struct `AudioFrame` in the current scope
+  --> tests/ui/audio_frame_text_constructor.rs:17:29
+   |
+17 |     let frame = AudioFrame::from_pcm16_text("hello");
+   |                             ^^^^^^^^^^^^^^^ function or associated item not found in `AudioFrame`
+   |
+note: if you're trying to build a new `AudioFrame` consider using one of the following associated functions:
+      AudioFrame::from_pcm16_bytes
+      AudioFrame::from_base64
+  --> src/lib.rs
+   |
+   |     pub fn from_pcm16_bytes(bytes: impl Into<Bytes>) -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+   |     pub fn from_base64(encoded: impl AsRef<str>) -> Result<Self, String> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: there is an associated function `from_pcm16_bytes` with a similar name
+   |
+17 -     let frame = AudioFrame::from_pcm16_text("hello");
+17 +     let frame = AudioFrame::from_pcm16_bytes("hello");
+   |

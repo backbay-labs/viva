@@ -28,6 +28,15 @@ fn study_store_write_outcome_cannot_be_dropped_silently() {
     trybuild::TestCases::new().compile_fail("tests/ui/study_store_write_outcome_unused.rs");
 }
 
+/// Plan 06 Task 5 (`DOMAIN-007`): text-as-PCM is absent from the production API.
+/// `AudioFrame` is built from decoded PCM16 bytes or from validated base64 and
+/// from nothing else, so no adapter, service, or fixture can reinterpret a string
+/// as audio samples.
+#[test]
+fn audio_frames_cannot_be_built_from_text() {
+    trybuild::TestCases::new().compile_fail("tests/ui/audio_frame_text_constructor.rs");
+}
+
 /// Plan 06 Task 3A Step 2A (`DOMAIN-011`): the recorded D-04 selector is
 /// `CONFIRM_DELETE`, so the domain compiles no soft-delete/restore surface at all.
 /// These two cases are registered only on the selected branch; under

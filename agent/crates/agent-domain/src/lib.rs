@@ -101,22 +101,29 @@ pub fn viva_max_submitted_answer_resolution() -> Duration {
     Duration::from_millis(max_resolution_ms)
 }
 
+/// Plan 06 Task 5 (`DOMAIN-007`): decoded PCM16 samples plus the base64 encoding
+/// of exactly those samples, computed once.
+///
+/// Both fields are always populated, so `pcm16_base64()` borrows rather than
+/// re-encoding on every access — a realtime turn reads the encoding on the hot
+/// path. The two constructors are the whole public surface: samples arrive as
+/// decoded bytes or as base64 that has already been validated by decoding it.
+/// There is deliberately no text constructor; `tests/ui/audio_frame_text_constructor.rs`
+/// compile-proves its absence.
 #[derive(Clone, Debug)]
 pub struct AudioFrame {
     pcm16: Bytes,
-    pcm16_base64: Option<Arc<str>>,
+    pcm16_base64: Arc<str>,
 }
 
 impl AudioFrame {
     pub fn from_pcm16_bytes(bytes: impl Into<Bytes>) -> Self {
+        let pcm16 = bytes.into();
+        let pcm16_base64 = Arc::<str>::from(STANDARD.encode(&pcm16));
         Self {
-            pcm16: bytes.into(),
-            pcm16_base64: None,
+            pcm16,
+            pcm16_base64,
         }
-    }
-
-    pub fn from_pcm16_text(text: impl AsRef<str>) -> Self {
-        Self::from_pcm16_bytes(Bytes::copy_from_slice(text.as_ref().as_bytes()))
     }
 
     pub fn from_base64(encoded: impl AsRef<str>) -> Result<Self, String> {
@@ -125,7 +132,7 @@ impl AudioFrame {
             .decode(encoded)
             .map(|pcm16| Self {
                 pcm16: Bytes::from(pcm16),
-                pcm16_base64: Some(Arc::<str>::from(encoded)),
+                pcm16_base64: Arc::<str>::from(encoded),
             })
             .map_err(|error| format!("invalid base64 PCM: {error}"))
     }
@@ -138,11 +145,8 @@ impl AudioFrame {
         self.pcm16.clone()
     }
 
-    pub fn pcm16_base64(&self) -> String {
-        self.pcm16_base64
-            .as_deref()
-            .map(str::to_owned)
-            .unwrap_or_else(|| STANDARD.encode(&self.pcm16))
+    pub fn pcm16_base64(&self) -> &str {
+        &self.pcm16_base64
     }
 }
 
@@ -160,7 +164,7 @@ impl Serialize for AudioFrame {
         S: Serializer,
     {
         let mut frame = serializer.serialize_struct("AudioFrame", 1)?;
-        frame.serialize_field("pcm16_base64", &self.pcm16_base64())?;
+        frame.serialize_field("pcm16_base64", self.pcm16_base64())?;
         frame.end()
     }
 }
