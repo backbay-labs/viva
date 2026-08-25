@@ -773,6 +773,7 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
                 "session evidence is not readable",
             ));
         }
+        let outcomes = self.recorded_outcomes();
         Ok(SessionLearningEvidence {
             user_id: user_id.to_owned(),
             study_set_id: study_set_id.to_owned(),
@@ -780,7 +781,18 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
             // This single-question store keeps the session on its one authorized
             // question for the whole session.
             current_question: self.question.clone(),
-            outcomes: self.recorded_outcomes(),
+            // Only a question some persisted outcome actually names.
+            answered_questions: self
+                .question
+                .iter()
+                .filter(|question| {
+                    outcomes
+                        .iter()
+                        .any(|outcome| outcome.question_id == question.question_id)
+                })
+                .cloned()
+                .collect(),
+            outcomes,
             concept_labels: self.concept_labels.clone(),
             // Under D-01A the recap's review entries are the persisted decisions,
             // never a schedule this store recomputed.
@@ -4789,6 +4801,16 @@ impl agent_domain::StudyMemoryStore for FakeSessionTurnStore {
         voice_session_id: &str,
     ) -> Result<SessionLearningEvidence, PortError> {
         let cursor = self.cursor();
+        let outcomes = self.recorded_outcomes();
+        // The join a persisted store makes: each distinct question a persisted
+        // outcome names, resolved back to the stored question row.
+        let mut answered_ids = BTreeSet::new();
+        let answered_questions = outcomes
+            .iter()
+            .filter(|outcome| answered_ids.insert(outcome.question_id.clone()))
+            .filter_map(|outcome| self.questions.get(&outcome.question_id))
+            .cloned()
+            .collect();
         Ok(SessionLearningEvidence {
             user_id: user_id.to_owned(),
             study_set_id: study_set_id.to_owned(),
@@ -4799,7 +4821,8 @@ impl agent_domain::StudyMemoryStore for FakeSessionTurnStore {
                 .as_ref()
                 .and_then(|question_id| self.questions.get(question_id))
                 .cloned(),
-            outcomes: self.recorded_outcomes(),
+            answered_questions,
+            outcomes,
             concept_labels: self.concept_labels.clone(),
             review_decisions: Vec::new(),
         })
@@ -5177,5 +5200,195 @@ async fn session_cursor_refuses_an_answer_to_a_question_the_session_is_not_on() 
     assert!(
         store.recorded_outcomes().is_empty(),
         "a refused answer persists no outcome",
+    );
+}
+
+/// One satisfied assessment per rubric criterion at a lower confidence, so the
+/// outcome this produces differs from [`satisfies`] for the same question.
+fn satisfies_weakly(question: &StudyQuestion) -> EvaluationDecision {
+    EvaluationDecision::Evaluated {
+        assessments: question
+            .rubric
+            .criteria
+            .iter()
+            .map(|criterion| {
+                assessment(
+                    &criterion.criterion_id,
+                    CriterionAssessmentKind::Satisfied,
+                    0.61,
+                )
+            })
+            .collect(),
+        concise_feedback: "A weaker reading of the same bound rubric claims.".to_owned(),
+        retry_prompt: None,
+    }
+}
+
+/// A replay is not a new turn, so the cursor gate must not re-decide it.
+///
+/// The cursor authorizes the answer the server is *currently* waiting for. A
+/// redelivery of an already-recorded `response_id` — the reconnect and
+/// lost-acknowledgement case the transport is built to produce — was authorized
+/// when its outcome was persisted, and the same turn's own `Advance` is what
+/// moves the cursor off that question. Re-gating it on the cursor therefore
+/// refuses the very deliveries idempotency exists to absorb.
+///
+/// Both stale-cursor shapes are covered: the cursor on no question at all, and
+/// the cursor on a *different* question. Neither may cost the replay its
+/// persisted outcome, and neither may cost the surface a guard — a changed
+/// payload under one response id still fails closed, and a new response id
+/// answering the completed question is still refused.
+#[tokio::test]
+async fn turn_outcome_replay_survives_the_cursor_advancing_past_its_question() {
+    const SPOKEN: &str = "NADH hands its electrons to the first complex of the chain.";
+    let fixture = progression_fixture();
+    let store = Arc::new(FakeSessionTurnStore::from_fixture(&fixture));
+
+    let first_selection = session_turn_executor(&store, Arc::new(UnreachableEvaluator))
+        .execute(
+            "sel-1",
+            ToolProposal::select_next_question(STUDY_SET_ID, &store.voice_session_id, "quiz"),
+        )
+        .await
+        .expect("the first selection succeeds")
+        .result;
+    let question = selected_question(&first_selection);
+
+    let recorded = session_turn_executor(&store, ScriptedEvaluator::once(satisfies(&question)))
+        .execute(
+            "ans-1",
+            ToolProposal::evaluate_spoken_answer(
+                STUDY_SET_ID,
+                &store.voice_session_id,
+                &question.question_id,
+                SPOKEN,
+            ),
+        )
+        .await
+        .expect("the first answer of the session is evaluated")
+        .result;
+    assert_eq!(recorded["record"]["replayed"], json!(false));
+    assert!(
+        store.cursor().current_question_id.is_none(),
+        "this turn's own Advance moved the cursor off the question it answered",
+    );
+
+    // Redelivery one: the cursor is on no question at all.
+    let replayed = session_turn_executor(&store, ScriptedEvaluator::once(satisfies(&question)))
+        .execute(
+            "ans-1",
+            ToolProposal::evaluate_spoken_answer(
+                STUDY_SET_ID,
+                &store.voice_session_id,
+                &question.question_id,
+                SPOKEN,
+            ),
+        )
+        .await
+        .expect("an exact redelivery replays the outcome persisted under its response id")
+        .result;
+    assert_eq!(replayed["turn_outcome"], recorded["turn_outcome"]);
+    assert_eq!(replayed["record"]["replayed"], json!(true));
+
+    // Redelivery two: the cursor has since moved on to a different question.
+    let second_selection = session_turn_executor(&store, Arc::new(UnreachableEvaluator))
+        .execute(
+            "sel-2",
+            ToolProposal::select_next_question(STUDY_SET_ID, &store.voice_session_id, "quiz"),
+        )
+        .await
+        .expect("the second selection succeeds")
+        .result;
+    assert_ne!(
+        selected_question(&second_selection).question_id,
+        question.question_id,
+    );
+    let late_replay = session_turn_executor(&store, ScriptedEvaluator::once(satisfies(&question)))
+        .execute(
+            "ans-1",
+            ToolProposal::evaluate_spoken_answer(
+                STUDY_SET_ID,
+                &store.voice_session_id,
+                &question.question_id,
+                SPOKEN,
+            ),
+        )
+        .await
+        .expect("a redelivery arriving after the cursor moved on still replays its outcome")
+        .result;
+    assert_eq!(late_replay["turn_outcome"], recorded["turn_outcome"]);
+    assert_eq!(late_replay["record"]["replayed"], json!(true));
+    assert_eq!(
+        store.recorded_outcomes().len(),
+        1,
+        "no replay persisted a second outcome",
+    );
+
+    // The payload guard is untouched: a *different* answer under the recorded
+    // response id is a protocol violation, not a replay, and is still refused
+    // rather than quietly handed the persisted outcome.
+    let conflict =
+        session_turn_executor(&store, ScriptedEvaluator::once(satisfies_weakly(&question)))
+            .execute(
+                "ans-1",
+                ToolProposal::evaluate_spoken_answer(
+                    STUDY_SET_ID,
+                    &store.voice_session_id,
+                    &question.question_id,
+                    "A different spoken answer under the same response id.",
+                ),
+            )
+            .await
+            .expect_err("a changed payload under one response id must fail closed");
+    match conflict {
+        ToolExecutionError::Store(port) => assert_eq!(port.kind(), PortErrorKind::Conflict),
+        other => panic!("expected a store conflict, found {other:?}"),
+    }
+
+    // The recorded identity is authoritative: a redelivery that names a
+    // different question is not a second turn smuggled under one response id,
+    // and it is refused before the evaluator is ever reached.
+    let current = selected_question(&second_selection);
+    let mismatched = session_turn_executor(&store, Arc::new(UnreachableEvaluator))
+        .execute(
+            "ans-1",
+            ToolProposal::evaluate_spoken_answer(
+                STUDY_SET_ID,
+                &store.voice_session_id,
+                &current.question_id,
+                "An answer to the current question under an already-recorded response id.",
+            ),
+        )
+        .await
+        .expect_err("a recorded response id may only ever name the question it recorded");
+    assert!(
+        matches!(mismatched, ToolExecutionError::InvalidArguments(ref message)
+            if message.contains(&question.question_id) && message.contains(&current.question_id)),
+        "the refusal names both the recorded question and the one offered, got {mismatched:?}",
+    );
+
+    // And a *new* turn is still gated on the cursor: a fresh response id may not
+    // answer a question this session has already completed and moved past.
+    let refused = session_turn_executor(&store, Arc::new(UnreachableEvaluator))
+        .execute(
+            "ans-3",
+            ToolProposal::evaluate_spoken_answer(
+                STUDY_SET_ID,
+                &store.voice_session_id,
+                &question.question_id,
+                "A second answer to a question the session already completed.",
+            ),
+        )
+        .await
+        .expect_err("a new turn is still gated on the question the cursor is on");
+    assert!(
+        matches!(refused, ToolExecutionError::InvalidArguments(ref message)
+            if message.contains(&question.question_id)),
+        "the refusal names the question the session is no longer on, got {refused:?}",
+    );
+    assert_eq!(
+        store.recorded_outcomes().len(),
+        1,
+        "neither the refused payload nor the refused new turn persisted an outcome",
     );
 }

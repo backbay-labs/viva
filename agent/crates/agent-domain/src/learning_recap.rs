@@ -76,6 +76,23 @@ pub struct SessionLearningEvidence {
     /// projection of `outcomes`.
     #[serde(default)]
     pub current_question: Option<StudyQuestion>,
+    /// The questions this session's persisted `outcomes` were graded against,
+    /// each with the server-owned rubric that graded it.
+    ///
+    /// The cursor names the answer the server is *currently* waiting for, so it
+    /// cannot authorize a redelivery of a turn already recorded: that turn's own
+    /// disposition is what moved the cursor off its question. A replay is bound
+    /// from here instead, which is why this carries the question rather than
+    /// only its identity — the replay recomputes the same payload, so the store
+    /// keeps its per-response payload guard rather than being handed a value it
+    /// must take on trust.
+    ///
+    /// One entry per distinct `question_id` among `outcomes` is enough; order is
+    /// not read. A store that cannot report an entry leaves it out and the
+    /// replay fails closed rather than grading against a question the server
+    /// cannot confirm it asked. The recap fold ignores this field entirely.
+    #[serde(default)]
+    pub answered_questions: Vec<StudyQuestion>,
     pub outcomes: Vec<TurnOutcome>,
     pub concept_labels: Vec<ConceptLabel>,
     pub review_decisions: Vec<ReviewScheduleSummary>,
