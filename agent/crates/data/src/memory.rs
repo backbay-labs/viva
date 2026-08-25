@@ -5,14 +5,19 @@ use std::{
 };
 
 use agent_domain::{
-    format_rfc3339_millis, parse_utc_instant,
-    learning_outcome::{VIVA_CHALLENGE_RESOLUTION_SCHEMA, VIVA_TURN_OUTCOME_RECORD_SCHEMA,
-        VIVA_TURN_OUTCOME_SCHEMA},
-    learning_recap::{ConceptLabel, ReviewScheduleAuthority, ReviewScheduleSummary,
-        SessionLearningEvidence},
-    study_projection::{StudyProjectionActiveQuestionV1, StudyProjectionConceptV1,
+    format_rfc3339_millis,
+    learning_outcome::{
+        VIVA_CHALLENGE_RESOLUTION_SCHEMA, VIVA_TURN_OUTCOME_RECORD_SCHEMA, VIVA_TURN_OUTCOME_SCHEMA,
+    },
+    learning_recap::{
+        ConceptLabel, ReviewScheduleAuthority, ReviewScheduleSummary, SessionLearningEvidence,
+    },
+    parse_utc_instant,
+    study_projection::{
+        StudyProjectionActiveQuestionV1, StudyProjectionConceptV1,
         StudyProjectionQuestionProgressV1, StudyProjectionReviewItemV1, StudyProjectionSessionV1,
-        StudyProjectionSourceCitationV1, StudyProjectionStudySetV1, StudyProjectionVersionV1},
+        StudyProjectionSourceCitationV1, StudyProjectionStudySetV1, StudyProjectionVersionV1,
+    },
     AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
     AnswerEvaluation, AuthenticatedStudyProjectionV1, ChallengeDisposition, ChallengeResolution,
     ConceptStatus, ConceptStatusTransition, CreateFileStudySet, CreatePasteStudySet,
@@ -420,7 +425,6 @@ pub struct RecapRecord {
     pub recap: PersistedSessionRecap,
 }
 
-
 /// One persisted Plan 04 [`TurnOutcome`], stored as the canonical typed object.
 ///
 /// `payload_sha256` is the same canonical digest the durable backend stores, so
@@ -574,10 +578,16 @@ const FIXTURE_ID_TRANSLATIONS: &[(&str, &str)] = &[
     // Seeded development fixture.
     ("biology-midterm", "11111111-1111-4111-8111-111111111111"),
     ("lec-5", "22222222-2222-4222-8222-222222222222"),
-    ("src-lecture-5-slide-18", "33333333-3333-4333-8333-333333333333"),
+    (
+        "src-lecture-5-slide-18",
+        "33333333-3333-4333-8333-333333333333",
+    ),
     ("voice-session-1", "44444444-4444-4444-8444-444444444444"),
     // Plan 04 learning-core fixtures (`agent/fixtures/learning-core/*.json`).
-    ("set-cellular-respiration", "5e700001-0000-4000-8000-000000000001"),
+    (
+        "set-cellular-respiration",
+        "5e700001-0000-4000-8000-000000000001",
+    ),
     ("lec5", "5e700001-0000-4000-8000-000000000002"),
     ("lec3", "5e700001-0000-4000-8000-000000000003"),
     ("src-lec5-slide-18", "5e700001-0000-4000-8000-000000000004"),
@@ -1034,7 +1044,6 @@ impl InMemoryStudyStore {
         ))
     }
 
-
     /// A session that can still be read: the tenant owns it and it is not deleted.
     ///
     /// Evidence and recaps outlive the live session, so a closed session must
@@ -1075,7 +1084,11 @@ impl InMemoryStudyStore {
         study_set
             .question_ids
             .iter()
-            .filter_map(|question_id| state.questions.get(&question_key(study_set_id, question_id)))
+            .filter_map(|question_id| {
+                state
+                    .questions
+                    .get(&question_key(study_set_id, question_id))
+            })
             .filter(|record| record.active)
             .map(|record| record.question.clone())
             .collect()
@@ -1131,8 +1144,7 @@ impl InMemoryStudyStore {
         let total = u32::try_from(active.len()).unwrap_or(u32::MAX);
         let Some(current) = cursor.current_question_id.as_deref() else {
             return QuestionProgressionResult::Exhausted {
-                completed: u32::try_from(cursor.completed_question_ids.len())
-                    .unwrap_or(u32::MAX),
+                completed: u32::try_from(cursor.completed_question_ids.len()).unwrap_or(u32::MAX),
                 total,
                 revision: cursor.revision,
             };
@@ -1234,7 +1246,6 @@ impl InMemoryStudyStore {
         }
         record.cursor.current_question_id = None;
     }
-
 
     /// The selected D-01 v1 schedule write, under a caller-held state write lock.
     ///
@@ -1419,7 +1430,6 @@ impl InMemoryStudyStore {
             .count()
     }
 }
-
 
 /// The one `selection_reason` `D-02B` ordered progression ever reports.
 pub(crate) const ORDERED_PROGRESSION_SELECTION_REASON: &str = "ordered_v1:first_active_uncompleted";
@@ -4259,12 +4269,8 @@ impl StudyMemoryStore for InMemoryStudyStore {
 
         let disposition = turn_outcome_disposition(&outcome);
         let question_id = outcome.question_id.clone();
-        let progression = Self::progression_record_locked(
-            &mut state,
-            user_id,
-            study_set_id,
-            voice_session_id,
-        );
+        let progression =
+            Self::progression_record_locked(&mut state, user_id, study_set_id, voice_session_id);
         Self::apply_outcome_disposition(progression, &question_id, disposition);
 
         state.turn_outcomes.push(TurnOutcomeRecord {
@@ -4438,12 +4444,8 @@ impl StudyMemoryStore for InMemoryStudyStore {
         Self::study_set_locked(&state, user_id, study_set_id)?;
         Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
         let active = Self::active_questions_locked(&state, study_set_id);
-        let progression = Self::progression_record_locked(
-            &mut state,
-            user_id,
-            study_set_id,
-            voice_session_id,
-        );
+        let progression =
+            Self::progression_record_locked(&mut state, user_id, study_set_id, voice_session_id);
         Self::apply_ordered_selection(progression, response_id, &active);
         Ok(Self::ordered_progression_result(
             &progression.cursor,

@@ -8,9 +8,10 @@ use agent_domain::{
     learning_outcome::VIVA_TURN_OUTCOME_RECORD_SCHEMA,
     learning_recap::{ConceptLabel, SessionLearningEvidence},
     parse_utc_instant,
-    study_projection::{StudyProjectionConceptV1, StudyProjectionQuestionProgressV1,
-        StudyProjectionReviewItemV1, StudyProjectionSessionV1, StudyProjectionStudySetV1,
-        StudyProjectionVersionV1},
+    study_projection::{
+        StudyProjectionConceptV1, StudyProjectionQuestionProgressV1, StudyProjectionReviewItemV1,
+        StudyProjectionSessionV1, StudyProjectionStudySetV1, StudyProjectionVersionV1,
+    },
     AnswerAttemptEnvelope, AnswerEvaluation, AuthenticatedStudyProjectionV1, ChallengeResolution,
     ConceptStatus, CreateFileStudySet, CreatePasteStudySet, LibraryNextReviewSummary,
     LibrarySessionRecapSummary, LibrarySessionSummary, LibraryStudyDocumentSummary,
@@ -296,7 +297,6 @@ impl PostgresStudyStore {
 
         Ok(())
     }
-
 
     /// Locks exactly the tenant-owned open session row for the rest of `tx`.
     ///
@@ -602,7 +602,6 @@ impl PostgresStudyStore {
         .map_err(pg_error)?;
         Ok(())
     }
-
 
     /// The selected D-01 v1 schedule write, inside a caller-owned transaction.
     ///
@@ -1125,7 +1124,9 @@ enum ScheduleWriteOutcome {
     Inserted(ReviewScheduleDecisionV1),
     Replayed(ReviewScheduleDecisionV1),
     /// A concurrent writer won and its unique violation aborted this transaction.
-    RaceLost { payload_sha256: String },
+    RaceLost {
+        payload_sha256: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3536,11 +3537,7 @@ impl StudyMemoryStore for PostgresStudyStore {
                 &context,
             )
             .map_err(|error| {
-                PortError::invalid_input(
-                    "postgres",
-                    &transition.concept_id,
-                    error.to_string(),
-                )
+                PortError::invalid_input("postgres", &transition.concept_id, error.to_string())
             })?;
             match Self::persist_review_schedule_decision_locked(
                 &mut tx,
@@ -3584,7 +3581,8 @@ impl StudyMemoryStore for PostgresStudyStore {
             &outcome.question_id,
             turn_outcome_disposition(&outcome),
         );
-        Self::persist_progression(&mut tx, study_set_uuid, voice_session_uuid, &progression).await?;
+        Self::persist_progression(&mut tx, study_set_uuid, voice_session_uuid, &progression)
+            .await?;
 
         tx.commit().await.map_err(pg_error)?;
         for _ in 0..scheduled {
@@ -3897,7 +3895,9 @@ impl StudyMemoryStore for PostgresStudyStore {
         for row in &concept_rows {
             let concept_id: String = row.try_get("concept_public_id").map_err(pg_error)?;
             let status = concept_status(
-                row.try_get::<String, _>("status").map_err(pg_error)?.as_str(),
+                row.try_get::<String, _>("status")
+                    .map_err(pg_error)?
+                    .as_str(),
             )?;
             concepts.push(StudyProjectionConceptV1 {
                 last_reviewed_at: last_reviewed_at(&outcomes, &concept_id),
@@ -3911,9 +3911,8 @@ impl StudyMemoryStore for PostgresStudyStore {
             });
         }
 
-        let ingestion_status = ingestion_status(
-            row_string(&set_row, "ingestion_status")?.as_str(),
-        )?;
+        let ingestion_status =
+            ingestion_status(row_string(&set_row, "ingestion_status")?.as_str())?;
         let active = Self::active_questions(&self.pool, study_set_uuid).await?;
         let cursor = sqlx::query_scalar::<_, Value>(
             "SELECT progression_json
@@ -3926,27 +3925,24 @@ impl StudyMemoryStore for PostgresStudyStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(pg_error)?
-        .map(|value| {
-            progression_record_from_json(user_id, study_set_id, voice_session_id, value)
-        })
+        .map(|value| progression_record_from_json(user_id, study_set_id, voice_session_id, value))
         .transpose()?
         .map(|record| record.cursor);
 
-        let document_titles = sqlx::query(
-            "SELECT id, display_name FROM study_documents WHERE study_set_id = $1",
-        )
-        .bind(study_set_uuid)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(pg_error)?
-        .into_iter()
-        .map(|row| {
-            Ok((
-                Self::logical_id_for_uuid(row.try_get::<Uuid, _>("id").map_err(pg_error)?),
-                row.try_get::<String, _>("display_name").map_err(pg_error)?,
-            ))
-        })
-        .collect::<Result<std::collections::BTreeMap<_, _>, PortError>>()?;
+        let document_titles =
+            sqlx::query("SELECT id, display_name FROM study_documents WHERE study_set_id = $1")
+                .bind(study_set_uuid)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(pg_error)?
+                .into_iter()
+                .map(|row| {
+                    Ok((
+                        Self::logical_id_for_uuid(row.try_get::<Uuid, _>("id").map_err(pg_error)?),
+                        row.try_get::<String, _>("display_name").map_err(pg_error)?,
+                    ))
+                })
+                .collect::<Result<std::collections::BTreeMap<_, _>, PortError>>()?;
 
         let active_question = cursor
             .as_ref()
@@ -4000,7 +3996,6 @@ impl StudyMemoryStore for PostgresStudyStore {
     }
 }
 
-
 fn row_string(row: &sqlx::postgres::PgRow, column: &'static str) -> Result<String, PortError> {
     row.try_get(column).map_err(pg_error)
 }
@@ -4018,13 +4013,13 @@ fn study_mode(_stored: &str) -> agent_domain::StudyMode {
 fn progression_record_to_json(record: &QuestionProgressionRecord) -> Result<Value, PortError> {
     let mut value = serde_json::to_value(&record.cursor)
         .map_err(|error| json_invariant("question_progression_cursor_json", &error))?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| PortError::internal(
+    let object = value.as_object_mut().ok_or_else(|| {
+        PortError::internal(
             "postgres",
             "question_progression_cursor_json",
             "a serialized progression cursor is always a JSON object",
-        ))?;
+        )
+    })?;
     object.insert(
         "applied_response_ids".to_owned(),
         serde_json::to_value(&record.applied_response_ids)
@@ -4039,13 +4034,13 @@ fn progression_record_from_json(
     voice_session_id: &str,
     mut value: Value,
 ) -> Result<QuestionProgressionRecord, PortError> {
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| PortError::internal(
+    let object = value.as_object_mut().ok_or_else(|| {
+        PortError::internal(
             "postgres",
             "question_progression_cursor_json",
             "a stored progression cursor is always a JSON object",
-        ))?;
+        )
+    })?;
     let applied = object
         .remove("applied_response_ids")
         .unwrap_or_else(|| Value::Array(Vec::new()));

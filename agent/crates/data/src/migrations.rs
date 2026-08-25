@@ -3205,7 +3205,10 @@ mod tests {
             "conflict must not leak SQLSTATE detail: {}",
             error.reason()
         );
-        assert_eq!(attempt_rows(&pool, &session_id, response_id).await, committed);
+        assert_eq!(
+            attempt_rows(&pool, &session_id, response_id).await,
+            committed
+        );
         assert_eq!(store.write_counts().answer_attempts, attempts_after_first);
 
         fixture
@@ -3446,25 +3449,24 @@ mod tests {
     }
 
     async fn swap_digest_event_kind(pool: &sqlx::PgPool, from: &str, to: &str) -> u64 {
-        sqlx::query(
-            "UPDATE event_authorization_digests SET event_kind = $2 WHERE event_kind = $1",
-        )
-        .bind(from)
-        .bind(to)
-        .execute(pool)
-        .await
-        .expect("digest event kind swap succeeds")
-        .rows_affected()
+        sqlx::query("UPDATE event_authorization_digests SET event_kind = $2 WHERE event_kind = $1")
+            .bind(from)
+            .bind(to)
+            .execute(pool)
+            .await
+            .expect("digest event kind swap succeeds")
+            .rows_affected()
     }
 
     /// Replaces the stored digest and returns what it was, so the caller can put
     /// it back and prove the rejection changed nothing.
     async fn swap_digest_payload(pool: &sqlx::PgPool, to: &str) -> String {
-        let previous =
-            sqlx::query_scalar::<_, String>("SELECT payload_sha256 FROM event_authorization_digests")
-                .fetch_one(pool)
-                .await
-                .expect("digest payload read succeeds");
+        let previous = sqlx::query_scalar::<_, String>(
+            "SELECT payload_sha256 FROM event_authorization_digests",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("digest payload read succeeds");
         sqlx::query("UPDATE event_authorization_digests SET payload_sha256 = $1")
             .bind(to)
             .execute(pool)
@@ -3692,7 +3694,9 @@ mod tests {
         let other_study_set_uuid =
             parse_uuid("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").expect("secondary set UUID");
 
-        let authorize = |store: PostgresStudyStore, session_id: String, evaluation: AnswerEvaluation| async move {
+        let authorize = |store: PostgresStudyStore,
+                         session_id: String,
+                         evaluation: AnswerEvaluation| async move {
             store
                 .authorize_answer_evaluation(
                     "user-1",
@@ -4073,7 +4077,11 @@ mod tests {
         }
     }
 
-    fn extra_question(question_id: &str, concept_id: &str, source: &StudySourceReference) -> StudyQuestion {
+    fn extra_question(
+        question_id: &str,
+        concept_id: &str,
+        source: &StudySourceReference,
+    ) -> StudyQuestion {
         StudyQuestion {
             question_id: question_id.to_owned(),
             concept_id: concept_id.to_owned(),
@@ -4126,7 +4134,11 @@ mod tests {
 
         ordinal += 1;
         questions.push((
-            extra_question("q-glycolysis-net-atp", "concept-glycolysis-atp", &glycolysis_source),
+            extra_question(
+                "q-glycolysis-net-atp",
+                "concept-glycolysis-atp",
+                &glycolysis_source,
+            ),
             false,
             ordinal,
         ));
@@ -4403,7 +4415,8 @@ mod tests {
             .map(|(concept_id, decision)| ReviewScheduleSummary {
                 concept_id,
                 due_at: agent_domain::format_rfc3339_millis(decision.due_at),
-                authority: agent_domain::learning_recap::ReviewScheduleAuthority::ServerPersistedFsrs,
+                authority:
+                    agent_domain::learning_recap::ReviewScheduleAuthority::ServerPersistedFsrs,
             })
             .collect::<Vec<_>>();
         summaries.sort_by(|left, right| {
@@ -4529,13 +4542,23 @@ mod tests {
         let outcome = outcome_named("evaluated_strong");
 
         let first = store
-            .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004", outcome.clone())
+            .record_turn_outcome(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                "vs-0004",
+                outcome.clone(),
+            )
             .await
             .expect("first outcome persists");
         assert_eq!(first, fixture.persisted["first_record"]);
 
         let replay = store
-            .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004", outcome.clone())
+            .record_turn_outcome(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                "vs-0004",
+                outcome.clone(),
+            )
             .await
             .expect("identical replay is accepted");
         assert_eq!(replay, fixture.persisted["replay_record"]);
@@ -4560,8 +4583,9 @@ mod tests {
         assert_eq!(
             ledger
                 .iter()
-                .filter(|record| record.kind
-                    == crate::memory::EventAuthorizationKind::ReviewSchedule)
+                .filter(
+                    |record| record.kind == crate::memory::EventAuthorizationKind::ReviewSchedule
+                )
                 .count(),
             2
         );
@@ -4601,7 +4625,12 @@ mod tests {
         let outcome = outcome_named("evaluated_strong");
 
         let first = store
-            .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004", outcome.clone())
+            .record_turn_outcome(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                "vs-0004",
+                outcome.clone(),
+            )
             .await
             .expect("first outcome persists");
         assert_eq!(first, fixture.persisted["first_record"]);
@@ -4619,7 +4648,12 @@ mod tests {
         assert_eq!(reviews, 2);
 
         let replay = store
-            .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0004", outcome.clone())
+            .record_turn_outcome(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                "vs-0004",
+                outcome.clone(),
+            )
             .await
             .expect("identical replay is accepted");
         assert_eq!(replay, fixture.persisted["replay_record"]);
@@ -4715,7 +4749,12 @@ mod tests {
         // A challenge against an outcome that does not exist is refused.
         let orphan = challenge_named("source_confirmed");
         let error = store
-            .record_challenge_resolution(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0006", orphan.clone())
+            .record_challenge_resolution(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                "vs-0006",
+                orphan.clone(),
+            )
             .await
             .expect_err("a challenge cannot bind a missing outcome");
         assert!(matches!(
@@ -4734,12 +4773,22 @@ mod tests {
             .expect("challenged outcome persists");
 
         let stored = store
-            .record_challenge_resolution(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0006", orphan.clone())
+            .record_challenge_resolution(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                "vs-0006",
+                orphan.clone(),
+            )
             .await
             .expect("challenge binds its outcome and source");
         assert_eq!(stored, orphan);
         let replay = store
-            .record_challenge_resolution(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0006", orphan.clone())
+            .record_challenge_resolution(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                "vs-0006",
+                orphan.clone(),
+            )
             .await
             .expect("identical challenge replay returns the stored value");
         assert_eq!(replay, orphan);
