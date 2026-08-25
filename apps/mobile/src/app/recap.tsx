@@ -1,36 +1,42 @@
 import * as Haptics from "expo-haptics";
 import { useRouter } from "expo-router";
-import { useState } from "react";
+import { useMemo, useState, useSyncExternalStore } from "react";
 import { Pressable, ScrollView, Share, StyleSheet, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+import { type RecapColorToken, recapModel } from "@/agent/recap-view-model";
+import { sessionResultStore } from "@/agent/session-store";
 import { ActionButton } from "@/components/actions";
 import { ArrowUpRightIcon, OrnamentRule, SparkIcon } from "@/components/brand";
 import { VivaText } from "@/components/type";
 import { VoiceOrb } from "@/components/voice-orb";
 import { colors, fonts, layout, radius, space } from "@/theme/tokens";
 
-const ledger = [
-  { count: 12, label: "strong", color: colors.sageDeep },
-  { count: 3, label: "shaky", color: colors.ochre },
-  { count: 2, label: "tomorrow", color: colors.plumVivid },
-];
-
-const moments = [
-  {
-    detail: "The course uses a shuttle-dependent range rather than one fixed yield.",
-    source: "Lecture 5 · slide 12",
-    title: "ATP yield—you said 36; use 30–32 for this course.",
-  },
-  {
-    detail: "Connect NADH electron donation to proton pumping and the gradient.",
-    source: "Lecture 5 · slide 18",
-    title: "You skipped the mechanism of the proton shuttle.",
-  },
-];
+const LEDGER_COLORS: Record<RecapColorToken, string> = {
+  ochre: colors.ochre,
+  plumVivid: colors.plumVivid,
+  sageDeep: colors.sageDeep,
+};
 
 export default function RecapScreen() {
   const router = useRouter();
+  const result = useSyncExternalStore(
+    sessionResultStore.subscribe,
+    sessionResultStore.get,
+    sessionResultStore.get,
+  );
+  const model = useMemo(
+    () =>
+      recapModel({
+        conceptStatuses: result?.conceptStatuses ?? {},
+        now: new Date(),
+        partialReason: result?.partialReason,
+        recap: result?.recap,
+        studySet: result?.studySet,
+        terminalReason: result?.terminalReason,
+      }),
+    [result],
+  );
   const [openMoment, setOpenMoment] = useState<number | null>(null);
   const [scheduled, setScheduled] = useState(false);
 
@@ -46,6 +52,62 @@ export default function RecapScreen() {
       router.replace("/");
     }
   };
+
+  if (!result?.recap) {
+    return (
+      <SafeAreaView edges={["top", "left", "right", "bottom"]} style={styles.safeArea}>
+        <View style={styles.header}>
+          <Pressable
+            accessibilityLabel="Close recap"
+            accessibilityRole="button"
+            hitSlop={10}
+            onPress={backToToday}
+            style={({ pressed }) => [styles.headerButton, pressed && styles.pressed]}
+          >
+            <VivaText style={styles.closeGlyph}>×</VivaText>
+          </Pressable>
+          <VivaText style={styles.headerTitle} variant="caption">
+            Session recap
+          </VivaText>
+          <View style={styles.headerSpacer} />
+        </View>
+        <ScrollView
+          contentContainerStyle={styles.scrollContent}
+          showsVerticalScrollIndicator={false}
+        >
+          <View style={styles.hero}>
+            <VoiceOrb size={72} state="ready" />
+            <VivaText accessibilityRole="header" style={styles.title} variant="display">
+              {model.headline}
+            </VivaText>
+            <OrnamentRule align="center" compact />
+            <VivaText style={styles.summary} tone="muted">
+              {model.summary}
+            </VivaText>
+            {model.partialReasonCopy ? (
+              <VivaText
+                accessibilityLiveRegion="polite"
+                style={styles.summary}
+                testID="recap-partial-reason"
+                tone="ochre"
+              >
+                {model.partialReasonCopy}
+              </VivaText>
+            ) : null}
+          </View>
+          <View style={styles.actions}>
+            <ActionButton onPress={backToToday} testID="recap-home">
+              Back to Today
+            </ActionButton>
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  const shareMessage = `Viva session: ${model.ledger
+    .map((item) => `${item.count} ${item.label}`)
+    .join(", ")}.`;
 
   return (
     <SafeAreaView edges={["top", "left", "right", "bottom"]} style={styles.safeArea}>
@@ -68,7 +130,7 @@ export default function RecapScreen() {
           hitSlop={10}
           onPress={() =>
             void Share.share({
-              message: "Viva session: 12 concepts strong, 3 shaky, and 2 scheduled for tomorrow.",
+              message: shareMessage,
               title: "Viva session recap",
             })
           }
@@ -80,46 +142,67 @@ export default function RecapScreen() {
 
       <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
         <View style={styles.hero}>
-          <VoiceOrb size={72} state="complete" />
-          <VivaText accessibilityRole="header" style={styles.title} variant="display">
-            Session complete
+          <VoiceOrb size={72} state={model.partialReasonCopy ? "ready" : "complete"} />
+          <VivaText
+            accessibilityRole="header"
+            style={styles.title}
+            testID="recap-headline"
+            variant="display"
+          >
+            {model.headline}
           </VivaText>
           <OrnamentRule align="center" compact />
           <VivaText style={styles.summary} tone="muted">
-            Your mechanism held. ATP accounting needs one more pass.
+            {model.summary}
           </VivaText>
+          {model.partialReasonCopy ? (
+            <VivaText accessibilityLiveRegion="polite" style={styles.summary} tone="ochre">
+              {model.partialReasonCopy}
+            </VivaText>
+          ) : null}
         </View>
 
-        <View accessibilityLabel="Mastery summary" style={styles.ledger}>
-          {ledger.map((item, index) => (
-            <View
-              key={item.label}
-              style={[styles.ledgerRow, index < ledger.length - 1 && styles.ledgerRowBorder]}
-            >
-              <View style={[styles.ledgerDot, { backgroundColor: item.color }]} />
-              <VivaText style={[styles.ledgerCount, { color: item.color }]}>{item.count}</VivaText>
-              <VivaText style={styles.ledgerLabel} variant="lead">
-                {item.label}
-              </VivaText>
-            </View>
-          ))}
+        <View accessibilityLabel="Mastery summary" style={styles.ledger} testID="recap-ledger">
+          {model.ledger.map((item, index) => {
+            const color = LEDGER_COLORS[item.colorToken];
+            return (
+              <View
+                key={item.label}
+                style={[
+                  styles.ledgerRow,
+                  index < model.ledger.length - 1 && styles.ledgerRowBorder,
+                ]}
+              >
+                <View style={[styles.ledgerDot, { backgroundColor: color }]} />
+                <VivaText style={[styles.ledgerCount, { color }]}>{item.count}</VivaText>
+                <VivaText style={styles.ledgerLabel} variant="lead">
+                  {item.label}
+                </VivaText>
+              </View>
+            );
+          })}
         </View>
 
         <View style={styles.momentsSection}>
           <VivaText variant="lead">Moments worth revisiting</VivaText>
           <View style={styles.momentsList}>
-            {moments.map((moment, index) => {
+            {model.moments.length === 0 ? (
+              <VivaText style={styles.moment} tone="muted">
+                No source moments were returned for this recap.
+              </VivaText>
+            ) : null}
+            {model.moments.map((moment, index) => {
               const expanded = openMoment === index;
               return (
                 <Pressable
                   accessibilityHint={expanded ? "Collapse source detail" : "Expand source detail"}
                   accessibilityRole="button"
                   accessibilityState={{ expanded }}
-                  key={moment.source}
+                  key={moment.key}
                   onPress={() => setOpenMoment(expanded ? null : index)}
                   style={({ pressed }) => [
                     styles.moment,
-                    index < moments.length - 1 && styles.momentBorder,
+                    index < model.moments.length - 1 && styles.momentBorder,
                     pressed && styles.pressed,
                   ]}
                 >
@@ -153,29 +236,39 @@ export default function RecapScreen() {
           </View>
         </View>
 
-        <View style={styles.plan}>
-          <View style={styles.planDate}>
-            <VivaText tone="plum" variant="eyebrow">
-              Next recall
-            </VivaText>
-            <VivaText style={styles.planTitle} variant="title">
-              Tomorrow · 8 min
-            </VivaText>
+        {model.nextReview ? (
+          <View style={styles.plan}>
+            <View style={styles.planDate}>
+              <VivaText tone="plum" variant="eyebrow">
+                Next recall
+              </VivaText>
+              <VivaText style={styles.planTitle} variant="title">
+                {model.nextReview.when}
+              </VivaText>
+            </View>
+            <VivaText tone="muted">{model.nextReview.label}</VivaText>
           </View>
-          <VivaText tone="muted">NADH · ATP yield · shuttle systems</VivaText>
-        </View>
+        ) : null}
 
         <View style={styles.actions}>
           {scheduled ? (
             <View accessibilityLiveRegion="polite" style={styles.scheduledNote}>
               <SparkIcon color={colors.sageDeep} size={15} />
               <VivaText style={styles.scheduledText} tone="sage">
-                Tomorrow’s drill is scheduled.
+                Marked for this visit.
               </VivaText>
             </View>
           ) : (
-            <ActionButton onPress={scheduleReview}>Schedule tomorrow’s drill</ActionButton>
+            <ActionButton disabled={!model.nextReview} onPress={scheduleReview}>
+              {model.nextReview?.when === "tomorrow"
+                ? "Schedule tomorrow’s drill"
+                : "Schedule next review"}
+            </ActionButton>
           )}
+          <VivaText style={styles.persistenceNote} tone="muted" variant="caption">
+            Not saved: this confirmation exists only until you leave this screen. Persistent
+            scheduling is tracked in D-M8 / D-01.
+          </VivaText>
           <ActionButton onPress={backToToday} tone="secondary">
             Back to Today
           </ActionButton>
@@ -207,6 +300,9 @@ const styles = StyleSheet.create({
     alignItems: "flex-start",
     justifyContent: "center",
     minHeight: layout.minTouch,
+    minWidth: layout.minTouch,
+  },
+  headerSpacer: {
     minWidth: layout.minTouch,
   },
   headerTitle: {
@@ -319,6 +415,10 @@ const styles = StyleSheet.create({
   },
   planTitle: {
     fontSize: 28,
+    textTransform: "capitalize",
+  },
+  persistenceNote: {
+    textAlign: "center",
   },
   pressed: {
     opacity: 0.62,
