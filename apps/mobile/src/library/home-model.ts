@@ -1,6 +1,6 @@
 import type { VivaLibraryProjection, VivaLibrarySnapshot } from "@/agent/shared-web";
 import type { AppConfig } from "@/runtime/config";
-import { decideMobileLibraryStart } from "./library-client";
+import { decideMobileLibraryStart, type MobileRuntimePlatform } from "./library-client";
 
 export type HomeLibraryModel = {
   canStart: boolean;
@@ -22,10 +22,11 @@ export function homeModelFromLibrary(
   projection: VivaLibraryProjection,
   snapshot: VivaLibrarySnapshot,
   config: AppConfig,
+  platform: MobileRuntimePlatform = "unknown",
 ): HomeLibraryModel {
   const row =
     projection.libraryRows.find(
-      (candidate) => decideMobileLibraryStart(config, snapshot, candidate.id).canStart,
+      (candidate) => decideMobileLibraryStart(config, snapshot, candidate.id, platform).canStart,
     ) ?? projection.libraryRows[0];
   if (!row) {
     return {
@@ -38,7 +39,7 @@ export function homeModelFromLibrary(
   }
 
   const snapshotRow = snapshot.study_sets.find((studySet) => studySet.id === row.id);
-  const startDecision = decideMobileLibraryStart(config, snapshot, row.id);
+  const startDecision = decideMobileLibraryStart(config, snapshot, row.id, platform);
   const nextReview = projection.sessionRows.find(
     (session) => session.studySetId === row.id && session.nextReview,
   )?.nextReview;

@@ -349,6 +349,65 @@ describe("mobile library client", () => {
     }
   });
 
+  test("admits the Android emulator host only from the Android runtime", () => {
+    const snapshot = withStartAction(cannedLibrarySnapshot, {
+      available: false,
+      unavailable_reason: "session_token_unavailable",
+    });
+    const androidEmulatorConfig = {
+      ...config,
+      agentHttpUrl: "http://10.0.2.2:4318",
+      agentWsUrl: "ws://10.0.2.2:4318/ws",
+    };
+
+    expect(decideMobileLibraryStart(androidEmulatorConfig, snapshot, "biology-midterm")).toEqual({
+      canStart: false,
+      reason: "unsigned_agent_not_loopback",
+    });
+    expect(
+      decideMobileLibraryStart(androidEmulatorConfig, snapshot, "biology-midterm", "ios"),
+    ).toEqual({ canStart: false, reason: "unsigned_agent_not_loopback" });
+    expect(
+      decideMobileLibraryStart(androidEmulatorConfig, snapshot, "biology-midterm", "android"),
+    ).toEqual({ authority: "trusted_loopback_unsigned", canStart: true });
+    expect(
+      studySetForSession(snapshot, "biology-midterm", androidEmulatorConfig, "android"),
+    ).toMatchObject({
+      id: "biology-midterm",
+      sessionToken: undefined,
+    });
+  });
+
+  test("rejects mixed or secure-looking Android emulator endpoint pairs", () => {
+    const snapshot = withStartAction(cannedLibrarySnapshot, {
+      available: false,
+      unavailable_reason: "session_token_unavailable",
+    });
+    const rejectedConfigs = [
+      {
+        ...config,
+        agentHttpUrl: "http://10.0.2.2:4318",
+        agentWsUrl: "ws://127.0.0.1:4318/ws",
+      },
+      {
+        ...config,
+        agentHttpUrl: "http://127.0.0.1:4318",
+        agentWsUrl: "ws://10.0.2.2:4318/ws",
+      },
+      {
+        ...config,
+        agentHttpUrl: "https://10.0.2.2:4318",
+        agentWsUrl: "wss://10.0.2.2:4318/ws",
+      },
+    ];
+
+    for (const rejectedConfig of rejectedConfigs) {
+      expect(
+        decideMobileLibraryStart(rejectedConfig, snapshot, "biology-midterm", "android"),
+      ).toEqual({ canStart: false, reason: "unsigned_agent_not_loopback" });
+    }
+  });
+
   test("keeps direct-route unsigned admission fail-closed outside the exact fixture boundary", () => {
     const unsignedSnapshot = withStartAction(cannedLibrarySnapshot, {
       available: false,

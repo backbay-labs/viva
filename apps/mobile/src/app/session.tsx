@@ -77,6 +77,7 @@ export default function SessionScreen() {
               snapshot,
               requestedStudySetId ?? DEFAULT_FIXTURE_STUDY_SET_ID,
               config,
+              Platform.OS,
             ),
           });
         } catch (error) {

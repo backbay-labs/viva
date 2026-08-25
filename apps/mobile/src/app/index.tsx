@@ -1,7 +1,7 @@
 import * as Haptics from "expo-haptics";
 import { useRouter } from "expo-router";
 import { useEffect, useMemo, useState } from "react";
-import { Pressable, ScrollView, StyleSheet, View } from "react-native";
+import { Platform, Pressable, ScrollView, StyleSheet, View } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { ActionButton } from "@/components/actions";
@@ -34,7 +34,7 @@ export default function HomeScreen() {
     let active = true;
     void loadLibrary(config)
       .then(({ projection, snapshot }) => {
-        if (active) setHomeModel(homeModelFromLibrary(projection, snapshot, config));
+        if (active) setHomeModel(homeModelFromLibrary(projection, snapshot, config, Platform.OS));
       })
       .catch(() => {
         if (active) setHomeModel(null);

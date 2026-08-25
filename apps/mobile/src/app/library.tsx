@@ -3,6 +3,7 @@ import { useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
+  Platform,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -155,7 +156,12 @@ export default function LibraryScreen() {
             </View>
           ) : null}
           {library?.projection.libraryRows.map((row, index) => {
-            const startDecision = decideMobileLibraryStart(config, library.snapshot, row.id);
+            const startDecision = decideMobileLibraryStart(
+              config,
+              library.snapshot,
+              row.id,
+              Platform.OS,
+            );
             return (
               <View
                 key={row.id}

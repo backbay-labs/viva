@@ -134,6 +134,42 @@ describe("homeModelFromLibrary", () => {
     });
   });
 
+  test("threads Android runtime authority into emulator-host admission", () => {
+    const first = cannedLibrarySnapshot.study_sets[0];
+    if (!first) throw new Error("canned biology study set is missing");
+    const snapshot = {
+      ...cannedLibrarySnapshot,
+      study_sets: [
+        {
+          ...first,
+          actions: {
+            ...first.actions,
+            start: {
+              available: false as const,
+              unavailable_reason: "session_token_unavailable",
+            },
+          },
+        },
+      ],
+    };
+    const projection = projectLibrarySnapshot(snapshot);
+    const androidEmulatorConfig = {
+      ...config,
+      agentHttpUrl: "http://10.0.2.2:4318",
+      agentWsUrl: "ws://10.0.2.2:4318/ws",
+    };
+
+    expect(homeModelFromLibrary(projection, snapshot, androidEmulatorConfig)).toMatchObject({
+      canStart: false,
+    });
+    expect(
+      homeModelFromLibrary(projection, snapshot, androidEmulatorConfig, "android"),
+    ).toMatchObject({
+      canStart: true,
+      studySetId: "biology-midterm",
+    });
+  });
+
   test("returns an explicitly empty model when the library has no study sets", () => {
     const snapshot = { ...cannedLibrarySnapshot, sessions: [], study_sets: [] };
 

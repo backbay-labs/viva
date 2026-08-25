@@ -21,6 +21,8 @@ export type LoadedLibrary = {
   snapshot: VivaLibrarySnapshot;
 };
 
+export type MobileRuntimePlatform = "android" | "ios" | "macos" | "unknown" | "web" | "windows";
+
 export type MobileLibraryStartDecision =
   | {
       authority: "signed_action" | "trusted_loopback_unsigned";
@@ -80,13 +82,16 @@ export function fetchMobileAgentReadiness(config: AppConfig, fetchImpl: typeof f
  * In unsigned loopback mode the server returns `session_token_unavailable`
  * only after its server-owned, ingestion, source-deletion, and question-count
  * gates pass. Mobile rechecks those observable gates and admits only the fixed
- * `user-1` / `biology-midterm` fixture over loopback HTTP and WebSocket URLs.
- * It does not mint a token or reinterpret any other unavailable action.
+ * `user-1` / `biology-midterm` fixture over a matched host-loopback route, or
+ * over Android's exact `10.0.2.2` emulator-host alias when the native runtime
+ * says it is Android. It does not mint a token or reinterpret any other
+ * unavailable action.
  */
 export function decideMobileLibraryStart(
   config: AppConfig,
   snapshot: VivaLibrarySnapshot,
   studySetId: string,
+  platform: MobileRuntimePlatform = "unknown",
 ): MobileLibraryStartDecision {
   const row = snapshot.study_sets.find((studySet) => studySet.id === studySetId);
   if (!row) return denied("study_set_missing");
@@ -120,9 +125,12 @@ export function decideMobileLibraryStart(
   if (config.sessionToken) {
     return denied("configured_token_conflicts_with_unsigned_action");
   }
+  const httpRoute = trustedUnsignedAgentRoute(config.agentHttpUrl, "http");
+  const wsRoute = trustedUnsignedAgentRoute(config.agentWsUrl, "ws");
   if (
-    !isLoopbackAgentUrl(config.agentHttpUrl, ["http:", "https:"]) ||
-    !isLoopbackAgentUrl(config.agentWsUrl, ["ws:", "wss:"])
+    !httpRoute ||
+    httpRoute !== wsRoute ||
+    (httpRoute === "android_emulator" && platform !== "android")
   ) {
     return denied("unsigned_agent_not_loopback");
   }
@@ -146,13 +154,14 @@ export function studySetForSession(
   snapshot: VivaLibrarySnapshot,
   studySetId: string,
   config: AppConfig,
+  platform: MobileRuntimePlatform = "unknown",
 ): StudySet {
   const row = snapshot.study_sets.find((studySet) => studySet.id === studySetId);
   if (!row) {
     throw new Error(`Study set ${studySetId} is unavailable in the library snapshot`);
   }
 
-  const decision = decideMobileLibraryStart(config, snapshot, studySetId);
+  const decision = decideMobileLibraryStart(config, snapshot, studySetId, platform);
   if (!decision.canStart) {
     throw new Error(`Study set ${studySetId} cannot start (${decision.reason})`);
   }
@@ -226,19 +235,31 @@ function denied(
   return { canStart: false, reason };
 }
 
-function isLoopbackAgentUrl(value: string, protocols: readonly string[]): boolean {
+type TrustedUnsignedAgentRoute = "android_emulator" | "host_loopback";
+
+function trustedUnsignedAgentRoute(
+  value: string,
+  transport: "http" | "ws",
+): TrustedUnsignedAgentRoute | null {
   try {
     const url = new URL(value);
-    if (!protocols.includes(url.protocol) || url.username || url.password) return false;
+    const protocols = transport === "http" ? ["http:", "https:"] : ["ws:", "wss:"];
+    if (!protocols.includes(url.protocol) || url.username || url.password) return null;
     const hostname = url.hostname.toLowerCase();
-    if (hostname === "localhost" || hostname === "::1" || hostname === "[::1]") return true;
+    if (hostname === "10.0.2.2") {
+      const emulatorProtocol = transport === "http" ? "http:" : "ws:";
+      return url.protocol === emulatorProtocol ? "android_emulator" : null;
+    }
+    if (hostname === "localhost" || hostname === "::1" || hostname === "[::1]") {
+      return "host_loopback";
+    }
     const octets = hostname.split(".");
-    return (
-      octets.length === 4 &&
+    return octets.length === 4 &&
       octets[0] === "127" &&
       octets.every((octet) => /^\d+$/.test(octet) && Number(octet) >= 0 && Number(octet) <= 255)
-    );
+      ? "host_loopback"
+      : null;
   } catch {
-    return false;
+    return null;
   }
 }
