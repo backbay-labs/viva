@@ -48,8 +48,8 @@ pub use learning_progression::{
     ProgressionPolicyId, QuestionProgressionCursor, QuestionProgressionResult,
 };
 pub use learning_recap::{
-    ConceptLabel, RecapBuildError, RecapConceptOutcome, ReviewScheduleAuthority,
-    ReviewScheduleSummary, SessionLearningEvidence,
+    build_session_recap, ConceptLabel, RecapBuildError, RecapConceptOutcome,
+    ReviewScheduleAuthority, ReviewScheduleSummary, SessionLearningEvidence, StudySessionRecap,
 };
 // `PortErrorKind` is the store-side half of the typed classification boundary:
 // Plans 07/08/09 select retry policy, terminal reason, HTTP status, and
@@ -76,9 +76,40 @@ pub use review_schedule::{
 // The one legal-transition table and absorbing terminal state; `study.rs` keeps
 // the Plan-04-owned phase and terminal-reason declarations this machine drives.
 pub use session_state::{StudySessionState, StudySessionTransitionError};
+/// MIGRATION SHIM — not a published domain contract, and no plan names it.
+///
+/// The superseded recap shape, kept reachable under an explicit version name while
+/// the consumer crates migrate their call sites off it. The crate-root
+/// `StudySessionRecap` is Plan 04's evidence-derived
+/// [`learning_recap::StudySessionRecap`], and it is the only recap this domain
+/// builds, emits, or persists; nothing in `agent-domain` produces or names a V1.
+/// The alias exists only because Task 0 Step 3's root swap left the `study.rs`
+/// declaration unreachable from a private module — dead under `-D warnings` — while
+/// consumer source still names its fields.
+///
+/// The same swap touches two Plan-04-owned files, recorded here (and ratified as
+/// coordinator amendment A-10) because the deleted code is what carried their
+/// rationale. Only one edit is compile-forced: the `record_recap` call site in
+/// `tool_executor.rs` now persists the v2 recap directly (reverting it is E0599 —
+/// `from_evidence_recap` no longer exists on the crate-root type). The second —
+/// `study.rs` losing `StudySessionRecap::from_evidence_recap`, the lossy V1
+/// projection of the v2 fold — compiles either way and is instead the cleanup
+/// Plan 04 designed to happen at exactly this swap: its own doc comment called the
+/// swap the intended forcing function and labelled the function a recorded
+/// `LEARN-011`-window cleanup, and no caller outside its doc and test remained.
+/// The superseded declaration itself is deliberately left standing: Plans
+/// 07/08/09 still name its fields.
+///
+/// Removal trigger: when `agent-adapters`, `agent-service`, and `data` have each
+/// migrated to the v2 recap (Plans 07, 08, and 09), delete this line together with
+/// the `StudySessionRecap` declaration in `study.rs`. Nothing else has to change —
+/// `study_session_recap_v1_is_a_shim_with_a_removal_trigger_the_domain_never_uses`
+/// in `tests/protocol_fixtures.rs` fails if the domain ever starts depending on it,
+/// or if this trigger is dropped.
+pub use study::StudySessionRecap as StudySessionRecapV1;
 pub use study::{
     fixture_question, fixture_source_reference, AnswerEvaluation, RecapSourceMoment, StudyQuestion,
-    StudySessionPhase, StudySessionRecap, StudySourceReference, TerminalSessionReason,
+    StudySessionPhase, StudySourceReference, TerminalSessionReason,
 };
 pub use study_projection::AuthenticatedStudyProjectionV1;
 pub use tool_executor::{AuthorizedStudySession, ToolExecutionError, VivaToolExecutor};

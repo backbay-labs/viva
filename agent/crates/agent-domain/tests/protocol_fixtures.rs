@@ -291,6 +291,187 @@ fn shared_recaps_rejects_injected_unknown_key() {
         .expect_err("an unknown envelope key must be rejected, not ignored");
 }
 
+/// Plan 06 Task 0 Step 3: the crate root publishes exactly one recap, and it is
+/// Plan 04's evidence-derived recap — not the superseded bucket-array shape.
+///
+/// A consumer that writes `agent_domain::StudySessionRecap` must land on the type
+/// the domain actually builds and persists. The superseded shape is still
+/// declared while Plans 07/08/09 migrate their call sites, but only under its own
+/// `StudySessionRecapV1` name, so one root name can never mean two recaps.
+#[test]
+fn crate_root_recap_is_the_evidence_derived_recap() {
+    // Compiles only while the root name and Plan 04's declaration are one type.
+    const _ROOT_IS_THE_LEARNING_RECAP: fn(
+        agent_domain::learning_recap::StudySessionRecap,
+    ) -> agent_domain::StudySessionRecap = |recap| recap;
+
+    // ...and the superseded shape is a genuinely different type behind a name
+    // that says which version it is.
+    assert_ne!(
+        std::any::TypeId::of::<agent_domain::StudySessionRecap>(),
+        std::any::TypeId::of::<agent_domain::StudySessionRecapV1>(),
+        "the two recap versions must not collapse into one type",
+    );
+
+    // The root path parses the canonical wire recap and reports the v2 schema.
+    let value = fixture_value(RECAPS_FIXTURE);
+    let raw = value["recaps"]["all_missed"].clone();
+    let recap: agent_domain::StudySessionRecap =
+        serde_json::from_value(raw).expect("the canonical recap parses through the root name");
+
+    assert_eq!(recap.schema, VIVA_STUDY_SESSION_RECAP_SCHEMA);
+    assert!(
+        !recap.concepts.is_empty(),
+        "the evidence-derived recap carries per-concept outcomes, not bucket arrays",
+    );
+}
+
+/// Plan 06 Task 0 Step 3: the crate root republishes the locked `learning_recap`
+/// block **entire**, so Plans 04/05/07/08/09 read one published path per name.
+///
+/// The recap type alone is not the seam: a consumer that can name the recap but
+/// not the fold that produces it has to reach around `agent_domain::` into the
+/// module path to build one, which is exactly the drift Step 3 locks the block to
+/// prevent. Naming each entry through `agent_domain::` turns an omission from the
+/// block into a compile error, and folding one canonical case through the root
+/// path proves the published name is Plan 04's declaration and not a stub.
+#[test]
+fn crate_root_publishes_the_locked_learning_recap_seam() {
+    // Task 0 Step 3's locked block, one crate-root path per exported name.
+    const _BUILD_SESSION_RECAP: fn(
+        &agent_domain::SessionLearningEvidence,
+    ) -> Result<
+        agent_domain::StudySessionRecap,
+        agent_domain::RecapBuildError,
+    > = agent_domain::build_session_recap;
+    const _CONCEPT_LABEL: fn(agent_domain::ConceptLabel) -> agent_domain::ConceptLabel =
+        |value| value;
+    const _RECAP_CONCEPT_OUTCOME: fn(
+        agent_domain::RecapConceptOutcome,
+    ) -> agent_domain::RecapConceptOutcome = |value| value;
+    const _REVIEW_SCHEDULE_AUTHORITY: fn(
+        agent_domain::ReviewScheduleAuthority,
+    ) -> agent_domain::ReviewScheduleAuthority = |value| value;
+    const _REVIEW_SCHEDULE_SUMMARY: fn(
+        agent_domain::ReviewScheduleSummary,
+    ) -> agent_domain::ReviewScheduleSummary = |value| value;
+
+    // The root-path fold is the authoritative one: Plan 04 owns full fold coverage
+    // in `tests/learning_core.rs`; this pins that the published path reaches it.
+    let fixture: RecapsFixture =
+        serde_json::from_str(RECAPS_FIXTURE).expect("recaps fixture parses");
+    let evidence = &fixture.evidence["mixed_strong_shaky_missed"];
+    let built = agent_domain::build_session_recap(evidence)
+        .expect("canonical evidence folds through the crate-root path");
+
+    assert_eq!(
+        built, fixture.recaps["mixed_strong_shaky_missed"],
+        "the crate-root fold must produce the canonical recap, not a substitute",
+    );
+}
+
+/// `StudySessionRecapV1` is a migration shim, not a published domain contract, and
+/// this test is what keeps it from quietly becoming one.
+///
+/// No plan names the alias. It exists only because the Task 0 Step 3 root swap left
+/// the superseded `study.rs` recap unreachable from a private module — dead under
+/// `-D warnings` — while Plans 07/08/09 still name its fields in their own source.
+/// An unplanned public export with no expiry is how a temporary bridge turns
+/// permanent, so the shim has to carry a machine-checkable removal trigger and must
+/// stay inert: `agent-domain` itself never names it, so deleting the one export line
+/// and the `study.rs` declaration behind it is the whole removal.
+///
+/// The same doc block is also where the root swap's other half has to survive. The
+/// swap forced two edits inside Plan-04-owned files, and the rationale for them
+/// lived in the `study.rs` comment the swap deleted, so a reader of the diff would
+/// otherwise find a Plan 06 commit touching Plan 04's files with the explanation
+/// removed in the same hunk. Requiring both edits to be named here keeps that record
+/// attached to the seam that caused them.
+#[test]
+fn study_session_recap_v1_is_a_shim_with_a_removal_trigger_the_domain_never_uses() {
+    const ALIAS: &str = "StudySessionRecapV1";
+    const EXPORT_LINE: &str = "pub use study::StudySessionRecap as StudySessionRecapV1;";
+
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let lib_rs = std::fs::read_to_string(src_dir.join("lib.rs")).expect("lib.rs is readable");
+
+    assert_eq!(
+        lib_rs.matches(EXPORT_LINE).count(),
+        1,
+        "the superseded recap must be published exactly once, under its version name",
+    );
+
+    // The doc block attached to the export is the removal trigger. Read exactly the
+    // contiguous `///` run directly above the export — not the surrounding file — so
+    // a required phrase somewhere else in `lib.rs` cannot satisfy this by accident.
+    let mut doc_lines = lib_rs
+        .lines()
+        .take_while(|line| line.trim() != EXPORT_LINE)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take_while(|line| line.trim_start().starts_with("///"))
+        .collect::<Vec<_>>();
+    doc_lines.reverse();
+    let doc_block = doc_lines.join("\n");
+    assert!(
+        !doc_block.is_empty(),
+        "the {ALIAS} export must carry a doc block stating why it exists",
+    );
+    for required in [
+        "MIGRATION SHIM",
+        "Removal trigger:",
+        "agent-adapters",
+        "agent-service",
+        "data",
+        // The two Plan-04-owned edits made at the root swap (one compile-forced,
+        // one A-10-authorized cleanup). Naming them here is what keeps the
+        // deleted `study.rs` rationale in the tree.
+        "from_evidence_recap",
+        "tool_executor.rs",
+    ] {
+        assert!(
+            doc_block.contains(required),
+            "the {ALIAS} export must document {required:?} in its removal trigger, found: {doc_block}",
+        );
+    }
+
+    // Nothing inside the domain may depend on the shim, or removing it stops being
+    // a one-line deletion and the bridge has become load-bearing.
+    let mut offenders = Vec::new();
+    let mut pending = vec![src_dir.clone()];
+    let mut scanned = 0_usize;
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("agent-domain src is readable") {
+            let path = entry.expect("directory entry is readable").path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            scanned += 1;
+            if path == src_dir.join("lib.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source file is readable");
+            if text.contains(ALIAS) {
+                offenders.push(path.display().to_string());
+            }
+        }
+    }
+
+    assert!(
+        scanned > 1,
+        "the scan must actually reach the domain source"
+    );
+    assert!(
+        offenders.is_empty(),
+        "{ALIAS} is a migration shim for Plans 07/08/09; agent-domain must not name it, found in {offenders:?}",
+    );
+}
+
 #[test]
 fn shared_recaps_rejects_unknown_review_authority() {
     let mut value = fixture_value(RECAPS_FIXTURE);

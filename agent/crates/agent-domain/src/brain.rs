@@ -7,30 +7,34 @@ use tokio::{sync::mpsc, task::AbortHandle};
 use crate::{
     ids::SessionId,
     learning_outcome::EvaluationDeferralReason,
+    learning_recap::StudySessionRecap,
     tools::{ToolPlan, ToolProposal, ToolResult},
-    AnswerEvaluation, AudioFrame, StudyQuestion, StudySessionPhase, StudySessionRecap,
-    StudySourceReference, TerminalSessionReason,
+    AnswerEvaluation, AudioFrame, StudyQuestion, StudySessionPhase, StudySourceReference,
+    TerminalSessionReason,
 };
 
 pub type BrainEventStream = BoxStream<'static, BrainEvent>;
 
+/// The single engine this product runs (recorded decision `D-03B`).
+///
+/// There is one oral-exam engine, so there is one mode. `Teach`, `Mock`, and
+/// `Cram` were vocabulary for engines that were never built: a client could name
+/// them, but nothing behind this type could execute them. Keeping the variants
+/// would let a forged or stale wire value parse into a mode the server cannot
+/// honour, so the vocabulary is exactly what the engine can do. `quiz` is the
+/// internal identifier reported on the wire; the learner-facing label lives in
+/// the web app.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StudyMode {
     #[default]
     Quiz,
-    Teach,
-    Mock,
-    Cram,
 }
 
 impl StudyMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Quiz => "quiz",
-            Self::Teach => "teach",
-            Self::Mock => "mock",
-            Self::Cram => "cram",
         }
     }
 }
@@ -64,13 +68,18 @@ pub struct SourceContext {
     pub retrieval_reason: String,
 }
 
+/// Admission input for one study session.
+///
+/// The client-declared session goal is gone (recorded decision `D-03B`): it was
+/// free text no policy read, so it could only ever be an unvalidated string
+/// carried into storage and logs. Session scope comes from the bound
+/// `study_set_id` and `active_concepts` instead.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub session_id: Option<SessionId>,
     pub user_id: Option<String>,
     pub study_set_id: Option<String>,
     pub mode: Option<StudyMode>,
-    pub initial_goal: Option<String>,
     pub source_context: Vec<SourceContext>,
     pub active_concepts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -193,56 +193,6 @@ pub struct StudySessionRecap {
     pub source_moments: Vec<RecapSourceMoment>,
 }
 
-impl StudySessionRecap {
-    /// The V1 projection of the one evidence-derived v2 recap.
-    ///
-    /// `StudyMemoryStore::record_recap` still takes this V1 shape, because the
-    /// crate-root `StudySessionRecap` name is swapped to
-    /// [`crate::learning_recap::StudySessionRecap`] in Plan 06's second PR. Until
-    /// then, this is how the v2 fold reaches the store.
-    ///
-    /// Every value below is read off that single fold — there is no second recap
-    /// fold, no re-grading, and no invented fact. V1 cannot represent a v2
-    /// `(response_id, source_id)` moment, which carries no excerpt, confidence, or
-    /// status, so `source_moments` is empty rather than fabricated, and concepts
-    /// in the `Review` band appear only through `review_later`.
-    ///
-    /// This function and the four bucket arrays are a recorded LEARN-011-window
-    /// cleanup: when the root name swaps, its return type becomes the v2 recap and
-    /// the body stops compiling, which is the intended forcing function.
-    pub fn from_evidence_recap(recap: &crate::learning_recap::StudySessionRecap) -> Self {
-        let labels_with_status = |wanted: ConceptStatus| {
-            recap
-                .concepts
-                .iter()
-                .filter(|concept| concept.status == wanted)
-                .map(|concept| concept.label.clone())
-                .collect::<Vec<_>>()
-        };
-        Self {
-            voice_session_id: recap.voice_session_id.clone(),
-            headline: recap.headline.clone(),
-            summary: recap.summary.clone(),
-            strong_concepts: labels_with_status(ConceptStatus::Strong),
-            shaky_concepts: labels_with_status(ConceptStatus::Shaky),
-            missed_concepts: labels_with_status(ConceptStatus::Missed),
-            review_later: recap
-                .review_schedule
-                .iter()
-                .filter_map(|item| {
-                    recap
-                        .concepts
-                        .iter()
-                        .find(|concept| concept.concept_id == item.concept_id)
-                })
-                .map(|concept| concept.label.clone())
-                .collect(),
-            next_action: recap.next_action.clone(),
-            source_moments: Vec::new(),
-        }
-    }
-}
-
 pub fn fixture_source_reference() -> StudySourceReference {
     StudySourceReference {
         source_id: "src-lecture-5-slide-18".to_owned(),

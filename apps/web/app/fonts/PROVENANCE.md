@@ -30,7 +30,7 @@ Total committed WOFF2 payload: 58,064 + 42,200 + 23,456 = 123,720 bytes
 
 Both the raw upstream fetch and the fonttools subsetting step ran outside
 this worktree (a disposable `uv` virtual environment, deleted afterward);
-nothing in this recipe is committed except its output.
+nothing in this preparation procedure is committed except its output.
 
 ```bash
 # 1. Fetch the pinned upstream TTFs and OFL texts (raw.githubusercontent.com).

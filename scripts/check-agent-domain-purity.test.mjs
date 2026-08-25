@@ -9,6 +9,7 @@ import {
   AGENT_DOMAIN_CONDITIONAL_DEPENDENCIES,
   AGENT_DOMAIN_DEPENDENCY_ALLOWLIST,
   AGENT_DOMAIN_MANIFEST_RELATIVE_PATH,
+  AGENT_DOMAIN_REVIEW_SCHEDULING_DEPENDENCIES,
   AGENT_DOMAIN_SOURCE_RELATIVE_DIR,
   assertAgentDomainBoundary,
   formatPurityReport,
@@ -108,18 +109,39 @@ test("recognizes chrono and uuid as pure validation dependencies", () => {
   assert.deepEqual([...AGENT_DOMAIN_CONDITIONAL_DEPENDENCIES], ["chrono", "uuid"]);
   assert.deepEqual(
     [...AGENT_DOMAIN_DEPENDENCY_ALLOWLIST].sort(),
-    [...AGENT_DOMAIN_BASE_DEPENDENCIES, ...AGENT_DOMAIN_CONDITIONAL_DEPENDENCIES].sort(),
+    [
+      ...AGENT_DOMAIN_BASE_DEPENDENCIES,
+      ...AGENT_DOMAIN_REVIEW_SCHEDULING_DEPENDENCIES,
+      ...AGENT_DOMAIN_CONDITIONAL_DEPENDENCIES,
+    ].sort(),
   );
 
   const report = assertAgentDomainBoundary(
     metadataWithDependencies([
       ...AGENT_DOMAIN_BASE_DEPENDENCIES.map((name) => dependency(name)),
+      ...AGENT_DOMAIN_REVIEW_SCHEDULING_DEPENDENCIES.map((name) => dependency(name)),
       ...AGENT_DOMAIN_CONDITIONAL_DEPENDENCIES.map((name) => dependency(name)),
     ]),
     cleanSources,
   );
 
   assert.deepEqual(report.dependencies, [...AGENT_DOMAIN_DEPENDENCY_ALLOWLIST].sort());
+});
+
+test("recognizes exactly fsrs as the sanctioned D-01 scheduling dependency", () => {
+  assert.deepEqual([...AGENT_DOMAIN_REVIEW_SCHEDULING_DEPENDENCIES], ["fsrs"]);
+
+  const report = assertAgentDomainBoundary(metadataWithDependency("fsrs"), cleanSources);
+  assert.ok(report.dependencies.includes("fsrs"));
+
+  // The seam admits one crate by name. A neighbouring scheduling library is not
+  // covered by D-01 and must still be rejected.
+  for (const name of ["fsrs-optimizer", "rs-fsrs", "supermemo2"]) {
+    assert.throws(
+      () => assertAgentDomainBoundary(metadataWithDependency(name), cleanSources),
+      new RegExp(`${name}.*not in the agent-domain allowlist`),
+    );
+  }
 });
 
 test("rejects a path dependency even when it borrows an allowlisted crate name", () => {
@@ -368,20 +390,33 @@ test("manifest dependency parsing sees normal dependencies only", () => {
   assert.throws(() => parseManifestDependencyNames(null), /manifest/);
 });
 
-test("D-04 CONFIRM_DELETE keeps chrono and uuid out of the domain manifest", () => {
+test("D-04 CONFIRM_DELETE keeps uuid out of the domain manifest", () => {
   const manifestText = readFileSync(
     path.join(REPO_ROOT, AGENT_DOMAIN_MANIFEST_RELATIVE_PATH),
     "utf8",
   );
   const declared = parseManifestDependencyNames(manifestText);
 
-  assert.deepEqual(declared, [...AGENT_DOMAIN_BASE_DEPENDENCIES].sort());
-  for (const conditional of AGENT_DOMAIN_CONDITIONAL_DEPENDENCIES) {
-    assert.ok(
-      !declared.includes(conditional),
-      `CONFIRM_DELETE must not declare the conditional dependency ${conditional}`,
-    );
-  }
+  // The exact declared set, so a new dependency cannot arrive unnoticed: the
+  // always-needed base, plus the recorded `D-01 SERVER_PERSISTED_FSRS` seam,
+  // which is `fsrs` for the algorithm and `chrono` for its UTC instants. `chrono`
+  // is therefore declared under `CONFIRM_DELETE` as well, and its presence says
+  // nothing about D-04.
+  assert.deepEqual(
+    declared,
+    [
+      ...AGENT_DOMAIN_BASE_DEPENDENCIES,
+      ...AGENT_DOMAIN_REVIEW_SCHEDULING_DEPENDENCIES,
+      "chrono",
+    ].sort(),
+  );
+
+  // `uuid` is the one conditional the D-04 branch alone would add, so its absence
+  // is the manifest-level half of the `CONFIRM_DELETE` absence proof.
+  assert.ok(
+    !declared.includes("uuid"),
+    "CONFIRM_DELETE must not declare the conditional dependency uuid",
+  );
 });
 
 test("the checked-in domain crate passes its own boundary", () => {
