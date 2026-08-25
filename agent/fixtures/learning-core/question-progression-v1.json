@@ -13,12 +13,32 @@
   "questions": {
     "q-etc-electron-flow": {
       "question_id": "q-etc-electron-flow",
+      "concept_id": "concept-electron-transport-chain",
       "prompt": "Explain how NADH starts electron flow through the chain.",
       "expected_terms": [
         "electron donor",
         "complex I"
       ],
       "follow_up": "Now connect that flow to the proton gradient in one sentence.",
+      "rubric": {
+        "policy_version": "viva.semantic-rubric.v1",
+        "criteria": [
+          {
+            "criterion_id": "crit-etc-donor",
+            "concept_id": "concept-electron-transport-chain",
+            "claim": "NADH donates high-energy electrons to complex I of the electron transport chain.",
+            "source_id": "src-lec5-slide-18",
+            "required": true
+          },
+          {
+            "criterion_id": "crit-etc-complex-order",
+            "concept_id": "concept-electron-transport-chain",
+            "claim": "Electrons pass through the chain complexes in order of increasing electron affinity.",
+            "source_id": "src-lec5-slide-18",
+            "required": false
+          }
+        ]
+      },
       "source": {
         "source_id": "src-lec5-slide-18",
         "document_id": "lec5",
@@ -30,12 +50,25 @@
     },
     "q-gradient-direction": {
       "question_id": "q-gradient-direction",
+      "concept_id": "concept-proton-gradient",
       "prompt": "Which way do protons move as electrons pass down the chain?",
       "expected_terms": [
         "intermembrane space",
         "proton gradient"
       ],
       "follow_up": "State exactly where the protons accumulate.",
+      "rubric": {
+        "policy_version": "viva.semantic-rubric.v1",
+        "criteria": [
+          {
+            "criterion_id": "crit-gradient-direction",
+            "concept_id": "concept-proton-gradient",
+            "claim": "Electron flow pumps protons from the matrix into the intermembrane space.",
+            "source_id": "src-lec5-slide-19",
+            "required": true
+          }
+        ]
+      },
       "source": {
         "source_id": "src-lec5-slide-19",
         "document_id": "lec5",
@@ -47,12 +80,25 @@
     },
     "q-atp-synthase-coupling": {
       "question_id": "q-atp-synthase-coupling",
+      "concept_id": "concept-atp-synthesis",
       "prompt": "How does the proton gradient drive ATP synthesis?",
       "expected_terms": [
         "chemiosmosis",
         "synthase"
       ],
       "follow_up": "Name the enzyme that couples the gradient to synthesis.",
+      "rubric": {
+        "policy_version": "viva.semantic-rubric.v1",
+        "criteria": [
+          {
+            "criterion_id": "crit-atp-coupling",
+            "concept_id": "concept-atp-synthesis",
+            "claim": "Protons flowing back through ATP synthase drive ATP synthesis.",
+            "source_id": "src-lec5-slide-20",
+            "required": true
+          }
+        ]
+      },
       "source": {
         "source_id": "src-lec5-slide-20",
         "document_id": "lec5",
@@ -64,12 +110,25 @@
     },
     "q-archived-glycolysis": {
       "question_id": "q-archived-glycolysis",
+      "concept_id": "concept-glycolysis-atp",
       "prompt": "What is the net ATP yield of the glycolysis stage?",
       "expected_terms": [
         "net two",
         "substrate-level"
       ],
       "follow_up": "Separate the gross yield from the net yield.",
+      "rubric": {
+        "policy_version": "viva.semantic-rubric.v1",
+        "criteria": [
+          {
+            "criterion_id": "crit-glycolysis-net",
+            "concept_id": "concept-glycolysis-atp",
+            "claim": "The glycolysis stage nets two ATP per glucose by substrate-level transfer.",
+            "source_id": "src-lec3-slide-04",
+            "required": true
+          }
+        ]
+      },
       "source": {
         "source_id": "src-lec3-slide-04",
         "document_id": "lec3",
@@ -195,12 +254,32 @@
       "result": "selected",
       "question": {
         "question_id": "q-etc-electron-flow",
+        "concept_id": "concept-electron-transport-chain",
         "prompt": "Explain how NADH starts electron flow through the chain.",
         "expected_terms": [
           "electron donor",
           "complex I"
         ],
         "follow_up": "Now connect that flow to the proton gradient in one sentence.",
+        "rubric": {
+          "policy_version": "viva.semantic-rubric.v1",
+          "criteria": [
+            {
+              "criterion_id": "crit-etc-donor",
+              "concept_id": "concept-electron-transport-chain",
+              "claim": "NADH donates high-energy electrons to complex I of the electron transport chain.",
+              "source_id": "src-lec5-slide-18",
+              "required": true
+            },
+            {
+              "criterion_id": "crit-etc-complex-order",
+              "concept_id": "concept-electron-transport-chain",
+              "claim": "Electrons pass through the chain complexes in order of increasing electron affinity.",
+              "source_id": "src-lec5-slide-18",
+              "required": false
+            }
+          ]
+        },
         "source": {
           "source_id": "src-lec5-slide-18",
           "document_id": "lec5",
@@ -219,12 +298,32 @@
       "result": "retry",
       "question": {
         "question_id": "q-etc-electron-flow",
+        "concept_id": "concept-electron-transport-chain",
         "prompt": "Explain how NADH starts electron flow through the chain.",
         "expected_terms": [
           "electron donor",
           "complex I"
         ],
         "follow_up": "Now connect that flow to the proton gradient in one sentence.",
+        "rubric": {
+          "policy_version": "viva.semantic-rubric.v1",
+          "criteria": [
+            {
+              "criterion_id": "crit-etc-donor",
+              "concept_id": "concept-electron-transport-chain",
+              "claim": "NADH donates high-energy electrons to complex I of the electron transport chain.",
+              "source_id": "src-lec5-slide-18",
+              "required": true
+            },
+            {
+              "criterion_id": "crit-etc-complex-order",
+              "concept_id": "concept-electron-transport-chain",
+              "claim": "Electrons pass through the chain complexes in order of increasing electron affinity.",
+              "source_id": "src-lec5-slide-18",
+              "required": false
+            }
+          ]
+        },
         "source": {
           "source_id": "src-lec5-slide-18",
           "document_id": "lec5",
@@ -243,12 +342,32 @@
       "result": "retry",
       "question": {
         "question_id": "q-etc-electron-flow",
+        "concept_id": "concept-electron-transport-chain",
         "prompt": "Explain how NADH starts electron flow through the chain.",
         "expected_terms": [
           "electron donor",
           "complex I"
         ],
         "follow_up": "Now connect that flow to the proton gradient in one sentence.",
+        "rubric": {
+          "policy_version": "viva.semantic-rubric.v1",
+          "criteria": [
+            {
+              "criterion_id": "crit-etc-donor",
+              "concept_id": "concept-electron-transport-chain",
+              "claim": "NADH donates high-energy electrons to complex I of the electron transport chain.",
+              "source_id": "src-lec5-slide-18",
+              "required": true
+            },
+            {
+              "criterion_id": "crit-etc-complex-order",
+              "concept_id": "concept-electron-transport-chain",
+              "claim": "Electrons pass through the chain complexes in order of increasing electron affinity.",
+              "source_id": "src-lec5-slide-18",
+              "required": false
+            }
+          ]
+        },
         "source": {
           "source_id": "src-lec5-slide-18",
           "document_id": "lec5",
@@ -267,12 +386,25 @@
       "result": "selected",
       "question": {
         "question_id": "q-gradient-direction",
+        "concept_id": "concept-proton-gradient",
         "prompt": "Which way do protons move as electrons pass down the chain?",
         "expected_terms": [
           "intermembrane space",
           "proton gradient"
         ],
         "follow_up": "State exactly where the protons accumulate.",
+        "rubric": {
+          "policy_version": "viva.semantic-rubric.v1",
+          "criteria": [
+            {
+              "criterion_id": "crit-gradient-direction",
+              "concept_id": "concept-proton-gradient",
+              "claim": "Electron flow pumps protons from the matrix into the intermembrane space.",
+              "source_id": "src-lec5-slide-19",
+              "required": true
+            }
+          ]
+        },
         "source": {
           "source_id": "src-lec5-slide-19",
           "document_id": "lec5",
@@ -291,12 +423,25 @@
       "result": "selected",
       "question": {
         "question_id": "q-gradient-direction",
+        "concept_id": "concept-proton-gradient",
         "prompt": "Which way do protons move as electrons pass down the chain?",
         "expected_terms": [
           "intermembrane space",
           "proton gradient"
         ],
         "follow_up": "State exactly where the protons accumulate.",
+        "rubric": {
+          "policy_version": "viva.semantic-rubric.v1",
+          "criteria": [
+            {
+              "criterion_id": "crit-gradient-direction",
+              "concept_id": "concept-proton-gradient",
+              "claim": "Electron flow pumps protons from the matrix into the intermembrane space.",
+              "source_id": "src-lec5-slide-19",
+              "required": true
+            }
+          ]
+        },
         "source": {
           "source_id": "src-lec5-slide-19",
           "document_id": "lec5",
@@ -315,12 +460,25 @@
       "result": "selected",
       "question": {
         "question_id": "q-gradient-direction",
+        "concept_id": "concept-proton-gradient",
         "prompt": "Which way do protons move as electrons pass down the chain?",
         "expected_terms": [
           "intermembrane space",
           "proton gradient"
         ],
         "follow_up": "State exactly where the protons accumulate.",
+        "rubric": {
+          "policy_version": "viva.semantic-rubric.v1",
+          "criteria": [
+            {
+              "criterion_id": "crit-gradient-direction",
+              "concept_id": "concept-proton-gradient",
+              "claim": "Electron flow pumps protons from the matrix into the intermembrane space.",
+              "source_id": "src-lec5-slide-19",
+              "required": true
+            }
+          ]
+        },
         "source": {
           "source_id": "src-lec5-slide-19",
           "document_id": "lec5",
@@ -339,12 +497,25 @@
       "result": "selected",
       "question": {
         "question_id": "q-atp-synthase-coupling",
+        "concept_id": "concept-atp-synthesis",
         "prompt": "How does the proton gradient drive ATP synthesis?",
         "expected_terms": [
           "chemiosmosis",
           "synthase"
         ],
         "follow_up": "Name the enzyme that couples the gradient to synthesis.",
+        "rubric": {
+          "policy_version": "viva.semantic-rubric.v1",
+          "criteria": [
+            {
+              "criterion_id": "crit-atp-coupling",
+              "concept_id": "concept-atp-synthesis",
+              "claim": "Protons flowing back through ATP synthase drive ATP synthesis.",
+              "source_id": "src-lec5-slide-20",
+              "required": true
+            }
+          ]
+        },
         "source": {
           "source_id": "src-lec5-slide-20",
           "document_id": "lec5",
