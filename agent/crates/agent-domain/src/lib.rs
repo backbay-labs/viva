@@ -49,7 +49,7 @@ pub use learning_progression::{
 };
 pub use learning_recap::{
     ConceptLabel, RecapBuildError, RecapConceptOutcome, ReviewScheduleAuthority,
-    ReviewScheduleSummary, SessionLearningEvidence,
+    ReviewScheduleSummary, SessionLearningEvidence, StudySessionRecap,
 };
 // `PortErrorKind` is the store-side half of the typed classification boundary:
 // Plans 07/08/09 select retry policy, terminal reason, HTTP status, and
@@ -76,9 +76,19 @@ pub use review_schedule::{
 // The one legal-transition table and absorbing terminal state; `study.rs` keeps
 // the Plan-04-owned phase and terminal-reason declarations this machine drives.
 pub use session_state::{StudySessionState, StudySessionTransitionError};
+/// The superseded recap shape, kept reachable under an explicit version name
+/// while Plans 07/08/09 migrate their call sites off it.
+///
+/// The crate-root `StudySessionRecap` is Plan 04's evidence-derived
+/// [`learning_recap::StudySessionRecap`], and it is the only recap the domain
+/// builds, emits, or persists. This name exists so the adapter, service, and data
+/// crates that still name the old fields have something honest to point at during
+/// their migration; nothing in `agent-domain` produces one. Delete it once those
+/// three lanes have landed.
+pub use study::StudySessionRecap as StudySessionRecapV1;
 pub use study::{
     fixture_question, fixture_source_reference, AnswerEvaluation, RecapSourceMoment, StudyQuestion,
-    StudySessionPhase, StudySessionRecap, StudySourceReference, TerminalSessionReason,
+    StudySessionPhase, StudySourceReference, TerminalSessionReason,
 };
 pub use study_projection::AuthenticatedStudyProjectionV1;
 pub use tool_executor::{AuthorizedStudySession, ToolExecutionError, VivaToolExecutor};

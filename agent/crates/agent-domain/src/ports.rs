@@ -5,11 +5,11 @@ use serde_json::Value;
 use crate::{
     learning_outcome::{ChallengeResolution, PersistedTurnOutcome, TurnOutcome},
     learning_progression::{ProgressionPolicyId, QuestionProgressionResult},
-    learning_recap::SessionLearningEvidence,
+    learning_recap::{SessionLearningEvidence, StudySessionRecap},
     review_schedule::{ReviewScheduleDecisionV1, ReviewSchedulingContextV1},
     study_projection::AuthenticatedStudyProjectionV1,
     AnswerEvaluation, ConceptStatus, ManuscriptIntent, SessionConfig, SourceConfidence,
-    StudyQuestion, StudySessionRecap, StudySourceReference, ToolProposal,
+    StudyQuestion, StudySourceReference, ToolProposal,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

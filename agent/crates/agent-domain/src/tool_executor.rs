@@ -18,8 +18,8 @@ use crate::{
     learning_progression::ProgressionPolicyId,
     learning_recap::{RecapBuildError, SessionLearningEvidence},
     AnswerAttemptEnvelope, Clock, ConceptStatus, PortError, ReviewOutcomeV1, ReviewScheduleError,
-    SessionConfig, StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap,
-    StudySourceReference, SystemClock, ToolProposal, ToolResult,
+    SessionConfig, StudyMemoryStore, StudyMode, StudyQuestion, StudySourceReference, SystemClock,
+    ToolProposal, ToolResult,
 };
 
 /// The locked `viva.semantic-rubric.v1` thresholds. These are policy, not tuning
@@ -496,7 +496,7 @@ impl VivaToolExecutor {
                 &self.session.study_set_id,
                 &self.session.voice_session_id,
                 response_id,
-                StudySessionRecap::from_evidence_recap(&recap),
+                recap.clone(),
             )
             .await?;
         Ok(json!({ "recap": recap, "record": record }))

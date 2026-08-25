@@ -291,6 +291,41 @@ fn shared_recaps_rejects_injected_unknown_key() {
         .expect_err("an unknown envelope key must be rejected, not ignored");
 }
 
+/// Plan 06 Task 0 Step 3: the crate root publishes exactly one recap, and it is
+/// Plan 04's evidence-derived recap — not the superseded bucket-array shape.
+///
+/// A consumer that writes `agent_domain::StudySessionRecap` must land on the type
+/// the domain actually builds and persists. The superseded shape is still
+/// declared while Plans 07/08/09 migrate their call sites, but only under its own
+/// `StudySessionRecapV1` name, so one root name can never mean two recaps.
+#[test]
+fn crate_root_recap_is_the_evidence_derived_recap() {
+    // Compiles only while the root name and Plan 04's declaration are one type.
+    const _ROOT_IS_THE_LEARNING_RECAP: fn(
+        agent_domain::learning_recap::StudySessionRecap,
+    ) -> agent_domain::StudySessionRecap = |recap| recap;
+
+    // ...and the superseded shape is a genuinely different type behind a name
+    // that says which version it is.
+    assert_ne!(
+        std::any::TypeId::of::<agent_domain::StudySessionRecap>(),
+        std::any::TypeId::of::<agent_domain::StudySessionRecapV1>(),
+        "the two recap versions must not collapse into one type",
+    );
+
+    // The root path parses the canonical wire recap and reports the v2 schema.
+    let value = fixture_value(RECAPS_FIXTURE);
+    let raw = value["recaps"]["all_missed"].clone();
+    let recap: agent_domain::StudySessionRecap =
+        serde_json::from_value(raw).expect("the canonical recap parses through the root name");
+
+    assert_eq!(recap.schema, VIVA_STUDY_SESSION_RECAP_SCHEMA);
+    assert!(
+        !recap.concepts.is_empty(),
+        "the evidence-derived recap carries per-concept outcomes, not bucket arrays",
+    );
+}
+
 #[test]
 fn shared_recaps_rejects_unknown_review_authority() {
     let mut value = fixture_value(RECAPS_FIXTURE);

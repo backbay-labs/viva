@@ -7,9 +7,10 @@ use tokio::{sync::mpsc, task::AbortHandle};
 use crate::{
     ids::SessionId,
     learning_outcome::EvaluationDeferralReason,
+    learning_recap::StudySessionRecap,
     tools::{ToolPlan, ToolProposal, ToolResult},
-    AnswerEvaluation, AudioFrame, StudyQuestion, StudySessionPhase, StudySessionRecap,
-    StudySourceReference, TerminalSessionReason,
+    AnswerEvaluation, AudioFrame, StudyQuestion, StudySessionPhase, StudySourceReference,
+    TerminalSessionReason,
 };
 
 pub type BrainEventStream = BoxStream<'static, BrainEvent>;
