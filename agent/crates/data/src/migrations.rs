@@ -7998,10 +7998,10 @@ pub(crate) mod tests {
         )
         .await;
 
-        // A recap far larger than the obsolete multi-array index could hold. The
-        // btree tuple limit is ~2704 bytes across all indexed columns, so five
-        // arrays of 400 labels cannot be indexed at all — which is exactly why
-        // `0017` drops that index.
+        // A recap far larger than the obsolete multi-array index could hold. That
+        // index spans five array columns and the btree tuple limit is ~2704 bytes
+        // across all of them, so setting four of the five to 400 labels each puts
+        // the tuple far past the ceiling — which is exactly why `0017` drops it.
         let large: Vec<String> = (0..400)
             .map(|index| format!("concept-{index:04}-{}", "x".repeat(40)))
             .collect();
@@ -8016,8 +8016,15 @@ pub(crate) mod tests {
         .await
         .expect_err("the obsolete payload index cannot hold a large recap");
 
+        // One row in every table a `0014` database has — including the review item,
+        // the live nonce, and the usage event, which the fixture writes and which
+        // the upgrade must not touch.
         let before = historical_row_counts(&pool).await;
-        assert_eq!(before, (1, 1, 1, 1, 1, 1, 1, 1, 1));
+        assert_eq!(before.len(), HISTORICAL_0014_TABLES.len());
+        assert!(
+            before.values().all(|count| *count == 1),
+            "every seeded table starts with exactly one row: {before:?}"
+        );
 
         for (name, _) in MIGRATIONS
             .iter()
@@ -8259,27 +8266,52 @@ pub(crate) mod tests {
         .expect("historical usage event inserts");
     }
 
+    /// Every table `seed_0014_rows` writes, counted by name.
+    ///
+    /// Keyed rather than positional so the inventory and the fixture cannot drift
+    /// apart silently: a table the fixture seeds but this map omits is a table the
+    /// upgrade could empty without the assertion noticing, and the mismatch shows
+    /// up as a named key rather than as a tuple position.
     async fn historical_row_counts(
         pool: &sqlx::PgPool,
-    ) -> (i64, i64, i64, i64, i64, i64, i64, i64, i64) {
-        let count = async |sql: &'static str| {
-            sqlx::query_scalar::<_, i64>(sql)
+    ) -> std::collections::BTreeMap<&'static str, i64> {
+        let mut counts = std::collections::BTreeMap::new();
+        for (table, sql) in HISTORICAL_0014_TABLES {
+            let count = sqlx::query_scalar::<_, i64>(sql)
                 .fetch_one(pool)
                 .await
-                .expect("historical row count query succeeds")
-        };
-        (
-            count("SELECT COUNT(*) FROM study_sets").await,
-            count("SELECT COUNT(*) FROM study_documents").await,
-            count("SELECT COUNT(*) FROM source_spans").await,
-            count("SELECT COUNT(*) FROM concepts").await,
-            count("SELECT COUNT(*) FROM study_questions").await,
-            count("SELECT COUNT(*) FROM voice_sessions").await,
-            count("SELECT COUNT(*) FROM answer_attempts").await,
-            count("SELECT COUNT(*) FROM session_recaps").await,
-            count("SELECT COUNT(*) FROM concept_status_events").await,
-        )
+                .unwrap_or_else(|error| {
+                    panic!("historical row count query for {table} succeeds: {error}")
+                });
+            counts.insert(*table, count);
+        }
+        counts
     }
+
+    /// The literal statement per table — no dynamic identifier anywhere.
+    const HISTORICAL_0014_TABLES: &[(&str, &str)] = &[
+        ("answer_attempts", "SELECT COUNT(*) FROM answer_attempts"),
+        (
+            "concept_status_events",
+            "SELECT COUNT(*) FROM concept_status_events",
+        ),
+        ("concepts", "SELECT COUNT(*) FROM concepts"),
+        ("review_items", "SELECT COUNT(*) FROM review_items"),
+        ("session_recaps", "SELECT COUNT(*) FROM session_recaps"),
+        ("source_spans", "SELECT COUNT(*) FROM source_spans"),
+        ("study_documents", "SELECT COUNT(*) FROM study_documents"),
+        ("study_questions", "SELECT COUNT(*) FROM study_questions"),
+        ("study_sets", "SELECT COUNT(*) FROM study_sets"),
+        (
+            "voice_session_token_nonces",
+            "SELECT COUNT(*) FROM voice_session_token_nonces",
+        ),
+        ("voice_sessions", "SELECT COUNT(*) FROM voice_sessions"),
+        (
+            "voice_usage_events",
+            "SELECT COUNT(*) FROM voice_usage_events",
+        ),
+    ];
 
     /// The applied schema, the migration directory, and the privacy inventory are
     /// one fact, not three.
