@@ -2,6 +2,7 @@ export * from "./agent-contract";
 export * from "./learner-loop-contract";
 export * from "./learner-recovery-copy";
 export * from "./scheduling";
+export * from "./study-projection-contract";
 
 export type StudyMode = "quiz" | "teach" | "mock" | "cram";
 export type ConceptStatus = "strong" | "shaky" | "missed" | "review";
