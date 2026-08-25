@@ -7303,6 +7303,7 @@ async fn websocket_provider_slot_prefers_queued_completion_before_same_socket_ov
             text_inputs: text_inputs.clone(),
             study_store: store.clone(),
             usage_after_evaluation: None,
+            usage_enqueued: None,
         }),
         "answer_evaluated_provider_probe",
         VoiceWsAccess::default(),
@@ -7366,6 +7367,7 @@ async fn websocket_provider_slot_prefers_queued_completion_before_same_socket_ov
 async fn websocket_provider_drains_queued_usage_before_next_admission() {
     let text_inputs = Arc::new(AtomicUsize::new(0));
     let usage_gate = Arc::new(Notify::new());
+    let usage_enqueued = Arc::new(Notify::new());
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let state = AppState::with_study_store(
         Arc::new(AnswerEvaluatedProviderProbeBrain {
@@ -7378,6 +7380,7 @@ async fn websocket_provider_drains_queued_usage_before_next_admission() {
                 },
                 usage_gate.clone(),
             )),
+            usage_enqueued: Some(usage_enqueued.clone()),
         }),
         "answer_evaluated_provider_probe",
         VoiceWsAccess::default(),
@@ -7435,6 +7438,9 @@ async fn websocket_provider_drains_queued_usage_before_next_admission() {
     // registered its usage waiter. notify_waiters would lose that wake-up and
     // make the next admission race the unresolved first provider turn.
     usage_gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), usage_enqueued.notified())
+        .await
+        .expect("usage event should reach the server queue before the next admission");
     send_client_frame(
         &mut socket,
         &ClientFrame::Text {
@@ -7474,7 +7480,7 @@ async fn websocket_audio_continuation_requires_second_lease_when_limiter_enabled
     )
     .with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
-        idle: Duration::from_millis(40),
+        idle: Duration::from_millis(500),
         session: Duration::from_secs(5),
     });
     let Some(url) = spawn_server(state).await else {
@@ -11168,6 +11174,7 @@ struct AnswerEvaluatedProviderProbeBrain {
     text_inputs: Arc<AtomicUsize>,
     study_store: Arc<dyn StudyMemoryStore>,
     usage_after_evaluation: Option<(BrainUsage, Arc<Notify>)>,
+    usage_enqueued: Option<Arc<Notify>>,
 }
 
 #[async_trait::async_trait]
@@ -11209,6 +11216,7 @@ impl RealtimeBrain for AnswerEvaluatedProviderProbeBrain {
         let text_inputs = self.text_inputs.clone();
         let study_store = self.study_store.clone();
         let usage_after_evaluation = self.usage_after_evaluation.clone();
+        let usage_enqueued = self.usage_enqueued.clone();
         let task = tokio::spawn(async move {
             while let Some(input) = input_rx.recv().await {
                 if !matches!(
@@ -11251,7 +11259,11 @@ impl RealtimeBrain for AnswerEvaluatedProviderProbeBrain {
                     .await;
                 if let Some((usage, usage_gate)) = usage_after_evaluation.clone() {
                     usage_gate.notified().await;
-                    let _ = event_tx.send(BrainEvent::Usage(usage)).await;
+                    if event_tx.send(BrainEvent::Usage(usage)).await.is_ok() {
+                        if let Some(usage_enqueued) = usage_enqueued.as_ref() {
+                            usage_enqueued.notify_one();
+                        }
+                    }
                 }
                 let _ = event_tx
                     .send(BrainEvent::ResponseCompleted { response_id })
