@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use serde_json::{json, Value};
 use tokio::{sync::mpsc, task::AbortHandle};
 
@@ -2125,7 +2126,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         let sonic = json!({
             "type": "chunk",
             "context_id": response_id,
-            "data": "AQIDBA==",
+            "data": fake_examiner_tone_pcm16_base64(),
         });
         let Some(SonicEvent::Audio { pcm16_base64, .. }) = parse_sonic_event(&sonic.to_string())
         else {
@@ -2137,6 +2138,40 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
             .map(|frame| vec![frame])
             .map_err(BrainError::Protocol)
     }
+}
+
+/// Deterministic 600 ms examiner tone for the fake Sonic transport.
+///
+/// The fake previously emitted a 2-sample stub, which proved playback queue
+/// and speaking-state transitions but left human-audible playback and audible
+/// cancellation unprovable offline. This is a ~444 Hz triangle wave at 24 kHz
+/// mono PCM16 with a 20 ms linear fade at each end. Integer-only math keeps
+/// the bytes identical on every platform so the byte-exact session fixture
+/// stays stable.
+pub fn fake_examiner_tone_pcm16() -> Vec<u8> {
+    const TOTAL_SAMPLES: i32 = 14_400;
+    const PERIOD: i32 = 54;
+    const HALF_PERIOD: i32 = PERIOD / 2;
+    const AMPLITUDE: i32 = 8_000;
+    const FADE_SAMPLES: i32 = 480;
+
+    let mut bytes = Vec::with_capacity(TOTAL_SAMPLES as usize * 2);
+    for index in 0..TOTAL_SAMPLES {
+        let position = index % PERIOD;
+        let triangle = if position < HALF_PERIOD {
+            -AMPLITUDE + (2 * AMPLITUDE * position) / HALF_PERIOD
+        } else {
+            AMPLITUDE - (2 * AMPLITUDE * (position - HALF_PERIOD)) / HALF_PERIOD
+        };
+        let fade = index.min(TOTAL_SAMPLES - 1 - index).min(FADE_SAMPLES);
+        let sample = (triangle * fade / FADE_SAMPLES) as i16;
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
+fn fake_examiner_tone_pcm16_base64() -> String {
+    BASE64_STANDARD.encode(fake_examiner_tone_pcm16())
 }
 
 fn first_user_text(request: &Value) -> Option<String> {
@@ -2361,6 +2396,25 @@ mod tests {
     use std::sync::Mutex;
 
     use agent_domain::{SessionId, StudyMode};
+
+    #[test]
+    fn fake_examiner_tone_is_audible_scale_deterministic_pcm16() {
+        let tone = fake_examiner_tone_pcm16();
+        assert_eq!(tone.len(), 28_800, "600 ms at 24 kHz mono PCM16");
+        let samples: Vec<i16> = tone
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        assert_eq!(samples.first(), Some(&0), "fade-in starts silent");
+        assert_eq!(samples.last(), Some(&0), "fade-out ends silent");
+        let peak = samples
+            .iter()
+            .map(|sample| i32::from(*sample).abs())
+            .max()
+            .expect("tone has samples");
+        assert!(peak >= 6_000, "tone must be clearly audible, peak {peak}");
+        assert!(peak <= 8_000, "tone must stay below clipping, peak {peak}");
+    }
 
     #[tokio::test]
     async fn gemini_tool_loop_keeps_fallback_model_for_tool_continuations() {
