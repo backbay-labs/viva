@@ -14,7 +14,11 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { ActionButton } from "@/components/actions";
 import { OrnamentRule, SparkIcon, Wordmark } from "@/components/brand";
 import { VivaText } from "@/components/type";
-import { type LoadedLibrary, loadLibrary } from "@/library/library-client";
+import {
+  decideMobileLibraryStart,
+  type LoadedLibrary,
+  loadLibrary,
+} from "@/library/library-client";
 import { loadAppConfig } from "@/runtime/config";
 import { colors, fonts, layout, radius, space } from "@/theme/tokens";
 
@@ -150,43 +154,49 @@ export default function LibraryScreen() {
               </VivaText>
             </View>
           ) : null}
-          {library?.projection.libraryRows.map((row, index) => (
-            <View
-              key={row.id}
-              style={[
-                styles.sourceRow,
-                index < library.projection.libraryRows.length - 1 && styles.sourceRowBorder,
-              ]}
-            >
-              <View style={styles.documentMark}>
-                <VivaText aria-hidden tone="plum">
-                  §
-                </VivaText>
-              </View>
-              <View style={styles.sourceCopy}>
-                <View style={styles.rowHeading}>
-                  <VivaText style={styles.sourceName}>{row.title}</VivaText>
-                  <VivaText tone={row.statusLabel === "Ready" ? "sage" : "muted"} variant="caption">
-                    {row.statusLabel}
+          {library?.projection.libraryRows.map((row, index) => {
+            const startDecision = decideMobileLibraryStart(config, library.snapshot, row.id);
+            return (
+              <View
+                key={row.id}
+                style={[
+                  styles.sourceRow,
+                  index < library.projection.libraryRows.length - 1 && styles.sourceRowBorder,
+                ]}
+              >
+                <View style={styles.documentMark}>
+                  <VivaText aria-hidden tone="plum">
+                    §
                   </VivaText>
                 </View>
-                <VivaText tone="muted" variant="caption">
-                  {[row.course, row.detail, row.documentSummary].filter(Boolean).join(" · ")}
-                </VivaText>
-                <ActionButton
-                  accessibilityHint={`Starts recall from ${row.title}`}
-                  disabled={!row.start.available}
-                  onPress={() =>
-                    router.push({ pathname: "/session", params: { studySetId: row.id } })
-                  }
-                  style={styles.startButton}
-                  tone="tint"
-                >
-                  {row.start.available ? "Begin recall" : "Recall unavailable"}
-                </ActionButton>
+                <View style={styles.sourceCopy}>
+                  <View style={styles.rowHeading}>
+                    <VivaText style={styles.sourceName}>{row.title}</VivaText>
+                    <VivaText
+                      tone={row.statusLabel === "Ready" ? "sage" : "muted"}
+                      variant="caption"
+                    >
+                      {row.statusLabel}
+                    </VivaText>
+                  </View>
+                  <VivaText tone="muted" variant="caption">
+                    {[row.course, row.detail, row.documentSummary].filter(Boolean).join(" · ")}
+                  </VivaText>
+                  <ActionButton
+                    accessibilityHint={`Starts recall from ${row.title}`}
+                    disabled={!startDecision.canStart}
+                    onPress={() =>
+                      router.push({ pathname: "/session", params: { studySetId: row.id } })
+                    }
+                    style={styles.startButton}
+                    tone="tint"
+                  >
+                    {startDecision.canStart ? "Begin recall" : "Recall unavailable"}
+                  </ActionButton>
+                </View>
               </View>
-            </View>
-          ))}
+            );
+          })}
         </View>
 
         <View style={styles.uploadSection}>

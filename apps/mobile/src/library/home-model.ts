@@ -1,4 +1,6 @@
 import type { VivaLibraryProjection, VivaLibrarySnapshot } from "@/agent/shared-web";
+import type { AppConfig } from "@/runtime/config";
+import { decideMobileLibraryStart } from "./library-client";
 
 export type HomeLibraryModel = {
   canStart: boolean;
@@ -19,10 +21,12 @@ const unavailableConcept = {
 export function homeModelFromLibrary(
   projection: VivaLibraryProjection,
   snapshot: VivaLibrarySnapshot,
+  config: AppConfig,
 ): HomeLibraryModel {
   const row =
-    projection.libraryRows.find((candidate) => candidate.start.available) ??
-    projection.libraryRows[0];
+    projection.libraryRows.find(
+      (candidate) => decideMobileLibraryStart(config, snapshot, candidate.id).canStart,
+    ) ?? projection.libraryRows[0];
   if (!row) {
     return {
       canStart: false,
@@ -34,12 +38,13 @@ export function homeModelFromLibrary(
   }
 
   const snapshotRow = snapshot.study_sets.find((studySet) => studySet.id === row.id);
+  const startDecision = decideMobileLibraryStart(config, snapshot, row.id);
   const nextReview = projection.sessionRows.find(
     (session) => session.studySetId === row.id && session.nextReview,
   )?.nextReview;
 
   return {
-    canStart: row.start.available,
+    canStart: startDecision.canStart,
     contextLabel: snapshotRow?.course ?? "Exam date unavailable",
     studySetId: row.id,
     studySetTitle: row.title,

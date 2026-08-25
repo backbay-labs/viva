@@ -35,7 +35,7 @@ export default function HomeScreen() {
     let active = true;
     void loadLibrary(config)
       .then(({ projection, snapshot }) => {
-        if (active) setHomeModel(homeModelFromLibrary(projection, snapshot));
+        if (active) setHomeModel(homeModelFromLibrary(projection, snapshot, config));
       })
       .catch(() => {
         if (active) setHomeModel(null);

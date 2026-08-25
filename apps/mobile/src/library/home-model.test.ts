@@ -1,7 +1,17 @@
 import { describe, expect, test } from "bun:test";
 
 import { projectLibrarySnapshot, type VivaLibrarySnapshot } from "@/agent/shared-web";
+import type { AppConfig } from "@/runtime/config";
 import { homeModelFromLibrary } from "./home-model";
+
+const config: AppConfig = {
+  agentHttpUrl: "http://127.0.0.1:4318",
+  agentWsUrl: "ws://127.0.0.1:4318/ws",
+  sessionToken: null,
+  studySetId: "biology-midterm",
+  userId: "user-1",
+  wsOrigin: null,
+};
 
 const cannedLibrarySnapshot: VivaLibrarySnapshot = {
   privacy: {
@@ -43,7 +53,7 @@ describe("homeModelFromLibrary", () => {
       now: new Date("2026-08-24T13:00:00.000Z"),
     });
 
-    expect(homeModelFromLibrary(projection, cannedLibrarySnapshot)).toEqual({
+    expect(homeModelFromLibrary(projection, cannedLibrarySnapshot, config)).toEqual({
       canStart: true,
       contextLabel: "Biology 201",
       studySetId: "biology-midterm",
@@ -71,7 +81,7 @@ describe("homeModelFromLibrary", () => {
     };
     const projection = projectLibrarySnapshot(snapshot);
 
-    expect(homeModelFromLibrary(projection, snapshot)).toEqual({
+    expect(homeModelFromLibrary(projection, snapshot, config)).toEqual({
       canStart: false,
       contextLabel: "Exam date unavailable",
       studySetId: "chemistry-final",
@@ -88,17 +98,44 @@ describe("homeModelFromLibrary", () => {
       study_sets: [...cannedLibrarySnapshot.study_sets].reverse(),
     };
 
-    expect(homeModelFromLibrary(projectLibrarySnapshot(snapshot), snapshot)).toMatchObject({
+    expect(homeModelFromLibrary(projectLibrarySnapshot(snapshot), snapshot, config)).toMatchObject({
       canStart: true,
       studySetId: "biology-midterm",
       studySetTitle: "Biology Midterm",
     });
   });
 
+  test("enables the explicit trusted-loopback unsigned row even when web projection rejects it", () => {
+    const first = cannedLibrarySnapshot.study_sets[0];
+    if (!first) throw new Error("canned biology study set is missing");
+    const snapshot = {
+      ...cannedLibrarySnapshot,
+      study_sets: [
+        {
+          ...first,
+          actions: {
+            ...first.actions,
+            start: {
+              available: false as const,
+              unavailable_reason: "session_token_unavailable",
+            },
+          },
+        },
+      ],
+    };
+    const projection = projectLibrarySnapshot(snapshot);
+    expect(projection.libraryRows[0]?.start).toMatchObject({ available: false });
+
+    expect(homeModelFromLibrary(projection, snapshot, config)).toMatchObject({
+      canStart: true,
+      studySetId: "biology-midterm",
+    });
+  });
+
   test("returns an explicitly empty model when the library has no study sets", () => {
     const snapshot = { ...cannedLibrarySnapshot, sessions: [], study_sets: [] };
 
-    expect(homeModelFromLibrary(projectLibrarySnapshot(snapshot), snapshot)).toEqual({
+    expect(homeModelFromLibrary(projectLibrarySnapshot(snapshot), snapshot, config)).toEqual({
       canStart: false,
       contextLabel: "Exam date unavailable",
       studySetId: null,
@@ -129,13 +166,23 @@ function studySet(
           }
         : { available: false, unavailable_reason: "session_unavailable" },
     },
-    concept_count: 0,
+    concept_count: canStart ? 2 : 0,
     course,
-    documents: [],
+    documents: canStart
+      ? [
+          {
+            deleted: false,
+            display_name: "Lecture 5.pdf",
+            id: "lecture-5",
+            processing_status: "ready",
+            source_kind: "pdf",
+          },
+        ]
+      : [],
     id,
     ingestion_error: null,
     ingestion_status: "ready",
-    question_count: 0,
+    question_count: canStart ? 1 : 0,
     server_owned: true,
     title,
     user_id: "user-1",

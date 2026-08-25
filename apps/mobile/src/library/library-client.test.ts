@@ -3,7 +3,12 @@ import type { Concept, StudySet } from "@viva/core";
 
 import type { VivaLibrarySnapshot } from "@/agent/shared-web";
 import type { AppConfig } from "@/runtime/config";
-import { loadLibrary, studySetForSession, weakestConcept } from "./library-client";
+import {
+  decideMobileLibraryStart,
+  loadLibrary,
+  studySetForSession,
+  weakestConcept,
+} from "./library-client";
 
 const cannedLibrarySnapshot: VivaLibrarySnapshot = {
   user_id: "user-1",
@@ -124,7 +129,7 @@ describe("mobile library client", () => {
   });
 
   test("maps only server-owned metadata and leaves absent learning detail neutral", () => {
-    const studySet = studySetForSession(cannedLibrarySnapshot, "biology-midterm");
+    const studySet = studySetForSession(cannedLibrarySnapshot, "biology-midterm", config);
 
     expect(studySet).toMatchObject({
       concepts: [],
@@ -154,9 +159,146 @@ describe("mobile library client", () => {
   });
 
   test("fails closed when the selected study set is absent", () => {
-    expect(() => studySetForSession(cannedLibrarySnapshot, "unknown-set")).toThrow(
+    expect(() => studySetForSession(cannedLibrarySnapshot, "unknown-set", config)).toThrow(
       "Study set unknown-set is unavailable in the library snapshot",
     );
+  });
+
+  test("admits only the fully ready trusted fixture when loopback cannot mint a token", () => {
+    const snapshot = withStartAction(cannedLibrarySnapshot, {
+      available: false,
+      unavailable_reason: "session_token_unavailable",
+    });
+
+    expect(decideMobileLibraryStart(config, snapshot, "biology-midterm")).toEqual({
+      authority: "trusted_loopback_unsigned",
+      canStart: true,
+    });
+    expect(studySetForSession(snapshot, "biology-midterm", config)).toMatchObject({
+      id: "biology-midterm",
+      sessionId: undefined,
+      sessionToken: undefined,
+      userId: "user-1",
+    });
+
+    for (const loopbackConfig of [
+      { ...config, agentHttpUrl: "http://localhost:4318", agentWsUrl: "ws://localhost:4318/ws" },
+      { ...config, agentHttpUrl: "http://[::1]:4318", agentWsUrl: "ws://[::1]:4318/ws" },
+    ]) {
+      expect(decideMobileLibraryStart(loopbackConfig, snapshot, "biology-midterm")).toMatchObject({
+        authority: "trusted_loopback_unsigned",
+        canStart: true,
+      });
+    }
+  });
+
+  test("keeps direct-route unsigned admission fail-closed outside the exact fixture boundary", () => {
+    const unsignedSnapshot = withStartAction(cannedLibrarySnapshot, {
+      available: false,
+      unavailable_reason: "session_token_unavailable",
+    });
+    const cases: Array<{ config?: AppConfig; label: string; snapshot?: VivaLibrarySnapshot }> = [
+      {
+        config: { ...config, agentHttpUrl: "http://agent.example" },
+        label: "remote HTTP agent",
+      },
+      {
+        config: { ...config, agentWsUrl: "ws://agent.example/ws" },
+        label: "remote WebSocket agent",
+      },
+      {
+        config: { ...config, agentHttpUrl: "http://127.0.0.1.example" },
+        label: "loopback-looking remote hostname",
+      },
+      {
+        config: { ...config, userId: "user-2" },
+        label: "configured user mismatch",
+      },
+      {
+        config: { ...config, studySetId: "chemistry-final" },
+        label: "configured study-set mismatch",
+      },
+      {
+        config: { ...config, sessionToken: "viva1.unrelated" },
+        label: "configured token on an unsigned action",
+      },
+      {
+        label: "snapshot user mismatch",
+        snapshot: { ...unsignedSnapshot, user_id: "user-2" },
+      },
+      {
+        label: "row user mismatch",
+        snapshot: withStudySet(unsignedSnapshot, { user_id: "user-2" }),
+      },
+      {
+        label: "non-server-owned row",
+        snapshot: withStudySet(unsignedSnapshot, { server_owned: false }),
+      },
+      {
+        label: "non-ready row",
+        snapshot: withStudySet(unsignedSnapshot, { ingestion_status: "processing" }),
+      },
+      {
+        label: "no active concepts",
+        snapshot: withStudySet(unsignedSnapshot, { concept_count: 0 }),
+      },
+      {
+        label: "no active questions",
+        snapshot: withStudySet(unsignedSnapshot, { question_count: 0 }),
+      },
+      {
+        label: "no ready source",
+        snapshot: withStudySet(unsignedSnapshot, { documents: [] }),
+      },
+      {
+        label: "genuinely unavailable action",
+        snapshot: withStartAction(unsignedSnapshot, {
+          available: false,
+          unavailable_reason: "ingestion_processing",
+        }),
+      },
+      {
+        label: "malformed available action without a token",
+        snapshot: withStartAction(unsignedSnapshot, {
+          available: true,
+          session_id: "voice-session-unbound",
+        }),
+      },
+    ];
+
+    for (const testCase of cases) {
+      const decision = decideMobileLibraryStart(
+        testCase.config ?? config,
+        testCase.snapshot ?? unsignedSnapshot,
+        "biology-midterm",
+      );
+      expect({ canStart: decision.canStart, label: testCase.label }).toEqual({
+        canStart: false,
+        label: testCase.label,
+      });
+      expect(() =>
+        studySetForSession(
+          testCase.snapshot ?? unsignedSnapshot,
+          "biology-midterm",
+          testCase.config ?? config,
+        ),
+      ).toThrow("cannot start");
+    }
+  });
+
+  test("accepts a real signed start capability without weakening hosted admission", () => {
+    const hostedConfig = {
+      ...config,
+      agentHttpUrl: "https://agent.example",
+      agentWsUrl: "wss://agent.example/ws",
+    };
+
+    expect(
+      decideMobileLibraryStart(hostedConfig, cannedLibrarySnapshot, "biology-midterm"),
+    ).toEqual({
+      authority: "signed_action",
+      canStart: true,
+    });
   });
 
   test("selects the highest-miss concept and uses non-strong status as the tie-breaker", () => {
@@ -179,5 +321,28 @@ function concept(id: string, label: string, status: Concept["status"], misses: n
     misses,
     source: { confidence: "low", excerpt: "", label: "Source unavailable" },
     status,
+  };
+}
+
+function withStartAction(
+  snapshot: VivaLibrarySnapshot,
+  start: VivaLibrarySnapshot["study_sets"][number]["actions"]["start"],
+): VivaLibrarySnapshot {
+  const first = snapshot.study_sets[0];
+  if (!first) throw new Error("canned biology study set is missing");
+  return withStudySet(snapshot, {
+    actions: { ...first.actions, start },
+  });
+}
+
+function withStudySet(
+  snapshot: VivaLibrarySnapshot,
+  patch: Partial<VivaLibrarySnapshot["study_sets"][number]>,
+): VivaLibrarySnapshot {
+  const first = snapshot.study_sets[0];
+  if (!first) throw new Error("canned biology study set is missing");
+  return {
+    ...snapshot,
+    study_sets: [{ ...first, ...patch }, ...snapshot.study_sets.slice(1)],
   };
 }

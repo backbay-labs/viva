@@ -99,6 +99,11 @@ async function runProviderPhase(provider) {
       studySet.actions?.start?.available === false,
       `[${provider}] unsigned loopback library unexpectedly issued a start capability`,
     );
+    assertEqual(
+      studySet.actions?.start?.unavailable_reason,
+      "session_token_unavailable",
+      `${provider} unsigned loopback start unavailable reason`,
+    );
     const expectedStudySetTitle = requiredString(
       studySet.title,
       `[${provider}] live library study-set title`,
@@ -145,22 +150,21 @@ async function runProviderPhase(provider) {
     await liveTitle.waitFor({ state: "visible", timeout: 30_000 });
     await assertExactText(liveTitle, expectedStudySetTitle, `${provider} Home study-set title`);
 
-    const beginRecall = page.getByRole("button", { exact: true, name: "Begin recall" });
-    await waitForAllDisabled(
-      beginRecall,
-      10_000,
-      `[${provider}] Home did not fail closed when the live library start action was unavailable`,
+    const beginRecall = page
+      .getByRole("button", { exact: true, name: "Begin recall" })
+      .filter({ has: page.getByText("Begin recall", { exact: true }) });
+    await beginRecall.waitFor({ state: "visible", timeout: 30_000 });
+    assertEqual(await beginRecall.count(), 1, `${provider} Home Begin recall control count`);
+    assert(
+      await beginRecall.isEnabled(),
+      `[${provider}] trusted loopback Begin recall control was disabled`,
     );
-
-    // The loopback agent deliberately offers no browser session capability
-    // without signed/durable mode, while signed mode deliberately rejects the
-    // in-memory fixture store. The native simulator gate uses this same trusted
-    // loopback deep link. Keep the caveat machine-readable and never fake a
-    // library action in the browser.
-    console.log(`[${provider}] trusted_loopback_direct_session=true`);
-    await page.goto(`${webUrl}/session?studySetId=${encodeURIComponent(expected.studySetId)}`, {
-      waitUntil: "domcontentloaded",
-    });
+    const expectedSessionUrl = `${webUrl}/session?studySetId=${encodeURIComponent(expected.studySetId)}`;
+    await Promise.all([
+      page.waitForURL(expectedSessionUrl, { timeout: 30_000, waitUntil: "domcontentloaded" }),
+      beginRecall.click(),
+    ]);
+    assertEqual(page.url(), expectedSessionUrl, `${provider} Begin recall navigation`);
     const sessionRoot = page.getByTestId("session-live-root");
     await sessionRoot.waitFor({ state: "visible", timeout: 30_000 });
     await assertExactText(
@@ -428,21 +432,6 @@ async function assertExactText(locator, expected, label) {
     await delay(25);
   }
   assertEqual(actual, expected, label);
-}
-
-async function waitForAllDisabled(locator, timeoutMs, message) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const count = await locator.count();
-    if (count > 0) {
-      const disabled = await Promise.all(
-        Array.from({ length: count }, (_, index) => locator.nth(index).isDisabled()),
-      );
-      if (disabled.every(Boolean)) return;
-    }
-    await delay(25);
-  }
-  throw new Error(message);
 }
 
 function assertNoBrowserErrors(provider, consoleErrors, pageErrors) {
