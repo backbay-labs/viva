@@ -370,6 +370,96 @@ fn crate_root_publishes_the_locked_learning_recap_seam() {
     );
 }
 
+/// `StudySessionRecapV1` is a migration shim, not a published domain contract, and
+/// this test is what keeps it from quietly becoming one.
+///
+/// No plan names the alias. It exists only because the Task 0 Step 3 root swap left
+/// the superseded `study.rs` recap unreachable from a private module — dead under
+/// `-D warnings` — while Plans 07/08/09 still name its fields in their own source.
+/// An unplanned public export with no expiry is how a temporary bridge turns
+/// permanent, so the shim has to carry a machine-checkable removal trigger and must
+/// stay inert: `agent-domain` itself never names it, so deleting the one export line
+/// and the `study.rs` declaration behind it is the whole removal.
+#[test]
+fn study_session_recap_v1_is_a_shim_with_a_removal_trigger_the_domain_never_uses() {
+    const ALIAS: &str = "StudySessionRecapV1";
+    const EXPORT_LINE: &str = "pub use study::StudySessionRecap as StudySessionRecapV1;";
+
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let lib_rs = std::fs::read_to_string(src_dir.join("lib.rs")).expect("lib.rs is readable");
+
+    assert_eq!(
+        lib_rs.matches(EXPORT_LINE).count(),
+        1,
+        "the superseded recap must be published exactly once, under its version name",
+    );
+
+    // The doc block attached to the export is the removal trigger. Read exactly the
+    // contiguous `///` run directly above the export — not the surrounding file — so
+    // a required phrase somewhere else in `lib.rs` cannot satisfy this by accident.
+    let mut doc_lines = lib_rs
+        .lines()
+        .take_while(|line| line.trim() != EXPORT_LINE)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take_while(|line| line.trim_start().starts_with("///"))
+        .collect::<Vec<_>>();
+    doc_lines.reverse();
+    let doc_block = doc_lines.join("\n");
+    assert!(
+        !doc_block.is_empty(),
+        "the {ALIAS} export must carry a doc block stating why it exists",
+    );
+    for required in [
+        "MIGRATION SHIM",
+        "Removal trigger:",
+        "agent-adapters",
+        "agent-service",
+        "data",
+    ] {
+        assert!(
+            doc_block.contains(required),
+            "the {ALIAS} export must document {required:?} in its removal trigger, found: {doc_block}",
+        );
+    }
+
+    // Nothing inside the domain may depend on the shim, or removing it stops being
+    // a one-line deletion and the bridge has become load-bearing.
+    let mut offenders = Vec::new();
+    let mut pending = vec![src_dir.clone()];
+    let mut scanned = 0_usize;
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("agent-domain src is readable") {
+            let path = entry.expect("directory entry is readable").path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            scanned += 1;
+            if path == src_dir.join("lib.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source file is readable");
+            if text.contains(ALIAS) {
+                offenders.push(path.display().to_string());
+            }
+        }
+    }
+
+    assert!(
+        scanned > 1,
+        "the scan must actually reach the domain source"
+    );
+    assert!(
+        offenders.is_empty(),
+        "{ALIAS} is a migration shim for Plans 07/08/09; agent-domain must not name it, found in {offenders:?}",
+    );
+}
+
 #[test]
 fn shared_recaps_rejects_unknown_review_authority() {
     let mut value = fixture_value(RECAPS_FIXTURE);
