@@ -2647,107 +2647,127 @@ impl StudyMemoryStore for PostgresStudyStore {
         // columns while its placeholder capture metadata is upgraded in place.
         // A replay with different envelope values matches no `WHERE` branch,
         // returns no row, and is a `Conflict` — the duplicate key never escapes.
-        let mut tx = self.pool.begin().await.map_err(pg_error)?;
-        // `DATA-004`: take the session row's shared lock before writing, so a
-        // concurrent deletion is either fully before this transaction or refused by
-        // it. Without it a writer that validated first could commit its artifact
-        // after the purge had already run.
-        Self::lock_open_session_shared(&mut tx, user_id, study_set_uuid, voice_session_uuid)
-            .await?;
-        let inserted = sqlx::query_scalar::<_, bool>(
-            "INSERT INTO answer_attempts (
-                id,
-                voice_session_id,
-                response_id,
-                question_id,
-                submission_sequence,
-                idempotency_key,
-                capture_mode,
-                byte_count,
-                char_count,
-                duration_ms,
-                client_generation_id,
-                locale,
-                capture_status,
-                answer_content_policy,
-                answer_digest_hmac,
-                transcript_status,
-                transcript_confidence_bucket,
-                pre_provider_state
-             )
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-             ON CONFLICT (voice_session_id, response_id) DO UPDATE
-             SET submission_sequence = EXCLUDED.submission_sequence,
-                 idempotency_key = EXCLUDED.idempotency_key,
-                 capture_mode = EXCLUDED.capture_mode,
-                 byte_count = EXCLUDED.byte_count,
-                 char_count = EXCLUDED.char_count,
-                 duration_ms = EXCLUDED.duration_ms,
-                 client_generation_id = EXCLUDED.client_generation_id,
-                 locale = EXCLUDED.locale,
-                 capture_status = EXCLUDED.capture_status,
-                 answer_content_policy = EXCLUDED.answer_content_policy,
-                 answer_digest_hmac = EXCLUDED.answer_digest_hmac,
-                 transcript_status = EXCLUDED.transcript_status,
-                 transcript_confidence_bucket = EXCLUDED.transcript_confidence_bucket,
-                 pre_provider_state = EXCLUDED.pre_provider_state
-             WHERE answer_attempts.question_id = EXCLUDED.question_id
-               AND (
-                   answer_attempts.pre_provider_state = 'evaluation_only_compat'
-                   OR (
-                       answer_attempts.submission_sequence = EXCLUDED.submission_sequence
-                       AND answer_attempts.idempotency_key = EXCLUDED.idempotency_key
-                       AND answer_attempts.capture_mode = EXCLUDED.capture_mode
-                       AND answer_attempts.byte_count IS NOT DISTINCT FROM EXCLUDED.byte_count
-                       AND answer_attempts.char_count IS NOT DISTINCT FROM EXCLUDED.char_count
-                       AND answer_attempts.duration_ms IS NOT DISTINCT FROM EXCLUDED.duration_ms
-                       AND answer_attempts.client_generation_id
-                           IS NOT DISTINCT FROM EXCLUDED.client_generation_id
-                       AND answer_attempts.locale IS NOT DISTINCT FROM EXCLUDED.locale
-                       AND answer_attempts.capture_status = EXCLUDED.capture_status
-                       AND answer_attempts.answer_content_policy
-                           = EXCLUDED.answer_content_policy
-                       AND answer_attempts.answer_digest_hmac
-                           IS NOT DISTINCT FROM EXCLUDED.answer_digest_hmac
-                       AND answer_attempts.transcript_status
-                           IS NOT DISTINCT FROM EXCLUDED.transcript_status
-                       AND answer_attempts.transcript_confidence_bucket
-                           IS NOT DISTINCT FROM EXCLUDED.transcript_confidence_bucket
-                       AND answer_attempts.pre_provider_state = EXCLUDED.pre_provider_state
+        let mut remaining_attempts = ANSWER_ATTEMPT_UPSERT_ATTEMPTS;
+        let inserted = loop {
+            remaining_attempts -= 1;
+            let mut tx = self.pool.begin().await.map_err(pg_error)?;
+            // `DATA-004`: take the session row's shared lock before writing, so a
+            // concurrent deletion is either fully before this transaction or refused
+            // by it. Without it a writer that validated first could commit its
+            // artifact after the purge had already run.
+            Self::lock_open_session_shared(&mut tx, user_id, study_set_uuid, voice_session_uuid)
+                .await?;
+            let upserted = sqlx::query_scalar::<_, bool>(
+                "INSERT INTO answer_attempts (
+                    id,
+                    voice_session_id,
+                    response_id,
+                    question_id,
+                    submission_sequence,
+                    idempotency_key,
+                    capture_mode,
+                    byte_count,
+                    char_count,
+                    duration_ms,
+                    client_generation_id,
+                    locale,
+                    capture_status,
+                    answer_content_policy,
+                    answer_digest_hmac,
+                    transcript_status,
+                    transcript_confidence_bucket,
+                    pre_provider_state
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                 ON CONFLICT (voice_session_id, response_id) DO UPDATE
+                 SET submission_sequence = EXCLUDED.submission_sequence,
+                     idempotency_key = EXCLUDED.idempotency_key,
+                     capture_mode = EXCLUDED.capture_mode,
+                     byte_count = EXCLUDED.byte_count,
+                     char_count = EXCLUDED.char_count,
+                     duration_ms = EXCLUDED.duration_ms,
+                     client_generation_id = EXCLUDED.client_generation_id,
+                     locale = EXCLUDED.locale,
+                     capture_status = EXCLUDED.capture_status,
+                     answer_content_policy = EXCLUDED.answer_content_policy,
+                     answer_digest_hmac = EXCLUDED.answer_digest_hmac,
+                     transcript_status = EXCLUDED.transcript_status,
+                     transcript_confidence_bucket = EXCLUDED.transcript_confidence_bucket,
+                     pre_provider_state = EXCLUDED.pre_provider_state
+                 WHERE answer_attempts.question_id = EXCLUDED.question_id
+                   AND (
+                       answer_attempts.pre_provider_state = 'evaluation_only_compat'
+                       OR (
+                           answer_attempts.submission_sequence = EXCLUDED.submission_sequence
+                           AND answer_attempts.idempotency_key = EXCLUDED.idempotency_key
+                           AND answer_attempts.capture_mode = EXCLUDED.capture_mode
+                           AND answer_attempts.byte_count IS NOT DISTINCT FROM EXCLUDED.byte_count
+                           AND answer_attempts.char_count IS NOT DISTINCT FROM EXCLUDED.char_count
+                           AND answer_attempts.duration_ms IS NOT DISTINCT FROM EXCLUDED.duration_ms
+                           AND answer_attempts.client_generation_id
+                               IS NOT DISTINCT FROM EXCLUDED.client_generation_id
+                           AND answer_attempts.locale IS NOT DISTINCT FROM EXCLUDED.locale
+                           AND answer_attempts.capture_status = EXCLUDED.capture_status
+                           AND answer_attempts.answer_content_policy
+                               = EXCLUDED.answer_content_policy
+                           AND answer_attempts.answer_digest_hmac
+                               IS NOT DISTINCT FROM EXCLUDED.answer_digest_hmac
+                           AND answer_attempts.transcript_status
+                               IS NOT DISTINCT FROM EXCLUDED.transcript_status
+                           AND answer_attempts.transcript_confidence_bucket
+                               IS NOT DISTINCT FROM EXCLUDED.transcript_confidence_bucket
+                           AND answer_attempts.pre_provider_state = EXCLUDED.pre_provider_state
+                       )
                    )
-               )
-             RETURNING (xmax = '0'::xid) AS inserted",
-        )
-        .bind(Uuid::new_v4())
-        .bind(voice_session_uuid)
-        .bind(&envelope.response_id)
-        .bind(&envelope.question_id)
-        .bind(submission_sequence)
-        .bind(&envelope.idempotency_key)
-        .bind(envelope.capture_mode.as_str())
-        .bind(byte_count)
-        .bind(char_count)
-        .bind(duration_ms)
-        .bind(&envelope.client_generation_id)
-        .bind(&envelope.locale)
-        .bind(envelope.capture_status.as_str())
-        .bind(envelope.content_policy.as_str())
-        .bind(&envelope.answer_digest_hmac)
-        .bind(&envelope.transcript_status)
-        .bind(&envelope.transcript_confidence_bucket)
-        .bind(&envelope.pre_provider_state)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(pg_error)?;
-        let Some(inserted) = inserted else {
-            tx.rollback().await.map_err(pg_error)?;
-            return Err(PortError::conflict(
-                "postgres",
-                &envelope.response_id,
-                "answer attempt envelope cannot be changed",
-            ));
+                 RETURNING (xmax = '0'::xid) AS inserted",
+            )
+            .bind(Uuid::new_v4())
+            .bind(voice_session_uuid)
+            .bind(&envelope.response_id)
+            .bind(&envelope.question_id)
+            .bind(submission_sequence)
+            .bind(&envelope.idempotency_key)
+            .bind(envelope.capture_mode.as_str())
+            .bind(byte_count)
+            .bind(char_count)
+            .bind(duration_ms)
+            .bind(&envelope.client_generation_id)
+            .bind(&envelope.locale)
+            .bind(envelope.capture_status.as_str())
+            .bind(envelope.content_policy.as_str())
+            .bind(&envelope.answer_digest_hmac)
+            .bind(&envelope.transcript_status)
+            .bind(&envelope.transcript_confidence_bucket)
+            .bind(&envelope.pre_provider_state)
+            .fetch_optional(&mut *tx)
+            .await;
+            match upserted {
+                Ok(Some(inserted)) => {
+                    tx.commit().await.map_err(pg_error)?;
+                    break inserted;
+                }
+                Ok(None) => {
+                    tx.rollback().await.map_err(pg_error)?;
+                    return Err(PortError::conflict(
+                        "postgres",
+                        &envelope.response_id,
+                        "answer attempt envelope cannot be changed",
+                    ));
+                }
+                Err(error) if is_unique_violation(&error) => {
+                    // The statement aborted this transaction; nothing it did can
+                    // commit, and the retry opens its own.
+                    drop(tx);
+                    if remaining_attempts == 0 {
+                        return Err(duplicate_attempt_key_conflict(&envelope.response_id));
+                    }
+                }
+                Err(error) => {
+                    drop(tx);
+                    return Err(pg_error(error));
+                }
+            }
         };
-        tx.commit().await.map_err(pg_error)?;
         if inserted {
             self.increment_count(WriteCountKind::AnswerAttempt);
         }
@@ -2805,95 +2825,115 @@ impl StudyMemoryStore for PostgresStudyStore {
         // `DATA-005`: the attempt row and the browser authorization digest commit
         // in one transaction, so authority can never exist for an evaluation that
         // was rolled back.
-        let mut tx = self.pool.begin().await.map_err(pg_error)?;
-        // `DATA-004`: take the session row's shared lock before writing, so a
-        // concurrent deletion is either fully before this transaction or refused by
-        // it. Without it a writer that validated first could commit its artifact
-        // after the purge had already run.
-        Self::lock_open_session_shared(&mut tx, user_id, study_set_uuid, voice_session_uuid)
-            .await?;
-        let inserted = sqlx::query_scalar::<_, bool>(
-            "INSERT INTO answer_attempts (
-                id,
-                voice_session_id,
-                response_id,
-                question_id,
-                submission_sequence,
-                idempotency_key,
-                capture_mode,
-                capture_status,
-                answer_content_policy,
-                pre_provider_state,
-                evaluation_label,
-                concept_status,
-                confidence_score,
-                source_span_id
-             )
-             VALUES (
-                 $1, $2, $3, $4, 1, $5,
-                 'typed', 'accepted', 'none', 'evaluation_only_compat',
-                 $6, $7, $8, $9
-             )
-             ON CONFLICT (voice_session_id, response_id) DO UPDATE
-             SET evaluation_label = EXCLUDED.evaluation_label,
-                 concept_status = EXCLUDED.concept_status,
-                 confidence_score = EXCLUDED.confidence_score,
-                 source_span_id = EXCLUDED.source_span_id
-             WHERE answer_attempts.question_id = EXCLUDED.question_id
-               AND (
-                   (
-                       answer_attempts.evaluation_label IS NULL
-                       AND answer_attempts.concept_status IS NULL
-                       AND answer_attempts.confidence_score IS NULL
-                       AND answer_attempts.source_span_id IS NULL
+        let mut remaining_attempts = ANSWER_ATTEMPT_UPSERT_ATTEMPTS;
+        let inserted = loop {
+            remaining_attempts -= 1;
+            let mut tx = self.pool.begin().await.map_err(pg_error)?;
+            // `DATA-004`: take the session row's shared lock before writing, so a
+            // concurrent deletion is either fully before this transaction or refused
+            // by it. Without it a writer that validated first could commit its
+            // artifact after the purge had already run.
+            Self::lock_open_session_shared(&mut tx, user_id, study_set_uuid, voice_session_uuid)
+                .await?;
+            let upserted = sqlx::query_scalar::<_, bool>(
+                "INSERT INTO answer_attempts (
+                    id,
+                    voice_session_id,
+                    response_id,
+                    question_id,
+                    submission_sequence,
+                    idempotency_key,
+                    capture_mode,
+                    capture_status,
+                    answer_content_policy,
+                    pre_provider_state,
+                    evaluation_label,
+                    concept_status,
+                    confidence_score,
+                    source_span_id
+                 )
+                 VALUES (
+                     $1, $2, $3, $4, 1, $5,
+                     'typed', 'accepted', 'none', 'evaluation_only_compat',
+                     $6, $7, $8, $9
+                 )
+                 ON CONFLICT (voice_session_id, response_id) DO UPDATE
+                 SET evaluation_label = EXCLUDED.evaluation_label,
+                     concept_status = EXCLUDED.concept_status,
+                     confidence_score = EXCLUDED.confidence_score,
+                     source_span_id = EXCLUDED.source_span_id
+                 WHERE answer_attempts.question_id = EXCLUDED.question_id
+                   AND (
+                       (
+                           answer_attempts.evaluation_label IS NULL
+                           AND answer_attempts.concept_status IS NULL
+                           AND answer_attempts.confidence_score IS NULL
+                           AND answer_attempts.source_span_id IS NULL
+                       )
+                       OR (
+                           answer_attempts.evaluation_label
+                               IS NOT DISTINCT FROM EXCLUDED.evaluation_label
+                           AND answer_attempts.concept_status
+                               IS NOT DISTINCT FROM EXCLUDED.concept_status
+                           AND answer_attempts.confidence_score
+                               IS NOT DISTINCT FROM EXCLUDED.confidence_score
+                           AND answer_attempts.source_span_id
+                               IS NOT DISTINCT FROM EXCLUDED.source_span_id
+                       )
                    )
-                   OR (
-                       answer_attempts.evaluation_label
-                           IS NOT DISTINCT FROM EXCLUDED.evaluation_label
-                       AND answer_attempts.concept_status
-                           IS NOT DISTINCT FROM EXCLUDED.concept_status
-                       AND answer_attempts.confidence_score
-                           IS NOT DISTINCT FROM EXCLUDED.confidence_score
-                       AND answer_attempts.source_span_id
-                           IS NOT DISTINCT FROM EXCLUDED.source_span_id
-                   )
-               )
-             RETURNING (xmax = '0'::xid) AS inserted",
-        )
-        .bind(Uuid::new_v4())
-        .bind(voice_session_uuid)
-        .bind(response_id)
-        .bind(&evaluation.question_id)
-        .bind(format!(
-            "{voice_session_id}:{}:1:{response_id}:compat",
-            evaluation.question_id
-        ))
-        .bind(&evaluation.label)
-        .bind(concept_status_str(&evaluation.concept_status))
-        .bind(f64::from(evaluation.confidence_score))
-        .bind(source_span_uuid)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(pg_error)?;
-        let Some(inserted) = inserted else {
-            tx.rollback().await.map_err(pg_error)?;
-            return Err(PortError::conflict(
-                "postgres",
-                response_id,
-                "answer evaluation does not match the persisted attempt for this response",
-            ));
+                 RETURNING (xmax = '0'::xid) AS inserted",
+            )
+            .bind(Uuid::new_v4())
+            .bind(voice_session_uuid)
+            .bind(response_id)
+            .bind(&evaluation.question_id)
+            .bind(format!(
+                "{voice_session_id}:{}:1:{response_id}:compat",
+                evaluation.question_id
+            ))
+            .bind(&evaluation.label)
+            .bind(concept_status_str(&evaluation.concept_status))
+            .bind(f64::from(evaluation.confidence_score))
+            .bind(source_span_uuid)
+            .fetch_optional(&mut *tx)
+            .await;
+            match upserted {
+                Ok(Some(inserted)) => {
+                    Self::insert_event_authorization(
+                        &mut tx,
+                        user_id,
+                        study_set_uuid,
+                        voice_session_uuid,
+                        response_id,
+                        EventAuthorizationKind::AnswerEvaluation,
+                        &evaluation,
+                    )
+                    .await?;
+                    tx.commit().await.map_err(pg_error)?;
+                    break inserted;
+                }
+                Ok(None) => {
+                    tx.rollback().await.map_err(pg_error)?;
+                    return Err(PortError::conflict(
+                        "postgres",
+                        response_id,
+                        "answer evaluation does not match the persisted attempt for this response",
+                    ));
+                }
+                Err(error) if is_unique_violation(&error) => {
+                    // The statement aborted this transaction; nothing it did can
+                    // commit, and the retry opens its own.
+                    drop(tx);
+                    if remaining_attempts == 0 {
+                        return Err(duplicate_attempt_key_conflict(response_id));
+                    }
+                }
+                Err(error) => {
+                    drop(tx);
+                    return Err(pg_error(error));
+                }
+            }
         };
-        Self::insert_event_authorization(
-            &mut tx,
-            user_id,
-            study_set_uuid,
-            voice_session_uuid,
-            response_id,
-            EventAuthorizationKind::AnswerEvaluation,
-            &evaluation,
-        )
-        .await?;
-        tx.commit().await.map_err(pg_error)?;
         if inserted {
             self.increment_count(WriteCountKind::AnswerAttempt);
         }
@@ -4297,6 +4337,55 @@ fn count_to_usize(count: i64) -> Result<usize, PortError> {
 
 fn optional_u64_to_i64(value: Option<u64>, label: &str) -> Result<Option<i64>, PortError> {
     value.map(|value| to_i64(value, label)).transpose()
+}
+
+/// How many times one `answer_attempts` upsert may run before its duplicate key
+/// is treated as a real conflict.
+///
+/// `DATA-002` requires concurrent envelope/evaluation writes to converge
+/// "without a duplicate-key adapter error", and Task 4 states the same rule from
+/// the other side: the statement "never leaks SQLSTATE 23505". Migration `0011`
+/// puts *two* unique indexes on `answer_attempts`
+/// (`answer_attempts_voice_session_response_id_idx` and
+/// `answer_attempts_voice_session_idempotency_idx`) and one `ON CONFLICT` clause
+/// arbitrates exactly one of them, so PostgreSQL raises a hard 23505 for a
+/// collision on the other index — `ON CONFLICT` cannot absorb it.
+///
+/// Two different situations reach that error and they need different answers:
+///
+/// 1. Two identical concurrent writers. The loser's arbiter pre-check ran before
+///    the winner's arbiter index tuple existed, so it inserted speculatively and
+///    met the winner's idempotency tuple instead. The winner is committed by the
+///    time the error is raised, so running the same statement again sees it
+///    through the arbiter and takes the `DO UPDATE` branch. That is an idempotent
+///    replay, not a fault.
+/// 2. A different response claiming an already-committed idempotency key. Running
+///    again cannot help; the caller conflicts with committed state.
+///
+/// One bounded retry separates them without a second arbiter, an advisory lock,
+/// or a schema change: the first attempt absorbs the race, and a second identical
+/// failure proves the collision is real and becomes a typed `Conflict`.
+const ANSWER_ATTEMPT_UPSERT_ATTEMPTS: u32 = 2;
+
+/// SQLSTATE 23505 — `unique_violation`. Read from the code, never from the
+/// message text, so a translated or reworded server string cannot change the
+/// adapter's decision.
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| code == "23505")
+}
+
+/// The stable answer for a real idempotency-key collision. The SQLSTATE and the
+/// constraint name stay inside the adapter; callers see the same typed `Conflict`
+/// they see for every other rejected replay.
+fn duplicate_attempt_key_conflict(response_id: &str) -> PortError {
+    PortError::conflict(
+        "postgres",
+        response_id,
+        "answer attempt idempotency key is already claimed by another response",
+    )
 }
 
 /// Every SQL/pool/transaction failure is a durability failure: the store could

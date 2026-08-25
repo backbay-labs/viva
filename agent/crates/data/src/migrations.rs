@@ -3386,6 +3386,267 @@ mod tests {
             .expect("isolated test schema drops cleanly");
     }
 
+    /// `DATA-002`: "without a duplicate-key adapter error". Task 4 Step 4 states
+    /// the same rule from the other side — "it never leaks SQLSTATE 23505".
+    ///
+    /// Migration `0011` puts *two* unique indexes on `answer_attempts`, and
+    /// `ON CONFLICT` arbitrates exactly one of them. A tuple that collides on the
+    /// other index is a hard 23505 that `ON CONFLICT` cannot absorb. This is the
+    /// deterministic form of that collision — a second response claiming an
+    /// already-committed idempotency key — and it must be a typed `Conflict` that
+    /// mutates nothing, on both writers, never a `Durability` carrying the raw
+    /// constraint name.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_answer_attempt_duplicate_idempotency_key_never_leaks_duplicate_key() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&store, &session_id).await;
+
+        // Writer 1: the envelope path, whose idempotency key is caller-supplied
+        // and therefore genuinely collidable across two different responses.
+        let owner = "response-idempotency-owner";
+        let shared_key = "shared-idempotency-key";
+        store
+            .record_answer_attempt_envelope(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                AnswerAttemptEnvelope {
+                    idempotency_key: shared_key.to_owned(),
+                    ..fixture_envelope(owner)
+                },
+            )
+            .await
+            .expect("the first envelope claims the idempotency key");
+        let owner_row_before = attempt_rows(&pool, &session_id, owner).await;
+        assert_eq!(owner_row_before.len(), 1);
+        let counts_before = store.write_counts();
+
+        let thief = "response-idempotency-thief";
+        let envelope_error = store
+            .record_answer_attempt_envelope(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                AnswerAttemptEnvelope {
+                    idempotency_key: shared_key.to_owned(),
+                    ..fixture_envelope(thief)
+                },
+            )
+            .await
+            .expect_err("a second response cannot claim a committed idempotency key");
+        assert_eq!(envelope_error.kind(), PortErrorKind::Conflict);
+        assert!(
+            !envelope_error.reason().contains("duplicate key"),
+            "the adapter must not surface the raw duplicate-key text: {envelope_error:?}"
+        );
+        assert!(attempt_rows(&pool, &session_id, thief).await.is_empty());
+        assert_eq!(
+            attempt_rows(&pool, &session_id, owner).await,
+            owner_row_before
+        );
+        assert_eq!(store.write_counts(), counts_before);
+
+        // Writer 2: the evaluation compat path. Its own key is derived, so the
+        // collision is staged by an envelope that claims that derived key first.
+        let victim = "response-compat-victim";
+        let compat_key = format!(
+            "{session_id}:{}:1:{victim}:compat",
+            fixture_question().question_id
+        );
+        store
+            .record_answer_attempt_envelope(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                AnswerAttemptEnvelope {
+                    idempotency_key: compat_key,
+                    ..fixture_envelope("response-compat-key-owner")
+                },
+            )
+            .await
+            .expect("the staged envelope claims the compat idempotency key");
+        let counts_before = store.write_counts();
+
+        let evaluation_error = store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                victim,
+                fixture_evaluation("mostly correct", ConceptStatus::Strong, 0.84),
+            )
+            .await
+            .expect_err("the compat evaluation cannot claim a committed idempotency key");
+        assert_eq!(evaluation_error.kind(), PortErrorKind::Conflict);
+        assert!(
+            !evaluation_error.reason().contains("duplicate key"),
+            "the adapter must not surface the raw duplicate-key text: {evaluation_error:?}"
+        );
+        assert!(attempt_rows(&pool, &session_id, victim).await.is_empty());
+        assert_eq!(store.write_counts(), counts_before);
+        // A rolled-back evaluation leaves no browser authority behind either.
+        let victim_digests = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM event_authorization_digests
+             WHERE voice_session_id = $1 AND response_id = $2",
+        )
+        .bind(Uuid::parse_str(&session_id).expect("session id is a UUID"))
+        .bind(victim)
+        .fetch_one(&pool)
+        .await
+        .expect("authorization digest row count query succeeds");
+        assert_eq!(victim_digests, 0);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// One `answer_attempts` row, written outside the store so a test can stage a
+    /// specific index collision. Only the columns without a `0011` default are
+    /// bound; the rest are the compat placeholder the evaluation writer itself
+    /// uses.
+    async fn stage_answer_attempt(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        voice_session_uuid: Uuid,
+        response_id: &str,
+        question_id: &str,
+        idempotency_key: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO answer_attempts (
+                 id,
+                 voice_session_id,
+                 response_id,
+                 question_id,
+                 submission_sequence,
+                 idempotency_key,
+                 capture_mode,
+                 capture_status,
+                 answer_content_policy,
+                 pre_provider_state
+             )
+             VALUES ($1, $2, $3, $4, 1, $5, 'typed', 'accepted', 'none', 'evaluation_only_compat')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(voice_session_uuid)
+        .bind(response_id)
+        .bind(question_id)
+        .bind(idempotency_key)
+        .execute(&mut **tx)
+        .await
+        .expect("staged answer attempt inserts");
+    }
+
+    /// The convergence half of `DATA-002`: a duplicate key raised by a racer that
+    /// has since committed the arbiter row must converge, not fail.
+    ///
+    /// The interleaving is staged, not hoped for. `blocker` holds an uncommitted
+    /// row that owns the compat idempotency key under a *different* response, so
+    /// the evaluation's first attempt passes its arbiter pre-check, inserts
+    /// speculatively, and parks on the idempotency index. `winner` then inserts the
+    /// arbiter row for the real response and parks behind that speculative tuple.
+    /// Committing `blocker` kills the first attempt with the duplicate key and
+    /// releases `winner`, so the bounded retry finds a committed arbiter row and
+    /// takes the `DO UPDATE` branch — exactly the production race, with the timing
+    /// pinned. With one attempt instead of two this call returns `Conflict` and the
+    /// evaluation is lost.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_answer_attempt_duplicate_key_retry_converges_on_the_committed_row() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&store, &session_id).await;
+        let session_uuid = Uuid::parse_str(&session_id).expect("session id is a UUID");
+        let question_id = fixture_question().question_id;
+        let response_id = "response-retry-converges";
+        let compat_key = format!("{session_id}:{question_id}:1:{response_id}:compat");
+
+        let mut blocker = pool.begin().await.expect("blocker transaction begins");
+        stage_answer_attempt(
+            &mut blocker,
+            session_uuid,
+            "response-idempotency-blocker",
+            &question_id,
+            &compat_key,
+        )
+        .await;
+
+        let evaluation = fixture_evaluation("mostly correct", ConceptStatus::Strong, 0.84);
+        let writer = {
+            let store = store.clone();
+            let session_id = session_id.clone();
+            let evaluation = evaluation.clone();
+            tokio::spawn(async move {
+                store
+                    .record_answer_evaluation(
+                        "user-1",
+                        "biology-midterm",
+                        &session_id,
+                        response_id,
+                        evaluation,
+                    )
+                    .await
+            })
+        };
+        wait_for_parked_attempt_inserts(&pool, 1).await;
+
+        let winner_key = format!("{session_id}:{question_id}:1:{response_id}:winner");
+        let winner = {
+            let pool = pool.clone();
+            let question_id = question_id.clone();
+            let winner_key = winner_key.clone();
+            tokio::spawn(async move {
+                let mut tx = pool.begin().await.expect("winner transaction begins");
+                stage_answer_attempt(
+                    &mut tx,
+                    session_uuid,
+                    response_id,
+                    &question_id,
+                    &winner_key,
+                )
+                .await;
+                tx.commit().await.expect("winner commits");
+            })
+        };
+        wait_for_parked_attempt_inserts(&pool, 2).await;
+
+        blocker.commit().await.expect("blocker commits");
+        winner.await.expect("winner joins");
+        writer
+            .await
+            .expect("evaluation joins")
+            .expect("the bounded retry converges on the committed arbiter row");
+
+        let rows = attempt_rows(&pool, &session_id, response_id).await;
+        assert_eq!(rows.len(), 1);
+        // The surviving row is the winner's, updated in place: its idempotency key
+        // is the winner's and its evaluation columns are this call's.
+        assert_eq!(rows[0].idempotency_key, winner_key);
+        assert_eq!(rows[0].evaluation_label.as_deref(), Some("mostly correct"));
+        assert_eq!(rows[0].concept_status.as_deref(), Some("strong"));
+        // `DO UPDATE` inserted no physical row, so nothing is counted.
+        assert_eq!(store.write_counts().answer_attempts, 0);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
     #[tokio::test]
     #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
     async fn postgres_record_answer_envelope_and_evaluation_converge_in_either_order() {
