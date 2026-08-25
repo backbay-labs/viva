@@ -9,13 +9,16 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
     "jsx": "react-jsx",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "typeRoots": ["./types", "./node_modules/@types"],
     "baseUrl": ".",
     "paths": {
       "@viva/core": ["packages/core/src/index.ts"],
-      "@viva/core/*": ["packages/core/src/*.ts"],
+      "@viva/core/fixtures": ["packages/core/src/fixtures.ts"],
+      "@viva/core/runtime-validation": ["packages/core/src/runtime-validation.ts"],
+      "@viva/core/testing/fake-evaluator": ["packages/core/src/testing/fake-evaluator.ts"],
       "@viva/tokens": ["packages/tokens/src/index.ts"],
       "@viva/ui-web": ["packages/ui-web/src/index.tsx"]
     }

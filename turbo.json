@@ -53,7 +53,17 @@
       "persistent": true
     },
     "build": {
-      "dependsOn": ["^build"]
+      "dependsOn": ["^build"],
+      "env": [
+        "NEXT_PUBLIC_VIVA_AGENT_HTTP_URL",
+        "NEXT_PUBLIC_VIVA_AGENT_WS_URL",
+        "NEXT_PUBLIC_VIVA_API_URL",
+        "NEXT_PUBLIC_VIVA_VOICE_SESSION_TOKEN",
+        "NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID",
+        "NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID",
+        "NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID"
+      ],
+      "outputs": [".next/**", "!.next/cache/**"]
     },
     "lint": {
       "inputs": ["$TURBO_DEFAULT$", "biome.json", "package.json"],
