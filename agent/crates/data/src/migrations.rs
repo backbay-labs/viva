@@ -1359,10 +1359,342 @@ mod tests {
             .claim_session_token_nonce(claim.clone())
             .await
             .expect_err("replayed nonce claim is rejected");
-        assert_eq!(replay.kind(), PortErrorKind::Unavailable);
+        // `DATA-008`: a reused nonce lost a uniqueness race. Plan 06's taxonomy
+        // reserves `Conflict` for exactly that and names a reused nonce as its
+        // example; `Unavailable` would say the port could not answer at all.
+        assert_eq!(replay.kind(), PortErrorKind::Conflict);
         assert_eq!(replay.port(), "postgres");
         assert_eq!(replay.reason(), "session token nonce already used");
         assert_eq!(session_token_nonce_rows(&pool, &claim).await, 1);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// `DATA-008`: the one clock the nonce boundary table is written against.
+    const NONCE_PRUNE_NOW: u64 = 10_000;
+    /// Claimed early enough that none of the three boundary rows is pruned on the
+    /// way in; the prune under test is the one a later claim performs.
+    const NONCE_PRUNE_EARLIER_NOW: u64 = 9_000;
+    /// `9_939 + 60 < 10_000`: past validity *and* past the published skew.
+    const NONCE_PRUNE_EXPIRED_BEYOND_SKEW: u64 = 9_939;
+    /// `9_940 + 60 == 10_000`: the exact last instant service verification still
+    /// accepts the token, so the nonce must still be there to refuse a replay.
+    const NONCE_PRUNE_SKEW_BOUNDARY: u64 = 9_940;
+    /// Not expired at all.
+    const NONCE_PRUNE_LIVE: u64 = 10_001;
+
+    fn nonce_prune_claim(
+        voice_session_id: &str,
+        nonce: &str,
+        expires_at: u64,
+    ) -> SessionTokenNonceClaim {
+        SessionTokenNonceClaim {
+            user_id: "user-1".to_owned(),
+            study_set_id: "biology-midterm".to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            nonce: nonce.to_owned(),
+            expires_at,
+        }
+    }
+
+    /// The three boundary claims plus the later claim that triggers the prune.
+    fn nonce_prune_boundary_claims(voice_session_id: &str) -> [SessionTokenNonceClaim; 3] {
+        [
+            nonce_prune_claim(
+                voice_session_id,
+                "nonce-expired-beyond-skew",
+                NONCE_PRUNE_EXPIRED_BEYOND_SKEW,
+            ),
+            nonce_prune_claim(
+                voice_session_id,
+                "nonce-skew-boundary",
+                NONCE_PRUNE_SKEW_BOUNDARY,
+            ),
+            nonce_prune_claim(voice_session_id, "nonce-live", NONCE_PRUNE_LIVE),
+        ]
+    }
+
+    fn assert_nonce_replay_refused(error: &agent_domain::PortError, port: &str) {
+        assert_eq!(
+            error.kind(),
+            PortErrorKind::Conflict,
+            "a replayed nonce lost a uniqueness race; it is not an unavailable port"
+        );
+        assert_eq!(error.port(), port);
+        assert_eq!(error.reason(), "session token nonce already used");
+    }
+
+    /// `DATA-008`, in-memory half.
+    ///
+    /// Retention is bounded by the *published* acceptance rule, not by `expires_at`
+    /// alone: `agent_service::config` verifies a session token while
+    /// `expires_at + EXPIRY_CLOCK_SKEW_SECONDS >= now`, so a nonce dropped at
+    /// `expires_at` would leave a 60-second window in which a still-valid token
+    /// could be replayed against an empty ledger.
+    #[tokio::test]
+    async fn memory_nonce_prune_keeps_token_skew_boundary_and_rejects_live_replay() {
+        let store = crate::InMemoryStudyStore::seeded_fixture();
+        record_fixture_session(&store).await;
+        let session_id = "voice-session-1";
+        let claims = nonce_prune_boundary_claims(session_id);
+
+        // All three exist first, or the prune assertions below prove nothing.
+        for claim in &claims {
+            store
+                .claim_session_token_nonce_at(claim.clone(), NONCE_PRUNE_EARLIER_NOW)
+                .expect("boundary nonce is claimed before any of them can be pruned");
+        }
+        assert_eq!(store.snapshot().session_token_nonces.len(), 3);
+
+        // A later claim prunes opportunistically before it claims.
+        let trigger = nonce_prune_claim(session_id, "nonce-prune-trigger", NONCE_PRUNE_LIVE);
+        store
+            .claim_session_token_nonce_at(trigger.clone(), NONCE_PRUNE_NOW)
+            .expect("a fresh claim at the prune clock succeeds");
+
+        let retained = store.snapshot().session_token_nonces;
+        let retained_nonces = retained
+            .iter()
+            .map(|record| record.nonce.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !retained_nonces.contains(&"nonce-expired-beyond-skew"),
+            "9_939 + 60 < 10_000, so the row is past validity and past the skew: {retained_nonces:?}"
+        );
+        assert!(
+            retained_nonces.contains(&"nonce-skew-boundary"),
+            "9_940 + 60 == 10_000 is still accepted by token verification: {retained_nonces:?}"
+        );
+        assert!(
+            retained_nonces.contains(&"nonce-live"),
+            "10_001 has not expired at all: {retained_nonces:?}"
+        );
+        assert_eq!(retained.len(), 3, "{retained_nonces:?}");
+
+        // Replay defense is unweakened for everything still inside the window.
+        for claim in [&claims[1], &claims[2]] {
+            let replay = store
+                .claim_session_token_nonce_at(claim.clone(), NONCE_PRUNE_NOW)
+                .expect_err("a retained nonce cannot be replayed");
+            assert_nonce_replay_refused(&replay, "memory");
+        }
+        assert_eq!(store.snapshot().session_token_nonces.len(), 3);
+
+        // Deletion is immediate and does not wait for expiry: an already-expired row
+        // inserted after this claim's own prune is removed with the retained ones.
+        let late_expired = nonce_prune_claim(session_id, "nonce-late-expired", 9_000);
+        store
+            .claim_session_token_nonce_at(late_expired, NONCE_PRUNE_NOW)
+            .expect("an expired nonce still claims; the prune ran before this insert");
+        assert_eq!(store.snapshot().session_token_nonces.len(), 4);
+
+        store
+            .delete_session_history("user-1", "biology-midterm", session_id)
+            .await
+            .expect("session history deletion succeeds");
+        assert!(
+            store.snapshot().session_token_nonces.is_empty(),
+            "session deletion removes retained and expired nonce rows immediately"
+        );
+
+        // Same for study-set deletion, over a second session's rows.
+        let second_session = "vs-0001";
+        for (nonce, expires_at) in [
+            ("nonce-study-live", NONCE_PRUNE_LIVE),
+            ("nonce-study-expired", 9_000),
+        ] {
+            store
+                .claim_session_token_nonce_at(
+                    nonce_prune_claim(second_session, nonce, expires_at),
+                    NONCE_PRUNE_NOW,
+                )
+                .expect("second-session nonce is claimed");
+        }
+        assert_eq!(store.snapshot().session_token_nonces.len(), 2);
+        store
+            .delete_study_set("user-1", "biology-midterm")
+            .await
+            .expect("study set deletion succeeds");
+        assert!(
+            store.snapshot().session_token_nonces.is_empty(),
+            "study-set deletion removes retained and expired nonce rows immediately"
+        );
+    }
+
+    /// `DATA-008`, durable half. Same boundary table, same clock, same refusals.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_nonce_prune_keeps_token_skew_boundary_and_rejects_live_replay() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        record_fixture_session(&store).await;
+        let session_id = "voice-session-1";
+        let claims = nonce_prune_boundary_claims(session_id);
+
+        for claim in &claims {
+            store
+                .claim_session_token_nonce_at(claim.clone(), NONCE_PRUNE_EARLIER_NOW)
+                .await
+                .expect("boundary nonce is claimed before any of them can be pruned");
+        }
+        for claim in &claims {
+            assert_eq!(session_token_nonce_rows(&pool, claim).await, 1);
+        }
+
+        let trigger = nonce_prune_claim(session_id, "nonce-prune-trigger", NONCE_PRUNE_LIVE);
+        store
+            .claim_session_token_nonce_at(trigger.clone(), NONCE_PRUNE_NOW)
+            .await
+            .expect("a fresh claim at the prune clock succeeds");
+
+        assert_eq!(
+            session_token_nonce_rows(&pool, &claims[0]).await,
+            0,
+            "9_939 + 60 < 10_000, so the row is past validity and past the skew"
+        );
+        assert_eq!(
+            session_token_nonce_rows(&pool, &claims[1]).await,
+            1,
+            "9_940 + 60 == 10_000 is still accepted by token verification"
+        );
+        assert_eq!(
+            session_token_nonce_rows(&pool, &claims[2]).await,
+            1,
+            "10_001 has not expired at all"
+        );
+        assert_eq!(session_token_nonce_rows(&pool, &trigger).await, 1);
+
+        for claim in [&claims[1], &claims[2]] {
+            let replay = store
+                .claim_session_token_nonce_at(claim.clone(), NONCE_PRUNE_NOW)
+                .await
+                .expect_err("a retained nonce cannot be replayed");
+            assert_nonce_replay_refused(&replay, "postgres");
+            assert_eq!(session_token_nonce_rows(&pool, claim).await, 1);
+        }
+
+        let late_expired = nonce_prune_claim(session_id, "nonce-late-expired", 9_000);
+        store
+            .claim_session_token_nonce_at(late_expired.clone(), NONCE_PRUNE_NOW)
+            .await
+            .expect("an expired nonce still claims; the prune ran before this insert");
+        assert_eq!(session_token_nonce_rows(&pool, &late_expired).await, 1);
+
+        store
+            .delete_session_history("user-1", "biology-midterm", session_id)
+            .await
+            .expect("session history deletion succeeds");
+        for claim in [&claims[1], &claims[2], &trigger, &late_expired] {
+            assert_eq!(
+                session_token_nonce_rows(&pool, claim).await,
+                0,
+                "session deletion removes retained and expired nonce rows immediately"
+            );
+        }
+
+        let second_session = "vs-0001";
+        let study_live = nonce_prune_claim(second_session, "nonce-study-live", NONCE_PRUNE_LIVE);
+        let study_expired = nonce_prune_claim(second_session, "nonce-study-expired", 9_000);
+        for claim in [&study_live, &study_expired] {
+            store
+                .claim_session_token_nonce_at(claim.clone(), NONCE_PRUNE_NOW)
+                .await
+                .expect("second-session nonce is claimed");
+            assert_eq!(session_token_nonce_rows(&pool, claim).await, 1);
+        }
+        store
+            .delete_study_set("user-1", "biology-midterm")
+            .await
+            .expect("study set deletion succeeds");
+        for claim in [&study_live, &study_expired] {
+            assert_eq!(
+                session_token_nonce_rows(&pool, claim).await,
+                0,
+                "study-set deletion removes retained and expired nonce rows immediately"
+            );
+        }
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// `DATA-008`: the prune predicate is served by the index migration `0010`
+    /// already created, so bounding retention costs one indexed range delete rather
+    /// than a sequential scan of every nonce ever claimed.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_nonce_prune_uses_existing_expiry_index() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let study_set_uuid = fixture_uuid("biology-midterm").expect("study set fixture UUID");
+        let session_uuid = fixture_uuid("voice-session-1").expect("voice session fixture UUID");
+
+        // Enough rows, and a selective enough predicate, that index selection is a
+        // real choice rather than a rounding error on a three-row table.
+        sqlx::query(
+            "INSERT INTO voice_session_token_nonces
+                 (user_id, study_set_id, voice_session_id, nonce, expires_at)
+             SELECT 'user-1',
+                    $1,
+                    $2,
+                    'plan-nonce-' || generated,
+                    CASE WHEN generated <= 200 THEN 1000 ELSE 2000000000 END
+             FROM generate_series(1, 5000) AS generated",
+        )
+        .bind(study_set_uuid)
+        .bind(session_uuid)
+        .execute(&pool)
+        .await
+        .expect("query-plan fixture rows insert");
+        sqlx::raw_sql("ANALYZE voice_session_token_nonces")
+            .execute(&pool)
+            .await
+            .expect("statistics are collected before the plan is read");
+
+        let mut tx = pool.begin().await.expect("explain transaction begins");
+        // Disabled only for this assertion: it removes the planner's freedom to pick
+        // a scan for cost reasons so the question left is the one under test —
+        // whether an index can serve `expires_at < $1` at all.
+        sqlx::raw_sql("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .expect("sequential scan is disabled for the explain");
+        let plan = sqlx::query_scalar::<_, String>(
+            "EXPLAIN DELETE FROM voice_session_token_nonces WHERE expires_at < $1",
+        )
+        .bind(1_500_i64)
+        .fetch_all(&mut *tx)
+        .await
+        .expect("the prune statement plans")
+        .join("\n");
+        tx.rollback().await.expect("explain transaction rolls back");
+
+        assert!(
+            plan.contains("voice_session_token_nonces_expiry_idx"),
+            "the prune predicate must be served by migration 0010's expiry index:\n{plan}"
+        );
+        let remaining = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM voice_session_token_nonces WHERE nonce LIKE 'plan-nonce-%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query-plan fixture rows are counted");
+        assert_eq!(
+            remaining, 5_000,
+            "EXPLAIN without ANALYZE plans the delete; it never executes it"
+        );
 
         fixture
             .cleanup()

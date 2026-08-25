@@ -33,12 +33,13 @@ use uuid::Uuid;
 
 use crate::{
     memory::{
-        deletion_receipt, generate_file_study_set, generate_paste_study_set, last_reviewed_at,
-        payload_sha256, projection_active_question, require_selected_progression_policy,
-        review_schedule_summaries, turn_outcome_disposition, turn_outcome_transitions,
-        validate_challenge_resolution, validate_turn_outcome, ConceptStatusEventPayload,
-        EventAuthorizationKind, QuestionProgressionRecord, ReviewScheduleEventPayload,
-        DATA_RETENTION_POLICY, DELETED_ROW_CONSTANT, DELETED_STUDY_SET_TITLE,
+        current_epoch_seconds, deletion_receipt, generate_file_study_set, generate_paste_study_set,
+        last_reviewed_at, payload_sha256, projection_active_question,
+        require_selected_progression_policy, review_schedule_summaries, turn_outcome_disposition,
+        turn_outcome_transitions, validate_challenge_resolution, validate_turn_outcome,
+        ConceptStatusEventPayload, EventAuthorizationKind, QuestionProgressionRecord,
+        ReviewScheduleEventPayload, DATA_RETENTION_POLICY, DELETED_ROW_CONSTANT,
+        DELETED_STUDY_SET_TITLE, SESSION_TOKEN_NONCE_SKEW_SECONDS,
     },
     recap_label_buckets, InMemoryStudyStore,
 };
@@ -179,6 +180,97 @@ impl PostgresStudyStore {
         .fetch_one(&self.pool)
         .await
         .map_err(pg_error)
+    }
+
+    /// `DATA-008`: the deterministic nonce claim, with the clock as an argument.
+    ///
+    /// The public port method reads the clock once and calls this; nothing else
+    /// injects a clock, so a caller cannot move the retention boundary.
+    pub(crate) async fn claim_session_token_nonce_at(
+        &self,
+        claim: SessionTokenNonceClaim,
+        now: u64,
+    ) -> Result<(), PortError> {
+        let study_set_uuid = Self::uuid_for(&claim.study_set_id)?;
+        let voice_session_uuid = Self::uuid_for(&claim.voice_session_id)?;
+        let expires_at = i64::try_from(claim.expires_at).map_err(|_| {
+            PortError::invalid_input(
+                "postgres",
+                &claim.nonce,
+                "session token expiry exceeds postgres bigint",
+            )
+        })?;
+
+        // `DATA-004`: a nonce may be claimed before its session row exists, so the
+        // serialization point is the study-set row the deletion finalizer locks
+        // first, not the session row. Taking it here makes a concurrent deletion
+        // either fully before this claim or the reason it is refused.
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        let deleted_at = sqlx::query_scalar::<sqlx::Postgres, Option<DateTime<Utc>>>(
+            "SELECT deleted_at
+             FROM study_sets
+             WHERE id = $1 AND user_id = $2
+             FOR UPDATE",
+        )
+        .bind(study_set_uuid)
+        .bind(&claim.user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        if !matches!(deleted_at, Some(None)) {
+            tx.rollback().await.map_err(pg_error)?;
+            return Err(PortError::unavailable(
+                "postgres",
+                study_set_uuid.to_string(),
+                "study set is not available for this user",
+            ));
+        }
+
+        // `DATA-008`, statement 1 — prune. It runs inside the claim transaction, so
+        // the bound advances on the same traffic that creates the rows and needs no
+        // sweeper. The predicate is `expires_at < now - skew`, matching the service's
+        // acceptance rule `expires_at + skew >= now`: a nonce is kept for as long as
+        // any token carrying it can still be presented, and no longer. Migration
+        // 0010's `voice_session_token_nonces_expiry_idx` serves it directly.
+        let exclusive_cutoff =
+            i64::try_from(now.saturating_sub(SESSION_TOKEN_NONCE_SKEW_SECONDS)).unwrap_or(i64::MAX);
+        sqlx::query("DELETE FROM voice_session_token_nonces WHERE expires_at < $1")
+            .bind(exclusive_cutoff)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_error)?;
+
+        // Statement 2 — claim.
+        let result = sqlx::query(
+            "INSERT INTO voice_session_token_nonces
+                (user_id, study_set_id, voice_session_id, nonce, expires_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&claim.user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .bind(&claim.nonce)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        if result.rows_affected() == 0 {
+            // Commit rather than roll back: the refused insert changed nothing, and
+            // discarding the prune would mean a replay flood — the one workload that
+            // grows this table fastest — never advances its own retention bound.
+            tx.commit().await.map_err(pg_error)?;
+            return Err(PortError::conflict(
+                "postgres",
+                format!(
+                    "{}/{}/{}",
+                    claim.user_id, claim.study_set_id, claim.voice_session_id
+                ),
+                "session token nonce already used",
+            ));
+        }
+        tx.commit().await.map_err(pg_error)?;
+        Ok(())
     }
 
     fn uuid_for(logical_id: &str) -> Result<Uuid, PortError> {
@@ -1351,68 +1443,8 @@ impl StudyMemoryStore for PostgresStudyStore {
         &self,
         claim: SessionTokenNonceClaim,
     ) -> Result<(), PortError> {
-        let study_set_uuid = Self::uuid_for(&claim.study_set_id)?;
-        let voice_session_uuid = Self::uuid_for(&claim.voice_session_id)?;
-        let expires_at = i64::try_from(claim.expires_at).map_err(|_| {
-            PortError::invalid_input(
-                "postgres",
-                &claim.nonce,
-                "session token expiry exceeds postgres bigint",
-            )
-        })?;
-
-        // `DATA-004`: a nonce may be claimed before its session row exists, so the
-        // serialization point is the study-set row the deletion finalizer locks
-        // first, not the session row. Taking it here makes a concurrent deletion
-        // either fully before this claim or the reason it is refused.
-        let mut tx = self.pool.begin().await.map_err(pg_error)?;
-        let deleted_at = sqlx::query_scalar::<sqlx::Postgres, Option<DateTime<Utc>>>(
-            "SELECT deleted_at
-             FROM study_sets
-             WHERE id = $1 AND user_id = $2
-             FOR UPDATE",
-        )
-        .bind(study_set_uuid)
-        .bind(&claim.user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(pg_error)?;
-        if !matches!(deleted_at, Some(None)) {
-            tx.rollback().await.map_err(pg_error)?;
-            return Err(PortError::unavailable(
-                "postgres",
-                study_set_uuid.to_string(),
-                "study set is not available for this user",
-            ));
-        }
-
-        let result = sqlx::query(
-            "INSERT INTO voice_session_token_nonces
-                (user_id, study_set_id, voice_session_id, nonce, expires_at)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(&claim.user_id)
-        .bind(study_set_uuid)
-        .bind(voice_session_uuid)
-        .bind(&claim.nonce)
-        .bind(expires_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_error)?;
-        if result.rows_affected() == 0 {
-            tx.rollback().await.map_err(pg_error)?;
-            return Err(PortError::unavailable(
-                "postgres",
-                format!(
-                    "{}/{}/{}",
-                    claim.user_id, claim.study_set_id, claim.voice_session_id
-                ),
-                "session token nonce already used",
-            ));
-        }
-        tx.commit().await.map_err(pg_error)?;
-        Ok(())
+        self.claim_session_token_nonce_at(claim, current_epoch_seconds())
+            .await
     }
 
     async fn close_voice_session(

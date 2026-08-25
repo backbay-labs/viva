@@ -654,6 +654,28 @@ pub struct FixtureIdTranslation {
     pub storage_uuid: Uuid,
 }
 
+/// `DATA-008`: the published session-token clock skew, in seconds.
+///
+/// This mirrors `agent_service::config::EXPIRY_CLOCK_SKEW_SECONDS`, whose
+/// verification rule is `claims.expires_at + EXPIRY_CLOCK_SKEW_SECONDS < now`
+/// rejects. `data` cannot import it — `agent-service` depends on this crate, not
+/// the other way round — so the number is restated here with the rule it serves:
+/// a nonce must outlive every token that can still be presented with it, or
+/// bounding retention would open exactly the replay window the ledger exists to
+/// close. If Plan 08 ever changes that constant, this one changes with it.
+pub(crate) const SESSION_TOKEN_NONCE_SKEW_SECONDS: u64 = 60;
+
+/// Wall-clock epoch seconds, read once per port call.
+///
+/// A clock before the epoch is impossible in practice and would only make the
+/// retention window wider, never narrower, so it saturates to zero rather than
+/// panicking inside a store write.
+pub(crate) fn current_epoch_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 /// Fixture logical id to durable storage UUID, in both directions.
 ///
 /// Every id below names a checked-in fixture, never learner data: the seeded
@@ -868,6 +890,49 @@ impl InMemoryStudyStore {
             .read()
             .expect("memory store lock poisoned")
             .clone()
+    }
+
+    /// `DATA-008`: the deterministic nonce claim, with the clock as an argument.
+    ///
+    /// The public port method reads the clock once and calls this; nothing else
+    /// injects a clock, so a caller cannot move the retention boundary.
+    pub(crate) fn claim_session_token_nonce_at(
+        &self,
+        claim: SessionTokenNonceClaim,
+        now: u64,
+    ) -> Result<(), PortError> {
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        Self::study_set_locked(&state, &claim.user_id, &claim.study_set_id)?;
+        // Prune before the claim, under the same write lock, so no observer can see
+        // a ledger that has forgotten a nonce whose token is still presentable.
+        //
+        // The boundary is `expires_at + skew >= now`, not `expires_at >= now`:
+        // service verification accepts a token for a further
+        // `SESSION_TOKEN_NONCE_SKEW_SECONDS`, and dropping the nonce at `expires_at`
+        // would hand that whole interval to a replay.
+        state.session_token_nonces.retain(|record| {
+            record
+                .expires_at
+                .saturating_add(SESSION_TOKEN_NONCE_SKEW_SECONDS)
+                >= now
+        });
+        if state.session_token_nonces.iter().any(|used| {
+            used.user_id == claim.user_id
+                && used.study_set_id == claim.study_set_id
+                && used.voice_session_id == claim.voice_session_id
+                && used.nonce == claim.nonce
+        }) {
+            return Err(PortError::conflict(
+                "memory",
+                format!(
+                    "{}/{}/{}",
+                    claim.user_id, claim.study_set_id, claim.voice_session_id
+                ),
+                "session token nonce already used",
+            ));
+        }
+        state.session_token_nonces.push(claim);
+        Ok(())
     }
 
     pub fn fixture_id_translation(logical_id: &str) -> Result<FixtureIdTranslation, PortError> {
@@ -3245,25 +3310,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         &self,
         claim: SessionTokenNonceClaim,
     ) -> Result<(), PortError> {
-        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
-        Self::study_set_locked(&state, &claim.user_id, &claim.study_set_id)?;
-        if state.session_token_nonces.iter().any(|used| {
-            used.user_id == claim.user_id
-                && used.study_set_id == claim.study_set_id
-                && used.voice_session_id == claim.voice_session_id
-                && used.nonce == claim.nonce
-        }) {
-            return Err(PortError::unavailable(
-                "memory",
-                format!(
-                    "{}/{}/{}",
-                    claim.user_id, claim.study_set_id, claim.voice_session_id
-                ),
-                "session token nonce already used",
-            ));
-        }
-        state.session_token_nonces.push(claim);
-        Ok(())
+        self.claim_session_token_nonce_at(claim, current_epoch_seconds())
     }
 
     async fn close_voice_session(
@@ -3658,6 +3705,16 @@ impl StudyMemoryStore for InMemoryStudyStore {
             session.terminal_reason = Some(DELETED_ROW_CONSTANT.to_owned());
         }
         remove_session_artifacts(&mut state, user_id, study_set_id, &affected_sessions);
+        // `DATA-008`/`DATA-004`: nonces are scoped to the *set*, not to the session
+        // rows that happen to exist. A nonce is legitimately claimable before its
+        // session row is written — `claim_session_token_nonce` locks the study set
+        // for exactly that reason — so scoping this removal by `affected_sessions`
+        // would leave a learner-scoped row behind for every session that never
+        // opened. The durable backend deletes by `(user_id, study_set_id)`; this is
+        // the same statement.
+        state
+            .session_token_nonces
+            .retain(|record| record.user_id != user_id || record.study_set_id != study_set_id);
 
         // `D-05 HARD_PURGE_TEXT`: learner-authored and learner-derived material is
         // removed, not deactivated. Tombstoning a document and deactivating a
