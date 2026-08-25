@@ -40,6 +40,30 @@ const MAX_RETRY_PROMPT_SCALARS: usize = 240;
 /// source outside the bound rubric is invalid output, not feedback.
 const SOURCE_ID_PREFIXES: [&str; 2] = ["src-", "source:"];
 
+/// Tool arguments that would let a model, adapter, browser, or route claim
+/// review-scheduling authority.
+///
+/// D-01 makes every one of these a server fact: the due date and its cap come
+/// from `review_schedule.rs`, the card state and store revision never leave the
+/// server, the exam instant and its label come from the persisted study set, and
+/// the policy identifier is the recorded D-01 constant. A tool call that names one
+/// is refused rather than silently ignored, so a caller cannot believe it steered
+/// a schedule it did not steer.
+const RESERVED_SCHEDULING_ARGUMENTS: [&str; 12] = [
+    "due_at",
+    "uncapped_due_at",
+    "card",
+    "card_state",
+    "stability",
+    "difficulty",
+    "exam_at",
+    "exam_label",
+    "policy_id",
+    "cap_reason",
+    "revision",
+    "schema_version",
+];
+
 #[derive(Clone)]
 pub struct AuthorizedStudySession {
     pub user_id: String,
@@ -152,6 +176,7 @@ impl VivaToolExecutor {
         response_id: &str,
         proposal: &ToolProposal,
     ) -> Result<Value, ToolExecutionError> {
+        reject_scheduling_authority_arguments(proposal.arguments())?;
         let question_id = string_arg(proposal.arguments(), "question_id")?;
         let answer_text = raw_string_arg(proposal.arguments(), "answer_text")?;
         let transcript_confidence =
@@ -256,10 +281,78 @@ impl VivaToolExecutor {
                 outcome,
             )
             .await?;
+        // The schedule is derived from the row the store actually kept, so a
+        // replay schedules the persisted outcome rather than the one this call
+        // recomputed.
+        self.schedule_persisted_outcome(&persisted.turn_outcome)
+            .await?;
         Ok(json!({
             "turn_outcome": persisted.turn_outcome,
             "record": persisted.record,
         }))
+    }
+
+    /// `LEARN-003A` (D-01A): bind a persisted evaluated outcome to the one
+    /// authoritative review schedule.
+    ///
+    /// Everything Plan 03 owns stays Plan 03's: this reads
+    /// `review_scheduling_context` for the store's exam instant and prior card,
+    /// hands `review_schedule.rs` only the server-derived status plus provenance
+    /// and the injected clock, and writes through
+    /// `persist_review_schedule_decision`. It computes no date, keeps no second
+    /// card, and returns no learner-visible schedule of its own.
+    ///
+    /// A deferred outcome skips this path entirely: a deferral is a persisted
+    /// fact, not a graded review.
+    ///
+    /// The authorized response identity is the idempotency source, so a replay
+    /// reaches the store's existing per-response guard and the first decision
+    /// stays authoritative. That is also what repairs a turn whose outcome
+    /// committed and whose schedule did not: the retry replays the outcome and
+    /// completes the schedule instead of grading the answer twice.
+    async fn schedule_persisted_outcome(
+        &self,
+        outcome: &TurnOutcome,
+    ) -> Result<(), ToolExecutionError> {
+        let TurnResolution::Evaluated {
+            concept_transitions,
+            ..
+        } = &outcome.resolution
+        else {
+            return Ok(());
+        };
+        // D-01: read the injected clock exactly once for this outcome.
+        let now = self.clock.now();
+        for transition in concept_transitions {
+            let context = self
+                .store
+                .review_scheduling_context(
+                    &self.session.user_id,
+                    &self.session.study_set_id,
+                    &transition.concept_id,
+                )
+                .await?;
+            let review = ReviewOutcomeV1 {
+                status: transition.to_status.clone(),
+                // A graded turn carries no server-owned hint or miss counter.
+                // D-01 keeps unknown provenance null rather than coercing it to
+                // zero, and provenance can never move the rating or the date.
+                hint_count: None,
+                miss_count: None,
+            };
+            let decision = decide_review_schedule(now, &review, &context)?;
+            self.store
+                .persist_review_schedule_decision(
+                    &self.session.user_id,
+                    &self.session.study_set_id,
+                    &self.session.voice_session_id,
+                    &outcome.response_id,
+                    &transition.concept_id,
+                    decision,
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     /// The persisted status each rubric concept holds immediately before this
@@ -441,13 +534,8 @@ impl VivaToolExecutor {
         response_id: &str,
         proposal: &ToolProposal,
     ) -> Result<Value, ToolExecutionError> {
+        reject_scheduling_authority_arguments(proposal.arguments())?;
         let concept_id = string_arg(proposal.arguments(), "concept_id")?;
-        if proposal.arguments().get("due_at").is_some() {
-            return Err(ToolExecutionError::InvalidArguments(
-                "due_at is not an authoritative tool argument; @viva/core computes review dates"
-                    .to_owned(),
-            ));
-        }
         let status = concept_status_arg(proposal.arguments(), "status")?;
         // D-01: read the injected clock exactly once for this outcome, then take
         // every other authoritative input from the scoped store context.
@@ -550,6 +638,23 @@ fn bind_study_set_and_session(
         return Err(ToolExecutionError::InvalidArguments(
             "tool call is not bound to the authorized session".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+/// Refuse any tool argument that would claim review-scheduling authority.
+///
+/// Refusal rather than silent removal is the point: a caller that believes it set
+/// a due date and is quietly overruled learns nothing, while a caller that is
+/// refused cannot later be told its value was honoured.
+fn reject_scheduling_authority_arguments(args: &Value) -> Result<(), ToolExecutionError> {
+    for name in RESERVED_SCHEDULING_ARGUMENTS {
+        if args.get(name).is_some() {
+            return Err(ToolExecutionError::InvalidArguments(format!(
+                "`{name}` is a server-owned review scheduling fact and is not an \
+                 authoritative tool argument"
+            )));
+        }
     }
     Ok(())
 }

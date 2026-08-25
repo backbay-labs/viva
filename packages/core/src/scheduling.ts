@@ -143,6 +143,27 @@ export type ReviewScheduleItem = {
   ignoredAdvisorDueAt?: string;
 };
 
+/**
+ * The exact phrase each cap candidate contributes to `explanation[]`.
+ *
+ * `explanation[]` is the learner/operator-facing reasoning trail, so an entry
+ * here is a causal claim: it says this candidate is why the date moved. A
+ * candidate that did not strictly lower the running due date contributes
+ * nothing — a non-binding cap that still explained itself would assert a cause
+ * that had no effect. Provenance lines (the FSRS rating, a recorded hint, the
+ * prior-miss count, an ignored advisor date) are separate: they state facts
+ * about the outcome and claim no effect on the date.
+ */
+export const REVIEW_CAP_EXPLANATIONS = {
+  exam: "exam-near cap",
+  miss: "missed-status cap",
+  hint: "hint-assisted cap",
+  centrality: "high-centrality cap",
+  recency: "session recency cap",
+} as const satisfies Readonly<Record<string, string>>;
+
+export type ReviewCapCandidate = keyof typeof REVIEW_CAP_EXPLANATIONS;
+
 export function conceptStatusToRating(status: ConceptStatus): Grade {
   switch (status) {
     case "missed":
@@ -292,7 +313,7 @@ export function scheduleConceptReview(input: ReviewScheduleInput): ReviewSchedul
   recordProvenance(input, decision, explanation);
 
   const authoritativeDueAt = new Date(decision.due_at);
-  const dueAt = applyDisplayUrgencyCaps(authoritativeDueAt, input, explanation);
+  const dueAt = applyCapCandidates(decision, authoritativeDueAt, input, explanation);
   const item: ReviewScheduleItem = {
     conceptId: input.conceptId,
     label: input.label,
@@ -320,6 +341,15 @@ export function buildReviewSchedule(inputs: ReviewScheduleInput[]): ReviewSchedu
     .sort((a, b) => a.dueAt.getTime() - b.dueAt.getTime() || a.label.localeCompare(b.label));
 }
 
+/**
+ * Facts about the graded outcome, in the order they were recorded.
+ *
+ * None of these lines claims to have moved the date; the causal claims all live
+ * in {@link REVIEW_CAP_EXPLANATIONS} and are pushed only by a binding cap. The
+ * previous "session recency included" line was removed for exactly that reason:
+ * `lastReviewedAt` reaches the schedule only through the recency cap, so saying
+ * it was "included" whenever it was supplied asserted an effect it never had.
+ */
 function recordProvenance(
   input: ReviewScheduleInput,
   decision: ReviewScheduleDecisionV1,
@@ -335,57 +365,79 @@ function recordProvenance(
   if (input.centrality >= 90) {
     explanation.push("high-centrality concept");
   }
-  if (input.lastReviewedAt) {
-    explanation.push("session recency included");
-  }
   if (input.priorCard) {
     explanation.push(`review ${decision.card.reps} of this concept`);
   }
   if (input.advisorDueAt) {
     explanation.push("advisor due date ignored");
   }
-  if (decision.cap_reason === "exam_margin") {
-    explanation.push("exam-near cap");
-  }
-  if (decision.cap_reason === "past_exam") {
-    explanation.push("exam-near cap: the exam has already passed");
-  }
 }
 
-function applyDisplayUrgencyCaps(
+/**
+ * Walk the cap candidates in one fixed order, keeping the running due date and
+ * explaining only the candidates that strictly lowered it.
+ *
+ * The exam candidate comes first because it is already applied: Plan 03's
+ * `decideReviewSchedule` computed `authoritativeDueAt` from the uncapped FSRS
+ * date and set `cap_reason` if and only if the exam margin strictly lowered it.
+ * The remaining candidates are display urgency shaping applied on top of that
+ * authoritative date; each can pull the shown date earlier, never later.
+ *
+ * The resulting date is the minimum over the same candidate set as before, so
+ * ordering changes which causes are reported, never what the learner is shown.
+ */
+function applyCapCandidates(
+  decision: ReviewScheduleDecisionV1,
   authoritativeDueAt: Date,
   input: ReviewScheduleInput,
   explanation: string[],
 ): Date {
-  const cap = capDays(input, explanation);
-  if (cap === undefined) return authoritativeDueAt;
-  return minDate(authoritativeDueAt, addDays(input.now, cap));
+  let dueAt = authoritativeDueAt;
+
+  if (decision.cap_reason === "exam_margin") {
+    explanation.push(REVIEW_CAP_EXPLANATIONS.exam);
+  }
+  if (decision.cap_reason === "past_exam") {
+    explanation.push(`${REVIEW_CAP_EXPLANATIONS.exam}: the exam has already passed`);
+  }
+
+  for (const candidate of displayCapCandidates(input)) {
+    if (candidate.dueAt.getTime() >= dueAt.getTime()) continue;
+    dueAt = candidate.dueAt;
+    explanation.push(REVIEW_CAP_EXPLANATIONS[candidate.candidate]);
+  }
+
+  return dueAt;
 }
 
-function capDays(input: ReviewScheduleInput, explanation: string[]): number | undefined {
-  const caps: number[] = [];
-  if (input.status === "missed") caps.push(1);
-  if (input.hinted) caps.push(2);
-  if (input.centrality >= 90) caps.push(input.status === "strong" ? 3 : 2);
-  const recencyCap = recencyCapDays(input, explanation);
-  if (recencyCap !== undefined) caps.push(recencyCap);
-  return caps.length > 0 ? Math.min(...caps) : undefined;
+type DisplayCapCandidate = Readonly<{ candidate: ReviewCapCandidate; dueAt: Date }>;
+
+function displayCapCandidates(input: ReviewScheduleInput): DisplayCapCandidate[] {
+  const candidates: DisplayCapCandidate[] = [];
+  if (input.status === "missed") {
+    candidates.push({ candidate: "miss", dueAt: addDays(input.now, 1) });
+  }
+  if (input.hinted) {
+    candidates.push({ candidate: "hint", dueAt: addDays(input.now, 2) });
+  }
+  if (input.centrality >= 90) {
+    candidates.push({
+      candidate: "centrality",
+      dueAt: addDays(input.now, input.status === "strong" ? 3 : 2),
+    });
+  }
+  const recencyCap = recencyCapDays(input);
+  if (recencyCap !== undefined) {
+    candidates.push({ candidate: "recency", dueAt: addDays(input.now, recencyCap) });
+  }
+  return candidates;
 }
 
-function recencyCapDays(
-  { lastReviewedAt, now }: ReviewScheduleInput,
-  explanation: string[],
-): number | undefined {
+function recencyCapDays({ lastReviewedAt, now }: ReviewScheduleInput): number | undefined {
   if (!lastReviewedAt) return undefined;
   const daysSinceReview = Math.floor((now.getTime() - lastReviewedAt.getTime()) / DAY_MS);
-  if (daysSinceReview >= 21) {
-    explanation.push("session recency cap");
-    return 2;
-  }
-  if (daysSinceReview >= 7) {
-    explanation.push("session recency cap");
-    return 3;
-  }
+  if (daysSinceReview >= 21) return 2;
+  if (daysSinceReview >= 7) return 3;
   return undefined;
 }
 
@@ -400,10 +452,6 @@ function addDays(date: Date, days: number): Date {
   return new Date(date.getTime() + days * DAY_MS);
 }
 
-function minDate(a: Date, b: Date): Date {
-  return a.getTime() <= b.getTime() ? a : b;
-}
-
 function ratingName(rating: 1 | 2 | 3 | 4): string {
   switch (rating) {
     case 1:
@@ -415,6 +463,82 @@ function ratingName(rating: 1 | 2 | 3 | 4): string {
     case 4:
       return "Easy";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Consuming the persisted D-01A schedule (fail closed).
+//
+// `AuthenticatedStudyProjectionV1.reviewSchedule` is produced server-side from
+// persisted `ReviewScheduleDecisionV1` rows. The browser's whole job is to format
+// what it was given: nothing below computes, adjusts, or estimates a due date, and
+// a concept the server did not schedule has no interval at all rather than a
+// status-shaped guess.
+// ---------------------------------------------------------------------------
+
+/**
+ * The one authority D-01 selected. `core_fsrs_read_time` belongs to the rejected
+ * Branch B; a projection carrying it is rejected rather than rendered.
+ */
+export const VIVA_REVIEW_SELECTED_AUTHORITY = "server_persisted_fsrs" as const;
+
+/** One browser-safe review entry from the authenticated study projection. */
+export type ProjectedReviewScheduleItem = Readonly<{
+  conceptId: string;
+  dueAt: string;
+  authority: typeof VIVA_REVIEW_SELECTED_AUTHORITY;
+}>;
+
+/**
+ * The learner-visible interval for one concept, read only from the persisted
+ * projection.
+ *
+ * Returns `null` when the projection scheduled no review for that concept — a
+ * concept whose exam has already passed, or one that has never been graded. This
+ * is the replacement for the uncapped status-only estimate: two surfaces reading
+ * the same projection entry cannot disagree about the same concept's interval.
+ *
+ * Throws on a projection that cannot be trusted: a duplicated concept, an
+ * unparseable date, or an authority the recorded decision did not select.
+ */
+export function reviewIntervalFromProjection(
+  schedule: readonly ProjectedReviewScheduleItem[],
+  conceptId: string,
+  now: Date,
+): string | null {
+  const dueAt = reviewDueAtFromProjection(schedule, conceptId);
+  return dueAt === null ? null : humanInterval(now, dueAt);
+}
+
+/**
+ * The persisted due instant for one concept, or `null` when the projection
+ * scheduled none. Same fail-closed rules as {@link reviewIntervalFromProjection}.
+ */
+export function reviewDueAtFromProjection(
+  schedule: readonly ProjectedReviewScheduleItem[],
+  conceptId: string,
+): Date | null {
+  const seen = new Set<string>();
+  let found: Date | null = null;
+  for (const item of schedule) {
+    if (seen.has(item.conceptId)) {
+      throw new Error(`review projection carries a duplicate entry for \`${item.conceptId}\``);
+    }
+    seen.add(item.conceptId);
+    if (item.authority !== VIVA_REVIEW_SELECTED_AUTHORITY) {
+      throw new Error(
+        `review projection entry for \`${item.conceptId}\` carries authority ` +
+          `\`${String(item.authority)}\`, not the selected \`${VIVA_REVIEW_SELECTED_AUTHORITY}\``,
+      );
+    }
+    const dueAt = new Date(item.dueAt);
+    if (Number.isNaN(dueAt.getTime())) {
+      throw new Error(
+        `review projection entry for \`${item.conceptId}\` carries an unparseable due date`,
+      );
+    }
+    if (item.conceptId === conceptId) found = dueAt;
+  }
+  return found;
 }
 
 // ---------------------------------------------------------------------------

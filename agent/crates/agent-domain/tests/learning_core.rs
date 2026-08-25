@@ -23,8 +23,8 @@ use agent_domain::{
         StudySessionRecap as StudySessionRecapV2, VIVA_STUDY_SESSION_RECAP_SCHEMA,
     },
     study_projection::{
-        StudyProjectionConceptV1, StudyProjectionQuestionProgressV1, StudyProjectionSessionV1,
-        StudyProjectionStudySetV1, StudyProjectionVersionV1,
+        StudyProjectionConceptV1, StudyProjectionQuestionProgressV1, StudyProjectionReviewItemV1,
+        StudyProjectionSessionV1, StudyProjectionStudySetV1, StudyProjectionVersionV1,
     },
     AnswerEvaluation,
     AnswerEvaluator,
@@ -49,7 +49,10 @@ use agent_domain::{
     QuestionDisposition,
     RecapBuildError,
     ReviewScheduleAuthority,
+    ReviewScheduleCapReasonV1,
+    ReviewScheduleDecisionV1,
     ReviewScheduleSummary,
+    ReviewSchedulingContextV1,
     RubricCriterionV1,
     SessionLearningEvidence,
     SourceConfidence,
@@ -63,6 +66,9 @@ use agent_domain::{
     TurnOutcomeRecordReceipt,
     TurnResolution,
     VivaToolExecutor,
+    VIVA_REVIEW_EXAM_MARGIN_SECONDS,
+    VIVA_REVIEW_SCHEDULE_POLICY_ID,
+    VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -76,6 +82,16 @@ const SOURCE_DONOR: &str = "src-lec5-slide-18";
 const SOURCE_GRADIENT: &str = "src-lec5-slide-19";
 const SOURCE_COUPLING: &str = "src-lec5-slide-20";
 const NOW: &str = "2026-08-24T14:30:00.000Z";
+/// A later wall clock for replay/retry cases: a replayed tool call reads a new
+/// instant, so a schedule guard keyed on the computed date would silently write a
+/// second review. Plan 03 keys the guard on the graded outcome instead.
+const LATER: &str = "2026-08-24T18:45:00.000Z";
+/// Persisted exam instants. Only the instant is authoritative; the study set's
+/// `exam_label` is display copy and never enters the calculation.
+const EXAM_FAR_AT: &str = "2026-10-24T14:30:00.000Z";
+const EXAM_INSIDE_MARGIN_AT: &str = "2026-08-27T09:00:00.000Z";
+const EXAM_INSIDE_MARGIN_DUE_AT: &str = "2026-08-26T09:00:00.000Z";
+const EXAM_ALREADY_PAST_AT: &str = "2026-08-23T09:00:00.000Z";
 
 const TURN_OUTCOMES_FIXTURE: &str =
     include_str!("../../../fixtures/learning-core/turn-outcomes-v1.json");
@@ -259,18 +275,71 @@ impl AnswerEvaluator for UnreachableEvaluator {
 // Plan-04-owned in-test store.
 // ---------------------------------------------------------------------------
 
+/// One persisted D-01A decision row.
+///
+/// The replay key is exactly the one Plan 03's `persist_review_schedule_decision`
+/// documents: the graded outcome's identity plus the outcome payload, never the
+/// schedule that payload produced. A replay reads a later wall clock and therefore
+/// recomputes a different `due_at`/`generated_at`, so a guard keyed on those would
+/// let the replay write a second review and advance the persisted card.
+#[derive(Clone, Debug)]
+struct PersistedScheduleDecision {
+    user_id: String,
+    study_set_id: String,
+    voice_session_id: String,
+    response_id: String,
+    concept_id: String,
+    payload_key: String,
+    decision: ReviewScheduleDecisionV1,
+}
+
+impl PersistedScheduleDecision {
+    fn identifies(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+    ) -> bool {
+        self.user_id == user_id
+            && self.study_set_id == study_set_id
+            && self.voice_session_id == voice_session_id
+            && self.response_id == response_id
+            && self.concept_id == concept_id
+    }
+}
+
+/// The graded-outcome half of the replay key: concept, policy, status, rating, and
+/// provenance. Dates are deliberately absent.
+fn schedule_payload_key(concept_id: &str, decision: &ReviewScheduleDecisionV1) -> String {
+    format!(
+        "{concept_id}|{}|{:?}|{}|{:?}|{:?}",
+        decision.policy_id,
+        decision.status,
+        decision.rating,
+        decision.hint_count,
+        decision.miss_count,
+    )
+}
+
 #[derive(Default)]
 struct FakeLearningStore {
     question: Option<StudyQuestion>,
     sources: BTreeMap<String, StudySourceReference>,
     concept_labels: Vec<ConceptLabel>,
-    review_decisions: Vec<ReviewScheduleSummary>,
     statuses: Mutex<BTreeMap<String, ConceptStatus>>,
     outcomes: Mutex<Vec<TurnOutcome>>,
     challenges: Mutex<Vec<ChallengeResolution>>,
     persisted_recaps: Mutex<Vec<Value>>,
     evidence_unavailable: bool,
     recap_persistence_fails: bool,
+    /// The store-owned exam instant. D-01 forbids taking it from a tool argument.
+    exam_at: Option<String>,
+    /// Display copy only. Nothing below reads it while scheduling.
+    exam_label: Option<String>,
+    schedule_decisions: Mutex<Vec<PersistedScheduleDecision>>,
+    schedule_persistence_fails: Mutex<bool>,
 }
 
 impl FakeLearningStore {
@@ -329,11 +398,6 @@ impl FakeLearningStore {
         self.challenges.lock().expect("challenges lock").clone()
     }
 
-    fn with_review_decisions(mut self, decisions: Vec<ReviewScheduleSummary>) -> Self {
-        self.review_decisions = decisions;
-        self
-    }
-
     fn without_session_evidence(mut self) -> Self {
         self.evidence_unavailable = true;
         self
@@ -341,6 +405,67 @@ impl FakeLearningStore {
 
     fn persisted_recaps(&self) -> Vec<Value> {
         self.persisted_recaps.lock().expect("recaps lock").clone()
+    }
+
+    /// Bind a persisted exam instant plus its display label.
+    fn with_exam(mut self, exam_at: &str, exam_label: &str) -> Self {
+        self.exam_at = Some(exam_at.to_owned());
+        self.exam_label = Some(exam_label.to_owned());
+        self
+    }
+
+    /// A study set that shows an exam label but has recorded no exam instant.
+    fn with_exam_label_only(mut self, exam_label: &str) -> Self {
+        self.exam_label = Some(exam_label.to_owned());
+        self
+    }
+
+    fn set_schedule_persistence_failure(&self, fails: bool) {
+        *self
+            .schedule_persistence_fails
+            .lock()
+            .expect("schedule failure lock") = fails;
+    }
+
+    fn schedule_decisions(&self) -> Vec<PersistedScheduleDecision> {
+        self.schedule_decisions
+            .lock()
+            .expect("schedule decisions lock")
+            .clone()
+    }
+
+    fn decisions_for(&self, concept_id: &str) -> Vec<ReviewScheduleDecisionV1> {
+        self.schedule_decisions()
+            .into_iter()
+            .filter(|row| row.concept_id == concept_id)
+            .map(|row| row.decision)
+            .collect()
+    }
+
+    fn latest_decision_for(&self, concept_id: &str) -> Option<ReviewScheduleDecisionV1> {
+        self.decisions_for(concept_id).pop()
+    }
+
+    /// The D-01 authenticated read model: the latest persisted decision per
+    /// concept, with `past_exam`-capped decisions excluded because no future
+    /// review exists for them. Ordered by concept ID so two reads agree.
+    fn learner_visible_reviews(&self) -> Vec<(String, String)> {
+        let mut latest: BTreeMap<String, ReviewScheduleDecisionV1> = BTreeMap::new();
+        for row in self.schedule_decisions() {
+            latest.insert(row.concept_id.clone(), row.decision);
+        }
+        latest
+            .into_iter()
+            .filter(|(_, decision)| {
+                decision.cap_reason != Some(ReviewScheduleCapReasonV1::PastExam)
+            })
+            .map(|(concept_id, decision)| {
+                (
+                    concept_id,
+                    agent_domain::format_rfc3339_millis(decision.due_at),
+                )
+            })
+            .collect()
     }
 }
 
@@ -420,6 +545,96 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
             concept_id,
             "legacy due-date writes are not implemented by this store",
         ))
+    }
+
+    /// Plan 03's authoritative scheduling inputs: the store's own exam instant and
+    /// the latest persisted v1 card for the concept. Neither can come from a tool
+    /// argument.
+    async fn review_scheduling_context(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<ReviewSchedulingContextV1, PortError> {
+        let exam_at = match self.exam_at.as_deref() {
+            Some(raw) => Some(agent_domain::parse_utc_instant(raw).ok_or_else(|| {
+                PortError::invalid_input(
+                    "fake_store",
+                    concept_id,
+                    "the persisted exam instant does not parse",
+                )
+            })?),
+            None => None,
+        };
+        Ok(ReviewSchedulingContextV1 {
+            schema_version: VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+            exam_at,
+            card: self
+                .latest_decision_for(concept_id)
+                .map(|decision| decision.card),
+        })
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        decision: ReviewScheduleDecisionV1,
+    ) -> Result<Value, PortError> {
+        decision.validate().map_err(|error| {
+            PortError::invalid_input("fake_store", concept_id, error.to_string())
+        })?;
+        if *self
+            .schedule_persistence_fails
+            .lock()
+            .expect("schedule failure lock")
+        {
+            return Err(PortError::durability(
+                "fake_store",
+                concept_id,
+                "the review schedule decision could not be committed",
+            ));
+        }
+
+        let payload_key = schedule_payload_key(concept_id, &decision);
+        let mut rows = self
+            .schedule_decisions
+            .lock()
+            .expect("schedule decisions lock");
+        if let Some(stored) = rows.iter().find(|row| {
+            row.identifies(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+            )
+        }) {
+            if stored.payload_key != payload_key {
+                return Err(PortError::conflict(
+                    "fake_store",
+                    concept_id,
+                    "a different graded payload was already scheduled under this response",
+                ));
+            }
+            // A replay writes nothing: the first decision stays authoritative and
+            // the persisted FSRS memory does not advance.
+            return Ok(stored.decision.public_summary(concept_id));
+        }
+        let summary = decision.public_summary(concept_id);
+        rows.push(PersistedScheduleDecision {
+            user_id: user_id.to_owned(),
+            study_set_id: study_set_id.to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            response_id: response_id.to_owned(),
+            concept_id: concept_id.to_owned(),
+            payload_key,
+            decision,
+        });
+        Ok(summary)
     }
 
     async fn record_recap(
@@ -533,7 +748,17 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
             voice_session_id: voice_session_id.to_owned(),
             outcomes: self.recorded_outcomes(),
             concept_labels: self.concept_labels.clone(),
-            review_decisions: self.review_decisions.clone(),
+            // Under D-01A the recap's review entries are the persisted decisions,
+            // never a schedule this store recomputed.
+            review_decisions: self
+                .learner_visible_reviews()
+                .into_iter()
+                .map(|(concept_id, due_at)| ReviewScheduleSummary {
+                    concept_id,
+                    due_at,
+                    authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+                })
+                .collect(),
         })
     }
 
@@ -569,6 +794,12 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
         study_set_id: &str,
         voice_session_id: &str,
     ) -> Result<AuthenticatedStudyProjectionV1, PortError> {
+        // One persisted decision set feeds both the concept `due_at` and the
+        // projection's `review_schedule`; nothing here recomputes a due date.
+        let reviews = self
+            .learner_visible_reviews()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
         let concepts = self
             .concept_labels
             .iter()
@@ -577,7 +808,7 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
                 label: label.label.clone(),
                 status: self.status(&label.concept_id),
                 last_reviewed_at: None,
-                due_at: None,
+                due_at: reviews.get(&label.concept_id).cloned(),
             })
             .collect::<Vec<_>>();
         Ok(AuthenticatedStudyProjectionV1 {
@@ -586,7 +817,7 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
                 id: study_set_id.to_owned(),
                 title: "Cellular respiration".to_owned(),
                 course: None,
-                exam_label: None,
+                exam_label: self.exam_label.clone(),
                 ingestion_status: StudySetIngestionStatus::Ready,
             },
             session: StudyProjectionSessionV1 {
@@ -600,7 +831,14 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
                 completed: 0,
                 total: 3,
             },
-            review_schedule: Vec::new(),
+            review_schedule: reviews
+                .into_iter()
+                .map(|(concept_id, due_at)| StudyProjectionReviewItemV1 {
+                    concept_id,
+                    due_at,
+                    authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+                })
+                .collect(),
         })
     }
 }
@@ -623,12 +861,22 @@ fn executor(
     store: Arc<FakeLearningStore>,
     evaluator: Arc<dyn AnswerEvaluator>,
 ) -> VivaToolExecutor {
+    executor_at(store, evaluator, NOW)
+}
+
+/// The same composition at an explicit instant, so a replay or retry can read a
+/// wall clock that has genuinely moved.
+fn executor_at(
+    store: Arc<FakeLearningStore>,
+    evaluator: Arc<dyn AnswerEvaluator>,
+    now: &str,
+) -> VivaToolExecutor {
     VivaToolExecutor::with_clock(
         store,
         session(),
         evaluator,
         Arc::new(FixedClock::new(
-            agent_domain::parse_utc_instant(NOW).expect("clock instant parses"),
+            agent_domain::parse_utc_instant(now).expect("clock instant parses"),
         )),
     )
 }
@@ -2131,14 +2379,9 @@ fn recap_types_reject_unknown_inner_keys() {
 
 #[tokio::test]
 async fn recap_tool_folds_persisted_evidence_and_persists_it() {
-    let store =
-        Arc::new(
-            FakeLearningStore::ready().with_review_decisions(vec![ReviewScheduleSummary {
-                concept_id: CONCEPT_ETC.to_owned(),
-                due_at: "2026-08-31T09:00:00.000Z".to_owned(),
-                authority: ReviewScheduleAuthority::ServerPersistedFsrs,
-            }]),
-        );
+    // The review entries below are not seeded: they are the decisions the graded
+    // turn itself persisted through the selected D-01A seam.
+    let store = Arc::new(FakeLearningStore::ready());
     evaluate(
         &store,
         ScriptedEvaluator::once(evaluated(all_satisfied(0.9, 0.9, 0.9, 0.9))),
@@ -2176,8 +2419,15 @@ async fn recap_tool_folds_persisted_evidence_and_persists_it() {
             (CONCEPT_GRADIENT, ConceptStatus::Strong),
         ]
     );
-    assert_eq!(recap.review_schedule.len(), 1);
-    assert_eq!(recap.review_schedule[0].concept_id, CONCEPT_ETC);
+    assert_eq!(
+        recap
+            .review_schedule
+            .iter()
+            .map(|item| (item.concept_id.clone(), item.due_at.clone()))
+            .collect::<Vec<_>>(),
+        store.learner_visible_reviews()
+    );
+    assert_eq!(recap.review_schedule.len(), 2);
     assert_eq!(recap.source_moments.len(), 3);
 
     // Rebuilding is a pure projection: the second call equals the first exactly.
@@ -2255,4 +2505,533 @@ async fn recap_tool_fails_closed_on_unfoldable_evidence() {
         "{error:?}"
     );
     assert!(store.persisted_recaps().is_empty());
+}
+
+// ===========================================================================
+// LEARN-003A — evaluated outcomes bound to the selected D-01A v1 seam
+//
+// Every case below drives the real `evaluate_spoken_answer` path. Plan 03 owns
+// `PersistedFsrsCardV1`, `ReviewScheduleDecisionV1`, and `decide_review_schedule`;
+// nothing here redeclares them, recomputes a due date, or seeds a schedule the
+// executor did not actually persist.
+// ===========================================================================
+
+/// Grade one turn and return the store it was graded against.
+async fn graded_session(now: &str, response_id: &str, store: &Arc<FakeLearningStore>) {
+    executor_at(
+        Arc::clone(store),
+        ScriptedEvaluator::once(evaluated(all_satisfied(0.9, 0.9, 0.9, 0.9))),
+        now,
+    )
+    .execute(response_id, answer_proposal("A bound spoken answer."))
+    .await
+    .expect("the graded turn is persisted");
+}
+
+#[tokio::test]
+async fn scheduling_outcome_binds_the_evaluated_status_to_one_persisted_decision() {
+    let store = Arc::new(FakeLearningStore::ready());
+    graded_session(NOW, "response-1", &store).await;
+
+    let rows = store.schedule_decisions();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.concept_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![CONCEPT_ETC, CONCEPT_GRADIENT],
+        "one decision per evaluated concept transition, in rubric order"
+    );
+    for row in &rows {
+        assert_eq!(row.response_id, "response-1");
+        assert_eq!(row.user_id, USER_ID);
+        assert_eq!(row.study_set_id, STUDY_SET_ID);
+        assert_eq!(row.voice_session_id, VOICE_SESSION_ID);
+        let decision = &row.decision;
+        assert_eq!(decision.schema_version, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION);
+        assert_eq!(decision.policy_id, VIVA_REVIEW_SCHEDULE_POLICY_ID);
+        // The status is the server-derived transition, and its rating is the one
+        // D-01 mapping: strong -> 4 (Easy).
+        assert_eq!(decision.status, ConceptStatus::Strong);
+        assert_eq!(decision.rating, 4);
+        assert_eq!(
+            agent_domain::format_rfc3339_millis(decision.generated_at),
+            NOW
+        );
+        assert_eq!(decision.exam_at, None);
+        assert_eq!(decision.cap_reason, None);
+        assert_eq!(decision.card.reps, 1);
+        // Unknown provenance stays null; it is never coerced to zero.
+        assert_eq!(decision.hint_count, None);
+        assert_eq!(decision.miss_count, None);
+        decision
+            .validate()
+            .expect("the persisted decision is valid");
+    }
+}
+
+#[tokio::test]
+async fn scheduling_outcome_a_shaky_turn_schedules_the_shaky_rating() {
+    let store = Arc::new(FakeLearningStore::ready());
+    // Every required criterion satisfied, but below the strong floor.
+    evaluate(
+        &store,
+        ScriptedEvaluator::once(evaluated(all_satisfied(0.7, 0.7, 0.7, 0.7))),
+        "response-1",
+        answer_proposal("A bound spoken answer."),
+    )
+    .await
+    .expect("the graded turn is persisted");
+
+    let rows = store.schedule_decisions();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row.decision.status, ConceptStatus::Shaky);
+        assert_eq!(row.decision.rating, 3);
+    }
+}
+
+#[tokio::test]
+async fn scheduling_outcome_deferred_turn_creates_no_decision() {
+    for (label, evaluator, proposal) in [
+        (
+            "empty answer",
+            Arc::new(UnreachableEvaluator) as Arc<dyn AnswerEvaluator>,
+            answer_proposal("   "),
+        ),
+        (
+            "evaluator unavailable",
+            ScriptedEvaluator::failing(EvaluationError::Unavailable),
+            answer_proposal("A bound spoken answer."),
+        ),
+        (
+            "uncertain transcript",
+            Arc::new(UnreachableEvaluator),
+            answer_proposal_with(vec![("transcript_confidence", json!(0.2))]),
+        ),
+    ] {
+        let store = Arc::new(FakeLearningStore::ready());
+        let result = evaluate(&store, evaluator, "response-1", proposal)
+            .await
+            .unwrap_or_else(|error| panic!("{label} defers rather than failing: {error:?}"));
+        let outcome = turn_outcome_from(&result);
+        assert!(
+            matches!(outcome.resolution, TurnResolution::Deferred { .. }),
+            "{label}"
+        );
+        assert!(
+            store.schedule_decisions().is_empty(),
+            "{label} must schedule nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn scheduling_outcome_second_and_tenth_reviews_reload_the_persisted_card() {
+    let store = Arc::new(FakeLearningStore::ready());
+    for turn in 1..=10 {
+        graded_session(NOW, &format!("response-{turn}"), &store).await;
+    }
+
+    let decisions = store.decisions_for(CONCEPT_ETC);
+    assert_eq!(decisions.len(), 10);
+    for (index, decision) in decisions.iter().enumerate() {
+        assert_eq!(
+            decision.card.reps,
+            u32::try_from(index + 1).expect("small count"),
+            "review {} must continue the persisted card, not restart a New one",
+            index + 1
+        );
+    }
+    // A New card would produce the identical memory state and interval every time.
+    assert_ne!(decisions[1].card.stability, decisions[0].card.stability);
+    assert_ne!(decisions[9].card.stability, decisions[0].card.stability);
+    assert_ne!(decisions[9].uncapped_due_at, decisions[0].uncapped_due_at);
+    assert_eq!(decisions[9].card.lapses, 0);
+}
+
+#[tokio::test]
+async fn scheduling_outcome_replay_returns_the_stored_decision_without_advancing_memory() {
+    let store = Arc::new(FakeLearningStore::ready());
+    graded_session(NOW, "response-1", &store).await;
+    let first = store.decisions_for(CONCEPT_ETC);
+    assert_eq!(first.len(), 1);
+
+    // The replay reads a later wall clock, so a guard keyed on the computed date
+    // would let it write a second review.
+    graded_session(LATER, "response-1", &store).await;
+
+    let after = store.decisions_for(CONCEPT_ETC);
+    assert_eq!(after.len(), 1, "a replay writes no second decision");
+    assert_eq!(after[0], first[0]);
+    assert_eq!(after[0].card.reps, 1, "FSRS memory did not advance");
+    assert_eq!(
+        agent_domain::format_rfc3339_millis(after[0].generated_at),
+        NOW
+    );
+    assert_eq!(store.recorded_outcomes().len(), 1);
+}
+
+#[tokio::test]
+async fn scheduling_outcome_changed_payload_under_one_response_identity_fails_closed() {
+    let store = Arc::new(FakeLearningStore::ready());
+    graded_session(NOW, "response-1", &store).await;
+    let before = store.schedule_decisions();
+
+    // The same authorized response, a different graded payload.
+    let contradicted = evaluated(vec![
+        assessment(
+            "crit-etc-donor",
+            CriterionAssessmentKind::Contradicted,
+            0.95,
+        ),
+        assessment(
+            "crit-etc-complex-order",
+            CriterionAssessmentKind::Satisfied,
+            0.95,
+        ),
+        assessment(
+            "crit-etc-gradient",
+            CriterionAssessmentKind::Satisfied,
+            0.95,
+        ),
+        assessment(
+            "crit-etc-coupling",
+            CriterionAssessmentKind::Satisfied,
+            0.95,
+        ),
+    ]);
+    let error = evaluate(
+        &store,
+        ScriptedEvaluator::once(contradicted),
+        "response-1",
+        answer_proposal("A bound spoken answer."),
+    )
+    .await
+    .expect_err("a changed payload under one response identity must fail closed");
+    match error {
+        ToolExecutionError::Store(port) => assert_eq!(port.kind(), PortErrorKind::Conflict),
+        other => panic!("expected a conflict, found {other:?}"),
+    }
+    assert_eq!(
+        store
+            .schedule_decisions()
+            .iter()
+            .map(|row| row.decision.clone())
+            .collect::<Vec<_>>(),
+        before
+            .iter()
+            .map(|row| row.decision.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // The scheduling port itself carries the same guard: the replay key is the
+    // graded payload, not the schedule it produced.
+    let stored = store
+        .latest_decision_for(CONCEPT_ETC)
+        .expect("a decision is persisted");
+    let mut mutated = stored.clone();
+    mutated.status = ConceptStatus::Missed;
+    mutated.rating = 1;
+    let conflict = agent_domain::StudyMemoryStore::persist_review_schedule_decision(
+        store.as_ref(),
+        USER_ID,
+        STUDY_SET_ID,
+        VOICE_SESSION_ID,
+        "response-1",
+        CONCEPT_ETC,
+        mutated,
+    )
+    .await
+    .expect_err("a changed decision payload must not silently replace the stored one");
+    assert_eq!(conflict.kind(), PortErrorKind::Conflict);
+    assert_eq!(store.decisions_for(CONCEPT_ETC).len(), 1);
+}
+
+#[tokio::test]
+async fn scheduling_outcome_applies_the_persisted_exam_rule_at_every_boundary() {
+    // A far exam cannot cap an eight-day strong interval.
+    let far = Arc::new(FakeLearningStore::ready().with_exam(EXAM_FAR_AT, "Final exam"));
+    graded_session(NOW, "response-1", &far).await;
+    let decision = far
+        .latest_decision_for(CONCEPT_ETC)
+        .expect("a decision is persisted");
+    assert_eq!(decision.cap_reason, None);
+    assert_eq!(decision.due_at, decision.uncapped_due_at);
+    assert_eq!(
+        decision.exam_at.map(agent_domain::format_rfc3339_millis),
+        Some(EXAM_FAR_AT.to_owned())
+    );
+    assert_eq!(
+        decision.exam_margin_seconds,
+        VIVA_REVIEW_EXAM_MARGIN_SECONDS
+    );
+
+    // An exam inside the interval pulls the review back to exactly one margin.
+    let close = Arc::new(FakeLearningStore::ready().with_exam(EXAM_INSIDE_MARGIN_AT, "Final exam"));
+    graded_session(NOW, "response-1", &close).await;
+    let decision = close
+        .latest_decision_for(CONCEPT_ETC)
+        .expect("a decision is persisted");
+    assert_eq!(
+        decision.cap_reason,
+        Some(ReviewScheduleCapReasonV1::ExamMargin)
+    );
+    assert_eq!(
+        agent_domain::format_rfc3339_millis(decision.due_at),
+        EXAM_INSIDE_MARGIN_DUE_AT
+    );
+    assert!(decision.uncapped_due_at > decision.due_at);
+
+    // A past exam fails closed at the exam instant and never invents a future review.
+    let past = Arc::new(FakeLearningStore::ready().with_exam(EXAM_ALREADY_PAST_AT, "Final exam"));
+    graded_session(NOW, "response-1", &past).await;
+    let decision = past
+        .latest_decision_for(CONCEPT_ETC)
+        .expect("a decision is persisted");
+    assert_eq!(
+        decision.cap_reason,
+        Some(ReviewScheduleCapReasonV1::PastExam)
+    );
+    assert_eq!(
+        agent_domain::format_rfc3339_millis(decision.due_at),
+        EXAM_ALREADY_PAST_AT
+    );
+}
+
+#[tokio::test]
+async fn scheduling_outcome_exam_label_never_enters_the_calculation() {
+    let labelled = Arc::new(
+        FakeLearningStore::ready().with_exam(EXAM_INSIDE_MARGIN_AT, "Exam Friday, 8am, room 12"),
+    );
+    graded_session(NOW, "response-1", &labelled).await;
+    let renamed =
+        Arc::new(FakeLearningStore::ready().with_exam(EXAM_INSIDE_MARGIN_AT, "midterm 2 (moved)"));
+    graded_session(NOW, "response-1", &renamed).await;
+    assert_eq!(
+        labelled.latest_decision_for(CONCEPT_ETC),
+        renamed.latest_decision_for(CONCEPT_ETC)
+    );
+
+    // A label with no recorded instant schedules exactly as an unexamined set does.
+    let label_only = Arc::new(FakeLearningStore::ready().with_exam_label_only("Exam Friday"));
+    graded_session(NOW, "response-1", &label_only).await;
+    let none = Arc::new(FakeLearningStore::ready());
+    graded_session(NOW, "response-1", &none).await;
+    assert_eq!(
+        label_only.latest_decision_for(CONCEPT_ETC),
+        none.latest_decision_for(CONCEPT_ETC)
+    );
+    assert_eq!(
+        label_only
+            .latest_decision_for(CONCEPT_ETC)
+            .expect("a decision is persisted")
+            .exam_at,
+        None
+    );
+}
+
+#[tokio::test]
+async fn scheduling_outcome_recap_concept_and_projection_report_one_persisted_decision() {
+    let store = Arc::new(FakeLearningStore::ready());
+    graded_session(NOW, "response-1", &store).await;
+    let persisted = store.learner_visible_reviews();
+    assert_eq!(persisted.len(), 2);
+
+    let recap_result = executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+        .execute(
+            "response-2",
+            ToolProposal::build_session_recap(STUDY_SET_ID, VOICE_SESSION_ID),
+        )
+        .await
+        .expect("build_session_recap succeeds");
+    let recap: StudySessionRecapV2 =
+        serde_json::from_value(recap_result.result["recap"].clone()).expect("recap parses");
+    assert_eq!(
+        recap
+            .review_schedule
+            .iter()
+            .map(|item| (item.concept_id.clone(), item.due_at.clone()))
+            .collect::<Vec<_>>(),
+        persisted
+    );
+    for item in &recap.review_schedule {
+        assert_eq!(item.authority, ReviewScheduleAuthority::ServerPersistedFsrs);
+    }
+
+    let projection = agent_domain::StudyMemoryStore::authenticated_study_projection(
+        store.as_ref(),
+        USER_ID,
+        STUDY_SET_ID,
+        VOICE_SESSION_ID,
+    )
+    .await
+    .expect("the authenticated projection is readable");
+    assert_eq!(
+        projection
+            .review_schedule
+            .iter()
+            .map(|item| (item.concept_id.clone(), item.due_at.clone()))
+            .collect::<Vec<_>>(),
+        persisted
+    );
+    for concept in &projection.concepts {
+        let expected = persisted
+            .iter()
+            .find(|(concept_id, _)| concept_id == &concept.id)
+            .map(|(_, due_at)| due_at.clone());
+        assert_eq!(concept.due_at, expected, "concept {}", concept.id);
+    }
+
+    // The wire token is the selected D-01A authority on both surfaces.
+    let encoded = serde_json::to_value(&projection).expect("projection serializes");
+    assert_eq!(
+        encoded["reviewSchedule"][0]["authority"],
+        json!("server_persisted_fsrs")
+    );
+    let recap_encoded = serde_json::to_value(&recap).expect("recap serializes");
+    assert_eq!(
+        recap_encoded["review_schedule"][0]["authority"],
+        json!("server_persisted_fsrs")
+    );
+
+    // The browser-safe summary is all a tool result may carry.
+    let summary = store
+        .latest_decision_for(CONCEPT_ETC)
+        .expect("a decision is persisted")
+        .public_summary(CONCEPT_ETC);
+    let mut keys = summary
+        .as_object()
+        .expect("summary is an object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "cap_reason".to_owned(),
+            "concept_id".to_owned(),
+            "due_at".to_owned(),
+            "policy_id".to_owned(),
+            "schema_version".to_owned(),
+            "status".to_owned(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn scheduling_outcome_past_exam_decision_is_persisted_but_hidden_from_learner_reviews() {
+    let store = Arc::new(FakeLearningStore::ready().with_exam(EXAM_ALREADY_PAST_AT, "Exam Friday"));
+    graded_session(NOW, "response-1", &store).await;
+    assert_eq!(store.schedule_decisions().len(), 2);
+
+    let projection = agent_domain::StudyMemoryStore::authenticated_study_projection(
+        store.as_ref(),
+        USER_ID,
+        STUDY_SET_ID,
+        VOICE_SESSION_ID,
+    )
+    .await
+    .expect("the authenticated projection is readable");
+    assert!(projection.review_schedule.is_empty());
+    for concept in &projection.concepts {
+        assert_eq!(concept.due_at, None, "concept {}", concept.id);
+    }
+
+    let recap_result = executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+        .execute(
+            "response-2",
+            ToolProposal::build_session_recap(STUDY_SET_ID, VOICE_SESSION_ID),
+        )
+        .await
+        .expect("build_session_recap succeeds");
+    let recap: StudySessionRecapV2 =
+        serde_json::from_value(recap_result.result["recap"].clone()).expect("recap parses");
+    assert!(recap.review_schedule.is_empty());
+    assert_eq!(recap.next_action, "Keep answering to build more evidence.");
+}
+
+#[tokio::test]
+async fn scheduling_outcome_rejects_model_supplied_scheduling_authority() {
+    for (name, value) in [
+        ("due_at", json!("2099-01-01T00:00:00.000Z")),
+        ("uncapped_due_at", json!("2099-01-01T00:00:00.000Z")),
+        ("card", json!({ "stability": 400.0 })),
+        ("card_state", json!("review")),
+        ("stability", json!(400.0)),
+        ("difficulty", json!(1.0)),
+        ("exam_at", json!("2099-01-01T00:00:00.000Z")),
+        ("exam_label", json!("Exam Friday")),
+        ("policy_id", json!("viva.attacker.1")),
+        ("cap_reason", json!("exam_margin")),
+        ("revision", json!(9)),
+    ] {
+        let store = Arc::new(FakeLearningStore::ready());
+        let error = match evaluate(
+            &store,
+            ScriptedEvaluator::once(evaluated(all_satisfied(0.9, 0.9, 0.9, 0.9))),
+            "response-1",
+            answer_proposal_with(vec![(name, value)]),
+        )
+        .await
+        {
+            Ok(result) => panic!("`{name}` must be rejected, the tool returned {result}"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, ToolExecutionError::InvalidArguments(_)),
+            "`{name}` produced {error:?}"
+        );
+        assert!(store.schedule_decisions().is_empty(), "`{name}`");
+        assert!(store.recorded_outcomes().is_empty(), "`{name}`");
+    }
+}
+
+#[tokio::test]
+async fn scheduling_outcome_persistence_failure_fails_the_turn_and_retry_repairs_it() {
+    let store = Arc::new(FakeLearningStore::ready());
+    store.set_schedule_persistence_failure(true);
+
+    let error = evaluate(
+        &store,
+        ScriptedEvaluator::once(evaluated(all_satisfied(0.9, 0.9, 0.9, 0.9))),
+        "response-1",
+        answer_proposal("A bound spoken answer."),
+    )
+    .await
+    .expect_err("a scheduling write failure must fail the turn");
+    match error {
+        // Durability is the retryable class: nothing about the request was wrong.
+        ToolExecutionError::Store(port) => assert_eq!(port.kind(), PortErrorKind::Durability),
+        other => panic!("expected a retryable store failure, found {other:?}"),
+    }
+    assert!(store.schedule_decisions().is_empty());
+
+    // No recap may report a session whose scheduling never committed.
+    let recap_result = executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+        .execute(
+            "response-2",
+            ToolProposal::build_session_recap(STUDY_SET_ID, VOICE_SESSION_ID),
+        )
+        .await
+        .expect("the recap fold still runs over persisted evidence");
+    let recap: StudySessionRecapV2 =
+        serde_json::from_value(recap_result.result["recap"].clone()).expect("recap parses");
+    assert!(recap.review_schedule.is_empty());
+
+    // Retry repairs through Plan 03 idempotency: the outcome replays and the
+    // schedule lands exactly once, without grading the turn a second time.
+    store.set_schedule_persistence_failure(false);
+    graded_session(LATER, "response-1", &store).await;
+    assert_eq!(store.recorded_outcomes().len(), 1);
+    assert_eq!(store.decisions_for(CONCEPT_ETC).len(), 1);
+    assert_eq!(store.decisions_for(CONCEPT_GRADIENT).len(), 1);
+    assert_eq!(
+        store
+            .latest_decision_for(CONCEPT_ETC)
+            .expect("a decision is persisted")
+            .card
+            .reps,
+        1
+    );
 }

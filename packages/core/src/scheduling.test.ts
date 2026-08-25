@@ -4,11 +4,12 @@ import {
   buildReviewSchedule,
   conceptStatusToRating,
   decideReviewSchedule,
-  dueDateForStatus,
   humanInterval,
   type PersistedFsrsCardV1,
+  type ProjectedReviewScheduleItem,
+  REVIEW_CAP_EXPLANATIONS,
   type ReviewScheduleInput,
-  reviewIntervalForStatus,
+  reviewIntervalFromProjection,
   scheduleConceptReview,
   VIVA_REVIEW_EXAM_MARGIN_SECONDS,
 } from "./scheduling";
@@ -43,28 +44,6 @@ describe("humanInterval", () => {
     expect(humanInterval(NOW, NOW)).toBe("today");
     expect(humanInterval(NOW, new Date(NOW.getTime() + DAY))).toBe("tomorrow");
     expect(humanInterval(NOW, new Date(NOW.getTime() + 5 * DAY))).toBe("in 5 days");
-  });
-});
-
-describe("dueDateForStatus", () => {
-  test("schedules every status into the future", () => {
-    for (const status of ["strong", "shaky", "missed", "review"] as const) {
-      expect(dueDateForStatus(status, NOW).getTime()).toBeGreaterThan(NOW.getTime());
-    }
-  });
-
-  test("a strong answer earns a longer interval than a missed one", () => {
-    expect(dueDateForStatus("strong", NOW).getTime()).toBeGreaterThan(
-      dueDateForStatus("missed", NOW).getTime(),
-    );
-  });
-});
-
-describe("reviewIntervalForStatus", () => {
-  test("returns a non-empty human interval string", () => {
-    const phrase = reviewIntervalForStatus("shaky", NOW);
-    expect(phrase.length).toBeGreaterThan(0);
-    expect(/today|tomorrow|day/.test(phrase)).toBe(true);
   });
 });
 
@@ -270,5 +249,217 @@ describe("buildReviewSchedule", () => {
 
     expect(items[0]?.conceptId).toBe("missed");
     expect(items[0]?.priority).toBe("urgent");
+  });
+});
+
+/**
+ * LEARN-003A: `explanation[]` is the learner/operator-facing reasoning trail, so a
+ * cap entry may appear only when that cap actually lowered the running due date.
+ * Each row names one candidate, an input that exercises it, and whether that
+ * candidate is expected to bind.
+ */
+describe("cap explanation truthfulness", () => {
+  const base: ReviewScheduleInput = {
+    conceptId: "nadh",
+    label: "NADH",
+    status: "strong",
+    misses: 0,
+    hinted: false,
+    centrality: 50,
+    now: NOW,
+  };
+
+  const rows: ReadonlyArray<{
+    candidate: keyof typeof REVIEW_CAP_EXPLANATIONS;
+    name: string;
+    input: ReviewScheduleInput;
+    binds: boolean;
+  }> = [
+    {
+      candidate: "exam",
+      name: "an exam inside the strong interval",
+      input: { ...base, examDate: new Date(NOW.getTime() + 3 * DAY) },
+      binds: true,
+    },
+    {
+      candidate: "exam",
+      name: "an exam far past the strong interval",
+      input: { ...base, examDate: new Date(NOW.getTime() + 60 * DAY) },
+      binds: false,
+    },
+    {
+      candidate: "exam",
+      // The review's own example: a missed concept is already due tomorrow, so an
+      // exam three days out changes nothing.
+      name: "an exam beyond a missed concept already due tomorrow",
+      input: { ...base, status: "missed", examDate: new Date(NOW.getTime() + 3 * DAY) },
+      binds: false,
+    },
+    {
+      candidate: "miss",
+      name: "a missed concept whose FSRS date is already tomorrow",
+      input: { ...base, status: "missed", misses: 3 },
+      binds: false,
+    },
+    {
+      candidate: "hint",
+      name: "a hint on a strong eight-day interval",
+      input: { ...base, hinted: true },
+      binds: true,
+    },
+    {
+      candidate: "hint",
+      name: "a hint on a concept already due tomorrow",
+      input: { ...base, status: "missed", hinted: true },
+      binds: false,
+    },
+    {
+      candidate: "centrality",
+      name: "high centrality on a strong eight-day interval",
+      input: { ...base, centrality: 96 },
+      binds: true,
+    },
+    {
+      candidate: "centrality",
+      name: "high centrality behind a tighter hint cap",
+      input: { ...base, centrality: 96, hinted: true },
+      binds: false,
+    },
+    {
+      candidate: "recency",
+      name: "a stale last review on a strong eight-day interval",
+      input: { ...base, lastReviewedAt: new Date(NOW.getTime() - 28 * DAY) },
+      binds: true,
+    },
+    {
+      candidate: "recency",
+      name: "a stale last review behind an equal hint cap",
+      input: { ...base, hinted: true, lastReviewedAt: new Date(NOW.getTime() - 28 * DAY) },
+      binds: false,
+    },
+    {
+      candidate: "recency",
+      name: "a last review inside the recency window",
+      input: { ...base, lastReviewedAt: new Date(NOW.getTime() - 1 * DAY) },
+      binds: false,
+    },
+  ];
+
+  for (const row of rows) {
+    test(`${row.candidate}: ${row.name} ${row.binds ? "explains" : "explains nothing"}`, () => {
+      const item = scheduleConceptReview(row.input);
+      const entry = REVIEW_CAP_EXPLANATIONS[row.candidate];
+      const matching = item.explanation.filter((line) => line.startsWith(entry));
+
+      expect(matching.length).toBe(row.binds ? 1 : 0);
+      if (row.binds) {
+        const uncapped = decideReviewSchedule({
+          status: row.input.status,
+          now: row.input.now,
+          hintCount: null,
+          missCount: null,
+          examAt: null,
+          priorCard: null,
+        });
+        expect(item.dueAt.getTime()).toBeLessThan(new Date(uncapped.due_at).getTime());
+      }
+    });
+  }
+
+  test("a schedule with no binding cap explains no cap at all", () => {
+    const item = scheduleConceptReview(base);
+
+    for (const entry of Object.values(REVIEW_CAP_EXPLANATIONS)) {
+      expect(item.explanation.some((line) => line.startsWith(entry))).toBe(false);
+    }
+    expect(item.dueAt.getTime()).toBe(item.authoritativeDueAt.getTime());
+  });
+
+  test("only the caps that lowered the date are explained when several apply", () => {
+    // Exam-margin first (one day out), then nothing else can lower it further.
+    const item = scheduleConceptReview({
+      ...base,
+      status: "missed",
+      misses: 4,
+      hinted: true,
+      centrality: 99,
+      lastReviewedAt: new Date(NOW.getTime() - 28 * DAY),
+      examDate: new Date(NOW.getTime() + 3 * DAY),
+    });
+
+    for (const entry of Object.values(REVIEW_CAP_EXPLANATIONS)) {
+      expect(item.explanation.some((line) => line.startsWith(entry))).toBe(false);
+    }
+    expect(humanInterval(NOW, item.dueAt)).toBe("tomorrow");
+  });
+
+  test("every cap explanation constant is distinct", () => {
+    const entries = Object.values(REVIEW_CAP_EXPLANATIONS);
+    expect(new Set(entries).size).toBe(entries.length);
+  });
+});
+
+/**
+ * LEARN-003A: the browser consumes the persisted D-01A schedule and formats it.
+ * It never estimates an interval from a status, so a concept with no persisted
+ * review has no interval to render at all.
+ */
+describe("reviewIntervalFromProjection", () => {
+  const schedule: ProjectedReviewScheduleItem[] = [
+    { conceptId: "nadh", dueAt: "2026-06-19T12:00:00.000Z", authority: "server_persisted_fsrs" },
+    {
+      conceptId: "atp-synthase",
+      dueAt: "2026-06-25T12:00:00.000Z",
+      authority: "server_persisted_fsrs",
+    },
+  ];
+
+  test("renders the persisted due date for the named concept", () => {
+    expect(reviewIntervalFromProjection(schedule, "nadh", NOW)).toBe("in 2 days");
+    expect(reviewIntervalFromProjection(schedule, "atp-synthase", NOW)).toBe("in 8 days");
+  });
+
+  test("a concept with no persisted review has no interval, not an estimate", () => {
+    expect(reviewIntervalFromProjection(schedule, "glycolysis", NOW)).toBe(null);
+    expect(reviewIntervalFromProjection([], "nadh", NOW)).toBe(null);
+  });
+
+  test("rejects a duplicated concept instead of picking one", () => {
+    expect(() =>
+      reviewIntervalFromProjection(
+        [
+          schedule[0] as ProjectedReviewScheduleItem,
+          { ...(schedule[0] as ProjectedReviewScheduleItem), dueAt: "2026-07-01T12:00:00.000Z" },
+        ],
+        "nadh",
+        NOW,
+      ),
+    ).toThrow(/duplicate/i);
+  });
+
+  test("rejects an unparseable due date instead of rendering it", () => {
+    expect(() =>
+      reviewIntervalFromProjection(
+        [{ conceptId: "nadh", dueAt: "friday", authority: "server_persisted_fsrs" }],
+        "nadh",
+        NOW,
+      ),
+    ).toThrow(/due date/i);
+  });
+
+  test("rejects an authority the recorded decision did not select", () => {
+    expect(() =>
+      reviewIntervalFromProjection(
+        [
+          {
+            conceptId: "nadh",
+            dueAt: "2026-06-19T12:00:00.000Z",
+            authority: "core_fsrs_read_time" as ProjectedReviewScheduleItem["authority"],
+          },
+        ],
+        "nadh",
+        NOW,
+      ),
+    ).toThrow(/authority/i);
   });
 });
