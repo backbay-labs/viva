@@ -109,3 +109,16 @@ export {
   projectLibrarySnapshot,
   redactVivaLibrarySessionTokens,
 } from "@viva-web/viva-library";
+
+export type {
+  VoiceLevelMeter,
+  VoiceLevelMeterOptions,
+  VoiceLevelOptions,
+} from "@viva-web/viva-voice-level";
+export {
+  clamp01,
+  computeRms,
+  createVoiceLevelMeter,
+  smoothLevel,
+  voiceLevelFromRms,
+} from "@viva-web/viva-voice-level";
