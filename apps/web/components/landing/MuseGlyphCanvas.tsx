@@ -155,10 +155,27 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
     // mount's lifetime. The hex fallbacks only cover a token somehow
     // failing to resolve; they are not a parallel palette to keep in sync.
     function resolveTokenRgb(customProperty: string, fallbackHex: string): RGB {
+      // Read the token's own cascade value first. Setting `color: var(--x)`
+      // directly and reading it back is not a reliable resolution check:
+      // when `--x` is undefined, that declaration is invalid at
+      // computed-value time, and because `color` is an inherited property,
+      // an invalid declaration recomputes to whatever color the probe
+      // inherits from its ancestors (never an error, never empty) — so a
+      // renamed/typo'd token would silently match the `rgb(...)` regex
+      // below anyway and paint this field in an unrelated inherited color
+      // instead of ever reaching the documented hex fallback. Reading the
+      // custom property's raw value directly (it is declared on `:root`,
+      // i.e. `document.documentElement`) detects a genuinely undefined
+      // token — `getPropertyValue` returns `""` rather than inheriting
+      // anything — and routes that case to the literal fallback.
+      const raw = getComputedStyle(document.documentElement)
+        .getPropertyValue(customProperty)
+        .trim();
+      if (!raw) return hexToRgb(fallbackHex);
       const probe = document.createElement("span");
       probe.style.position = "absolute";
       probe.style.visibility = "hidden";
-      probe.style.color = `var(${customProperty})`;
+      probe.style.color = raw;
       document.body.appendChild(probe);
       const resolved = getComputedStyle(probe).color;
       probe.remove();
