@@ -60,6 +60,15 @@ export type MobileCaptureIssue =
   | { kind: "ended"; reason: VivaAudioCaptureEndReason; sequence: number }
   | { kind: "error"; message: string; sequence: number };
 
+export function coordinateMobilePlaybackState(input: {
+  capture: Pick<MobileCaptureSession, "cancel">;
+  onSpeakingChange: (speaking: boolean) => void;
+  speaking: boolean;
+}): void {
+  input.onSpeakingChange(input.speaking);
+  if (input.speaking) void input.capture.cancel();
+}
+
 function assertTypedMobileFrame(data: unknown): asserts data is string {
   if (typeof data !== "string") {
     throw new TypeError("Viva mobile rejects binary WebSocket payloads");
@@ -333,8 +342,16 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
     [],
   );
   const playback = useMemo<MobilePlaybackSession>(
-    () => createMobilePlaybackSession({ onSpeakingChange: setSpeaking }),
-    [],
+    () =>
+      createMobilePlaybackSession({
+        onSpeakingChange: (nextSpeaking) =>
+          coordinateMobilePlaybackState({
+            capture,
+            onSpeakingChange: setSpeaking,
+            speaking: nextSpeaking,
+          }),
+      }),
+    [capture],
   );
   const controllerRef = useRef<MobileVivaSessionController | null>(null);
   const activeSessionRef = useRef(session);

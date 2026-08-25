@@ -1,6 +1,6 @@
 import * as DocumentPicker from "expo-document-picker";
 import { useRouter } from "expo-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Platform,
@@ -35,20 +35,25 @@ export default function LibraryScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [picking, setPicking] = useState(false);
   const [pickerNote, setPickerNote] = useState<string | null>(null);
+  const loadEpochRef = useRef(0);
 
   const refreshLibrary = useCallback(
     async (pulled = false) => {
+      const loadEpoch = ++loadEpochRef.current;
       if (pulled) setRefreshing(true);
       // Signed start/resume capabilities are single-use and short-lived. Do
       // not leave a previously loaded row actionable while its replacement is
       // being fetched or after that fetch fails.
       setLoadState({ kind: "loading" });
       try {
-        setLoadState({ kind: "ready", library: await loadLibrary(config) });
+        const library = await loadLibrary(config);
+        if (loadEpochRef.current === loadEpoch) {
+          setLoadState({ kind: "ready", library });
+        }
       } catch {
-        setLoadState({ kind: "error" });
+        if (loadEpochRef.current === loadEpoch) setLoadState({ kind: "error" });
       } finally {
-        if (pulled) setRefreshing(false);
+        if (pulled && loadEpochRef.current === loadEpoch) setRefreshing(false);
       }
     },
     [config],

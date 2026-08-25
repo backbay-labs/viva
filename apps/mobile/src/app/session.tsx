@@ -289,6 +289,14 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     );
   }, [agent.captureIssue, captureState]);
 
+  useEffect(() => {
+    if (!agent.speaking || (captureState !== "listening" && captureState !== "requesting")) {
+      return;
+    }
+    setCaptureState("idle");
+    setCaptureMessage("Examiner playback started, so local microphone capture was stopped.");
+  }, [agent.speaking, captureState]);
+
   const unlockPlayback = () => {
     if (playbackUnlockedRef.current) return;
     playbackUnlockedRef.current = true;
@@ -298,7 +306,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
   };
 
   const startListening = async () => {
-    if (endingRef.current || agent.speaking) return;
+    if (endingRef.current || agent.playback.isActive()) return;
     unlockPlayback();
     agent.clearCaptureIssue();
     setCaptureMessage(undefined);
@@ -320,6 +328,13 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
 
     try {
       await agent.capture.start();
+      if (agent.playback.isActive()) {
+        outcome = "failed";
+        await agent.capture.cancel();
+        setCaptureMessage("Wait for the examiner to finish, then start your answer.");
+        setCaptureState("idle");
+        return;
+      }
       if (outcome !== "pending") {
         await agent.capture.cancel();
         return;
@@ -361,7 +376,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     }
     if (
       endingRef.current ||
-      agent.speaking ||
+      agent.playback.isActive() ||
       !agent.derived.canSubmitAnswer ||
       !agent.sendText(answer)
     ) {
@@ -646,7 +661,10 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
                   <ActionButton loading>Opening microphone</ActionButton>
                 ) : null}
                 {captureState === "listening" ? (
-                  <ActionButton disabled={busy} onPress={() => void finishSpokenAnswer()}>
+                  <ActionButton
+                    disabled={answerControlsBusy}
+                    onPress={() => void finishSpokenAnswer()}
+                  >
                     Finish answer
                   </ActionButton>
                 ) : null}

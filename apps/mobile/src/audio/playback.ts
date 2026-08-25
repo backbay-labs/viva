@@ -17,6 +17,7 @@ export type MobilePlaybackSession = {
   close: () => Promise<void>;
   drain: (input: MobilePlaybackDrainInput) => number;
   getOutputLevel: () => number;
+  isActive: () => boolean;
   resetForGeneration: () => void;
   unlock: () => Promise<void>;
 };
@@ -27,10 +28,12 @@ export function createMobilePlaybackSession(
     onSpeakingChange?: (speaking: boolean) => void;
   } = {},
 ): MobilePlaybackSession {
+  let active = false;
   const sink: VivaAudioPlaybackSink = createVivaAudioPlaybackSink({
     contextFactory: options.contextFactory ?? createMobilePlaybackContextFactory(),
     onStateChange: (state) => {
-      options.onSpeakingChange?.(state.responding || state.speaking);
+      active = state.responding || state.speaking;
+      options.onSpeakingChange?.(active);
     },
   });
 
@@ -58,6 +61,7 @@ export function createMobilePlaybackSession(
       return input.cancellations.length;
     },
     getOutputLevel: () => sink.getOutputLevel(),
+    isActive: () => active,
     resetForGeneration: () => {
       sink.resetForGeneration();
     },
