@@ -343,6 +343,11 @@ struct FakeLearningStore {
     exam_label: Option<String>,
     schedule_decisions: Mutex<Vec<PersistedScheduleDecision>>,
     schedule_persistence_fails: Mutex<bool>,
+    /// Every learner-fact write this store was *asked* to perform, in call order,
+    /// including the retired ones it refuses. `LEARN-009` asserts the exact
+    /// sequence, so an executor that reached an independent mastery, schedule, or
+    /// recap write would be visible here even when the write itself fails closed.
+    mutations: Mutex<Vec<String>>,
 }
 
 impl FakeLearningStore {
@@ -399,6 +404,18 @@ impl FakeLearningStore {
 
     fn recorded_challenges(&self) -> Vec<ChallengeResolution> {
         self.challenges.lock().expect("challenges lock").clone()
+    }
+
+    fn note_mutation(&self, call: impl Into<String>) {
+        self.mutations
+            .lock()
+            .expect("mutations lock")
+            .push(call.into());
+    }
+
+    /// The ordered learner-fact write log described on the field.
+    fn mutations(&self) -> Vec<String> {
+        self.mutations.lock().expect("mutations lock").clone()
     }
 
     fn without_session_evidence(mut self) -> Self {
@@ -511,6 +528,7 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
         response_id: &str,
         _evaluation: AnswerEvaluation,
     ) -> Result<Value, PortError> {
+        self.note_mutation(format!("record_answer_evaluation:{response_id}"));
         Err(PortError::unavailable(
             "fake_store",
             response_id,
@@ -528,6 +546,7 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
         concept_id: &str,
         _status: ConceptStatus,
     ) -> Result<ConceptStatus, PortError> {
+        self.note_mutation(format!("record_concept_status:{concept_id}"));
         Err(PortError::unavailable(
             "fake_store",
             concept_id,
@@ -543,6 +562,7 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
         concept_id: &str,
         _due_at: &str,
     ) -> Result<Value, PortError> {
+        self.note_mutation(format!("schedule_review_item:{concept_id}"));
         Err(PortError::unavailable(
             "fake_store",
             concept_id,
@@ -587,6 +607,7 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
         concept_id: &str,
         decision: ReviewScheduleDecisionV1,
     ) -> Result<Value, PortError> {
+        self.note_mutation(format!("persist_review_schedule_decision:{concept_id}"));
         decision.validate().map_err(|error| {
             PortError::invalid_input("fake_store", concept_id, error.to_string())
         })?;
@@ -645,9 +666,10 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
         _user_id: &str,
         _study_set_id: &str,
         voice_session_id: &str,
-        _response_id: &str,
+        response_id: &str,
         recap: agent_domain::StudySessionRecap,
     ) -> Result<Value, PortError> {
+        self.note_mutation(format!("record_recap:{response_id}"));
         if self.recap_persistence_fails {
             return Err(PortError::durability(
                 "fake_store",
@@ -670,6 +692,7 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
         _voice_session_id: &str,
         outcome: TurnOutcome,
     ) -> Result<PersistedTurnOutcome, PortError> {
+        self.note_mutation(format!("record_turn_outcome:{}", outcome.response_id));
         let mut outcomes = self.outcomes.lock().expect("outcomes lock");
         if let Some(stored) = outcomes
             .iter()
@@ -772,6 +795,10 @@ impl agent_domain::StudyMemoryStore for FakeLearningStore {
         _voice_session_id: &str,
         resolution: ChallengeResolution,
     ) -> Result<ChallengeResolution, PortError> {
+        self.note_mutation(format!(
+            "record_challenge_resolution:{}",
+            resolution.correction_id
+        ));
         let outcomes = self.outcomes.lock().expect("outcomes lock");
         if !outcomes
             .iter()
@@ -3810,4 +3837,325 @@ async fn ordered_progression_binds_the_authorized_session() {
         "{error:?}"
     );
     assert_eq!(store.cursor(), fixture.cursors["initial"]);
+}
+
+// ===========================================================================
+// LEARN-009 — one learner mutation path
+//
+// The production tool surface may only expose names whose executor derives every
+// returned fact from server state. Nothing a model proposes may independently
+// move mastery, choose a due date, name a concept, assert a status, or hand the
+// server a recap to store.
+// ===========================================================================
+
+/// Tool names that were live, independently callable learner mutations and are
+/// no longer declared at all.
+const RETIRED_TOOL_NAMES: [&str; 2] = ["mark_concept_status", "schedule_review_item"];
+
+/// The complete live surface. Each name's executor reads its answer back from the
+/// store rather than from the proposal.
+const LIVE_TOOL_NAMES: [&str; 5] = [
+    "select_next_question",
+    "evaluate_spoken_answer",
+    "retrieve_source_reference",
+    "build_session_recap",
+    "challenge_correction",
+];
+
+/// A fully formed legacy call: the exact shape that used to mark a concept
+/// `strong` or schedule a review on the model's say-so.
+fn retired_proposal(name: &str) -> ToolProposal {
+    ToolProposal::new(
+        name,
+        json!({
+            "study_set_id": STUDY_SET_ID,
+            "voice_session_id": VOICE_SESSION_ID,
+            "concept_id": CONCEPT_ETC,
+            "status": "strong",
+        }),
+    )
+}
+
+/// A well-formed proposal for each surviving tool, so a rejection below is
+/// attributable to the argument under test and not to a malformed call.
+fn live_proposal(name: &str) -> ToolProposal {
+    match name {
+        "select_next_question" => {
+            ToolProposal::select_next_question(STUDY_SET_ID, VOICE_SESSION_ID, "quiz")
+        }
+        "evaluate_spoken_answer" => answer_proposal("A bound spoken answer."),
+        "retrieve_source_reference" => {
+            ToolProposal::retrieve_source_reference(STUDY_SET_ID, VOICE_SESSION_ID, SOURCE_DONOR)
+        }
+        "build_session_recap" => ToolProposal::build_session_recap(STUDY_SET_ID, VOICE_SESSION_ID),
+        "challenge_correction" => ToolProposal::challenge_correction(
+            STUDY_SET_ID,
+            VOICE_SESSION_ID,
+            &source(
+                SOURCE_DONOR,
+                "slide:18",
+                "NADH donates high-energy electrons to complex I.",
+            ),
+            "correction-1",
+            "The slide reads differently to me.",
+        ),
+        other => panic!("`{other}` is not a live Viva tool"),
+    }
+}
+
+fn with_extra(proposal: &ToolProposal, key: &str, value: Value) -> ToolProposal {
+    let Value::Object(mut fields) = proposal.arguments().clone() else {
+        panic!("tool arguments are an object");
+    };
+    fields.insert(key.to_owned(), value);
+    ToolProposal::new(proposal.name(), Value::Object(fields))
+}
+
+#[tokio::test]
+async fn tool_authority_retired_mastery_and_schedule_tools_are_not_declared() {
+    for name in RETIRED_TOOL_NAMES {
+        // The bare name is not a tool this executor knows at all.
+        let store = Arc::new(FakeLearningStore::ready());
+        let outcome = executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+            .execute(
+                "response-1",
+                ToolProposal::new(
+                    name,
+                    json!({
+                        "study_set_id": STUDY_SET_ID,
+                        "voice_session_id": VOICE_SESSION_ID,
+                    }),
+                ),
+            )
+            .await;
+        match outcome {
+            Ok(result) => panic!(
+                "`{name}` must not be a declared tool, it returned {}",
+                result.result
+            ),
+            Err(ToolExecutionError::InvalidArguments(reason)) => assert!(
+                reason.contains("unknown Viva tool"),
+                "`{name}` was refused for the wrong reason: {reason}"
+            ),
+            Err(other) => panic!("`{name}` produced {other:?}"),
+        }
+        assert!(store.mutations().is_empty(), "`{name}`");
+    }
+}
+
+#[tokio::test]
+async fn tool_authority_retired_tool_calls_move_no_learner_fact() {
+    for name in RETIRED_TOOL_NAMES {
+        let store = Arc::new(FakeLearningStore::ready());
+        let error = executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+            .execute("response-1", retired_proposal(name))
+            .await;
+        let error = match error {
+            Ok(result) => panic!("`{name}` must be refused, it returned {}", result.result),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, ToolExecutionError::InvalidArguments(_)),
+            "`{name}` produced {error:?}"
+        );
+        assert!(
+            store.mutations().is_empty(),
+            "`{name}` wrote {:?}",
+            store.mutations()
+        );
+        assert!(store.schedule_decisions().is_empty(), "`{name}`");
+        assert_eq!(store.status(CONCEPT_ETC), ConceptStatus::Review, "`{name}`");
+    }
+}
+
+#[tokio::test]
+async fn tool_authority_refuses_a_model_supplied_due_date_on_every_live_tool() {
+    for name in LIVE_TOOL_NAMES {
+        let store = Arc::new(FakeLearningStore::ready());
+        let proposal = with_extra(
+            &live_proposal(name),
+            "due_at",
+            json!("2099-01-01T00:00:00.000Z"),
+        );
+        let error = match executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+            .execute("response-1", proposal)
+            .await
+        {
+            Ok(result) => panic!(
+                "`{name}` accepted a due date and returned {}",
+                result.result
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, ToolExecutionError::InvalidArguments(_)),
+            "`{name}` produced {error:?}"
+        );
+        assert!(
+            store.mutations().is_empty(),
+            "`{name}` wrote {:?}",
+            store.mutations()
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_authority_refuses_a_model_selected_concept_or_status_on_every_live_tool() {
+    // A fixture concept ID and a hardcoded `strong`: the exact pair the retired
+    // surface let a provider assert about a learner.
+    for (argument, value) in [
+        ("concept_id", json!("oxidative-phosphorylation")),
+        ("status", json!("strong")),
+    ] {
+        for name in LIVE_TOOL_NAMES {
+            let store = Arc::new(FakeLearningStore::ready());
+            let proposal = with_extra(&live_proposal(name), argument, value.clone());
+            let error = match executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+                .execute("response-1", proposal)
+                .await
+            {
+                Ok(result) => panic!(
+                    "`{name}` accepted `{argument}` and returned {}",
+                    result.result
+                ),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, ToolExecutionError::InvalidArguments(_)),
+                "`{name}`/`{argument}` produced {error:?}"
+            );
+            assert!(
+                store.mutations().is_empty(),
+                "`{name}`/`{argument}` wrote {:?}",
+                store.mutations()
+            );
+            assert_eq!(store.status(CONCEPT_ETC), ConceptStatus::Review);
+        }
+    }
+}
+
+#[tokio::test]
+async fn tool_authority_recap_ignores_a_model_supplied_payload() {
+    let fabricated = json!({
+        "schema": "viva.study_session_recap.v2",
+        "voice_session_id": VOICE_SESSION_ID,
+        "headline": "You aced oxidative phosphorylation.",
+        "summary": "Every concept is strong.",
+        "concepts": [{
+            "concept_id": "oxidative-phosphorylation",
+            "label": "Oxidative phosphorylation",
+            "status": "strong",
+        }],
+        "review_schedule": [],
+        "next_action": "Rest.",
+        "source_moments": [],
+        "deferred_turns": 0,
+    });
+
+    // Identical sessions: one recap built from a bare call, one from a call
+    // carrying a fabricated recap.
+    let bare = Arc::new(FakeLearningStore::ready());
+    graded_session(NOW, "response-1", &bare).await;
+    executor(Arc::clone(&bare), Arc::new(UnreachableEvaluator))
+        .execute(
+            "response-2",
+            ToolProposal::build_session_recap(STUDY_SET_ID, VOICE_SESSION_ID),
+        )
+        .await
+        .expect("the bare recap succeeds");
+
+    let payloaded = Arc::new(FakeLearningStore::ready());
+    graded_session(NOW, "response-1", &payloaded).await;
+    let result = executor(Arc::clone(&payloaded), Arc::new(UnreachableEvaluator))
+        .execute(
+            "response-2",
+            with_extra(
+                &ToolProposal::build_session_recap(STUDY_SET_ID, VOICE_SESSION_ID),
+                "recap",
+                fabricated.clone(),
+            ),
+        )
+        .await
+        .expect("the payloaded recap succeeds");
+
+    assert_eq!(payloaded.persisted_recaps(), bare.persisted_recaps());
+    let encoded = serde_json::to_string(&payloaded.persisted_recaps()).expect("recaps serialize");
+    assert!(!encoded.contains("oxidative-phosphorylation"), "{encoded}");
+    assert!(!encoded.contains("You aced"), "{encoded}");
+    let returned = serde_json::to_string(&result.result["recap"]).expect("recap serializes");
+    assert!(
+        !returned.contains("oxidative-phosphorylation"),
+        "{returned}"
+    );
+}
+
+#[tokio::test]
+async fn tool_authority_recap_without_persisted_evidence_claims_nothing() {
+    let store = Arc::new(FakeLearningStore::ready());
+    let result = executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+        .execute(
+            "response-1",
+            ToolProposal::build_session_recap(STUDY_SET_ID, VOICE_SESSION_ID),
+        )
+        .await
+        .expect("a recap over no evidence still succeeds");
+    let recap: StudySessionRecapV2 =
+        serde_json::from_value(result.result["recap"].clone()).expect("recap parses");
+    assert_eq!(
+        recap.summary,
+        "No graded outcome was saved for this session."
+    );
+    assert!(recap.concepts.is_empty());
+    assert!(recap.review_schedule.is_empty());
+    assert!(recap.source_moments.is_empty());
+    assert_eq!(recap.deferred_turns, 0);
+}
+
+#[tokio::test]
+async fn tool_authority_only_mutation_sequence_is_outcome_transitions_schedule_then_recap() {
+    // Evaluated: the outcome and its transitions commit first, then one review
+    // decision per transition, then the recap projection. Nothing else writes.
+    let store = Arc::new(FakeLearningStore::ready());
+    graded_session(NOW, "response-1", &store).await;
+    executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+        .execute(
+            "response-2",
+            ToolProposal::build_session_recap(STUDY_SET_ID, VOICE_SESSION_ID),
+        )
+        .await
+        .expect("build_session_recap succeeds");
+    assert_eq!(
+        store.mutations(),
+        vec![
+            "record_turn_outcome:response-1".to_owned(),
+            format!("persist_review_schedule_decision:{CONCEPT_ETC}"),
+            format!("persist_review_schedule_decision:{CONCEPT_GRADIENT}"),
+            "record_recap:response-2".to_owned(),
+        ]
+    );
+
+    // Deferred: the deferral is persisted and nothing is scheduled or graded.
+    let store = Arc::new(FakeLearningStore::ready());
+    evaluate(
+        &store,
+        ScriptedEvaluator::failing(EvaluationError::Unavailable),
+        "response-1",
+        answer_proposal("A bound spoken answer."),
+    )
+    .await
+    .expect("a deferral is persisted");
+    executor(Arc::clone(&store), Arc::new(UnreachableEvaluator))
+        .execute(
+            "response-2",
+            ToolProposal::build_session_recap(STUDY_SET_ID, VOICE_SESSION_ID),
+        )
+        .await
+        .expect("build_session_recap succeeds");
+    assert_eq!(
+        store.mutations(),
+        vec![
+            "record_turn_outcome:response-1".to_owned(),
+            "record_recap:response-2".to_owned(),
+        ]
+    );
 }

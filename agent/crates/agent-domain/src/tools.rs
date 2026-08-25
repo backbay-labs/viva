@@ -6,6 +6,14 @@ use crate::{
     StudySourceReference,
 };
 
+/// The declared Viva tool surface.
+///
+/// `LEARN-009` keeps a name here only when the executor derives everything it
+/// returns from server state. The retired `mark_concept_status` and
+/// `schedule_review_item` constructors are deliberately absent: mastery moves
+/// only inside a persisted `TurnOutcome`, and a review date is an internal
+/// post-outcome policy step, never a model-selected argument. Their absence is
+/// the removal — a model cannot propose a tool this type cannot name.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ToolProposal {
     name: ToolName,
@@ -70,23 +78,6 @@ impl ToolProposal {
         )
     }
 
-    pub fn mark_concept_status(
-        study_set_id: impl Into<String>,
-        voice_session_id: impl Into<String>,
-        concept_id: impl Into<String>,
-        status: impl Into<String>,
-    ) -> Self {
-        Self::new(
-            "mark_concept_status",
-            json!({
-                "study_set_id": study_set_id.into(),
-                "voice_session_id": voice_session_id.into(),
-                "concept_id": concept_id.into(),
-                "status": status.into(),
-            }),
-        )
-    }
-
     pub fn build_session_recap(
         study_set_id: impl Into<String>,
         voice_session_id: impl Into<String>,
@@ -120,23 +111,6 @@ impl ToolProposal {
                 "retrieval_reason": &source.retrieval_reason,
                 "correction_id": correction_id.into(),
                 "challenge_text": challenge_text.into(),
-            }),
-        )
-    }
-
-    pub fn schedule_review_item(
-        study_set_id: impl Into<String>,
-        voice_session_id: impl Into<String>,
-        concept_id: impl Into<String>,
-        status: impl Into<String>,
-    ) -> Self {
-        Self::new(
-            "schedule_review_item",
-            json!({
-                "study_set_id": study_set_id.into(),
-                "voice_session_id": voice_session_id.into(),
-                "concept_id": concept_id.into(),
-                "status": status.into(),
             }),
         )
     }
