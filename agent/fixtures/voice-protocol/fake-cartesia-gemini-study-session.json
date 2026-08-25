@@ -2,7 +2,8 @@
   "client": [
     {
       "type": "session_config",
-      "version": 4,
+      "version": 5,
+      "client_generation_id": "1",
       "session": {
         "session_id": "voice-session-1",
         "user_id": "user-1",
@@ -23,25 +24,35 @@
       }
     },
     {
-      "type": "audio",
-      "version": 4,
+      "type": "audio_chunk",
+      "version": 5,
+      "client_generation_id": "1",
+      "turn_id": "turn-1",
+      "sequence": 0,
       "frame": {
         "pcm16_base64": "AQIDBA=="
       }
     },
     {
+      "type": "audio_end",
+      "version": 5,
+      "client_generation_id": "1",
+      "turn_id": "turn-1",
+      "final_sequence": 0
+    },
+    {
       "type": "cancel",
-      "version": 4
+      "version": 5
     },
     {
       "type": "stop",
-      "version": 4
+      "version": 5
     }
   ],
   "server": [
     {
       "type": "ready",
-      "version": 4,
+      "version": 5,
       "sample_rate_hz": 24000,
       "input_encoding": "pcm_s16le",
       "brain": {
@@ -62,7 +73,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "ready"
@@ -70,10 +81,10 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "question_started",
-        "response_id": "response-1",
+        "response_id": "response-1-generation-1",
         "question": {
           "question_id": "q-oxidative-phosphorylation-nadh",
           "prompt": "Explain the role of NADH in oxidative phosphorylation.",
@@ -96,8 +107,15 @@
       }
     },
     {
+      "type": "audio_turn_accepted",
+      "version": 5,
+      "client_generation_id": "1",
+      "turn_id": "turn-1",
+      "final_sequence": 0
+    },
+    {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "listening"
@@ -105,26 +123,26 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "transcript_delta",
-        "response_id": "response-1",
+        "response_id": "response-1-generation-1",
         "text": "received 4 PCM16 bytes"
       }
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "transcript_final",
-        "response_id": "response-1",
+        "response_id": "response-1-generation-1",
         "text": "NADH donates electrons to the electron transport chain.",
         "confidence": 0.91
       }
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "thinking"
@@ -132,10 +150,10 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "answer_evaluated",
-        "response_id": "response-1",
+        "response_id": "response-1-generation-1",
         "evaluation": {
           "question_id": "q-oxidative-phosphorylation-nadh",
           "answer_text": "NADH donates electrons to the electron transport chain.",
@@ -157,10 +175,10 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "manuscript_intent",
-        "response_id": "response-1",
+        "response_id": "response-1-generation-1",
         "intent": {
           "type": "entity_intent",
           "entity_id": "nadh",
@@ -172,10 +190,10 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "source_reference",
-        "response_id": "response-1",
+        "response_id": "response-1-generation-1",
         "source": {
           "source_id": "src-lecture-5-slide-18",
           "document_id": "lec-5",
@@ -188,20 +206,20 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "concept_status",
-        "response_id": "response-1",
+        "response_id": "response-1-generation-1",
         "concept_id": "oxidative-phosphorylation",
         "status": "strong"
       }
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "audio_delta",
-        "response_id": "response-1",
+        "response_id": "response-1-generation-1",
         "frame": {
           "pcm16_base64": "AQIDBA=="
         }
@@ -209,7 +227,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "feedback"
@@ -217,7 +235,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "correction"
@@ -225,10 +243,10 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "recap_ready",
-        "response_id": "response-1",
+        "response_id": "response-1-generation-1",
         "recap": {
           "voice_session_id": "voice-session-1",
           "headline": "Explain the role of NADH in oxidative phosphorylation. is ready for another pass.",
@@ -257,7 +275,7 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "session_phase",
         "phase": "recap"
@@ -265,10 +283,10 @@
     },
     {
       "type": "event",
-      "version": 4,
+      "version": 5,
       "event": {
         "type": "cancellation",
-        "response_id": "response-2"
+        "response_id": "response-2-generation-1"
       }
     }
   ]

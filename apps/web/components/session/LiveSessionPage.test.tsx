@@ -1,22 +1,37 @@
 import { describe, expect, test } from "bun:test";
-import type { SessionRecap } from "@viva/core";
+import { type SessionRecap, VIVA_AUDIO_MAX_TURN_SAMPLES } from "@viva/core";
 import type { VivaAgentDerivedState } from "../../lib/use-viva-agent-session";
-import type { VivaAgentAudioOutput } from "../../lib/viva-agent-client";
-import { VivaAudioWorkletUnavailableError } from "../../lib/viva-audio-capture";
+import {
+  type VivaAgentAudioOutput,
+  VivaAudioSendRejectedError,
+  type VivaAudioSendResult,
+} from "../../lib/viva-agent-client";
+import {
+  startVivaPcm16StreamingCapture,
+  VIVA_AUDIO_SAMPLE_RATE_HZ,
+  type VivaAudioCaptureEndReason,
+  type VivaAudioCaptureSampleFrame,
+  type VivaAudioCaptureSource,
+  type VivaAudioCaptureStartOptions,
+  VivaAudioWorkletUnavailableError,
+  type VivaPcm16StreamingCaptureController,
+} from "../../lib/viva-audio-capture";
 import { projectTrace } from "../../lib/viva-session-projection";
 import {
   browserLifecycleReconnectPlan,
   browserSessionReconnectReason,
   canStartMicrophoneCapture,
   captureLevelForBloom,
+  createLiveAudioTurnDriver,
+  createOpaqueAudioTurnId,
   derivedStateWithProjectedRecap,
   drainAgentAudio,
   enterTextAnswerMode,
   isCurrentBrowserLifecycleAttempt,
   isSessionOver,
+  type LiveAudioTurnSeam,
   micStateForAudioCaptureError,
   micStateForCaptureEndReason,
-  pcm16ChunksToBase64,
   refreshBrowserSessionToken,
   resetPlaybackCancellationStateForGeneration,
   sameBrowserSessionRouteIdentity,
@@ -27,6 +42,7 @@ import {
   shouldUseLiveMicAudioTransport,
   spokenTurnFallbackAction,
   stopCaptureForRecap,
+  submitSpokenCaptureTurn,
   textAnswerPayload,
   textAnswerStateForSession,
 } from "./LiveSessionPage";
@@ -372,8 +388,9 @@ describe("sessionRouteWsAccessToken", () => {
 });
 
 describe("LiveSessionPage recap cleanup", () => {
-  test("stops microphone capture when a terminal recap appears", () => {
+  test("stops microphone capture and cancels the in-flight turn on a terminal recap", () => {
     let stops = 0;
+    let cancels = 0;
     const captureRef = {
       current: {
         stop: () => {
@@ -383,15 +400,16 @@ describe("LiveSessionPage recap cleanup", () => {
     };
     const captureStartedRef = { current: true };
     const levelRef = { current: { agent: 0.2, user: 0.8 } };
-    const capturedTurnPcm16Ref = { current: [new Uint8Array([1, 2])] };
 
-    stopCaptureForRecap(captureRef, captureStartedRef, levelRef, capturedTurnPcm16Ref);
+    stopCaptureForRecap(captureRef, captureStartedRef, levelRef, () => {
+      cancels += 1;
+    });
 
     expect(stops).toBe(1);
+    expect(cancels).toBe(1);
     expect(captureRef.current).toBe(null);
     expect(captureStartedRef.current).toBe(false);
     expect(levelRef.current).toEqual({ agent: 0.2, user: 0 });
-    expect(capturedTurnPcm16Ref.current).toEqual([]);
   });
 
   test("stops microphone capture and leaves the bloom at floor in text answer mode", () => {
@@ -417,17 +435,19 @@ describe("LiveSessionPage recap cleanup", () => {
         },
       },
     };
-    const capturedTurnPcm16Ref = { current: [new Uint8Array([3, 4])] };
+    let audioTurnCancels = 0;
 
-    enterTextAnswerMode(captureRef, captureStartedRef, levelRef, meterRef, capturedTurnPcm16Ref);
+    enterTextAnswerMode(captureRef, captureStartedRef, levelRef, meterRef, () => {
+      audioTurnCancels += 1;
+    });
 
     expect(cancels).toBe(1);
     expect(stops).toBe(0);
     expect(resets).toBe(1);
+    expect(audioTurnCancels).toBe(1);
     expect(captureRef.current).toBe(null);
     expect(captureStartedRef.current).toBe(false);
     expect(levelRef.current).toEqual({ agent: 0.1, user: 0 });
-    expect(capturedTurnPcm16Ref.current).toEqual([]);
   });
 
   test("classifies Worklet support failures separately from mic permission denial", () => {
@@ -528,11 +548,6 @@ describe("LiveSessionPage recap cleanup", () => {
         textAnswerMode: true,
       }),
     ).toBe(false);
-  });
-
-  test("merges buffered worklet PCM chunks into one live audio turn", () => {
-    expect(pcm16ChunksToBase64([])).toBe(null);
-    expect(pcm16ChunksToBase64([new Uint8Array([1, 2]), new Uint8Array([3, 4])])).toBe("AQIDBA==");
   });
 
   test("opens typed answer mode instead of synthesizing a spoken-answer placeholder", () => {
@@ -662,3 +677,436 @@ describe("LiveSessionPage recap cleanup", () => {
     expect(projection.question.highlights).not.toContain("Fixture stale id");
   });
 });
+
+/**
+ * CRIT-AUDIO-01 page lifecycle. The wiring is exercised through the extracted
+ * controller-driven helpers, not a mounted component: `bun:test` has no DOM
+ * environment at this base and this lane does not add one. The real mounted
+ * lifecycle is covered by the browser E2E proofs.
+ */
+describe("live audio turn driver", () => {
+  const sent = (acceptedThroughSequence: number): VivaAudioSendResult => ({
+    acceptedThroughSequence,
+    status: "sent",
+  });
+
+  type RecordedCall =
+    | { kind: "chunk"; turnId: string; sequence: number; byteLength: number }
+    | { kind: "end"; turnId: string; finalSequence: number }
+    | { kind: "cancel"; turnId: string };
+
+  function recordingSeam(overrides: Partial<LiveAudioTurnSeam> = {}): {
+    seam: LiveAudioTurnSeam;
+    calls: RecordedCall[];
+    payloads: string[];
+  } {
+    const calls: RecordedCall[] = [];
+    const payloads: string[] = [];
+    const seam: LiveAudioTurnSeam = {
+      cancelAudioTurn: (turnId) => {
+        calls.push({ kind: "cancel", turnId });
+      },
+      endAudioTurn: (input) => {
+        calls.push({ finalSequence: input.finalSequence, kind: "end", turnId: input.turnId });
+        return sent(input.finalSequence);
+      },
+      sendAudioChunk: (input) => {
+        calls.push({
+          byteLength: input.pcm16Bytes.byteLength,
+          kind: "chunk",
+          sequence: input.sequence,
+          turnId: input.turnId,
+        });
+        payloads.push(JSON.stringify({ ...input, pcm16Bytes: Array.from(input.pcm16Bytes) }));
+        return sent(input.sequence);
+      },
+      ...overrides,
+    };
+    return { calls, payloads, seam };
+  }
+
+  function fixedTurnIds(...ids: string[]) {
+    let index = 0;
+    return () => ids[index++] ?? `unexpected-turn-${index}`;
+  }
+
+  const frame = (byteLength: number) => ({ pcm16Bytes: new Uint8Array(byteLength) });
+
+  test("streams contiguous chunks for a turn and submits exactly one end", () => {
+    const { calls, seam } = recordingSeam();
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-a"),
+    });
+
+    for (let callback = 0; callback < 4; callback += 1) driver.captureFrame(frame(960));
+    const end = driver.submit();
+
+    expect(calls).toEqual([
+      { byteLength: 960, kind: "chunk", sequence: 0, turnId: "turn-a" },
+      { byteLength: 960, kind: "chunk", sequence: 1, turnId: "turn-a" },
+      { byteLength: 960, kind: "chunk", sequence: 2, turnId: "turn-a" },
+      { byteLength: 960, kind: "chunk", sequence: 3, turnId: "turn-a" },
+      { finalSequence: 3, kind: "end", turnId: "turn-a" },
+    ]);
+    expect(end).toEqual(sent(3));
+    expect(driver.getTurn()).toBe(null);
+    expect(driver.isAwaitingAcceptance()).toBe(true);
+    // Nothing is submitted twice, and an empty turn never produces an end frame.
+    expect(driver.submit()).toBe(null);
+    expect(calls.filter((call) => call.kind === "end")).toHaveLength(1);
+  });
+
+  test("never sends a merged whole-turn payload", () => {
+    const { calls, payloads, seam } = recordingSeam();
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-b"),
+    });
+
+    for (let callback = 0; callback < 50; callback += 1) driver.captureFrame(frame(960));
+    driver.submit();
+
+    const chunkBytes = calls.filter((call) => call.kind === "chunk");
+    expect(chunkBytes).toHaveLength(50);
+    for (const call of chunkBytes) expect(call.byteLength).toBe(960);
+    for (const payload of payloads) expect(payload.length).toBeLessThan(64 * 1024);
+  });
+
+  test("keeps pending and socket_closed results as retry metadata, never as a sent answer", () => {
+    const pending: VivaAudioSendResult = {
+      acceptedThroughSequence: 0,
+      retainedFromSequence: 0,
+      status: "pending",
+    };
+    const closed: VivaAudioSendResult = {
+      acceptedThroughSequence: 0,
+      error: { code: "socket_closed", message: "Viva voice WebSocket is not open" },
+      retainedFromSequence: 0,
+      retryable: true,
+      status: "socket_closed",
+    };
+    const results: VivaAudioSendResult[] = [sent(0), pending, closed];
+    let index = 0;
+    const recorded = recordingSeam();
+    const { calls } = recorded;
+    const seam: LiveAudioTurnSeam = {
+      ...recorded.seam,
+      sendAudioChunk: (input) => {
+        recorded.seam.sendAudioChunk(input);
+        return results[index++] ?? closed;
+      },
+    };
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-c"),
+    });
+
+    expect(driver.captureFrame(frame(960)).chunk?.result).toEqual(sent(0));
+    expect(driver.captureFrame(frame(960)).chunk?.result).toEqual(pending);
+    expect(driver.captureFrame(frame(960)).chunk?.result).toEqual(closed);
+    expect(driver.getLastResult()).toEqual(closed);
+    // The turn is still live and contiguous — nothing was dropped or reordered.
+    expect(driver.getTurn()).toEqual({
+      capturedSamples: 1_440,
+      nextSequence: 3,
+      turnId: "turn-c",
+    });
+    expect(calls.map((call) => (call.kind === "chunk" ? call.sequence : call.kind))).toEqual([
+      0, 1, 2,
+    ]);
+  });
+
+  test("stops and ends exactly at the 45-second raw sample cap", () => {
+    const { calls, seam } = recordingSeam();
+    let capacityReached = 0;
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-d"),
+      maxTurnSamples: 960,
+      onCapacityReached: () => {
+        capacityReached += 1;
+      },
+    });
+
+    // 480 samples per production 20 ms callback.
+    driver.captureFrame(frame(960));
+    const atCap = driver.captureFrame(frame(960));
+    const afterCap = driver.captureFrame(frame(960));
+
+    expect(atCap.chunk?.sequence).toBe(1);
+    expect(atCap.end).toEqual(sent(1));
+    expect(afterCap).toEqual({ chunk: null, end: null, ignored: "awaiting_acceptance" });
+    expect(capacityReached).toBe(1);
+    expect(calls).toEqual([
+      { byteLength: 960, kind: "chunk", sequence: 0, turnId: "turn-d" },
+      { byteLength: 960, kind: "chunk", sequence: 1, turnId: "turn-d" },
+      { finalSequence: 1, kind: "end", turnId: "turn-d" },
+    ]);
+  });
+
+  test("drops an over-cap callback instead of exceeding 1,080,000 samples", () => {
+    const { calls, seam } = recordingSeam();
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-e"),
+      maxTurnSamples: 1_000,
+    });
+
+    driver.captureFrame(frame(960));
+    const overCap = driver.captureFrame(frame(2_000));
+
+    expect(overCap.chunk).toBe(null);
+    expect(overCap.ignored).toBe("capped");
+    expect(overCap.end).toEqual(sent(0));
+    expect(calls).toEqual([
+      { byteLength: 960, kind: "chunk", sequence: 0, turnId: "turn-e" },
+      { finalSequence: 0, kind: "end", turnId: "turn-e" },
+    ]);
+    expect(VIVA_AUDIO_MAX_TURN_SAMPLES).toBe(1_080_000);
+  });
+
+  test("only audio_turn_accepted release lets a new turn open", () => {
+    const { calls, seam } = recordingSeam();
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-f", "turn-g"),
+    });
+
+    driver.captureFrame(frame(960));
+    driver.submit();
+
+    expect(driver.captureFrame(frame(960))).toEqual({
+      chunk: null,
+      end: null,
+      ignored: "awaiting_acceptance",
+    });
+    expect(driver.release("turn-mismatched")).toBe(false);
+    expect(driver.captureFrame(frame(960)).ignored).toBe("awaiting_acceptance");
+
+    expect(driver.release("turn-f")).toBe(true);
+    expect(driver.captureFrame(frame(960)).chunk).toEqual({ result: sent(0), sequence: 0 });
+    expect(calls.at(-1)).toEqual({ byteLength: 960, kind: "chunk", sequence: 0, turnId: "turn-g" });
+  });
+
+  test("every abort path cancels the live turn exactly once", () => {
+    for (const abort of ["switch_to_text", "device_error", "disposal", "explicit_cancel"]) {
+      const { calls, seam } = recordingSeam();
+      const driver = createLiveAudioTurnDriver({
+        controller: seam,
+        createTurnId: fixedTurnIds(`turn-${abort}`),
+      });
+      driver.captureFrame(frame(960));
+
+      expect(driver.cancel()).toBe(true);
+      // Repeated teardown (unmount after an explicit cancel) never double-cancels.
+      expect(driver.cancel()).toBe(false);
+
+      expect(calls.filter((call) => call.kind === "cancel")).toEqual([
+        { kind: "cancel", turnId: `turn-${abort}` },
+      ]);
+      expect(driver.getTurn()).toBe(null);
+      expect(driver.isAwaitingAcceptance()).toBe(false);
+    }
+  });
+
+  test("cancels a submitted turn that is still awaiting acceptance", () => {
+    const { calls, seam } = recordingSeam();
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-h"),
+    });
+    driver.captureFrame(frame(960));
+    driver.submit();
+
+    expect(driver.cancel()).toBe(true);
+
+    expect(calls.at(-1)).toEqual({ kind: "cancel", turnId: "turn-h" });
+    expect(driver.isAwaitingAcceptance()).toBe(false);
+  });
+
+  test("ignores empty and odd-byte capture callbacks without opening a turn", () => {
+    const { calls, seam } = recordingSeam();
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-i"),
+    });
+
+    expect(driver.captureFrame(frame(0))).toEqual({ chunk: null, end: null, ignored: "empty" });
+    expect(driver.captureFrame(frame(961))).toEqual({ chunk: null, end: null, ignored: "empty" });
+
+    expect(calls).toEqual([]);
+    expect(driver.getTurn()).toBe(null);
+  });
+
+  test("surfaces a rejected send without raw payload material or a partial turn", () => {
+    const rejection = new VivaAudioSendRejectedError({
+      code: "audio_queue_limit",
+      message: "Audio turn exceeds the maximum retained turn size",
+    });
+    const errors: string[] = [];
+    const { seam } = recordingSeam({
+      sendAudioChunk: () => {
+        throw rejection;
+      },
+    });
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-j"),
+      onSendRejected: (error) => errors.push(`${error.code}:${error.message}`),
+    });
+
+    const outcome = driver.captureFrame({ pcm16Bytes: Uint8Array.from([0x11, 0x22, 0x33, 0x44]) });
+
+    expect(outcome).toEqual({ chunk: null, end: null, ignored: "rejected" });
+    expect(errors).toEqual(["audio_queue_limit:Audio turn exceeds the maximum retained turn size"]);
+    expect(errors.join(" ")).not.toContain("ESIz");
+    expect(driver.getTurn()).toBe(null);
+  });
+
+  test("mints opaque turn ids that carry no learner material", () => {
+    const first = createOpaqueAudioTurnId();
+    const second = createOpaqueAudioTurnId();
+
+    expect(first).not.toBe(second);
+    expect(first.startsWith("turn-")).toBe(true);
+    expect(/^turn-[A-Za-z0-9-]+$/.test(first)).toBe(true);
+  });
+
+  test("the real capture source at the raw sample cap ends once and stops without recursion", () => {
+    const { calls, seam } = recordingSeam();
+    const source = new FakeLiveCaptureSource(VIVA_AUDIO_SAMPLE_RATE_HZ);
+    const captureRef: { current: VivaPcm16StreamingCaptureController | null } = { current: null };
+    let capacityReached = 0;
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-cap"),
+      maxTurnSamples: 960,
+      // The page's exact capacity wiring, in the page's exact order: the stop
+      // runs before the ref is cleared, so a re-entrant callback still sees the
+      // live controller.
+      onCapacityReached: () => {
+        capacityReached += 1;
+        captureRef.current?.stop();
+        captureRef.current = null;
+      },
+    });
+    captureRef.current = startVivaPcm16StreamingCapture({
+      onFrame: (frame) => {
+        driver.captureFrame(frame);
+      },
+      source,
+    });
+
+    // 700-sample worklet callbacks leave a partial tail buffered at the exact
+    // moment the cap is reached, and stopping capture flushes that tail straight
+    // back into `captureFrame` while the capping callback is still on the stack.
+    source.push(new Float32Array(700).fill(0.25));
+    source.push(new Float32Array(700).fill(-0.25));
+
+    expect(capacityReached).toBe(1);
+    expect(calls).toEqual([
+      { byteLength: 960, kind: "chunk", sequence: 0, turnId: "turn-cap" },
+      { byteLength: 960, kind: "chunk", sequence: 1, turnId: "turn-cap" },
+      { finalSequence: 1, kind: "end", turnId: "turn-cap" },
+    ]);
+    expect(driver.getTurn()).toBe(null);
+    expect(driver.isAwaitingAcceptance()).toBe(true);
+    expect(source.stopped).toBe(true);
+  });
+
+  test("submitting a spoken turn flushes the tail and keeps the microphone open", () => {
+    const { calls, seam } = recordingSeam();
+    const source = new FakeLiveCaptureSource(VIVA_AUDIO_SAMPLE_RATE_HZ);
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-first", "turn-second"),
+    });
+    const capture = startVivaPcm16StreamingCapture({
+      onFrame: (frame) => {
+        driver.captureFrame(frame);
+      },
+      source,
+    });
+    const captureRef = { current: capture };
+
+    source.push(new Float32Array(700).fill(0.25));
+
+    expect(submitSpokenCaptureTurn(captureRef, driver)).toEqual({
+      acceptedThroughSequence: 1,
+      status: "sent",
+    });
+
+    // The buffered 220-sample tail is the turn's last chunk, ahead of the end.
+    expect(calls).toEqual([
+      { byteLength: 960, kind: "chunk", sequence: 0, turnId: "turn-first" },
+      { byteLength: 440, kind: "chunk", sequence: 1, turnId: "turn-first" },
+      { finalSequence: 1, kind: "end", turnId: "turn-first" },
+    ]);
+    // Submitting an answer must not tear the microphone down. The page keeps
+    // `captureStarted` true for the whole session and nothing resets it on a
+    // question change, so a stopped source here would silently make every later
+    // spoken answer impossible.
+    expect(capture.isActive()).toBe(true);
+    expect(source.stopped).toBe(false);
+    expect(captureRef.current).toBe(capture);
+    expect(
+      canStartMicrophoneCapture({
+        captureStarted: true,
+        consentAcknowledged: true,
+        textAnswerMode: false,
+      }),
+    ).toBe(false);
+
+    // Next question: acceptance releases the turn and the same live capture opens
+    // a second one with no new gesture and no new getUserMedia prompt.
+    expect(driver.release("turn-first")).toBe(true);
+    source.push(new Float32Array(480).fill(-0.25));
+
+    expect(calls.at(-1)).toEqual({
+      byteLength: 960,
+      kind: "chunk",
+      sequence: 0,
+      turnId: "turn-second",
+    });
+  });
+});
+
+class FakeLiveCaptureSource implements VivaAudioCaptureSource {
+  readonly sampleRateHz: number;
+  stopped = false;
+  #onSamples:
+    | ((samples: Float32Array, sampleRateHz: number, frame?: VivaAudioCaptureSampleFrame) => void)
+    | null = null;
+  #onEnded: ((reason: VivaAudioCaptureEndReason) => void) | null = null;
+
+  constructor(sampleRateHz: number) {
+    this.sampleRateHz = sampleRateHz;
+  }
+
+  start(
+    onSamples: (
+      samples: Float32Array,
+      sampleRateHz: number,
+      frame?: VivaAudioCaptureSampleFrame,
+    ) => void,
+    options?: VivaAudioCaptureStartOptions,
+  ) {
+    this.#onSamples = onSamples;
+    this.#onEnded = options?.onEnded ?? null;
+  }
+
+  stop() {
+    this.stopped = true;
+    this.#onSamples = null;
+    this.#onEnded?.("stopped");
+  }
+
+  push(samples: Float32Array) {
+    this.#onSamples?.(samples, this.sampleRateHz, {
+      rms: 0,
+      sampleRateHz: this.sampleRateHz,
+      samples,
+    });
+  }
+}

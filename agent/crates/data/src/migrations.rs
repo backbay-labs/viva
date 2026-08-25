@@ -62,6 +62,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0014_session_recaps_one_row_per_session.sql",
         include_str!("../../../migrations/0014_session_recaps_one_row_per_session.sql"),
     ),
+    (
+        "0015_review_schedule_decisions_v1.sql",
+        include_str!("../../../migrations/0015_review_schedule_decisions_v1.sql"),
+    ),
 ];
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
@@ -342,6 +346,61 @@ mod tests {
         assert!(sql.contains(
             "PRIMARY KEY (user_id, study_set_id, voice_session_id, response_id, concept_id, payload_sha256)"
         ));
+    }
+
+    #[test]
+    fn migrations_define_the_v1_review_schedule_decision_columns() {
+        let sql = migration_sql();
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS schedule_schema_version SMALLINT"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS schedule_decision JSONB"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS schedule_card JSONB"));
+        assert!(sql.contains("review_items_schedule_v1_complete"));
+        assert!(sql.contains("schedule_schema_version = 1"));
+        assert!(sql.contains("review_items_schedule_cap_reason_valid"));
+        assert!(sql.contains("IN ('exam_margin', 'past_exam')"));
+        assert!(sql.contains("review_items_schedule_decision_v1_idx"));
+    }
+
+    /// The 0012 guard keys on `due_at`, which a replay recomputes from a later clock.
+    /// The v1 replay guard must key on the graded outcome instead, or a replayed tool
+    /// call writes a second scheduled review and advances the persisted FSRS card.
+    #[test]
+    fn migrations_guard_review_schedule_replays_on_the_graded_outcome_not_the_due_date() {
+        let sql = migration_sql();
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS schedule_response_id TEXT"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS schedule_payload_sha256 TEXT"));
+        assert!(sql.contains(
+            "CREATE UNIQUE INDEX IF NOT EXISTS review_items_schedule_response_replay_idx"
+        ));
+        assert!(sql.contains("schedule_response_id, schedule_payload_sha256"));
+        assert!(sql.contains("AND schedule_response_id IS NOT NULL"));
+        // The replay key must never be the computed schedule.
+        let replay_index = sql
+            .split("review_items_schedule_response_replay_idx")
+            .nth(1)
+            .expect("replay index is defined");
+        let replay_definition = replay_index
+            .split(';')
+            .next()
+            .expect("replay index definition terminates");
+        assert!(!replay_definition.contains("due_at"), "{replay_definition}");
+    }
+
+    #[test]
+    fn migrations_supersede_the_four_known_fixed_review_dates_without_inventing_new_ones() {
+        let sql = migration_sql();
+        assert!(sql.contains("SET status = 'superseded'"));
+        for buggy in [
+            "2026-06-18T09:00:00Z",
+            "2026-06-19T09:00:00Z",
+            "2026-06-20T09:00:00Z",
+            "2026-06-24T09:00:00Z",
+        ] {
+            assert!(sql.contains(buggy), "migration must supersede {buggy}");
+        }
+        // Supersession only: the migration never writes a replacement due date.
+        assert!(!sql.contains("SET due_at ="));
+        assert!(!sql.contains("UPDATE review_items\nSET due_at"));
     }
 
     #[test]
@@ -932,6 +991,454 @@ mod tests {
         .await
         .expect("review item row count query succeeds");
         assert_eq!(row_count, 1);
+    }
+
+    /// The Postgres half of the D-01 replay guard. Two calls that differ only because
+    /// the wall clock moved are the same graded outcome: they must leave exactly one
+    /// scheduled row, and the persisted FSRS card must not advance.
+    #[tokio::test]
+    async fn optional_postgres_review_schedule_decision_replay_writes_one_row_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        record_fixture_session(&store).await;
+
+        let graded_at =
+            agent_domain::parse_utc_instant("2031-04-05T12:00:00.000Z").expect("instant parses");
+        let outcome = agent_domain::ReviewOutcomeV1 {
+            status: ConceptStatus::Shaky,
+            hint_count: Some(2),
+            miss_count: Some(1),
+        };
+        let context = agent_domain::ReviewSchedulingContextV1::empty();
+        let first_decision = agent_domain::decide_review_schedule(graded_at, &outcome, &context)
+            .expect("first decision");
+        // The replay reads a later clock, exactly as the live executor does.
+        let replay_decision = agent_domain::decide_review_schedule(
+            graded_at + chrono::Duration::seconds(1),
+            &outcome,
+            &context,
+        )
+        .expect("replayed decision");
+        assert_ne!(first_decision.due_at, replay_decision.due_at);
+
+        let before = store.write_counts();
+        let first = store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-7",
+                "atp-synthase",
+                first_decision.clone(),
+            )
+            .await
+            .expect("first decision persists");
+        let replay = store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-7",
+                "atp-synthase",
+                replay_decision,
+            )
+            .await
+            .expect("replay observes the guard");
+        assert_eq!(replay, first, "a replay reports the persisted decision");
+
+        let after = store.write_counts();
+        assert_eq!(after.review_items - before.review_items, 1);
+        let row_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM review_items
+             WHERE user_id = $1
+               AND study_set_id = $2
+               AND voice_session_id = $3
+               AND concept_id = $4
+               AND status = 'scheduled'
+               AND schedule_schema_version = 1",
+        )
+        .bind("user-1")
+        .bind(fixture_uuid("biology-midterm").expect("study set fixture UUID"))
+        .bind(fixture_uuid("voice-session-1").expect("voice session fixture UUID"))
+        .bind(parse_uuid("77777777-7777-4777-8777-777777777777").expect("concept fixture UUID"))
+        .fetch_one(&pool)
+        .await
+        .expect("review item row count query succeeds");
+        assert_eq!(row_count, 1);
+
+        let context = store
+            .review_scheduling_context("user-1", "biology-midterm", "atp-synthase")
+            .await
+            .expect("authoritative context");
+        assert_eq!(
+            context.card.as_ref().map(|card| card.reps),
+            Some(1),
+            "a replay must not advance the persisted FSRS card"
+        );
+    }
+
+    /// Long enough for the paste/file ingestion heuristics to derive real source
+    /// spans and concepts.
+    fn ingestible_text() -> String {
+        let sentences = [
+            "Mitochondria electron transport builds a proton gradient across the inner membrane for ATP synthase.",
+            "NADH transfers electrons through Complex I while oxygen accepts them at the end of the chain.",
+            "Chemiosmosis couples proton flow to ATP production during oxidative phosphorylation.",
+        ]
+        .join(" ");
+        format!("{sentences} {}", sentences.repeat(8))
+    }
+
+    const EXAM_AT: &str = "2031-04-05T18:30:00.000Z";
+    const EXAM_CAPPED_DUE_AT: &str = "2031-04-04T18:30:00.000Z";
+    const SCHEDULE_GRADED_AT: &str = "2031-04-05T12:00:00.000Z";
+
+    /// D-01's exam margin and past-exam fail-closed rule are unreachable unless the
+    /// exam instant the learner supplies at ingestion actually lands in the durable
+    /// backend. This drives the whole authoritative path on real PostgreSQL:
+    /// ingestion -> `review_scheduling_context` -> `decide_review_schedule`.
+    #[tokio::test]
+    async fn optional_postgres_ingestion_persists_the_exam_instant_for_the_d01_cap_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        let store = PostgresStudyStore::new(pool.clone());
+
+        let ingested = store
+            .create_paste_study_set(agent_domain::CreatePasteStudySet {
+                user_id: "user-1".to_owned(),
+                title: "Bio paste".to_owned(),
+                course: None,
+                exam_date: Some(EXAM_AT.to_owned()),
+                pasted_text: ingestible_text(),
+                session_id: Some(Uuid::new_v4().to_string()),
+            })
+            .await
+            .expect("paste ingestion succeeds");
+        let concept_id = ingested
+            .concepts
+            .first()
+            .expect("ingestion produced a concept")
+            .public_id
+            .clone();
+
+        let context = store
+            .review_scheduling_context("user-1", &ingested.study_set.id, &concept_id)
+            .await
+            .expect("authoritative context");
+        assert_eq!(
+            context.exam_at,
+            Some(agent_domain::parse_utc_instant(EXAM_AT).expect("exam instant")),
+            "the exam cap has no authoritative input if ingestion drops the exam instant"
+        );
+
+        let decision = agent_domain::decide_review_schedule(
+            agent_domain::parse_utc_instant(SCHEDULE_GRADED_AT).expect("instant parses"),
+            &agent_domain::ReviewOutcomeV1 {
+                status: ConceptStatus::Shaky,
+                hint_count: None,
+                miss_count: None,
+            },
+            &context,
+        )
+        .expect("authoritative decision");
+        assert_eq!(
+            agent_domain::format_rfc3339_millis(decision.due_at),
+            EXAM_CAPPED_DUE_AT
+        );
+        assert_eq!(
+            decision.cap_reason,
+            Some(agent_domain::ReviewScheduleCapReasonV1::ExamMargin)
+        );
+    }
+
+    /// The production retry route always sends `exam_date: None`, so a retry that
+    /// writes the input verbatim erases the learner's exam instant on the durable
+    /// backend exactly as it did in memory.
+    #[tokio::test]
+    async fn optional_postgres_file_retry_keeps_the_exam_instant_the_learner_recorded_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        let store = PostgresStudyStore::new(pool.clone());
+
+        let ingested = store
+            .create_file_study_set(agent_domain::CreateFileStudySet {
+                user_id: "user-1".to_owned(),
+                study_set_id: None,
+                title: "Bio PDF".to_owned(),
+                course: Some("Biology 201".to_owned()),
+                exam_date: Some(EXAM_AT.to_owned()),
+                file_name: "Lecture 9.pdf".to_owned(),
+                content_type: Some("application/pdf".to_owned()),
+                file_bytes: ingestible_text().into_bytes(),
+                session_id: Some(Uuid::new_v4().to_string()),
+            })
+            .await
+            .expect("file ingestion succeeds");
+        let study_set_id = ingested.study_set.id.clone();
+
+        let retried = store
+            .retry_file_study_set(agent_domain::CreateFileStudySet {
+                user_id: "user-1".to_owned(),
+                study_set_id: Some(study_set_id.clone()),
+                title: String::new(),
+                course: None,
+                exam_date: None,
+                file_name: "Lecture 9 rescan.pdf".to_owned(),
+                content_type: Some("application/pdf".to_owned()),
+                file_bytes: ingestible_text().into_bytes(),
+                session_id: Some(Uuid::new_v4().to_string()),
+            })
+            .await
+            .expect("retry succeeds");
+        let concept_id = retried
+            .concepts
+            .first()
+            .expect("retry produced a concept")
+            .public_id
+            .clone();
+
+        assert_eq!(
+            store
+                .review_scheduling_context("user-1", &study_set_id, &concept_id)
+                .await
+                .expect("authoritative context")
+                .exam_at,
+            Some(agent_domain::parse_utc_instant(EXAM_AT).expect("exam instant")),
+            "a file retry must not erase the exam instant the learner already recorded"
+        );
+    }
+
+    /// Fail closed where the learner supplies the value, on the durable backend too.
+    #[tokio::test]
+    async fn optional_postgres_ingestion_rejects_an_unparseable_exam_date_when_database_url_is_set()
+    {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        let store = PostgresStudyStore::new(pool.clone());
+        store
+            .create_paste_study_set(agent_domain::CreatePasteStudySet {
+                user_id: "user-1".to_owned(),
+                title: "Bio paste".to_owned(),
+                course: None,
+                exam_date: Some("sometime next week".to_owned()),
+                pasted_text: ingestible_text(),
+                session_id: Some(Uuid::new_v4().to_string()),
+            })
+            .await
+            .expect_err("an unparseable exam date is rejected where the learner supplies it");
+    }
+
+    /// Under the D-01 exam cap every decision for one concept clamps to the SAME
+    /// `due_at`, so a guard that leans on the `due_at` conflict arbiter
+    /// (`review_items_voice_session_concept_due_scheduled_idx`, migration 0012) sees
+    /// a plain conflict and takes `DO UPDATE`: the replay counts as a second review
+    /// write and overwrites the authoritative first decision.
+    ///
+    /// The window that has to be closed is narrow and real: racer B reads, finds
+    /// nothing, racer A commits, and only then does B insert. Reproducing it needs
+    /// genuine parallelism — a multi-threaded runtime, one warmed connection per
+    /// racer so `BEGIN` cannot serialize them, a barrier so they start together, and
+    /// enough rounds that the interleaving actually occurs. Four racers against a
+    /// pool of five: no racer can starve while another holds the guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn optional_postgres_review_schedule_decision_concurrent_replay_under_the_exam_cap_writes_one_row_when_database_url_is_set(
+    ) {
+        const RACERS: usize = 4;
+        const ROUNDS: usize = 12;
+
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = Arc::new(PostgresStudyStore::new(pool.clone()));
+        record_fixture_session(store.as_ref()).await;
+
+        // Open one connection per racer up front. A lazily grown pool hands the same
+        // connection to each racer in turn, which serializes the transactions and
+        // hides the very interleaving under test.
+        {
+            let mut warm = Vec::new();
+            for _ in 0..RACERS {
+                warm.push(pool.acquire().await.expect("pool connection"));
+            }
+            drop(warm);
+        }
+
+        let graded_at =
+            agent_domain::parse_utc_instant(SCHEDULE_GRADED_AT).expect("instant parses");
+        let outcome = agent_domain::ReviewOutcomeV1 {
+            status: ConceptStatus::Shaky,
+            hint_count: Some(2),
+            miss_count: Some(1),
+        };
+        let context = agent_domain::ReviewSchedulingContextV1 {
+            schema_version: agent_domain::VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+            exam_at: Some(agent_domain::parse_utc_instant(EXAM_AT).expect("exam instant")),
+            card: None,
+        };
+        // Each racer reads the clock a second later, exactly as a replayed tool call
+        // does; under the cap every one of them still clamps to the same due date.
+        let decisions: Vec<_> = (0..RACERS)
+            .map(|offset| {
+                agent_domain::decide_review_schedule(
+                    graded_at + chrono::Duration::seconds(offset as i64),
+                    &outcome,
+                    &context,
+                )
+                .expect("capped decision")
+            })
+            .collect();
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| decision.due_at == decisions[0].due_at),
+            "the cap is what makes the due_at arbiter collide"
+        );
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| decision.generated_at != decisions[0].generated_at),
+            "the racers must be distinguishable by the clock-derived field"
+        );
+
+        for round in 0..ROUNDS {
+            // A fresh graded outcome per round: each round is a first call plus three
+            // replays of that same call, never a replay of an earlier round.
+            let response_id = format!("response-cap-{round}");
+            let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
+            let before = store.write_counts();
+
+            let mut handles = Vec::new();
+            for decision in decisions.iter().take(RACERS).cloned() {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                let response_id = response_id.clone();
+                handles.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    store
+                        .persist_review_schedule_decision(
+                            "user-1",
+                            "biology-midterm",
+                            "voice-session-1",
+                            &response_id,
+                            "atp-synthase",
+                            decision,
+                        )
+                        .await
+                }));
+            }
+            let mut results = Vec::new();
+            for handle in handles {
+                results.push(handle.await.expect("racer joins").expect("racer succeeds"));
+            }
+            for result in &results {
+                assert_eq!(
+                    result, &results[0],
+                    "round {round}: every racer reports the one persisted decision"
+                );
+            }
+
+            let after = store.write_counts();
+            assert_eq!(
+                after.review_items - before.review_items,
+                1,
+                "round {round}: a replay writes nothing, even when the cap makes the due dates equal"
+            );
+            let rows = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM review_items
+                 WHERE schedule_response_id = $1 AND status = 'scheduled'",
+            )
+            .bind(&response_id)
+            .fetch_one(&pool)
+            .await
+            .expect("row count query succeeds");
+            assert_eq!(rows, 1, "round {round}");
+
+            let persisted_generated_at = sqlx::query_scalar::<_, String>(
+                "SELECT schedule_decision->>'generated_at' FROM review_items
+                 WHERE schedule_response_id = $1 AND status = 'scheduled'",
+            )
+            .bind(&response_id)
+            .fetch_one(&pool)
+            .await
+            .expect("persisted decision query succeeds");
+            assert!(
+                decisions.iter().any(|decision| {
+                    agent_domain::format_rfc3339_millis(decision.generated_at)
+                        == persisted_generated_at
+                }),
+                "round {round}: the persisted decision must be one a caller produced"
+            );
+            assert_eq!(
+                results[0]["due_at"].as_str(),
+                Some(agent_domain::format_rfc3339_millis(decisions[0].due_at).as_str()),
+                "round {round}"
+            );
+        }
+    }
+
+    /// The two backends must leave the same authorization ledger behind: a replay
+    /// performs no write, so it appends no second authorization on either.
+    #[tokio::test]
+    async fn optional_postgres_review_schedule_decision_replay_records_exactly_one_authorization_when_database_url_is_set(
+    ) {
+        let Some(pool) = optional_postgres_pool().await else {
+            return;
+        };
+        run_migrations(&pool).await.expect("migrations apply");
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        record_fixture_session(&store).await;
+
+        let decision = agent_domain::decide_review_schedule(
+            agent_domain::parse_utc_instant(SCHEDULE_GRADED_AT).expect("instant parses"),
+            &agent_domain::ReviewOutcomeV1 {
+                status: ConceptStatus::Shaky,
+                hint_count: Some(2),
+                miss_count: Some(1),
+            },
+            &agent_domain::ReviewSchedulingContextV1::empty(),
+        )
+        .expect("authoritative decision");
+        for _ in 0..3 {
+            store
+                .persist_review_schedule_decision(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    "response-ledger",
+                    "atp-synthase",
+                    decision.clone(),
+                )
+                .await
+                .expect("decision persists");
+        }
+        assert_eq!(
+            store.event_authorization_ledger_len(),
+            1,
+            "a replay writes nothing, so it appends no second authorization"
+        );
     }
 
     #[tokio::test]

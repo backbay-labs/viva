@@ -31,7 +31,59 @@ import {
   type VivaAgentGenerationReason,
   type VivaAgentSessionController,
   type VivaAgentSessionState,
+  type VivaAudioChunkInput,
+  type VivaAudioSendResult,
 } from "./viva-agent-client";
+
+export type VivaAgentAudioCommands = {
+  sendAudioChunk: (input: VivaAudioChunkInput) => VivaAudioSendResult;
+  endAudioTurn: (input: Readonly<{ turnId: string; finalSequence: number }>) => VivaAudioSendResult;
+  cancelAudioTurn: (turnId: string) => void;
+  retryPendingAudio: () => VivaAudioSendResult;
+};
+
+const VIVA_AGENT_DISCONNECTED_SEND_ERROR = {
+  code: "socket_closed",
+  message: "Viva agent session is not connected",
+} as const;
+
+function disconnectedAudioSendResult(retainedFromSequence: number): VivaAudioSendResult {
+  return {
+    acceptedThroughSequence: null,
+    error: VIVA_AGENT_DISCONNECTED_SEND_ERROR,
+    retainedFromSequence,
+    retryable: true,
+    status: "socket_closed",
+  };
+}
+
+/**
+ * The hook's audio surface, extracted as a pure factory over the controller seam
+ * so it is provable without mounting a component (`bun:test` has no DOM at this
+ * base). Each method delegates and returns the controller's discriminated
+ * `VivaAudioSendResult` unchanged; with no mounted controller the caller gets a
+ * retryable `socket_closed` rather than a silently dropped chunk.
+ *
+ * Fail-closed rejections are the one case a result cannot carry: the locked
+ * `VivaAudioSendResult` union has no variant for `audio_turn_limit` or
+ * `audio_queue_limit`, so the controller raises `VivaAudioSendRejectedError` for
+ * those and this surface deliberately lets it propagate rather than inventing a
+ * status. Callers that can hit them — a second concurrent `turnId`, an oversized
+ * chunk, a sequence gap, or a turn over 2,160,000 raw bytes — must catch it
+ * (`isVivaAudioSendRejectedError`), exactly as `createLiveAudioTurnDriver` does
+ * through its `onSendRejected` hook.
+ */
+export function createVivaAgentAudioCommands(
+  getController: () => VivaAgentSessionController | null,
+): VivaAgentAudioCommands {
+  return {
+    cancelAudioTurn: (turnId) => getController()?.cancelAudioTurn(turnId),
+    endAudioTurn: (input) => getController()?.endAudioTurn(input) ?? disconnectedAudioSendResult(0),
+    retryPendingAudio: () => getController()?.retryPendingAudio() ?? disconnectedAudioSendResult(0),
+    sendAudioChunk: (input) =>
+      getController()?.sendAudioChunk(input) ?? disconnectedAudioSendResult(0),
+  };
+}
 
 export type VivaAgentDerivedState = {
   phase: VivaAgentSessionState["phase"];
@@ -108,6 +160,7 @@ export function useVivaAgentSession(options: UseVivaAgentSessionOptions) {
     () => agentStudySetReadiness(options.studySet, options.trustedStudySetId),
     [options.studySet, options.trustedStudySetId],
   );
+  const audio = useMemo(() => createVivaAgentAudioCommands(() => controllerRef.current), []);
 
   return {
     acknowledgeAudio: (consumed: readonly VivaAgentAudioOutput[]) =>
@@ -123,7 +176,10 @@ export function useVivaAgentSession(options: UseVivaAgentSessionOptions) {
       sessionToken?: string | null;
     }) => controllerRef.current?.refreshSession(input),
     reset: () => controllerRef.current?.reset(),
-    sendAudio: (pcm16Base64: string) => controllerRef.current?.sendAudio(pcm16Base64) ?? false,
+    cancelAudioTurn: audio.cancelAudioTurn,
+    endAudioTurn: audio.endAudioTurn,
+    retryPendingAudio: audio.retryPendingAudio,
+    sendAudioChunk: audio.sendAudioChunk,
     sendText: (text: string) => controllerRef.current?.sendText(text) ?? false,
     status: agentState.status,
     stop: () => controllerRef.current?.stop(),

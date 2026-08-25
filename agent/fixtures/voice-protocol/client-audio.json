@@ -1,6 +1,9 @@
 {
-  "type": "audio",
-  "version": 4,
+  "type": "audio_chunk",
+  "version": 5,
+  "client_generation_id": "1",
+  "turn_id": "turn-1",
+  "sequence": 0,
   "frame": {
     "pcm16_base64": "AQIDBA=="
   }

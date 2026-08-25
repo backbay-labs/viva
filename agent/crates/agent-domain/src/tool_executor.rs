@@ -3,9 +3,10 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::{
-    AnswerAttemptEnvelope, ConceptStatus, PortError, RecapSourceMoment, SessionConfig,
-    StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap, StudySourceReference,
-    ToolProposal, ToolResult,
+    decide_review_schedule, AnswerAttemptEnvelope, Clock, ConceptStatus, PortError,
+    RecapSourceMoment, ReviewOutcomeV1, ReviewScheduleError, SessionConfig, StudyMemoryStore,
+    StudyMode, StudyQuestion, StudySessionRecap, StudySourceReference, SystemClock, ToolProposal,
+    ToolResult,
 };
 
 #[derive(Clone)]
@@ -33,11 +34,27 @@ impl AuthorizedStudySession {
 pub struct VivaToolExecutor {
     store: Arc<dyn StudyMemoryStore>,
     session: AuthorizedStudySession,
+    clock: Arc<dyn Clock>,
 }
 
 impl VivaToolExecutor {
+    /// Production composition: the authoritative scheduling instant comes from the
+    /// system clock, never from a tool argument.
     pub fn new(store: Arc<dyn StudyMemoryStore>, session: AuthorizedStudySession) -> Self {
-        Self { store, session }
+        Self::with_clock(store, session, Arc::new(SystemClock))
+    }
+
+    /// Test/composition path with an injected clock.
+    pub fn with_clock(
+        store: Arc<dyn StudyMemoryStore>,
+        session: AuthorizedStudySession,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            store,
+            session,
+            clock,
+        }
     }
 
     pub async fn execute(
@@ -53,7 +70,7 @@ impl VivaToolExecutor {
             "mark_concept_status" => self.mark_concept_status(response_id, &proposal).await?,
             "build_session_recap" => self.build_session_recap(response_id).await?,
             "challenge_correction" => self.challenge_correction(&proposal).await?,
-            "schedule_review_item" => self.schedule_review_item(&proposal).await?,
+            "schedule_review_item" => self.schedule_review_item(response_id, &proposal).await?,
             other => {
                 return Err(ToolExecutionError::InvalidArguments(format!(
                     "unknown Viva tool `{other}`"
@@ -228,6 +245,7 @@ impl VivaToolExecutor {
 
     async fn schedule_review_item(
         &self,
+        response_id: &str,
         proposal: &ToolProposal,
     ) -> Result<Value, ToolExecutionError> {
         let concept_id = string_arg(proposal.arguments(), "concept_id")?;
@@ -238,17 +256,43 @@ impl VivaToolExecutor {
             ));
         }
         let status = concept_status_arg(proposal.arguments(), "status")?;
-        let due_at = storage_due_at_for_status(&status);
-        Ok(self
+        // D-01: read the injected clock exactly once for this outcome, then take
+        // every other authoritative input from the scoped store context.
+        let now = self.clock.now();
+        let context = self
             .store
-            .schedule_review_item(
+            .review_scheduling_context(
+                &self.session.user_id,
+                &self.session.study_set_id,
+                &concept_id,
+            )
+            .await?;
+        let outcome = ReviewOutcomeV1 {
+            status,
+            hint_count: optional_count_arg(proposal.arguments(), "hint_count")?,
+            miss_count: optional_count_arg(proposal.arguments(), "miss_count")?,
+        };
+        let decision = decide_review_schedule(now, &outcome, &context)?;
+        // The store is the single authority on what is actually scheduled: it owns the
+        // per-response replay guard, so on a replayed tool call it keeps the first
+        // decision and returns that one. Reporting the locally recomputed decision here
+        // would tell the model a due date that is not the one on record.
+        let record = self
+            .store
+            .persist_review_schedule_decision(
                 &self.session.user_id,
                 &self.session.study_set_id,
                 &self.session.voice_session_id,
+                response_id,
                 &concept_id,
-                due_at,
+                decision,
             )
-            .await?)
+            .await?;
+        let mut result = record.clone();
+        if let Value::Object(fields) = &mut result {
+            fields.insert("record".to_owned(), record);
+        }
+        Ok(result)
     }
 
     async fn canonical_source(
@@ -289,6 +333,8 @@ pub enum ToolExecutionError {
     Unavailable(String),
     #[error("tool store error: {0}")]
     Store(#[from] PortError),
+    #[error("review scheduling error: {0}")]
+    ReviewSchedule(#[from] ReviewScheduleError),
 }
 
 fn bind_study_set_and_session(
@@ -336,12 +382,21 @@ fn label_for_status(status: &ConceptStatus) -> &'static str {
     }
 }
 
-fn storage_due_at_for_status(status: &ConceptStatus) -> &'static str {
-    match status {
-        ConceptStatus::Missed => "2026-06-18T09:00:00Z",
-        ConceptStatus::Shaky => "2026-06-19T09:00:00Z",
-        ConceptStatus::Review => "2026-06-20T09:00:00Z",
-        ConceptStatus::Strong => "2026-06-24T09:00:00Z",
+/// Hint and miss counts are D-01 provenance only: they are recorded when the
+/// authorized outcome supplies them, stay `None` when it does not (never zero), and
+/// can never move the rating or the scheduled date.
+fn optional_count_arg(args: &Value, name: &str) -> Result<Option<u32>, ToolExecutionError> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|count| u32::try_from(count).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                ToolExecutionError::InvalidArguments(format!(
+                    "`{name}` must be a non-negative whole number when supplied"
+                ))
+            }),
     }
 }
 
@@ -409,4 +464,389 @@ fn required<'a>(value: Option<&'a str>, label: &str) -> Result<&'a str, ToolExec
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ToolExecutionError::InvalidArguments(format!("missing `{label}`")))
+}
+
+#[cfg(test)]
+mod review_schedule_tests {
+    use super::*;
+    use crate::{
+        AnswerEvaluation, FixedClock, PersistedFsrsCardV1, ReviewScheduleCapReasonV1,
+        ReviewScheduleDecisionV1, ReviewSchedulingContextV1, StudySourceReference,
+        VIVA_REVIEW_SCHEDULE_POLICY_ID, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+    };
+    use chrono::{DateTime, Utc};
+    use std::sync::Mutex;
+
+    /// Literals copied from `packages/core/src/review-scheduling-conformance-v1.json`
+    /// (`new-shaky-hinted-one-miss-no-exam` and `exam-inside-cap-window`). They are
+    /// never regenerated from this code's own output.
+    const GRADED_AT: &str = "2031-04-05T12:00:00.000Z";
+    const SHAKY_DUE_AT: &str = "2031-04-07T12:00:00.000Z";
+    const STRONG_DUE_AT: &str = "2031-04-13T12:00:00.000Z";
+    const EXAM_INSIDE_WINDOW_AT: &str = "2031-04-09T06:00:00.000Z";
+    const EXAM_INSIDE_WINDOW_DUE_AT: &str = "2031-04-08T06:00:00.000Z";
+
+    fn instant(raw: &str) -> DateTime<Utc> {
+        crate::parse_utc_instant(raw).expect("test instant parses")
+    }
+
+    #[derive(Default)]
+    struct RecordingStore {
+        exam_at: Option<DateTime<Utc>>,
+        card: Mutex<Option<PersistedFsrsCardV1>>,
+        decisions: Mutex<Vec<ReviewScheduleDecisionV1>>,
+        legacy_due_dates: Mutex<Vec<String>>,
+    }
+
+    impl RecordingStore {
+        fn with_exam(exam_at: &str) -> Self {
+            Self {
+                exam_at: Some(instant(exam_at)),
+                ..Self::default()
+            }
+        }
+
+        fn only_decision(&self) -> ReviewScheduleDecisionV1 {
+            let decisions = self.decisions.lock().expect("decisions lock");
+            assert_eq!(decisions.len(), 1, "exactly one decision must be persisted");
+            decisions[0].clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StudyMemoryStore for RecordingStore {
+        async fn record_answer_evaluation(
+            &self,
+            _user_id: &str,
+            _study_set_id: &str,
+            _voice_session_id: &str,
+            _response_id: &str,
+            _evaluation: AnswerEvaluation,
+        ) -> Result<Value, PortError> {
+            Ok(json!({}))
+        }
+
+        async fn source_reference(
+            &self,
+            _user_id: &str,
+            _study_set_id: &str,
+            _source_id: &str,
+        ) -> Result<Option<StudySourceReference>, PortError> {
+            Ok(None)
+        }
+
+        async fn study_context(
+            &self,
+            _user_id: &str,
+            _study_set_id: &str,
+        ) -> Result<Option<Value>, PortError> {
+            Ok(None)
+        }
+
+        async fn record_concept_status(
+            &self,
+            _user_id: &str,
+            _study_set_id: &str,
+            _voice_session_id: &str,
+            _response_id: &str,
+            _concept_id: &str,
+            status: ConceptStatus,
+        ) -> Result<ConceptStatus, PortError> {
+            Ok(status)
+        }
+
+        async fn schedule_review_item(
+            &self,
+            _user_id: &str,
+            _study_set_id: &str,
+            _voice_session_id: &str,
+            _concept_id: &str,
+            due_at: &str,
+        ) -> Result<Value, PortError> {
+            self.legacy_due_dates
+                .lock()
+                .expect("legacy lock")
+                .push(due_at.to_owned());
+            Ok(json!({ "due_at": due_at }))
+        }
+
+        async fn record_recap(
+            &self,
+            _user_id: &str,
+            _study_set_id: &str,
+            _voice_session_id: &str,
+            _response_id: &str,
+            _recap: StudySessionRecap,
+        ) -> Result<Value, PortError> {
+            Ok(json!({}))
+        }
+
+        async fn review_scheduling_context(
+            &self,
+            _user_id: &str,
+            _study_set_id: &str,
+            _concept_id: &str,
+        ) -> Result<ReviewSchedulingContextV1, PortError> {
+            Ok(ReviewSchedulingContextV1 {
+                schema_version: VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+                exam_at: self.exam_at,
+                card: self.card.lock().expect("card lock").clone(),
+            })
+        }
+
+        async fn persist_review_schedule_decision(
+            &self,
+            _user_id: &str,
+            _study_set_id: &str,
+            _voice_session_id: &str,
+            _response_id: &str,
+            concept_id: &str,
+            decision: ReviewScheduleDecisionV1,
+        ) -> Result<Value, PortError> {
+            decision
+                .validate()
+                .map_err(|error| PortError::adapter("test_store", error.to_string()))?;
+            let summary = decision.public_summary(concept_id);
+            *self.card.lock().expect("card lock") = Some(decision.card.clone());
+            self.decisions
+                .lock()
+                .expect("decisions lock")
+                .push(decision);
+            Ok(summary)
+        }
+    }
+
+    fn session() -> AuthorizedStudySession {
+        AuthorizedStudySession {
+            user_id: "user-1".to_owned(),
+            study_set_id: "biology-midterm".to_owned(),
+            voice_session_id: "voice-session-1".to_owned(),
+            mode: StudyMode::Quiz,
+            active_concepts: vec!["nadh".to_owned()],
+        }
+    }
+
+    fn executor(store: Arc<RecordingStore>, now: &str) -> VivaToolExecutor {
+        VivaToolExecutor::with_clock(store, session(), Arc::new(FixedClock::new(instant(now))))
+    }
+
+    fn proposal(status: &str) -> ToolProposal {
+        ToolProposal::schedule_review_item("biology-midterm", "voice-session-1", "nadh", status)
+    }
+
+    #[tokio::test]
+    async fn review_schedule_tool_persists_the_authoritative_decision_not_a_fixed_date() {
+        let store = Arc::new(RecordingStore::default());
+        let result = executor(Arc::clone(&store), GRADED_AT)
+            .execute("response-1", proposal("shaky"))
+            .await
+            .expect("schedule_review_item succeeds");
+
+        let decision = store.only_decision();
+        assert_eq!(crate::format_rfc3339_millis(decision.due_at), SHAKY_DUE_AT);
+        assert_eq!(decision.policy_id, VIVA_REVIEW_SCHEDULE_POLICY_ID);
+        assert_eq!(decision.rating, 3);
+        assert_eq!(decision.card.reps, 1);
+        assert!(store
+            .legacy_due_dates
+            .lock()
+            .expect("legacy lock")
+            .is_empty());
+
+        let encoded = serde_json::to_string(&result.result).expect("tool result serializes");
+        assert!(!encoded.contains("2026-06-"), "{encoded}");
+        assert!(!encoded.contains("stability"), "{encoded}");
+        assert!(!encoded.contains("difficulty"), "{encoded}");
+        assert_eq!(result.result["due_at"], SHAKY_DUE_AT);
+        assert_eq!(result.result["policy_id"], VIVA_REVIEW_SCHEDULE_POLICY_ID);
+        assert_eq!(result.result["schema_version"], 1);
+    }
+
+    #[tokio::test]
+    async fn review_schedule_tool_maps_every_status_to_the_recorded_rating() {
+        for (status, rating) in [("missed", 1), ("review", 2), ("shaky", 3), ("strong", 4)] {
+            let store = Arc::new(RecordingStore::default());
+            executor(Arc::clone(&store), GRADED_AT)
+                .execute("response-1", proposal(status))
+                .await
+                .expect("schedule_review_item succeeds");
+            assert_eq!(store.only_decision().rating, rating, "status={status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn review_schedule_tool_uses_the_injected_clock_for_every_outcome() {
+        let store = Arc::new(RecordingStore::default());
+        executor(Arc::clone(&store), GRADED_AT)
+            .execute("response-1", proposal("strong"))
+            .await
+            .expect("schedule_review_item succeeds");
+        let decision = store.only_decision();
+        assert_eq!(
+            crate::format_rfc3339_millis(decision.generated_at),
+            GRADED_AT
+        );
+        assert_eq!(crate::format_rfc3339_millis(decision.due_at), STRONG_DUE_AT);
+    }
+
+    #[tokio::test]
+    async fn review_schedule_tool_advances_a_prior_card_instead_of_restarting_it() {
+        let store = Arc::new(RecordingStore::default());
+        executor(Arc::clone(&store), GRADED_AT)
+            .execute("response-1", proposal("strong"))
+            .await
+            .expect("first outcome");
+        let first = store.only_decision();
+
+        let second_now = crate::format_rfc3339_millis(first.card.due_at);
+        executor(Arc::clone(&store), &second_now)
+            .execute("response-2", proposal("strong"))
+            .await
+            .expect("second outcome");
+
+        let decisions = store.decisions.lock().expect("decisions lock").clone();
+        assert_eq!(decisions.len(), 2);
+        let second = &decisions[1];
+        assert_eq!(second.card.reps, 2);
+        assert_eq!(second.card.elapsed_days, first.card.scheduled_days);
+        assert!(
+            second.card.scheduled_days > first.card.scheduled_days,
+            "a second strong review must schedule further out than the first"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_schedule_tool_caps_at_the_recorded_exam_margin() {
+        let store = Arc::new(RecordingStore::with_exam(EXAM_INSIDE_WINDOW_AT));
+        executor(Arc::clone(&store), GRADED_AT)
+            .execute("response-1", proposal("strong"))
+            .await
+            .expect("schedule_review_item succeeds");
+        let decision = store.only_decision();
+        assert_eq!(
+            crate::format_rfc3339_millis(decision.due_at),
+            EXAM_INSIDE_WINDOW_DUE_AT
+        );
+        assert_eq!(
+            crate::format_rfc3339_millis(decision.uncapped_due_at),
+            STRONG_DUE_AT
+        );
+        assert_eq!(
+            decision.cap_reason,
+            Some(ReviewScheduleCapReasonV1::ExamMargin)
+        );
+        assert!(decision.due_at <= decision.exam_at.expect("exam instant"));
+    }
+
+    #[tokio::test]
+    async fn review_schedule_tool_never_schedules_after_the_exam() {
+        for exam_at in [
+            "2031-04-05T12:00:01.000Z",
+            "2031-04-05T18:30:00.000Z",
+            "2031-04-06T12:00:00.000Z",
+            "2031-04-13T12:00:00.000Z",
+            "2031-09-01T08:00:00.000Z",
+        ] {
+            let store = Arc::new(RecordingStore::with_exam(exam_at));
+            executor(Arc::clone(&store), GRADED_AT)
+                .execute("response-1", proposal("strong"))
+                .await
+                .expect("schedule_review_item succeeds");
+            let decision = store.only_decision();
+            assert!(
+                decision.due_at <= instant(exam_at),
+                "exam_at={exam_at} due_at={}",
+                decision.due_at
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn review_schedule_tool_fails_closed_for_an_already_past_exam() {
+        let store = Arc::new(RecordingStore::with_exam("2031-03-30T09:15:00.000Z"));
+        executor(Arc::clone(&store), GRADED_AT)
+            .execute("response-1", proposal("missed"))
+            .await
+            .expect("schedule_review_item succeeds");
+        let decision = store.only_decision();
+        assert_eq!(
+            crate::format_rfc3339_millis(decision.due_at),
+            "2031-03-30T09:15:00.000Z"
+        );
+        assert_eq!(
+            decision.cap_reason,
+            Some(ReviewScheduleCapReasonV1::PastExam)
+        );
+    }
+
+    #[tokio::test]
+    async fn review_schedule_tool_rejects_a_model_supplied_due_at() {
+        let store = Arc::new(RecordingStore::default());
+        let mut proposal = proposal("strong");
+        let arguments = proposal.arguments().clone();
+        let Value::Object(mut fields) = arguments else {
+            panic!("tool arguments are an object");
+        };
+        fields.insert(
+            "due_at".to_owned(),
+            Value::String("2099-01-01T00:00:00Z".to_owned()),
+        );
+        proposal = ToolProposal::new("schedule_review_item", Value::Object(fields));
+
+        let error = executor(Arc::clone(&store), GRADED_AT)
+            .execute("response-1", proposal)
+            .await
+            .expect_err("model-supplied due_at must be rejected");
+        assert!(matches!(error, ToolExecutionError::InvalidArguments(_)));
+        assert!(store.decisions.lock().expect("decisions lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_schedule_tool_records_hint_and_miss_provenance_without_moving_the_date() {
+        let plain = Arc::new(RecordingStore::default());
+        executor(Arc::clone(&plain), GRADED_AT)
+            .execute("response-1", proposal("shaky"))
+            .await
+            .expect("plain outcome");
+        let plain_decision = plain.only_decision();
+        assert_eq!(plain_decision.hint_count, None);
+        assert_eq!(plain_decision.miss_count, None);
+
+        let annotated = Arc::new(RecordingStore::default());
+        let Value::Object(mut fields) = proposal("shaky").arguments().clone() else {
+            panic!("tool arguments are an object");
+        };
+        fields.insert("hint_count".to_owned(), json!(2));
+        fields.insert("miss_count".to_owned(), json!(1));
+        executor(Arc::clone(&annotated), GRADED_AT)
+            .execute(
+                "response-1",
+                ToolProposal::new("schedule_review_item", Value::Object(fields)),
+            )
+            .await
+            .expect("annotated outcome");
+        let annotated_decision = annotated.only_decision();
+        assert_eq!(annotated_decision.hint_count, Some(2));
+        assert_eq!(annotated_decision.miss_count, Some(1));
+        assert_eq!(annotated_decision.rating, plain_decision.rating);
+        assert_eq!(annotated_decision.due_at, plain_decision.due_at);
+    }
+
+    #[tokio::test]
+    async fn review_schedule_tool_rejects_negative_hint_or_miss_provenance() {
+        let store = Arc::new(RecordingStore::default());
+        let Value::Object(mut fields) = proposal("shaky").arguments().clone() else {
+            panic!("tool arguments are an object");
+        };
+        fields.insert("miss_count".to_owned(), json!(-1));
+        let error = executor(Arc::clone(&store), GRADED_AT)
+            .execute(
+                "response-1",
+                ToolProposal::new("schedule_review_item", Value::Object(fields)),
+            )
+            .await
+            .expect_err("negative provenance must be rejected");
+        assert!(matches!(error, ToolExecutionError::InvalidArguments(_)));
+        assert!(store.decisions.lock().expect("decisions lock").is_empty());
+    }
 }

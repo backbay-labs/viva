@@ -11,19 +11,26 @@ import evidencePackFixture from "../../../agent/fixtures/voice-protocol/syntheti
 import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
 import {
   type AgentSessionConfig,
-  audioClientFrame,
+  audioChunkClientFrame,
+  audioEndClientFrame,
   parseVivaClientFrame,
   parseVivaServerFrame,
   sessionConfigFrame,
+  VIVA_AUDIO_MAX_CHUNK_BYTES,
+  VIVA_AUDIO_MAX_CHUNK_SAMPLES,
+  VIVA_AUDIO_MAX_TURN_BYTES,
+  VIVA_AUDIO_MAX_TURN_SAMPLES,
+  VIVA_AUDIO_SAMPLE_RATE_HZ,
   VIVA_VOICE_INPUT_ENCODING,
+  VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
   VIVA_VOICE_PROTOCOL_VERSION,
   VIVA_VOICE_SAMPLE_RATE_HZ,
 } from "./agent-contract";
 import { seedStudySets } from "./index";
 
 describe("Viva voice agent contract", () => {
-  test("uses protocol v4 because terminal reasons include tool executor failures", () => {
-    expect(VIVA_VOICE_PROTOCOL_VERSION).toBe(4);
+  test("uses protocol v5 because bounded audio turns replace whole-turn audio frames", () => {
+    expect(VIVA_VOICE_PROTOCOL_VERSION).toBe(5);
     expect(() =>
       parseVivaServerFrame({
         type: "ready",
@@ -32,6 +39,169 @@ describe("Viva voice agent contract", () => {
         input_encoding: VIVA_VOICE_INPUT_ENCODING,
       }),
     ).toThrow("Unsupported Viva voice protocol version");
+    expect(() =>
+      parseVivaServerFrame({
+        type: "ready",
+        version: 4,
+        sample_rate_hz: VIVA_VOICE_SAMPLE_RATE_HZ,
+        input_encoding: VIVA_VOICE_INPUT_ENCODING,
+      }),
+    ).toThrow("Unsupported Viva voice protocol version");
+  });
+
+  test("publishes the locked protocol v5 audio constants from one 24 kHz literal", () => {
+    expect(VIVA_AUDIO_SAMPLE_RATE_HZ).toBe(VIVA_VOICE_SAMPLE_RATE_HZ);
+    expect(VIVA_AUDIO_SAMPLE_RATE_HZ).toBe(24_000);
+    expect(VIVA_AUDIO_MAX_CHUNK_SAMPLES).toBe(4_096);
+    expect(VIVA_AUDIO_MAX_CHUNK_BYTES).toBe(8_192);
+    expect(VIVA_AUDIO_MAX_TURN_SAMPLES).toBe(1_080_000);
+    expect(VIVA_AUDIO_MAX_TURN_BYTES).toBe(2_160_000);
+    expect(VIVA_AUDIO_MAX_CHUNK_BYTES).toBe(VIVA_AUDIO_MAX_CHUNK_SAMPLES * 2);
+    expect(VIVA_AUDIO_MAX_TURN_BYTES).toBe(VIVA_AUDIO_MAX_TURN_SAMPLES * 2);
+    expect(VIVA_AUDIO_MAX_TURN_SAMPLES).toBe(45 * VIVA_AUDIO_SAMPLE_RATE_HZ);
+    expect(VIVA_VOICE_MAX_TEXT_FRAME_BYTES).toBe(64 * 1024);
+  });
+
+  test("keeps a maximum-size audio_chunk below the unchanged 64 KiB text frame cap", () => {
+    const frame = {
+      type: "audio_chunk",
+      version: 5,
+      client_generation_id: "generation-7",
+      turn_id: "turn-01",
+      sequence: 0,
+      frame: { pcm16_base64: bytesToBase64(new Uint8Array(VIVA_AUDIO_MAX_CHUNK_BYTES)) },
+    } as const;
+
+    expect(parseVivaClientFrame(frame)).toEqual(frame);
+    expect(new TextEncoder().encode(JSON.stringify(frame)).length).toBeLessThan(
+      VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
+    );
+  });
+
+  test("parses the exact bounded audio turn lifecycle frames", () => {
+    const chunk = audioChunkClientFrame({
+      clientGenerationId: "generation-7",
+      turnId: "turn-01",
+      sequence: 0,
+      pcm16Base64: "AQIDBA==",
+    });
+    const end = audioEndClientFrame({
+      clientGenerationId: "generation-7",
+      turnId: "turn-01",
+      finalSequence: 0,
+    });
+
+    expect(parseVivaClientFrame(chunk)).toEqual({
+      type: "audio_chunk",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "generation-7",
+      turn_id: "turn-01",
+      sequence: 0,
+      frame: { pcm16_base64: "AQIDBA==" },
+    });
+    expect(parseVivaClientFrame(end)).toEqual({
+      type: "audio_end",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "generation-7",
+      turn_id: "turn-01",
+      final_sequence: 0,
+    });
+    expect(
+      parseVivaServerFrame({
+        type: "audio_turn_accepted",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        client_generation_id: "generation-7",
+        turn_id: "turn-01",
+        final_sequence: 0,
+      }),
+    ).toEqual({
+      type: "audio_turn_accepted",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "generation-7",
+      turn_id: "turn-01",
+      final_sequence: 0,
+    });
+  });
+
+  test("rejects the legacy whole-turn audio frame", () => {
+    expect(() =>
+      parseVivaClientFrame({
+        type: "audio",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        frame: { pcm16_base64: "AQIDBA==" },
+      }),
+    ).toThrow("Unknown Viva voice client frame");
+  });
+
+  test("rejects audio frames with unsafe sequences or missing turn identity", () => {
+    const chunk = {
+      type: "audio_chunk",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "generation-7",
+      turn_id: "turn-01",
+      sequence: 0,
+      frame: { pcm16_base64: "AQIDBA==" },
+    };
+
+    expect(() => parseVivaClientFrame({ ...chunk, sequence: -1 })).toThrow("Invalid sequence");
+    expect(() => parseVivaClientFrame({ ...chunk, sequence: 1.5 })).toThrow("Invalid sequence");
+    expect(() => parseVivaClientFrame({ ...chunk, sequence: Number.MAX_SAFE_INTEGER + 2 })).toThrow(
+      "Invalid sequence",
+    );
+    expect(() => parseVivaClientFrame({ ...chunk, client_generation_id: "" })).toThrow(
+      "Missing client_generation_id",
+    );
+    expect(() => parseVivaClientFrame({ ...chunk, turn_id: "  " })).toThrow("Missing turn_id");
+    expect(() => parseVivaClientFrame({ ...chunk, frame: { pcm16_base64: "" } })).toThrow(
+      "Missing pcm16_base64",
+    );
+    // "AQ==" decodes to one odd PCM byte, which cannot be a whole 16-bit sample.
+    expect(() => parseVivaClientFrame({ ...chunk, frame: { pcm16_base64: "AQ==" } })).toThrow(
+      "Invalid pcm16_base64",
+    );
+    expect(() =>
+      parseVivaClientFrame({
+        ...chunk,
+        frame: { pcm16_base64: bytesToBase64(new Uint8Array(VIVA_AUDIO_MAX_CHUNK_BYTES + 2)) },
+      }),
+    ).toThrow("Audio chunk exceeds maximum size");
+
+    const end = {
+      type: "audio_end",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "generation-7",
+      turn_id: "turn-01",
+      final_sequence: 0,
+    };
+    expect(() => parseVivaClientFrame({ ...end, final_sequence: -1 })).toThrow(
+      "Invalid final_sequence",
+    );
+    expect(() => parseVivaClientFrame({ ...end, client_generation_id: undefined })).toThrow(
+      "Missing client_generation_id",
+    );
+    expect(() => parseVivaClientFrame({ ...end, turn_id: undefined })).toThrow("Missing turn_id");
+  });
+
+  test("scopes cancellation to one in-progress audio turn or none at all", () => {
+    const scoped = {
+      type: "cancel",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      client_generation_id: "generation-7",
+      turn_id: "turn-01",
+    };
+
+    expect(parseVivaClientFrame(scoped)).toEqual(scoped);
+    expect(parseVivaClientFrame({ type: "cancel", version: VIVA_VOICE_PROTOCOL_VERSION })).toEqual({
+      type: "cancel",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+    });
+    expect(() =>
+      parseVivaClientFrame({
+        type: "cancel",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        turn_id: "turn-01",
+      }),
+    ).toThrow("Missing client_generation_id");
   });
 
   test("parses shared ready fixture from Rust service", () => {
@@ -299,8 +469,13 @@ describe("Viva voice agent contract", () => {
     ).toThrow("Invalid manuscript marginalia_id");
   });
 
-  test("builds and parses shared audio frame fixture", () => {
-    const frame = audioClientFrame("AQIDBA==");
+  test("builds and parses shared audio chunk fixture", () => {
+    const frame = audioChunkClientFrame({
+      clientGenerationId: "1",
+      turnId: "turn-1",
+      sequence: 0,
+      pcm16Base64: "AQIDBA==",
+    });
     const parsedFixture = parseVivaClientFrame(audioFixture);
 
     expect(parsedFixture).toEqual(frame);
@@ -382,8 +557,10 @@ describe("Viva voice agent contract", () => {
     );
 
     expect(clientFrames[0]?.type).toBe("session_config");
-    expect(clientFrames[1]?.type).toBe("audio");
+    expect(clientFrames[1]?.type).toBe("audio_chunk");
+    expect(clientFrames[2]?.type).toBe("audio_end");
     expect(serverFrames[0]?.type).toBe("ready");
+    expect(serverFrames[3]?.type).toBe("audio_turn_accepted");
     expect(eventTypes).toEqual([
       "session_phase",
       "question_started",
@@ -531,6 +708,14 @@ describe("Viva voice agent contract", () => {
     ).toThrow("Missing document_id");
   });
 });
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
 
 function activeConceptIdsFromFixture(fixture: { client: unknown[] }): string[] {
   return fixture.client.flatMap((frame) => {

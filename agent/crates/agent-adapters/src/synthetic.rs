@@ -8,12 +8,12 @@ use std::time::Duration;
 use tokio::{sync::mpsc, task::AbortHandle, time::sleep};
 
 use agent_domain::{
-    fixture_question, AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus,
-    AnswerContentPolicy, AnswerEvaluation, BrainError, BrainEvent, BrainInput, BrainProviderError,
-    BrainUsage, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent,
-    ManuscriptRegister, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession,
-    RealtimeSessionTaskGuard, RecapSourceMoment, SessionConfig, StudyMemoryStore, StudyQuestion,
-    StudySessionPhase, StudySessionRecap,
+    decide_review_schedule, fixture_question, AnswerAttemptEnvelope, AnswerCaptureMode,
+    AnswerCaptureStatus, AnswerContentPolicy, AnswerEvaluation, BrainError, BrainEvent, BrainInput,
+    BrainProviderError, BrainUsage, Clock, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind,
+    ManuscriptIntent, ManuscriptRegister, RealtimeBrain, RealtimeBrainCapabilities,
+    RealtimeSession, RealtimeSessionTaskGuard, RecapSourceMoment, ReviewOutcomeV1, SessionConfig,
+    StudyMemoryStore, StudyQuestion, StudySessionPhase, StudySessionRecap, SystemClock,
 };
 
 /// One step in the synthetic evaluation rotation. Deterministic, offline, no
@@ -63,15 +63,37 @@ const ANSWER_SPECS: [SyntheticAnswerSpec; 4] = [
     },
 ];
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SyntheticBrain {
     study_store: Option<Arc<dyn StudyMemoryStore>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl Default for SyntheticBrain {
+    fn default() -> Self {
+        Self {
+            study_store: None,
+            clock: Arc::new(SystemClock),
+        }
+    }
 }
 
 impl SyntheticBrain {
     pub fn with_study_store(study_store: Arc<dyn StudyMemoryStore>) -> Self {
         Self {
             study_store: Some(study_store),
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// Test/composition path: pin the authoritative D-01 grading instant.
+    pub fn with_study_store_and_clock(
+        study_store: Arc<dyn StudyMemoryStore>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            study_store: Some(study_store),
+            clock,
         }
     }
 
@@ -126,6 +148,7 @@ impl RealtimeBrain for SyntheticBrain {
         let spec = SyntheticStudySessionSpec::from_config(&config)?;
         let question = self.question_for_spec(&spec).await?;
         let study_store = self.study_store.clone();
+        let clock = Arc::clone(&self.clock);
         if let Some(store) = &study_store {
             store
                 .record_voice_session(&config)
@@ -161,7 +184,10 @@ impl RealtimeBrain for SyntheticBrain {
                             &response_id,
                             SyntheticAnswerInput::audio(frame, None),
                             answer_turn,
-                            study_store.clone(),
+                            SyntheticStudyContext {
+                                study_store: study_store.clone(),
+                                clock: Arc::clone(&clock),
+                            },
                         ));
                     }
                     BrainInput::AudioWithMetadata {
@@ -180,7 +206,10 @@ impl RealtimeBrain for SyntheticBrain {
                             &response_id,
                             SyntheticAnswerInput::audio(frame, client_generation_id),
                             answer_turn,
-                            study_store.clone(),
+                            SyntheticStudyContext {
+                                study_store: study_store.clone(),
+                                clock: Arc::clone(&clock),
+                            },
                         ));
                     }
                     BrainInput::Text(text) => {
@@ -195,7 +224,10 @@ impl RealtimeBrain for SyntheticBrain {
                             &response_id,
                             SyntheticAnswerInput::text(text, None),
                             answer_turn,
-                            study_store.clone(),
+                            SyntheticStudyContext {
+                                study_store: study_store.clone(),
+                                clock: Arc::clone(&clock),
+                            },
                         ));
                     }
                     BrainInput::TextWithMetadata {
@@ -214,7 +246,10 @@ impl RealtimeBrain for SyntheticBrain {
                             &response_id,
                             SyntheticAnswerInput::text(text, client_generation_id),
                             answer_turn,
-                            study_store.clone(),
+                            SyntheticStudyContext {
+                                study_store: study_store.clone(),
+                                clock: Arc::clone(&clock),
+                            },
                         ));
                     }
                     BrainInput::CancelResponse => {
@@ -358,6 +393,13 @@ fn cancel_active_response(active_response: &mut Option<ActiveResponse>) {
     }
 }
 
+/// The store and injected clock a graded synthetic turn writes through.
+#[derive(Clone)]
+struct SyntheticStudyContext {
+    study_store: Option<Arc<dyn StudyMemoryStore>>,
+    clock: Arc<dyn Clock>,
+}
+
 fn spawn_study_answer_sequence(
     event_tx: mpsc::Sender<BrainEvent>,
     spec: SyntheticStudySessionSpec,
@@ -365,8 +407,9 @@ fn spawn_study_answer_sequence(
     response_id: &str,
     answer_input: SyntheticAnswerInput,
     turn: usize,
-    study_store: Option<Arc<dyn StudyMemoryStore>>,
+    study: SyntheticStudyContext,
 ) -> ActiveResponse {
+    let SyntheticStudyContext { study_store, clock } = study;
     let response_id = response_id.to_owned();
     let cancelled = Arc::new(AtomicBool::new(false));
     let completed = Arc::new(AtomicBool::new(false));
@@ -383,6 +426,7 @@ fn spawn_study_answer_sequence(
                 answer_input,
                 turn,
                 study_store,
+                clock,
                 cancelled: task_cancelled,
                 completed: task_completed,
             },
@@ -405,6 +449,7 @@ struct StudyAnswerJob {
     answer_input: SyntheticAnswerInput,
     turn: usize,
     study_store: Option<Arc<dyn StudyMemoryStore>>,
+    clock: Arc<dyn Clock>,
     cancelled: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
 }
@@ -690,16 +735,46 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
         return;
     }
     if let Some(store) = &job.study_store {
-        // Best-effort scheduling — never block the loop on a store rejection.
-        let _ = store
-            .schedule_review_item(
+        // D-01 SERVER_PERSISTED_FSRS: the review schedule is authoritative. A silently
+        // missing or incorrect schedule is a critical failure, so a store rejection
+        // aborts this outcome exactly the way a concept-status rejection already does.
+        let now = job.clock.now();
+        let context = match store
+            .review_scheduling_context(&job.spec.user_id, &job.spec.study_set_id, concept_id)
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                emit_store_error(event_tx, error.to_string()).await;
+                return;
+            }
+        };
+        let outcome = ReviewOutcomeV1 {
+            status: answer_spec.status.clone(),
+            hint_count: None,
+            miss_count: None,
+        };
+        let decision = match decide_review_schedule(now, &outcome, &context) {
+            Ok(decision) => decision,
+            Err(error) => {
+                emit_store_error(event_tx, error.to_string()).await;
+                return;
+            }
+        };
+        if let Err(error) = store
+            .persist_review_schedule_decision(
                 &job.spec.user_id,
                 &job.spec.study_set_id,
                 &job.spec.voice_session_id,
+                &job.response_id,
                 concept_id,
-                storage_due_at_for_status(&answer_spec.status),
+                decision,
             )
-            .await;
+            .await
+        {
+            emit_store_error(event_tx, error.to_string()).await;
+            return;
+        }
     }
     if !send_unless_cancelled(
         event_tx,
@@ -803,15 +878,6 @@ async fn emit_store_error(event_tx: &mpsc::Sender<BrainEvent>, message: String) 
             failure: None,
         }))
         .await;
-}
-
-fn storage_due_at_for_status(status: &ConceptStatus) -> &'static str {
-    match status {
-        ConceptStatus::Missed => "2026-06-18T09:00:00Z",
-        ConceptStatus::Shaky => "2026-06-19T09:00:00Z",
-        ConceptStatus::Review => "2026-06-20T09:00:00Z",
-        ConceptStatus::Strong => "2026-06-24T09:00:00Z",
-    }
 }
 
 fn study_session_recap(
@@ -1164,5 +1230,238 @@ mod tests {
         assert_eq!(snapshot.concept_statuses.len(), 0);
         assert_eq!(snapshot.review_items.len(), 0);
         assert_eq!(snapshot.recaps.len(), 0);
+    }
+
+    /// The WebSocket assembler admits one `BrainInput` per completed browser turn,
+    /// so thousands of bounded chunks still produce exactly one evaluated turn.
+    #[tokio::test]
+    async fn one_assembled_forty_five_second_turn_produces_one_evaluated_turn() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let brain = SyntheticBrain::with_study_store(store.clone());
+        let mut session = brain
+            .open(SessionConfig {
+                session_id: Some(SessionId::new("voice-session-1")),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+        let _ = next_event(&mut session).await;
+        let _ = next_event(&mut session).await;
+
+        // 45 seconds of mono pcm_s16le at 24 kHz: 2,250 bounded 20 ms chunks.
+        session
+            .input
+            .send(BrainInput::AudioWithMetadata {
+                frame: agent_domain::AudioFrame::from_pcm16_bytes(vec![0_u8; 2_160_000]),
+                client_generation_id: Some("generation-1".to_owned()),
+            })
+            .await
+            .unwrap();
+
+        // Read past the first evaluation to the turn's terminal event, so a
+        // second evaluation would be counted rather than hidden by an early
+        // break.
+        let mut transcripts = Vec::new();
+        let mut evaluations = 0_u32;
+        let mut completed = false;
+        for _ in 0..64 {
+            match timeout(Duration::from_secs(5), session.events.recv()).await {
+                Ok(Some(BrainEvent::TranscriptFinal { text, .. })) => transcripts.push(text),
+                Ok(Some(BrainEvent::AnswerEvaluated { .. })) => evaluations += 1,
+                Ok(Some(BrainEvent::ResponseCompleted { .. })) => {
+                    completed = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("the assembled turn never reached its terminal event"),
+            }
+        }
+        assert!(completed, "the assembled turn completed exactly once");
+
+        // Close the input side and drain the remainder of the stream: any
+        // second provider turn for the same assembled frame surfaces here.
+        let RealtimeSession {
+            input,
+            mut events,
+            task_guard: _task_guard,
+        } = session;
+        drop(input);
+        while let Ok(Some(event)) = timeout(Duration::from_secs(5), events.recv()).await {
+            match event {
+                BrainEvent::TranscriptFinal { text, .. } => transcripts.push(text),
+                BrainEvent::AnswerEvaluated { .. } => evaluations += 1,
+                _ => {}
+            }
+        }
+
+        assert_eq!(transcripts, vec!["received 2160000 PCM16 bytes".to_owned()]);
+        assert_eq!(evaluations, 1);
+        assert_eq!(store.snapshot().answer_attempts.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod synthetic_review_schedule_tests {
+    use std::sync::Arc;
+
+    use agent_domain::{
+        parse_utc_instant, BrainEvent, BrainInput, ConceptStatus, FixedClock, RealtimeBrain,
+        RealtimeSession, ReviewScheduleCapReasonV1, SessionConfig, SessionId, StudyMode,
+        StudySessionPhase, VIVA_REVIEW_SCHEDULE_POLICY_ID,
+    };
+    use tokio::time::{timeout, Duration};
+
+    use super::SyntheticBrain;
+
+    /// Literals copied from `packages/core/src/review-scheduling-conformance-v1.json`
+    /// (`new-shaky-hinted-one-miss-no-exam`, `exam-closer-than-margin`, and
+    /// `exam-already-past-fail-closed`). The synthetic rotation grades the first turn
+    /// `shaky`, so the fixture's shaky rows are the expected authoritative outcomes.
+    const GRADED_AT: &str = "2031-04-05T12:00:00.000Z";
+    const SHAKY_DUE_AT: &str = "2031-04-07T12:00:00.000Z";
+    const EXAM_AT: &str = "2031-04-05T18:30:00.000Z";
+    const EXAM_CAPPED_DUE_AT: &str = "2031-04-04T18:30:00.000Z";
+
+    async fn next_event(session: &mut RealtimeSession) -> BrainEvent {
+        timeout(Duration::from_secs(5), session.events.recv())
+            .await
+            .expect("synthetic event within deterministic timeout")
+            .expect("synthetic event stream stays open")
+    }
+
+    async fn run_first_graded_turn(
+        store: Arc<data::InMemoryStudyStore>,
+        graded_at: &str,
+    ) -> Vec<String> {
+        let clock = Arc::new(FixedClock::new(
+            parse_utc_instant(graded_at).expect("graded instant parses"),
+        ));
+        let brain = SyntheticBrain::with_study_store_and_clock(store, clock);
+        let mut session = brain
+            .open(SessionConfig {
+                session_id: Some(SessionId::new("voice-session-1")),
+                user_id: Some("user-1".to_owned()),
+                study_set_id: Some("biology-midterm".to_owned()),
+                mode: Some(StudyMode::Quiz),
+                active_concepts: vec!["nadh".to_owned()],
+                ..SessionConfig::default()
+            })
+            .await
+            .expect("synthetic session opens");
+        let _ = next_event(&mut session).await;
+        let _ = next_event(&mut session).await;
+        session
+            .input
+            .send(BrainInput::Text(
+                "NADH gives electrons to the electron transport chain.".to_owned(),
+            ))
+            .await
+            .expect("text input accepted");
+
+        let mut errors = Vec::new();
+        loop {
+            match next_event(&mut session).await {
+                // A surfaced store error aborts the outcome: nothing follows it.
+                BrainEvent::Error(error) => {
+                    errors.push(error.message);
+                    break;
+                }
+                BrainEvent::SessionPhase {
+                    phase: StudySessionPhase::Correction,
+                } => break,
+                _ => {}
+            }
+        }
+        errors
+    }
+
+    #[tokio::test]
+    async fn synthetic_review_schedule_persists_the_authoritative_decision() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let errors = run_first_graded_turn(Arc::clone(&store), GRADED_AT).await;
+        assert!(errors.is_empty(), "synthetic store errors: {errors:?}");
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.review_schedule_decisions.len(), 1);
+        let record = &snapshot.review_schedule_decisions[0];
+        assert_eq!(record.concept_id, "nadh");
+        assert_eq!(record.decision.status, ConceptStatus::Shaky);
+        assert_eq!(record.decision.rating, 3);
+        assert_eq!(record.decision.policy_id, VIVA_REVIEW_SCHEDULE_POLICY_ID);
+        assert_eq!(
+            agent_domain::format_rfc3339_millis(record.decision.generated_at),
+            GRADED_AT
+        );
+        assert_eq!(
+            agent_domain::format_rfc3339_millis(record.decision.due_at),
+            SHAKY_DUE_AT
+        );
+        assert_eq!(record.decision.cap_reason, None);
+        assert_eq!(record.decision.card.reps, 1);
+
+        // The paired review item carries the same authoritative date, never a fixed one.
+        assert_eq!(snapshot.review_items.len(), 1);
+        assert_eq!(snapshot.review_items[0].due_at, SHAKY_DUE_AT);
+        let encoded = serde_json::to_string(&snapshot.review_items).expect("snapshot serializes");
+        assert!(!encoded.contains("2026-06-"), "{encoded}");
+    }
+
+    #[tokio::test]
+    async fn synthetic_review_schedule_honours_the_recorded_exam_margin() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        store.set_study_set_exam_date("biology-midterm", Some(EXAM_AT.to_owned()));
+        let errors = run_first_graded_turn(Arc::clone(&store), GRADED_AT).await;
+        assert!(errors.is_empty(), "synthetic store errors: {errors:?}");
+
+        let snapshot = store.snapshot();
+        let record = &snapshot.review_schedule_decisions[0];
+        assert_eq!(
+            agent_domain::format_rfc3339_millis(record.decision.due_at),
+            EXAM_CAPPED_DUE_AT
+        );
+        assert_eq!(
+            record.decision.cap_reason,
+            Some(ReviewScheduleCapReasonV1::ExamMargin)
+        );
+        assert!(record.decision.due_at <= record.decision.exam_at.expect("exam instant"));
+    }
+
+    #[tokio::test]
+    async fn synthetic_review_schedule_fails_closed_for_an_already_past_exam() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        store.set_study_set_exam_date(
+            "biology-midterm",
+            Some("2031-03-30T09:15:00.000Z".to_owned()),
+        );
+        let errors = run_first_graded_turn(Arc::clone(&store), GRADED_AT).await;
+        assert!(errors.is_empty(), "synthetic store errors: {errors:?}");
+
+        let snapshot = store.snapshot();
+        let record = &snapshot.review_schedule_decisions[0];
+        assert_eq!(
+            agent_domain::format_rfc3339_millis(record.decision.due_at),
+            "2031-03-30T09:15:00.000Z"
+        );
+        assert_eq!(
+            record.decision.cap_reason,
+            Some(ReviewScheduleCapReasonV1::PastExam)
+        );
+    }
+
+    #[tokio::test]
+    async fn synthetic_review_schedule_surfaces_a_store_rejection_instead_of_skipping_it() {
+        // An unparseable exam instant makes the authoritative context unavailable. The
+        // old best-effort path swallowed this; a missing authoritative schedule is a
+        // critical failure and must surface.
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        store.set_study_set_exam_date("biology-midterm", Some("not-a-date".to_owned()));
+        let errors = run_first_graded_turn(Arc::clone(&store), GRADED_AT).await;
+        assert_eq!(errors.len(), 1, "expected exactly one surfaced store error");
+        assert!(store.snapshot().review_schedule_decisions.is_empty());
+        assert!(store.snapshot().review_items.is_empty());
     }
 }

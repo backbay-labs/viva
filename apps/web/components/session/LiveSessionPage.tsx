@@ -1,21 +1,24 @@
 "use client";
 
-import { type SessionRecap, seedStudySets } from "@viva/core";
+import { type SessionRecap, seedStudySets, VIVA_AUDIO_MAX_TURN_SAMPLES } from "@viva/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePrefersReducedMotion } from "../../lib/use-prefers-reduced-motion";
 import { useVivaAgentSession, type VivaAgentDerivedState } from "../../lib/use-viva-agent-session";
 import {
   fetchVivaAgentReadinessProbe,
+  isVivaAudioSendRejectedError,
   refreshVivaSessionToken,
   type VivaAgentAudioOutput,
   type VivaAgentGenerationReason,
   type VivaAgentReadinessProbe,
+  type VivaAudioChunkInput,
+  type VivaAudioSendResult,
+  type VivaClientSendError,
   vivaAgentHttpBaseUrl,
 } from "../../lib/viva-agent-client";
 import {
   createBrowserVivaAudioCaptureSource,
   isVivaAudioWorkletUnavailableError,
-  pcm16LeBytesToBase64,
   startVivaPcm16StreamingCapture,
   VIVA_AUDIO_SAMPLE_RATE_HZ,
   type VivaAudioCaptureEndReason,
@@ -125,7 +128,7 @@ export function LiveSessionPage() {
   const captureRef = useRef<VivaPcm16StreamingCaptureController | null>(null);
   const captureStartedRef = useRef(false);
   const micStartGenerationRef = useRef(0);
-  const capturedTurnPcm16Ref = useRef<Uint8Array[]>([]);
+  const audioTurnDriverRef = useRef<LiveAudioTurnDriver | null>(null);
   const textAnswerModeRef = useRef(false);
   const recordingConsentAcknowledgedRef = useRef(false);
   const meterRef = useRef(createVoiceLevelMeter({ coefficient: 0.3 }));
@@ -144,6 +147,32 @@ export function LiveSessionPage() {
     return () => {
       mountedRef.current = false;
     };
+  }, []);
+
+  // One lifecycle driver per page instance, wired to the live controller seam.
+  const getAudioTurnDriver = useCallback(() => {
+    if (audioTurnDriverRef.current) return audioTurnDriverRef.current;
+    const driver = createLiveAudioTurnDriver({
+      controller: {
+        cancelAudioTurn: (turnId) => agentRef.current.cancelAudioTurn(turnId),
+        endAudioTurn: (endInput) => agentRef.current.endAudioTurn(endInput),
+        sendAudioChunk: (chunkInput) => agentRef.current.sendAudioChunk(chunkInput),
+      },
+      createTurnId: createOpaqueAudioTurnId,
+      // At the raw 45-second cap the capture source is stopped; the driver has
+      // already emitted the turn's final chunk and its single `audio_end`.
+      onCapacityReached: () => {
+        captureRef.current?.stop();
+        captureRef.current = null;
+        captureStartedRef.current = false;
+        levelRef.current.user = 0;
+      },
+    });
+    audioTurnDriverRef.current = driver;
+    return driver;
+  }, []);
+  const cancelActiveAudioTurn = useCallback(() => {
+    audioTurnDriverRef.current?.cancel();
   }, []);
 
   const getPlayback = useCallback(() => {
@@ -223,7 +252,7 @@ export function LiveSessionPage() {
       setHintShown(false);
       setTextRetryOpen(false);
       setSubmittedTextAnswer(undefined);
-      stopCaptureForRecap(captureRef, captureStartedRef, levelRef, capturedTurnPcm16Ref);
+      stopCaptureForRecap(captureRef, captureStartedRef, levelRef, cancelActiveAudioTurn);
       resetPlaybackForGeneration();
       if (plan.action === "refresh_session_token") {
         void refreshVivaSessionToken({
@@ -264,6 +293,7 @@ export function LiveSessionPage() {
       activeStudySet.id,
       activeStudySet.sessionId,
       activeStudySet.userId,
+      cancelActiveAudioTurn,
       resetPlaybackForGeneration,
     ],
   );
@@ -353,11 +383,14 @@ export function LiveSessionPage() {
     () => () => {
       captureRef.current?.stop();
       captureRef.current = null;
-      capturedTurnPcm16Ref.current = [];
+      // Disposal cancels the in-flight input turn exactly once so the retained
+      // ledger is released and the server never sees a half-streamed turn.
+      cancelActiveAudioTurn();
+      audioTurnDriverRef.current = null;
       void playbackRef.current?.close();
       playbackRef.current = null;
     },
-    [],
+    [cancelActiveAudioTurn],
   );
 
   const startMic = useCallback(async () => {
@@ -392,7 +425,7 @@ export function LiveSessionPage() {
         source.stop();
         captureStartedRef.current = false;
         levelRef.current.user = 0;
-        capturedTurnPcm16Ref.current = [];
+        cancelActiveAudioTurn();
         return;
       }
       const meter = meterRef.current;
@@ -402,7 +435,9 @@ export function LiveSessionPage() {
           captureRef.current = null;
           captureStartedRef.current = false;
           levelRef.current.user = 0;
-          capturedTurnPcm16Ref.current = [];
+          // A device change or explicit stop mid-turn discards the partial turn
+          // rather than leaving retained bytes that can never be ended.
+          if (reason !== "stopped") cancelActiveAudioTurn();
           setMicState((current) => micStateForCaptureEndReason(reason, current));
         },
         onError: (error) => {
@@ -410,7 +445,7 @@ export function LiveSessionPage() {
           captureRef.current = null;
           captureStartedRef.current = false;
           levelRef.current.user = 0;
-          capturedTurnPcm16Ref.current = [];
+          cancelActiveAudioTurn();
           setMicState(micStateForAudioCaptureError(error));
         },
         onFrame: (frame) => {
@@ -421,7 +456,7 @@ export function LiveSessionPage() {
               textAnswerMode: textAnswerModeRef.current,
             })
           ) {
-            capturedTurnPcm16Ref.current.push(frame.pcm16Bytes);
+            getAudioTurnDriver().captureFrame(frame);
           }
         },
         onSampleFrame: (frame) => {
@@ -441,15 +476,15 @@ export function LiveSessionPage() {
       if (textAnswerModeRef.current || startGeneration !== micStartGenerationRef.current) {
         captureStartedRef.current = false;
         levelRef.current.user = 0;
-        capturedTurnPcm16Ref.current = [];
+        cancelActiveAudioTurn();
         return;
       }
       captureStartedRef.current = false; // allow another attempt on the next gesture
       levelRef.current.user = 0;
-      capturedTurnPcm16Ref.current = [];
+      cancelActiveAudioTurn();
       setMicState(micStateForAudioCaptureError(error));
     }
-  }, []);
+  }, [cancelActiveAudioTurn, getAudioTurnDriver]);
 
   const unlockPlayback = useCallback(() => {
     void getPlayback()
@@ -478,8 +513,8 @@ export function LiveSessionPage() {
   const activateTextAnswerMode = useCallback(() => {
     textAnswerModeRef.current = true;
     micStartGenerationRef.current += 1;
-    enterTextAnswerMode(captureRef, captureStartedRef, levelRef, meterRef, capturedTurnPcm16Ref);
-  }, []);
+    enterTextAnswerMode(captureRef, captureStartedRef, levelRef, meterRef, cancelActiveAudioTurn);
+  }, [cancelActiveAudioTurn]);
 
   const submitSpokenTurn = useCallback(() => {
     onUserGesture();
@@ -493,14 +528,11 @@ export function LiveSessionPage() {
         textAnswerMode: textAnswerModeRef.current,
       })
     ) {
-      const payload = pcm16ChunksToBase64(capturedTurnPcm16Ref.current);
-      capturedTurnPcm16Ref.current = [];
-      if (payload) {
-        agentRef.current.sendAudio(payload);
-        return;
-      }
+      // Flush the capture tail into the turn's last chunk and send exactly one
+      // `audio_end`, leaving the microphone open for the next question.
+      if (submitSpokenCaptureTurn(captureRef, getAudioTurnDriver())) return;
     } else {
-      capturedTurnPcm16Ref.current = [];
+      cancelActiveAudioTurn();
     }
     if (
       spokenTurnFallbackAction({
@@ -512,7 +544,7 @@ export function LiveSessionPage() {
       setTextAnswerEnabled(true);
       setTextRetryOpen(true);
     }
-  }, [activateTextAnswerMode, onUserGesture]);
+  }, [activateTextAnswerMode, cancelActiveAudioTurn, getAudioTurnDriver, onUserGesture]);
   const submitTextTurn = useCallback(
     (answer: string) => {
       const payload = textAnswerPayload(answer);
@@ -602,23 +634,32 @@ export function LiveSessionPage() {
     setSourceOpen(false);
     setHintShown(false);
     setTextRetryOpen(false);
-    stopCaptureForRecap(captureRef, captureStartedRef, levelRef, capturedTurnPcm16Ref);
+    stopCaptureForRecap(captureRef, captureStartedRef, levelRef, cancelActiveAudioTurn);
     agentRef.current.stop();
-  }, []);
+  }, [cancelActiveAudioTurn]);
   const cancelCheckingTurn = useCallback(() => {
     setSourceOpen(false);
     setHintShown(false);
     setTextRetryOpen(false);
     setSubmittedTextAnswer(undefined);
-    capturedTurnPcm16Ref.current = [];
+    cancelActiveAudioTurn();
     levelRef.current.user = 0;
     agentRef.current.cancel();
-  }, []);
+  }, [cancelActiveAudioTurn]);
 
   useEffect(() => {
     if (!agent.derived.recap) return;
-    stopCaptureForRecap(captureRef, captureStartedRef, levelRef, capturedTurnPcm16Ref);
-  }, [agent.derived.recap]);
+    stopCaptureForRecap(captureRef, captureStartedRef, levelRef, cancelActiveAudioTurn);
+  }, [agent.derived.recap, cancelActiveAudioTurn]);
+
+  // The server accepted the exact in-flight turn: release the page's turn state
+  // so the next capture callback can open a new one. Acceptance is not provider
+  // success — the pending submission stays until the evaluation arrives.
+  const acceptedAudioTurnId = agent.agentState.acceptedAudioTurn?.turnId;
+  useEffect(() => {
+    if (!acceptedAudioTurnId) return;
+    audioTurnDriverRef.current?.release(acceptedAudioTurnId);
+  }, [acceptedAudioTurnId]);
 
   const activeQuestionId = agent.derived.question?.id;
   const previousQuestionIdRef = useRef(activeQuestionId);
@@ -626,12 +667,12 @@ export function LiveSessionPage() {
   useEffect(() => {
     if (previousQuestionIdRef.current === activeQuestionId) return;
     previousQuestionIdRef.current = activeQuestionId;
-    capturedTurnPcm16Ref.current = [];
+    cancelActiveAudioTurn();
     setSubmittedTextAnswer(undefined);
     setTextAnswerEnabled(false);
     setTextRetryOpen(false);
     setInterruptAcknowledged(false);
-  }, [activeQuestionId]);
+  }, [activeQuestionId, cancelActiveAudioTurn]);
 
   // Stable session-start reference so FSRS review intervals are deterministic
   // across renders (and don't recompute the projection every tick).
@@ -846,7 +887,7 @@ export function LiveSessionPage() {
       }}
       onUseVoiceAnswer={() => {
         textAnswerModeRef.current = false;
-        capturedTurnPcm16Ref.current = [];
+        cancelActiveAudioTurn();
         setTextAnswerEnabled(false);
         onUserGesture();
       }}
@@ -1022,13 +1063,15 @@ export function stopCaptureForRecap(
   captureRef: { current: LiveCaptureController | null },
   captureStartedRef: { current: boolean },
   levelRef: { current: { user: number } },
-  capturedTurnPcm16Ref?: Pcm16BufferRef,
+  cancelAudioTurn?: () => void,
 ) {
   captureRef.current?.stop();
   captureRef.current = null;
   captureStartedRef.current = false;
   levelRef.current.user = 0;
-  clearCapturedTurnPcm16(capturedTurnPcm16Ref);
+  // The in-flight input turn is cancelled through the controller so its retained
+  // bytes are released and no phantom provider turn can be created.
+  cancelAudioTurn?.();
 }
 
 export function enterTextAnswerMode(
@@ -1036,7 +1079,7 @@ export function enterTextAnswerMode(
   captureStartedRef: { current: boolean },
   levelRef: { current: { user: number } },
   meterRef?: { current: { reset: () => void } },
-  capturedTurnPcm16Ref?: Pcm16BufferRef,
+  cancelAudioTurn?: () => void,
 ) {
   const capture = captureRef.current;
   if (capture?.cancel) {
@@ -1048,16 +1091,31 @@ export function enterTextAnswerMode(
   captureStartedRef.current = false;
   levelRef.current.user = 0;
   meterRef?.current.reset();
-  clearCapturedTurnPcm16(capturedTurnPcm16Ref);
+  cancelAudioTurn?.();
 }
 
 type LiveCaptureController = Pick<VivaPcm16StreamingCaptureController, "stop"> &
-  Partial<Pick<VivaPcm16StreamingCaptureController, "cancel">>;
+  Partial<Pick<VivaPcm16StreamingCaptureController, "cancel" | "flush">>;
 
-type Pcm16BufferRef = { current: Uint8Array[] };
-
-function clearCapturedTurnPcm16(capturedTurnPcm16Ref?: Pcm16BufferRef) {
-  if (capturedTurnPcm16Ref) capturedTurnPcm16Ref.current = [];
+/**
+ * Submit the spoken answer: flush the capture tail into the turn's last chunk,
+ * then send exactly one `audio_end`.
+ *
+ * The capture source is deliberately left running. It is session-scoped, not
+ * turn-scoped: `stop`/`end`/`cancel` release the browser source, which stops
+ * every `MediaStream` track and closes the `AudioContext`, while the page's
+ * `captureStarted` flag stays set and no question change resets it — so ending
+ * capture here would leave a dead controller behind and make every later spoken
+ * answer impossible. The retained ledger is not cleared either: only
+ * `audio_turn_accepted` releases it, so `pending` and `socket_closed` keep their
+ * retry metadata instead of pretending the answer was sent.
+ */
+export function submitSpokenCaptureTurn(
+  captureRef: { current: LiveCaptureController | null },
+  driver: Pick<LiveAudioTurnDriver, "submit">,
+): VivaAudioSendResult | null {
+  captureRef.current?.flush?.();
+  return driver.submit();
 }
 
 export function micStateForAudioCaptureError(error: unknown): RuntimeMicState {
@@ -1110,16 +1168,165 @@ export function captureLevelForBloom(input: {
   return input.meter.push(input.samples);
 }
 
-export function pcm16ChunksToBase64(chunks: readonly Uint8Array[]): string | null {
-  const byteLength = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
-  if (byteLength === 0) return null;
-  const merged = new Uint8Array(byteLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
+export type ActiveAudioTurn = {
+  turnId: string;
+  nextSequence: number;
+  capturedSamples: number;
+};
+
+/** The exact controller surface the page's audio lifecycle depends on. */
+export type LiveAudioTurnSeam = {
+  sendAudioChunk: (input: VivaAudioChunkInput) => VivaAudioSendResult;
+  endAudioTurn: (input: Readonly<{ turnId: string; finalSequence: number }>) => VivaAudioSendResult;
+  cancelAudioTurn: (turnId: string) => void;
+};
+
+export type LiveAudioCaptureOutcome = {
+  chunk: { sequence: number; result: VivaAudioSendResult } | null;
+  end: VivaAudioSendResult | null;
+  ignored: "empty" | "awaiting_acceptance" | "capped" | "rejected" | null;
+};
+
+export type LiveAudioTurnDriver = {
+  captureFrame: (frame: { pcm16Bytes: Uint8Array }) => LiveAudioCaptureOutcome;
+  submit: () => VivaAudioSendResult | null;
+  release: (turnId: string) => boolean;
+  cancel: () => boolean;
+  getTurn: () => ActiveAudioTurn | null;
+  getLastResult: () => VivaAudioSendResult | null;
+  isAwaitingAcceptance: () => boolean;
+};
+
+/**
+ * The page's whole microphone-turn lifecycle, extracted from the component so it
+ * is provable without a DOM (`bun:test` has no DOM environment at this base).
+ *
+ * It never merges a turn into one payload: each capture callback becomes one
+ * bounded, contiguous `audio_chunk`, and the turn is submitted with exactly one
+ * `audio_end`. Captured samples are counted with checked arithmetic and capture
+ * stops before the 45-second raw cap can be exceeded. A submitted turn stays
+ * retained by the controller until `audio_turn_accepted` releases it, so a later
+ * capture callback is dropped rather than opening a second input turn, and a
+ * `socket_closed` result is preserved as retry metadata instead of being read as
+ * a successful answer.
+ */
+export function createLiveAudioTurnDriver(input: {
+  controller: LiveAudioTurnSeam;
+  createTurnId: () => string;
+  maxTurnSamples?: number;
+  onCapacityReached?: () => void;
+  onSendRejected?: (error: VivaClientSendError) => void;
+}): LiveAudioTurnDriver {
+  const maxTurnSamples = input.maxTurnSamples ?? VIVA_AUDIO_MAX_TURN_SAMPLES;
+  let turn: ActiveAudioTurn | null = null;
+  let awaitingTurnId: string | null = null;
+  let lastResult: VivaAudioSendResult | null = null;
+
+  function endActiveTurn(active: ActiveAudioTurn): VivaAudioSendResult | null {
+    if (active.nextSequence === 0) {
+      turn = null;
+      return null;
+    }
+    try {
+      const result = input.controller.endAudioTurn({
+        finalSequence: active.nextSequence - 1,
+        turnId: active.turnId,
+      });
+      lastResult = result;
+      awaitingTurnId = active.turnId;
+      turn = null;
+      return result;
+    } catch (error) {
+      if (!isVivaAudioSendRejectedError(error)) throw error;
+      turn = null;
+      input.onSendRejected?.(error.error);
+      return null;
+    }
   }
-  return pcm16LeBytesToBase64(merged);
+
+  return {
+    captureFrame(frame) {
+      const byteLength = frame.pcm16Bytes.byteLength;
+      if (byteLength === 0 || byteLength % 2 !== 0) {
+        return { chunk: null, end: null, ignored: "empty" };
+      }
+      if (awaitingTurnId !== null) {
+        return { chunk: null, end: null, ignored: "awaiting_acceptance" };
+      }
+      const active = turn ?? {
+        capturedSamples: 0,
+        nextSequence: 0,
+        turnId: input.createTurnId(),
+      };
+      const capturedSamples = active.capturedSamples + byteLength / 2;
+      if (!Number.isSafeInteger(capturedSamples) || capturedSamples > maxTurnSamples) {
+        // End before notifying — see the comment on the exact-cap branch below.
+        const end = turn ? endActiveTurn(turn) : null;
+        input.onCapacityReached?.();
+        return { chunk: null, end, ignored: "capped" };
+      }
+      let result: VivaAudioSendResult;
+      try {
+        result = input.controller.sendAudioChunk({
+          pcm16Bytes: frame.pcm16Bytes,
+          sequence: active.nextSequence,
+          turnId: active.turnId,
+        });
+      } catch (error) {
+        if (!isVivaAudioSendRejectedError(error)) throw error;
+        input.onSendRejected?.(error.error);
+        return { chunk: null, end: null, ignored: "rejected" };
+      }
+      lastResult = result;
+      const chunk = { result, sequence: active.nextSequence };
+      turn = {
+        capturedSamples,
+        nextSequence: active.nextSequence + 1,
+        turnId: active.turnId,
+      };
+      if (capturedSamples === maxTurnSamples) {
+        // The turn's single `audio_end` is sent BEFORE the capacity callback,
+        // because that callback stops the capture source and the source flushes
+        // its buffered tail synchronously back into `captureFrame`. Ending first
+        // leaves this driver awaiting acceptance, so the flushed tail is ignored
+        // instead of re-entering this branch and calling back into the stop that
+        // produced it — which recursed until the stack was exhausted.
+        const end = endActiveTurn(turn);
+        input.onCapacityReached?.();
+        return { chunk, end, ignored: null };
+      }
+      return { chunk, end: null, ignored: null };
+    },
+    submit() {
+      return turn ? endActiveTurn(turn) : null;
+    },
+    release(turnId: string) {
+      if (awaitingTurnId !== turnId) return false;
+      awaitingTurnId = null;
+      lastResult = null;
+      return true;
+    },
+    cancel() {
+      const cancelledTurnId = turn?.turnId ?? awaitingTurnId;
+      if (cancelledTurnId === null) return false;
+      turn = null;
+      awaitingTurnId = null;
+      lastResult = null;
+      input.controller.cancelAudioTurn(cancelledTurnId);
+      return true;
+    },
+    getLastResult: () => lastResult,
+    getTurn: () => turn,
+    isAwaitingAcceptance: () => awaitingTurnId !== null,
+  };
+}
+
+/** Opaque per-turn identifier; it never carries learner or transcript material. */
+export function createOpaqueAudioTurnId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `turn-${crypto.randomUUID()}`;
+  }
+  return `turn-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 export function spokenTurnFallbackAction(input: {

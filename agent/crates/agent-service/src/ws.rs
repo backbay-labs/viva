@@ -40,7 +40,8 @@ use crate::{
         SessionTokenClaims, VoiceLimitConfig, VoiceWsAccessError,
     },
     protocol::{
-        ClientFrame, ServerFrame, VivaServerEvent, VIVA_VOICE_MAX_BINARY_FRAME_BYTES,
+        ClientFrame, ServerFrame, VivaServerEvent, VIVA_AUDIO_MAX_CHUNK_BYTES,
+        VIVA_AUDIO_MAX_TURN_BYTES, VIVA_VOICE_MAX_BINARY_FRAME_BYTES,
         VIVA_VOICE_MAX_TEXT_FRAME_BYTES, VIVA_VOICE_PROTOCOL_VERSION,
     },
 };
@@ -535,6 +536,8 @@ async fn handle_socket(
     let mut terminal_persisted = false;
     let mut cancelled_responses = CancelledResponseTracker::default();
     let mut session_limits = SessionLimitRuntime::new();
+    // One bounded browser audio turn under assembly at a time, connection-local.
+    let mut incoming_audio_turn: Option<IncomingAudioTurn> = None;
     let session_cap = tokio::time::sleep(state.ws_timeouts.session);
     tokio::pin!(session_cap);
     let turn_cap = tokio::time::sleep(state.ws_timeouts.idle);
@@ -650,6 +653,7 @@ async fn handle_socket(
                     .await;
                     break;
                 }
+                let accepted_audio_turn = client_input.accepted_audio_turn();
                 let mut provider_admission_lease = admission.lease.take();
                 let turn_send_deadline = if client_input.action().arms_turn_cap() {
                     pre_answer_idle_armed = false;
@@ -682,6 +686,22 @@ async fn handle_socket(
                             active_provider_turns = active_provider_turns.saturating_add(1);
                             if let Some(lease) = provider_admission_lease.take() {
                                 pending_provider_admissions.push(lease);
+                            }
+                        }
+                        if let Some(accepted) = accepted_audio_turn {
+                            if send_json(
+                                &mut sender,
+                                &ServerFrame::audio_turn_accepted(
+                                    accepted.client_generation_id,
+                                    accepted.turn_id,
+                                    accepted.final_sequence,
+                                ),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                terminal_reason = "send_failed";
+                                break;
                             }
                         }
                     }
@@ -749,6 +769,7 @@ async fn handle_socket(
                     &session_binding,
                     &state.voice_limits,
                     &mut session_limits,
+                    &mut incoming_audio_turn,
                 ) {
                     Ok(client_input) => client_input,
                     Err(ClientMessageError::Drained) => {
@@ -864,6 +885,7 @@ async fn handle_socket(
                     }
                     continue;
                 }
+                let accepted_audio_turn = client_input.accepted_audio_turn();
                 let mut provider_admission_lease = None;
                 let requires_provider_admission =
                     client_input_requires_provider_admission(&client_input);
@@ -1062,6 +1084,22 @@ async fn handle_socket(
                             }
                             if let Some(lease) = provider_admission_lease.take() {
                                 pending_provider_admissions.push(lease);
+                            }
+                        }
+                        if let Some(accepted) = accepted_audio_turn {
+                            if send_json(
+                                &mut sender,
+                                &ServerFrame::audio_turn_accepted(
+                                    accepted.client_generation_id,
+                                    accepted.turn_id,
+                                    accepted.final_sequence,
+                                ),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                terminal_reason = "send_failed";
+                                break;
                             }
                         }
                         match action {
@@ -2816,8 +2854,9 @@ async fn handle_client_message(
     message: Message,
     input: &mpsc::Sender<BrainInput>,
     session_binding: &AuthorizedClientSession,
+    audio_assembly: &mut Option<IncomingAudioTurn>,
 ) -> Result<ClientAction, ClientFrameError> {
-    match client_input_action(message, session_binding)? {
+    match client_input_action(message, session_binding, audio_assembly)? {
         ClientInputAction::Send {
             brain_input,
             action,
@@ -2825,6 +2864,11 @@ async fn handle_client_message(
             .send(brain_input)
             .await
             .map(|_| action)
+            .map_err(|_| ClientFrameError::disconnected()),
+        ClientInputAction::SendAudioTurn { brain_input, .. } => input
+            .send(brain_input)
+            .await
+            .map(|_| ClientAction::Audio)
             .map_err(|_| ClientFrameError::disconnected()),
         ClientInputAction::TrySend {
             brain_input,
@@ -2834,6 +2878,8 @@ async fn handle_client_message(
             Ok(action)
         }
         ClientInputAction::Keepalive => Ok(ClientAction::Keepalive),
+        ClientInputAction::AudioTurnBuffered => Ok(ClientAction::AudioChunk),
+        ClientInputAction::AudioTurnDiscarded => Ok(ClientAction::AudioTurnCancel),
     }
 }
 
@@ -2842,10 +2888,16 @@ fn prepare_client_message_with_drain(
     session_binding: &AuthorizedClientSession,
     limits: &VoiceLimitConfig,
     session_limits: &mut SessionLimitRuntime,
+    audio_assembly: &mut Option<IncomingAudioTurn>,
 ) -> Result<ClientInputAction, ClientMessageError> {
-    let action =
-        client_input_action(message, session_binding).map_err(ClientMessageError::Frame)?;
-    if let ClientInputAction::Send { brain_input, .. } = &action {
+    let action = client_input_action(message, session_binding, audio_assembly)
+        .map_err(ClientMessageError::Frame)?;
+    let brain_input = match &action {
+        ClientInputAction::Send { brain_input, .. }
+        | ClientInputAction::SendAudioTurn { brain_input, .. } => Some(brain_input),
+        _ => None,
+    };
+    if let Some(brain_input) = brain_input {
         if let Some(bytes) = brain_input_audio_bytes(brain_input) {
             if !session_limits.record_audio_bytes(limits, bytes) {
                 return Err(ClientMessageError::RateLimit);
@@ -2868,6 +2920,11 @@ async fn send_client_input_action_with_drain(
         } => send_brain_input_with_deadline(input, brain_input, drain_signal, turn_deadline)
             .await
             .map(|_| action),
+        ClientInputAction::SendAudioTurn { brain_input, .. } => {
+            send_brain_input_with_deadline(input, brain_input, drain_signal, turn_deadline)
+                .await
+                .map(|_| ClientAction::Audio)
+        }
         ClientInputAction::TrySend {
             brain_input,
             action,
@@ -2876,6 +2933,8 @@ async fn send_client_input_action_with_drain(
             Ok(action)
         }
         ClientInputAction::Keepalive => Ok(ClientAction::Keepalive),
+        ClientInputAction::AudioTurnBuffered => Ok(ClientAction::AudioChunk),
+        ClientInputAction::AudioTurnDiscarded => Ok(ClientAction::AudioTurnCancel),
     }
 }
 
@@ -2899,9 +2958,145 @@ fn validated_client_generation_id(
     }
 }
 
+/// One connection-local bounded audio turn under assembly. Retained until an
+/// explicit `audio_end`, a matching scoped `cancel`, or a protocol violation.
+#[derive(Debug)]
+struct IncomingAudioTurn {
+    client_generation_id: String,
+    turn_id: String,
+    next_sequence: u32,
+    pcm16: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum AudioAssemblyAction {
+    Pending,
+    Complete {
+        client_generation_id: String,
+        turn_id: String,
+        final_sequence: u32,
+        frame: AudioFrame,
+    },
+    Cancelled,
+}
+
+/// The completed turn identity echoed back to the browser once its single
+/// assembled `BrainInput` has been admitted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AcceptedAudioTurn {
+    client_generation_id: String,
+    turn_id: String,
+    final_sequence: u32,
+}
+
+fn audio_identity_is_valid(client_generation_id: &str, turn_id: &str) -> bool {
+    !client_generation_id.trim().is_empty() && !turn_id.trim().is_empty()
+}
+
+fn accept_audio_chunk(
+    assembly: &mut Option<IncomingAudioTurn>,
+    client_generation_id: String,
+    turn_id: String,
+    sequence: u32,
+    frame: AudioFrame,
+) -> Result<AudioAssemblyAction, ClientFrameError> {
+    let reject = |assembly: &mut Option<IncomingAudioTurn>, error: ClientFrameError| {
+        *assembly = None;
+        Err(error)
+    };
+
+    if !audio_identity_is_valid(&client_generation_id, &turn_id) {
+        return reject(assembly, ClientFrameError::invalid_audio_frame());
+    }
+
+    // Decode before mutation: a rejected payload never reaches the retained turn.
+    let pcm16 = frame.pcm16_bytes();
+    if pcm16.is_empty() {
+        return reject(assembly, ClientFrameError::invalid_audio_frame());
+    }
+    if pcm16.len() > VIVA_AUDIO_MAX_CHUNK_BYTES {
+        return reject(assembly, ClientFrameError::oversized_audio_chunk());
+    }
+    if !pcm16.len().is_multiple_of(2) {
+        return reject(assembly, ClientFrameError::invalid_audio_frame());
+    }
+
+    match assembly.as_mut() {
+        None => {
+            if sequence != 0 {
+                return reject(assembly, ClientFrameError::invalid_audio_frame());
+            }
+            *assembly = Some(IncomingAudioTurn {
+                client_generation_id,
+                turn_id,
+                next_sequence: 1,
+                pcm16: pcm16.to_vec(),
+            });
+        }
+        Some(turn) => {
+            if turn.client_generation_id != client_generation_id
+                || turn.turn_id != turn_id
+                || turn.next_sequence != sequence
+            {
+                return reject(assembly, ClientFrameError::invalid_audio_frame());
+            }
+            let Some(total) = turn.pcm16.len().checked_add(pcm16.len()) else {
+                return reject(assembly, ClientFrameError::oversized_audio_turn());
+            };
+            if total > VIVA_AUDIO_MAX_TURN_BYTES {
+                return reject(assembly, ClientFrameError::oversized_audio_turn());
+            }
+            let Some(next_sequence) = turn.next_sequence.checked_add(1) else {
+                return reject(assembly, ClientFrameError::invalid_audio_frame());
+            };
+            turn.pcm16.extend_from_slice(pcm16);
+            turn.next_sequence = next_sequence;
+        }
+    }
+    Ok(AudioAssemblyAction::Pending)
+}
+
+fn accept_audio_end(
+    assembly: &mut Option<IncomingAudioTurn>,
+    client_generation_id: &str,
+    turn_id: &str,
+    final_sequence: u32,
+) -> Result<AudioAssemblyAction, ClientFrameError> {
+    let Some(turn) = assembly.take() else {
+        return Err(ClientFrameError::invalid_audio_frame());
+    };
+    if turn.client_generation_id != client_generation_id
+        || turn.turn_id != turn_id
+        || turn.next_sequence != final_sequence.saturating_add(1)
+    {
+        return Err(ClientFrameError::invalid_audio_frame());
+    }
+    Ok(AudioAssemblyAction::Complete {
+        client_generation_id: turn.client_generation_id,
+        turn_id: turn.turn_id,
+        final_sequence,
+        frame: AudioFrame::from_pcm16_bytes(turn.pcm16),
+    })
+}
+
+fn accept_audio_cancel(
+    assembly: &mut Option<IncomingAudioTurn>,
+    client_generation_id: &str,
+    turn_id: &str,
+) -> Result<AudioAssemblyAction, ClientFrameError> {
+    let Some(turn) = assembly.take() else {
+        return Err(ClientFrameError::invalid_audio_frame());
+    };
+    if turn.client_generation_id != client_generation_id || turn.turn_id != turn_id {
+        return Err(ClientFrameError::invalid_audio_frame());
+    }
+    Ok(AudioAssemblyAction::Cancelled)
+}
+
 fn client_input_action(
     message: Message,
     session_binding: &AuthorizedClientSession,
+    audio_assembly: &mut Option<IncomingAudioTurn>,
 ) -> Result<ClientInputAction, ClientFrameError> {
     match message {
         Message::Text(text) => {
@@ -2924,23 +3119,58 @@ fn client_input_action(
                         action: ClientAction::ConfigRefresh,
                     })
                 }
-                ClientFrame::Audio {
-                    frame,
+                ClientFrame::AudioChunk {
                     client_generation_id,
+                    turn_id,
+                    sequence,
+                    frame,
                     ..
                 } => {
-                    let client_generation_id =
-                        validated_client_generation_id(client_generation_id)?;
-                    Ok(ClientInputAction::Send {
-                        brain_input: match client_generation_id {
-                            Some(client_generation_id) => BrainInput::AudioWithMetadata {
+                    match accept_audio_chunk(
+                        audio_assembly,
+                        client_generation_id,
+                        turn_id,
+                        sequence,
+                        frame,
+                    )? {
+                        AudioAssemblyAction::Pending => Ok(ClientInputAction::AudioTurnBuffered),
+                        AudioAssemblyAction::Complete { .. } | AudioAssemblyAction::Cancelled => {
+                            Err(ClientFrameError::invalid_audio_frame())
+                        }
+                    }
+                }
+                ClientFrame::AudioEnd {
+                    client_generation_id,
+                    turn_id,
+                    final_sequence,
+                    ..
+                } => {
+                    match accept_audio_end(
+                        audio_assembly,
+                        &client_generation_id,
+                        &turn_id,
+                        final_sequence,
+                    )? {
+                        AudioAssemblyAction::Complete {
+                            client_generation_id,
+                            turn_id,
+                            final_sequence,
+                            frame,
+                        } => Ok(ClientInputAction::SendAudioTurn {
+                            brain_input: BrainInput::AudioWithMetadata {
                                 frame,
-                                client_generation_id: Some(client_generation_id),
+                                client_generation_id: Some(client_generation_id.clone()),
                             },
-                            None => BrainInput::Audio(frame),
-                        },
-                        action: ClientAction::Audio,
-                    })
+                            accepted: AcceptedAudioTurn {
+                                client_generation_id,
+                                turn_id,
+                                final_sequence,
+                            },
+                        }),
+                        AudioAssemblyAction::Pending | AudioAssemblyAction::Cancelled => {
+                            Err(ClientFrameError::invalid_audio_frame())
+                        }
+                    }
                 }
                 ClientFrame::Text {
                     text,
@@ -2961,10 +3191,32 @@ fn client_input_action(
                     })
                 }
                 ClientFrame::ToolResult { .. } => Err(ClientFrameError::untrusted_tool_result()),
-                ClientFrame::Cancel { .. } => Ok(ClientInputAction::Send {
-                    brain_input: BrainInput::CancelResponse,
-                    action: ClientAction::Cancel,
-                }),
+                ClientFrame::Cancel {
+                    client_generation_id,
+                    turn_id,
+                    ..
+                } => match (client_generation_id, turn_id) {
+                    // A scoped cancel discards a matching in-progress assembly and
+                    // never creates a provider turn.
+                    (Some(client_generation_id), Some(turn_id)) => {
+                        match accept_audio_cancel(audio_assembly, &client_generation_id, &turn_id)?
+                        {
+                            AudioAssemblyAction::Cancelled => {
+                                Ok(ClientInputAction::AudioTurnDiscarded)
+                            }
+                            AudioAssemblyAction::Pending | AudioAssemblyAction::Complete { .. } => {
+                                Err(ClientFrameError::invalid_audio_frame())
+                            }
+                        }
+                    }
+                    // A turn id without a generation names a turn it cannot prove it owns.
+                    (None, Some(_)) => Err(ClientFrameError::invalid_audio_frame()),
+                    // Without both identities this preserves provider-response cancellation.
+                    (Some(_), None) | (None, None) => Ok(ClientInputAction::Send {
+                        brain_input: BrainInput::CancelResponse,
+                        action: ClientAction::Cancel,
+                    }),
+                },
                 ClientFrame::Stop { .. } => Ok(ClientInputAction::TrySend {
                     brain_input: BrainInput::Stop,
                     action: ClientAction::Stop,
@@ -3233,6 +3485,8 @@ impl AuthorizedClientSession {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClientAction {
     Audio,
+    AudioChunk,
+    AudioTurnCancel,
     AnswerText,
     Cancel,
     Close,
@@ -3253,18 +3507,37 @@ enum ClientInputAction {
         brain_input: BrainInput,
         action: ClientAction,
     },
+    /// One complete bounded audio turn, admitted exactly once at explicit end.
+    SendAudioTurn {
+        brain_input: BrainInput,
+        accepted: AcceptedAudioTurn,
+    },
     TrySend {
         brain_input: BrainInput,
         action: ClientAction,
     },
     Keepalive,
+    /// A valid chunk retained in the connection-local assembly; nothing forwarded.
+    AudioTurnBuffered,
+    /// A matching scoped cancel discarded the assembly; no provider turn exists.
+    AudioTurnDiscarded,
 }
 
 impl ClientInputAction {
     fn action(&self) -> ClientAction {
         match self {
             Self::Send { action, .. } | Self::TrySend { action, .. } => *action,
+            Self::SendAudioTurn { .. } => ClientAction::Audio,
             Self::Keepalive => ClientAction::Keepalive,
+            Self::AudioTurnBuffered => ClientAction::AudioChunk,
+            Self::AudioTurnDiscarded => ClientAction::AudioTurnCancel,
+        }
+    }
+
+    fn accepted_audio_turn(&self) -> Option<AcceptedAudioTurn> {
+        match self {
+            Self::SendAudioTurn { accepted, .. } => Some(accepted.clone()),
+            _ => None,
         }
     }
 }
@@ -3398,6 +3671,36 @@ impl ClientFrameError {
         }
     }
 
+    fn invalid_audio_frame() -> Self {
+        Self {
+            auth_failure_code: None,
+            message: "invalid audio frame",
+            close_code: close_code::PROTOCOL,
+            close_reason: "invalid audio frame",
+            terminal_reason: "invalid_audio_frame",
+        }
+    }
+
+    fn oversized_audio_chunk() -> Self {
+        Self {
+            auth_failure_code: None,
+            message: "audio chunk exceeds maximum size",
+            close_code: close_code::SIZE,
+            close_reason: "audio chunk too large",
+            terminal_reason: "oversized_audio_chunk",
+        }
+    }
+
+    fn oversized_audio_turn() -> Self {
+        Self {
+            auth_failure_code: None,
+            message: "audio turn exceeds maximum size",
+            close_code: close_code::SIZE,
+            close_reason: "audio turn too large",
+            terminal_reason: "oversized_audio_turn",
+        }
+    }
+
     fn oversized_binary() -> Self {
         Self {
             auth_failure_code: None,
@@ -3435,7 +3738,13 @@ fn record_client_action(state: &AppState, voice_session_id: Option<String>, acti
             VoiceEvidenceEventKind::ConfigAccepted,
             "config refresh received",
         ),
-        ClientAction::Keepalive => return,
+        // Bounded chunks are connection-local until an explicit end; they are not
+        // an answer and never enter the evidence pack on their own.
+        ClientAction::AudioChunk | ClientAction::Keepalive => return,
+        ClientAction::AudioTurnCancel => (
+            VoiceEvidenceEventKind::CancelReceived,
+            "audio turn cancel received",
+        ),
         ClientAction::Stop => (VoiceEvidenceEventKind::StopReceived, "stop received"),
     };
     state
@@ -4681,12 +4990,39 @@ mod tests {
     #[tokio::test]
     async fn maps_versioned_audio_text_and_cancel_frames_to_brain_inputs() {
         let (input, mut received) = mpsc::channel(8);
-        let audio = include_str!("../../../fixtures/voice-protocol/client-audio.json");
+        let audio_chunk = include_str!("../../../fixtures/voice-protocol/client-audio.json");
         let binding = fixture_binding();
+        let mut audio_assembly = None;
 
-        handle_client_message(Message::Text(audio.to_owned().into()), &input, &binding)
+        assert_eq!(
+            handle_client_message(
+                Message::Text(audio_chunk.to_owned().into()),
+                &input,
+                &binding,
+                &mut audio_assembly,
+            )
             .await
-            .unwrap();
+            .unwrap(),
+            ClientAction::AudioChunk
+        );
+        handle_client_message(
+            Message::Text(
+                json!({
+                    "type": "audio_end",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": "1",
+                    "turn_id": "turn-1",
+                    "final_sequence": 0,
+                })
+                .to_string()
+                .into(),
+            ),
+            &input,
+            &binding,
+            &mut audio_assembly,
+        )
+        .await
+        .unwrap();
         handle_client_message(
             Message::Text(
                 json!({"type":"text","version":VIVA_VOICE_PROTOCOL_VERSION,"text":"quiz me"})
@@ -4695,6 +5031,7 @@ mod tests {
             ),
             &input,
             &binding,
+            &mut audio_assembly,
         )
         .await
         .unwrap();
@@ -4706,13 +5043,20 @@ mod tests {
             ),
             &input,
             &binding,
+            &mut audio_assembly,
         )
         .await
         .unwrap();
 
         match received.recv().await.unwrap() {
-            BrainInput::Audio(frame) => assert_eq!(frame.pcm16_bytes(), &[1, 2, 3, 4]),
-            other => panic!("expected audio input, got {other:?}"),
+            BrainInput::AudioWithMetadata {
+                frame,
+                client_generation_id,
+            } => {
+                assert_eq!(frame.pcm16_bytes(), &[1, 2, 3, 4]);
+                assert_eq!(client_generation_id.as_deref(), Some("1"));
+            }
+            other => panic!("expected one assembled audio input, got {other:?}"),
         }
         match received.recv().await.unwrap() {
             BrainInput::Text(text) => assert_eq!(text, "quiz me"),
@@ -4760,6 +5104,7 @@ mod tests {
     async fn maps_client_generation_ids_to_brain_inputs() {
         let (input, mut received) = mpsc::channel(8);
         let binding = fixture_binding();
+        let mut audio_assembly = None;
 
         handle_client_message(
             Message::Text(
@@ -4774,22 +5119,44 @@ mod tests {
             ),
             &input,
             &binding,
+            &mut audio_assembly,
         )
         .await
         .unwrap();
         handle_client_message(
             Message::Text(
                 json!({
-                    "type": "audio",
+                    "type": "audio_chunk",
                     "version": VIVA_VOICE_PROTOCOL_VERSION,
-                    "frame": { "pcm16_base64": "AQIDBA==" },
                     "client_generation_id": "token_refresh-3",
+                    "turn_id": "turn-01",
+                    "sequence": 0,
+                    "frame": { "pcm16_base64": "AQIDBA==" },
                 })
                 .to_string()
                 .into(),
             ),
             &input,
             &binding,
+            &mut audio_assembly,
+        )
+        .await
+        .unwrap();
+        handle_client_message(
+            Message::Text(
+                json!({
+                    "type": "audio_end",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": "token_refresh-3",
+                    "turn_id": "turn-01",
+                    "final_sequence": 0,
+                })
+                .to_string()
+                .into(),
+            ),
+            &input,
+            &binding,
+            &mut audio_assembly,
         )
         .await
         .unwrap();
@@ -4821,9 +5188,14 @@ mod tests {
         let (input, mut received) = mpsc::channel(8);
         let binding = fixture_binding();
 
-        handle_client_message(Message::Binary(vec![5_u8, 6, 7].into()), &input, &binding)
-            .await
-            .unwrap();
+        handle_client_message(
+            Message::Binary(vec![5_u8, 6, 7].into()),
+            &input,
+            &binding,
+            &mut None,
+        )
+        .await
+        .unwrap();
 
         match received.recv().await.unwrap() {
             BrainInput::Audio(frame) => assert_eq!(frame.pcm16_bytes(), &[5, 6, 7]),
@@ -4944,6 +5316,7 @@ mod tests {
             Message::Text(r#"{"type":"text","version":1,"text":"quiz me"}"#.into()),
             &input,
             &binding,
+            &mut None,
         )
         .await;
 
@@ -4973,6 +5346,7 @@ mod tests {
             ),
             &input,
             &binding,
+            &mut None,
         )
         .await;
 
@@ -4985,11 +5359,23 @@ mod tests {
         let binding = fixture_binding();
 
         assert_eq!(
-            handle_client_message(Message::Ping(vec![1, 2, 3].into()), &input, &binding).await,
+            handle_client_message(
+                Message::Ping(vec![1, 2, 3].into()),
+                &input,
+                &binding,
+                &mut None
+            )
+            .await,
             Ok(ClientAction::Keepalive)
         );
         assert_eq!(
-            handle_client_message(Message::Pong(vec![1, 2, 3].into()), &input, &binding).await,
+            handle_client_message(
+                Message::Pong(vec![1, 2, 3].into()),
+                &input,
+                &binding,
+                &mut None
+            )
+            .await,
             Ok(ClientAction::Keepalive)
         );
         assert!(received.try_recv().is_err());
@@ -5003,11 +5389,23 @@ mod tests {
         let too_large_audio = vec![0_u8; VIVA_VOICE_MAX_BINARY_FRAME_BYTES + 1];
 
         assert_eq!(
-            handle_client_message(Message::Text(too_large_text.into()), &input, &binding).await,
+            handle_client_message(
+                Message::Text(too_large_text.into()),
+                &input,
+                &binding,
+                &mut None
+            )
+            .await,
             Err(ClientFrameError::oversized_text())
         );
         assert_eq!(
-            handle_client_message(Message::Binary(too_large_audio.into()), &input, &binding).await,
+            handle_client_message(
+                Message::Binary(too_large_audio.into()),
+                &input,
+                &binding,
+                &mut None,
+            )
+            .await,
             Err(ClientFrameError::oversized_binary())
         );
     }
@@ -5463,5 +5861,264 @@ mod tests {
                 text: "suppressed browser text".to_owned(),
             },
         ));
+    }
+
+    /// Connection-local assembler unit tests. The module name keeps every
+    /// plan-named test reachable through the `audio_assembler` filter without
+    /// renaming the test functions themselves.
+    mod audio_assembler {
+        use super::*;
+
+        const TEST_GENERATION: &str = "generation-7";
+        const TEST_TURN: &str = "turn-01";
+
+        fn pcm_chunk(bytes: usize) -> AudioFrame {
+            AudioFrame::from_pcm16_bytes(vec![0xAB_u8; bytes])
+        }
+
+        fn push_chunk(
+            assembly: &mut Option<IncomingAudioTurn>,
+            sequence: u32,
+            bytes: usize,
+        ) -> Result<AudioAssemblyAction, ClientFrameError> {
+            accept_audio_chunk(
+                assembly,
+                TEST_GENERATION.to_owned(),
+                TEST_TURN.to_owned(),
+                sequence,
+                pcm_chunk(bytes),
+            )
+        }
+
+        fn assert_sanitized_audio_error(error: ClientFrameError, frame: &AudioFrame) {
+            let encoded = frame.pcm16_base64();
+            if !encoded.is_empty() {
+                assert!(!error.message.contains(&encoded));
+                assert!(!error.close_reason.contains(&encoded));
+                assert!(!error.terminal_reason.contains(&encoded));
+            }
+            assert!(!error.message.contains("pcm16"));
+            assert!(!error.close_reason.contains("pcm16"));
+        }
+
+        #[test]
+        fn audio_assembler_requires_zero_based_contiguous_sequences() {
+            let mut assembly = None;
+            for sequence in 0..3 {
+                let action =
+                    push_chunk(&mut assembly, sequence, 960).expect("contiguous chunk accepted");
+                assert!(matches!(action, AudioAssemblyAction::Pending));
+            }
+
+            let turn = assembly.as_ref().expect("assembly is retained until end");
+            assert_eq!(turn.client_generation_id, TEST_GENERATION);
+            assert_eq!(turn.turn_id, TEST_TURN);
+            assert_eq!(turn.next_sequence, 3);
+            assert_eq!(turn.pcm16.len(), 2_880);
+
+            let mut nonzero_start = None;
+            let error =
+                push_chunk(&mut nonzero_start, 1, 960).expect_err("a turn cannot start after zero");
+            assert_eq!(error, ClientFrameError::invalid_audio_frame());
+            assert!(nonzero_start.is_none());
+        }
+
+        #[test]
+        fn audio_assembler_rejects_duplicate_gap_and_out_of_order_sequences() {
+            for replayed in [0_u32, 2] {
+                let mut assembly = None;
+                push_chunk(&mut assembly, 0, 960).expect("first chunk accepted");
+                let error = push_chunk(&mut assembly, replayed, 960)
+                    .expect_err("duplicate and gapped sequences fail closed");
+                assert_eq!(error, ClientFrameError::invalid_audio_frame());
+                assert!(assembly.is_none(), "a rejected frame clears the assembly");
+            }
+
+            let mut assembly = None;
+            push_chunk(&mut assembly, 0, 960).expect("first chunk accepted");
+            push_chunk(&mut assembly, 1, 960).expect("second chunk accepted");
+            let error = push_chunk(&mut assembly, 1, 960)
+                .expect_err("a sequence cannot be reused out of order");
+            assert_eq!(error, ClientFrameError::invalid_audio_frame());
+            assert!(assembly.is_none());
+        }
+
+        #[test]
+        fn audio_assembler_rejects_mismatched_generation_or_turn() {
+            for (generation, turn_id) in [(TEST_GENERATION, "turn-02"), ("generation-8", TEST_TURN)]
+            {
+                let mut assembly = None;
+                push_chunk(&mut assembly, 0, 960).expect("first chunk accepted");
+                let error = accept_audio_chunk(
+                    &mut assembly,
+                    generation.to_owned(),
+                    turn_id.to_owned(),
+                    1,
+                    pcm_chunk(960),
+                )
+                .expect_err("a second identity cannot join an active turn");
+                assert_eq!(error, ClientFrameError::invalid_audio_frame());
+                assert!(assembly.is_none());
+            }
+
+            for (generation, turn_id) in [("", TEST_TURN), (TEST_GENERATION, "   ")] {
+                let mut assembly = None;
+                let error = accept_audio_chunk(
+                    &mut assembly,
+                    generation.to_owned(),
+                    turn_id.to_owned(),
+                    0,
+                    pcm_chunk(960),
+                )
+                .expect_err("empty identity fails closed");
+                assert_eq!(error, ClientFrameError::invalid_audio_frame());
+                assert!(assembly.is_none());
+            }
+        }
+
+        #[test]
+        fn audio_assembler_rejects_empty_odd_or_oversized_chunks() {
+            for (bytes, expected) in [
+                (0_usize, ClientFrameError::invalid_audio_frame()),
+                (1, ClientFrameError::invalid_audio_frame()),
+                (
+                    VIVA_AUDIO_MAX_CHUNK_BYTES + 1,
+                    ClientFrameError::oversized_audio_chunk(),
+                ),
+            ] {
+                let mut assembly = None;
+                let frame = pcm_chunk(bytes);
+                let error = accept_audio_chunk(
+                    &mut assembly,
+                    TEST_GENERATION.to_owned(),
+                    TEST_TURN.to_owned(),
+                    0,
+                    frame.clone(),
+                )
+                .expect_err("invalid chunk sizes fail closed");
+                assert_eq!(error, expected);
+                assert!(assembly.is_none());
+                assert_sanitized_audio_error(error, &frame);
+            }
+
+            let mut assembly = None;
+            push_chunk(&mut assembly, 0, VIVA_AUDIO_MAX_CHUNK_BYTES)
+                .expect("the exact chunk ceiling is accepted");
+            assert_eq!(
+                assembly.expect("assembly retained").pcm16.len(),
+                VIVA_AUDIO_MAX_CHUNK_BYTES
+            );
+        }
+
+        #[test]
+        fn audio_assembler_accepts_exact_45_second_limit_and_rejects_one_more_sample() {
+            let full_chunks = VIVA_AUDIO_MAX_TURN_BYTES / VIVA_AUDIO_MAX_CHUNK_BYTES;
+            let tail = VIVA_AUDIO_MAX_TURN_BYTES - full_chunks * VIVA_AUDIO_MAX_CHUNK_BYTES;
+
+            let fill_to_limit = || {
+                let mut assembly = None;
+                let mut sequence = 0_u32;
+                for _ in 0..full_chunks {
+                    push_chunk(&mut assembly, sequence, VIVA_AUDIO_MAX_CHUNK_BYTES)
+                        .expect("chunk under the turn cap is accepted");
+                    sequence += 1;
+                }
+                push_chunk(&mut assembly, sequence, tail)
+                    .expect("the exact turn ceiling is accepted");
+                assert_eq!(
+                    assembly.as_ref().expect("assembly retained").pcm16.len(),
+                    VIVA_AUDIO_MAX_TURN_BYTES
+                );
+                (assembly, sequence)
+            };
+
+            let (mut accepted, final_sequence) = fill_to_limit();
+            let action =
+                accept_audio_end(&mut accepted, TEST_GENERATION, TEST_TURN, final_sequence)
+                    .expect("the exact 45-second turn completes");
+            let AudioAssemblyAction::Complete { frame, .. } = action else {
+                panic!("expected one complete assembled turn");
+            };
+            assert_eq!(frame.pcm16_bytes().len(), VIVA_AUDIO_MAX_TURN_BYTES);
+
+            let (mut overflowing, final_sequence) = fill_to_limit();
+            let error = push_chunk(&mut overflowing, final_sequence + 1, 2)
+                .expect_err("one more sample fails closed");
+            assert_eq!(error, ClientFrameError::oversized_audio_turn());
+            assert!(overflowing.is_none());
+        }
+
+        #[test]
+        fn audio_end_requires_last_sequence_and_emits_one_complete_frame() {
+            let mut mismatched = None;
+            for sequence in 0..3 {
+                push_chunk(&mut mismatched, sequence, 960).expect("chunk accepted");
+            }
+            let error = accept_audio_end(&mut mismatched, TEST_GENERATION, TEST_TURN, 3)
+                .expect_err("audio_end must name the last accepted sequence");
+            assert_eq!(error, ClientFrameError::invalid_audio_frame());
+            assert!(mismatched.is_none());
+
+            let mut assembly = None;
+            for sequence in 0..3 {
+                let action = push_chunk(&mut assembly, sequence, 960).expect("chunk accepted");
+                assert!(
+                    matches!(action, AudioAssemblyAction::Pending),
+                    "no provider turn before explicit end"
+                );
+            }
+            let action = accept_audio_end(&mut assembly, TEST_GENERATION, TEST_TURN, 2)
+                .expect("the completed turn is admitted once");
+            let AudioAssemblyAction::Complete {
+                client_generation_id,
+                turn_id,
+                final_sequence,
+                frame,
+            } = action
+            else {
+                panic!("expected one complete assembled turn");
+            };
+            assert_eq!(client_generation_id, TEST_GENERATION);
+            assert_eq!(turn_id, TEST_TURN);
+            assert_eq!(final_sequence, 2);
+            assert_eq!(frame.pcm16_bytes().len(), 2_880);
+            assert!(assembly.is_none(), "the completed turn is moved out once");
+
+            let mut empty = None;
+            let error = accept_audio_end(&mut empty, TEST_GENERATION, TEST_TURN, 0)
+                .expect_err("audio_end without an assembled turn fails closed");
+            assert_eq!(error, ClientFrameError::invalid_audio_frame());
+        }
+
+        #[test]
+        fn matching_cancel_discards_without_emitting_brain_input() {
+            let mut assembly = None;
+            for sequence in 0..3 {
+                push_chunk(&mut assembly, sequence, 960).expect("chunk accepted");
+            }
+            let action = accept_audio_cancel(&mut assembly, TEST_GENERATION, TEST_TURN)
+                .expect("a matching cancel discards the assembly");
+            assert!(matches!(action, AudioAssemblyAction::Cancelled));
+            assert!(assembly.is_none(), "no phantom provider turn is created");
+
+            let mut other = None;
+            accept_audio_chunk(
+                &mut other,
+                TEST_GENERATION.to_owned(),
+                "turn-02".to_owned(),
+                0,
+                pcm_chunk(960),
+            )
+            .expect("chunk accepted");
+            let error = accept_audio_cancel(&mut other, TEST_GENERATION, TEST_TURN)
+                .expect_err("a mismatched cancel is a protocol error");
+            assert_eq!(error, ClientFrameError::invalid_audio_frame());
+            assert!(other.is_none());
+
+            let mut empty = None;
+            let error = accept_audio_cancel(&mut empty, TEST_GENERATION, TEST_TURN)
+                .expect_err("a scoped cancel without an assembly is a protocol error");
+            assert_eq!(error, ClientFrameError::invalid_audio_frame());
+        }
     }
 }

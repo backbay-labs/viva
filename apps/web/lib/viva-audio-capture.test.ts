@@ -3,6 +3,7 @@ import {
   base64ToPcm16LeBytes,
   chunkPcm16LeBytes,
   createBrowserVivaAudioCaptureSource,
+  createStreamingFloat32Resampler,
   float32ToPcm16Base64Frames,
   float32ToPcm16Base64FramesAtSampleRate,
   float32ToPcm16LeBytes,
@@ -296,9 +297,267 @@ describe("Viva audio capture helpers", () => {
   });
 });
 
+/**
+ * CRIT-AUDIO-01: one resampler instance per capture lifecycle. The AudioWorklet
+ * hands the page irregular block sizes; resampling each block from scratch resets
+ * phase at every boundary and drifts the emitted 24 kHz sample count away from
+ * `duration * 24_000`. These specs pin phase continuity and the exact counts at
+ * both browser capture rates.
+ */
+describe("streaming Float32 resampler", () => {
+  const TARGET_RATE_HZ = 24_000;
+  const SOURCE_RATES_HZ = [44_100, 48_000] as const;
+  const TURN_SECONDS = [2, 10, 45] as const;
+  // Deliberately irregular AudioWorklet callback sizes: sub-sample, prime-ish,
+  // power-of-two, and oversized blocks, so no block boundary lands on a whole
+  // resampling period.
+  const IRREGULAR_CALLBACK_BLOCKS = [1, 127, 128, 511, 7, 2048, 333] as const;
+
+  const toneCache = new Map<string, Float32Array>();
+
+  function toneSamples(sourceRateHz: number, seconds: number): Float32Array {
+    const key = `${sourceRateHz}:${seconds}`;
+    const cached = toneCache.get(key);
+    if (cached) return cached;
+    const total = Math.round(sourceRateHz * seconds);
+    const samples = new Float32Array(total);
+    for (let index = 0; index < total; index += 1) {
+      samples[index] = Math.sin((2 * Math.PI * 440 * index) / sourceRateHz);
+    }
+    toneCache.set(key, samples);
+    return samples;
+  }
+
+  function concatFloat32(blocks: readonly Float32Array[]): Float32Array {
+    let total = 0;
+    for (const block of blocks) total += block.length;
+    const merged = new Float32Array(total);
+    let offset = 0;
+    for (const block of blocks) {
+      merged.set(block, offset);
+      offset += block.length;
+    }
+    return merged;
+  }
+
+  function firstMismatchIndex(left: Float32Array, right: Float32Array): number {
+    const shared = Math.min(left.length, right.length);
+    for (let index = 0; index < shared; index += 1) {
+      if (left[index] !== right[index]) return index;
+    }
+    return left.length === right.length ? -1 : shared;
+  }
+
+  function pushInOneBlock(sourceRateHz: number, seconds: number): Float32Array {
+    return createStreamingFloat32Resampler(sourceRateHz, TARGET_RATE_HZ).push(
+      toneSamples(sourceRateHz, seconds),
+    );
+  }
+
+  function streamInIrregularBlocks(sourceRateHz: number, seconds: number): Float32Array {
+    const source = toneSamples(sourceRateHz, seconds);
+    const resampler = createStreamingFloat32Resampler(sourceRateHz, TARGET_RATE_HZ);
+    const blocks: Float32Array[] = [];
+    let offset = 0;
+    let callback = 0;
+    while (offset < source.length) {
+      const requested = IRREGULAR_CALLBACK_BLOCKS[callback % IRREGULAR_CALLBACK_BLOCKS.length];
+      const size = Math.min(requested, source.length - offset);
+      blocks.push(resampler.push(source.subarray(offset, offset + size)));
+      offset += size;
+      callback += 1;
+    }
+    return concatFloat32(blocks);
+  }
+
+  test("emits exactly duration * 24_000 samples for 2/10/45 second turns at 44.1 and 48 kHz", () => {
+    for (const sourceRate of SOURCE_RATES_HZ) {
+      for (const seconds of TURN_SECONDS) {
+        expect(streamInIrregularBlocks(sourceRate, seconds).length).toBe(seconds * 24_000);
+        expect(pushInOneBlock(sourceRate, seconds).length).toBe(seconds * 24_000);
+      }
+    }
+  });
+
+  test("keeps irregular callback blocks phase-continuous with a single whole-turn push", () => {
+    for (const sourceRate of SOURCE_RATES_HZ) {
+      for (const seconds of TURN_SECONDS) {
+        const streamed = streamInIrregularBlocks(sourceRate, seconds);
+        const whole = pushInOneBlock(sourceRate, seconds);
+        expect(streamed.length).toBe(whole.length);
+        expect(firstMismatchIndex(streamed, whole)).toBe(-1);
+      }
+    }
+  });
+
+  test("reset restarts a capture generation and is never valid between callbacks", () => {
+    const source = toneSamples(44_100, 2);
+    const resampler = createStreamingFloat32Resampler(44_100, TARGET_RATE_HZ);
+
+    const firstGeneration = resampler.push(source);
+    resampler.reset();
+    const secondGeneration = resampler.push(source);
+
+    expect(secondGeneration.length).toBe(firstGeneration.length);
+    expect(firstMismatchIndex(secondGeneration, firstGeneration)).toBe(-1);
+
+    const perCallbackReset = createStreamingFloat32Resampler(44_100, TARGET_RATE_HZ);
+    const blocks: Float32Array[] = [];
+    for (let offset = 0; offset < source.length; offset += 1_000) {
+      perCallbackReset.reset();
+      blocks.push(
+        perCallbackReset.push(source.subarray(offset, Math.min(offset + 1_000, source.length))),
+      );
+    }
+
+    expect(concatFloat32(blocks).length).not.toBe(firstGeneration.length);
+  });
+
+  test("rejects non-positive sample rates before allocating", () => {
+    expect(() => createStreamingFloat32Resampler(0, TARGET_RATE_HZ)).toThrow(
+      "sourceSampleRateHz must be a positive finite number",
+    );
+    expect(() => createStreamingFloat32Resampler(48_000, Number.NaN)).toThrow(
+      "targetSampleRateHz must be a positive finite number",
+    );
+  });
+
+  test("streaming capture reuses one resampler across every worklet callback", () => {
+    const source = new FakeAudioCaptureSource(48_000);
+    const emitted: number[] = [];
+    const capture = startVivaPcm16StreamingCapture({
+      frameDurationMs: 1 / 24,
+      onFrame: (frame) => emitted.push(...frame.pcm16Bytes),
+      source,
+    });
+
+    const tone = toneSamples(48_000, 0.01);
+    let offset = 0;
+    for (const size of [1, 127, 128, 224]) {
+      source.push(tone.slice(offset, offset + size));
+      offset += size;
+    }
+    capture.end();
+
+    const expected = float32ToPcm16LeBytes(
+      createStreamingFloat32Resampler(48_000, VIVA_AUDIO_SAMPLE_RATE_HZ).push(
+        tone.subarray(0, offset),
+      ),
+    );
+
+    expect(emitted.length).toBe(expected.length);
+    expect(emitted).toEqual(Array.from(expected));
+  });
+});
+
+describe("streaming capture turn lifecycle", () => {
+  // 20 ms of mono PCM16 at 24 kHz — the production capture chunk.
+  const FRAME_BYTES = 960;
+
+  /** Distinct per-sample values, so a replayed byte range cannot hide in a fill. */
+  function rampSamples(count: number, startIndex = 0): Float32Array {
+    const samples = new Float32Array(count);
+    for (let index = 0; index < count; index += 1) {
+      samples[index] = (((startIndex + index) % 2_000) + 1) / 4_000;
+    }
+    return samples;
+  }
+
+  test("flushes a turn tail without ending the microphone lifecycle", () => {
+    // `end()` terminates the whole capture generation: it stops the source — which
+    // in the browser stops every MediaStream track and closes the AudioContext —
+    // and, because `active` is already false by then, never reports `onEnded`. A
+    // page that submitted an answer with it would keep a "capture started" flag
+    // pointing at a dead controller and could never reopen the microphone, so a
+    // turn boundary must flush instead of ending.
+    const terminated = new FakeAudioCaptureSource(VIVA_AUDIO_SAMPLE_RATE_HZ);
+    const terminatedEndReasons: VivaAudioCaptureEndReason[] = [];
+    const terminatedCapture = startVivaPcm16StreamingCapture({
+      onEnded: (reason) => terminatedEndReasons.push(reason),
+      onFrame: () => {},
+      source: terminated,
+    });
+
+    terminatedCapture.end();
+
+    expect(terminated.stopped).toBe(true);
+    expect(terminatedCapture.isActive()).toBe(false);
+    expect(terminatedEndReasons).toEqual([]);
+
+    const source = new FakeAudioCaptureSource(VIVA_AUDIO_SAMPLE_RATE_HZ);
+    const frames: { sequence: number; byteLength: number }[] = [];
+    const capture = startVivaPcm16StreamingCapture({
+      onFrame: (frame) => frames.push({ byteLength: frame.byteLength, sequence: frame.sequence }),
+      source,
+    });
+
+    source.push(rampSamples(700));
+
+    expect(frames).toEqual([{ byteLength: FRAME_BYTES, sequence: 0 }]);
+
+    capture.flush();
+
+    // The buffered 220-sample tail becomes the turn's last chunk...
+    expect(frames).toEqual([
+      { byteLength: FRAME_BYTES, sequence: 0 },
+      { byteLength: 440, sequence: 1 },
+    ]);
+    // ...and the microphone stays open for the next question.
+    expect(capture.isActive()).toBe(true);
+    expect(source.stopped).toBe(false);
+
+    // A second flush with nothing buffered emits nothing, and capture continues.
+    capture.flush();
+    source.push(rampSamples(480, 700));
+
+    expect(frames).toEqual([
+      { byteLength: FRAME_BYTES, sequence: 0 },
+      { byteLength: 440, sequence: 1 },
+      { byteLength: FRAME_BYTES, sequence: 2 },
+    ]);
+    expect(capture.isActive()).toBe(true);
+  });
+
+  test("a consumer that stops capture from inside onFrame never replays buffered bytes", () => {
+    const source = new FakeAudioCaptureSource(VIVA_AUDIO_SAMPLE_RATE_HZ);
+    const emitted: { sequence: number; bytes: number[] }[] = [];
+    const capture = startVivaPcm16StreamingCapture({
+      onFrame: (frame) => {
+        emitted.push({ bytes: Array.from(frame.pcm16Bytes), sequence: frame.sequence });
+        // The 45-second turn cap does exactly this: the consumer stops capture
+        // from inside the frame callback, so the tail flush re-enters `onFrame`
+        // while the emitting callback is still on the stack — and the re-entrant
+        // callback asks to stop again.
+        if (frame.sequence >= 1) capture.stop();
+      },
+      source,
+    });
+
+    const first = rampSamples(700);
+    const second = rampSamples(700, 700);
+    source.push(first);
+    source.push(second);
+
+    const expectedBytes = Array.from(
+      float32ToPcm16LeBytes(Float32Array.from([...first, ...second])),
+    );
+    // Every captured byte is emitted exactly once, in order, under contiguous
+    // sequence numbers: nothing is replayed and nothing is stranded in a buffer
+    // that the stop already abandoned.
+    expect(emitted.map((frame) => frame.sequence)).toEqual([0, 1, 2]);
+    expect(emitted.flatMap((frame) => frame.bytes)).toEqual(expectedBytes);
+    expect(capture.isActive()).toBe(false);
+    expect(source.stopped).toBe(true);
+    // The nested stop request is already being served, so the source (real
+    // MediaStream tracks and AudioContext) is torn down exactly once.
+    expect(source.stopCount).toBe(1);
+  });
+});
+
 class FakeAudioCaptureSource implements VivaAudioCaptureSource {
   readonly sampleRateHz: number;
   stopped = false;
+  stopCount = 0;
   #onSamples:
     | ((samples: Float32Array, sampleRateHz: number, frame?: VivaAudioCaptureSampleFrame) => void)
     | null = null;
@@ -322,6 +581,7 @@ class FakeAudioCaptureSource implements VivaAudioCaptureSource {
 
   stop() {
     this.stopped = true;
+    this.stopCount += 1;
     this.#onSamples = null;
     this.#onEnded?.("stopped");
   }

@@ -1,0 +1,869 @@
+{
+  "schema_version": 1,
+  "fixture_id": "viva.review-scheduling-conformance.v1",
+  "decision_id": "D-01",
+  "selected_authority": "SERVER_PERSISTED_FSRS",
+  "policy_id": "viva.fsrs6-default.1",
+  "fsrs": {
+    "algorithm": "FSRS-6",
+    "parameters": [
+      0.212, 1.2931, 2.3065, 8.2956, 6.4133, 0.8334, 3.0194, 0.001, 1.8722, 0.1666, 0.796, 1.4835,
+      0.0614, 0.2629, 1.6483, 0.6014, 1.8729, 0.5425, 0.0912, 0.0658, 0.1542
+    ],
+    "desired_retention": 0.9,
+    "maximum_interval_days": 36500,
+    "enable_fuzzing": false,
+    "learning_steps": [],
+    "relearning_steps": []
+  },
+  "status_ratings": {
+    "missed": 1,
+    "review": 2,
+    "shaky": 3,
+    "strong": 4
+  },
+  "exam_margin_seconds": 86400,
+  "memory_state_tolerance": {
+    "absolute": 0.0001,
+    "relative": 1e-6,
+    "rule": "abs(actual - expected) <= absolute + relative * abs(expected)",
+    "rationale": "Every scheduling-authoritative field (rating, scheduled_days, uncapped_due_at, due_at, cap_reason, counters, state) is compared exactly. Only the FSRS memory state carries this bound, because the D-01-pinned Rust crate evaluates FSRS-6 in f32 while the oracle and ts-fsrs evaluate it in f64."
+  },
+  "oracle": {
+    "name": "py-fsrs",
+    "pypi_package": "fsrs",
+    "version": "6.3.2",
+    "artifact_sha256": {
+      "fsrs-6.3.2-py3-none-any.whl": "bc55066c821164b1cff6d75b17a3ed8e86cfd45789e3d775cfcb895319ce9ba4",
+      "fsrs-6.3.2.tar.gz": "7fe79947ceb92ca35fdca3dfa511a239be15b317cde63d6643a2da6110844d91"
+    }
+  },
+  "cases": [
+    {
+      "case_id": "new-missed-unknown-provenance-no-exam",
+      "note": "New card, missed -> Again. Hint and miss provenance unknown; never coerced to zero.",
+      "input": {
+        "concept_id": "concept-thermo-entropy",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "missed",
+        "hint_count": null,
+        "miss_count": null,
+        "exam_at": null,
+        "prior_card": null
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "missed",
+          "rating": 1,
+          "hint_count": null,
+          "miss_count": null,
+          "exam_at": null,
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-06T12:00:00.000Z",
+          "due_at": "2031-04-06T12:00:00.000Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-06T12:00:00.000Z",
+            "stability": 0.212,
+            "difficulty": 6.4133,
+            "elapsed_days": 0,
+            "scheduled_days": 1,
+            "reps": 1,
+            "lapses": 0,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "new-review-zero-provenance-no-exam",
+      "note": "New card, review -> Hard, with explicit zero hints and zero misses.",
+      "input": {
+        "concept_id": "concept-thermo-enthalpy",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "review",
+        "hint_count": 0,
+        "miss_count": 0,
+        "exam_at": null,
+        "prior_card": null
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "review",
+          "rating": 2,
+          "hint_count": 0,
+          "miss_count": 0,
+          "exam_at": null,
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-06T12:00:00.000Z",
+          "due_at": "2031-04-06T12:00:00.000Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-06T12:00:00.000Z",
+            "stability": 1.2931,
+            "difficulty": 5.112170705601056,
+            "elapsed_days": 0,
+            "scheduled_days": 1,
+            "reps": 1,
+            "lapses": 0,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "new-shaky-hinted-one-miss-no-exam",
+      "note": "New card, shaky -> Good, positive hint count and exactly one miss.",
+      "input": {
+        "concept_id": "concept-thermo-gibbs",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "shaky",
+        "hint_count": 2,
+        "miss_count": 1,
+        "exam_at": null,
+        "prior_card": null
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "shaky",
+          "rating": 3,
+          "hint_count": 2,
+          "miss_count": 1,
+          "exam_at": null,
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-07T12:00:00.000Z",
+          "due_at": "2031-04-07T12:00:00.000Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-07T12:00:00.000Z",
+            "stability": 2.3065,
+            "difficulty": 2.118103970459016,
+            "elapsed_days": 0,
+            "scheduled_days": 2,
+            "reps": 1,
+            "lapses": 0,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "new-strong-no-exam",
+      "note": "New card, strong -> Easy.",
+      "input": {
+        "concept_id": "concept-thermo-carnot",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "strong",
+        "hint_count": 0,
+        "miss_count": 0,
+        "exam_at": null,
+        "prior_card": null
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "strong",
+          "rating": 4,
+          "hint_count": 0,
+          "miss_count": 0,
+          "exam_at": null,
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-13T12:00:00.000Z",
+          "due_at": "2031-04-13T12:00:00.000Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-13T12:00:00.000Z",
+            "stability": 8.2956,
+            "difficulty": 1.0,
+            "elapsed_days": 0,
+            "scheduled_days": 8,
+            "reps": 1,
+            "lapses": 0,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "prior-review-strong-long-interval",
+      "note": "Existing review-state card after 8 elapsed days, strong -> Easy. Expected interval is deliberately not 1/2/3/8 days.",
+      "input": {
+        "concept_id": "concept-thermo-carnot",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "strong",
+        "hint_count": 0,
+        "miss_count": 3,
+        "exam_at": null,
+        "prior_card": {
+          "schema_version": 1,
+          "due_at": "2031-04-05T12:00:00.000Z",
+          "stability": 8.2956,
+          "difficulty": 5.2,
+          "elapsed_days": 0,
+          "scheduled_days": 8,
+          "reps": 1,
+          "lapses": 0,
+          "state": "review",
+          "last_review_at": "2031-03-28T12:00:00.000Z"
+        }
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "strong",
+          "rating": 4,
+          "hint_count": 0,
+          "miss_count": 3,
+          "exam_at": null,
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-05-17T12:00:00.000Z",
+          "due_at": "2031-05-17T12:00:00.000Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-05-17T12:00:00.000Z",
+            "stability": 41.546203173901965,
+            "difficulty": 3.5812920492968385,
+            "elapsed_days": 8,
+            "scheduled_days": 42,
+            "reps": 2,
+            "lapses": 0,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "prior-review-shaky-good",
+      "note": "Existing review-state card, shaky -> Good.",
+      "input": {
+        "concept_id": "concept-thermo-gibbs",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "shaky",
+        "hint_count": 1,
+        "miss_count": 2,
+        "exam_at": null,
+        "prior_card": {
+          "schema_version": 1,
+          "due_at": "2031-04-05T12:00:00.000Z",
+          "stability": 8.2956,
+          "difficulty": 5.2,
+          "elapsed_days": 0,
+          "scheduled_days": 8,
+          "reps": 1,
+          "lapses": 0,
+          "state": "review",
+          "last_review_at": "2031-03-28T12:00:00.000Z"
+        }
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "shaky",
+          "rating": 3,
+          "hint_count": 1,
+          "miss_count": 2,
+          "exam_at": null,
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-05-01T12:00:00.000Z",
+          "due_at": "2031-05-01T12:00:00.000Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-05-01T12:00:00.000Z",
+            "stability": 26.049138989749565,
+            "difficulty": 5.190028369296838,
+            "elapsed_days": 8,
+            "scheduled_days": 26,
+            "reps": 2,
+            "lapses": 0,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "prior-review-review-hard",
+      "note": "Existing review-state card, review -> Hard.",
+      "input": {
+        "concept_id": "concept-thermo-enthalpy",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "review",
+        "hint_count": null,
+        "miss_count": 2,
+        "exam_at": null,
+        "prior_card": {
+          "schema_version": 1,
+          "due_at": "2031-04-05T12:00:00.000Z",
+          "stability": 8.2956,
+          "difficulty": 5.2,
+          "elapsed_days": 0,
+          "scheduled_days": 8,
+          "reps": 1,
+          "lapses": 0,
+          "state": "review",
+          "last_review_at": "2031-03-28T12:00:00.000Z"
+        }
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "review",
+          "rating": 2,
+          "hint_count": null,
+          "miss_count": 2,
+          "exam_at": null,
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-24T12:00:00.000Z",
+          "due_at": "2031-04-24T12:00:00.000Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-24T12:00:00.000Z",
+            "stability": 18.972578348435388,
+            "difficulty": 6.7987646892968385,
+            "elapsed_days": 8,
+            "scheduled_days": 19,
+            "reps": 2,
+            "lapses": 0,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "prior-review-missed-lapse",
+      "note": "Existing review-state card, missed -> Again; the lapse counter advances only for an existing card.",
+      "input": {
+        "concept_id": "concept-thermo-entropy",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "missed",
+        "hint_count": 3,
+        "miss_count": null,
+        "exam_at": null,
+        "prior_card": {
+          "schema_version": 1,
+          "due_at": "2031-04-05T12:00:00.000Z",
+          "stability": 8.2956,
+          "difficulty": 5.2,
+          "elapsed_days": 0,
+          "scheduled_days": 8,
+          "reps": 1,
+          "lapses": 0,
+          "state": "review",
+          "last_review_at": "2031-03-28T12:00:00.000Z"
+        }
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "missed",
+          "rating": 1,
+          "hint_count": 3,
+          "miss_count": null,
+          "exam_at": null,
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-06T12:00:00.000Z",
+          "due_at": "2031-04-06T12:00:00.000Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-06T12:00:00.000Z",
+            "stability": 1.2549450442995698,
+            "difficulty": 8.407501009296837,
+            "elapsed_days": 8,
+            "scheduled_days": 1,
+            "reps": 2,
+            "lapses": 1,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "prior-same-day-short-term",
+      "note": "Existing card re-graded the same UTC day (zero elapsed days) exercises the FSRS-6 short-term stability branch.",
+      "input": {
+        "concept_id": "concept-thermo-gibbs",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "shaky",
+        "hint_count": 0,
+        "miss_count": 1,
+        "exam_at": null,
+        "prior_card": {
+          "schema_version": 1,
+          "due_at": "2031-04-05T12:00:00.000Z",
+          "stability": 2.3065,
+          "difficulty": 4.75,
+          "elapsed_days": 0,
+          "scheduled_days": 2,
+          "reps": 2,
+          "lapses": 1,
+          "state": "review",
+          "last_review_at": "2031-04-05T03:30:00.000Z"
+        }
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "shaky",
+          "rating": 3,
+          "hint_count": 0,
+          "miss_count": 1,
+          "exam_at": null,
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-07T12:00:00.000Z",
+          "due_at": "2031-04-07T12:00:00.000Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-07T12:00:00.000Z",
+            "stability": 2.3065,
+            "difficulty": 4.740478369296839,
+            "elapsed_days": 0,
+            "scheduled_days": 2,
+            "reps": 3,
+            "lapses": 1,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "exam-outside-cap-window",
+      "note": "Future exam far beyond the uncapped due date leaves the schedule untouched.",
+      "input": {
+        "concept_id": "concept-thermo-carnot",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "strong",
+        "hint_count": 0,
+        "miss_count": 0,
+        "exam_at": "2031-09-01T08:00:00.000Z",
+        "prior_card": null
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "strong",
+          "rating": 4,
+          "hint_count": 0,
+          "miss_count": 0,
+          "exam_at": "2031-09-01T08:00:00.000Z",
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-13T12:00:00.000Z",
+          "due_at": "2031-04-13T12:00:00.000Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-13T12:00:00.000Z",
+            "stability": 8.2956,
+            "difficulty": 1.0,
+            "elapsed_days": 0,
+            "scheduled_days": 8,
+            "reps": 1,
+            "lapses": 0,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "exam-inside-cap-window",
+      "note": "Future exam inside the uncapped window pulls the review back to exam_at minus the 86400s margin.",
+      "input": {
+        "concept_id": "concept-thermo-carnot",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "strong",
+        "hint_count": 0,
+        "miss_count": 0,
+        "exam_at": "2031-04-09T06:00:00.000Z",
+        "prior_card": null
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "strong",
+          "rating": 4,
+          "hint_count": 0,
+          "miss_count": 0,
+          "exam_at": "2031-04-09T06:00:00.000Z",
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-13T12:00:00.000Z",
+          "due_at": "2031-04-08T06:00:00.000Z",
+          "cap_reason": "exam_margin",
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-13T12:00:00.000Z",
+            "stability": 8.2956,
+            "difficulty": 1.0,
+            "elapsed_days": 0,
+            "scheduled_days": 8,
+            "reps": 1,
+            "lapses": 0,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "exam-exactly-at-margin-boundary",
+      "note": "exam_at minus the margin lands exactly on the uncapped due date, so the cap does not strictly lower it and no cap reason is recorded.",
+      "input": {
+        "concept_id": "concept-thermo-carnot",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "strong",
+        "hint_count": 0,
+        "miss_count": 0,
+        "exam_at": "2031-04-14T12:00:00.000Z",
+        "prior_card": null
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "strong",
+          "rating": 4,
+          "hint_count": 0,
+          "miss_count": 0,
+          "exam_at": "2031-04-14T12:00:00.000Z",
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-13T12:00:00.000Z",
+          "due_at": "2031-04-13T12:00:00.000Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-13T12:00:00.000Z",
+            "stability": 8.2956,
+            "difficulty": 1.0,
+            "elapsed_days": 0,
+            "scheduled_days": 8,
+            "reps": 1,
+            "lapses": 0,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "exam-closer-than-margin",
+      "note": "Exam nearer than the 86400s margin caps the review before the grading instant; no review may ever land after exam_at.",
+      "input": {
+        "concept_id": "concept-thermo-gibbs",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "shaky",
+        "hint_count": 1,
+        "miss_count": 0,
+        "exam_at": "2031-04-05T18:30:00.000Z",
+        "prior_card": null
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "shaky",
+          "rating": 3,
+          "hint_count": 1,
+          "miss_count": 0,
+          "exam_at": "2031-04-05T18:30:00.000Z",
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-07T12:00:00.000Z",
+          "due_at": "2031-04-04T18:30:00.000Z",
+          "cap_reason": "exam_margin",
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-07T12:00:00.000Z",
+            "stability": 2.3065,
+            "difficulty": 2.118103970459016,
+            "elapsed_days": 0,
+            "scheduled_days": 2,
+            "reps": 1,
+            "lapses": 0,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "exam-already-past-fail-closed",
+      "note": "Exam already past at grading time: fail closed with due_at = exam_at and cap_reason past_exam.",
+      "input": {
+        "concept_id": "concept-thermo-entropy",
+        "graded_at": "2031-04-05T12:00:00.000Z",
+        "status": "missed",
+        "hint_count": null,
+        "miss_count": 4,
+        "exam_at": "2031-03-30T09:15:00.000Z",
+        "prior_card": {
+          "schema_version": 1,
+          "due_at": "2031-04-05T12:00:00.000Z",
+          "stability": 8.2956,
+          "difficulty": 5.2,
+          "elapsed_days": 0,
+          "scheduled_days": 8,
+          "reps": 1,
+          "lapses": 0,
+          "state": "review",
+          "last_review_at": "2031-03-28T12:00:00.000Z"
+        }
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T12:00:00.000Z",
+          "status": "missed",
+          "rating": 1,
+          "hint_count": null,
+          "miss_count": 4,
+          "exam_at": "2031-03-30T09:15:00.000Z",
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-06T12:00:00.000Z",
+          "due_at": "2031-03-30T09:15:00.000Z",
+          "cap_reason": "past_exam",
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-06T12:00:00.000Z",
+            "stability": 1.2549450442995698,
+            "difficulty": 8.407501009296837,
+            "elapsed_days": 8,
+            "scheduled_days": 1,
+            "reps": 2,
+            "lapses": 1,
+            "state": "review",
+            "last_review_at": "2031-04-05T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "utc-just-before-midnight",
+      "note": "Grading just before UTC midnight; the due instant is a plain UTC offset with no calendar-day rounding.",
+      "input": {
+        "concept_id": "concept-thermo-gibbs",
+        "graded_at": "2031-04-05T23:59:59.750Z",
+        "status": "shaky",
+        "hint_count": 0,
+        "miss_count": 0,
+        "exam_at": null,
+        "prior_card": null
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-05T23:59:59.750Z",
+          "status": "shaky",
+          "rating": 3,
+          "hint_count": 0,
+          "miss_count": 0,
+          "exam_at": null,
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-07T23:59:59.750Z",
+          "due_at": "2031-04-07T23:59:59.750Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-07T23:59:59.750Z",
+            "stability": 2.3065,
+            "difficulty": 2.118103970459016,
+            "elapsed_days": 0,
+            "scheduled_days": 2,
+            "reps": 1,
+            "lapses": 0,
+            "state": "review",
+            "last_review_at": "2031-04-05T23:59:59.750Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "utc-just-after-midnight",
+      "note": "Grading just after UTC midnight on the following day.",
+      "input": {
+        "concept_id": "concept-thermo-enthalpy",
+        "graded_at": "2031-04-06T00:00:00.250Z",
+        "status": "review",
+        "hint_count": 1,
+        "miss_count": 0,
+        "exam_at": null,
+        "prior_card": null
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2031-04-06T00:00:00.250Z",
+          "status": "review",
+          "rating": 2,
+          "hint_count": 1,
+          "miss_count": 0,
+          "exam_at": null,
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2031-04-07T00:00:00.250Z",
+          "due_at": "2031-04-07T00:00:00.250Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2031-04-07T00:00:00.250Z",
+            "stability": 1.2931,
+            "difficulty": 5.112170705601056,
+            "elapsed_days": 0,
+            "scheduled_days": 1,
+            "reps": 1,
+            "lapses": 0,
+            "state": "review",
+            "last_review_at": "2031-04-06T00:00:00.250Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "leap-day-existing-card",
+      "note": "Leap-day grading on an existing card; the interval is added as an exact instant offset across the month boundary.",
+      "input": {
+        "concept_id": "concept-thermo-entropy",
+        "graded_at": "2032-02-29T12:00:00.000Z",
+        "status": "shaky",
+        "hint_count": 2,
+        "miss_count": 0,
+        "exam_at": null,
+        "prior_card": {
+          "schema_version": 1,
+          "due_at": "2032-02-29T09:00:00.000Z",
+          "stability": 13.4321,
+          "difficulty": 6.05,
+          "elapsed_days": 13,
+          "scheduled_days": 13,
+          "reps": 3,
+          "lapses": 1,
+          "state": "review",
+          "last_review_at": "2032-02-16T09:00:00.000Z"
+        }
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2032-02-29T12:00:00.000Z",
+          "status": "shaky",
+          "rating": 3,
+          "hint_count": 2,
+          "miss_count": 0,
+          "exam_at": null,
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2032-04-05T12:00:00.000Z",
+          "due_at": "2032-04-05T12:00:00.000Z",
+          "cap_reason": null,
+          "card": {
+            "schema_version": 1,
+            "due_at": "2032-04-05T12:00:00.000Z",
+            "stability": 36.13134303590477,
+            "difficulty": 6.039178369296838,
+            "elapsed_days": 13,
+            "scheduled_days": 36,
+            "reps": 4,
+            "lapses": 1,
+            "state": "review",
+            "last_review_at": "2032-02-29T12:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "leap-day-exam-margin-cap",
+      "note": "Leap-day grading capped by an exam just inside the margin window.",
+      "input": {
+        "concept_id": "concept-thermo-carnot",
+        "graded_at": "2032-02-29T12:00:00.000Z",
+        "status": "strong",
+        "hint_count": null,
+        "miss_count": 0,
+        "exam_at": "2032-03-04T07:45:00.000Z",
+        "prior_card": {
+          "schema_version": 1,
+          "due_at": "2032-02-29T09:00:00.000Z",
+          "stability": 13.4321,
+          "difficulty": 6.05,
+          "elapsed_days": 13,
+          "scheduled_days": 13,
+          "reps": 3,
+          "lapses": 1,
+          "state": "review",
+          "last_review_at": "2032-02-16T09:00:00.000Z"
+        }
+      },
+      "expected": {
+        "decision": {
+          "schema_version": 1,
+          "policy_id": "viva.fsrs6-default.1",
+          "generated_at": "2032-02-29T12:00:00.000Z",
+          "status": "strong",
+          "rating": 4,
+          "hint_count": null,
+          "miss_count": 0,
+          "exam_at": "2032-03-04T07:45:00.000Z",
+          "exam_margin_seconds": 86400,
+          "uncapped_due_at": "2032-04-25T12:00:00.000Z",
+          "due_at": "2032-03-03T07:45:00.000Z",
+          "cap_reason": "exam_margin",
+          "card": {
+            "schema_version": 1,
+            "due_at": "2032-04-25T12:00:00.000Z",
+            "stability": 55.945512281946044,
+            "difficulty": 4.7153224392968385,
+            "elapsed_days": 13,
+            "scheduled_days": 56,
+            "reps": 4,
+            "lapses": 1,
+            "state": "review",
+            "last_review_at": "2032-02-29T12:00:00.000Z"
+          }
+        }
+      }
+    }
+  ]
+}

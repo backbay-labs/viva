@@ -6,11 +6,30 @@ use agent_domain::{
 };
 use serde::{Deserialize, Serialize};
 
-pub const VIVA_VOICE_PROTOCOL_VERSION: u32 = 4;
+pub const VIVA_VOICE_PROTOCOL_VERSION: u32 = 5;
 pub const VIVA_VOICE_SAMPLE_RATE_HZ: u32 = 24_000;
 pub const VIVA_VOICE_INPUT_ENCODING: &str = "pcm_s16le";
 pub const VIVA_VOICE_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
 pub const VIVA_VOICE_MAX_BINARY_FRAME_BYTES: usize = 256 * 1024;
+
+/// Alias of the existing 24 kHz voice constant; one literal source.
+pub const VIVA_AUDIO_SAMPLE_RATE_HZ: u32 = VIVA_VOICE_SAMPLE_RATE_HZ;
+pub const VIVA_AUDIO_MAX_CHUNK_SAMPLES: usize = 4_096;
+/// Mono `pcm_s16le` is two bytes per sample.
+pub const VIVA_AUDIO_MAX_CHUNK_BYTES: usize = 8_192;
+/// The 45-second bound on one browser turn.
+pub const VIVA_AUDIO_MAX_TURN_SAMPLES: usize = 1_080_000;
+pub const VIVA_AUDIO_MAX_TURN_BYTES: usize = 2_160_000;
+
+// The locked v5 audio constants are written as literals so both language
+// contracts read identically. This compile-time block keeps the literals
+// self-consistent in production builds, not only under `cargo test`.
+const _: () = {
+    assert!(VIVA_AUDIO_MAX_CHUNK_BYTES == VIVA_AUDIO_MAX_CHUNK_SAMPLES * 2);
+    assert!(VIVA_AUDIO_MAX_TURN_SAMPLES == 45 * VIVA_AUDIO_SAMPLE_RATE_HZ as usize);
+    assert!(VIVA_AUDIO_MAX_TURN_BYTES == VIVA_AUDIO_MAX_TURN_SAMPLES * 2);
+    assert!(VIVA_AUDIO_MAX_CHUNK_BYTES < VIVA_VOICE_MAX_TEXT_FRAME_BYTES);
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -21,11 +40,18 @@ pub enum ClientFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_generation_id: Option<String>,
     },
-    Audio {
+    AudioChunk {
         version: u32,
+        client_generation_id: String,
+        turn_id: String,
+        sequence: u32,
         frame: AudioFrame,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        client_generation_id: Option<String>,
+    },
+    AudioEnd {
+        version: u32,
+        client_generation_id: String,
+        turn_id: String,
+        final_sequence: u32,
     },
     Text {
         version: u32,
@@ -39,6 +65,10 @@ pub enum ClientFrame {
     },
     Cancel {
         version: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_generation_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     Stop {
         version: u32,
@@ -49,10 +79,11 @@ impl ClientFrame {
     pub fn version(&self) -> u32 {
         match self {
             Self::SessionConfig { version, .. }
-            | Self::Audio { version, .. }
+            | Self::AudioChunk { version, .. }
+            | Self::AudioEnd { version, .. }
             | Self::Text { version, .. }
             | Self::ToolResult { version, .. }
-            | Self::Cancel { version }
+            | Self::Cancel { version, .. }
             | Self::Stop { version } => *version,
         }
     }
@@ -97,6 +128,12 @@ pub enum ServerFrame {
         input_encoding: String,
         brain: RealtimeBrainCapabilities,
         store: StudyStoreCapabilities,
+    },
+    AudioTurnAccepted {
+        version: u32,
+        client_generation_id: String,
+        turn_id: String,
+        final_sequence: u32,
     },
     Event {
         version: u32,
@@ -367,6 +404,21 @@ impl ServerFrame {
             message: message.into(),
         }
     }
+
+    /// Emitted only after the server validated a complete bounded audio turn and
+    /// admitted its single assembled `BrainInput`. Not a provider acknowledgment.
+    pub fn audio_turn_accepted(
+        client_generation_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        final_sequence: u32,
+    ) -> Self {
+        Self::AudioTurnAccepted {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: client_generation_id.into(),
+            turn_id: turn_id.into(),
+            final_sequence,
+        }
+    }
 }
 
 fn default_ready_brain() -> RealtimeBrainCapabilities {
@@ -418,11 +470,140 @@ mod tests {
         assert_eq!(
             serde_json::to_value(frame).expect("serializes"),
             json!({
-                "type": "audio",
+                "type": "audio_chunk",
                 "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": "1",
+                "turn_id": "turn-1",
+                "sequence": 0,
                 "frame": { "pcm16_base64": "AQIDBA==" }
             })
         );
+    }
+
+    #[test]
+    fn deserializes_shared_audio_end_frame_from_full_session_fixture() {
+        let fixture: FullSessionFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/voice-protocol/fake-cartesia-gemini-study-session.json"
+        ))
+        .expect("fixture is valid full fake provider session");
+
+        let end = fixture.client.get(2).expect("audio end frame exists");
+        assert_eq!(
+            serde_json::to_value(end).expect("serializes"),
+            json!({
+                "type": "audio_end",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": "1",
+                "turn_id": "turn-1",
+                "final_sequence": 0
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_audio_turn_accepted_server_frame() {
+        let frame = ServerFrame::audio_turn_accepted("1", "turn-1", 0);
+
+        assert_eq!(
+            serde_json::to_value(&frame).expect("serializes"),
+            json!({
+                "type": "audio_turn_accepted",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": "1",
+                "turn_id": "turn-1",
+                "final_sequence": 0
+            })
+        );
+
+        let fixture: FullSessionFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/voice-protocol/fake-cartesia-gemini-study-session.json"
+        ))
+        .expect("fixture is valid full fake provider session");
+        assert_eq!(fixture.server.get(3), Some(&frame));
+    }
+
+    #[test]
+    fn rejects_legacy_whole_turn_audio_frame() {
+        let legacy = json!({
+            "type": "audio",
+            "version": VIVA_VOICE_PROTOCOL_VERSION,
+            "frame": { "pcm16_base64": "AQIDBA==" }
+        });
+
+        assert!(serde_json::from_value::<ClientFrame>(legacy).is_err());
+    }
+
+    #[test]
+    fn rejects_negative_fractional_or_identity_less_audio_frames() {
+        let chunk = |sequence: serde_json::Value| {
+            json!({
+                "type": "audio_chunk",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": "generation-7",
+                "turn_id": "turn-01",
+                "sequence": sequence,
+                "frame": { "pcm16_base64": "AQIDBA==" }
+            })
+        };
+
+        assert!(serde_json::from_value::<ClientFrame>(chunk(json!(0))).is_ok());
+        assert!(serde_json::from_value::<ClientFrame>(chunk(json!(-1))).is_err());
+        assert!(serde_json::from_value::<ClientFrame>(chunk(json!(1.5))).is_err());
+        assert!(serde_json::from_value::<ClientFrame>(json!({
+            "type": "audio_chunk",
+            "version": VIVA_VOICE_PROTOCOL_VERSION,
+            "turn_id": "turn-01",
+            "sequence": 0,
+            "frame": { "pcm16_base64": "AQIDBA==" }
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ClientFrame>(json!({
+            "type": "audio_end",
+            "version": VIVA_VOICE_PROTOCOL_VERSION,
+            "client_generation_id": "generation-7",
+            "final_sequence": 0
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ClientFrame>(json!({
+            "type": "audio_end",
+            "version": VIVA_VOICE_PROTOCOL_VERSION,
+            "client_generation_id": "generation-7",
+            "turn_id": "turn-01",
+            "final_sequence": -1
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn maximum_audio_chunk_frame_stays_below_text_frame_cap() {
+        let frame = ClientFrame::AudioChunk {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "generation-7".to_owned(),
+            turn_id: "turn-01".to_owned(),
+            sequence: 0,
+            frame: AudioFrame::from_pcm16_bytes(vec![0_u8; VIVA_AUDIO_MAX_CHUNK_BYTES]),
+        };
+
+        let encoded = serde_json::to_string(&frame).expect("serializes");
+        assert!(encoded.len() < VIVA_VOICE_MAX_TEXT_FRAME_BYTES);
+        assert_eq!(VIVA_VOICE_PROTOCOL_VERSION, 5);
+        assert_eq!(VIVA_AUDIO_SAMPLE_RATE_HZ, VIVA_VOICE_SAMPLE_RATE_HZ);
+        assert_eq!(VIVA_AUDIO_SAMPLE_RATE_HZ, 24_000);
+        assert_eq!(VIVA_AUDIO_MAX_CHUNK_SAMPLES, 4_096);
+        assert_eq!(VIVA_AUDIO_MAX_CHUNK_BYTES, 8_192);
+        assert_eq!(VIVA_AUDIO_MAX_TURN_SAMPLES, 1_080_000);
+        assert_eq!(VIVA_AUDIO_MAX_TURN_BYTES, 2_160_000);
+        assert_eq!(VIVA_VOICE_MAX_TEXT_FRAME_BYTES, 64 * 1024);
+
+        // The locked literals above are the contract; these restate the
+        // derivation they encode so a future edit cannot drift one from
+        // the other.
+        assert_eq!(VIVA_AUDIO_MAX_CHUNK_BYTES, VIVA_AUDIO_MAX_CHUNK_SAMPLES * 2);
+        assert_eq!(
+            VIVA_AUDIO_MAX_TURN_SAMPLES,
+            45 * VIVA_AUDIO_SAMPLE_RATE_HZ as usize
+        );
+        assert_eq!(VIVA_AUDIO_MAX_TURN_BYTES, VIVA_AUDIO_MAX_TURN_SAMPLES * 2);
     }
 
     #[test]
@@ -541,7 +722,14 @@ mod tests {
         ));
         assert!(matches!(
             fixture.client.get(1),
-            Some(ClientFrame::Audio { .. })
+            Some(ClientFrame::AudioChunk { sequence: 0, .. })
+        ));
+        assert!(matches!(
+            fixture.client.get(2),
+            Some(ClientFrame::AudioEnd {
+                final_sequence: 0,
+                ..
+            })
         ));
         let Some(ServerFrame::Ready { brain, .. }) = fixture.server.first() else {
             panic!("expected ready frame");
@@ -610,10 +798,7 @@ mod tests {
             push_next_browser_frame(&mut actual, &mut session).await;
         }
 
-        assert_eq!(
-            actual,
-            without_websocket_post_release_completion_markers(&fixture.server)
-        );
+        assert_eq!(actual, without_websocket_only_frames(&fixture.server));
         let snapshot = store.snapshot();
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.answer_attempts.len(), 1);
@@ -629,13 +814,31 @@ mod tests {
         ))
         .expect("fixture is valid full fake provider session");
         let session_config = match fixture.client.first().expect("client frame exists") {
-            ClientFrame::SessionConfig { session, .. } => session.clone(),
+            ClientFrame::SessionConfig {
+                session,
+                client_generation_id,
+                ..
+            } => {
+                // The real WebSocket path moves the frame-level generation onto the
+                // domain config (`ws.rs`, authorized initial session config), so a
+                // session's question response ids carry it. This in-process harness
+                // must apply the same assignment or it silently diverges from the
+                // server it is asserting against.
+                let mut session = session.clone();
+                session.client_generation_id = client_generation_id.clone();
+                session
+            }
             other => panic!("expected session_config, got {other:?}"),
         };
-        let audio_frame = match fixture.client.get(1).expect("audio frame exists") {
-            ClientFrame::Audio { frame, .. } => frame.clone(),
-            other => panic!("expected audio frame, got {other:?}"),
-        };
+        let (audio_frame, audio_generation_id) =
+            match fixture.client.get(1).expect("audio chunk frame exists") {
+                ClientFrame::AudioChunk {
+                    frame,
+                    client_generation_id,
+                    ..
+                } => (frame.clone(), client_generation_id.clone()),
+                other => panic!("expected audio chunk frame, got {other:?}"),
+            };
 
         let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
         let brain = agent_adapters::cartesia_gemini::FakeCartesiaGeminiRuntime::new(store.clone());
@@ -646,7 +849,10 @@ mod tests {
         }
         session
             .input
-            .send(BrainInput::Audio(audio_frame))
+            .send(BrainInput::AudioWithMetadata {
+                frame: audio_frame,
+                client_generation_id: Some(audio_generation_id),
+            })
             .await
             .expect("sends audio");
         for _ in 0..13 {
@@ -659,10 +865,7 @@ mod tests {
             .expect("sends cancel");
         push_next_browser_frame(&mut actual, &mut session).await;
 
-        assert_eq!(
-            actual,
-            without_websocket_post_release_completion_markers(&fixture.server)
-        );
+        assert_eq!(actual, without_websocket_only_frames(&fixture.server));
         let snapshot = store.snapshot();
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.answer_attempts.len(), 1);
@@ -740,12 +943,15 @@ mod tests {
         }
     }
 
-    fn without_websocket_post_release_completion_markers(
-        frames: &[ServerFrame],
-    ) -> Vec<ServerFrame> {
+    /// Frames only the WebSocket boundary produces: the post-release completion
+    /// marker and the bounded-audio-turn acceptance the assembler emits.
+    fn without_websocket_only_frames(frames: &[ServerFrame]) -> Vec<ServerFrame> {
         let mut filtered = Vec::with_capacity(frames.len());
         let mut previous_was_correction = false;
         for frame in frames {
+            if matches!(frame, ServerFrame::AudioTurnAccepted { .. }) {
+                continue;
+            }
             if previous_was_correction
                 && server_frame_is_session_phase(frame, StudySessionPhase::Feedback)
             {

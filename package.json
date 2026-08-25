@@ -23,6 +23,8 @@
     "hosted:monitor": "node scripts/hosted-monitor-runner.mjs",
     "live:smoke": "node scripts/live-provider-smoke.mjs",
     "e2e:browser": "node scripts/e2e-browser.mjs",
+    "e2e:browser:audio": "node scripts/e2e-browser-audio.mjs",
+    "e2e:browser:audio:negative": "node scripts/e2e-browser-audio.mjs --case oversized-single-chunk",
     "build": "turbo run build",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",

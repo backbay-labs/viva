@@ -1,8 +1,8 @@
 {
   "client_fixture": "fake-cartesia-gemini-study-session.json#client",
   "server_fixture": "fake-cartesia-gemini-study-session.json#server",
-  "client_frame_count": 4,
-  "server_frame_count": 17,
+  "client_frame_count": 5,
+  "server_frame_count": 18,
   "store_snapshot": {
     "sessions": 1,
     "answer_attempts": 1,
@@ -48,7 +48,7 @@
     {
       "kind": "question_emitted",
       "voice_session_id": "voice-session-1",
-      "detail": "response-1"
+      "detail": "response-1-generation-1"
     },
     {
       "kind": "provider_admission",
@@ -63,12 +63,12 @@
     {
       "kind": "evaluation_emitted",
       "voice_session_id": "voice-session-1",
-      "detail": "response-1"
+      "detail": "response-1-generation-1"
     },
     {
       "kind": "source_emitted",
       "voice_session_id": "voice-session-1",
-      "detail": "response-1"
+      "detail": "response-1-generation-1"
     },
     {
       "kind": "cancel_received",
@@ -78,7 +78,7 @@
     {
       "kind": "cancel_received",
       "voice_session_id": "voice-session-1",
-      "detail": "response-2"
+      "detail": "response-2-generation-1"
     },
     {
       "kind": "stop_received",

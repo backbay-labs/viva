@@ -10,6 +10,10 @@ rust-version.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true
+chrono.workspace = true
+# D-01 SERVER_PERSISTED_FSRS pins this exact FSRS implementation and version.
+# Changing it requires amending docs/decisions/2026-08-23-d-01-review-scheduling-authority.md.
+fsrs = "=6.6.1"
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true

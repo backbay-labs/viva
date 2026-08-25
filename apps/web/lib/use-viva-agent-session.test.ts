@@ -8,10 +8,16 @@ import {
 import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
 import {
   agentSourceToUiSource,
+  createVivaAgentAudioCommands,
   deriveVivaAgentUiState,
   studySetToAgentSessionConfig,
 } from "./use-viva-agent-session";
-import { initialVivaAgentSessionState, vivaAgentReducer } from "./viva-agent-client";
+import {
+  initialVivaAgentSessionState,
+  type VivaAgentSessionController,
+  type VivaAudioSendResult,
+  vivaAgentReducer,
+} from "./viva-agent-client";
 
 describe("useVivaAgentSession adapter", () => {
   test("maps study set to agent session config without browser source tuples", () => {
@@ -149,5 +155,92 @@ describe("useVivaAgentSession adapter", () => {
 
     expect(derived.generationId).toBe("session_bootstrap-1");
     expect(derived.canSubmitAnswer).toBe(false);
+  });
+});
+
+/**
+ * The hook's audio surface is the pure command factory the hook itself uses, so
+ * the four v5 audio methods are provable without a DOM: `bun:test` has no DOM
+ * environment at this base and this lane does not add one.
+ */
+describe("viva agent audio commands", () => {
+  const sent: VivaAudioSendResult = { acceptedThroughSequence: 4, status: "sent" };
+  const pending: VivaAudioSendResult = {
+    acceptedThroughSequence: 4,
+    retainedFromSequence: 5,
+    status: "pending",
+  };
+
+  test("delegates the four audio methods to the controller and returns results unchanged", () => {
+    const calls: string[] = [];
+    const controller = {
+      cancelAudioTurn: (turnId: string) => {
+        calls.push(`cancel:${turnId}`);
+      },
+      endAudioTurn: (input: { turnId: string; finalSequence: number }) => {
+        calls.push(`end:${input.turnId}:${input.finalSequence}`);
+        return pending;
+      },
+      retryPendingAudio: () => {
+        calls.push("retry");
+        return sent;
+      },
+      sendAudioChunk: (input: { turnId: string; sequence: number; pcm16Bytes: Uint8Array }) => {
+        calls.push(`chunk:${input.turnId}:${input.sequence}:${input.pcm16Bytes.byteLength}`);
+        return sent;
+      },
+    } as unknown as VivaAgentSessionController;
+    const commands = createVivaAgentAudioCommands(() => controller);
+
+    expect(
+      commands.sendAudioChunk({
+        pcm16Bytes: new Uint8Array(960),
+        sequence: 0,
+        turnId: "turn-hook",
+      }),
+    ).toBe(sent);
+    expect(commands.endAudioTurn({ finalSequence: 0, turnId: "turn-hook" })).toBe(pending);
+    commands.cancelAudioTurn("turn-hook");
+    expect(commands.retryPendingAudio()).toBe(sent);
+
+    expect(calls).toEqual([
+      "chunk:turn-hook:0:960",
+      "end:turn-hook:0",
+      "cancel:turn-hook",
+      "retry",
+    ]);
+  });
+
+  test("returns a retryable socket_closed result while no controller is mounted", () => {
+    const commands = createVivaAgentAudioCommands(() => null);
+    const disconnected = {
+      code: "socket_closed",
+      message: "Viva agent session is not connected",
+    } as const;
+
+    expect(
+      commands.sendAudioChunk({ pcm16Bytes: new Uint8Array(2), sequence: 7, turnId: "turn-hook" }),
+    ).toEqual({
+      acceptedThroughSequence: null,
+      error: disconnected,
+      retainedFromSequence: 0,
+      retryable: true,
+      status: "socket_closed",
+    });
+    expect(commands.endAudioTurn({ finalSequence: 7, turnId: "turn-hook" })).toEqual({
+      acceptedThroughSequence: null,
+      error: disconnected,
+      retainedFromSequence: 0,
+      retryable: true,
+      status: "socket_closed",
+    });
+    expect(commands.retryPendingAudio()).toEqual({
+      acceptedThroughSequence: null,
+      error: disconnected,
+      retainedFromSequence: 0,
+      retryable: true,
+      status: "socket_closed",
+    });
+    expect(() => commands.cancelAudioTurn("turn-hook")).not.toThrow();
   });
 });

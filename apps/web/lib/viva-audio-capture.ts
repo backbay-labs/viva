@@ -1,7 +1,10 @@
-import { VIVA_VOICE_SAMPLE_RATE_HZ } from "@viva/core";
+import { VIVA_AUDIO_SAMPLE_RATE_HZ } from "@viva/core";
+
+// Re-exported verbatim: `packages/core` owns the single 24 kHz literal for the
+// whole protocol-v5 surface, so the browser capture path never re-declares it.
+export { VIVA_AUDIO_SAMPLE_RATE_HZ };
 
 export const VIVA_PCM16_BYTES_PER_SAMPLE = 2;
-export const VIVA_AUDIO_SAMPLE_RATE_HZ = VIVA_VOICE_SAMPLE_RATE_HZ;
 export const VIVA_AUDIO_DEFAULT_FRAME_DURATION_MS = 20;
 
 export type VivaPcm16ChunkOptions = {
@@ -60,6 +63,16 @@ export type VivaPcm16StreamingCaptureOptions = {
 };
 
 export type VivaPcm16StreamingCaptureController = {
+  /**
+   * Emit the buffered tail as one final chunk and keep capturing.
+   *
+   * A turn boundary is not a capture-lifecycle boundary: the microphone stays
+   * open across the whole session while each answer is delimited by the turn
+   * controller. `stop`/`end`/`cancel` all release the source — in the browser
+   * that stops every `MediaStream` track and closes the `AudioContext`, which
+   * cannot be undone without a fresh user gesture and permission prompt.
+   */
+  flush: () => void;
   stop: () => void;
   cancel: () => void;
   end: () => void;
@@ -130,6 +143,95 @@ export function resampleFloat32ToSampleRate(
     output[outputIndex] = left + (right - left) * weight;
   }
   return output;
+}
+
+export type StreamingFloat32Resampler = {
+  push(input: Float32Array): Float32Array;
+  reset(): void;
+};
+
+/**
+ * One resampler instance per capture lifecycle (CRIT-AUDIO-01).
+ *
+ * `resampleFloat32ToSampleRate` restarts at source index 0 on every call, so
+ * resampling each AudioWorklet callback independently resets phase at every block
+ * boundary and rounds the emitted count per block — a 45-second turn then drifts
+ * away from `45 * 24_000` samples. This instance instead tracks the generation's
+ * total source samples and next target index as integers, derives each target
+ * sample from the exact rational position `j * sourceRate / targetRate`, and
+ * retains the single boundary source sample the next callback needs.
+ *
+ * After `N` source samples the emitted target count is exactly
+ * `floor(N * targetRate / sourceRate)`, so cumulative duration error stays below
+ * one 24 kHz sample. `reset()` is for a new capture generation or disposal only;
+ * calling it between callbacks is the very bug this type exists to prevent.
+ */
+export function createStreamingFloat32Resampler(
+  sourceSampleRateHz: number,
+  targetSampleRateHz: number,
+): StreamingFloat32Resampler {
+  if (!Number.isFinite(sourceSampleRateHz) || sourceSampleRateHz <= 0) {
+    throw new Error("sourceSampleRateHz must be a positive finite number");
+  }
+  if (!Number.isFinite(targetSampleRateHz) || targetSampleRateHz <= 0) {
+    throw new Error("targetSampleRateHz must be a positive finite number");
+  }
+
+  // Absolute source index feeding target sample `targetIndex`. Both operands stay
+  // exact integers well inside Number.MAX_SAFE_INTEGER for a 45-second turn
+  // (1_080_000 * 48_000 = 5.184e10), so the floor is exact.
+  const sourceIndexForTarget = (targetIndex: number) =>
+    Math.floor((targetIndex * sourceSampleRateHz) / targetSampleRateHz);
+
+  let retained = EMPTY_FLOAT32;
+  let retainedStartIndex = 0;
+  let sourceSampleCount = 0;
+  let nextTargetIndex = 0;
+
+  return {
+    push(input: Float32Array): Float32Array {
+      const nextSourceSampleCount = sourceSampleCount + input.length;
+      const targetCount = Math.floor(
+        (nextSourceSampleCount * targetSampleRateHz) / sourceSampleRateHz,
+      );
+      const window = retained.length === 0 ? input : joinFloat32(retained, input);
+      const emitCount = targetCount - nextTargetIndex;
+      const output = emitCount > 0 ? new Float32Array(emitCount) : EMPTY_FLOAT32;
+      const lastWindowIndex = window.length - 1;
+
+      for (let offset = 0; offset < emitCount; offset += 1) {
+        const targetIndex = nextTargetIndex + offset;
+        const numerator = targetIndex * sourceSampleRateHz;
+        const sourceIndex = Math.floor(numerator / targetSampleRateHz);
+        const remainder = numerator - sourceIndex * targetSampleRateHz;
+        const leftIndex = sourceIndex - retainedStartIndex;
+        const rightIndex = leftIndex < lastWindowIndex ? leftIndex + 1 : lastWindowIndex;
+        const left = window[leftIndex] ?? 0;
+        const right = window[rightIndex] ?? left;
+        output[offset] =
+          remainder === 0 ? left : left + ((right - left) * remainder) / targetSampleRateHz;
+      }
+
+      sourceSampleCount = nextSourceSampleCount;
+      nextTargetIndex = targetCount;
+
+      // Keep exactly the boundary samples the next target index interpolates over.
+      // `slice` copies, so a caller reusing its AudioWorklet buffer cannot mutate
+      // what this generation retained.
+      const keepFromIndex = Math.min(sourceIndexForTarget(targetCount), nextSourceSampleCount);
+      const keepFromWindowOffset = keepFromIndex - retainedStartIndex;
+      retained =
+        keepFromWindowOffset >= window.length ? EMPTY_FLOAT32 : window.slice(keepFromWindowOffset);
+      retainedStartIndex = keepFromIndex;
+      return output;
+    },
+    reset() {
+      retained = EMPTY_FLOAT32;
+      retainedStartIndex = 0;
+      sourceSampleCount = 0;
+      nextTargetIndex = 0;
+    },
+  };
 }
 
 export function float32ToPcm16Base64FramesAtSampleRate(
@@ -243,18 +345,48 @@ export function startVivaPcm16StreamingCapture(
     sampleRateHz: targetSampleRateHz,
   });
   let active = true;
+  // A flushed tail frame reaches consumer code that may call `stop()`/`end()`
+  // again from inside the callback; that nested request is already being served
+  // by the finish in progress, so it must not restart the flush.
+  let finishing = false;
   let pendingPcm16 = new Uint8Array(0);
   let sequence = 0;
+  // Exactly one resampler for this capture lifecycle. It is created on the first
+  // callback (the worklet reports the real hardware rate there), replaced only
+  // when the source itself changes rate, and dropped on stop/cancel/end/error.
+  let resampler: StreamingFloat32Resampler | null = null;
+  let resamplerSourceRateHz = 0;
 
+  function resampleForLifecycle(samples: Float32Array, sourceSampleRateHz: number): Float32Array {
+    if (!resampler || resamplerSourceRateHz !== sourceSampleRateHz) {
+      resampler = createStreamingFloat32Resampler(sourceSampleRateHz, targetSampleRateHz);
+      resamplerSourceRateHz = sourceSampleRateHz;
+    }
+    return resampler.push(samples);
+  }
+
+  function releaseResampler() {
+    resampler = null;
+    resamplerSourceRateHz = 0;
+  }
+
+  // `onFrame` is consumer code that can synchronously re-enter this capture — the
+  // 45-second turn cap stops capture from inside the callback, and stopping
+  // flushes the tail straight back through `onFrame`. Every mutation below is
+  // therefore published BEFORE the callback runs: the sequence counter advances
+  // first, and the pending buffer always holds exactly the bytes that have not
+  // been emitted yet. A re-entrant flush can then only see unsent bytes, and can
+  // never replay a frame or reuse a sequence number.
   function emitFrame(bytes: Uint8Array) {
     const pcm16Bytes = bytes.slice();
+    const frameSequence = sequence;
+    sequence += 1;
     options.onFrame({
-      byteLength: bytes.byteLength,
+      byteLength: pcm16Bytes.byteLength,
       pcm16Base64: pcm16LeBytesToBase64(pcm16Bytes),
       pcm16Bytes,
-      sequence,
+      sequence: frameSequence,
     });
-    sequence += 1;
   }
 
   function pushPcm16(bytes: Uint8Array) {
@@ -262,20 +394,20 @@ export function startVivaPcm16StreamingCapture(
     const merged = new Uint8Array(pendingPcm16.byteLength + bytes.byteLength);
     merged.set(pendingPcm16);
     merged.set(bytes, pendingPcm16.byteLength);
+    pendingPcm16 = merged;
 
-    let offset = 0;
-    while (merged.byteLength - offset >= frameByteLength) {
-      emitFrame(merged.slice(offset, offset + frameByteLength));
-      offset += frameByteLength;
+    while (active && pendingPcm16.byteLength >= frameByteLength) {
+      const frame = pendingPcm16.subarray(0, frameByteLength);
+      pendingPcm16 = pendingPcm16.slice(frameByteLength);
+      emitFrame(frame);
     }
-    pendingPcm16 = merged.slice(offset);
   }
 
   function flushPendingFrame() {
-    if (active && pendingPcm16.byteLength > 0) {
-      emitFrame(pendingPcm16);
-      pendingPcm16 = new Uint8Array(0);
-    }
+    if (!active || pendingPcm16.byteLength === 0) return;
+    const tail = pendingPcm16;
+    pendingPcm16 = new Uint8Array(0);
+    emitFrame(tail);
   }
 
   function stopSource() {
@@ -296,17 +428,14 @@ export function startVivaPcm16StreamingCapture(
             sampleRateHz: sourceSampleRateHz,
             samples,
           });
-          pushPcm16(
-            float32ToPcm16LeBytes(
-              resampleFloat32ToSampleRate(samples, sourceSampleRateHz, targetSampleRateHz),
-            ),
-          );
+          pushPcm16(float32ToPcm16LeBytes(resampleForLifecycle(samples, sourceSampleRateHz)));
         },
         {
           onEnded: (reason) => {
             if (!active) return;
             active = false;
             pendingPcm16 = new Uint8Array(0);
+            releaseResampler();
             options.onEnded?.(reason);
           },
         },
@@ -315,26 +444,31 @@ export function startVivaPcm16StreamingCapture(
       if (!active) return;
       active = false;
       pendingPcm16 = new Uint8Array(0);
+      releaseResampler();
       options.onError?.(error);
       stopSource();
     });
   } catch (error) {
     active = false;
+    releaseResampler();
     options.onError?.(error);
     stopSource();
   }
 
   function finish(flush: boolean) {
-    if (!active) return;
+    if (!active || finishing) return;
+    finishing = true;
     if (flush) flushPendingFrame();
     active = false;
     pendingPcm16 = new Uint8Array(0);
+    releaseResampler();
     stopSource();
   }
 
   return {
     cancel: () => finish(false),
     end: () => finish(true),
+    flush: () => flushPendingFrame(),
     isActive: () => active,
     stop: () => finish(true),
   };
@@ -446,6 +580,15 @@ export async function createBrowserVivaAudioCaptureSource(
     },
     stop,
   };
+}
+
+const EMPTY_FLOAT32 = new Float32Array(0);
+
+function joinFloat32(head: Float32Array, tail: Float32Array): Float32Array {
+  const merged = new Float32Array(head.length + tail.length);
+  merged.set(head);
+  merged.set(tail, head.length);
+  return merged;
 }
 
 function clampFiniteAudioSample(sample: number): number {
