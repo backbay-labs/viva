@@ -1,0 +1,220 @@
+{
+  "schema": "viva.learning_core.study_projection.v1",
+  "projections": {
+    "ready_session_with_active_question": {
+      "version": 1,
+      "studySet": {
+        "id": "set-cellular-respiration",
+        "title": "Cellular respiration",
+        "course": "BIO 201",
+        "examLabel": "Midterm 2",
+        "ingestionStatus": "ready"
+      },
+      "session": {
+        "id": "vs-1001",
+        "mode": "quiz",
+        "goal": null
+      },
+      "concepts": [
+        {
+          "id": "concept-electron-transport-chain",
+          "label": "Electron transport chain",
+          "status": "strong",
+          "lastReviewedAt": "2026-08-24T16:00:00.000Z",
+          "dueAt": "2026-08-29T09:00:00.000Z"
+        },
+        {
+          "id": "concept-proton-gradient",
+          "label": "Proton gradient",
+          "status": "shaky",
+          "lastReviewedAt": "2026-08-24T16:03:00.000Z",
+          "dueAt": "2026-08-26T09:00:00.000Z"
+        },
+        {
+          "id": "concept-atp-synthesis",
+          "label": "ATP synthesis",
+          "status": "missed",
+          "lastReviewedAt": null,
+          "dueAt": null
+        }
+      ],
+      "activeQuestion": {
+        "id": "q-atp-synthase-coupling",
+        "conceptId": "concept-atp-synthesis",
+        "prompt": "How does the proton gradient drive ATP synthesis?",
+        "sourceCitations": [
+          {
+            "sourceId": "src-lec5-slide-20",
+            "documentId": "lec-5",
+            "span": "slide:20",
+            "label": "Lecture 5, slide 20",
+            "confidence": "medium"
+          }
+        ]
+      },
+      "questionProgress": {
+        "completed": 2,
+        "total": 3
+      },
+      "reviewSchedule": [
+        {
+          "conceptId": "concept-electron-transport-chain",
+          "dueAt": "2026-08-29T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "conceptId": "concept-proton-gradient",
+          "dueAt": "2026-08-26T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ]
+    },
+    "ready_session_after_exhaustion": {
+      "version": 1,
+      "studySet": {
+        "id": "set-cellular-respiration",
+        "title": "Cellular respiration",
+        "course": "BIO 201",
+        "examLabel": "Midterm 2",
+        "ingestionStatus": "ready"
+      },
+      "session": {
+        "id": "vs-1001",
+        "mode": "quiz",
+        "goal": null
+      },
+      "concepts": [
+        {
+          "id": "concept-electron-transport-chain",
+          "label": "Electron transport chain",
+          "status": "strong",
+          "lastReviewedAt": "2026-08-24T16:00:00.000Z",
+          "dueAt": "2026-08-29T09:00:00.000Z"
+        },
+        {
+          "id": "concept-proton-gradient",
+          "label": "Proton gradient",
+          "status": "shaky",
+          "lastReviewedAt": "2026-08-24T16:03:00.000Z",
+          "dueAt": "2026-08-26T09:00:00.000Z"
+        },
+        {
+          "id": "concept-atp-synthesis",
+          "label": "ATP synthesis",
+          "status": "missed",
+          "lastReviewedAt": "2026-08-24T16:06:00.000Z",
+          "dueAt": "2026-08-25T09:00:00.000Z"
+        }
+      ],
+      "activeQuestion": null,
+      "questionProgress": {
+        "completed": 3,
+        "total": 3
+      },
+      "reviewSchedule": [
+        {
+          "conceptId": "concept-electron-transport-chain",
+          "dueAt": "2026-08-29T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "conceptId": "concept-proton-gradient",
+          "dueAt": "2026-08-26T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "conceptId": "concept-atp-synthesis",
+          "dueAt": "2026-08-25T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ]
+    },
+    "library_entry_without_schedule": {
+      "version": 1,
+      "studySet": {
+        "id": "set-membrane-transport",
+        "title": "Membrane transport",
+        "course": null,
+        "examLabel": null,
+        "ingestionStatus": "ready"
+      },
+      "session": {
+        "id": "vs-2001",
+        "mode": "quiz",
+        "goal": null
+      },
+      "concepts": [
+        {
+          "id": "concept-osmosis",
+          "label": "Osmosis",
+          "status": "review",
+          "lastReviewedAt": null,
+          "dueAt": null
+        }
+      ],
+      "activeQuestion": {
+        "id": "q-osmosis-direction",
+        "conceptId": "concept-osmosis",
+        "prompt": "Which way does water move across a semipermeable membrane?",
+        "sourceCitations": [
+          {
+            "sourceId": "src-lec2-slide-07",
+            "documentId": "lec-2",
+            "span": "slide:07",
+            "label": "Lecture 2, slide 7",
+            "confidence": "high"
+          }
+        ]
+      },
+      "questionProgress": {
+        "completed": 0,
+        "total": 1
+      },
+      "reviewSchedule": []
+    },
+    "non_ready_set_has_no_active_question": {
+      "version": 1,
+      "studySet": {
+        "id": "set-enzyme-kinetics",
+        "title": "Enzyme kinetics",
+        "course": "BIO 201",
+        "examLabel": null,
+        "ingestionStatus": "processing"
+      },
+      "session": {
+        "id": "vs-3001",
+        "mode": "quiz",
+        "goal": null
+      },
+      "concepts": [],
+      "activeQuestion": null,
+      "questionProgress": {
+        "completed": 0,
+        "total": 0
+      },
+      "reviewSchedule": []
+    },
+    "failed_ingestion_is_reported_not_hidden": {
+      "version": 1,
+      "studySet": {
+        "id": "set-photosynthesis",
+        "title": "Photosynthesis",
+        "course": null,
+        "examLabel": "Final",
+        "ingestionStatus": "failed"
+      },
+      "session": {
+        "id": "vs-4001",
+        "mode": "quiz",
+        "goal": null
+      },
+      "concepts": [],
+      "activeQuestion": null,
+      "questionProgress": {
+        "completed": 0,
+        "total": 0
+      },
+      "reviewSchedule": []
+    }
+  }
+}
