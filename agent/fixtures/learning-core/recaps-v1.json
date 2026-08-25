@@ -1,0 +1,1116 @@
+{
+  "schema": "viva.learning_core.recaps.v1",
+  "evidence": {
+    "all_missed": {
+      "user_id": "user-101",
+      "study_set_id": "set-cellular-respiration",
+      "voice_session_id": "vs-0001",
+      "outcomes": [
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-1001",
+          "question_id": "q-etc-electron-flow",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T15:00:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-18"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "insufficient_evidence",
+            "confidence": 0.66,
+            "assessments": [
+              {
+                "criterion_id": "crit-etc-donor",
+                "assessment": "not_demonstrated",
+                "confidence": 0.72
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-electron-transport-chain",
+                "from_status": "review",
+                "to_status": "missed",
+                "criterion_ids": [
+                  "crit-etc-donor"
+                ]
+              }
+            ],
+            "concise_feedback": "No required criterion was demonstrated for the electron transport chain.",
+            "retry_prompt": "Start with what NADH hands off.",
+            "disposition": "advance"
+          }
+        },
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-1002",
+          "question_id": "q-gradient-direction",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T15:02:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-19"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "wrong",
+            "confidence": 0.9,
+            "assessments": [
+              {
+                "criterion_id": "crit-etc-gradient",
+                "assessment": "contradicted",
+                "confidence": 0.9
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-proton-gradient",
+                "from_status": "review",
+                "to_status": "missed",
+                "criterion_ids": [
+                  "crit-etc-gradient"
+                ]
+              }
+            ],
+            "concise_feedback": "The required proton-gradient claim was contradicted.",
+            "retry_prompt": "Which side of the inner membrane gains protons?",
+            "disposition": "retry_current"
+          }
+        }
+      ],
+      "concept_labels": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "label": "Electron transport chain"
+        },
+        {
+          "concept_id": "concept-proton-gradient",
+          "label": "Proton gradient"
+        }
+      ],
+      "review_decisions": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "due_at": "2026-08-25T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "concept_id": "concept-proton-gradient",
+          "due_at": "2026-08-25T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ]
+    },
+    "mixed_strong_shaky_missed": {
+      "user_id": "user-101",
+      "study_set_id": "set-cellular-respiration",
+      "voice_session_id": "vs-0002",
+      "outcomes": [
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-2001",
+          "question_id": "q-etc-electron-flow",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T16:00:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-18"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "strong",
+            "confidence": 0.9,
+            "assessments": [
+              {
+                "criterion_id": "crit-etc-donor",
+                "assessment": "satisfied",
+                "confidence": 0.9
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-electron-transport-chain",
+                "from_status": "review",
+                "to_status": "strong",
+                "criterion_ids": [
+                  "crit-etc-donor"
+                ]
+              }
+            ],
+            "concise_feedback": "The electron donation and the ordered complexes both held.",
+            "retry_prompt": null,
+            "disposition": "advance"
+          }
+        },
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-2002",
+          "question_id": "q-gradient-direction",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T16:03:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-19"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "mostly_correct",
+            "confidence": 0.79,
+            "assessments": [
+              {
+                "criterion_id": "crit-etc-gradient",
+                "assessment": "satisfied",
+                "confidence": 0.79
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-proton-gradient",
+                "from_status": "review",
+                "to_status": "shaky",
+                "criterion_ids": [
+                  "crit-etc-gradient"
+                ]
+              }
+            ],
+            "concise_feedback": "The gradient claim was correct but only weakly supported.",
+            "retry_prompt": "Say precisely where the pumped protons accumulate.",
+            "disposition": "advance"
+          }
+        },
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-2003",
+          "question_id": "q-atp-synthase-coupling",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T16:06:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-20"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "wrong",
+            "confidence": 0.88,
+            "assessments": [
+              {
+                "criterion_id": "crit-atp-coupling",
+                "assessment": "contradicted",
+                "confidence": 0.88
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-atp-synthesis",
+                "from_status": "review",
+                "to_status": "missed",
+                "criterion_ids": [
+                  "crit-atp-coupling"
+                ]
+              }
+            ],
+            "concise_feedback": "A required coupling claim was contradicted.",
+            "retry_prompt": "What actually turns the synthase rotor?",
+            "disposition": "retry_current"
+          }
+        }
+      ],
+      "concept_labels": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "label": "Electron transport chain"
+        },
+        {
+          "concept_id": "concept-proton-gradient",
+          "label": "Proton gradient"
+        },
+        {
+          "concept_id": "concept-atp-synthesis",
+          "label": "ATP synthesis"
+        }
+      ],
+      "review_decisions": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "due_at": "2026-08-29T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "concept_id": "concept-proton-gradient",
+          "due_at": "2026-08-26T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "concept_id": "concept-atp-synthesis",
+          "due_at": "2026-08-25T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ]
+    },
+    "deferred_only": {
+      "user_id": "user-101",
+      "study_set_id": "set-cellular-respiration",
+      "voice_session_id": "vs-0003",
+      "outcomes": [
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-3001",
+          "question_id": "q-etc-electron-flow",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T17:00:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-18"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "deferred",
+            "reason": "empty_answer",
+            "can_retry_same_question": true,
+            "disposition": "retry_current"
+          }
+        },
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-3002",
+          "question_id": "q-etc-electron-flow",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T17:01:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-18"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "deferred",
+            "reason": "transcript_uncertain",
+            "can_retry_same_question": true,
+            "disposition": "retry_current"
+          }
+        }
+      ],
+      "concept_labels": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "label": "Electron transport chain"
+        }
+      ],
+      "review_decisions": []
+    },
+    "evaluated_then_idempotent_replay": {
+      "user_id": "user-101",
+      "study_set_id": "set-cellular-respiration",
+      "voice_session_id": "vs-0004",
+      "outcomes": [
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-4001",
+          "question_id": "q-etc-electron-flow",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T18:00:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-18"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "strong",
+            "confidence": 0.91,
+            "assessments": [
+              {
+                "criterion_id": "crit-etc-donor",
+                "assessment": "satisfied",
+                "confidence": 0.91
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-electron-transport-chain",
+                "from_status": "review",
+                "to_status": "strong",
+                "criterion_ids": [
+                  "crit-etc-donor"
+                ]
+              }
+            ],
+            "concise_feedback": "Every required criterion for the chain held.",
+            "retry_prompt": null,
+            "disposition": "advance"
+          }
+        },
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-4001",
+          "question_id": "q-etc-electron-flow",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T18:00:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-18"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "strong",
+            "confidence": 0.91,
+            "assessments": [
+              {
+                "criterion_id": "crit-etc-donor",
+                "assessment": "satisfied",
+                "confidence": 0.91
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-electron-transport-chain",
+                "from_status": "review",
+                "to_status": "strong",
+                "criterion_ids": [
+                  "crit-etc-donor"
+                ]
+              }
+            ],
+            "concise_feedback": "Every required criterion for the chain held.",
+            "retry_prompt": null,
+            "disposition": "advance"
+          }
+        }
+      ],
+      "concept_labels": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "label": "Electron transport chain"
+        }
+      ],
+      "review_decisions": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "due_at": "2026-08-31T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ]
+    },
+    "reconnect_rebuild": {
+      "user_id": "user-101",
+      "study_set_id": "set-cellular-respiration",
+      "voice_session_id": "vs-0002",
+      "outcomes": [
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-2001",
+          "question_id": "q-etc-electron-flow",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T16:00:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-18"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "strong",
+            "confidence": 0.9,
+            "assessments": [
+              {
+                "criterion_id": "crit-etc-donor",
+                "assessment": "satisfied",
+                "confidence": 0.9
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-electron-transport-chain",
+                "from_status": "review",
+                "to_status": "strong",
+                "criterion_ids": [
+                  "crit-etc-donor"
+                ]
+              }
+            ],
+            "concise_feedback": "The electron donation and the ordered complexes both held.",
+            "retry_prompt": null,
+            "disposition": "advance"
+          }
+        },
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-2002",
+          "question_id": "q-gradient-direction",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T16:03:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-19"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "mostly_correct",
+            "confidence": 0.79,
+            "assessments": [
+              {
+                "criterion_id": "crit-etc-gradient",
+                "assessment": "satisfied",
+                "confidence": 0.79
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-proton-gradient",
+                "from_status": "review",
+                "to_status": "shaky",
+                "criterion_ids": [
+                  "crit-etc-gradient"
+                ]
+              }
+            ],
+            "concise_feedback": "The gradient claim was correct but only weakly supported.",
+            "retry_prompt": "Say precisely where the pumped protons accumulate.",
+            "disposition": "advance"
+          }
+        },
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-2003",
+          "question_id": "q-atp-synthase-coupling",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T16:06:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-20"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "wrong",
+            "confidence": 0.88,
+            "assessments": [
+              {
+                "criterion_id": "crit-atp-coupling",
+                "assessment": "contradicted",
+                "confidence": 0.88
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-atp-synthesis",
+                "from_status": "review",
+                "to_status": "missed",
+                "criterion_ids": [
+                  "crit-atp-coupling"
+                ]
+              }
+            ],
+            "concise_feedback": "A required coupling claim was contradicted.",
+            "retry_prompt": "What actually turns the synthase rotor?",
+            "disposition": "retry_current"
+          }
+        }
+      ],
+      "concept_labels": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "label": "Electron transport chain"
+        },
+        {
+          "concept_id": "concept-proton-gradient",
+          "label": "Proton gradient"
+        },
+        {
+          "concept_id": "concept-atp-synthesis",
+          "label": "ATP synthesis"
+        }
+      ],
+      "review_decisions": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "due_at": "2026-08-29T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "concept_id": "concept-proton-gradient",
+          "due_at": "2026-08-26T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "concept_id": "concept-atp-synthesis",
+          "due_at": "2026-08-25T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ]
+    },
+    "superseded_challenged_outcome": {
+      "user_id": "user-101",
+      "study_set_id": "set-cellular-respiration",
+      "voice_session_id": "vs-0006",
+      "outcomes": [
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-6001",
+          "question_id": "q-gradient-direction",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T19:00:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-19"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "wrong",
+            "confidence": 0.9,
+            "assessments": [
+              {
+                "criterion_id": "crit-etc-gradient",
+                "assessment": "contradicted",
+                "confidence": 0.9
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-proton-gradient",
+                "from_status": "review",
+                "to_status": "missed",
+                "criterion_ids": [
+                  "crit-etc-gradient"
+                ]
+              }
+            ],
+            "concise_feedback": "The required proton-gradient claim was contradicted.",
+            "retry_prompt": "Which side of the inner membrane gains protons?",
+            "disposition": "retry_current"
+          }
+        },
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-6002",
+          "question_id": "q-gradient-direction",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T19:04:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-19"
+          ],
+          "supersedes_response_id": "resp-6001",
+          "resolution": {
+            "kind": "evaluated",
+            "label": "strong",
+            "confidence": 0.88,
+            "assessments": [
+              {
+                "criterion_id": "crit-etc-gradient",
+                "assessment": "satisfied",
+                "confidence": 0.88
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-proton-gradient",
+                "from_status": "missed",
+                "to_status": "strong",
+                "criterion_ids": [
+                  "crit-etc-gradient"
+                ]
+              }
+            ],
+            "concise_feedback": "The corrected answer put the protons on the intermembrane side.",
+            "retry_prompt": null,
+            "disposition": "advance"
+          }
+        }
+      ],
+      "concept_labels": [
+        {
+          "concept_id": "concept-proton-gradient",
+          "label": "Proton gradient"
+        }
+      ],
+      "review_decisions": [
+        {
+          "concept_id": "concept-proton-gradient",
+          "due_at": "2026-08-30T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ]
+    },
+    "no_outcomes": {
+      "user_id": "user-101",
+      "study_set_id": "set-cellular-respiration",
+      "voice_session_id": "vs-0007",
+      "outcomes": [],
+      "concept_labels": [],
+      "review_decisions": []
+    },
+    "same_label_distinct_concepts": {
+      "user_id": "user-101",
+      "study_set_id": "set-cellular-respiration",
+      "voice_session_id": "vs-0008",
+      "outcomes": [
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-8001",
+          "question_id": "q-glycolysis-net-atp",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T20:00:00.000Z",
+          "source_ids": [
+            "src-lec3-slide-04"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "strong",
+            "confidence": 0.93,
+            "assessments": [
+              {
+                "criterion_id": "crit-glycolysis-net",
+                "assessment": "satisfied",
+                "confidence": 0.93
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-glycolysis-atp",
+                "from_status": "review",
+                "to_status": "strong",
+                "criterion_ids": [
+                  "crit-glycolysis-net"
+                ]
+              }
+            ],
+            "concise_feedback": "The net yield for the glycolysis stage was exact.",
+            "retry_prompt": null,
+            "disposition": "advance"
+          }
+        },
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-8002",
+          "question_id": "q-krebs-net-atp",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T20:03:00.000Z",
+          "source_ids": [
+            "src-lec4-slide-11"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "mostly_correct",
+            "confidence": 0.8,
+            "assessments": [
+              {
+                "criterion_id": "crit-krebs-net",
+                "assessment": "satisfied",
+                "confidence": 0.8
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-krebs-atp",
+                "from_status": "review",
+                "to_status": "shaky",
+                "criterion_ids": [
+                  "crit-krebs-net"
+                ]
+              }
+            ],
+            "concise_feedback": "The Krebs yield was right in kind but weakly supported.",
+            "retry_prompt": "Separate the per-turn yield from the per-glucose yield.",
+            "disposition": "advance"
+          }
+        }
+      ],
+      "concept_labels": [
+        {
+          "concept_id": "concept-glycolysis-atp",
+          "label": "ATP yield"
+        },
+        {
+          "concept_id": "concept-krebs-atp",
+          "label": "ATP yield"
+        }
+      ],
+      "review_decisions": [
+        {
+          "concept_id": "concept-glycolysis-atp",
+          "due_at": "2026-09-01T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "concept_id": "concept-krebs-atp",
+          "due_at": "2026-08-27T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ]
+    },
+    "source_moment_outside_outcome": {
+      "user_id": "user-101",
+      "study_set_id": "set-cellular-respiration",
+      "voice_session_id": "vs-0009",
+      "outcomes": [
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-9001",
+          "question_id": "q-etc-electron-flow",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T21:00:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-18"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "evaluated",
+            "label": "strong",
+            "confidence": 0.92,
+            "assessments": [
+              {
+                "criterion_id": "crit-etc-donor",
+                "assessment": "satisfied",
+                "confidence": 0.92
+              }
+            ],
+            "concept_transitions": [
+              {
+                "concept_id": "concept-electron-transport-chain",
+                "from_status": "review",
+                "to_status": "strong",
+                "criterion_ids": [
+                  "crit-etc-donor"
+                ]
+              }
+            ],
+            "concise_feedback": "Every required criterion for the chain held.",
+            "retry_prompt": null,
+            "disposition": "advance"
+          }
+        },
+        {
+          "schema": "viva.turn_outcome.v1",
+          "response_id": "resp-9002",
+          "question_id": "q-gradient-direction",
+          "rubric_policy_version": "viva.semantic-rubric.v1",
+          "recorded_at": "2026-08-24T21:02:00.000Z",
+          "source_ids": [
+            "src-lec5-slide-22"
+          ],
+          "supersedes_response_id": null,
+          "resolution": {
+            "kind": "deferred",
+            "reason": "evaluator_unavailable",
+            "can_retry_same_question": false,
+            "disposition": "deferred"
+          }
+        }
+      ],
+      "concept_labels": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "label": "Electron transport chain"
+        }
+      ],
+      "review_decisions": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "due_at": "2026-08-31T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ]
+    }
+  },
+  "recaps": {
+    "all_missed": {
+      "schema": "viva.study_session_recap.v2",
+      "voice_session_id": "vs-0001",
+      "headline": "Strong concepts: 0 of 2.",
+      "summary": "Graded concepts: 2. Evaluated turns: 2. Deferred turns: 0.",
+      "concepts": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "label": "Electron transport chain",
+          "status": "missed"
+        },
+        {
+          "concept_id": "concept-proton-gradient",
+          "label": "Proton gradient",
+          "status": "missed"
+        }
+      ],
+      "review_schedule": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "due_at": "2026-08-25T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "concept_id": "concept-proton-gradient",
+          "due_at": "2026-08-25T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ],
+      "next_action": "Review the scheduled concepts on their due dates.",
+      "source_moments": [
+        {
+          "response_id": "resp-1001",
+          "source_id": "src-lec5-slide-18"
+        },
+        {
+          "response_id": "resp-1002",
+          "source_id": "src-lec5-slide-19"
+        }
+      ],
+      "deferred_turns": 0
+    },
+    "mixed_strong_shaky_missed": {
+      "schema": "viva.study_session_recap.v2",
+      "voice_session_id": "vs-0002",
+      "headline": "Strong concepts: 1 of 3.",
+      "summary": "Graded concepts: 3. Evaluated turns: 3. Deferred turns: 0.",
+      "concepts": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "label": "Electron transport chain",
+          "status": "strong"
+        },
+        {
+          "concept_id": "concept-proton-gradient",
+          "label": "Proton gradient",
+          "status": "shaky"
+        },
+        {
+          "concept_id": "concept-atp-synthesis",
+          "label": "ATP synthesis",
+          "status": "missed"
+        }
+      ],
+      "review_schedule": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "due_at": "2026-08-29T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "concept_id": "concept-proton-gradient",
+          "due_at": "2026-08-26T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "concept_id": "concept-atp-synthesis",
+          "due_at": "2026-08-25T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ],
+      "next_action": "Review the scheduled concepts on their due dates.",
+      "source_moments": [
+        {
+          "response_id": "resp-2001",
+          "source_id": "src-lec5-slide-18"
+        },
+        {
+          "response_id": "resp-2002",
+          "source_id": "src-lec5-slide-19"
+        },
+        {
+          "response_id": "resp-2003",
+          "source_id": "src-lec5-slide-20"
+        }
+      ],
+      "deferred_turns": 0
+    },
+    "deferred_only": {
+      "schema": "viva.study_session_recap.v2",
+      "voice_session_id": "vs-0003",
+      "headline": "No graded concepts this session.",
+      "summary": "No graded outcome was saved for this session.",
+      "concepts": [],
+      "review_schedule": [],
+      "next_action": "Answer one question to start building evidence.",
+      "source_moments": [],
+      "deferred_turns": 2
+    },
+    "evaluated_then_idempotent_replay": {
+      "schema": "viva.study_session_recap.v2",
+      "voice_session_id": "vs-0004",
+      "headline": "Strong concepts: 1 of 1.",
+      "summary": "Graded concepts: 1. Evaluated turns: 1. Deferred turns: 0.",
+      "concepts": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "label": "Electron transport chain",
+          "status": "strong"
+        }
+      ],
+      "review_schedule": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "due_at": "2026-08-31T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ],
+      "next_action": "Review the scheduled concepts on their due dates.",
+      "source_moments": [
+        {
+          "response_id": "resp-4001",
+          "source_id": "src-lec5-slide-18"
+        }
+      ],
+      "deferred_turns": 0
+    },
+    "reconnect_rebuild": {
+      "schema": "viva.study_session_recap.v2",
+      "voice_session_id": "vs-0002",
+      "headline": "Strong concepts: 1 of 3.",
+      "summary": "Graded concepts: 3. Evaluated turns: 3. Deferred turns: 0.",
+      "concepts": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "label": "Electron transport chain",
+          "status": "strong"
+        },
+        {
+          "concept_id": "concept-proton-gradient",
+          "label": "Proton gradient",
+          "status": "shaky"
+        },
+        {
+          "concept_id": "concept-atp-synthesis",
+          "label": "ATP synthesis",
+          "status": "missed"
+        }
+      ],
+      "review_schedule": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "due_at": "2026-08-29T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "concept_id": "concept-proton-gradient",
+          "due_at": "2026-08-26T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "concept_id": "concept-atp-synthesis",
+          "due_at": "2026-08-25T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ],
+      "next_action": "Review the scheduled concepts on their due dates.",
+      "source_moments": [
+        {
+          "response_id": "resp-2001",
+          "source_id": "src-lec5-slide-18"
+        },
+        {
+          "response_id": "resp-2002",
+          "source_id": "src-lec5-slide-19"
+        },
+        {
+          "response_id": "resp-2003",
+          "source_id": "src-lec5-slide-20"
+        }
+      ],
+      "deferred_turns": 0
+    },
+    "superseded_challenged_outcome": {
+      "schema": "viva.study_session_recap.v2",
+      "voice_session_id": "vs-0006",
+      "headline": "Strong concepts: 1 of 1.",
+      "summary": "Graded concepts: 1. Evaluated turns: 1. Deferred turns: 0.",
+      "concepts": [
+        {
+          "concept_id": "concept-proton-gradient",
+          "label": "Proton gradient",
+          "status": "strong"
+        }
+      ],
+      "review_schedule": [
+        {
+          "concept_id": "concept-proton-gradient",
+          "due_at": "2026-08-30T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ],
+      "next_action": "Review the scheduled concepts on their due dates.",
+      "source_moments": [
+        {
+          "response_id": "resp-6002",
+          "source_id": "src-lec5-slide-19"
+        }
+      ],
+      "deferred_turns": 0
+    },
+    "no_outcomes": {
+      "schema": "viva.study_session_recap.v2",
+      "voice_session_id": "vs-0007",
+      "headline": "No graded concepts this session.",
+      "summary": "No graded outcome was saved for this session.",
+      "concepts": [],
+      "review_schedule": [],
+      "next_action": "Answer one question to start building evidence.",
+      "source_moments": [],
+      "deferred_turns": 0
+    },
+    "same_label_distinct_concepts": {
+      "schema": "viva.study_session_recap.v2",
+      "voice_session_id": "vs-0008",
+      "headline": "Strong concepts: 1 of 2.",
+      "summary": "Graded concepts: 2. Evaluated turns: 2. Deferred turns: 0.",
+      "concepts": [
+        {
+          "concept_id": "concept-glycolysis-atp",
+          "label": "ATP yield",
+          "status": "strong"
+        },
+        {
+          "concept_id": "concept-krebs-atp",
+          "label": "ATP yield",
+          "status": "shaky"
+        }
+      ],
+      "review_schedule": [
+        {
+          "concept_id": "concept-glycolysis-atp",
+          "due_at": "2026-09-01T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        },
+        {
+          "concept_id": "concept-krebs-atp",
+          "due_at": "2026-08-27T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ],
+      "next_action": "Review the scheduled concepts on their due dates.",
+      "source_moments": [
+        {
+          "response_id": "resp-8001",
+          "source_id": "src-lec3-slide-04"
+        },
+        {
+          "response_id": "resp-8002",
+          "source_id": "src-lec4-slide-11"
+        }
+      ],
+      "deferred_turns": 0
+    },
+    "source_moment_outside_outcome": {
+      "schema": "viva.study_session_recap.v2",
+      "voice_session_id": "vs-0009",
+      "headline": "Strong concepts: 1 of 1.",
+      "summary": "Graded concepts: 1. Evaluated turns: 1. Deferred turns: 1.",
+      "concepts": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "label": "Electron transport chain",
+          "status": "strong"
+        }
+      ],
+      "review_schedule": [
+        {
+          "concept_id": "concept-electron-transport-chain",
+          "due_at": "2026-08-31T09:00:00.000Z",
+          "authority": "server_persisted_fsrs"
+        }
+      ],
+      "next_action": "Review the scheduled concepts on their due dates.",
+      "source_moments": [
+        {
+          "response_id": "resp-9001",
+          "source_id": "src-lec5-slide-18"
+        }
+      ],
+      "deferred_turns": 1
+    }
+  }
+}
