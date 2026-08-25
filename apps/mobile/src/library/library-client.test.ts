@@ -128,6 +128,21 @@ describe("mobile library client", () => {
     ]);
   });
 
+  test("uses the explicit Stage-1 token as the protected library bearer", async () => {
+    const calls: Array<{ init?: RequestInit; input: string }> = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init, input: String(input) });
+      return new Response(JSON.stringify(cannedLibrarySnapshot), {
+        headers: { "content-type": "application/json" },
+        status: 200,
+      });
+    }) as typeof fetch;
+
+    await loadLibrary({ ...config, sessionToken: "spike-bearer" }, fetchImpl);
+
+    expect(calls[0]?.init?.headers).toEqual({ authorization: "Bearer spike-bearer" });
+  });
+
   test("maps only server-owned metadata and leaves absent learning detail neutral", () => {
     const studySet = studySetForSession(cannedLibrarySnapshot, "biology-midterm", config);
 
