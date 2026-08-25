@@ -302,8 +302,10 @@ mod tests {
             RecapConceptOutcome, RecapSourceMoment, ReviewScheduleAuthority, ReviewScheduleSummary,
             VIVA_STUDY_SESSION_RECAP_SCHEMA,
         },
-        ConceptStatus, PortErrorKind, SessionConfig, SessionId, SessionTokenNonceClaim,
-        StudyMemoryStore, StudyMode, StudySessionRecap, StudyStoreWriteCounts, VoiceUsageRecord,
+        AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
+        AnswerEvaluation, ConceptStatus, PortErrorKind, SessionConfig, SessionId,
+        SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudySessionRecap,
+        StudyStoreWriteCounts, StudyStoreWriteOutcome, VoiceUsageRecord,
     };
     use serde::Deserialize;
     use std::sync::Arc;
@@ -1245,7 +1247,7 @@ mod tests {
             .expect("records usage");
 
         assert_eq!(
-            count_delta_from_writes(store.write_counts(), baseline_writes, 1),
+            count_delta_from_writes(store.write_counts(), baseline_writes),
             expected
         );
         assert_eq!(
@@ -2487,6 +2489,759 @@ mod tests {
             .expect("isolated test schema drops cleanly");
     }
 
+    // ------------------------------------------------------------------
+    // Task 4 (`DATA-002`, `DATA-003`, `DATA-010`)
+    //
+    // Session, evaluation, usage, and count writes have to be atomic against
+    // a concurrent racer and against deletion. Every assertion below is on
+    // return variants, final rows, final values, per-instance count deltas,
+    // and typed error kinds — "it did not panic" proves nothing here.
+    // ------------------------------------------------------------------
+
+    fn session_config(session_id: &str) -> SessionConfig {
+        SessionConfig {
+            session_id: Some(SessionId::new(session_id)),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        }
+    }
+
+    fn fixture_envelope(response_id: &str) -> AnswerAttemptEnvelope {
+        let question = fixture_question();
+        AnswerAttemptEnvelope {
+            response_id: response_id.to_owned(),
+            question_id: question.question_id.clone(),
+            submission_sequence: 1,
+            idempotency_key: format!("{}:1:{response_id}", question.question_id),
+            capture_mode: AnswerCaptureMode::Typed,
+            byte_count: Some(24),
+            char_count: Some(24),
+            duration_ms: Some(1_200),
+            client_generation_id: Some("generation-1".to_owned()),
+            locale: Some("en-US".to_owned()),
+            capture_status: AnswerCaptureStatus::Accepted,
+            content_policy: AnswerContentPolicy::None,
+            answer_digest_hmac: None,
+            transcript_status: Some("final".to_owned()),
+            transcript_confidence_bucket: Some("high".to_owned()),
+            pre_provider_state: "captured".to_owned(),
+        }
+    }
+
+    fn fixture_evaluation(label: &str, status: ConceptStatus, confidence: f32) -> AnswerEvaluation {
+        let question = fixture_question();
+        AnswerEvaluation {
+            question_id: question.question_id,
+            answer_text: "NADH donates electrons.".to_owned(),
+            label: label.to_owned(),
+            concise_feedback: "Grounded in the seeded source.".to_owned(),
+            retry_prompt: question.follow_up,
+            source: question.source,
+            concept_status: status,
+            confidence_score: confidence,
+        }
+    }
+
+    fn usage_record(session_id: &str) -> VoiceUsageRecord {
+        VoiceUsageRecord {
+            voice_session_id: Some(session_id.to_owned()),
+            provider: "synthetic".to_owned(),
+            model: "synthetic-viva".to_owned(),
+            duration_seconds: 2,
+            text_input_tokens: 20,
+            text_output_tokens: 10,
+            audio_input_tokens: 0,
+            audio_output_tokens: 0,
+            cost_estimate_usd: 0.00002,
+            first_audio_latency_ms: None,
+            answer_eval_latency_ms: Some(1),
+            source_retrieval_latency_ms: None,
+            source_grounded_correction_count: 1,
+        }
+    }
+
+    /// The complete persisted answer-attempt tuple: every envelope column and
+    /// every evaluation column, so a converged race can be compared as one value
+    /// instead of field by field at each call site.
+    #[derive(Debug, PartialEq)]
+    struct AttemptRow {
+        question_id: String,
+        submission_sequence: i32,
+        idempotency_key: String,
+        capture_mode: String,
+        byte_count: Option<i64>,
+        char_count: Option<i64>,
+        duration_ms: Option<i64>,
+        client_generation_id: Option<String>,
+        locale: Option<String>,
+        capture_status: String,
+        answer_content_policy: String,
+        transcript_status: Option<String>,
+        transcript_confidence_bucket: Option<String>,
+        pre_provider_state: String,
+        evaluation_label: Option<String>,
+        concept_status: Option<String>,
+        confidence_score: Option<f64>,
+        source_span_id: Option<Uuid>,
+    }
+
+    async fn attempt_rows(
+        pool: &sqlx::PgPool,
+        voice_session_id: &str,
+        response_id: &str,
+    ) -> Vec<AttemptRow> {
+        sqlx::query(
+            "SELECT
+                 question_id,
+                 submission_sequence,
+                 idempotency_key,
+                 capture_mode,
+                 byte_count,
+                 char_count,
+                 duration_ms,
+                 client_generation_id,
+                 locale,
+                 capture_status,
+                 answer_content_policy,
+                 transcript_status,
+                 transcript_confidence_bucket,
+                 pre_provider_state,
+                 evaluation_label,
+                 concept_status,
+                 confidence_score,
+                 source_span_id
+             FROM answer_attempts
+             WHERE voice_session_id = $1 AND response_id = $2
+             ORDER BY id",
+        )
+        .bind(fixture_uuid(voice_session_id).expect("voice session fixture UUID"))
+        .bind(response_id)
+        .fetch_all(pool)
+        .await
+        .expect("answer attempt row query succeeds")
+        .into_iter()
+        .map(|row| {
+            use sqlx::Row as _;
+            AttemptRow {
+                question_id: row.get("question_id"),
+                submission_sequence: row.get("submission_sequence"),
+                idempotency_key: row.get("idempotency_key"),
+                capture_mode: row.get("capture_mode"),
+                byte_count: row.get("byte_count"),
+                char_count: row.get("char_count"),
+                duration_ms: row.get("duration_ms"),
+                client_generation_id: row.get("client_generation_id"),
+                locale: row.get("locale"),
+                capture_status: row.get("capture_status"),
+                answer_content_policy: row.get("answer_content_policy"),
+                transcript_status: row.get("transcript_status"),
+                transcript_confidence_bucket: row.get("transcript_confidence_bucket"),
+                pre_provider_state: row.get("pre_provider_state"),
+                evaluation_label: row.get("evaluation_label"),
+                concept_status: row.get("concept_status"),
+                confidence_score: row.get("confidence_score"),
+                source_span_id: row.get("source_span_id"),
+            }
+        })
+        .collect()
+    }
+
+    /// The tuple both convergence orders have to reach: the full envelope plus
+    /// the full evaluation, with neither writer clearing the other's columns.
+    fn converged_attempt_row(response_id: &str, evaluation: &AnswerEvaluation) -> AttemptRow {
+        let envelope = fixture_envelope(response_id);
+        AttemptRow {
+            question_id: envelope.question_id,
+            submission_sequence: 1,
+            idempotency_key: envelope.idempotency_key,
+            capture_mode: "typed".to_owned(),
+            byte_count: Some(24),
+            char_count: Some(24),
+            duration_ms: Some(1_200),
+            client_generation_id: Some("generation-1".to_owned()),
+            locale: Some("en-US".to_owned()),
+            capture_status: "accepted".to_owned(),
+            answer_content_policy: "none".to_owned(),
+            transcript_status: Some("final".to_owned()),
+            transcript_confidence_bucket: Some("high".to_owned()),
+            pre_provider_state: "captured".to_owned(),
+            evaluation_label: Some(evaluation.label.clone()),
+            concept_status: Some(
+                match evaluation.concept_status {
+                    ConceptStatus::Strong => "strong",
+                    ConceptStatus::Shaky => "shaky",
+                    ConceptStatus::Missed => "missed",
+                    ConceptStatus::Review => "review",
+                }
+                .to_owned(),
+            ),
+            confidence_score: Some(f64::from(evaluation.confidence_score)),
+            source_span_id: Some(
+                fixture_uuid(&evaluation.source.source_id).expect("source fixture UUID"),
+            ),
+        }
+    }
+
+    /// Stops a deletion transaction *after* it has already removed this
+    /// session's usage rows and *before* it commits, by holding the table its
+    /// final statement needs.
+    ///
+    /// This is the forced interleaving the unserialized check-then-insert loses:
+    /// a usage writer that only reads `status` sees the pre-delete value, writes
+    /// its row, and the row outlives the commit. A writer that takes the session
+    /// row lock instead cannot even read until the deletion commits.
+    /// Parks every answer-attempt INSERT on the seeded source span's key-share
+    /// lock.
+    ///
+    /// The evaluation writer's `UPDATE` matches no row, so it fires no
+    /// foreign-key trigger and runs straight through; the existence probe is a
+    /// plain read. Only the INSERT's foreign-key check needs the locked row. A
+    /// check-then-insert therefore parks *after* its probe has already answered
+    /// "no row exists", which is precisely the window a single conflict-safe
+    /// upsert closes.
+    async fn wait_for_parked_attempt_inserts(pool: &sqlx::PgPool, expected: i64) {
+        for _ in 0..400 {
+            let parked = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*)
+                 FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND state = 'active'
+                   AND wait_event_type = 'Lock'
+                   AND query LIKE '%INSERT INTO answer_attempts%'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("parked-backend query succeeds");
+            if parked >= expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("fewer than {expected} answer-attempt inserts parked on the source-span wedge");
+    }
+
+    async fn wait_until_delete_is_wedged(pool: &sqlx::PgPool) {
+        for _ in 0..400 {
+            let blocked = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*)
+                 FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND state = 'active'
+                   AND wait_event_type = 'Lock'
+                   AND query LIKE '%DELETE FROM voice_session_token_nonces%'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("blocked-backend query succeeds");
+            if blocked > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the deletion transaction never reached the wedge lock");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_record_voice_session_replay_is_idempotent_and_count_exact() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let first_store = PostgresStudyStore::new(pool.clone());
+        let second_store = PostgresStudyStore::new(pool.clone());
+
+        // Sequential replay on one instance: one physical row, one counted write.
+        let sequential_id = Uuid::new_v4().to_string();
+        assert_eq!(
+            first_store
+                .record_voice_session(&session_config(&sequential_id))
+                .await
+                .expect("first session write succeeds"),
+            StudyStoreWriteOutcome::Inserted
+        );
+        assert_eq!(
+            first_store
+                .record_voice_session(&session_config(&sequential_id))
+                .await
+                .expect("session replay succeeds"),
+            StudyStoreWriteOutcome::IdempotentReplay
+        );
+        assert_eq!(first_store.write_counts().sessions, 1);
+        assert_eq!(voice_session_rows(&pool, &sequential_id).await, 1);
+        assert_eq!(session_status(&pool, &sequential_id).await, "open");
+
+        // Concurrent replay across two instances over the same pool.
+        let concurrent_id = Uuid::new_v4().to_string();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let first = {
+            let store = first_store.clone();
+            let config = session_config(&concurrent_id);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.record_voice_session(&config).await
+            })
+        };
+        let second = {
+            let store = second_store.clone();
+            let config = session_config(&concurrent_id);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.record_voice_session(&config).await
+            })
+        };
+        let first = first.await.expect("first racer joins");
+        let second = second.await.expect("second racer joins");
+        let mut outcomes = vec![
+            first.expect("first concurrent session write succeeds"),
+            second.expect("second concurrent session write succeeds"),
+        ];
+        outcomes.sort_by_key(|outcome| match outcome {
+            StudyStoreWriteOutcome::Inserted => 0,
+            StudyStoreWriteOutcome::IdempotentReplay => 1,
+        });
+        assert_eq!(
+            outcomes,
+            vec![
+                StudyStoreWriteOutcome::Inserted,
+                StudyStoreWriteOutcome::IdempotentReplay
+            ]
+        );
+        assert_eq!(voice_session_rows(&pool, &concurrent_id).await, 1);
+        // Instance deltas: the sequential pair already counted one session on the
+        // first instance, so the summed delta for the raced id must be exactly one.
+        assert_eq!(
+            (first_store.write_counts().sessions - 1) + second_store.write_counts().sessions,
+            1
+        );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_record_answer_evaluation_concurrent_compat_replay_is_atomic() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let first_store = PostgresStudyStore::new(pool.clone());
+        let second_store = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&first_store, &session_id).await;
+
+        let evaluation = fixture_evaluation("mostly correct", ConceptStatus::Strong, 0.84);
+        let response_id = "response-compat-race";
+
+        // Force the interleaving instead of hoping for it: both racers reach the
+        // physical insert together, each having already observed "no row".
+        let mut wedge = pool.begin().await.expect("wedge transaction begins");
+        sqlx::query("SELECT id FROM source_spans WHERE id = $1 FOR UPDATE")
+            .bind(fixture_uuid("src-lecture-5-slide-18").expect("source fixture UUID"))
+            .fetch_one(&mut *wedge)
+            .await
+            .expect("source span wedge lock is taken");
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let first = {
+            let store = first_store.clone();
+            let session_id = session_id.clone();
+            let evaluation = evaluation.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .record_answer_evaluation(
+                        "user-1",
+                        "biology-midterm",
+                        &session_id,
+                        response_id,
+                        evaluation,
+                    )
+                    .await
+            })
+        };
+        let second = {
+            let store = second_store.clone();
+            let session_id = session_id.clone();
+            let evaluation = evaluation.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .record_answer_evaluation(
+                        "user-1",
+                        "biology-midterm",
+                        &session_id,
+                        response_id,
+                        evaluation,
+                    )
+                    .await
+            })
+        };
+        wait_for_parked_attempt_inserts(&pool, 2).await;
+        wedge.commit().await.expect("source span wedge releases");
+
+        let first = first.await.expect("first racer joins");
+        let second = second.await.expect("second racer joins");
+        for result in [&first, &second] {
+            let error = match result {
+                Ok(_) => continue,
+                Err(error) => error,
+            };
+            panic!("concurrent identical evaluation replay failed: {error:?}");
+        }
+
+        let rows = attempt_rows(&pool, &session_id, response_id).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].evaluation_label.as_deref(), Some("mostly correct"));
+        assert_eq!(rows[0].concept_status.as_deref(), Some("strong"));
+        assert_eq!(rows[0].pre_provider_state, "evaluation_only_compat");
+        assert_eq!(
+            first_store.write_counts().answer_attempts
+                + second_store.write_counts().answer_attempts,
+            1
+        );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_record_answer_envelope_and_evaluation_converge_in_either_order() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let envelope_store = PostgresStudyStore::new(pool.clone());
+        let evaluation_store = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&envelope_store, &session_id).await;
+        let evaluation = fixture_evaluation("mostly correct", ConceptStatus::Strong, 0.84);
+
+        // Order 1: envelope first, evaluation second.
+        let envelope_first = "response-envelope-first";
+        envelope_store
+            .record_answer_attempt_envelope(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                fixture_envelope(envelope_first),
+            )
+            .await
+            .expect("envelope records first");
+        evaluation_store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                envelope_first,
+                evaluation.clone(),
+            )
+            .await
+            .expect("evaluation fills the envelope row");
+        assert_eq!(
+            attempt_rows(&pool, &session_id, envelope_first).await,
+            vec![converged_attempt_row(envelope_first, &evaluation)]
+        );
+
+        // Order 2: evaluation first, envelope second.
+        let evaluation_first = "response-evaluation-first";
+        evaluation_store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                evaluation_first,
+                evaluation.clone(),
+            )
+            .await
+            .expect("evaluation records first");
+        envelope_store
+            .record_answer_attempt_envelope(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                fixture_envelope(evaluation_first),
+            )
+            .await
+            .expect("envelope upgrades the compat row");
+        assert_eq!(
+            attempt_rows(&pool, &session_id, evaluation_first).await,
+            vec![converged_attempt_row(evaluation_first, &evaluation)]
+        );
+
+        // Order 3: released together, so whichever wins the insert, the committed
+        // tuple is the same.
+        let raced = "response-envelope-evaluation-race";
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let envelope_task = {
+            let store = envelope_store.clone();
+            let session_id = session_id.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .record_answer_attempt_envelope(
+                        "user-1",
+                        "biology-midterm",
+                        &session_id,
+                        fixture_envelope(raced),
+                    )
+                    .await
+            })
+        };
+        let evaluation_task = {
+            let store = evaluation_store.clone();
+            let session_id = session_id.clone();
+            let evaluation = evaluation.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .record_answer_evaluation(
+                        "user-1",
+                        "biology-midterm",
+                        &session_id,
+                        raced,
+                        evaluation,
+                    )
+                    .await
+            })
+        };
+        envelope_task
+            .await
+            .expect("envelope racer joins")
+            .expect("raced envelope write succeeds");
+        evaluation_task
+            .await
+            .expect("evaluation racer joins")
+            .expect("raced evaluation write succeeds");
+        assert_eq!(
+            attempt_rows(&pool, &session_id, raced).await,
+            vec![converged_attempt_row(raced, &evaluation)]
+        );
+
+        // Three physical rows, three counted attempts across both instances.
+        assert_eq!(
+            envelope_store.write_counts().answer_attempts
+                + evaluation_store.write_counts().answer_attempts,
+            3
+        );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_conflicting_evaluation_replay_returns_conflict_without_mutation() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let store = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&store, &session_id).await;
+
+        let response_id = "response-divergent-replay";
+        let original = fixture_evaluation("mostly correct", ConceptStatus::Strong, 0.84);
+        store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                response_id,
+                original.clone(),
+            )
+            .await
+            .expect("first evaluation records");
+        let committed = attempt_rows(&pool, &session_id, response_id).await;
+        let attempts_after_first = store.write_counts().answer_attempts;
+
+        let divergent = fixture_evaluation("wrong", ConceptStatus::Missed, 0.11);
+        let error = store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                &session_id,
+                response_id,
+                divergent,
+            )
+            .await
+            .expect_err("a divergent replay under the same response identity is refused");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+        assert!(
+            !error.reason().contains("23505") && !error.reason().contains("duplicate key"),
+            "conflict must not leak SQLSTATE detail: {}",
+            error.reason()
+        );
+        assert_eq!(attempt_rows(&pool, &session_id, response_id).await, committed);
+        assert_eq!(store.write_counts().answer_attempts, attempts_after_first);
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_voice_usage_and_session_delete_serialize_to_no_usage_row() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let usage_store = PostgresStudyStore::new(pool.clone());
+        let delete_store = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&usage_store, &session_id).await;
+
+        let mut wedge = pool.begin().await.expect("wedge transaction begins");
+        sqlx::query("LOCK TABLE voice_session_token_nonces IN EXCLUSIVE MODE")
+            .execute(&mut *wedge)
+            .await
+            .expect("wedge lock is taken");
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let delete = {
+            let store = delete_store.clone();
+            let session_id = session_id.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .delete_session_history("user-1", "biology-midterm", &session_id)
+                    .await
+            })
+        };
+        barrier.wait().await;
+        wait_until_delete_is_wedged(&pool).await;
+
+        let usage = {
+            let store = usage_store.clone();
+            let session_id = session_id.clone();
+            tokio::spawn(async move { store.record_voice_usage(usage_record(&session_id)).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        wedge.commit().await.expect("wedge lock releases");
+
+        delete
+            .await
+            .expect("delete joins")
+            .expect("session history deletion succeeds");
+        let usage = usage.await.expect("usage joins");
+
+        // The invariant this test owns: whichever of the two legal serial orders
+        // ran, the final deleted state contains no usage row.
+        assert_eq!(usage_rows_for_session(&pool, &session_id).await, 0);
+        assert_eq!(session_status(&pool, &session_id).await, "deleted");
+        // And the usage writer reported that order truthfully.
+        match usage {
+            Ok(StudyStoreWriteOutcome::Inserted) => {
+                assert_eq!(usage_store.write_counts().voice_usage, 1);
+            }
+            Ok(StudyStoreWriteOutcome::IdempotentReplay) => {
+                panic!("usage has no stable identity and must never report a replay")
+            }
+            Err(error) => {
+                assert_eq!(error.kind(), PortErrorKind::Conflict);
+                assert_eq!(usage_store.write_counts().voice_usage, 0);
+            }
+        }
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_voice_usage_and_study_delete_serialize_to_no_usage_row() {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let usage_store = PostgresStudyStore::new(pool.clone());
+        let delete_store = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&usage_store, &session_id).await;
+
+        let mut wedge = pool.begin().await.expect("wedge transaction begins");
+        sqlx::query("LOCK TABLE voice_session_token_nonces IN EXCLUSIVE MODE")
+            .execute(&mut *wedge)
+            .await
+            .expect("wedge lock is taken");
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let delete = {
+            let store = delete_store.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.delete_study_set("user-1", "biology-midterm").await
+            })
+        };
+        barrier.wait().await;
+        wait_until_delete_is_wedged(&pool).await;
+
+        let usage = {
+            let store = usage_store.clone();
+            let session_id = session_id.clone();
+            tokio::spawn(async move { store.record_voice_usage(usage_record(&session_id)).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        wedge.commit().await.expect("wedge lock releases");
+
+        delete
+            .await
+            .expect("delete joins")
+            .expect("study set deletion succeeds");
+        let usage = usage.await.expect("usage joins");
+
+        // The invariant this test owns: whichever of the two legal serial orders
+        // ran, the final deleted state contains no usage row.
+        assert_eq!(usage_rows_for_session(&pool, &session_id).await, 0);
+        assert_eq!(session_status(&pool, &session_id).await, "deleted");
+        // And the usage writer reported that order truthfully.
+        match usage {
+            Ok(StudyStoreWriteOutcome::Inserted) => {
+                assert_eq!(usage_store.write_counts().voice_usage, 1);
+            }
+            Ok(StudyStoreWriteOutcome::IdempotentReplay) => {
+                panic!("usage has no stable identity and must never report a replay")
+            }
+            Err(error) => {
+                assert_eq!(error.kind(), PortErrorKind::Conflict);
+                assert_eq!(usage_store.write_counts().voice_usage, 0);
+            }
+        }
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
     async fn run_migrations_until(
         pool: &sqlx::PgPool,
         stop_before_name: &str,
@@ -2762,10 +3517,12 @@ mod tests {
             .expected_delta
     }
 
+    /// Every field, including usage, now comes from the store's own published
+    /// counters: Plan 06's `StudyStoreWriteCounts.voice_usage` made the usage
+    /// delta sayable, so the truth table no longer takes it from the test.
     fn count_delta_from_writes(
         after: StudyStoreWriteCounts,
         before: StudyStoreWriteCounts,
-        usage_events: usize,
     ) -> ExactCountDelta {
         ExactCountDelta {
             sessions: after.sessions - before.sessions,
@@ -2773,7 +3530,7 @@ mod tests {
             concept_statuses: after.concept_statuses - before.concept_statuses,
             review_items: after.review_items - before.review_items,
             recaps: after.recaps - before.recaps,
-            usage_events,
+            usage_events: after.voice_usage - before.voice_usage,
         }
     }
 
@@ -2864,6 +3621,18 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("row count query succeeds")
+    }
+
+    async fn voice_session_rows(pool: &sqlx::PgPool, voice_session_id: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM voice_sessions
+             WHERE id = $1",
+        )
+        .bind(parse_uuid(voice_session_id).expect("session id is a UUID"))
+        .fetch_one(pool)
+        .await
+        .expect("voice session row count query succeeds")
     }
 
     async fn usage_rows_for_session(pool: &sqlx::PgPool, voice_session_id: &str) -> i64 {

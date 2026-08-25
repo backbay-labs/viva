@@ -1,6 +1,9 @@
 use std::{
     fmt::Write as _,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
 };
 
 use agent_domain::{
@@ -30,8 +33,52 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct PostgresStudyStore {
     pool: PgPool,
-    counts: Arc<RwLock<StudyStoreWriteCounts>>,
+    counts: Arc<PostgresWriteCounters>,
     event_authorizations: Arc<RwLock<Vec<EventAuthorizationRecord>>>,
+}
+
+/// The published write counts, one lock-free counter per kind.
+///
+/// `DATA-002`/`DATA-010`: the previous `RwLock<StudyStoreWriteCounts>` made the
+/// post-commit count update fallible, so a poisoned local lock turned an
+/// already-committed row into a returned error. Callers retry returned errors,
+/// and a usage event has no stable identity to retry against, so that path could
+/// duplicate a committed usage row. A counter that cannot fail cannot do that:
+/// one `fetch_add` after a successful commit, and nothing at all on replay,
+/// conflict, or rollback.
+#[derive(Debug, Default)]
+struct PostgresWriteCounters {
+    sessions: AtomicUsize,
+    answer_attempts: AtomicUsize,
+    concept_statuses: AtomicUsize,
+    review_items: AtomicUsize,
+    recaps: AtomicUsize,
+    voice_usage: AtomicUsize,
+}
+
+impl PostgresWriteCounters {
+    fn increment(&self, kind: WriteCountKind) {
+        let counter = match kind {
+            WriteCountKind::Session => &self.sessions,
+            WriteCountKind::AnswerAttempt => &self.answer_attempts,
+            WriteCountKind::ConceptStatus => &self.concept_statuses,
+            WriteCountKind::ReviewItem => &self.review_items,
+            WriteCountKind::Recap => &self.recaps,
+            WriteCountKind::VoiceUsage => &self.voice_usage,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> StudyStoreWriteCounts {
+        StudyStoreWriteCounts {
+            sessions: self.sessions.load(Ordering::Relaxed),
+            answer_attempts: self.answer_attempts.load(Ordering::Relaxed),
+            concept_statuses: self.concept_statuses.load(Ordering::Relaxed),
+            review_items: self.review_items.load(Ordering::Relaxed),
+            recaps: self.recaps.load(Ordering::Relaxed),
+            voice_usage: self.voice_usage.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,7 +185,7 @@ impl PostgresStudyStore {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            counts: Arc::new(RwLock::new(StudyStoreWriteCounts::default())),
+            counts: Arc::new(PostgresWriteCounters::default()),
             event_authorizations: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -309,18 +356,34 @@ impl PostgresStudyStore {
         Ok(())
     }
 
-    fn increment_count(&self, kind: WriteCountKind) -> Result<(), PortError> {
-        let mut counts = self
-            .counts
-            .write()
-            .map_err(|_| lock_poisoned("write_counts"))?;
-        match kind {
-            WriteCountKind::Session => counts.sessions += 1,
-            WriteCountKind::AnswerAttempt => counts.answer_attempts += 1,
-            WriteCountKind::ConceptStatus => counts.concept_statuses += 1,
-            WriteCountKind::ReviewItem => counts.review_items += 1,
-            WriteCountKind::Recap => counts.recaps += 1,
-        }
+    /// One counted write, after the row it counts is committed. Infallible by
+    /// construction: see [`PostgresWriteCounters`].
+    fn increment_count(&self, kind: WriteCountKind) {
+        self.counts.increment(kind);
+    }
+
+    /// Locks every session row a deletion is about to mutate, in a stable order.
+    ///
+    /// `ORDER BY id` is the deadlock-avoidance rule: two deletions that touch
+    /// overlapping session sets take the same row locks in the same sequence.
+    async fn lock_sessions_for_deletion(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: &str,
+        study_set_uuid: Uuid,
+    ) -> Result<(), PortError> {
+        sqlx::query(
+            "SELECT id
+             FROM voice_sessions
+             WHERE user_id = $1
+               AND study_set_id = $2
+             ORDER BY id
+             FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(pg_error)?;
         Ok(())
     }
 
@@ -594,6 +657,7 @@ enum WriteCountKind {
     ConceptStatus,
     ReviewItem,
     Recap,
+    VoiceUsage,
 }
 
 #[async_trait]
@@ -611,10 +675,7 @@ impl StudyMemoryStore for PostgresStudyStore {
     }
 
     fn write_counts(&self) -> StudyStoreWriteCounts {
-        self.counts
-            .read()
-            .expect("postgres write count lock poisoned")
-            .clone()
+        self.counts.snapshot()
     }
 
     async fn pending_answer_attempts_for_session(
@@ -707,11 +768,16 @@ impl StudyMemoryStore for PostgresStudyStore {
         .map_err(pg_error)
     }
 
-    // `DATA-003`/Task 4: this upsert still cannot tell an insert from a replay —
-    // `ON CONFLICT DO UPDATE` reports one affected row either way — so it reports
-    // exactly what it does, which is to count every accepted call as a write. Task
-    // 4 Step 3 replaces the statement with `RETURNING (xmax = '0'::xid)` and only
-    // then can `IdempotentReplay` be returned truthfully.
+    /// `DATA-003`: one statement carries both the write and the truth about it.
+    ///
+    /// `RETURNING (xmax = '0'::xid)` distinguishes the physical insert from the
+    /// conflict path, so a replay can be reported as a replay instead of being
+    /// counted as a second session. The `DO UPDATE ... SET mode = voice_sessions.mode`
+    /// is a deliberate no-op write: it is the only way to make a matching replay
+    /// return a row (and therefore be distinguishable from a refused one) without
+    /// changing any committed value. A replay of a closed or deleted session, or
+    /// one whose owner/set/mode differ, matches no `WHERE` and returns no row,
+    /// which is `Conflict` — never a silent reopen.
     async fn record_voice_session(
         &self,
         config: &SessionConfig,
@@ -723,30 +789,35 @@ impl StudyMemoryStore for PostgresStudyStore {
         let study_set_uuid = Self::uuid_for(study_set_id)?;
         self.ensure_study_set(user_id, study_set_uuid).await?;
         let mode = config.mode.clone().unwrap_or_default();
-        let result = sqlx::query(
+        let inserted = sqlx::query_scalar::<_, bool>(
             "INSERT INTO voice_sessions (id, user_id, study_set_id, mode, status)
              VALUES ($1, $2, $3, $4, 'open')
              ON CONFLICT (id) DO UPDATE
-             SET mode = EXCLUDED.mode
+             SET mode = voice_sessions.mode
              WHERE voice_sessions.user_id = EXCLUDED.user_id
                AND voice_sessions.study_set_id = EXCLUDED.study_set_id
-               AND voice_sessions.status = 'open'",
+               AND voice_sessions.status = 'open'
+               AND voice_sessions.mode = EXCLUDED.mode
+             RETURNING (xmax = '0'::xid) AS inserted",
         )
         .bind(session_uuid)
         .bind(user_id)
         .bind(study_set_uuid)
         .bind(mode.as_str())
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(pg_error)?;
-        if result.rows_affected() == 0 {
+        let Some(inserted) = inserted else {
             return Err(PortError::conflict(
                 "postgres",
                 session_id,
                 "voice session cannot be reopened or ownership changed",
             ));
+        };
+        if !inserted {
+            return Ok(StudyStoreWriteOutcome::IdempotentReplay);
         }
-        self.increment_count(WriteCountKind::Session)?;
+        self.increment_count(WriteCountKind::Session);
         Ok(StudyStoreWriteOutcome::Inserted)
     }
 
@@ -1368,6 +1439,10 @@ impl StudyMemoryStore for PostgresStudyStore {
         self.ensure_study_set(user_id, study_set_uuid).await?;
 
         let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        // `DATA-010`: take every affected session row lock, in `id` order, before
+        // any status mutation or artifact removal. A concurrent usage write is
+        // then either fully before this transaction or fully refused by it.
+        Self::lock_sessions_for_deletion(&mut tx, user_id, study_set_uuid).await?;
         let deleted_source_spans = sqlx::query(
             "UPDATE source_spans sp
              SET deleted_at = COALESCE(sp.deleted_at, NOW())
@@ -1525,6 +1600,13 @@ impl StudyMemoryStore for PostgresStudyStore {
         }
 
         let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        // `DATA-010`: same session-row lock the usage writer takes, before any
+        // status mutation or artifact removal.
+        sqlx::query("SELECT id FROM voice_sessions WHERE id = $1 FOR UPDATE")
+            .bind(voice_session_uuid)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(pg_error)?;
         sqlx::query(
             "UPDATE voice_sessions
              SET status = 'deleted',
@@ -1969,7 +2051,12 @@ impl StudyMemoryStore for PostgresStudyStore {
         let char_count = optional_u64_to_i64(envelope.char_count, "answer char count")?;
         let duration_ms = optional_u64_to_i64(envelope.duration_ms, "answer duration")?;
 
-        let inserted = sqlx::query(
+        // `DATA-002`: one conflict-safe statement. It writes the envelope columns
+        // and nothing else, so an evaluation that arrived first keeps its own
+        // columns while its placeholder capture metadata is upgraded in place.
+        // A replay with different envelope values matches no `WHERE` branch,
+        // returns no row, and is a `Conflict` — the duplicate key never escapes.
+        let inserted = sqlx::query_scalar::<_, bool>(
             "INSERT INTO answer_attempts (
                 id,
                 voice_session_id,
@@ -1991,7 +2078,47 @@ impl StudyMemoryStore for PostgresStudyStore {
                 pre_provider_state
              )
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-             ON CONFLICT (voice_session_id, response_id) DO NOTHING",
+             ON CONFLICT (voice_session_id, response_id) DO UPDATE
+             SET submission_sequence = EXCLUDED.submission_sequence,
+                 idempotency_key = EXCLUDED.idempotency_key,
+                 capture_mode = EXCLUDED.capture_mode,
+                 byte_count = EXCLUDED.byte_count,
+                 char_count = EXCLUDED.char_count,
+                 duration_ms = EXCLUDED.duration_ms,
+                 client_generation_id = EXCLUDED.client_generation_id,
+                 locale = EXCLUDED.locale,
+                 capture_status = EXCLUDED.capture_status,
+                 answer_content_policy = EXCLUDED.answer_content_policy,
+                 answer_digest_hmac = EXCLUDED.answer_digest_hmac,
+                 transcript_status = EXCLUDED.transcript_status,
+                 transcript_confidence_bucket = EXCLUDED.transcript_confidence_bucket,
+                 pre_provider_state = EXCLUDED.pre_provider_state
+             WHERE answer_attempts.question_id = EXCLUDED.question_id
+               AND (
+                   answer_attempts.pre_provider_state = 'evaluation_only_compat'
+                   OR (
+                       answer_attempts.submission_sequence = EXCLUDED.submission_sequence
+                       AND answer_attempts.idempotency_key = EXCLUDED.idempotency_key
+                       AND answer_attempts.capture_mode = EXCLUDED.capture_mode
+                       AND answer_attempts.byte_count IS NOT DISTINCT FROM EXCLUDED.byte_count
+                       AND answer_attempts.char_count IS NOT DISTINCT FROM EXCLUDED.char_count
+                       AND answer_attempts.duration_ms IS NOT DISTINCT FROM EXCLUDED.duration_ms
+                       AND answer_attempts.client_generation_id
+                           IS NOT DISTINCT FROM EXCLUDED.client_generation_id
+                       AND answer_attempts.locale IS NOT DISTINCT FROM EXCLUDED.locale
+                       AND answer_attempts.capture_status = EXCLUDED.capture_status
+                       AND answer_attempts.answer_content_policy
+                           = EXCLUDED.answer_content_policy
+                       AND answer_attempts.answer_digest_hmac
+                           IS NOT DISTINCT FROM EXCLUDED.answer_digest_hmac
+                       AND answer_attempts.transcript_status
+                           IS NOT DISTINCT FROM EXCLUDED.transcript_status
+                       AND answer_attempts.transcript_confidence_bucket
+                           IS NOT DISTINCT FROM EXCLUDED.transcript_confidence_bucket
+                       AND answer_attempts.pre_provider_state = EXCLUDED.pre_provider_state
+                   )
+               )
+             RETURNING (xmax = '0'::xid) AS inserted",
         )
         .bind(Uuid::new_v4())
         .bind(voice_session_uuid)
@@ -2011,62 +2138,18 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(&envelope.transcript_status)
         .bind(&envelope.transcript_confidence_bucket)
         .bind(&envelope.pre_provider_state)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(pg_error)?;
-        if inserted.rows_affected() == 0 {
-            let matches = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(
-                    SELECT 1
-                    FROM answer_attempts
-                    WHERE voice_session_id = $1
-                      AND response_id = $2
-                      AND question_id = $3
-                      AND submission_sequence = $4
-                      AND idempotency_key = $5
-                      AND capture_mode = $6
-                      AND byte_count IS NOT DISTINCT FROM $7
-                      AND char_count IS NOT DISTINCT FROM $8
-                      AND duration_ms IS NOT DISTINCT FROM $9
-                      AND client_generation_id IS NOT DISTINCT FROM $10
-                      AND locale IS NOT DISTINCT FROM $11
-                      AND capture_status = $12
-                      AND answer_content_policy = $13
-                      AND answer_digest_hmac IS NOT DISTINCT FROM $14
-                      AND transcript_status IS NOT DISTINCT FROM $15
-                      AND transcript_confidence_bucket IS NOT DISTINCT FROM $16
-                      AND pre_provider_state = $17
-                )",
-            )
-            .bind(voice_session_uuid)
-            .bind(&envelope.response_id)
-            .bind(&envelope.question_id)
-            .bind(submission_sequence)
-            .bind(&envelope.idempotency_key)
-            .bind(envelope.capture_mode.as_str())
-            .bind(byte_count)
-            .bind(char_count)
-            .bind(duration_ms)
-            .bind(&envelope.client_generation_id)
-            .bind(&envelope.locale)
-            .bind(envelope.capture_status.as_str())
-            .bind(envelope.content_policy.as_str())
-            .bind(&envelope.answer_digest_hmac)
-            .bind(&envelope.transcript_status)
-            .bind(&envelope.transcript_confidence_bucket)
-            .bind(&envelope.pre_provider_state)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(pg_error)?;
-            if !matches {
-                return Err(PortError::conflict(
-                    "postgres",
-                    &envelope.response_id,
-                    "answer attempt envelope cannot be changed",
-                ));
-            }
-        } else {
-            self.increment_count(WriteCountKind::AnswerAttempt)?;
+        let Some(inserted) = inserted else {
+            return Err(PortError::conflict(
+                "postgres",
+                &envelope.response_id,
+                "answer attempt envelope cannot be changed",
+            ));
+        };
+        if inserted {
+            self.increment_count(WriteCountKind::AnswerAttempt);
         }
 
         Ok(json!({
@@ -2108,80 +2191,88 @@ impl StudyMemoryStore for PostgresStudyStore {
         self.ensure_active_question(study_set_uuid, &evaluation.question_id)
             .await?;
         let source_span_uuid = Self::uuid_for(&evaluation.source.source_id)?;
-        let updated = sqlx::query(
-            "UPDATE answer_attempts
-             SET evaluation_label = $1,
-                 concept_status = $2,
-                 confidence_score = $3,
-                 source_span_id = $4
-             WHERE voice_session_id = $5
-               AND response_id = $6
-               AND question_id = $7",
+        // `DATA-002`: one conflict-safe statement replaces the old
+        // check-then-insert. Two racing identical writes converge on one physical
+        // row instead of one of them surfacing SQLSTATE 23505, and a divergent
+        // replay under the same response identity matches no `WHERE` branch and
+        // becomes a typed `Conflict` that leaves the committed tuple untouched.
+        //
+        // The guard's first branch is the envelope-first order (the evaluation
+        // columns are still empty); its second is an identical replay. Together
+        // with the envelope writer's compat upgrade, both interleavings converge
+        // on the same complete tuple.
+        let inserted = sqlx::query_scalar::<_, bool>(
+            "INSERT INTO answer_attempts (
+                id,
+                voice_session_id,
+                response_id,
+                question_id,
+                submission_sequence,
+                idempotency_key,
+                capture_mode,
+                capture_status,
+                answer_content_policy,
+                pre_provider_state,
+                evaluation_label,
+                concept_status,
+                confidence_score,
+                source_span_id
+             )
+             VALUES (
+                 $1, $2, $3, $4, 1, $5,
+                 'typed', 'accepted', 'none', 'evaluation_only_compat',
+                 $6, $7, $8, $9
+             )
+             ON CONFLICT (voice_session_id, response_id) DO UPDATE
+             SET evaluation_label = EXCLUDED.evaluation_label,
+                 concept_status = EXCLUDED.concept_status,
+                 confidence_score = EXCLUDED.confidence_score,
+                 source_span_id = EXCLUDED.source_span_id
+             WHERE answer_attempts.question_id = EXCLUDED.question_id
+               AND (
+                   (
+                       answer_attempts.evaluation_label IS NULL
+                       AND answer_attempts.concept_status IS NULL
+                       AND answer_attempts.confidence_score IS NULL
+                       AND answer_attempts.source_span_id IS NULL
+                   )
+                   OR (
+                       answer_attempts.evaluation_label
+                           IS NOT DISTINCT FROM EXCLUDED.evaluation_label
+                       AND answer_attempts.concept_status
+                           IS NOT DISTINCT FROM EXCLUDED.concept_status
+                       AND answer_attempts.confidence_score
+                           IS NOT DISTINCT FROM EXCLUDED.confidence_score
+                       AND answer_attempts.source_span_id
+                           IS NOT DISTINCT FROM EXCLUDED.source_span_id
+                   )
+               )
+             RETURNING (xmax = '0'::xid) AS inserted",
         )
+        .bind(Uuid::new_v4())
+        .bind(voice_session_uuid)
+        .bind(response_id)
+        .bind(&evaluation.question_id)
+        .bind(format!(
+            "{voice_session_id}:{}:1:{response_id}:compat",
+            evaluation.question_id
+        ))
         .bind(&evaluation.label)
         .bind(concept_status_str(&evaluation.concept_status))
         .bind(f64::from(evaluation.confidence_score))
         .bind(source_span_uuid)
-        .bind(voice_session_uuid)
-        .bind(response_id)
-        .bind(&evaluation.question_id)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(pg_error)?;
-        if updated.rows_affected() == 0 {
-            let existing_response = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(
-                    SELECT 1 FROM answer_attempts
-                    WHERE voice_session_id = $1 AND response_id = $2
-                )",
-            )
-            .bind(voice_session_uuid)
-            .bind(response_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(pg_error)?;
-            if existing_response {
-                return Err(PortError::conflict(
-                    "postgres",
-                    response_id,
-                    "answer evaluation question does not match persisted attempt envelope",
-                ));
-            }
-            sqlx::query(
-                "INSERT INTO answer_attempts (
-                    id,
-                    voice_session_id,
-                    response_id,
-                    question_id,
-                    submission_sequence,
-                    idempotency_key,
-                    capture_mode,
-                    capture_status,
-                    answer_content_policy,
-                    pre_provider_state,
-                    evaluation_label,
-                    concept_status,
-                    confidence_score,
-                    source_span_id
-                 )
-                 VALUES ($1, $2, $3, $4, 1, $5, 'typed', 'accepted', 'none', 'evaluation_only_compat', $6, $7, $8, $9)",
-            )
-            .bind(Uuid::new_v4())
-            .bind(voice_session_uuid)
-            .bind(response_id)
-            .bind(&evaluation.question_id)
-            .bind(format!(
-                "{voice_session_id}:{}:1:{response_id}:compat",
-                evaluation.question_id
-            ))
-            .bind(&evaluation.label)
-            .bind(concept_status_str(&evaluation.concept_status))
-            .bind(f64::from(evaluation.confidence_score))
-            .bind(source_span_uuid)
-            .execute(&self.pool)
-            .await
-            .map_err(pg_error)?;
-            self.increment_count(WriteCountKind::AnswerAttempt)?;
+        let Some(inserted) = inserted else {
+            return Err(PortError::conflict(
+                "postgres",
+                response_id,
+                "answer evaluation does not match the persisted attempt for this response",
+            ));
+        };
+        if inserted {
+            self.increment_count(WriteCountKind::AnswerAttempt);
         }
         self.record_event_authorization(
             user_id,
@@ -2331,7 +2422,7 @@ impl StudyMemoryStore for PostgresStudyStore {
             ));
         }
         tx.commit().await.map_err(pg_error)?;
-        self.increment_count(WriteCountKind::ConceptStatus)?;
+        self.increment_count(WriteCountKind::ConceptStatus);
         self.record_event_authorization(
             user_id,
             study_set_id,
@@ -2377,7 +2468,7 @@ impl StudyMemoryStore for PostgresStudyStore {
                 json!({ "concept_id": concept_id, "due_at": due_at, "status": "scheduled" }),
             );
         }
-        self.increment_count(WriteCountKind::ReviewItem)?;
+        self.increment_count(WriteCountKind::ReviewItem);
         Ok(json!({ "concept_id": concept_id, "due_at": due_at, "status": "scheduled" }))
     }
 
@@ -2607,7 +2698,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         };
 
         if result.rows_affected() > 0 {
-            self.increment_count(WriteCountKind::ReviewItem)?;
+            self.increment_count(WriteCountKind::ReviewItem);
         }
         self.record_event_authorization(
             user_id,
@@ -2687,7 +2778,7 @@ impl StudyMemoryStore for PostgresStudyStore {
         .await
         .map_err(pg_error)?;
         if inserted {
-            self.increment_count(WriteCountKind::Recap)?;
+            self.increment_count(WriteCountKind::Recap);
         }
         self.record_event_authorization(
             user_id,
@@ -2716,20 +2807,29 @@ impl StudyMemoryStore for PostgresStudyStore {
             .as_deref()
             .map(Self::uuid_for)
             .transpose()?;
+        // `DATA-010`: the status read and the insert are one transaction, and the
+        // read takes the session row's `FOR UPDATE` lock that both deletion paths
+        // also take. That leaves exactly two serial orders — usage commits and
+        // deletion then removes it, or deletion commits and usage observes
+        // `deleted` and writes nothing — and no interleaving in which a usage row
+        // outlives the deletion.
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
         if let Some(voice_session_uuid) = voice_session_uuid {
-            let deleted = sqlx::query_scalar::<_, bool>(
-                "SELECT status = 'deleted' FROM voice_sessions WHERE id = $1",
+            let status = sqlx::query_scalar::<_, String>(
+                "SELECT status
+                 FROM voice_sessions
+                 WHERE id = $1
+                 FOR UPDATE",
             )
             .bind(voice_session_uuid)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(pg_error)?
-            .unwrap_or(false);
-            if deleted {
+            .map_err(pg_error)?;
+            if status.as_deref() == Some("deleted") {
                 // No row was written, so neither write outcome is true here. The
                 // typed contract makes that sayable: a usage event aimed at a
-                // deleted session lost to deletion. Task 4 Step 5 adds the
-                // `FOR UPDATE` serialization this check still lacks.
+                // deleted session lost to deletion.
+                tx.commit().await.map_err(pg_error)?;
                 return Err(PortError::conflict(
                     "postgres",
                     event.voice_session_id.as_deref().unwrap_or("unknown"),
@@ -2788,12 +2888,14 @@ impl StudyMemoryStore for PostgresStudyStore {
             event.source_grounded_correction_count,
             "source_grounded_correction_count",
         )?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(pg_error)?;
+        tx.commit().await.map_err(pg_error)?;
         // Usage records carry no stable event identity, so an accepted write is
         // always a real insert; Plan 09 never reports a usage replay it cannot
-        // identify.
+        // identify. The count moves only after the commit succeeded.
+        self.increment_count(WriteCountKind::VoiceUsage);
         Ok(StudyStoreWriteOutcome::Inserted)
     }
 }
