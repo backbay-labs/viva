@@ -206,6 +206,15 @@ pub(super) fn record_locked(state: &mut InMemoryStudyState, record: EventAuthori
     state.event_authorizations.insert(record);
 }
 
+/// Whether this exact authorization is already on record, under the caller's
+/// already-held state lock. The idempotency test for a replayed write.
+pub(super) fn is_recorded_locked(
+    state: &InMemoryStudyState,
+    record: &EventAuthorizationRecord,
+) -> bool {
+    state.event_authorizations.contains(record)
+}
+
 /// End one session's browser authority, under the caller's already-held state
 /// write lock.
 ///

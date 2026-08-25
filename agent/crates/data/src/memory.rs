@@ -1868,7 +1868,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
             Self::ensure_concept_locked(study_set, &state, concept_id)?;
         }
-        if state.event_authorizations.contains(&authorization) {
+        if authorization::is_recorded_locked(&state, &authorization) {
             return Ok(status);
         }
         if let Some(concept) = state
