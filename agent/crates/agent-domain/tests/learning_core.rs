@@ -882,7 +882,6 @@ fn session() -> AuthorizedStudySession {
         user_id: USER_ID.to_owned(),
         study_set_id: STUDY_SET_ID.to_owned(),
         voice_session_id: VOICE_SESSION_ID.to_owned(),
-        mode: StudyMode::Quiz,
         active_concepts: vec![CONCEPT_ETC.to_owned(), CONCEPT_GRADIENT.to_owned()],
     }
 }
@@ -3422,7 +3421,6 @@ fn progression_session(fixture: &ProgressionFixture) -> AuthorizedStudySession {
         user_id: USER_ID.to_owned(),
         study_set_id: STUDY_SET_ID.to_owned(),
         voice_session_id: fixture.voice_session_id.clone(),
-        mode: StudyMode::Quiz,
         active_concepts: Vec::new(),
     }
 }

@@ -75,22 +75,44 @@ const RESERVED_SCHEDULING_ARGUMENTS: [&str; 12] = [
 /// quietly ignored — being overruled in silence teaches a caller nothing.
 const RESERVED_MASTERY_ARGUMENTS: [&str; 2] = ["concept_id", "status"];
 
+/// The one execution engine this server publishes (`LEARN-005B`, D-03B).
+///
+/// It is a server-owned constant, not a client value: every tool result reports
+/// this identifier, and no code path derives a mode from a session config, a
+/// claim, a query parameter, or a tool argument. The learner never sees this
+/// token — the public action is Plan 13's exact `Begin oral exam` label — so
+/// `quiz` is an internal wire identifier and never a second choice on offer.
+pub const VIVA_STUDY_MODE: &str = "quiz";
+
 #[derive(Clone)]
 pub struct AuthorizedStudySession {
     pub user_id: String,
     pub study_set_id: String,
     pub voice_session_id: String,
-    pub mode: StudyMode,
     pub active_concepts: Vec<String>,
 }
 
 impl AuthorizedStudySession {
+    /// Admission binds identity, and only identity.
+    ///
+    /// D-03B removed the untrusted mode: an absent mode is not "quiz by
+    /// default", it is simply no longer an input, so there is nothing here to
+    /// default. A config that still names a non-quiz mode is a forged or stale
+    /// client value describing behaviour this server cannot execute, and it is
+    /// refused rather than silently downgraded to the one engine that exists —
+    /// a caller told its `cram` session was admitted would be told a falsehood.
     pub fn from_config(config: &SessionConfig) -> Result<Self, ToolExecutionError> {
+        if let Some(mode) = config.mode.as_ref().map(StudyMode::as_str) {
+            if mode != VIVA_STUDY_MODE {
+                return Err(ToolExecutionError::InvalidArguments(format!(
+                    "session mode `{mode}` is not the one oral-exam engine"
+                )));
+            }
+        }
         Ok(Self {
             user_id: required(config.user_id.as_deref(), "user_id")?.to_owned(),
             study_set_id: required(config.study_set_id.as_deref(), "study_set_id")?.to_owned(),
             voice_session_id: required(config.session_id.as_deref(), "session_id")?.to_owned(),
-            mode: config.mode.clone().unwrap_or_default(),
             active_concepts: config.active_concepts.clone(),
         })
     }
@@ -198,7 +220,9 @@ impl VivaToolExecutor {
                 ProgressionPolicyId::OrderedV1,
             )
             .await?;
-        Ok(json!({ "progression": progression, "mode": self.session.mode.as_str() }))
+        // D-03B: the reported mode is the server-owned engine constant. Nothing a
+        // client sent reaches this field.
+        Ok(json!({ "progression": progression, "mode": VIVA_STUDY_MODE }))
     }
 
     /// The only production path that can produce evaluated mastery.
