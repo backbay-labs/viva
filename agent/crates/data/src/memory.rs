@@ -30,7 +30,8 @@ use agent_domain::{
     StudySessionDurableCounts, StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus,
     StudySetSummary, StudySourceReference, StudySourceSpanSummary, StudyStoreBackend,
     StudyStoreCapabilities, StudyStoreWriteCounts, StudyStoreWriteOutcome, TurnOutcome,
-    TurnOutcomeRecordReceipt, TurnResolution, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+    TurnOutcomeRecordReceipt, TurnResolution, VoiceUsageRecord,
+    VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -425,6 +426,49 @@ pub struct RecapRecord {
     pub recap: PersistedSessionRecap,
 }
 
+/// One accepted Plan 06 [`agent_domain::VoiceUsageRecord`].
+///
+/// The port type is not serializable, so this is the same
+/// `Persisted*`-from-port-type projection the rest of this module uses. Usage has
+/// no stable event identity, so every accepted write appends exactly one record
+/// and the collection's length is the published `voice_usage` count.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PersistedVoiceUsage {
+    pub voice_session_id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub duration_seconds: u64,
+    pub text_input_tokens: u64,
+    pub text_output_tokens: u64,
+    pub audio_input_tokens: u64,
+    pub audio_output_tokens: u64,
+    pub cost_estimate_usd: f64,
+    pub first_audio_latency_ms: Option<u64>,
+    pub answer_eval_latency_ms: Option<u64>,
+    pub source_retrieval_latency_ms: Option<u64>,
+    pub source_grounded_correction_count: u64,
+}
+
+impl From<&VoiceUsageRecord> for PersistedVoiceUsage {
+    fn from(event: &VoiceUsageRecord) -> Self {
+        Self {
+            voice_session_id: event.voice_session_id.clone(),
+            provider: event.provider.clone(),
+            model: event.model.clone(),
+            duration_seconds: event.duration_seconds,
+            text_input_tokens: event.text_input_tokens,
+            text_output_tokens: event.text_output_tokens,
+            audio_input_tokens: event.audio_input_tokens,
+            audio_output_tokens: event.audio_output_tokens,
+            cost_estimate_usd: event.cost_estimate_usd,
+            first_audio_latency_ms: event.first_audio_latency_ms,
+            answer_eval_latency_ms: event.answer_eval_latency_ms,
+            source_retrieval_latency_ms: event.source_retrieval_latency_ms,
+            source_grounded_correction_count: event.source_grounded_correction_count,
+        }
+    }
+}
+
 /// One persisted Plan 04 [`TurnOutcome`], stored as the canonical typed object.
 ///
 /// `payload_sha256` is the same canonical digest the durable backend stores, so
@@ -546,6 +590,11 @@ pub struct InMemoryStudyState {
     #[serde(default)]
     pub review_schedule_decisions: Vec<ReviewScheduleDecisionRecord>,
     pub recaps: Vec<RecapRecord>,
+    /// Plan 06's usage collection (Task 7). Usage carries no stable event
+    /// identity, so this is an append-only log and its length is the published
+    /// `voice_usage` count.
+    #[serde(default)]
+    pub voice_usage_events: Vec<PersistedVoiceUsage>,
     /// Plan 04's canonical learning persistence (Task 6).
     #[serde(default)]
     pub turn_outcomes: Vec<TurnOutcomeRecord>,
@@ -609,14 +658,110 @@ const FIXTURE_ID_TRANSLATIONS: &[(&str, &str)] = &[
     ("vs-1001", "5e700001-0000-4000-8000-000000000021"),
 ];
 
+/// `DATA-012`: the one deterministic interleaving point this crate's tests can
+/// stop an in-memory mutation at.
+///
+/// The hook sits between a method's validation and its mutation. A test arms one
+/// site, waits until the writer has validated and is about to write, runs the
+/// racing operation, and only then releases the writer. Under a method that holds
+/// one state write lock across validation and mutation the racer cannot even
+/// begin until the paused writer commits; under a validate-then-mutate method it
+/// runs to completion inside the gap, which is exactly the state the RED tests
+/// witness.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MutationSite {
+    VoiceSession,
+    AnswerEvaluation,
+    TurnOutcome,
+    VoiceUsage,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct MutationPause {
+    site: MutationSite,
+    entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+/// The test side of one armed pause.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct MutationPauseHandle {
+    entered: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+impl MutationPauseHandle {
+    /// Blocks the calling thread until the armed mutation has validated and is
+    /// about to mutate. A site that is never reached fails the test rather than
+    /// hanging the suite.
+    pub(crate) fn wait_until_paused(&self) {
+        self.entered
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the armed mutation reaches its pause point");
+    }
+
+    pub(crate) fn release(&self) {
+        let _ = self.release.send(());
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStudyStore {
     inner: Arc<RwLock<InMemoryStudyState>>,
+    #[cfg(test)]
+    pause: Arc<RwLock<Option<MutationPause>>>,
 }
 
 impl InMemoryStudyStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Arms a one-shot pause at `site`.
+    #[cfg(test)]
+    pub(crate) fn pause_at(&self, site: MutationSite) -> MutationPauseHandle {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.pause.write().expect("pause lock poisoned") = Some(MutationPause {
+            site,
+            entered: std::sync::Mutex::new(entered_tx),
+            release: std::sync::Mutex::new(release_rx),
+        });
+        MutationPauseHandle {
+            entered: entered_rx,
+            release: release_tx,
+        }
+    }
+
+    /// The pause itself. Disarms before blocking, so a site is stopped at most
+    /// once per arming and a second caller never waits on a released channel.
+    #[cfg(test)]
+    fn pause_hook(&self, site: MutationSite) {
+        let armed = {
+            let mut guard = self.pause.write().expect("pause lock poisoned");
+            if guard.as_ref().is_some_and(|pause| pause.site == site) {
+                guard.take()
+            } else {
+                None
+            }
+        };
+        let Some(pause) = armed else {
+            return;
+        };
+        let _ = pause
+            .entered
+            .lock()
+            .expect("pause sender lock poisoned")
+            .send(());
+        let _ = pause
+            .release
+            .lock()
+            .expect("pause receiver lock poisoned")
+            .recv_timeout(std::time::Duration::from_secs(10));
     }
 
     pub fn seeded_fixture() -> Self {
@@ -1750,6 +1895,12 @@ fn remove_session_artifacts(
     state
         .answer_attempts
         .retain(|record| !voice_session_ids.contains(&record.voice_session_id));
+    state.voice_usage_events.retain(|record| {
+        record
+            .voice_session_id
+            .as_ref()
+            .is_none_or(|session_id| !voice_session_ids.contains(session_id))
+    });
     state.event_authorizations.retain(|record| {
         record.user_id != user_id
             || record.study_set_id != study_set_id
@@ -2869,10 +3020,10 @@ impl StudyMemoryStore for InMemoryStudyStore {
             concept_statuses: state.concept_statuses.len(),
             review_items: state.review_items.len(),
             recaps: state.recaps.len(),
-            // This backend records no voice usage at all — `record_voice_usage`
-            // keeps the fail-closed `Unavailable` default — so the honest count is
-            // zero rather than an omitted field.
-            voice_usage: 0,
+            // Every published count is derived from the committed collection it
+            // describes, so a count can never disagree with the state that
+            // produced it.
+            voice_usage: state.voice_usage_events.len(),
         }
     }
 
@@ -2960,41 +3111,52 @@ impl StudyMemoryStore for InMemoryStudyStore {
         let user_id = required_user_id(config)?;
         let study_set_id = required_study_set_id(config)?;
         let voice_session_id = required_session_id(config)?;
-        let replayed = {
-            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
-            Self::study_set_locked(&state, user_id, study_set_id)?;
-            if let Some(existing) = state
-                .sessions
-                .iter()
-                .find(|session| session.voice_session_id == voice_session_id)
-            {
-                if existing.user_id != user_id || existing.study_set_id != study_set_id {
-                    return Err(PortError::conflict(
-                        "memory",
-                        voice_session_id,
-                        "voice session ownership cannot be changed",
-                    ));
-                }
-                if existing.status != "open" {
-                    return Err(PortError::unavailable(
-                        "memory",
-                        voice_session_id,
-                        "closed voice session cannot be reopened",
-                    ));
-                }
-                true
-            } else {
-                false
+        let record = VoiceSessionRecord::from_config(config);
+
+        // `DATA-012`: one write lock spans the validation and the write. The
+        // previous read-lock-then-`SessionStore::save` shape let a `close` commit
+        // in the gap, and `save`'s remove-and-push then resurrected the session as
+        // `open`.
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        Self::study_set_locked(&state, user_id, study_set_id)?;
+        let existing = state
+            .sessions
+            .iter()
+            .position(|session| session.voice_session_id == voice_session_id);
+        if let Some(index) = existing {
+            let session = &state.sessions[index];
+            if session.user_id != user_id || session.study_set_id != study_set_id {
+                return Err(PortError::conflict(
+                    "memory",
+                    voice_session_id,
+                    "voice session ownership cannot be changed",
+                ));
             }
-        };
-        self.save(&VoiceSessionRecord::from_config(config)).await?;
+            if session.status != "open" {
+                return Err(PortError::conflict(
+                    "memory",
+                    voice_session_id,
+                    "closed voice session cannot be reopened",
+                ));
+            }
+        }
+        #[cfg(test)]
+        self.pause_hook(MutationSite::VoiceSession);
         // The outcome reports the physical truth this backend can see: the row
         // already existed, or it did not.
-        Ok(if replayed {
-            StudyStoreWriteOutcome::IdempotentReplay
-        } else {
-            StudyStoreWriteOutcome::Inserted
-        })
+        match existing {
+            Some(index) => {
+                // In place, never remove-and-push: the committed insertion
+                // position is this backend's recency ordinal (`DATA-011`), exactly
+                // as Postgres preserves `started_at` across a replay.
+                state.sessions[index] = record;
+                Ok(StudyStoreWriteOutcome::IdempotentReplay)
+            }
+            None => {
+                state.sessions.push(record);
+                Ok(StudyStoreWriteOutcome::Inserted)
+            }
+        }
     }
 
     async fn claim_session_token_nonce(
@@ -3732,12 +3894,6 @@ impl StudyMemoryStore for InMemoryStudyStore {
         envelope
             .validate_fail_closed()
             .map_err(|reason| PortError::invalid_input("memory", &envelope.response_id, reason))?;
-        {
-            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
-            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-            Self::active_question_source_locked(study_set, &state, user_id, &envelope.question_id)?;
-        }
         let persisted = PersistedAnswerAttemptEnvelope::from(&envelope);
         let record = AnswerAttemptRecord {
             user_id: user_id.to_owned(),
@@ -3749,7 +3905,13 @@ impl StudyMemoryStore for InMemoryStudyStore {
         };
         let result = serde_json::to_value(&record)
             .map_err(|error| json_invariant("study_store_record", &error))?;
+        // `DATA-012`: validate against the same locked state the mutation writes.
         let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        {
+            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+            Self::active_question_source_locked(study_set, &state, user_id, &envelope.question_id)?;
+        }
         if let Some(existing) = state.answer_attempts.iter_mut().find(|existing| {
             existing.user_id == user_id
                 && existing.study_set_id == study_set_id
@@ -3781,19 +3943,6 @@ impl StudyMemoryStore for InMemoryStudyStore {
         evaluation.validate_fail_closed().map_err(|reason| {
             PortError::invalid_input("memory", &evaluation.question_id, reason)
         })?;
-        let canonical_source = {
-            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
-            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-            Self::active_question_source_locked(study_set, &state, user_id, &evaluation.question_id)
-        }?;
-        if canonical_source != evaluation.source {
-            return Err(PortError::invalid_input(
-                "memory",
-                &evaluation.question_id,
-                "answer evaluation source tuple does not match active question source",
-            ));
-        }
         let persisted_evaluation = PersistedAnswerEvaluation::from(&evaluation);
         let authorization = event_authorization_record(
             "memory",
@@ -3804,7 +3953,29 @@ impl StudyMemoryStore for InMemoryStudyStore {
             EventAuthorizationKind::AnswerEvaluation,
             &evaluation,
         )?;
+        // `DATA-012`: one write lock spans the validation and the write, so a
+        // deletion that commits first cannot be followed by a late attempt row or
+        // a late authorization digest.
         let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        let canonical_source = {
+            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+            Self::active_question_source_locked(
+                study_set,
+                &state,
+                user_id,
+                &evaluation.question_id,
+            )?
+        };
+        if canonical_source != evaluation.source {
+            return Err(PortError::invalid_input(
+                "memory",
+                &evaluation.question_id,
+                "answer evaluation source tuple does not match active question source",
+            ));
+        }
+        #[cfg(test)]
+        self.pause_hook(MutationSite::AnswerEvaluation);
         let result = if let Some(existing) = state.answer_attempts.iter_mut().find(|record| {
             record.user_id == user_id
                 && record.study_set_id == study_set_id
@@ -3883,12 +4054,6 @@ impl StudyMemoryStore for InMemoryStudyStore {
         concept_id: &str,
         status: ConceptStatus,
     ) -> Result<ConceptStatus, PortError> {
-        {
-            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
-            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-            Self::ensure_concept_locked(study_set, &state, concept_id)?;
-        }
         let record = ConceptStatusRecord {
             user_id: user_id.to_owned(),
             study_set_id: study_set_id.to_owned(),
@@ -3909,7 +4074,13 @@ impl StudyMemoryStore for InMemoryStudyStore {
             EventAuthorizationKind::ConceptStatus,
             &payload,
         )?;
+        // `DATA-012`: validate against the same locked state the mutation writes.
         let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        {
+            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+            Self::ensure_concept_locked(study_set, &state, concept_id)?;
+        }
         if state.event_authorizations.contains(&authorization) {
             return Ok(status);
         }
@@ -3932,12 +4103,6 @@ impl StudyMemoryStore for InMemoryStudyStore {
         concept_id: &str,
         due_at: &str,
     ) -> Result<Value, PortError> {
-        {
-            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
-            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-            Self::ensure_concept_locked(study_set, &state, concept_id)?;
-        }
         let record = ReviewItemRecord {
             user_id: user_id.to_owned(),
             study_set_id: study_set_id.to_owned(),
@@ -3947,7 +4112,13 @@ impl StudyMemoryStore for InMemoryStudyStore {
         };
         let result = serde_json::to_value(&record)
             .map_err(|error| json_invariant("study_store_record", &error))?;
+        // `DATA-012`: validate against the same locked state the mutation writes.
         let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        {
+            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+            Self::ensure_concept_locked(study_set, &state, concept_id)?;
+        }
         if !state.review_items.contains(&record) {
             state.review_items.push(record);
         }
@@ -4046,22 +4217,6 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 "recap session does not match authorized session",
             ));
         }
-        {
-            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
-            Self::study_set_locked(&state, user_id, study_set_id)?;
-            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-        }
-        for moment in &recap.source_moments {
-            let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
-            Self::source_reference_locked(&state, user_id, study_set_id, &moment.source_id)
-                .ok_or_else(|| {
-                    PortError::unavailable(
-                        "memory",
-                        moment.source_id.clone(),
-                        "recap source reference is not available for this user and study set",
-                    )
-                })?;
-        }
         let record = RecapRecord {
             user_id: user_id.to_owned(),
             study_set_id: study_set_id.to_owned(),
@@ -4079,17 +4234,66 @@ impl StudyMemoryStore for InMemoryStudyStore {
         )?;
         let result = serde_json::to_value(&record)
             .map_err(|error| json_invariant("study_store_record", &error))?;
-        {
-            let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
-            state.recaps.retain(|existing| {
-                existing.user_id != record.user_id
-                    || existing.study_set_id != record.study_set_id
-                    || existing.voice_session_id != record.voice_session_id
-            });
-            state.recaps.push(record);
-            state.event_authorizations.insert(authorization);
+        // `DATA-012`: one write lock spans the set/session/source validation and
+        // the write. The previous shape took a fresh read lock per source moment,
+        // so a deletion could commit between two of them.
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        Self::study_set_locked(&state, user_id, study_set_id)?;
+        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+        for moment in &recap.source_moments {
+            Self::source_reference_locked(&state, user_id, study_set_id, &moment.source_id)
+                .ok_or_else(|| {
+                    PortError::unavailable(
+                        "memory",
+                        moment.source_id.clone(),
+                        "recap source reference is not available for this user and study set",
+                    )
+                })?;
         }
+        state.recaps.retain(|existing| {
+            existing.user_id != record.user_id
+                || existing.study_set_id != record.study_set_id
+                || existing.voice_session_id != record.voice_session_id
+        });
+        state.recaps.push(record);
+        state.event_authorizations.insert(authorization);
         Ok(result)
+    }
+
+    /// `DATA-010` for this backend: the session-status check and the usage append
+    /// happen under one state write lock, which is the same lock both deletion
+    /// paths hold while they mutate session status and remove artifacts.
+    ///
+    /// That leaves exactly two serial orders — usage commits and the deletion then
+    /// removes it, or the deletion commits and usage observes `deleted` and writes
+    /// nothing. Usage carries no stable event identity, so an accepted write is
+    /// always a real `Inserted`; this backend never reports a replay it cannot
+    /// identify.
+    async fn record_voice_usage(
+        &self,
+        event: VoiceUsageRecord,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
+        let record = PersistedVoiceUsage::from(&event);
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        if let Some(voice_session_id) = record.voice_session_id.as_deref() {
+            let status = state
+                .sessions
+                .iter()
+                .find(|session| session.voice_session_id == voice_session_id)
+                .map(|session| session.status.as_str());
+            if status == Some("deleted") {
+                // No record was written, so neither write outcome is true here.
+                return Err(PortError::conflict(
+                    "memory",
+                    voice_session_id,
+                    "voice session was deleted before usage could be recorded",
+                ));
+            }
+        }
+        #[cfg(test)]
+        self.pause_hook(MutationSite::VoiceUsage);
+        state.voice_usage_events.push(record);
+        Ok(StudyStoreWriteOutcome::Inserted)
     }
 
     /// `LEARN-003`/Task 6: the canonical outcome, its concept transitions, its
@@ -4144,6 +4348,8 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 Self::ensure_concept_locked(study_set, &state, &transition.concept_id)?;
             }
         }
+        #[cfg(test)]
+        self.pause_hook(MutationSite::TurnOutcome);
 
         // Replay or conflict, decided on the canonical digest.
         if let Some(existing) = state.turn_outcomes.iter().find(|record| {
@@ -6708,6 +6914,439 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Task 7 (`DATA-012`)
+    //
+    // Every in-memory check-and-mutate path has to hold one state write lock
+    // across its validation and its mutation. The tests below arm the
+    // deterministic pause between the two halves, run the racing operation, and
+    // assert the *final committed state* — a validate-then-mutate method lets
+    // the racer finish inside the gap and then writes on top of it.
+    // ------------------------------------------------------------------
+
+    /// Runs `wait_until_paused` off the async runtime: it blocks a thread, and the
+    /// mutation it waits for is blocking a worker thread of its own.
+    async fn await_pause(handle: MutationPauseHandle) -> MutationPauseHandle {
+        tokio::task::spawn_blocking(move || {
+            handle.wait_until_paused();
+            handle
+        })
+        .await
+        .expect("pause waiter joins")
+    }
+
+    fn fixture_usage_record(voice_session_id: Option<&str>) -> agent_domain::VoiceUsageRecord {
+        agent_domain::VoiceUsageRecord {
+            voice_session_id: voice_session_id.map(ToOwned::to_owned),
+            provider: "synthetic".to_owned(),
+            model: "synthetic-viva".to_owned(),
+            duration_seconds: 2,
+            text_input_tokens: 20,
+            text_output_tokens: 10,
+            audio_input_tokens: 0,
+            audio_output_tokens: 0,
+            cost_estimate_usd: 0.000_02,
+            first_audio_latency_ms: None,
+            answer_eval_latency_ms: Some(1),
+            source_retrieval_latency_ms: None,
+            source_grounded_correction_count: 1,
+        }
+    }
+
+    /// One evaluated turn for the seeded fixture's own question and concepts.
+    fn fixture_turn_outcome(response_id: &str) -> TurnOutcome {
+        let question = fixture_question();
+        let criterion_id = question.rubric.criteria[0].criterion_id.clone();
+        TurnOutcome {
+            schema: VIVA_TURN_OUTCOME_SCHEMA.to_owned(),
+            response_id: response_id.to_owned(),
+            question_id: question.question_id.clone(),
+            rubric_policy_version: question.rubric.policy_version.clone(),
+            recorded_at: "2031-04-05T12:00:00.000Z".to_owned(),
+            source_ids: vec![question.source.source_id.clone()],
+            supersedes_response_id: None,
+            resolution: TurnResolution::Evaluated {
+                label: agent_domain::EvaluationLabel::MostlyCorrect,
+                confidence: 0.84,
+                assessments: vec![agent_domain::CriterionAssessment {
+                    criterion_id: criterion_id.clone(),
+                    assessment: agent_domain::CriterionAssessmentKind::Satisfied,
+                    confidence: 0.84,
+                }],
+                concept_transitions: vec![ConceptStatusTransition {
+                    concept_id: "oxidative-phosphorylation".to_owned(),
+                    from_status: ConceptStatus::Shaky,
+                    to_status: ConceptStatus::Strong,
+                    criterion_ids: vec![criterion_id],
+                }],
+                concise_feedback: "Grounded in the seeded source.".to_owned(),
+                retry_prompt: None,
+                disposition: QuestionDisposition::Advance,
+            },
+        }
+    }
+
+    /// A session write that validated while the session was open must not resurrect
+    /// it after a close that committed in between.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_close_and_session_replay_cannot_reopen_closed_session() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+
+        let pause = store.pause_at(MutationSite::VoiceSession);
+        let replay_store = Arc::clone(&store);
+        let replay = tokio::spawn(async move {
+            replay_store
+                .record_voice_session(&fixture_session_config())
+                .await
+        });
+        let pause = await_pause(pause).await;
+
+        let close_store = Arc::clone(&store);
+        let close = tokio::spawn(async move {
+            close_store
+                .close_voice_session("voice-session-1", "completed")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        pause.release();
+
+        let replayed = replay
+            .await
+            .expect("session replay joins")
+            .expect("replaying an open session succeeds");
+        let closed = close
+            .await
+            .expect("close joins")
+            .expect("closing the session succeeds");
+
+        assert_eq!(replayed, StudyStoreWriteOutcome::IdempotentReplay);
+        assert_eq!(closed["status"], "closed");
+
+        let state = store.snapshot();
+        let session = state
+            .sessions
+            .iter()
+            .find(|session| session.voice_session_id == "voice-session-1")
+            .expect("the fixture session row still exists");
+        assert_eq!(
+            session.status, "closed",
+            "a replayed session write must never reopen a closed session"
+        );
+        assert_eq!(session.terminal_reason.as_deref(), Some("completed"));
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(store.write_counts().sessions, 1);
+    }
+
+    /// An evaluation that validated before a deletion must not append after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_delete_and_answer_evaluation_cannot_leave_late_artifact() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+
+        let pause = store.pause_at(MutationSite::AnswerEvaluation);
+        let evaluation_store = Arc::clone(&store);
+        let evaluation = fixture_evaluation(&fixture_question());
+        let write = tokio::spawn(async move {
+            evaluation_store
+                .record_answer_evaluation(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    "response-race",
+                    evaluation,
+                )
+                .await
+        });
+        let pause = await_pause(pause).await;
+
+        let delete_store = Arc::clone(&store);
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_study_set("user-1", "biology-midterm")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        pause.release();
+
+        let _ = write.await.expect("evaluation joins");
+        delete
+            .await
+            .expect("delete joins")
+            .expect("study set deletion succeeds");
+
+        let state = store.snapshot();
+        assert!(
+            state.answer_attempts.is_empty(),
+            "deletion must not be followed by a late answer attempt: {:?}",
+            state.answer_attempts
+        );
+        assert!(
+            state.event_authorizations.is_empty(),
+            "deletion must not be followed by a late authorization digest"
+        );
+        assert_eq!(store.write_counts().answer_attempts, 0);
+    }
+
+    /// The same race for Plan 04's canonical outcome, its transitions, its
+    /// progression cursor, its schedule, and its digests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_delete_and_turn_outcome_cannot_leave_late_artifact() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+
+        let pause = store.pause_at(MutationSite::TurnOutcome);
+        let outcome_store = Arc::clone(&store);
+        let write = tokio::spawn(async move {
+            outcome_store
+                .record_turn_outcome(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    fixture_turn_outcome("response-race"),
+                )
+                .await
+        });
+        let pause = await_pause(pause).await;
+
+        let delete_store = Arc::clone(&store);
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_study_set("user-1", "biology-midterm")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        pause.release();
+
+        let _ = write.await.expect("turn outcome joins");
+        delete
+            .await
+            .expect("delete joins")
+            .expect("study set deletion succeeds");
+
+        let state = store.snapshot();
+        assert!(
+            state.turn_outcomes.is_empty(),
+            "deletion must not be followed by a late turn outcome"
+        );
+        assert!(
+            state.question_progressions.is_empty(),
+            "deletion must not be followed by a late progression cursor"
+        );
+        assert!(
+            state.review_schedule_decisions.is_empty(),
+            "deletion must not be followed by a late review schedule decision"
+        );
+        assert!(
+            state.event_authorizations.is_empty(),
+            "deletion must not be followed by a late authorization digest"
+        );
+    }
+
+    /// `DATA-010` for this backend: usage and session deletion serialize, and the
+    /// order that ends deleted ends with no usage record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_voice_usage_and_session_delete_serialize_to_no_usage_record() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+
+        let pause = store.pause_at(MutationSite::VoiceUsage);
+        let usage_store = Arc::clone(&store);
+        let usage = tokio::spawn(async move {
+            usage_store
+                .record_voice_usage(fixture_usage_record(Some("voice-session-1")))
+                .await
+        });
+        let pause = await_pause(pause).await;
+
+        let delete_store = Arc::clone(&store);
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_session_history("user-1", "biology-midterm", "voice-session-1")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        pause.release();
+
+        let _ = usage.await.expect("usage joins");
+        delete
+            .await
+            .expect("delete joins")
+            .expect("session history deletion succeeds");
+
+        assert_eq!(
+            store.write_counts().voice_usage,
+            0,
+            "a deleted session must end with no usage record"
+        );
+
+        // The other serial order: usage that arrives after the deletion is a
+        // typed conflict, not a silent success.
+        let late = store
+            .record_voice_usage(fixture_usage_record(Some("voice-session-1")))
+            .await
+            .expect_err("usage for a deleted session is refused");
+        assert_eq!(late.kind(), PortErrorKind::Conflict);
+        assert_eq!(store.write_counts().voice_usage, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_voice_usage_and_study_delete_serialize_to_no_usage_record() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+
+        let pause = store.pause_at(MutationSite::VoiceUsage);
+        let usage_store = Arc::clone(&store);
+        let usage = tokio::spawn(async move {
+            usage_store
+                .record_voice_usage(fixture_usage_record(Some("voice-session-1")))
+                .await
+        });
+        let pause = await_pause(pause).await;
+
+        let delete_store = Arc::clone(&store);
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_study_set("user-1", "biology-midterm")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        pause.release();
+
+        let _ = usage.await.expect("usage joins");
+        delete
+            .await
+            .expect("delete joins")
+            .expect("study set deletion succeeds");
+
+        assert_eq!(
+            store.write_counts().voice_usage,
+            0,
+            "a deleted study set must end with no usage record"
+        );
+
+        let late = store
+            .record_voice_usage(fixture_usage_record(Some("voice-session-1")))
+            .await
+            .expect_err("usage after study set deletion is refused");
+        assert_eq!(late.kind(), PortErrorKind::Conflict);
+        assert_eq!(store.write_counts().voice_usage, 0);
+    }
+
+    /// Eight racers replaying byte-identical writes leave exactly one of each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn memory_concurrent_identical_replays_keep_every_count_exact() {
+        const RACERS: usize = 8;
+
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+        assert_eq!(
+            store
+                .record_voice_usage(fixture_usage_record(Some("voice-session-1")))
+                .await
+                .expect("usage is recorded by this backend"),
+            StudyStoreWriteOutcome::Inserted
+        );
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
+        let mut handles = Vec::with_capacity(RACERS);
+        for _ in 0..RACERS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                assert_eq!(
+                    store
+                        .record_voice_session(&fixture_session_config())
+                        .await
+                        .expect("session replay succeeds"),
+                    StudyStoreWriteOutcome::IdempotentReplay
+                );
+                store
+                    .record_answer_evaluation(
+                        "user-1",
+                        "biology-midterm",
+                        "voice-session-1",
+                        "response-replay",
+                        fixture_evaluation(&fixture_question()),
+                    )
+                    .await
+                    .expect("evaluation replay succeeds");
+                store
+                    .record_concept_status(
+                        "user-1",
+                        "biology-midterm",
+                        "voice-session-1",
+                        "response-replay",
+                        "nadh",
+                        ConceptStatus::Strong,
+                    )
+                    .await
+                    .expect("concept status replay succeeds");
+                store
+                    .schedule_review_item(
+                        "user-1",
+                        "biology-midterm",
+                        "voice-session-1",
+                        "atp-synthase",
+                        "2031-04-07T12:00:00.000Z",
+                    )
+                    .await
+                    .expect("review item replay succeeds");
+                store
+                    .record_recap(
+                        "user-1",
+                        "biology-midterm",
+                        "voice-session-1",
+                        "response-replay",
+                        fixture_recap(),
+                    )
+                    .await
+                    .expect("recap replay succeeds");
+                store
+                    .record_turn_outcome(
+                        "user-1",
+                        "biology-midterm",
+                        "voice-session-1",
+                        fixture_turn_outcome("response-replay-outcome"),
+                    )
+                    .await
+                    .expect("turn outcome replay succeeds");
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("racer joins");
+        }
+
+        let counts = store.write_counts();
+        assert_eq!(
+            counts,
+            StudyStoreWriteCounts {
+                sessions: 1,
+                answer_attempts: 1,
+                concept_statuses: 1,
+                // Two distinct concepts are scheduled exactly once each: the
+                // explicit `atp-synthase` call, and the graded transition on
+                // `oxidative-phosphorylation` that the turn outcome schedules
+                // under D-01 `SERVER_PERSISTED_FSRS`.
+                review_items: 2,
+                recaps: 1,
+                voice_usage: 1,
+            }
+        );
+
+        let state = store.snapshot();
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.answer_attempts.len(), 1);
+        assert_eq!(state.concept_statuses.len(), 1);
+        assert_eq!(state.review_items.len(), 2);
+        assert_eq!(state.review_schedule_decisions.len(), 1);
+        assert_eq!(state.recaps.len(), 1);
+        assert_eq!(state.turn_outcomes.len(), 1);
+        assert_eq!(state.question_progressions.len(), 1);
+        assert_eq!(state.voice_usage_events.len(), 1);
     }
 }
 
