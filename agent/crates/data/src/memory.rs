@@ -1272,9 +1272,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         }
         let status = session.status.clone();
         let terminal_reason = session.terminal_reason.clone();
-        state
-            .event_authorizations
-            .retain(|record| record.voice_session_id != voice_session_id);
+        authorization::evict_session_locked(&mut state, voice_session_id);
         Ok(json!({
             "voice_session_id": voice_session_id,
             "status": status,
@@ -1320,7 +1318,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         // `deleted_at IS NULL`; without this, one backend answered a deleted set's
         // context with its scrubbed tombstone — content-free, but still an
         // existence answer the other backend refuses to give.
-        if state.deleted_study_sets.contains_key(study_set_id) {
+        if privacy::is_deleted_locked(&state, study_set_id) {
             return Ok(None);
         }
         let documents = state
@@ -1387,11 +1385,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             // `DATA-004`: the library is an active read, so a tombstone is not in
             // it. Under `HARD_PURGE_TEXT` the tombstone exists only to keep a
             // repeated delete idempotent and to stop a seed recreating the set.
-            .filter(|study_set| {
-                !state
-                    .deleted_study_sets
-                    .contains_key(&study_set.study_set_id)
-            })
+            .filter(|study_set| !privacy::is_deleted_locked(&state, &study_set.study_set_id))
             .map(|study_set| {
                 let mut documents = state
                     .documents
@@ -1819,7 +1813,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             state.answer_attempts.push(record);
             result
         };
-        state.event_authorizations.insert(authorization);
+        authorization::record_locked(&mut state, authorization);
         Ok(result)
     }
 
@@ -1884,7 +1878,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             concept.status = status.clone();
         }
         state.concept_statuses.push(record);
-        state.event_authorizations.insert(authorization);
+        authorization::record_locked(&mut state, authorization);
         Ok(status)
     }
 
@@ -2001,7 +1995,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 || existing.voice_session_id != record.voice_session_id
         });
         state.recaps.push(record);
-        state.event_authorizations.insert(authorization);
+        authorization::record_locked(&mut state, authorization);
         Ok(result)
     }
 

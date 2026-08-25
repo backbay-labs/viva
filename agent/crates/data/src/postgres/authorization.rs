@@ -190,6 +190,23 @@ impl PostgresStudyStore {
     }
 }
 
+/// Remove one session's authorization digests inside the caller's transaction.
+///
+/// `DATA-005`: session close ends browser authority in the same transaction that
+/// closes the session, so an *open* session may resume across a restart or on a
+/// second instance while a closed one cannot replay browser authority anywhere.
+pub(super) async fn delete_session_digests(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    voice_session_uuid: Uuid,
+) -> Result<(), PortError> {
+    sqlx::query("DELETE FROM event_authorization_digests WHERE voice_session_id = $1")
+        .bind(voice_session_uuid)
+        .execute(&mut **tx)
+        .await
+        .map_err(pg_error)?;
+    Ok(())
+}
+
 /// The six authorization port bodies. `postgres.rs` keeps the trait signatures;
 /// the durable digest comparison that decides whether a browser event is
 /// authoritative lives here.

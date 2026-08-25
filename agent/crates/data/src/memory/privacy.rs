@@ -189,6 +189,15 @@ pub(super) fn remove_session_artifacts(
     });
 }
 
+/// Whether this set has been deleted, under the caller's already-held state
+/// lock.
+///
+/// `DATA-004`: the one place a read path asks "is this a tombstone?", so every
+/// projection excludes a deleted set for the same reason and by the same test.
+pub(super) fn is_deleted_locked(state: &InMemoryStudyState, study_set_id: &str) -> bool {
+    state.deleted_study_sets.contains_key(study_set_id)
+}
+
 /// The privacy port bodies. `memory.rs` keeps the trait signatures; the locked
 /// deletion, the usage/delete serialization, and the receipt live here.
 pub(super) fn delete_study_set(

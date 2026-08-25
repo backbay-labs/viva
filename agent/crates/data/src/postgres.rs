@@ -558,11 +558,7 @@ impl StudyMemoryStore for PostgresStudyStore {
                 row.try_get("terminal_reason").map_err(pg_error)?,
             )
         };
-        sqlx::query("DELETE FROM event_authorization_digests WHERE voice_session_id = $1")
-            .bind(voice_session_uuid)
-            .execute(&mut *tx)
-            .await
-            .map_err(pg_error)?;
+        authorization::delete_session_digests(&mut tx, voice_session_uuid).await?;
         tx.commit().await.map_err(pg_error)?;
         Ok(json!({
             "voice_session_id": voice_session_id,

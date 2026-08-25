@@ -197,6 +197,26 @@ impl InMemoryStudyStore {
     }
 }
 
+/// Record one authorization under the caller's already-held state write lock.
+///
+/// `DATA-005`: the digest and the domain record it authorizes are committed by
+/// the same locked mutation, and the collection deduplicates, so an identical
+/// replay cannot grow it.
+pub(super) fn record_locked(state: &mut InMemoryStudyState, record: EventAuthorizationRecord) {
+    state.event_authorizations.insert(record);
+}
+
+/// End one session's browser authority, under the caller's already-held state
+/// write lock.
+///
+/// `DATA-005`: an *open* session may resume across a restart or on a second
+/// instance; a closed or deleted one may not replay browser authority anywhere.
+pub(super) fn evict_session_locked(state: &mut InMemoryStudyState, voice_session_id: &str) {
+    state
+        .event_authorizations
+        .retain(|record| record.voice_session_id != voice_session_id);
+}
+
 /// The six authorization port bodies. `memory.rs` keeps the trait signatures; the
 /// digest comparison that decides whether a browser event is authoritative lives
 /// here.
