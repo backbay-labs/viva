@@ -413,9 +413,17 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     Boolean(agent.agentState.pendingSubmission) ||
     agent.derived.phase === "thinking";
   const showCorrection = Boolean(correction) && !retrying;
+  const webInstrumentation = {
+    dataSet: { vivaSpeaking: agent.speaking ? "true" : "false" },
+  };
 
   return (
-    <SafeAreaView edges={["top", "left", "right", "bottom"]} style={styles.safeArea}>
+    <SafeAreaView
+      {...webInstrumentation}
+      edges={["top", "left", "right", "bottom"]}
+      style={styles.safeArea}
+      testID="session-live-root"
+    >
       <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : undefined}
         onTouchStart={unlockPlayback}

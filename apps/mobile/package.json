@@ -48,6 +48,7 @@
     "ios": "expo run:ios",
     "web": "expo start --web",
     "build": "expo export --platform web",
+    "e2e:live": "node scripts/e2e-live-loop.mjs",
     "lint": "biome check src app.json package.json tsconfig.json",
     "test": "bun test src",
     "typecheck": "tsc --noEmit"
