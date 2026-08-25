@@ -2126,7 +2126,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         let sonic = json!({
             "type": "chunk",
             "context_id": response_id,
-            "data": fake_examiner_tone_pcm16_base64(),
+            "data": encoded_fake_examiner_tone(),
         });
         let Some(SonicEvent::Audio { pcm16_base64, .. }) = parse_sonic_event(&sonic.to_string())
         else {
@@ -2170,7 +2170,7 @@ pub fn fake_examiner_tone_pcm16() -> Vec<u8> {
     bytes
 }
 
-fn fake_examiner_tone_pcm16_base64() -> String {
+fn encoded_fake_examiner_tone() -> String {
     BASE64_STANDARD.encode(fake_examiner_tone_pcm16())
 }
 
