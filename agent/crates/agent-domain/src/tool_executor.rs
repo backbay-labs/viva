@@ -200,9 +200,9 @@ impl VivaToolExecutor {
     /// Progression is a persisted, session-scoped cursor, so this asks the store
     /// for the authorized selection under the selected `OrderedV1` policy and
     /// reports exactly what came back. It never calls the global
-    /// [`Self::active_question`] shortcut, which answers with the study set's
-    /// first active question and therefore cannot advance, retry, resume, or
-    /// exhaust a session.
+    /// [`StudyMemoryStore::active_question`] shortcut, which answers with the
+    /// study set's first active question and therefore cannot advance, retry,
+    /// resume, or exhaust a session.
     ///
     /// The authorized response identity is the idempotency source: the store
     /// authorizes one selection per response, so a replay — or two callers racing
@@ -232,6 +232,19 @@ impl VivaToolExecutor {
     /// recording instant, previous statuses, and retry disposition are all read
     /// back from server-owned state, and only the criterion-level verdicts come
     /// from the injected [`AnswerEvaluator`].
+    ///
+    /// A new turn's question comes from this session's own progression cursor,
+    /// never from the study set's global [`StudyMemoryStore::active_question`]
+    /// shortcut. `LEARN-004B` made progression a per-session cursor, so the
+    /// shortcut — which takes no session and answers with the study set's first
+    /// active question — names the right question only until the cursor first
+    /// advances. Gating an answer on it would refuse the second answer of every
+    /// session.
+    ///
+    /// A replay is not a new turn and is not re-gated on the cursor: it is bound
+    /// from the outcome already persisted under its response id, because that
+    /// turn's own disposition is what moved the cursor off the question it
+    /// answered. See [`Self::turn_question`].
     async fn evaluate_spoken_answer(
         &self,
         response_id: &str,
@@ -242,18 +255,10 @@ impl VivaToolExecutor {
         let transcript_confidence =
             optional_confidence_arg(proposal.arguments(), "transcript_confidence")?;
 
-        let question = self.active_question().await?;
-        if question.question_id != question_id {
-            return Err(ToolExecutionError::InvalidArguments(format!(
-                "question `{question_id}` is not active"
-            )));
-        }
-        validate_authorized_rubric(&question)?;
-        let source_ids = authorized_source_ids(&question.rubric);
-
-        // One session-evidence read serves three server-owned bindings: the
-        // replay identity, the previous concept statuses, and the challenged
-        // outcome a replacement may supersede.
+        // One session-evidence read serves four server-owned bindings: the
+        // authorized question this turn may grade, the replay identity, the
+        // previous concept statuses, and the challenged outcome a replacement may
+        // supersede.
         let evidence = self
             .store
             .session_learning_evidence(
@@ -263,6 +268,11 @@ impl VivaToolExecutor {
             )
             .await?;
         let recorded = RecordedResponse::find(&evidence, response_id);
+        let question = self
+            .turn_question(&evidence, &recorded, response_id, &question_id)
+            .await?;
+        validate_authorized_rubric(&question)?;
+        let source_ids = authorized_source_ids(&question.rubric);
         let supersedes_response_id =
             bind_supersedes(proposal.arguments(), &evidence, &question.question_id)?;
         let prior_statuses = self
@@ -582,17 +592,81 @@ impl VivaToolExecutor {
             })
     }
 
-    async fn active_question(&self) -> Result<StudyQuestion, ToolExecutionError> {
-        let mut question = self
-            .store
-            .active_question(&self.session.user_id, &self.session.study_set_id)
-            .await?
-            .ok_or_else(|| {
-                ToolExecutionError::Unavailable(format!(
-                    "no active generated question is available for study set `{}`",
-                    self.session.study_set_id
-                ))
-            })?;
+    /// The question this turn is authorized to grade, bound from the session's
+    /// own persisted state.
+    ///
+    /// Two facts are server-owned here and neither comes from the proposal: which
+    /// question this turn may grade, and what that question's rubric says. The
+    /// caller's `question_id` is only ever checked against the server's answer,
+    /// never used to choose it.
+    ///
+    /// Which server fact answers depends on whether this is a new turn:
+    ///
+    /// - a **new turn** is gated on the session's progression cursor. A question
+    ///   the cursor is not on, or a session on no question at all, refuses the
+    ///   turn rather than grading an answer against a question the server did
+    ///   not ask;
+    /// - a **replay** — a response id this session has already recorded an
+    ///   outcome under — is bound from that outcome instead. Its question was
+    ///   authorized when the outcome was persisted, and that same turn's
+    ///   disposition is what moved the cursor off it, so re-gating the
+    ///   redelivery on the cursor would refuse exactly the deliveries
+    ///   idempotency exists to absorb. The recorded identity is authoritative:
+    ///   a redelivery naming a different question is refused, not accepted as a
+    ///   second turn under one response id.
+    ///
+    /// A replay still rebuilds its payload from the rubric it was graded by, so
+    /// the store keeps its per-response payload guard: a *changed* payload under
+    /// a recorded response id fails closed exactly as before, rather than being
+    /// handed the persisted outcome on trust.
+    ///
+    /// The source tuple is re-resolved through deterministic retrieval, so a
+    /// stored question citing a source this session cannot retrieve fails closed
+    /// instead of carrying an unverified citation into a persisted outcome.
+    async fn turn_question(
+        &self,
+        evidence: &SessionLearningEvidence,
+        recorded: &RecordedResponse<'_>,
+        response_id: &str,
+        question_id: &str,
+    ) -> Result<StudyQuestion, ToolExecutionError> {
+        let mut question = match recorded.question_id {
+            Some(recorded_question_id) => {
+                if recorded_question_id != question_id {
+                    return Err(ToolExecutionError::InvalidArguments(format!(
+                        "response `{response_id}` already recorded an outcome for question \
+                         `{recorded_question_id}`, so `{question_id}` cannot be answered under it"
+                    )));
+                }
+                evidence
+                    .answered_questions
+                    .iter()
+                    .find(|question| question.question_id == recorded_question_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ToolExecutionError::Unavailable(format!(
+                            "session `{}` cannot rebind question `{recorded_question_id}` to \
+                             replay response `{response_id}`",
+                            self.session.voice_session_id
+                        ))
+                    })?
+            }
+            None => {
+                let current = evidence.current_question.as_ref().ok_or_else(|| {
+                    ToolExecutionError::Unavailable(format!(
+                        "session `{}` is not on a question, so `{question_id}` cannot be answered",
+                        self.session.voice_session_id
+                    ))
+                })?;
+                if current.question_id != question_id {
+                    return Err(ToolExecutionError::InvalidArguments(format!(
+                        "question `{question_id}` is not the question session `{}` is on",
+                        self.session.voice_session_id
+                    )));
+                }
+                current.clone()
+            }
+        };
         question.source = self.canonical_source(&question.source.source_id).await?;
         Ok(question)
     }
@@ -799,11 +873,15 @@ fn validate_authorized_rubric(question: &StudyQuestion) -> Result<(), ToolExecut
 /// The stable server-owned half of a response that was already graded once.
 ///
 /// A replay re-derives the graded facts from the same authorized inputs and must
-/// reproduce the persisted outcome exactly, so the recording instant and the
-/// previous concept statuses come from the stored row rather than from a later
-/// clock read or from a status this very response already moved.
+/// reproduce the persisted outcome exactly, so the question, the recording
+/// instant, and the previous concept statuses come from the stored row rather
+/// than from a cursor that has since advanced, a later clock read, or a status
+/// this very response already moved.
 #[derive(Default)]
 struct RecordedResponse<'a> {
+    /// The question the persisted outcome was graded against. `None` means this
+    /// response id has recorded no outcome yet, so the turn is a new one.
+    question_id: Option<&'a str>,
     recorded_at: Option<&'a str>,
     from_statuses: BTreeMap<&'a str, ConceptStatus>,
 }
@@ -831,6 +909,7 @@ impl<'a> RecordedResponse<'a> {
             }
         }
         Self {
+            question_id: Some(outcome.question_id.as_str()),
             recorded_at: Some(outcome.recorded_at.as_str()),
             from_statuses,
         }

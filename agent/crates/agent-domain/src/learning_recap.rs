@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     learning_outcome::{TurnOutcome, TurnResolution},
-    parse_utc_instant, ConceptStatus,
+    parse_utc_instant, ConceptStatus, StudyQuestion,
 };
 
 /// Exact `StudySessionRecap::schema` value.
@@ -58,6 +58,41 @@ pub struct SessionLearningEvidence {
     pub user_id: String,
     pub study_set_id: String,
     pub voice_session_id: String,
+    /// The question this session's progression cursor is currently on, with the
+    /// server-owned rubric that grades it.
+    ///
+    /// This is the session-scoped counterpart of the study set's global
+    /// `StudyMemoryStore::active_question` shortcut. The shortcut takes no
+    /// session and no cursor, so it always answers with the study set's *first*
+    /// active question; once a session's ordered cursor advances past that
+    /// question the shortcut names a different question than the one the server
+    /// just asked. Only this field tracks the session.
+    ///
+    /// `None` means the session is not on a question — a fresh session before
+    /// its first selection, or an exhausted one. A store that cannot report the
+    /// cursor's question leaves it `None` and the turn fails closed: an answer
+    /// is never graded against a question the server cannot confirm it asked.
+    /// The recap fold ignores this field entirely; a recap stays a pure
+    /// projection of `outcomes`.
+    #[serde(default)]
+    pub current_question: Option<StudyQuestion>,
+    /// The questions this session's persisted `outcomes` were graded against,
+    /// each with the server-owned rubric that graded it.
+    ///
+    /// The cursor names the answer the server is *currently* waiting for, so it
+    /// cannot authorize a redelivery of a turn already recorded: that turn's own
+    /// disposition is what moved the cursor off its question. A replay is bound
+    /// from here instead, which is why this carries the question rather than
+    /// only its identity — the replay recomputes the same payload, so the store
+    /// keeps its per-response payload guard rather than being handed a value it
+    /// must take on trust.
+    ///
+    /// One entry per distinct `question_id` among `outcomes` is enough; order is
+    /// not read. A store that cannot report an entry leaves it out and the
+    /// replay fails closed rather than grading against a question the server
+    /// cannot confirm it asked. The recap fold ignores this field entirely.
+    #[serde(default)]
+    pub answered_questions: Vec<StudyQuestion>,
     pub outcomes: Vec<TurnOutcome>,
     pub concept_labels: Vec<ConceptLabel>,
     pub review_decisions: Vec<ReviewScheduleSummary>,
