@@ -5454,6 +5454,329 @@ mod tests {
             .expect("isolated test schema drops cleanly");
     }
 
+    // ------------------------------------------------------------------
+    // Task 8 (`DATA-011`)
+    //
+    // The two backends have to return Plan 04's typed projection with the same
+    // fields and the same ordering, and the library's completed-session list has
+    // to be in true recency order on both. Every assertion below compares the two
+    // backends against each other over the same driven writes, so a value only one
+    // of them can produce fails.
+    // ------------------------------------------------------------------
+
+    /// The authoritative exam instant both backends project as `exam_label`.
+    const PROJECTION_EXAM_AT: &str = "2031-04-09T18:30:00.000Z";
+
+    /// The two non-lexical session ids the ordering tests use. Sorting them as
+    /// text and ordering them by recency give opposite answers, which is what
+    /// makes the difference observable.
+    const RECENCY_FIRST_SESSION: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const RECENCY_SECOND_SESSION: &str = "11111111-1111-4111-8111-111111111110";
+
+    async fn set_started_at(pool: &sqlx::PgPool, voice_session_id: &str, started_at: &str) {
+        sqlx::query("UPDATE voice_sessions SET started_at = $2 WHERE id = $1")
+            .bind(fixture_uuid(voice_session_id).expect("session UUID"))
+            .bind(agent_domain::parse_utc_instant(started_at).expect("instant parses"))
+            .execute(pool)
+            .await
+            .expect("started_at is pinned for a deterministic ordering proof");
+    }
+
+    async fn open_biology_session(store: &dyn StudyMemoryStore, voice_session_id: &str) {
+        assert_eq!(
+            store
+                .record_voice_session(&SessionConfig {
+                    session_id: Some(SessionId::new(voice_session_id)),
+                    user_id: Some("user-1".to_owned()),
+                    study_set_id: Some("biology-midterm".to_owned()),
+                    mode: Some(StudyMode::Quiz),
+                    ..SessionConfig::default()
+                })
+                .await
+                .expect("session opens"),
+            StudyStoreWriteOutcome::Inserted
+        );
+    }
+
+    fn completed_session_ids(snapshot: &agent_domain::StudyLibrarySnapshot) -> Vec<String> {
+        snapshot
+            .sessions
+            .iter()
+            .map(|session| session.voice_session_id.clone())
+            .collect()
+    }
+
+    /// Plan 04's `AuthenticatedStudyProjectionV1`, built by each backend from its
+    /// own rows, must be the same typed value and the same bytes.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_memory_backend_authenticated_study_projection_is_identical() {
+        let seed = learning_core_seed();
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        seed_learning_core_postgres(&pool, &seed).await;
+        let durable = PostgresStudyStore::new(pool.clone());
+        let volatile = seed_learning_core_memory(&seed);
+
+        // The exam instant is authoritative store context on both backends.
+        sqlx::query("UPDATE study_sets SET exam_at = $2 WHERE id = $1")
+            .bind(fixture_uuid(LEARNING_SET_ID).expect("learning set UUID"))
+            .bind(agent_domain::parse_utc_instant(PROJECTION_EXAM_AT).expect("instant parses"))
+            .execute(&pool)
+            .await
+            .expect("exam instant seeds");
+        volatile.set_study_set_exam_date(LEARNING_SET_ID, Some(PROJECTION_EXAM_AT.to_owned()));
+
+        let session_id = "vs-0001";
+        for store in [&durable as &dyn StudyMemoryStore, &volatile] {
+            open_learning_session(store, session_id).await;
+            let selected = store
+                .select_next_question(
+                    LEARNING_USER_ID,
+                    LEARNING_SET_ID,
+                    session_id,
+                    "resp-projection-1",
+                    ProgressionPolicyId::OrderedV1,
+                )
+                .await
+                .expect("first selection succeeds");
+            let QuestionProgressionResult::Selected { question, .. } = &selected else {
+                panic!("the first ordered selection returns a question: {selected:?}");
+            };
+            assert_eq!(question.question_id, "q-etc-electron-flow");
+            let mut outcome = outcome_named("evaluated_strong");
+            outcome.response_id = "resp-projection-1".to_owned();
+            outcome.question_id = question.question_id.clone();
+            store
+                .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, session_id, outcome)
+                .await
+                .expect("graded outcome persists");
+            // The graded turn advanced, so select again: the projection's active
+            // question is the cursor's current question, and a projection with
+            // none would compare equal for the wrong reason.
+            let advanced = store
+                .select_next_question(
+                    LEARNING_USER_ID,
+                    LEARNING_SET_ID,
+                    session_id,
+                    "resp-projection-2",
+                    ProgressionPolicyId::OrderedV1,
+                )
+                .await
+                .expect("second selection succeeds");
+            let QuestionProgressionResult::Selected { question, .. } = &advanced else {
+                panic!("the second ordered selection returns a question: {advanced:?}");
+            };
+            assert_eq!(question.question_id, "q-gradient-direction");
+        }
+
+        let durable_projection = durable
+            .authenticated_study_projection(LEARNING_USER_ID, LEARNING_SET_ID, session_id)
+            .await
+            .expect("durable projection");
+        let volatile_projection = volatile
+            .authenticated_study_projection(LEARNING_USER_ID, LEARNING_SET_ID, session_id)
+            .await
+            .expect("volatile projection");
+
+        // Not vacuously equal: every part of the projection carries a value.
+        assert_eq!(durable_projection.study_set.id, LEARNING_SET_ID);
+        assert_eq!(
+            durable_projection.study_set.exam_label.as_deref(),
+            Some(PROJECTION_EXAM_AT)
+        );
+        assert_eq!(durable_projection.concepts.len(), seed.concepts.len());
+        assert_eq!(durable_projection.question_progress.total, 3);
+        assert!(durable_projection.active_question.is_some());
+        assert!(!durable_projection.review_schedule.is_empty());
+
+        assert_eq!(durable_projection, volatile_projection);
+        assert_eq!(
+            serde_json::to_string(&durable_projection).expect("projection serializes"),
+            serde_json::to_string(&volatile_projection).expect("projection serializes"),
+        );
+
+        // A reconnect rebuilds the identical projection from the same rows.
+        let reread = PostgresStudyStore::new(pool.clone())
+            .authenticated_study_projection(LEARNING_USER_ID, LEARNING_SET_ID, session_id)
+            .await
+            .expect("reconnect projection");
+        assert_eq!(reread, durable_projection);
+
+        // A tombstoned source is omitted by both backends, so the question bound
+        // to it stops being active on both.
+        sqlx::query("UPDATE study_documents SET deleted_at = NOW() WHERE id = $1")
+            .bind(fixture_uuid("lec5").expect("document UUID"))
+            .execute(&pool)
+            .await
+            .expect("document tombstones");
+        volatile.upsert_document(crate::StudyDocumentRecord {
+            study_set_id: LEARNING_SET_ID.to_owned(),
+            document_id: "lec5".to_owned(),
+            title: "Lecture 5".to_owned(),
+            source_kind: "pdf".to_owned(),
+            processing_status: agent_domain::StudySetIngestionStatus::Ready,
+            tombstoned: true,
+        });
+
+        let durable_after = durable
+            .authenticated_study_projection(LEARNING_USER_ID, LEARNING_SET_ID, session_id)
+            .await
+            .expect("durable projection after tombstone");
+        let volatile_after = volatile
+            .authenticated_study_projection(LEARNING_USER_ID, LEARNING_SET_ID, session_id)
+            .await
+            .expect("volatile projection after tombstone");
+        assert_eq!(
+            durable_after.question_progress.total, 0,
+            "a tombstoned source removes every question bound to it"
+        );
+        assert!(durable_after.active_question.is_none());
+        assert_eq!(durable_after, volatile_after);
+        assert_eq!(
+            serde_json::to_string(&durable_after).expect("projection serializes"),
+            serde_json::to_string(&volatile_after).expect("projection serializes"),
+        );
+
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// The library's completed sessions are ordered by true recency on both
+    /// backends: the *second* session inserted comes first, and an idempotent
+    /// replay of the first one does not move it.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_memory_backend_library_sessions_use_true_recency_order() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let durable = PostgresStudyStore::new(pool.clone());
+        let volatile = crate::InMemoryStudyStore::seeded_fixture();
+
+        for store in [&durable as &dyn StudyMemoryStore, &volatile] {
+            open_biology_session(store, RECENCY_FIRST_SESSION).await;
+            open_biology_session(store, RECENCY_SECOND_SESSION).await;
+            // Between the inserts and the closes, replay the *first* session. A
+            // remove-and-push replay would move it to the end of the in-memory
+            // vector and make it the most recent one.
+            assert_eq!(
+                store
+                    .record_voice_session(&SessionConfig {
+                        session_id: Some(SessionId::new(RECENCY_FIRST_SESSION)),
+                        user_id: Some("user-1".to_owned()),
+                        study_set_id: Some("biology-midterm".to_owned()),
+                        mode: Some(StudyMode::Quiz),
+                        ..SessionConfig::default()
+                    })
+                    .await
+                    .expect("replaying an open session succeeds"),
+                StudyStoreWriteOutcome::IdempotentReplay
+            );
+            for session_id in [RECENCY_FIRST_SESSION, RECENCY_SECOND_SESSION] {
+                store
+                    .close_voice_session(session_id, "completed")
+                    .await
+                    .expect("session closes as completed");
+            }
+        }
+        // The durable ordering key is `started_at`; pin it so the proof is exact.
+        set_started_at(&pool, RECENCY_FIRST_SESSION, "2031-04-05T12:00:00.000Z").await;
+        set_started_at(&pool, RECENCY_SECOND_SESSION, "2031-04-05T12:00:05.000Z").await;
+
+        let durable_library = durable
+            .library_snapshot("user-1")
+            .await
+            .expect("durable library snapshot");
+        let volatile_library = volatile
+            .library_snapshot("user-1")
+            .await
+            .expect("volatile library snapshot");
+
+        assert_eq!(
+            completed_session_ids(&durable_library),
+            vec![
+                RECENCY_SECOND_SESSION.to_owned(),
+                RECENCY_FIRST_SESSION.to_owned()
+            ],
+            "the later session is first"
+        );
+        assert_eq!(
+            completed_session_ids(&volatile_library),
+            completed_session_ids(&durable_library),
+            "both backends order completed sessions by true recency"
+        );
+        assert_eq!(durable_library.sessions, volatile_library.sessions);
+
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// When recency ties, the documented tie-break is the session id, descending.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_memory_backend_tie_breaks_library_order_by_session_id() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let durable = PostgresStudyStore::new(pool.clone());
+        let volatile = crate::InMemoryStudyStore::seeded_fixture();
+
+        for store in [&durable as &dyn StudyMemoryStore, &volatile] {
+            // In memory the equivalent of a durable `started_at` tie is the stable
+            // insertion order the projection contract documents: insert the lower
+            // id first so reverse-insertion and descending id agree.
+            open_biology_session(store, RECENCY_SECOND_SESSION).await;
+            open_biology_session(store, RECENCY_FIRST_SESSION).await;
+            for session_id in [RECENCY_FIRST_SESSION, RECENCY_SECOND_SESSION] {
+                store
+                    .close_voice_session(session_id, "completed")
+                    .await
+                    .expect("session closes as completed");
+            }
+        }
+        // Exactly equal durable start instants, so only the tie-break can order them.
+        for session_id in [RECENCY_FIRST_SESSION, RECENCY_SECOND_SESSION] {
+            set_started_at(&pool, session_id, "2031-04-05T12:00:00.000Z").await;
+        }
+
+        let durable_library = durable
+            .library_snapshot("user-1")
+            .await
+            .expect("durable library snapshot");
+        let volatile_library = volatile
+            .library_snapshot("user-1")
+            .await
+            .expect("volatile library snapshot");
+
+        assert_eq!(
+            completed_session_ids(&durable_library),
+            vec![
+                RECENCY_FIRST_SESSION.to_owned(),
+                RECENCY_SECOND_SESSION.to_owned()
+            ],
+            "an exact tie orders by session id, descending"
+        );
+        assert_eq!(
+            completed_session_ids(&volatile_library),
+            completed_session_ids(&durable_library),
+        );
+        assert_eq!(durable_library.sessions, volatile_library.sessions);
+
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
     async fn run_migrations_until(
         pool: &sqlx::PgPool,
         stop_before_name: &str,

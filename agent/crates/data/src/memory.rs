@@ -1235,8 +1235,40 @@ impl InMemoryStudyStore {
                     .get(&question_key(study_set_id, question_id))
             })
             .filter(|record| record.active)
+            .filter(|record| {
+                Self::source_span_available_locked(
+                    state,
+                    study_set_id,
+                    &record.question.source.source_id,
+                )
+            })
             .map(|record| record.question.clone())
             .collect()
+    }
+
+    /// Whether a source span is still retrievable for this study set.
+    ///
+    /// `DATA-011`: this is the in-memory form of the durable
+    /// `ACTIVE_QUESTION_SELECT` join, which requires the span and its document to
+    /// belong to the set and to be un-tombstoned. Without it a tombstoned document
+    /// left its questions active on one backend and removed them on the other, so
+    /// the two projections disagreed about the very thing deletion is supposed to
+    /// hide.
+    fn source_span_available_locked(
+        state: &InMemoryStudyState,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> bool {
+        let Some(span) = state.source_spans.get(source_id) else {
+            return false;
+        };
+        if span.study_set_id != study_set_id || span.tombstoned {
+            return false;
+        }
+        state
+            .documents
+            .get(&span.source.document_id)
+            .is_some_and(|document| document.study_set_id == study_set_id && !document.tombstoned)
     }
 
     /// The one progression cursor for this session, created at revision `0` if it
@@ -3404,15 +3436,22 @@ impl StudyMemoryStore for InMemoryStudyStore {
             .collect::<Vec<_>>();
         study_sets.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.id.cmp(&b.id)));
 
+        // `DATA-011`: the committed insertion position *is* this backend's recency
+        // ordinal — Plan 06 deliberately adds no timestamp to `VoiceSessionRecord`,
+        // and `record_voice_session` replays in place so a replay never moves a
+        // session. Sorting by session id, as this list used to, is not recency at
+        // all: for two non-lexical UUIDs it can invert the order Postgres returns
+        // from `started_at DESC`.
         let mut sessions = state
             .sessions
             .iter()
-            .filter(|session| {
+            .enumerate()
+            .filter(|(_, session)| {
                 session.user_id == user_id
                     && session.status == "closed"
                     && session.terminal_reason.as_deref() == Some("completed")
             })
-            .map(|session| {
+            .map(|(insertion_ordinal, session)| {
                 let study_set_title = state
                     .study_sets
                     .get(&session.study_set_id)
@@ -3471,28 +3510,33 @@ impl StudyMemoryStore for InMemoryStudyStore {
                         }
                     });
 
-                LibrarySessionSummary {
-                    voice_session_id: session.voice_session_id.clone(),
-                    user_id: session.user_id.clone(),
-                    study_set_id: session.study_set_id.clone(),
-                    study_set_title,
-                    status: session.status.clone(),
-                    terminal_reason: session.terminal_reason.clone(),
-                    recap,
-                    next_review,
-                }
+                (
+                    insertion_ordinal,
+                    LibrarySessionSummary {
+                        voice_session_id: session.voice_session_id.clone(),
+                        user_id: session.user_id.clone(),
+                        study_set_id: session.study_set_id.clone(),
+                        study_set_title,
+                        status: session.status.clone(),
+                        terminal_reason: session.terminal_reason.clone(),
+                        recap,
+                        next_review,
+                    },
+                )
             })
             .collect::<Vec<_>>();
-        sessions.sort_by(|a, b| {
-            b.voice_session_id
-                .cmp(&a.voice_session_id)
-                .then_with(|| a.study_set_title.cmp(&b.study_set_title))
+        // Most recent first, with the session id as the documented tie-break —
+        // the same rule the durable backend states as `started_at DESC, id DESC`.
+        sessions.sort_by(|(left_ordinal, left), (right_ordinal, right)| {
+            right_ordinal
+                .cmp(left_ordinal)
+                .then_with(|| right.voice_session_id.cmp(&left.voice_session_id))
         });
 
         Ok(StudyLibrarySnapshot {
             user_id: user_id.to_owned(),
             study_sets,
-            sessions,
+            sessions: sessions.into_iter().map(|(_, session)| session).collect(),
         })
     }
 
