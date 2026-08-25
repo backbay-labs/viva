@@ -140,3 +140,24 @@ test("mounted web tests use one exact DOM implementation", async () => {
   assert.equal(webPackage.devDependencies?.["happy-dom"], "20.11.6");
   assert.equal(webPackage.devDependencies?.["@happy-dom/global-registrator"], "20.11.6");
 });
+
+test("Turbo restores web build artifacts and hashes public build inputs", async () => {
+  const rootPackage = await readJson("package.json");
+  const turbo = await readJson("turbo.json");
+  assert.equal(
+    rootPackage.scripts?.["build:cache:prove"],
+    "node scripts/prove-turbo-cache-restoration.mjs",
+  );
+  assert.equal(turbo.tasks.build.outputs.includes(".next/**"), true);
+  assert.equal(turbo.tasks.build.outputs.includes("!.next/cache/**"), true);
+  const requiredBuildEnv = [
+    "NEXT_PUBLIC_VIVA_AGENT_HTTP_URL",
+    "NEXT_PUBLIC_VIVA_AGENT_WS_URL",
+    "NEXT_PUBLIC_VIVA_API_URL",
+    "NEXT_PUBLIC_VIVA_VOICE_SESSION_TOKEN",
+    "NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID",
+    "NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID",
+    "NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID",
+  ];
+  assert.equal(requiredBuildEnv.every((name) => turbo.tasks.build.env.includes(name)), true);
+});
