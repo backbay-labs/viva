@@ -109,3 +109,9 @@ Node 05's tightened shared contract (v2 recap shape, quiz-only mode, VivaErrorFr
 - `apps/web` production build is red for the same type errors.
 
 Any typecheck error, test failure, or build failure outside this enumeration blocks normally. Intermediate merge gates (07/09/08/11) scope their web checks accordingly; node 11's own files must still typecheck clean. Expires at node 10, which must restore full web green.
+
+## A-13 (2026-08-25) — Merge-order edge 09→07; Plan 07 Task 1 file-list extension; SyntheticFixtureAnswerEvaluator placement
+
+1. **DAG edge added:** node 09 merges before node 07's Task 1 runs. The program DAG modeled source-level dependencies only and omitted `agent-adapters`' dev-dependency on `agent/crates/data` — every `cargo test -p agent-adapters` target links `data`, which cannot compile until Plan 09's Tasks 4/6 adopt the merged Plan 04/06 APIs. No cycle: Plan 09's gates are `-p data`/`-p agent-domain` only. (Worker-diagnosed at dispatch; lane 07 made no commits and re-dispatches after node 09.)
+2. **Plan 07 Task 1 staging list reads as amended** to include `stt.rs` and `tts.rs`: their 38 compile errors are purely compile-forced (Plan 06 collapsed BrainError to the single typed Failure variant), and Task 1 cannot produce a compiling commit without minimal typed-failure edits there. Tasks 3/6/7 retain their behavioral scope in those files.
+3. **SyntheticFixtureAnswerEvaluator** (named by Plan 07's seam text, absent from agent-domain): ruled a Plan-07-owned type — implemented inside Plan 07's fake/synthetic builders, implementing Plan 04's published `AnswerEvaluator` trait, deriving decisions only from the Plan 04 learning-core fixtures, constructible only through named fake/synthetic builders (never default or environment-controlled). Plan 04 publishes the trait, not the fixture evaluator.
