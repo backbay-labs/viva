@@ -3,6 +3,11 @@ import fixtureJson from "../../../agent/fixtures/learning-core/study-projection-
   type: "json",
 };
 import {
+  type ProjectedReviewScheduleItem,
+  reviewDueAtFromProjection,
+  VIVA_REVIEW_SELECTED_AUTHORITY,
+} from "./scheduling";
+import {
   type AuthenticatedStudyProjectionV1,
   VIVA_CONCEPT_STATUSES,
   VIVA_REVIEW_SCHEDULE_AUTHORITIES,
@@ -169,11 +174,37 @@ const REJECTED_MUTATIONS: ReadonlyArray<{
       "Duplicate authenticated study projection review schedule entry for concept-electron-transport-chain",
   },
   {
+    // Mixed authorities cannot survive a validator that pins every entry to the
+    // one selected D-01 authority: whichever entry is not it is refused by name.
     name: "mixed scheduling authorities",
     mutate: (projection) => {
       schedule(projection)[1].authority = "core_fsrs_read_time";
     },
-    message: "review schedule mixes scheduling authorities",
+    message:
+      "Authenticated study projection review schedule entry for concept-proton-gradient " +
+      "carries authority core_fsrs_read_time, not the selected D-01 authority server_persisted_fsrs",
+  },
+  {
+    // The gap a schedule-internal agreement check leaves open: every entry
+    // uniformly carrying the REJECTED D-01 Branch B authority. Agreement is not
+    // authority, so this must fail closed at the boundary rather than reach the
+    // browser and throw mid-render inside `reviewIntervalFromProjection`.
+    name: "a uniformly rejected-branch authority",
+    mutate: (projection) => {
+      for (const item of schedule(projection)) {
+        item.authority = "core_fsrs_read_time";
+      }
+    },
+    message:
+      "Authenticated study projection review schedule entry for concept-electron-transport-chain " +
+      "carries authority core_fsrs_read_time, not the selected D-01 authority server_persisted_fsrs",
+  },
+  {
+    name: "a single rejected-branch authority on the first entry",
+    mutate: (projection) => {
+      schedule(projection)[0].authority = "core_fsrs_read_time";
+    },
+    message: "not the selected D-01 authority server_persisted_fsrs",
   },
   {
     name: "an unknown scheduling authority",
@@ -291,10 +322,32 @@ describe("LEARN-008 authenticated study projection contract", () => {
     // D-03B: one honest oral-exam engine, so `quiz` is the whole mode vocabulary
     // and a projection may not carry a goal.
     expect([...VIVA_STUDY_MODES]).toEqual(["quiz"]);
-    expect([...VIVA_REVIEW_SCHEDULE_AUTHORITIES]).toEqual([
-      "server_persisted_fsrs",
-      "core_fsrs_read_time",
-    ]);
+    // D-01A: server-persisted FSRS is the one selected scheduling authority, so
+    // the allowlist holds exactly it. `core_fsrs_read_time` is Branch B's
+    // read-time replay, which the recorded decision rejected.
+    expect([...VIVA_REVIEW_SCHEDULE_AUTHORITIES]).toEqual(["server_persisted_fsrs"]);
+  });
+
+  test("pins the projection authority to the same constant the browser reader enforces", () => {
+    // Two modules must not be able to drift into disagreeing about which D-01
+    // branch shipped: what this validator admits is exactly what
+    // `reviewIntervalFromProjection` will render instead of throwing.
+    expect(VIVA_REVIEW_SCHEDULE_AUTHORITIES).toHaveLength(1);
+    expect(VIVA_REVIEW_SCHEDULE_AUTHORITIES[0]).toBe(VIVA_REVIEW_SELECTED_AUTHORITY);
+  });
+
+  test("hands the fail-closed browser reader a schedule it accepts", () => {
+    for (const name of FIXTURE_CASES) {
+      const projection = validateAuthenticatedStudyProjectionV1(fixtureCase(name) as unknown);
+      // The validated entries are the browser reader's input type, not a
+      // widened cast: an accepted projection is a renderable projection.
+      const schedule: readonly ProjectedReviewScheduleItem[] = projection.reviewSchedule;
+
+      for (const concept of projection.concepts) {
+        const dueAt = reviewDueAtFromProjection(schedule, concept.id);
+        expect(dueAt === null ? null : dueAt.toISOString()).toBe(concept.dueAt);
+      }
+    }
   });
 
   test("accepts every shared fixture case handed in as unknown", () => {

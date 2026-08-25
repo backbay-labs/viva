@@ -17,7 +17,9 @@
  *   source excerpts — a citation carries identifiers, span, label, confidence;
  * - every review-schedule entry and the active question reference an included
  *   concept, and a concept's `dueAt` equals its schedule entry or is null;
- * - all review items share the one selected D-01 authority;
+ * - every review item carries the one authority D-01 selected — agreeing with
+ *   each other is not enough, because a whole schedule can agree on the wrong
+ *   branch;
  * - a set that is not `ready` has no active question and cannot start a session.
  *
  * The closed aliases below are deliberately narrower than the root `@viva/core`
@@ -48,12 +50,31 @@ export const VIVA_SOURCE_CITATION_CONFIDENCES = ["high", "medium", "low"] as con
 
 export type SourceCitationConfidence = (typeof VIVA_SOURCE_CITATION_CONFIDENCES)[number];
 
-export const VIVA_REVIEW_SCHEDULE_AUTHORITIES = [
+/**
+ * The one review authority D-01 selected: D-01A, server-persisted FSRS.
+ *
+ * This mirrors `VIVA_REVIEW_SELECTED_AUTHORITY` in `./scheduling`, which the
+ * browser reader enforces on the same entries; the two are asserted equal in
+ * `study-projection-contract.test.ts` so they cannot drift into disagreeing
+ * about which branch shipped. Recorded in
+ * `docs/decisions/2026-08-23-d-01-review-scheduling-authority.md`.
+ */
+export const VIVA_REVIEW_SCHEDULE_AUTHORITIES = ["server_persisted_fsrs"] as const;
+
+export type ReviewScheduleAuthority = (typeof VIVA_REVIEW_SCHEDULE_AUTHORITIES)[number];
+
+/**
+ * Every authority name the v1 wire vocabulary spells, selected or not.
+ *
+ * `core_fsrs_read_time` is Branch B's read-time replay, which the recorded
+ * decision rejected. Naming it here is not admitting it: knowing the name is
+ * what lets a rejection say *which* unselected branch produced the projection
+ * instead of reporting an unrecognized string.
+ */
+const REVIEW_SCHEDULE_AUTHORITY_VOCABULARY = [
   "server_persisted_fsrs",
   "core_fsrs_read_time",
 ] as const;
-
-export type ReviewScheduleAuthority = (typeof VIVA_REVIEW_SCHEDULE_AUTHORITIES)[number];
 
 export type AuthenticatedStudyProjectionV1 = {
   version: 1;
@@ -360,13 +381,22 @@ function validateQuestionProgress(
   return { completed, total };
 }
 
+/**
+ * Validate the review schedule against the one selected D-01 authority.
+ *
+ * Requiring the entries only to agree with each other would accept a whole
+ * schedule computed by the rejected branch — a stale Branch-B-era row set, or an
+ * upstream that never migrated — and the browser reader would then throw
+ * mid-render on every scheduled concept. The projection is the security
+ * boundary, so the wrong branch fails closed here, by name.
+ */
 function validateReviewSchedule(
   value: unknown[],
   conceptIds: ReadonlySet<string>,
 ): AuthenticatedStudyProjectionV1["reviewSchedule"] {
   const subject = `${SUBJECT} reviewSchedule`;
   const seen = new Set<string>();
-  let authority: ReviewScheduleAuthority | undefined;
+  const [selectedAuthority] = VIVA_REVIEW_SCHEDULE_AUTHORITIES;
 
   return value.map((entry) => {
     const source = record(entry, subject);
@@ -383,19 +413,20 @@ function validateReviewSchedule(
 
     const itemAuthority = member(
       nonEmptyString(source, "authority", subject),
-      VIVA_REVIEW_SCHEDULE_AUTHORITIES,
+      REVIEW_SCHEDULE_AUTHORITY_VOCABULARY,
       "review schedule authority",
     );
-    if (authority === undefined) {
-      authority = itemAuthority;
-    } else if (authority !== itemAuthority) {
-      invalid(`${SUBJECT} review schedule mixes scheduling authorities`);
+    if (itemAuthority !== selectedAuthority) {
+      invalid(
+        `${SUBJECT} review schedule entry for ${conceptId} carries authority ` +
+          `${itemAuthority}, not the selected D-01 authority ${selectedAuthority}`,
+      );
     }
 
     return {
       conceptId,
       dueAt: utcInstant(source, "dueAt", subject),
-      authority: itemAuthority,
+      authority: selectedAuthority,
     };
   });
 }
