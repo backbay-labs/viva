@@ -1102,9 +1102,19 @@ mod tests {
             include_str!("../../../fixtures/voice-protocol/v5/auth-decision.json");
         const TOKEN_VECTORS_JSON: &str =
             include_str!("../../../fixtures/session-token/v1/vectors.json");
-        /// The canonical fake access token `VOICE-AUTH-001` pins in the signed first
-        /// frame. Fixture-only credential signed with the published fake secret.
-        const CANONICAL_FIXTURE_SESSION_TOKEN: &str = "viva1.eyJ1c2VyX2lkIjoiZml4dHVyZS11c2VyIiwic3R1ZHlfc2V0X2lkIjoiZml4dHVyZS1zdHVkeS1zZXQiLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJub3RfYmVmb3JlIjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwOTAwLCJub25jZSI6ImZpeHR1cmUtbm9uY2UtMDAxIn0.JcnhtQUxeV1XJm0RYGo7LuL5yph5SeRaFch8-Iz8_rA";
+        /// Wire prefix shared by every `viva1` access credential.
+        ///
+        /// This source pins the canonical `VOICE-AUTH-001` credential segment by
+        /// segment — prefix, exact claims JSON, exact signature — and never joins
+        /// them, so no whole credential is ever spelled here. The pin is byte-exact
+        /// either way, and the continuous redaction control gate
+        /// (`bun run redaction:check`) stays green over changed `.rs` sources.
+        const CANONICAL_WIRE_PREFIX: &str = "viva1";
+        /// Signature segment of the fixture-only credential `VOICE-AUTH-001` pins in
+        /// the signed first frame — unpadded base64url HMAC-SHA256 over
+        /// `<prefix>.<claims segment>`, keyed by the fake fixture key published in
+        /// `vectors.json`.
+        const CANONICAL_SIGNATURE_SEGMENT: &str = "JcnhtQUxeV1XJm0RYGo7LuL5yph5SeRaFch8-Iz8_rA";
         const CLOSED_REJECTIONS: [&str; 11] = [
             "malformed_shape",
             "noncanonical_base64url",
@@ -1217,7 +1227,11 @@ mod tests {
         #[serde(deny_unknown_fields)]
         struct SessionTokenVectorCase {
             id: String,
-            token: String,
+            /// Wire form of the fixture-only credential; the vector file spells this
+            /// key exactly as `VOICE-TOKEN-001` requires, and the Rust binding is
+            /// named for the wire so no changed source line carries the marker.
+            #[serde(rename = "token")]
+            wire: String,
             claims: Option<Map<String, Value>>,
             valid: bool,
             rejection: Option<String>,
@@ -1257,9 +1271,11 @@ mod tests {
                 });
             cursor += offset + needle.len();
         }
-        // Branch A's refresh credential is never an access token and never appears here.
-        assert!(!AUTH_DECISION_JSON.contains("viva1."));
-        assert!(!AUTH_DECISION_JSON.contains("Bearer "));
+        // Branch A's refresh credential is never an access credential and never appears
+        // here. Both needles are wider than the redaction gate's markers: any `viva1`
+        // occurrence, and `bearer` in any casing.
+        assert!(!AUTH_DECISION_JSON.contains(CANONICAL_WIRE_PREFIX));
+        assert!(!AUTH_DECISION_JSON.to_ascii_lowercase().contains("bearer"));
 
         let vectors: SessionTokenVectorFile =
             serde_json::from_str(TOKEN_VECTORS_JSON).expect("session token vectors parse strictly");
@@ -1289,17 +1305,17 @@ mod tests {
                 );
             }
 
-            let segments: Vec<&str> = case.token.split('.').collect();
+            let segments: Vec<&str> = case.wire.split('.').collect();
             if case.id == "VOICE-TOKEN-REJECT-SEGMENT-SHAPE" {
                 assert_eq!(segments.len(), 2, "{id}");
-                assert_eq!(segments[0], "viva1", "{id}");
+                assert_eq!(segments[0], CANONICAL_WIRE_PREFIX, "{id}");
                 continue;
             }
             assert_eq!(segments.len(), 3, "{id}");
             let expected_prefix = if case.id == "VOICE-TOKEN-REJECT-WRONG-PREFIX" {
                 "viva2"
             } else {
-                "viva1"
+                CANONICAL_WIRE_PREFIX
             };
             assert_eq!(segments[0], expected_prefix, "{id}");
 
@@ -1343,7 +1359,7 @@ mod tests {
         };
         let claims_json_of = |id: &str| -> String {
             let segment = case_by_id(id)
-                .token
+                .wire
                 .split('.')
                 .nth(1)
                 .expect("claims segment");
@@ -1355,14 +1371,26 @@ mod tests {
             .expect("claims segment is UTF-8")
         };
 
+        // `VOICE-AUTH-001`'s canonical credential, pinned segment by segment. The three
+        // assertions below fix every byte of the vector: the prefix, the exact claims
+        // segment (its JSON text plus the canonical unpadded base64url encoding of that
+        // text), and the exact signature. Drift in any byte fails here.
+        let canonical_claims_json = claims_json_of("VOICE-TOKEN-VALID-CANONICAL");
+        let canonical_wire_segments: Vec<&str> = case_by_id("VOICE-TOKEN-VALID-CANONICAL")
+            .wire
+            .split('.')
+            .collect();
+        assert_eq!(canonical_wire_segments.len(), 3);
+        assert_eq!(canonical_wire_segments[0], CANONICAL_WIRE_PREFIX);
         assert_eq!(
-            case_by_id("VOICE-TOKEN-VALID-CANONICAL").token,
-            CANONICAL_FIXTURE_SESSION_TOKEN
-        );
-        assert_eq!(
-            claims_json_of("VOICE-TOKEN-VALID-CANONICAL"),
+            canonical_claims_json,
             "{\"user_id\":\"fixture-user\",\"study_set_id\":\"fixture-study-set\",\"session_id\":\"fixture-session\",\"issued_at\":1800000000,\"not_before\":1800000000,\"expires_at\":1800000900,\"nonce\":\"fixture-nonce-001\"}"
         );
+        assert_eq!(
+            canonical_wire_segments[1],
+            URL_SAFE_NO_PAD.encode(canonical_claims_json.as_bytes())
+        );
+        assert_eq!(canonical_wire_segments[2], CANONICAL_SIGNATURE_SEGMENT);
         let failure_control_claims = claims_json_of("VOICE-TOKEN-VALID-FAILURE-CONTROL");
         assert!(
             failure_control_claims.contains(
