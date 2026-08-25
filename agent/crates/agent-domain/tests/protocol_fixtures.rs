@@ -326,6 +326,50 @@ fn crate_root_recap_is_the_evidence_derived_recap() {
     );
 }
 
+/// Plan 06 Task 0 Step 3: the crate root republishes the locked `learning_recap`
+/// block **entire**, so Plans 04/05/07/08/09 read one published path per name.
+///
+/// The recap type alone is not the seam: a consumer that can name the recap but
+/// not the fold that produces it has to reach around `agent_domain::` into the
+/// module path to build one, which is exactly the drift Step 3 locks the block to
+/// prevent. Naming each entry through `agent_domain::` turns an omission from the
+/// block into a compile error, and folding one canonical case through the root
+/// path proves the published name is Plan 04's declaration and not a stub.
+#[test]
+fn crate_root_publishes_the_locked_learning_recap_seam() {
+    // Task 0 Step 3's locked block, one crate-root path per exported name.
+    const _BUILD_SESSION_RECAP: fn(
+        &agent_domain::SessionLearningEvidence,
+    ) -> Result<
+        agent_domain::StudySessionRecap,
+        agent_domain::RecapBuildError,
+    > = agent_domain::build_session_recap;
+    const _CONCEPT_LABEL: fn(agent_domain::ConceptLabel) -> agent_domain::ConceptLabel =
+        |value| value;
+    const _RECAP_CONCEPT_OUTCOME: fn(
+        agent_domain::RecapConceptOutcome,
+    ) -> agent_domain::RecapConceptOutcome = |value| value;
+    const _REVIEW_SCHEDULE_AUTHORITY: fn(
+        agent_domain::ReviewScheduleAuthority,
+    ) -> agent_domain::ReviewScheduleAuthority = |value| value;
+    const _REVIEW_SCHEDULE_SUMMARY: fn(
+        agent_domain::ReviewScheduleSummary,
+    ) -> agent_domain::ReviewScheduleSummary = |value| value;
+
+    // The root-path fold is the authoritative one: Plan 04 owns full fold coverage
+    // in `tests/learning_core.rs`; this pins that the published path reaches it.
+    let fixture: RecapsFixture =
+        serde_json::from_str(RECAPS_FIXTURE).expect("recaps fixture parses");
+    let evidence = &fixture.evidence["mixed_strong_shaky_missed"];
+    let built = agent_domain::build_session_recap(evidence)
+        .expect("canonical evidence folds through the crate-root path");
+
+    assert_eq!(
+        built, fixture.recaps["mixed_strong_shaky_missed"],
+        "the crate-root fold must produce the canonical recap, not a substitute",
+    );
+}
+
 #[test]
 fn shared_recaps_rejects_unknown_review_authority() {
     let mut value = fixture_value(RECAPS_FIXTURE);

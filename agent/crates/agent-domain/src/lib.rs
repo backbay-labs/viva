@@ -48,8 +48,8 @@ pub use learning_progression::{
     ProgressionPolicyId, QuestionProgressionCursor, QuestionProgressionResult,
 };
 pub use learning_recap::{
-    ConceptLabel, RecapBuildError, RecapConceptOutcome, ReviewScheduleAuthority,
-    ReviewScheduleSummary, SessionLearningEvidence, StudySessionRecap,
+    build_session_recap, ConceptLabel, RecapBuildError, RecapConceptOutcome,
+    ReviewScheduleAuthority, ReviewScheduleSummary, SessionLearningEvidence, StudySessionRecap,
 };
 // `PortErrorKind` is the store-side half of the typed classification boundary:
 // Plans 07/08/09 select retry policy, terminal reason, HTTP status, and
