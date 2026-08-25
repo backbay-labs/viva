@@ -1,31 +1,50 @@
 import * as DocumentPicker from "expo-document-picker";
 import { useRouter } from "expo-router";
-import { useState } from "react";
-import { Pressable, ScrollView, StyleSheet, View } from "react-native";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  ActivityIndicator,
+  Pressable,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  View,
+} from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { ActionButton } from "@/components/actions";
 import { OrnamentRule, SparkIcon, Wordmark } from "@/components/brand";
 import { VivaText } from "@/components/type";
+import { type LoadedLibrary, loadLibrary } from "@/library/library-client";
+import { loadAppConfig } from "@/runtime/config";
 import { colors, fonts, layout, radius, space } from "@/theme/tokens";
-
-type Source = {
-  detail: string;
-  id: string;
-  name: string;
-  type: string;
-};
-
-const startingSources: Source[] = [
-  { detail: "48 slides", id: "lecture-5", name: "Lecture 5 · Respiration", type: "Slides" },
-  { detail: "12 pages", id: "midterm-guide", name: "Midterm study guide", type: "PDF" },
-  { detail: "6 pages", id: "review-notes", name: "Ananya’s review notes", type: "Notes" },
-];
 
 export default function LibraryScreen() {
   const router = useRouter();
-  const [sources, setSources] = useState<Source[]>(startingSources);
+  const config = useMemo(() => loadAppConfig(), []);
+  const [library, setLibrary] = useState<LoadedLibrary | null>(null);
+  const [loadError, setLoadError] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [picking, setPicking] = useState(false);
+  const [pickerNote, setPickerNote] = useState<string | null>(null);
+
+  const refreshLibrary = useCallback(
+    async (pulled = false) => {
+      if (pulled) setRefreshing(true);
+      setLoadError(false);
+      try {
+        setLibrary(await loadLibrary(config));
+      } catch {
+        setLoadError(true);
+      } finally {
+        if (pulled) setRefreshing(false);
+      }
+    },
+    [config],
+  );
+
+  useEffect(() => {
+    void refreshLibrary();
+  }, [refreshLibrary]);
 
   const chooseDocument = async () => {
     setPicking(true);
@@ -36,13 +55,10 @@ export default function LibraryScreen() {
         type: ["application/pdf", "text/plain", "application/vnd.ms-powerpoint"],
       });
       if (!result.canceled) {
-        const newSources = result.assets.map((asset) => ({
-          detail: asset.size ? `${Math.max(1, Math.round(asset.size / 1024))} KB` : "Ready",
-          id: asset.uri,
-          name: asset.name,
-          type: asset.mimeType?.includes("pdf") ? "PDF" : "Document",
-        }));
-        setSources((current) => [...current, ...newSources]);
+        const count = result.assets.length;
+        setPickerNote(
+          `${count} file${count === 1 ? "" : "s"} selected locally — nothing was uploaded.`,
+        );
       }
     } finally {
       setPicking(false);
@@ -67,7 +83,17 @@ export default function LibraryScreen() {
         <View style={styles.headerSpacer} />
       </View>
 
-      <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
+        refreshControl={
+          <RefreshControl
+            onRefresh={() => void refreshLibrary(true)}
+            refreshing={refreshing}
+            tintColor={colors.plumVivid}
+          />
+        }
+        showsVerticalScrollIndicator={false}
+      >
         <View style={styles.hero}>
           <VivaText tone="muted" variant="eyebrow">
             Your folios
@@ -87,22 +113,50 @@ export default function LibraryScreen() {
               <SparkIcon color={colors.sageDeep} size={15} />
             </View>
             <View>
-              <VivaText variant="lead">Biology Midterm</VivaText>
+              <VivaText variant="lead">Your study sets</VivaText>
               <VivaText tone="muted" variant="caption">
-                {sources.length} sources · exam Friday
+                {library
+                  ? `${library.projection.libraryRows.length} live folios`
+                  : "From the agent"}
               </VivaText>
             </View>
           </View>
-          <VivaText tone="sage" variant="caption">
-            Ready
-          </VivaText>
         </View>
 
-        <View accessibilityLabel="Biology Midterm sources" style={styles.sourceList}>
-          {sources.map((source, index) => (
+        <View accessibilityLabel="Study sets from the Viva agent" style={styles.sourceList}>
+          {!library && !loadError ? (
+            <View accessibilityLiveRegion="polite" style={styles.stateCard}>
+              <ActivityIndicator color={colors.plumVivid} />
+              <VivaText tone="muted">Opening the library…</VivaText>
+            </View>
+          ) : null}
+          {loadError ? (
+            <View accessibilityLiveRegion="polite" style={styles.stateCard}>
+              <VivaText style={styles.stateTitle} variant="lead">
+                The folios are out of reach.
+              </VivaText>
+              <VivaText tone="muted">
+                The library is unreachable. Start the local agent, then pull to retry.
+              </VivaText>
+            </View>
+          ) : null}
+          {library && library.projection.libraryRows.length === 0 ? (
+            <View accessibilityLiveRegion="polite" style={styles.stateCard}>
+              <VivaText style={styles.stateTitle} variant="lead">
+                No folios yet.
+              </VivaText>
+              <VivaText tone="muted">
+                The agent returned an empty library. Stage 2 will add ingestion from mobile.
+              </VivaText>
+            </View>
+          ) : null}
+          {library?.projection.libraryRows.map((row, index) => (
             <View
-              key={source.id}
-              style={[styles.sourceRow, index < sources.length - 1 && styles.sourceRowBorder]}
+              key={row.id}
+              style={[
+                styles.sourceRow,
+                index < library.projection.libraryRows.length - 1 && styles.sourceRowBorder,
+              ]}
             >
               <View style={styles.documentMark}>
                 <VivaText aria-hidden tone="plum">
@@ -110,10 +164,26 @@ export default function LibraryScreen() {
                 </VivaText>
               </View>
               <View style={styles.sourceCopy}>
-                <VivaText style={styles.sourceName}>{source.name}</VivaText>
+                <View style={styles.rowHeading}>
+                  <VivaText style={styles.sourceName}>{row.title}</VivaText>
+                  <VivaText tone={row.statusLabel === "Ready" ? "sage" : "muted"} variant="caption">
+                    {row.statusLabel}
+                  </VivaText>
+                </View>
                 <VivaText tone="muted" variant="caption">
-                  {source.type} · {source.detail}
+                  {[row.course, row.detail, row.documentSummary].filter(Boolean).join(" · ")}
                 </VivaText>
+                <ActionButton
+                  accessibilityHint={`Starts recall from ${row.title}`}
+                  disabled={!row.start.available}
+                  onPress={() =>
+                    router.push({ pathname: "/session", params: { studySetId: row.id } })
+                  }
+                  style={styles.startButton}
+                  tone="tint"
+                >
+                  {row.start.available ? "Begin recall" : "Recall unavailable"}
+                </ActionButton>
               </View>
             </View>
           ))}
@@ -122,17 +192,20 @@ export default function LibraryScreen() {
         <View style={styles.uploadSection}>
           <VivaText variant="lead">Add course material</VivaText>
           <VivaText tone="muted">
-            Files stay attached to this study set. Each correction names the passage it used.
+            File selection is preview-only. Ingestion upload arrives with the library milestone in
+            Stage 2; nothing selected here is saved to Viva.
           </VivaText>
+          {pickerNote ? (
+            <VivaText tone="ochre" variant="caption">
+              {pickerNote}
+            </VivaText>
+          ) : null}
           <ActionButton loading={picking} onPress={() => void chooseDocument()} tone="tint">
-            Choose PDFs, slides, or notes
+            Preview PDFs, slides, or notes
           </ActionButton>
         </View>
 
         <View style={styles.actions}>
-          <ActionButton onPress={() => router.push("/session")}>
-            Begin recall from this folio
-          </ActionButton>
           <ActionButton
             onPress={() => (router.canDismiss() ? router.dismissAll() : router.replace("/"))}
             tone="secondary"
@@ -192,6 +265,12 @@ const styles = StyleSheet.create({
   pressed: {
     opacity: 0.62,
   },
+  rowHeading: {
+    alignItems: "baseline",
+    flexDirection: "row",
+    gap: space.sm,
+    justifyContent: "space-between",
+  },
   safeArea: {
     backgroundColor: colors.canvas,
     flex: 1,
@@ -218,10 +297,11 @@ const styles = StyleSheet.create({
     fontFamily: fonts.bodySemibold,
   },
   sourceRow: {
-    alignItems: "center",
+    alignItems: "flex-start",
     flexDirection: "row",
     gap: space.sm,
     minHeight: 72,
+    paddingVertical: space.md,
   },
   sourceRowBorder: {
     borderBottomColor: colors.hairlineSoft,
@@ -246,6 +326,21 @@ const styles = StyleSheet.create({
     height: 42,
     justifyContent: "center",
     width: 42,
+  },
+  startButton: {
+    alignSelf: "flex-start",
+    marginTop: space.xs,
+    minHeight: layout.minTouch,
+  },
+  stateCard: {
+    alignItems: "flex-start",
+    gap: space.sm,
+    minHeight: 112,
+    justifyContent: "center",
+    paddingVertical: space.lg,
+  },
+  stateTitle: {
+    color: colors.inkStrong,
   },
   title: {
     fontSize: 38,

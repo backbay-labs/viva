@@ -1,20 +1,72 @@
 import * as Haptics from "expo-haptics";
 import { useRouter } from "expo-router";
+import { useEffect, useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, View } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { fetchVivaAgentReadinessProbe } from "@/agent/shared-web";
 import { ActionButton } from "@/components/actions";
 import { OrnamentRule, SparkIcon, Wordmark } from "@/components/brand";
 import { VivaText } from "@/components/type";
 import { OrbBackdrop, VoiceOrb } from "@/components/voice-orb";
+import { type HomeLibraryModel, homeModelFromLibrary } from "@/library/home-model";
+import { loadLibrary } from "@/library/library-client";
+import { loadAppConfig } from "@/runtime/config";
 import { colors, fonts, layout, radius, space } from "@/theme/tokens";
+
+const offlineFallback: HomeLibraryModel = {
+  canStart: true,
+  contextLabel: "exam Friday",
+  studySetId: null,
+  studySetTitle: "Biology Midterm",
+  weakConceptDetail: "Weak concept · unavailable offline",
+  weakConceptId: null,
+  weakConceptTitle: "Concept detail unavailable",
+};
 
 export default function HomeScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const config = useMemo(() => loadAppConfig(), []);
+  const [homeModel, setHomeModel] = useState<HomeLibraryModel | null>(null);
+  const [readinessCaption, setReadinessCaption] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void loadLibrary(config)
+      .then(({ projection, snapshot }) => {
+        if (active) setHomeModel(homeModelFromLibrary(projection, snapshot));
+      })
+      .catch(() => {
+        if (active) setHomeModel(null);
+      });
+
+    void fetchVivaAgentReadinessProbe({ apiBaseUrl: config.agentHttpUrl }).then((probe) => {
+      if (!active) return;
+      if (probe.status === "api_missing" || probe.status === "offline") {
+        setReadinessCaption("agent offline");
+      } else if (probe.status === "observed" && !probe.ready.ready) {
+        setReadinessCaption("agent not ready");
+      } else {
+        setReadinessCaption(null);
+      }
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [config]);
+
+  const displayModel = homeModel ?? offlineFallback;
+  const activeStudySetId = homeModel
+    ? homeModel.canStart
+      ? homeModel.studySetId
+      : null
+    : config.studySetId;
 
   const beginRecall = () => {
-    router.push("/session");
+    if (!activeStudySetId) return;
+    router.push({ pathname: "/session", params: { studySetId: activeStudySetId } });
   };
 
   return (
@@ -43,7 +95,7 @@ export default function HomeScreen() {
         </View>
 
         <Pressable
-          accessibilityHint="Open the Biology Midterm study set"
+          accessibilityHint={`Open the ${displayModel.studySetTitle} study set`}
           accessibilityRole="button"
           hitSlop={{ bottom: 4, top: 4 }}
           onPress={() => router.push("/library")}
@@ -53,10 +105,10 @@ export default function HomeScreen() {
             ◇
           </VivaText>
           <VivaText style={styles.contextTitle} variant="caption">
-            Biology Midterm
+            {displayModel.studySetTitle}
           </VivaText>
           <VivaText tone="muted" variant="caption">
-            · exam Friday
+            · {displayModel.contextLabel}
           </VivaText>
           <VivaText aria-hidden style={styles.contextChevron}>
             ›
@@ -80,11 +132,15 @@ export default function HomeScreen() {
             accessibilityHint="Starts your voice session"
             accessibilityLabel="Begin recall"
             accessibilityRole="button"
+            disabled={!activeStudySetId}
             onPress={() => {
               void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
               beginRecall();
             }}
-            style={({ pressed }) => pressed && styles.orbPressed}
+            style={({ pressed }) => [
+              pressed && styles.orbPressed,
+              !activeStudySetId && styles.disabled,
+            ]}
           >
             <VoiceOrb size={166} state="ready" />
           </Pressable>
@@ -101,10 +157,10 @@ export default function HomeScreen() {
           </View>
           <View style={styles.conceptCopy}>
             <VivaText tone="muted" variant="caption">
-              Weak concept · missed twice
+              {displayModel.weakConceptDetail}
             </VivaText>
             <VivaText style={styles.conceptTitle} variant="lead">
-              Cellular respiration
+              {displayModel.weakConceptTitle}
             </VivaText>
           </View>
           <VivaText aria-hidden style={styles.chevron}>
@@ -115,6 +171,7 @@ export default function HomeScreen() {
         <View style={styles.primaryBlock}>
           <ActionButton
             accessibilityHint="Starts a spoken recall session"
+            disabled={!activeStudySetId}
             icon={<SparkIcon color={colors.plumSoft} size={15} />}
             onPress={beginRecall}
           >
@@ -123,6 +180,11 @@ export default function HomeScreen() {
           <VivaText style={styles.privacyNote} tone="muted" variant="caption">
             Microphone access starts only after you tap Start listening.
           </VivaText>
+          {readinessCaption ? (
+            <VivaText style={styles.readinessNote} tone="ochre" variant="caption">
+              {readinessCaption}
+            </VivaText>
+          ) : null}
         </View>
       </ScrollView>
     </SafeAreaView>
@@ -169,6 +231,9 @@ const styles = StyleSheet.create({
   conceptTitle: {
     fontSize: 22,
     lineHeight: 27,
+  },
+  disabled: {
+    opacity: 0.5,
   },
   contextChevron: {
     color: colors.inkMuted,
@@ -232,6 +297,10 @@ const styles = StyleSheet.create({
     alignSelf: "center",
     maxWidth: 320,
     textAlign: "center",
+  },
+  readinessNote: {
+    alignSelf: "center",
+    textTransform: "lowercase",
   },
   promise: {
     color: colors.inkSecondary,
