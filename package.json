@@ -26,6 +26,7 @@
     "e2e:browser:audio": "node scripts/e2e-browser-audio.mjs",
     "e2e:browser:audio:negative": "node scripts/e2e-browser-audio.mjs --case oversized-single-chunk",
     "build": "turbo run build",
+    "build:cache:prove": "node scripts/prove-turbo-cache-restoration.mjs",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
     "test:scripts": "node --test scripts/*.test.mjs",
@@ -37,9 +38,11 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.15",
+    "@viva/core": "workspace:*",
     "playwright": "^1.51.1",
     "turbo": "^2.9.14",
     "typescript": "^5.9.3",
-    "ws": "^8.21.0"
+    "ws": "^8.21.0",
+    "yaml": "2.8.2"
   }
 }
