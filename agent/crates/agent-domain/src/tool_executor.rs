@@ -1003,16 +1003,22 @@ fn is_valid_confidence(confidence: f32) -> bool {
 
 /// Evaluator copy is learner-facing text, so it is bounded, control-free, and may
 /// not name a source the bound rubric does not authorize.
+///
+/// "Control-free" is literal and admits no whitespace exception: a line break or
+/// a tab is a control character, and this boundary fails closed rather than
+/// deciding which controls are harmless in a provider-supplied string.
+///
+/// The source rule is enforceable in one direction and is documented as such: any
+/// token shaped like a study-store source identifier must be one the bound rubric
+/// authorizes. Verbatim excerpt text from a source outside the rubric is not
+/// detectable here, because the executor can only retrieve authorized sources.
 fn is_authorized_copy(text: &str, max_scalars: usize, authorized_sources: &[String]) -> bool {
     let trimmed = text.trim();
     let scalars = trimmed.chars().count();
     if scalars == 0 || scalars > max_scalars {
         return false;
     }
-    if text
-        .chars()
-        .any(|scalar| scalar.is_control() && !matches!(scalar, '\n' | '\t'))
-    {
+    if text.chars().any(char::is_control) {
         return false;
     }
     !text

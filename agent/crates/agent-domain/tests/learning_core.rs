@@ -1575,6 +1575,17 @@ async fn turn_outcome_rejects_evaluator_feedback_outside_the_authorized_bounds()
             None,
         ),
         (
+            "line break",
+            "feedback split\nacross lines".to_owned(),
+            None,
+        ),
+        ("tab", "feedback with a\ttab".to_owned(), None),
+        (
+            "line break in the retry prompt",
+            "acceptable feedback".to_owned(),
+            Some("retry\nprompt".to_owned()),
+        ),
+        (
             "overlong retry prompt",
             "acceptable feedback".to_owned(),
             Some("y".repeat(241)),
