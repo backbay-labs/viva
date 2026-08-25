@@ -6,6 +6,7 @@ import {
 } from "@viva/core";
 
 import {
+  fetchVivaAgentReadinessProbe,
   fetchVivaLibrarySnapshot,
   projectLibrarySnapshot,
   type VivaLibraryAction,
@@ -52,6 +53,25 @@ export async function loadLibrary(
     userId: config.userId,
   });
   return { projection: projectLibrarySnapshot(snapshot), snapshot };
+}
+
+export function fetchMobileAgentReadiness(config: AppConfig, fetchImpl: typeof fetch = fetch) {
+  const bearerToken = config.restBearerToken?.trim();
+  const authenticatedFetch: typeof fetch = bearerToken
+    ? (input, init) => {
+        const headers = new Headers(init?.headers);
+        headers.set("authorization", `Bearer ${bearerToken}`);
+        return fetchImpl(input, {
+          ...init,
+          headers: Object.fromEntries(headers.entries()),
+        });
+      }
+    : fetchImpl;
+
+  return fetchVivaAgentReadinessProbe({
+    apiBaseUrl: config.agentHttpUrl,
+    fetchImpl: authenticatedFetch,
+  });
 }
 
 /**

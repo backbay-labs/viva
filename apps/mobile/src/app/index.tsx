@@ -4,13 +4,12 @@ import { useEffect, useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, View } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { fetchVivaAgentReadinessProbe } from "@/agent/shared-web";
 import { ActionButton } from "@/components/actions";
 import { OrnamentRule, SparkIcon, Wordmark } from "@/components/brand";
 import { VivaText } from "@/components/type";
 import { OrbBackdrop, VoiceOrb } from "@/components/voice-orb";
 import { type HomeLibraryModel, homeModelFromLibrary } from "@/library/home-model";
-import { loadLibrary } from "@/library/library-client";
+import { fetchMobileAgentReadiness, loadLibrary } from "@/library/library-client";
 import { loadAppConfig } from "@/runtime/config";
 import { colors, fonts, layout, radius, space } from "@/theme/tokens";
 
@@ -41,7 +40,7 @@ export default function HomeScreen() {
         if (active) setHomeModel(null);
       });
 
-    void fetchVivaAgentReadinessProbe({ apiBaseUrl: config.agentHttpUrl }).then((probe) => {
+    void fetchMobileAgentReadiness(config).then((probe) => {
       if (!active) return;
       if (probe.status === "api_missing" || probe.status === "offline") {
         setReadinessCaption("agent offline");

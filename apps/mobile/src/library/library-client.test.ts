@@ -8,6 +8,7 @@ import {
 import type { AppConfig } from "@/runtime/config";
 import {
   decideMobileLibraryStart,
+  fetchMobileAgentReadiness,
   loadLibrary,
   studySetForSession,
   weakestConcept,
@@ -191,6 +192,52 @@ describe("mobile library client", () => {
     await loadLibrary({ ...config, restBearerToken: "rest-bearer" }, fetchImpl);
 
     expect(calls[0]?.init?.headers).toEqual({ authorization: "Bearer rest-bearer" });
+  });
+
+  test("uses the REST bearer for protected health and readiness probes", async () => {
+    const calls: Array<{ init?: RequestInit; input: string }> = [];
+    const store = {
+      available: true,
+      backend: "memory",
+      durable: false,
+      nonce_replay_protection: false,
+      raw_audio_persistence: false,
+      transcript_persistence: false,
+      uuid_schema_translation: false,
+    };
+    const brain = {
+      configured: true,
+      live_runtime: true,
+      provider: "synthetic",
+      selectable: true,
+    };
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ init, input: url });
+      return new Response(
+        JSON.stringify(
+          url.endsWith("/health/brain")
+            ? { brain, provider: "synthetic", status: "ready", store }
+            : { brain, ready: true, store },
+        ),
+        { headers: { "content-type": "application/json" }, status: 200 },
+      );
+    }) as typeof fetch;
+
+    const probe = await fetchMobileAgentReadiness(
+      { ...config, restBearerToken: "rest-bearer" },
+      fetchImpl,
+    );
+
+    expect(probe.status).toBe("observed");
+    expect(calls.map(({ input }) => input)).toEqual([
+      "http://127.0.0.1:4318/health/brain",
+      "http://127.0.0.1:4318/ready",
+    ]);
+    expect(calls.map(({ init }) => init?.headers)).toEqual([
+      { authorization: "Bearer rest-bearer" },
+      { authorization: "Bearer rest-bearer" },
+    ]);
   });
 
   test("keeps static REST/WS bearers separate from the signed first-frame capability", async () => {
