@@ -1,6 +1,6 @@
-import { AudioModule, RecordingPresets, setAudioModeAsync, useAudioRecorder } from "expo-audio";
-import { useRouter } from "expo-router";
-import { useEffect, useReducer, useRef, useState } from "react";
+import type { StudySet } from "@viva/core";
+import { useLocalSearchParams, useRouter } from "expo-router";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AccessibilityInfo,
   KeyboardAvoidingView,
@@ -13,29 +13,33 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+import {
+  correctionModelFromEvaluation,
+  drainSessionPlayback,
+  orbStateForSession,
+  type SessionCorrectionModel,
+  shouldNavigateToRecap,
+  stageCopyForConnection,
+} from "@/agent/session-view-model";
+import { useMobileVivaSession } from "@/agent/use-mobile-viva-session";
 import { ActionButton } from "@/components/actions";
 import { OrnamentRule, SparkIcon } from "@/components/brand";
 import { VivaText } from "@/components/type";
 import { VoiceOrb, VoiceStateLabel, VoiceWaveform } from "@/components/voice-orb";
-import {
-  buildPrototypeCorrection,
-  initialSessionState,
-  type SessionPhase,
-  sessionReducer,
-} from "@/features/session/session-machine";
+import { loadLibrary, studySetForSession } from "@/library/library-client";
+import { loadAppConfig } from "@/runtime/config";
 import { colors, fonts, layout, radius, space } from "@/theme/tokens";
 
-const question = "Explain the role of NADH in oxidative phosphorylation.";
-const syntheticAnswer = "I think it produces 36 ATP.";
+// Protocol v4 is typed-only. Local PCM capture is a device/readiness seam and
+// must not become a transport capability until the protocol-v5 milestone.
+const voiceTurnsEnabled = false as const;
+const DEFAULT_FIXTURE_STUDY_SET_ID = "biology-midterm";
 
-const phaseAnnouncements: Record<SessionPhase, string> = {
-  correction: "Correction ready",
-  listening: "Viva is listening",
-  "mic-blocked": "Microphone unavailable. Typed answer is ready.",
-  ready: "Question ready",
-  requesting: "Requesting microphone access",
-  thinking: "Viva is reading your answer",
-};
+type CaptureState = "blocked" | "idle" | "listening" | "requesting";
+type SessionLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; studySet: StudySet }
+  | { kind: "error"; message: string };
 
 function formatElapsed(seconds: number) {
   const minutes = Math.floor(seconds / 60)
@@ -46,85 +50,260 @@ function formatElapsed(seconds: number) {
 }
 
 export default function SessionScreen() {
+  const params = useLocalSearchParams<{ studySetId?: string | string[] }>();
   const router = useRouter();
-  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
-  const [session, dispatch] = useReducer(sessionReducer, initialSessionState);
+  const config = useMemo(() => loadAppConfig(), []);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [loadState, setLoadState] = useState<SessionLoadState>({ kind: "loading" });
+  const requestedStudySetId = Array.isArray(params.studySetId)
+    ? params.studySetId[0]
+    : params.studySetId;
+
+  useEffect(() => {
+    const requestAttempt = loadAttempt;
+    void requestAttempt;
+    let active = true;
+    setLoadState({ kind: "loading" });
+    void loadLibrary(config).then(
+      ({ snapshot }) => {
+        if (!active) return;
+        try {
+          setLoadState({
+            kind: "ready",
+            studySet: studySetForSession(
+              snapshot,
+              requestedStudySetId ?? DEFAULT_FIXTURE_STUDY_SET_ID,
+            ),
+          });
+        } catch (error) {
+          setLoadState({ kind: "error", message: errorMessage(error) });
+        }
+      },
+      (error) => {
+        if (active) setLoadState({ kind: "error", message: errorMessage(error) });
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [config, loadAttempt, requestedStudySetId]);
+
+  if (loadState.kind === "ready") {
+    return <LiveSessionScreen studySet={loadState.studySet} />;
+  }
+
+  return (
+    <SafeAreaView edges={["top", "left", "right", "bottom"]} style={styles.safeArea}>
+      <View style={styles.header}>
+        <Pressable
+          accessibilityLabel="Leave session"
+          accessibilityRole="button"
+          hitSlop={12}
+          onPress={() => (router.canDismiss() ? router.dismissAll() : router.replace("/"))}
+          style={({ pressed }) => [styles.headerAction, pressed && styles.pressed]}
+        >
+          <VivaText style={styles.closeGlyph}>×</VivaText>
+        </Pressable>
+        <VivaText style={styles.sessionIdentityText} variant="caption">
+          Viva session
+        </VivaText>
+        <View style={styles.headerAction} />
+      </View>
+      <View style={styles.loadState}>
+        <VoiceOrb size={96} state={loadState.kind === "loading" ? "thinking" : "ready"} />
+        <VivaText accessibilityRole="header" style={styles.loadTitle} variant="title">
+          {loadState.kind === "loading" ? "Opening your study set…" : "Study set unavailable"}
+        </VivaText>
+        <VivaText style={styles.loadDetail} tone="muted">
+          {loadState.kind === "loading"
+            ? "Loading the current library snapshot from the local agent."
+            : `${loadState.message} Start the local agent, then retry.`}
+        </VivaText>
+        {loadState.kind === "error" ? (
+          <ActionButton onPress={() => setLoadAttempt((attempt) => attempt + 1)}>
+            Retry library
+          </ActionButton>
+        ) : null}
+      </View>
+    </SafeAreaView>
+  );
+}
+
+function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
+  const router = useRouter();
+  const agent = useMobileVivaSession({ mode: "quiz", studySet });
   const [elapsed, setElapsed] = useState(0);
   const [hintVisible, setHintVisible] = useState(false);
   const [sourceVisible, setSourceVisible] = useState(false);
   const [typing, setTyping] = useState(false);
   const [typedAnswer, setTypedAnswer] = useState("");
-  const evaluationTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [submittedText, setSubmittedText] = useState<string>();
+  const [captureState, setCaptureState] = useState<CaptureState>("idle");
+  const [captureMessage, setCaptureMessage] = useState<string>();
+  const [ending, setEnding] = useState(false);
+  const [orbLevel, setOrbLevel] = useState(0);
+  const [retrying, setRetrying] = useState(false);
+  const [retrySubmitted, setRetrySubmitted] = useState(false);
+  const endingRef = useRef(false);
+  const handledCancelRef = useRef(0);
+  const handledGenerationRef = useRef<string | undefined>(undefined);
+  const playbackUnlockedRef = useRef(false);
+  const sawRetryPendingRef = useRef(false);
+  const previousQuestionRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
-    if (session.phase !== "listening") {
-      return;
-    }
+    if (agent.status !== "open" || agent.derived.recap) return;
     const timer = setInterval(() => setElapsed((value) => value + 1), 1000);
     return () => clearInterval(timer);
-  }, [session.phase]);
+  }, [agent.derived.recap, agent.status]);
 
   useEffect(() => {
-    if (session.phase !== "ready") {
-      AccessibilityInfo.announceForAccessibility(phaseAnnouncements[session.phase]);
+    if (captureState === "requesting") {
+      AccessibilityInfo.announceForAccessibility("Requesting microphone access");
+    } else if (captureState === "listening") {
+      AccessibilityInfo.announceForAccessibility("Viva is listening locally");
+    } else if (captureState === "blocked") {
+      AccessibilityInfo.announceForAccessibility("Microphone unavailable. Typed answer is ready.");
+    } else if (agent.derived.evaluation && !retrying) {
+      AccessibilityInfo.announceForAccessibility("Correction ready");
     }
-  }, [session.phase]);
+  }, [agent.derived.evaluation, captureState, retrying]);
 
-  useEffect(
-    () => () => {
-      if (evaluationTimer.current) {
-        clearTimeout(evaluationTimer.current);
-      }
-    },
-    [],
-  );
+  useEffect(() => {
+    const generationId = agent.agentState.generation?.id;
+    if (handledGenerationRef.current !== generationId) {
+      handledGenerationRef.current = generationId;
+      handledCancelRef.current = 0;
+    }
+    const audio = agent.agentState.audio;
+    const cancellations = agent.agentState.cancelledResponseIds;
+    if (audio.length === 0 && cancellations.length === handledCancelRef.current) return;
+    handledCancelRef.current = drainSessionPlayback({
+      acknowledgeAudio: agent.acknowledgeAudio,
+      audio,
+      cancellations,
+      ending,
+      handledCancel: handledCancelRef.current,
+      playback: agent.playback,
+    });
+  }, [
+    agent.acknowledgeAudio,
+    agent.agentState.audio,
+    agent.agentState.cancelledResponseIds,
+    agent.agentState.generation?.id,
+    agent.playback,
+    ending,
+  ]);
 
-  const scheduleEvaluation = () => {
-    evaluationTimer.current = setTimeout(() => {
-      dispatch({ type: "EVALUATED" });
-    }, 1200);
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const level = agent.speaking
+        ? agent.playback.getOutputLevel()
+        : captureState === "listening"
+          ? agent.capture.getInputLevel()
+          : 0;
+      setOrbLevel(level);
+    }, 80);
+    return () => clearInterval(timer);
+  }, [agent.capture, agent.playback, agent.speaking, captureState]);
+
+  useEffect(() => {
+    const questionId = agent.derived.question?.id;
+    if (!questionId || questionId === previousQuestionRef.current) return;
+    previousQuestionRef.current = questionId;
+    sawRetryPendingRef.current = false;
+    setCaptureMessage(undefined);
+    setCaptureState("idle");
+    setHintVisible(false);
+    setRetrySubmitted(false);
+    setRetrying(false);
+    setSourceVisible(false);
+    setTypedAnswer("");
+  }, [agent.derived.question?.id]);
+
+  useEffect(() => {
+    if (!retrying || !retrySubmitted) return;
+    if (agent.agentState.pendingSubmission) sawRetryPendingRef.current = true;
+    if (
+      sawRetryPendingRef.current &&
+      !agent.agentState.pendingSubmission &&
+      agent.derived.evaluation
+    ) {
+      sawRetryPendingRef.current = false;
+      setRetrySubmitted(false);
+      setRetrying(false);
+    }
+  }, [agent.agentState.pendingSubmission, agent.derived.evaluation, retrySubmitted, retrying]);
+
+  useEffect(() => {
+    if (
+      shouldNavigateToRecap({
+        hasRecap: Boolean(agent.derived.recap),
+        status: agent.status,
+        terminalReason: agent.derived.terminalReason,
+      })
+    ) {
+      router.replace("/recap");
+    }
+  }, [agent.derived.recap, agent.derived.terminalReason, agent.status, router]);
+
+  useEffect(() => {
+    if (!agent.captureIssue || (captureState !== "listening" && captureState !== "requesting")) {
+      return;
+    }
+    setCaptureState("blocked");
+    setTyping(true);
+    setCaptureMessage(
+      agent.captureIssue.kind === "ended"
+        ? "Local microphone capture stopped. Your session is intact; type the answer to continue."
+        : "The microphone stopped unexpectedly. Your session is intact; type the answer to continue.",
+    );
+  }, [agent.captureIssue, captureState]);
+
+  const unlockPlayback = () => {
+    if (playbackUnlockedRef.current) return;
+    playbackUnlockedRef.current = true;
+    void agent.playback.unlock().catch(() => {
+      playbackUnlockedRef.current = false;
+    });
   };
 
   const startListening = async () => {
-    dispatch({ type: "BEGIN" });
+    if (endingRef.current) return;
+    unlockPlayback();
+    agent.clearCaptureIssue();
+    setCaptureMessage(undefined);
+    setCaptureState("requesting");
     setTyping(false);
-    // The recorder can stall without rejecting (notably on simulators), so a
-    // watchdog converts a silent hang into the honest typed-answer fallback.
+
     let outcome: "failed" | "pending" | "recording" = "pending";
     const failToTyping = (message: string) => {
-      if (outcome !== "pending") {
-        return;
-      }
+      if (outcome !== "pending") return;
       outcome = "failed";
-      dispatch({ message, type: "MIC_DENIED" });
+      setCaptureMessage(message);
+      setCaptureState("blocked");
       setTyping(true);
+      void agent.capture.cancel();
     };
     const watchdog = setTimeout(() => {
       failToTyping("The microphone did not start. Your session is intact; answer in writing.");
     }, 8000);
-    try {
-      const permission = await AudioModule.requestRecordingPermissionsAsync();
-      if (outcome !== "pending") {
-        return;
-      }
-      if (!permission.granted) {
-        failToTyping(
-          "Microphone access is off. You can answer in writing or enable it in Settings.",
-        );
-        return;
-      }
 
-      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
-      await recorder.prepareToRecordAsync();
+    try {
+      await agent.capture.start();
       if (outcome !== "pending") {
+        await agent.capture.cancel();
         return;
       }
-      recorder.record();
       outcome = "recording";
-      dispatch({ type: "MIC_GRANTED" });
-    } catch {
+      setCaptureState("listening");
+    } catch (error) {
+      const permissionDenied =
+        error instanceof Error && error.name === "MobileAudioPermissionError";
       failToTyping(
-        "Viva could not start the microphone. Your session is intact; answer in writing.",
+        permissionDenied
+          ? "Microphone access is off. You can answer in writing or enable it in Settings."
+          : "Viva could not start the microphone. Your session is intact; answer in writing.",
       );
     } finally {
       clearTimeout(watchdog);
@@ -132,46 +311,114 @@ export default function SessionScreen() {
   };
 
   const finishSpokenAnswer = async () => {
-    try {
-      await recorder.stop();
-    } finally {
-      dispatch({ type: "SUBMIT" });
-      scheduleEvaluation();
-    }
+    if (endingRef.current) return;
+    await agent.capture.stop();
+    const frames = agent.capture.getFrames().length;
+    setCaptureState("idle");
+    setCaptureMessage(
+      voiceTurnsEnabled
+        ? "Voice answer ready to send."
+        : `Voice capture stayed on this device (${frames} local frames). Type the answer to send it in Stage 0.`,
+    );
+    setTyping(true);
   };
 
   const submitTypedAnswer = () => {
-    if (!typedAnswer.trim()) {
+    unlockPlayback();
+    const answer = typedAnswer.trim();
+    if (!answer) {
       AccessibilityInfo.announceForAccessibility("Write an answer before submitting.");
       return;
     }
-    dispatch({ type: "SUBMIT" });
-    scheduleEvaluation();
+    if (endingRef.current || !agent.derived.canSubmitAnswer || !agent.sendText(answer)) {
+      AccessibilityInfo.announceForAccessibility(
+        "The agent is not ready for an answer. Wait for the question or retry the connection.",
+      );
+      return;
+    }
+    setSubmittedText(answer);
+    setCaptureMessage(undefined);
+    setSourceVisible(false);
+    setTyping(false);
+    if (retrying) {
+      sawRetryPendingRef.current = false;
+      setRetrySubmitted(true);
+    }
   };
 
   const finishSession = async () => {
-    if (session.phase === "listening") {
-      try {
-        await recorder.stop();
-      } catch {
-        // The recorder may already be stopped by the native audio session.
-      }
-    }
-    router.replace("/recap");
+    if (endingRef.current) return;
+    endingRef.current = true;
+    setEnding(true);
+    agent.playback.resetForGeneration();
+    agent.stop();
+    await agent.capture.stop();
   };
 
   const retry = () => {
-    dispatch({ type: "RETRY" });
+    if (endingRef.current) return;
+    unlockPlayback();
+    setCaptureMessage(undefined);
     setTypedAnswer("");
     setHintVisible(false);
     setSourceVisible(false);
-    setTyping(false);
+    setRetrySubmitted(false);
+    setRetrying(true);
+    setTyping(true);
   };
+
+  const retryConnection = () => {
+    unlockPlayback();
+    handledCancelRef.current = 0;
+    setCaptureMessage(undefined);
+    setCaptureState("idle");
+    endingRef.current = false;
+    setEnding(false);
+    agent.refreshSession({ reason: "socket_retry" });
+  };
+
+  const correction = agent.derived.evaluation
+    ? correctionModelFromEvaluation(
+        agent.derived.evaluation,
+        agent.derived.finalTranscript,
+        submittedText,
+        agent.derived.transcriptConfidence,
+      )
+    : undefined;
+  const connectionCopy = stageCopyForConnection({
+    close: agent.derived.close,
+    status: agent.status,
+    terminalReason: agent.derived.terminalReason,
+  });
+  const disconnected = agent.status === "closed" || agent.status === "error";
+  const activePrompt =
+    retrying && correction
+      ? correction.retryPrompt
+      : (agent.derived.question?.prompt ?? connectionCopy.title);
+  const localPhase = retrying
+    ? "listening"
+    : captureState === "requesting"
+      ? "thinking"
+      : captureState === "listening"
+        ? "listening"
+        : agent.derived.phase;
+  const orbState = orbStateForSession({
+    phase: localPhase,
+    speaking: agent.speaking,
+    status: agent.status,
+  });
+  const busy =
+    ending ||
+    disconnected ||
+    Boolean(agent.agentState.pendingSubmission) ||
+    agent.derived.phase === "thinking";
+  const showCorrection = Boolean(correction) && !retrying;
 
   return (
     <SafeAreaView edges={["top", "left", "right", "bottom"]} style={styles.safeArea}>
       <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : undefined}
+        onTouchStart={unlockPlayback}
         style={styles.keyboardView}
       >
         <View style={styles.header}>
@@ -179,7 +426,11 @@ export default function SessionScreen() {
             accessibilityLabel="Leave session"
             accessibilityRole="button"
             hitSlop={12}
-            onPress={() => (router.canDismiss() ? router.dismissAll() : router.replace("/"))}
+            onPress={() => {
+              agent.close();
+              if (router.canDismiss()) router.dismissAll();
+              else router.replace("/");
+            }}
             style={({ pressed }) => [styles.headerAction, pressed && styles.pressed]}
           >
             <VivaText style={styles.closeGlyph}>×</VivaText>
@@ -187,14 +438,16 @@ export default function SessionScreen() {
           <View style={styles.sessionIdentity}>
             <SparkIcon color={colors.sageDeep} size={11} />
             <VivaText style={styles.sessionIdentityText} variant="caption">
-              Biology Midterm
+              {studySet.title}
             </VivaText>
           </View>
           <Pressable
             accessibilityRole="button"
+            disabled={ending}
             hitSlop={8}
             onPress={() => void finishSession()}
             style={({ pressed }) => [styles.endAction, pressed && styles.pressed]}
+            testID="session-end"
           >
             <VivaText tone="ochre" variant="caption">
               End
@@ -207,11 +460,8 @@ export default function SessionScreen() {
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
-          {session.phase === "correction" ? (
-            <CorrectionView
-              answer={typedAnswer.trim() || syntheticAnswer}
-              feedback={buildPrototypeCorrection(typedAnswer.trim() || syntheticAnswer)}
-            />
+          {showCorrection && correction ? (
+            <CorrectionView feedback={correction} />
           ) : (
             <View style={styles.sessionBody}>
               <View style={styles.statusBlock}>
@@ -222,65 +472,89 @@ export default function SessionScreen() {
                   </VivaText>
                   <View style={styles.timerDot} />
                 </View>
-                <VoiceStateLabel>
-                  {session.phase === "requesting"
-                    ? "Opening microphone…"
-                    : session.phase === "listening"
-                      ? "Listening"
-                      : session.phase === "thinking"
-                        ? "Reading your answer…"
-                        : "Question ready"}
-                </VoiceStateLabel>
+                <View testID="session-provider-status">
+                  <VoiceStateLabel>
+                    {captureState === "requesting"
+                      ? "Opening microphone…"
+                      : captureState === "listening"
+                        ? "Listening locally"
+                        : busy
+                          ? "Reading your answer…"
+                          : disconnected
+                            ? connectionCopy.statusLabel
+                            : agent.speaking
+                              ? "Examiner speaking"
+                              : agent.derived.question
+                                ? "Question ready"
+                                : connectionCopy.statusLabel}
+                  </VoiceStateLabel>
+                </View>
               </View>
 
               <View style={styles.orbBlock}>
-                <VoiceOrb
-                  size={156}
-                  state={
-                    session.phase === "listening"
-                      ? "listening"
-                      : session.phase === "thinking" || session.phase === "requesting"
-                        ? "thinking"
-                        : "ready"
-                  }
-                />
+                <VoiceOrb level={orbLevel} size={156} state={orbState} />
               </View>
 
               <View style={styles.questionBlock}>
-                <VivaText accessibilityRole="header" style={styles.question} variant="title">
-                  {question}
+                <VivaText
+                  accessibilityRole="header"
+                  style={styles.question}
+                  testID="session-question"
+                  variant="title"
+                >
+                  {activePrompt}
                 </VivaText>
-                {session.phase === "listening" ? <VoiceWaveform /> : null}
+                {captureState === "listening" || agent.speaking ? <VoiceWaveform /> : null}
+                {!agent.derived.question ? (
+                  <VivaText style={styles.loadDetail} tone="muted">
+                    {connectionCopy.detail}
+                  </VivaText>
+                ) : null}
               </View>
 
-              {hintVisible ? (
+              {hintVisible && agent.derived.question ? (
                 <View accessibilityLiveRegion="polite" style={styles.disclosure}>
                   <VivaText tone="plum" variant="eyebrow">
                     One foothold
                   </VivaText>
                   <VivaText style={styles.disclosureCopy}>
-                    Start with what NADH donates, then explain what that transfer makes possible.
+                    {agent.derived.question.followUp}
                   </VivaText>
                 </View>
               ) : null}
 
-              {sourceVisible ? (
+              {sourceVisible && agent.derived.question ? (
                 <View accessibilityLiveRegion="polite" style={styles.disclosure}>
                   <VivaText tone="plum" variant="eyebrow">
                     Source boundary
                   </VivaText>
                   <VivaText style={styles.disclosureCopy}>
-                    Lecture 5 · slides 12–18. The passage stays closed until after recall.
+                    {agent.derived.question.source.label}.{" "}
+                    {agent.derived.question.source.retrievalReason}
                   </VivaText>
                 </View>
               ) : null}
 
-              {session.phase === "mic-blocked" ? (
+              {captureMessage ? (
                 <View accessibilityLiveRegion="assertive" style={styles.recovery}>
                   <VivaText tone="ochre" variant="eyebrow">
-                    Microphone unavailable
+                    {captureState === "blocked" ? "Microphone unavailable" : "Typed-only stage"}
                   </VivaText>
-                  <VivaText style={styles.recoveryCopy}>{session.recoveryMessage}</VivaText>
+                  <VivaText style={styles.recoveryCopy}>{captureMessage}</VivaText>
+                </View>
+              ) : null}
+
+              {disconnected ? (
+                <View accessibilityLiveRegion="assertive" style={styles.recovery}>
+                  <VivaText tone="ochre" variant="eyebrow">
+                    {connectionCopy.statusLabel}
+                  </VivaText>
+                  <VivaText style={styles.recoveryCopy}>{connectionCopy.detail}</VivaText>
+                  {connectionCopy.canRetry ? (
+                    <ActionButton onPress={retryConnection} tone="secondary">
+                      Retry connection
+                    </ActionButton>
+                  ) : null}
                 </View>
               ) : null}
 
@@ -291,48 +565,61 @@ export default function SessionScreen() {
                   </VivaText>
                   <TextInput
                     accessibilityLabelledBy="answer-label"
-                    autoFocus={session.phase === "mic-blocked"}
+                    autoFocus={captureState === "blocked" || retrying}
+                    editable={!busy}
                     multiline
                     onChangeText={setTypedAnswer}
                     placeholder="Explain it from memory…"
                     placeholderTextColor={colors.inkTertiary}
                     style={styles.input}
+                    testID="session-answer-input"
                     textAlignVertical="top"
                     value={typedAnswer}
                   />
-                  <ActionButton onPress={submitTypedAnswer}>Submit answer</ActionButton>
+                  <ActionButton
+                    disabled={busy || !agent.derived.canSubmitAnswer || !typedAnswer.trim()}
+                    onPress={submitTypedAnswer}
+                    testID="session-submit"
+                  >
+                    Submit answer
+                  </ActionButton>
                 </View>
               ) : null}
 
               <View style={styles.actionDock}>
-                {session.phase === "ready" && !typing ? (
+                {agent.derived.question && captureState === "idle" && !typing ? (
                   <ActionButton
+                    disabled={!agent.derived.canSubmitAnswer || busy}
                     icon={<SparkIcon color={colors.plumSoft} size={15} />}
                     onPress={() => void startListening()}
                   >
                     Start listening
                   </ActionButton>
                 ) : null}
-                {session.phase === "requesting" ? (
+                {captureState === "requesting" ? (
                   <ActionButton loading>Opening microphone</ActionButton>
                 ) : null}
-                {session.phase === "listening" ? (
-                  <ActionButton onPress={() => void finishSpokenAnswer()}>
+                {captureState === "listening" ? (
+                  <ActionButton disabled={busy} onPress={() => void finishSpokenAnswer()}>
                     Finish answer
                   </ActionButton>
                 ) : null}
                 <View style={styles.secondaryActions}>
                   <ActionButton
-                    disabled={session.phase === "requesting" || session.phase === "thinking"}
-                    onPress={() => setHintVisible((value) => !value)}
+                    disabled={!agent.derived.question || captureState === "requesting" || busy}
+                    onPress={() => {
+                      unlockPlayback();
+                      setHintVisible((value) => !value);
+                    }}
                     style={styles.secondaryAction}
                     tone="tint"
                   >
                     {hintVisible ? "Hide hint" : "Hint"}
                   </ActionButton>
                   <ActionButton
-                    disabled={session.phase === "requesting" || session.phase === "thinking"}
+                    disabled={!agent.derived.question || captureState === "requesting" || busy}
                     onPress={() => {
+                      unlockPlayback();
                       setTyping((value) => !value);
                       if (!typing) setSourceVisible(false);
                     }}
@@ -343,8 +630,11 @@ export default function SessionScreen() {
                   </ActionButton>
                 </View>
                 <ActionButton
-                  disabled={session.phase === "requesting" || session.phase === "thinking"}
-                  onPress={() => setSourceVisible((value) => !value)}
+                  disabled={!agent.derived.question || captureState === "requesting" || busy}
+                  onPress={() => {
+                    unlockPlayback();
+                    setSourceVisible((value) => !value);
+                  }}
                   tone="quiet"
                 >
                   {sourceVisible ? "Close source note" : "Why this source?"}
@@ -354,13 +644,18 @@ export default function SessionScreen() {
           )}
         </ScrollView>
 
-        {session.phase === "correction" ? (
+        {showCorrection ? (
           <View style={styles.correctionDock}>
-            <ActionButton icon={<SparkIcon color={colors.plumSoft} size={15} />} onPress={retry}>
+            <ActionButton
+              disabled={ending}
+              icon={<SparkIcon color={colors.plumSoft} size={15} />}
+              onPress={retry}
+              testID="session-retry"
+            >
               Try again
             </ActionButton>
-            <ActionButton onPress={() => void finishSession()} tone="secondary">
-              Complete session
+            <ActionButton disabled={ending} onPress={() => void finishSession()} tone="secondary">
+              {ending ? "Ending session…" : "Complete session"}
             </ActionButton>
           </View>
         ) : null}
@@ -369,17 +664,11 @@ export default function SessionScreen() {
   );
 }
 
-function CorrectionView({
-  answer,
-  feedback,
-}: {
-  answer: string;
-  feedback: ReturnType<typeof buildPrototypeCorrection>;
-}) {
+function CorrectionView({ feedback }: { feedback: SessionCorrectionModel }) {
   const [sourceExpanded, setSourceExpanded] = useState(false);
 
   return (
-    <View style={styles.correctionBody}>
+    <View style={styles.correctionBody} testID="session-correction">
       <View style={styles.correctionHeading}>
         <VoiceOrb size={76} state="correcting" />
         <VivaText tone="ochre" variant="eyebrow">
@@ -397,7 +686,7 @@ function CorrectionView({
             You said
           </VivaText>
           <VivaText style={styles.answerQuote} variant="lead">
-            {answer}
+            {feedback.answer}
           </VivaText>
         </View>
         <View style={styles.manuscriptRule} />
@@ -406,6 +695,18 @@ function CorrectionView({
             Correction
           </VivaText>
           <VivaText style={styles.correctionCopy}>{feedback.correction}</VivaText>
+        </View>
+        <View style={styles.manuscriptRule} />
+        <View style={styles.manuscriptSection}>
+          <VivaText tone="plum" variant="caption">
+            Try this next
+          </VivaText>
+          <VivaText style={styles.correctionCopy}>{feedback.retryPrompt}</VivaText>
+          {feedback.uncertainTranscript ? (
+            <VivaText tone="ochre" variant="caption">
+              The transcript confidence was low; verify the quoted answer before retrying.
+            </VivaText>
+          ) : null}
         </View>
         <View style={styles.manuscriptRule} />
         <Pressable
@@ -425,7 +726,7 @@ function CorrectionView({
               Source
             </VivaText>
             <VivaText style={styles.sourceTitle} variant="caption">
-              {feedback.source}
+              {feedback.sourceLabel}
             </VivaText>
           </View>
           <VivaText
@@ -445,6 +746,12 @@ function CorrectionView({
       </View>
     </View>
   );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error && error.message.trim()
+    ? error.message.trim()
+    : "The library request failed.";
 }
 
 const styles = StyleSheet.create({
@@ -539,6 +846,21 @@ const styles = StyleSheet.create({
   },
   keyboardView: {
     flex: 1,
+  },
+  loadDetail: {
+    maxWidth: 340,
+    textAlign: "center",
+  },
+  loadState: {
+    alignItems: "center",
+    flex: 1,
+    gap: space.md,
+    justifyContent: "center",
+    paddingHorizontal: layout.gutter,
+  },
+  loadTitle: {
+    maxWidth: 340,
+    textAlign: "center",
   },
   manuscript: {
     backgroundColor: colors.sheet,

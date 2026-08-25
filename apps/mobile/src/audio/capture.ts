@@ -184,6 +184,7 @@ export function createMobileCaptureSession(
             if (frames.length === MAX_TURN_FRAMES) {
               active = false;
               controller?.stop();
+              invokeSafely(() => options.onEnded?.("stopped"));
             }
           },
           onSampleFrame: (frame) => {

@@ -82,7 +82,15 @@ function useReducedMotion() {
   return reduced;
 }
 
-export function VoiceOrb({ size = 168, state = "ready" }: { size?: number; state?: OrbState }) {
+export function VoiceOrb({
+  level = 0,
+  size = 168,
+  state = "ready",
+}: {
+  level?: number;
+  size?: number;
+  state?: OrbState;
+}) {
   const gradientId = `orb${useId().replace(/[^a-zA-Z0-9]/g, "")}`;
   const motion = useRef(new Animated.Value(0.55)).current;
   const spin = useRef(new Animated.Value(0)).current;
@@ -94,6 +102,8 @@ export function VoiceOrb({ size = 168, state = "ready" }: { size?: number; state
   const orbitRadius = sphereRadius * 1.24;
   const listening = state === "listening";
   const palette = palettes[state];
+  const normalizedLevel = Number.isFinite(level) ? Math.max(0, Math.min(1, level)) : 0;
+  const levelScale = 1 + normalizedLevel * 0.1;
 
   useEffect(() => {
     const breathing = reducedMotion ? null : breathingByState[state];
@@ -164,7 +174,10 @@ export function VoiceOrb({ size = 168, state = "ready" }: { size?: number; state
       style={[styles.frame, { height: canvas, width: canvas }]}
     >
       <Animated.View
-        style={[styles.layer, { opacity: glowOpacity, transform: [{ scale: glowScale }] }]}
+        style={[
+          styles.layer,
+          { opacity: glowOpacity, transform: [{ scale: glowScale }, { scale: levelScale }] },
+        ]}
       >
         <Svg height={canvas} width={canvas}>
           <Defs>

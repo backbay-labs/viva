@@ -90,7 +90,11 @@ describe("createMobileCaptureSession", () => {
 
   test("enforces the learner-loop cap and retains at most the derived frame count", async () => {
     const source = new FakeCaptureSource();
-    const session = createMobileCaptureSession({ source });
+    const ended: VivaAudioCaptureEndReason[] = [];
+    const session = createMobileCaptureSession({
+      onEnded: (reason) => ended.push(reason),
+      source,
+    });
 
     await session.start();
     for (let index = 0; index < MOBILE_CAPTURE_MAX_TURN_FRAMES + 3; index += 1) {
@@ -100,6 +104,7 @@ describe("createMobileCaptureSession", () => {
     expect(session.getFrames()).toHaveLength(MOBILE_CAPTURE_MAX_TURN_FRAMES);
     expect(session.isActive()).toBe(false);
     expect(source.stopCalls).toBe(1);
+    expect(ended).toEqual(["stopped"]);
   });
 
   test("drops partial frames from the ledger while shared framing accumulates them", async () => {

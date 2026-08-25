@@ -38,6 +38,7 @@ describe("sessionResultStore", () => {
 
     sessionResultStore.set({
       conceptStatuses: { nadh: "strong" },
+      partialReason: "provider_timeout",
       recap,
       studySet,
       studySetTitle: studySet.title,
@@ -47,6 +48,7 @@ describe("sessionResultStore", () => {
     expect(stored?.studySet).toBe(studySet);
     expect(stored?.recap).toBe(recap);
     expect(stored?.conceptStatuses).toEqual({ nadh: "strong" });
+    expect(stored?.partialReason).toBe("provider_timeout");
     expect(stored?.studySetTitle).toBe("Biology Midterm");
     expect(notifications).toBe(1);
 

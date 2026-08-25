@@ -1,8 +1,10 @@
 import {
   type AgentSessionConfig,
+  type AgentTerminalSessionReason,
   agentStudySetReadiness,
   type StudyMode,
   type StudySet,
+  VIVA_AGENT_TERMINAL_SESSION_REASONS,
 } from "@viva/core";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { AppStateStatus } from "react-native";
@@ -12,11 +14,13 @@ import {
   createVivaAgentSessionController,
   deriveVivaAgentUiState,
   initialVivaAgentSessionState,
+  parseVivaAgentMessage,
   studySetToAgentSessionConfig,
   type VivaAgentAudioOutput,
   type VivaAgentGenerationReason,
   type VivaAgentSessionController,
   type VivaAgentSessionState,
+  type VivaAudioCaptureEndReason,
 } from "@/agent/shared-web";
 import { createMobileCaptureSession, type MobileCaptureSession } from "@/audio/capture";
 import { createMobilePlaybackSession, type MobilePlaybackSession } from "@/audio/playback";
@@ -44,6 +48,10 @@ export type UseMobileVivaSessionOptions = {
   mode: StudyMode;
   studySet: StudySet;
 };
+
+export type MobileCaptureIssue =
+  | { kind: "ended"; reason: VivaAudioCaptureEndReason; sequence: number }
+  | { kind: "error"; message: string; sequence: number };
 
 function assertTypedMobileFrame(data: unknown): asserts data is string {
   if (typeof data !== "string") {
@@ -75,16 +83,23 @@ function assertTypedMobileFrame(data: unknown): asserts data is string {
 export function createGuardedWebSocketImplementation(
   WebSocketImpl: typeof WebSocket,
   wsOrigin: string | null,
+  onRecapPartialReason?: (reason: AgentTerminalSessionReason) => void,
 ): typeof WebSocket {
   const NativeWebSocket = WebSocketImpl as unknown as NativeWebSocketConstructor;
 
   class GuardedMobileWebSocket {
     readonly #native: WebSocket;
+    readonly #partialReasonListener?: EventListener;
 
     constructor(url: string, protocols?: string | string[]) {
       this.#native = wsOrigin
         ? new NativeWebSocket(url, protocols, { headers: { Origin: wsOrigin } })
         : new NativeWebSocket(url, protocols);
+      this.#partialReasonListener = (event) => {
+        const reason = recapPartialReasonFromMessage((event as MessageEvent).data);
+        if (reason) onRecapPartialReason?.(reason);
+      };
+      this.#native.addEventListener("message", this.#partialReasonListener);
     }
 
     get binaryType(): BinaryType {
@@ -124,6 +139,9 @@ export function createGuardedWebSocketImplementation(
     }
 
     close(code?: number, reason?: string): void {
+      if (this.#partialReasonListener) {
+        this.#native.removeEventListener?.("message", this.#partialReasonListener);
+      }
       this.#native.close(code, reason);
     }
 
@@ -150,22 +168,44 @@ export function createGuardedWebSocketImplementation(
 
 export function createMobileSessionController(options: {
   config: AppConfig;
+  onRecapPartialReason?: (reason: AgentTerminalSessionReason) => void;
   session: AgentSessionConfig;
+  sessionToken?: string | null;
   WebSocketImpl?: typeof WebSocket;
 }): MobileVivaSessionController {
   const WebSocketImpl = createGuardedWebSocketImplementation(
     options.WebSocketImpl ?? WebSocket,
     options.config.wsOrigin,
+    options.onRecapPartialReason,
   );
   const controller = createVivaAgentSessionController({
     WebSocketImpl,
     session: options.session,
-    sessionToken: options.config.sessionToken,
-    token: options.config.sessionToken ?? undefined,
+    sessionToken: options.sessionToken ?? options.config.sessionToken,
+    token: options.sessionToken ?? options.config.sessionToken ?? undefined,
     url: options.config.agentWsUrl,
   });
   const { sendAudio: _forbiddenAudioCapability, ...typedController } = controller;
   return typedController;
+}
+
+function recapPartialReasonFromMessage(data: unknown): AgentTerminalSessionReason | undefined {
+  if (typeof data !== "string") return undefined;
+  try {
+    const frame = parseVivaAgentMessage(data);
+    if (frame.type !== "event" || frame.event.type !== "recap_ready") return undefined;
+    const reason = frame.event.partial_reason;
+    if (
+      typeof reason === "string" &&
+      (VIVA_AGENT_TERMINAL_SESSION_REASONS as readonly string[]).includes(reason)
+    ) {
+      return reason as AgentTerminalSessionReason;
+    }
+  } catch {
+    // The shared controller owns inbound validation and diagnostics. This tap
+    // only preserves one field that its current state projection drops.
+  }
+  return undefined;
 }
 
 export function foregroundReconnectAction(input: {
@@ -218,8 +258,35 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
       }),
     [config.userId, options.mode, options.studySet],
   );
-  const capture = useMemo<MobileCaptureSession>(() => createMobileCaptureSession(), []);
-  const playback = useMemo<MobilePlaybackSession>(() => createMobilePlaybackSession(), []);
+  const [speaking, setSpeaking] = useState(false);
+  const [recapPartialReason, setRecapPartialReason] = useState<AgentTerminalSessionReason>();
+  const [captureIssue, setCaptureIssue] = useState<MobileCaptureIssue>();
+  const captureIssueSequence = useRef(0);
+  const captureCallbacksActive = useRef(true);
+  const capture = useMemo<MobileCaptureSession>(
+    () =>
+      createMobileCaptureSession({
+        onEnded: (reason) => {
+          if (!captureCallbacksActive.current) return;
+          captureIssueSequence.current += 1;
+          setCaptureIssue({ kind: "ended", reason, sequence: captureIssueSequence.current });
+        },
+        onError: (error) => {
+          if (!captureCallbacksActive.current) return;
+          captureIssueSequence.current += 1;
+          setCaptureIssue({
+            kind: "error",
+            message: error instanceof Error ? error.message : String(error),
+            sequence: captureIssueSequence.current,
+          });
+        },
+      }),
+    [],
+  );
+  const playback = useMemo<MobilePlaybackSession>(
+    () => createMobilePlaybackSession({ onSpeakingChange: setSpeaking }),
+    [],
+  );
   const controllerRef = useRef<MobileVivaSessionController | null>(null);
   const [agentState, setAgentState] = useState<VivaAgentSessionState>(initialVivaAgentSessionState);
   const derived = useMemo(() => deriveVivaAgentUiState(agentState), [agentState]);
@@ -227,7 +294,22 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
   latestLifecycle.current = { hasRecap: Boolean(derived.recap), status: agentState.status };
 
   useEffect(() => {
-    const controller = createMobileSessionController({ config, session });
+    captureCallbacksActive.current = true;
+    return () => {
+      captureCallbacksActive.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    sessionResultStore.clear();
+    setCaptureIssue(undefined);
+    setRecapPartialReason(undefined);
+    const controller = createMobileSessionController({
+      config,
+      onRecapPartialReason: setRecapPartialReason,
+      session,
+      sessionToken: config.sessionToken ?? options.studySet.sessionToken,
+    });
     controllerRef.current = controller;
     setAgentState(controller.getState());
     const unsubscribe = controller.subscribe(setAgentState);
@@ -242,7 +324,7 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
       void playback.close();
       if (controllerRef.current === controller) controllerRef.current = null;
     };
-  }, [capture, config, playback, session]);
+  }, [capture, config, options.studySet.sessionToken, playback, session]);
 
   useEffect(() => {
     const subscription = nativeAppState().addEventListener("change", (nextState) => {
@@ -260,14 +342,22 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
   }, [capture, playback]);
 
   useEffect(() => {
-    if (!derived.recap) return;
+    if (!derived.recap && !derived.terminalReason) return;
     sessionResultStore.set({
       conceptStatuses: derived.conceptStatuses,
+      partialReason: recapPartialReason,
       recap: derived.recap,
       studySet: options.studySet,
       studySetTitle: options.studySet.title,
+      terminalReason: derived.terminalReason,
     });
-  }, [derived.conceptStatuses, derived.recap, options.studySet]);
+  }, [
+    derived.conceptStatuses,
+    derived.recap,
+    derived.terminalReason,
+    options.studySet,
+    recapPartialReason,
+  ]);
 
   const readiness = useMemo(
     () => agentStudySetReadiness(options.studySet, config.studySetId),
@@ -283,12 +373,18 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
       controllerRef.current?.cancel();
     },
     capture,
+    captureIssue,
+    clearCaptureIssue: () => setCaptureIssue(undefined),
     close: () => {
       void capture.teardown();
       playback.resetForGeneration();
       controllerRef.current?.close();
     },
-    connect: (reason?: VivaAgentGenerationReason) => controllerRef.current?.connect(reason),
+    connect: (reason?: VivaAgentGenerationReason) => {
+      setCaptureIssue(undefined);
+      setRecapPartialReason(undefined);
+      return controllerRef.current?.connect(reason);
+    },
     derived,
     playback,
     readiness,
@@ -296,17 +392,22 @@ export function useMobileVivaSession(options: UseMobileVivaSessionOptions) {
       reason?: VivaAgentGenerationReason;
       sessionToken?: string | null;
     }) => {
+      setCaptureIssue(undefined);
+      setRecapPartialReason(undefined);
       void capture.reset();
       playback.resetForGeneration();
       return controllerRef.current?.refreshSession(input);
     },
     reset: () => {
+      setCaptureIssue(undefined);
+      setRecapPartialReason(undefined);
       sessionResultStore.clear();
       void capture.reset();
       playback.resetForGeneration();
       controllerRef.current?.reset();
     },
     sendText: (text: string) => controllerRef.current?.sendText(text) ?? false,
+    speaking,
     status: agentState.status,
     stop: () => {
       void capture.stop();

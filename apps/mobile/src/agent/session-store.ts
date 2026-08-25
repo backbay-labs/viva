@@ -1,10 +1,12 @@
-import type { ConceptStatus, SessionRecap, StudySet } from "@viva/core";
+import type { AgentTerminalSessionReason, ConceptStatus, SessionRecap, StudySet } from "@viva/core";
 
 export type MobileSessionResult = {
   conceptStatuses: Record<string, ConceptStatus>;
+  partialReason?: AgentTerminalSessionReason;
   recap?: SessionRecap;
   studySet: StudySet;
   studySetTitle?: string;
+  terminalReason?: AgentTerminalSessionReason;
 };
 
 let current: MobileSessionResult | undefined;

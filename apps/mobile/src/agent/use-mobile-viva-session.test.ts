@@ -7,6 +7,7 @@ import {
   foregroundReconnectAction,
 } from "@/agent/use-mobile-viva-session";
 import type { AppConfig } from "@/runtime/config";
+import syntheticStudySession from "../../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
 
 type Listener = (event: Event & { data?: unknown }) => void;
 
@@ -35,6 +36,17 @@ class FakeWebSocket {
   open(): void {
     this.readyState = 1;
     this.emit("open", new Event("open"));
+  }
+
+  message(data: unknown): void {
+    this.emit("message", Object.assign(new Event("message"), { data }));
+  }
+
+  removeEventListener(type: string, listener: Listener): void {
+    this.listeners.set(
+      type,
+      (this.listeners.get(type) ?? []).filter((candidate) => candidate !== listener),
+    );
   }
 
   send(value: unknown): void {
@@ -110,6 +122,63 @@ describe("createMobileSessionController", () => {
       expect(() => (socket.send as (value: unknown) => void)(payload)).toThrow();
     }
     expect(FakeWebSocket.instances[0]?.sent).toHaveLength(0);
+  });
+
+  test("puts a library-issued session capability on the socket and session frame", () => {
+    FakeWebSocket.instances = [];
+    const controller = createMobileSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      config,
+      session,
+      sessionToken: "library-capability",
+    });
+
+    controller.connect();
+    const socket = FakeWebSocket.instances[0];
+    expect(socket?.protocols?.[1]?.startsWith("bearer.")).toBe(true);
+    socket?.open();
+    expect(JSON.parse(String(socket?.sent[0])).session_token).toBe("library-capability");
+  });
+
+  test("preserves recap partial_reason before the shared projection drops it", () => {
+    FakeWebSocket.instances = [];
+    const reasons: string[] = [];
+    const controller = createMobileSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      config,
+      onRecapPartialReason: (reason) => reasons.push(reason),
+      session,
+    });
+    controller.connect();
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+    const recapFrame = syntheticStudySession.server.find(
+      (frame) => frame.type === "event" && frame.event?.type === "recap_ready",
+    );
+    if (recapFrame?.type !== "event" || !recapFrame.event) {
+      throw new Error("fixture recap missing");
+    }
+    const partialFrame = {
+      ...recapFrame,
+      event: { ...recapFrame.event, partial_reason: "provider_timeout" },
+    };
+    socket?.message(JSON.stringify(partialFrame));
+    socket?.message(
+      JSON.stringify({
+        ...partialFrame,
+        event: { ...partialFrame.event, partial_reason: "not-a-terminal-reason" },
+      }),
+    );
+    socket?.message(JSON.stringify({ ...partialFrame, version: 5 }));
+    expect(reasons).toEqual(["provider_timeout"]);
+    controller.close();
+    socket?.message(
+      JSON.stringify({
+        ...partialFrame,
+        event: { ...partialFrame.event, partial_reason: "turn_cap" },
+      }),
+    );
+    expect(reasons).toEqual(["provider_timeout"]);
   });
 });
 
