@@ -203,3 +203,39 @@ describe("LEARN-006 recovery actions keep distinct intents", () => {
     expect(entry.learner.secondary_action.intent).not.toBe(entry.learner.primary_action.intent);
   });
 });
+
+/**
+ * `LEARN-007` — completion copy is a success, not a recovery from a disconnect.
+ */
+describe("LEARN-007 session completion recovery copy", () => {
+  test("offers a new session and never reads as a failure", () => {
+    const entry = learnerRecoveryCopyForState("session_completed");
+
+    expect(entry).not.toBeUndefined();
+    expect(entry?.resolution_kind).toBe("success");
+    expect(entry?.submitted_answer_resolution).toBe(true);
+    expect(entry?.runtime_copy_causes).toEqual(["recap_success"]);
+    expect(entry?.learner.capsule_label).toBe("Session complete");
+    expect(entry?.learner.marginalia_title).toBe("Session recap ready.");
+    expect(entry?.learner.status_label).toBe("session complete");
+    expect(entry?.learner.primary_action).toEqual({
+      label: "Start a new session",
+      intent: "start_session",
+    });
+    expect(entry?.learner.secondary_action).toEqual({
+      label: "Start a new session",
+      intent: "start_session",
+    });
+    expect(entry?.operator.stage).toBe("recap");
+    expect(entry?.operator.diagnostic_fields).toEqual(["stage", "deploy_sha", "recap_success"]);
+    expect(entry?.operator.terminal_reason).toBeUndefined();
+    expect(entry?.operator.failure_class).toBeUndefined();
+
+    const text = learnerCopyText("session_completed");
+    expect(text.length).toBeGreaterThan(0);
+    expect(/disconnect|lost|failed|error|try again/i.test(text)).toBe(false);
+    for (const forbidden of FORBIDDEN_LEARNER_COPY_PATTERNS) {
+      expect(forbidden.test(text)).toBe(false);
+    }
+  });
+});

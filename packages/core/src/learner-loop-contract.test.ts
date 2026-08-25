@@ -595,3 +595,86 @@ describe("LEARN-006A composes the terminal-reason allowlist once", () => {
     expect(declared).toContain("durability_degraded");
   });
 });
+
+/**
+ * `LEARN-007` — a persisted recap is a learner outcome, not a disconnect.
+ *
+ * A session whose recap was saved has succeeded. Without its own success state
+ * the surface has nothing to show but the transport's terminal copy, so a clean
+ * or unclean close after `recap_ready` reads as a failure. `session_completed`
+ * is that outcome: non-terminal, holding its own submitted-answer resolution
+ * key, and reached only through the `recap_success` runtime cause.
+ */
+const SESSION_COMPLETED_COPY = Object.freeze({
+  capsule_label: "Session complete",
+  marginalia_title: "Session recap ready.",
+  marginalia_text: "Viva saved the evidence-backed recap and review plan.",
+  next_action_label: "Start a new session",
+  next_action_intent: "start_session",
+  primary_action_label: "Start a new session",
+  primary_action_intent: "start_session",
+  status_label: "session complete",
+});
+
+describe("LEARN-007 successful session completion", () => {
+  test("declares the exact session_completed state", () => {
+    const state = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+      (candidate) => candidate.id === "session_completed",
+    );
+
+    expect(state).not.toBeUndefined();
+    expect(state?.label).toBe("Session completed");
+    expect(state?.stage).toBe("recap");
+    expect(state?.resolution_kind).toBe("success");
+    expect(state?.submitted_answer_resolution).toBe(true);
+    expect(state?.max_resolution_ms).toBe(45_000);
+    expect(state?.learner_safe).toBe(true);
+    expect(state?.authority).toBe("durable_store_event");
+    expect(state?.sanitized_evidence).toBe(true);
+    expect(state?.runtime_copy_causes).toEqual(["recap_success"]);
+    expect(state?.copy).toEqual({ ...SESSION_COMPLETED_COPY });
+    expect(state?.operator_diagnostics).toEqual(["stage", "deploy_sha", "recap_success"]);
+  });
+
+  test("is not terminal and names no terminal reason", () => {
+    const state = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+      (candidate) => candidate.id === "session_completed",
+    );
+
+    expect(state).not.toBeUndefined();
+    expect(state?.resolution_kind).not.toBe("terminal");
+    expect(state?.terminal_reason).toBeUndefined();
+    expect(state?.failure_class).toBeUndefined();
+    expect(state?.failure_matrix).toBeUndefined();
+  });
+
+  test("holds its own submitted-answer resolution key", () => {
+    const keys = VIVA_LEARNER_LOOP_CONTRACT.states
+      .filter((state) => state.submitted_answer_resolution)
+      .map((state) => state.terminal_reason ?? state.failure_class ?? state.id);
+
+    expect(keys.filter((key) => key === "session_completed")).toEqual(["session_completed"]);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  test("maps the new recap_success runtime copy cause exactly once", () => {
+    expect([...VIVA_RUNTIME_COPY_CAUSES]).toContain("recap_success");
+
+    const mapped = VIVA_LEARNER_LOOP_CONTRACT.states
+      .filter((state) => (state.runtime_copy_causes as readonly string[]).includes("recap_success"))
+      .map((state) => state.id);
+
+    expect(mapped).toEqual(["session_completed"]);
+  });
+
+  test("does not turn recap_success into a terminal reason", () => {
+    expect([...VIVA_LEARNER_LOOP_TERMINAL_REASONS]).not.toContain("recap_success");
+
+    const contract = rawContract();
+    rawState(contract, "session_completed").terminal_reason = "recap_success";
+
+    expect(() => validateLearnerLoopContract(contract as unknown)).toThrow(
+      "Unknown learner loop terminal reason recap_success",
+    );
+  });
+});

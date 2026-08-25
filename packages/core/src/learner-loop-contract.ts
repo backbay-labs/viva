@@ -32,6 +32,7 @@ export const VIVA_RUNTIME_COPY_CAUSES = [
   "provider_rate_limited",
   "provider_timeout",
   "rate_limit",
+  "recap_success",
   "rollback",
   "session_cap",
   "session_disconnected",

@@ -251,6 +251,29 @@
       ]
     },
     {
+      "id": "session_completed",
+      "label": "Session completed",
+      "stage": "recap",
+      "resolution_kind": "success",
+      "submitted_answer_resolution": true,
+      "max_resolution_ms": 45000,
+      "learner_safe": true,
+      "authority": "durable_store_event",
+      "sanitized_evidence": true,
+      "runtime_copy_causes": ["recap_success"],
+      "copy": {
+        "capsule_label": "Session complete",
+        "marginalia_title": "Session recap ready.",
+        "marginalia_text": "Viva saved the evidence-backed recap and review plan.",
+        "next_action_label": "Start a new session",
+        "next_action_intent": "start_session",
+        "primary_action_label": "Start a new session",
+        "primary_action_intent": "start_session",
+        "status_label": "session complete"
+      },
+      "operator_diagnostics": ["stage", "deploy_sha", "recap_success"]
+    },
+    {
       "id": "deterministic_partial_recap",
       "label": "Deterministic partial recap",
       "stage": "websocket",

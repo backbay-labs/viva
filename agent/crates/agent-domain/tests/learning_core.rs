@@ -63,8 +63,10 @@ use agent_domain::{
     SourceConfidence,
     StudyMode,
     StudyQuestion,
+    StudySessionPhase,
     StudySetIngestionStatus,
     StudySourceReference,
+    TerminalSessionReason,
     ToolExecutionError,
     ToolProposal,
     TurnOutcome,
@@ -4331,4 +4333,135 @@ async fn quiz_only_authenticated_projection_reports_quiz_and_no_goal() {
     let encoded = serde_json::to_value(&projection).expect("projection serializes");
     assert_eq!(encoded["session"]["mode"], json!(VIVA_STUDY_MODE));
     assert_eq!(encoded["session"]["goal"], Value::Null);
+}
+
+// ---------------------------------------------------------------------------
+// LEARN-007 — one terminal-reason declaration behind session completion
+// ---------------------------------------------------------------------------
+//
+// A persisted recap has to be able to outrank a transport close, and that is
+// only honest if the session phase is cheap to carry alongside a completion
+// flag and if exactly one enum decides what a terminal reason is called. A
+// second declaration — an enum, or a hand-maintained wire/close string table in
+// a consumer — is how the wire token, the close text, and the learner copy drift
+// apart, so these tests read the Plan-06-owned consumers' own source and require
+// them to hold neither.
+
+const STUDY_SOURCE: &str = include_str!("../src/study.rs");
+const BRAIN_SOURCE: &str = include_str!("../src/brain.rs");
+const SESSION_STATE_SOURCE: &str = include_str!("../src/session_state.rs");
+
+fn assert_copy<T: Copy>() {}
+
+#[test]
+fn session_completion_phase_is_copy() {
+    assert_copy::<StudySessionPhase>();
+
+    // A non-`Copy` phase would be moved by the binding below, so this compiles
+    // only while `StudySessionPhase: Copy` holds.
+    let phase = StudySessionPhase::Recap;
+    let carried = phase;
+    assert_eq!(phase, carried);
+    assert_eq!(phase, StudySessionPhase::Recap);
+
+    let rendered = serde_json::to_value(phase).expect("phase serializes");
+    assert_eq!(rendered, json!("recap"));
+}
+
+#[test]
+fn session_completion_terminal_reason_declares_all_sixteen_once() {
+    assert_eq!(
+        TerminalSessionReason::ALL.len(),
+        16,
+        "the single terminal-reason declaration exposes exactly sixteen variants",
+    );
+
+    let wire_tokens: BTreeSet<&str> = TerminalSessionReason::ALL
+        .iter()
+        .map(|reason| reason.as_str())
+        .collect();
+    assert_eq!(
+        wire_tokens.len(),
+        TerminalSessionReason::ALL.len(),
+        "every terminal reason has its own wire token",
+    );
+
+    for reason in TerminalSessionReason::ALL {
+        let token = reason.as_str();
+        assert!(!token.is_empty(), "{reason:?} has an empty wire token");
+        assert!(
+            token
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character == '_'),
+            "{token} is not a snake_case wire token",
+        );
+
+        let encoded = serde_json::to_value(reason).expect("terminal reason serializes");
+        assert_eq!(encoded, json!(token), "serde parity for {token}");
+        let decoded: TerminalSessionReason =
+            serde_json::from_value(json!(token)).expect("terminal reason round trips");
+        assert_eq!(decoded, reason, "serde round trip for {token}");
+
+        assert_eq!(reason.to_string(), token, "Display must equal as_str");
+        assert_eq!(
+            reason.close_reason(),
+            token.replace('_', " "),
+            "the close reason is the wire token with underscores as spaces",
+        );
+    }
+}
+
+#[test]
+fn session_completion_terminal_reason_is_the_only_declaration() {
+    assert_eq!(
+        STUDY_SOURCE
+            .matches("pub enum TerminalSessionReason")
+            .count(),
+        1,
+        "study.rs declares the terminal-reason enum exactly once",
+    );
+
+    for (name, source) in [
+        ("brain.rs", BRAIN_SOURCE),
+        ("session_state.rs", SESSION_STATE_SOURCE),
+    ] {
+        assert_eq!(
+            source.matches("enum TerminalSessionReason").count(),
+            0,
+            "{name} must not redeclare the terminal-reason enum",
+        );
+        assert_eq!(
+            source.matches("impl TerminalSessionReason").count(),
+            0,
+            "{name} must not attach a second terminal-reason vocabulary",
+        );
+        assert!(
+            source.contains("TerminalSessionReason"),
+            "{name} must consume the one imported terminal-reason authority",
+        );
+    }
+
+    assert!(
+        BRAIN_SOURCE.contains("TerminalSessionReason::Drained"),
+        "brain.rs maps failure classes onto the imported variants, not onto strings",
+    );
+    assert!(
+        SESSION_STATE_SOURCE
+            .contains("use crate::study::{StudySessionPhase, TerminalSessionReason};"),
+        "session_state.rs imports both Plan-04-owned declarations",
+    );
+
+    // No consumer keeps a parallel string table: a wire or close literal
+    // repeated in the phase machine is exactly the drift this task removes.
+    for reason in TerminalSessionReason::ALL {
+        for literal in [
+            format!("\"{}\"", reason.as_str()),
+            format!("\"{}\"", reason.close_reason()),
+        ] {
+            assert!(
+                !SESSION_STATE_SOURCE.contains(&literal),
+                "session_state.rs repeats the terminal literal {literal}",
+            );
+        }
+    }
 }
