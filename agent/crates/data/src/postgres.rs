@@ -33,11 +33,12 @@ use uuid::Uuid;
 
 use crate::{
     memory::{
-        generate_file_study_set, generate_paste_study_set, last_reviewed_at, payload_sha256,
-        projection_active_question, require_selected_progression_policy, review_schedule_summaries,
-        turn_outcome_disposition, turn_outcome_transitions, validate_challenge_resolution,
-        validate_turn_outcome, ConceptStatusEventPayload, EventAuthorizationKind,
-        QuestionProgressionRecord, ReviewScheduleEventPayload,
+        deletion_receipt, generate_file_study_set, generate_paste_study_set, last_reviewed_at,
+        payload_sha256, projection_active_question, require_selected_progression_policy,
+        review_schedule_summaries, turn_outcome_disposition, turn_outcome_transitions,
+        validate_challenge_resolution, validate_turn_outcome, ConceptStatusEventPayload,
+        EventAuthorizationKind, QuestionProgressionRecord, ReviewScheduleEventPayload,
+        DATA_RETENTION_POLICY, DELETED_ROW_CONSTANT, DELETED_STUDY_SET_TITLE,
     },
     recap_label_buckets, InMemoryStudyStore,
 };
@@ -305,6 +306,45 @@ impl PostgresStudyStore {
     /// the same lock before they mutate status or remove artifacts. That leaves
     /// only two serial orders — write-then-delete, or delete-then-refuse — and no
     /// interleaving in which a late learning artifact survives the deletion.
+    /// The same tenant-owned open-session lock, taken in `SHARE` mode.
+    ///
+    /// `DATA-004`: an artifact writer needs to exclude *deletion*, which takes the
+    /// row `FOR UPDATE`, but it must not exclude another artifact writer — two
+    /// concurrent evaluations, recaps, status events, or schedule decisions still
+    /// have to race each other so their conflict-safe upserts are what proves
+    /// convergence. `FOR SHARE` conflicts with `FOR UPDATE` and with the deletion's
+    /// `UPDATE`, and with nothing else.
+    async fn lock_open_session_shared(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: &str,
+        study_set_uuid: Uuid,
+        voice_session_uuid: Uuid,
+    ) -> Result<(), PortError> {
+        let locked = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id
+             FROM voice_sessions
+             WHERE id = $1
+               AND user_id = $2
+               AND study_set_id = $3
+               AND status = 'open'
+             FOR SHARE",
+        )
+        .bind(voice_session_uuid)
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(pg_error)?;
+        if locked.is_some() {
+            return Ok(());
+        }
+        Err(PortError::unavailable(
+            "postgres",
+            voice_session_uuid.to_string(),
+            "voice session is not available for this user and study set",
+        ))
+    }
+
     async fn lock_open_session(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         user_id: &str,
@@ -842,11 +882,18 @@ impl PostgresStudyStore {
         Ok(())
     }
 
+    /// The ordinary ownership guard, used by the session, nonce, outcome,
+    /// challenge, progression, and projection paths.
+    ///
+    /// `DATA-004`: it requires `deleted_at IS NULL`, so a tombstone is `Unavailable`
+    /// to every one of them. Deletion itself does not come through here — it runs
+    /// its own locked, tombstone-aware lookup so a repeated delete can answer
+    /// idempotently instead of refusing its own tombstone.
     async fn ensure_study_set(&self, user_id: &str, study_set_uuid: Uuid) -> Result<(), PortError> {
         let exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(
                 SELECT 1 FROM study_sets
-                WHERE id = $1 AND user_id = $2
+                WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
              )",
         )
         .bind(study_set_uuid)
@@ -1306,8 +1353,39 @@ impl StudyMemoryStore for PostgresStudyStore {
     ) -> Result<(), PortError> {
         let study_set_uuid = Self::uuid_for(&claim.study_set_id)?;
         let voice_session_uuid = Self::uuid_for(&claim.voice_session_id)?;
-        self.ensure_study_set(&claim.user_id, study_set_uuid)
-            .await?;
+        let expires_at = i64::try_from(claim.expires_at).map_err(|_| {
+            PortError::invalid_input(
+                "postgres",
+                &claim.nonce,
+                "session token expiry exceeds postgres bigint",
+            )
+        })?;
+
+        // `DATA-004`: a nonce may be claimed before its session row exists, so the
+        // serialization point is the study-set row the deletion finalizer locks
+        // first, not the session row. Taking it here makes a concurrent deletion
+        // either fully before this claim or the reason it is refused.
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        let deleted_at = sqlx::query_scalar::<sqlx::Postgres, Option<DateTime<Utc>>>(
+            "SELECT deleted_at
+             FROM study_sets
+             WHERE id = $1 AND user_id = $2
+             FOR UPDATE",
+        )
+        .bind(study_set_uuid)
+        .bind(&claim.user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        if !matches!(deleted_at, Some(None)) {
+            tx.rollback().await.map_err(pg_error)?;
+            return Err(PortError::unavailable(
+                "postgres",
+                study_set_uuid.to_string(),
+                "study set is not available for this user",
+            ));
+        }
+
         let result = sqlx::query(
             "INSERT INTO voice_session_token_nonces
                 (user_id, study_set_id, voice_session_id, nonce, expires_at)
@@ -1318,17 +1396,12 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(study_set_uuid)
         .bind(voice_session_uuid)
         .bind(&claim.nonce)
-        .bind(i64::try_from(claim.expires_at).map_err(|_| {
-            PortError::invalid_input(
-                "postgres",
-                &claim.nonce,
-                "session token expiry exceeds postgres bigint",
-            )
-        })?)
-        .execute(&self.pool)
+        .bind(expires_at)
+        .execute(&mut *tx)
         .await
         .map_err(pg_error)?;
         if result.rows_affected() == 0 {
+            tx.rollback().await.map_err(pg_error)?;
             return Err(PortError::unavailable(
                 "postgres",
                 format!(
@@ -1338,6 +1411,7 @@ impl StudyMemoryStore for PostgresStudyStore {
                 "session token nonce already used",
             ));
         }
+        tx.commit().await.map_err(pg_error)?;
         Ok(())
     }
 
@@ -1484,20 +1558,23 @@ impl StudyMemoryStore for PostgresStudyStore {
             .to_owned();
         let study_set_uuid = Self::uuid_for(&study_set_id)?;
         let exam_at = crate::ingestion_exam_instant("postgres", input.exam_date.as_deref())?;
-        let row =
-            sqlx::query("SELECT title, course FROM study_sets WHERE id = $1 AND user_id = $2")
-                .bind(study_set_uuid)
-                .bind(&input.user_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(pg_error)?
-                .ok_or_else(|| {
-                    PortError::unavailable(
-                        "postgres",
-                        format!("{}/{}", input.user_id, study_set_id),
-                        "study set is not available for this user",
-                    )
-                })?;
+        let row = sqlx::query(
+            "SELECT title, course
+                 FROM study_sets
+                 WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+        )
+        .bind(study_set_uuid)
+        .bind(&input.user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_error)?
+        .ok_or_else(|| {
+            PortError::unavailable(
+                "postgres",
+                format!("{}/{}", input.user_id, study_set_id),
+                "study set is not available for this user",
+            )
+        })?;
         let generated = generate_file_study_set(CreateFileStudySet {
             user_id: input.user_id,
             study_set_id: Some(study_set_id),
@@ -1639,7 +1716,7 @@ impl StudyMemoryStore for PostgresStudyStore {
                 ), '[]'::jsonb)
              )
              FROM study_sets s
-             WHERE s.id = $1 AND s.user_id = $2",
+             WHERE s.id = $1 AND s.user_id = $2 AND s.deleted_at IS NULL",
         )
         .bind(study_set_uuid)
         .bind(user_id)
@@ -1654,6 +1731,7 @@ impl StudyMemoryStore for PostgresStudyStore {
             "SELECT id, user_id, title, course, ingestion_status, ingestion_error
              FROM study_sets
              WHERE user_id = $1
+               AND deleted_at IS NULL
              ORDER BY title ASC, id ASC",
         )
         .bind(user_id)
@@ -1866,178 +1944,181 @@ impl StudyMemoryStore for PostgresStudyStore {
         })
     }
 
+    /// `D-05 HARD_PURGE_TEXT` finalization, in one locked transaction.
+    ///
+    /// The recorded `D-04` selection is `CONFIRM_DELETE`, so this finalizer runs
+    /// immediately: there is no pending window, no `study_set_deletions` row, and no
+    /// restore path. What survives is the scrubbed `study_sets` tombstone and the
+    /// content-free deleted `voice_sessions` tombstones — identifiers, timestamps,
+    /// and constants — which exist only to keep a repeated delete idempotent and to
+    /// stop a fixture seed or a reconnect recreating the material.
     async fn delete_study_set(
         &self,
         user_id: &str,
         study_set_id: &str,
     ) -> Result<Value, PortError> {
         let study_set_uuid = Self::uuid_for(study_set_id)?;
-        self.ensure_study_set(user_id, study_set_uuid).await?;
-
         let mut tx = self.pool.begin().await.map_err(pg_error)?;
-        // `DATA-010`: take every affected session row lock, in `id` order, before
-        // any status mutation or artifact removal. A concurrent usage write is
-        // then either fully before this transaction or fully refused by it.
-        Self::lock_sessions_for_deletion(&mut tx, user_id, study_set_uuid).await?;
-        let deleted_source_spans = sqlx::query(
-            "UPDATE source_spans sp
-             SET deleted_at = COALESCE(sp.deleted_at, NOW())
-             FROM study_documents d
-             WHERE sp.document_id = d.id
-               AND d.study_set_id = $1
-               AND sp.deleted_at IS NULL",
-        )
-        .bind(study_set_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_error)?
-        .rows_affected();
-        let deleted_documents = sqlx::query(
-            "UPDATE study_documents
-             SET deleted_at = COALESCE(deleted_at, NOW())
-             WHERE study_set_id = $1 AND deleted_at IS NULL",
-        )
-        .bind(study_set_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_error)?
-        .rows_affected();
-        let disabled_questions = sqlx::query(
-            "UPDATE study_questions
-             SET active = FALSE
-             WHERE study_set_id = $1 AND active",
-        )
-        .bind(study_set_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_error)?
-        .rows_affected();
-        let hidden_sessions = sqlx::query(
-            "UPDATE voice_sessions
-             SET status = 'deleted',
-                 terminal_reason = 'deleted',
-                 ended_at = COALESCE(ended_at, NOW())
-             WHERE user_id = $1
-               AND study_set_id = $2
-               AND status <> 'deleted'",
-        )
-        .bind(user_id)
-        .bind(study_set_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_error)?
-        .rows_affected();
 
+        // Deletion deliberately does not call `ensure_study_set`: that guard now
+        // refuses a tombstone, and a repeated delete has to be able to read its own.
+        let owned = sqlx::query(
+            "SELECT title, course, exam_at, exam_date, ingestion_status, ingestion_error,
+                    deleted_at
+             FROM study_sets
+             WHERE id = $1 AND user_id = $2
+             FOR UPDATE",
+        )
+        .bind(study_set_uuid)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        let Some(row) = owned else {
+            tx.rollback().await.map_err(pg_error)?;
+            return Err(PortError::unavailable(
+                "postgres",
+                study_set_id,
+                "study set is not available for this user",
+            ));
+        };
+        // `DATA-010`: every affected session row lock, in `id` order, before any
+        // status mutation or artifact removal. A concurrent usage write is then
+        // either fully before this transaction or fully refused by it.
+        Self::lock_sessions_for_deletion(&mut tx, user_id, study_set_uuid).await?;
+
+        let existing_deleted_at: Option<DateTime<Utc>> =
+            row.try_get("deleted_at").map_err(pg_error)?;
+        if let Some(deleted_at) = existing_deleted_at {
+            // Already a finalized tombstone. Perform no `ensure_study_set`, no seed,
+            // no session update, and no child mutation; return the receipt the
+            // tombstone itself implies. A tombstone that does not look like one is a
+            // durability failure, never a licence to rehydrate or rescrub it.
+            let title: String = row.try_get("title").map_err(pg_error)?;
+            let course: Option<String> = row.try_get("course").map_err(pg_error)?;
+            let exam_at: Option<DateTime<Utc>> = row.try_get("exam_at").map_err(pg_error)?;
+            let exam_date: Option<chrono::NaiveDate> =
+                row.try_get("exam_date").map_err(pg_error)?;
+            let ingestion_status: String = row.try_get("ingestion_status").map_err(pg_error)?;
+            let ingestion_error: Option<String> =
+                row.try_get("ingestion_error").map_err(pg_error)?;
+            let malformed = title != DELETED_STUDY_SET_TITLE
+                || course.is_some()
+                || exam_at.is_some()
+                || exam_date.is_some()
+                || ingestion_status != DELETED_ROW_CONSTANT
+                || ingestion_error.is_some();
+            if malformed {
+                tx.rollback().await.map_err(pg_error)?;
+                return Err(PortError::durability(
+                    "postgres",
+                    study_set_id,
+                    "deleted study set tombstone is malformed",
+                ));
+            }
+            tx.commit().await.map_err(pg_error)?;
+            return Ok(deletion_receipt(
+                study_set_id,
+                &format_rfc3339_millis(deleted_at),
+            ));
+        }
+
+        // Sessions keep their identifiers and their original `started_at`, and
+        // nothing else: mode, status, and terminal reason all become the constant.
         sqlx::query(
-            "DELETE FROM session_recaps
-             WHERE user_id = $1 AND study_set_id = $2",
+            "UPDATE voice_sessions
+             SET mode = $3,
+                 status = $3,
+                 terminal_reason = $3,
+                 ended_at = COALESCE(ended_at, clock_timestamp())
+             WHERE user_id = $1
+               AND study_set_id = $2",
         )
         .bind(user_id)
         .bind(study_set_uuid)
+        .bind(DELETED_ROW_CONSTANT)
         .execute(&mut *tx)
         .await
         .map_err(pg_error)?;
-        sqlx::query(
-            "DELETE FROM concept_status_events
-             WHERE user_id = $1 AND study_set_id = $2",
-        )
-        .bind(user_id)
-        .bind(study_set_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_error)?;
-        sqlx::query(
-            "DELETE FROM review_items
-             WHERE user_id = $1 AND study_set_id = $2",
-        )
-        .bind(user_id)
-        .bind(study_set_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_error)?;
-        sqlx::query(
+
+        // Session-scoped artifacts, in foreign-key order. Challenge resolutions
+        // reference outcomes, and outcomes reference questions, so both go before
+        // the question purge below.
+        for statement in [
+            "DELETE FROM session_recaps WHERE user_id = $1 AND study_set_id = $2",
+            "DELETE FROM concept_status_events WHERE user_id = $1 AND study_set_id = $2",
+            "DELETE FROM review_items WHERE user_id = $1 AND study_set_id = $2",
             "DELETE FROM answer_attempts aa
              USING voice_sessions vs
              WHERE aa.voice_session_id = vs.id
                AND vs.user_id = $1
                AND vs.study_set_id = $2",
-        )
-        .bind(user_id)
-        .bind(study_set_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_error)?;
-        sqlx::query(
             "DELETE FROM voice_usage_events vue
              USING voice_sessions vs
              WHERE vue.voice_session_id = vs.id
                AND vs.user_id = $1
                AND vs.study_set_id = $2",
+            "DELETE FROM learning_challenge_resolutions WHERE user_id = $1 AND study_set_id = $2",
+            "DELETE FROM learning_turn_outcomes WHERE user_id = $1 AND study_set_id = $2",
+            "DELETE FROM question_progression_cursors WHERE user_id = $1 AND study_set_id = $2",
+            "DELETE FROM event_authorization_digests WHERE user_id = $1 AND study_set_id = $2",
+            "DELETE FROM voice_session_token_nonces WHERE user_id = $1 AND study_set_id = $2",
+        ] {
+            sqlx::query(statement)
+                .bind(user_id)
+                .bind(study_set_uuid)
+                .execute(&mut *tx)
+                .await
+                .map_err(pg_error)?;
+        }
+
+        // `D-05 HARD_PURGE_TEXT`: questions, concepts, and documents are deleted
+        // outright. Deleting documents cascades their source spans; the explicit
+        // question and concept deletes make the intended text purge auditable rather
+        // than leaving it to `ON DELETE SET NULL`.
+        for statement in [
+            "DELETE FROM study_question_ingestion_cursors WHERE study_set_id = $1",
+            "DELETE FROM study_questions WHERE study_set_id = $1",
+            "DELETE FROM concepts WHERE study_set_id = $1",
+            "DELETE FROM study_documents WHERE study_set_id = $1",
+        ] {
+            sqlx::query(statement)
+                .bind(study_set_uuid)
+                .execute(&mut *tx)
+                .await
+                .map_err(pg_error)?;
+        }
+
+        // `exam_at` is the authoritative exam instant migration `0015` introduced and
+        // `exam_date` its legacy calendar projection. Both are learner-supplied, so
+        // both are cleared; the plan's Branch A SQL predates the `exam_at` column.
+        let deleted_at: DateTime<Utc> = sqlx::query_scalar(
+            "UPDATE study_sets
+             SET title = $3,
+                 course = NULL,
+                 exam_at = NULL,
+                 exam_date = NULL,
+                 ingestion_status = $4,
+                 ingestion_error = NULL,
+                 deleted_at = COALESCE(deleted_at, clock_timestamp()),
+                 updated_at = clock_timestamp()
+             WHERE id = $1 AND user_id = $2
+             RETURNING deleted_at",
         )
-        .bind(user_id)
         .bind(study_set_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_error)?;
-        // Learner-derived: canonical learning records carry feedback and retry
-        // prompts, so they are removed with every other session artifact.
-        // Challenge resolutions reference outcomes, so they go first.
-        sqlx::query(
-            "DELETE FROM learning_challenge_resolutions
-             WHERE user_id = $1 AND study_set_id = $2",
-        )
         .bind(user_id)
-        .bind(study_set_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_error)?;
-        sqlx::query(
-            "DELETE FROM learning_turn_outcomes
-             WHERE user_id = $1 AND study_set_id = $2",
-        )
-        .bind(user_id)
-        .bind(study_set_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_error)?;
-        sqlx::query(
-            "DELETE FROM question_progression_cursors
-             WHERE user_id = $1 AND study_set_id = $2",
-        )
-        .bind(user_id)
-        .bind(study_set_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_error)?;
-        sqlx::query(
-            "DELETE FROM event_authorization_digests
-             WHERE user_id = $1 AND study_set_id = $2",
-        )
-        .bind(user_id)
-        .bind(study_set_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_error)?;
-        sqlx::query(
-            "DELETE FROM voice_session_token_nonces
-             WHERE user_id = $1 AND study_set_id = $2",
-        )
-        .bind(user_id)
-        .bind(study_set_uuid)
-        .execute(&mut *tx)
+        .bind(DELETED_STUDY_SET_TITLE)
+        .bind(DELETED_ROW_CONSTANT)
+        .fetch_one(&mut *tx)
         .await
         .map_err(pg_error)?;
 
         tx.commit().await.map_err(pg_error)?;
 
-        Ok(json!({
-            "study_set_id": study_set_id,
-            "status": "deleted",
-            "deleted_documents": deleted_documents,
-            "deleted_source_spans": deleted_source_spans,
-            "disabled_questions": disabled_questions,
-            "hidden_sessions": hidden_sessions,
-        }))
+        Ok(deletion_receipt(
+            study_set_id,
+            &format_rfc3339_millis(deleted_at),
+        ))
     }
 
     async fn delete_session_history(
@@ -2078,14 +2159,18 @@ impl StudyMemoryStore for PostgresStudyStore {
             .fetch_optional(&mut *tx)
             .await
             .map_err(pg_error)?;
+        // The session tombstone keeps its identifiers and its original `started_at`
+        // and nothing else; mode, status, and terminal reason are all the constant.
         sqlx::query(
             "UPDATE voice_sessions
-             SET status = 'deleted',
-                 terminal_reason = 'deleted',
-                 ended_at = COALESCE(ended_at, NOW())
+             SET mode = $2,
+                 status = $2,
+                 terminal_reason = $2,
+                 ended_at = COALESCE(ended_at, clock_timestamp())
              WHERE id = $1",
         )
         .bind(voice_session_uuid)
+        .bind(DELETED_ROW_CONSTANT)
         .execute(&mut *tx)
         .await
         .map_err(pg_error)?;
@@ -2186,7 +2271,8 @@ impl StudyMemoryStore for PostgresStudyStore {
         Ok(json!({
             "voice_session_id": voice_session_id,
             "study_set_id": study_set_id,
-            "status": "deleted",
+            "status": DELETED_ROW_CONSTANT,
+            "policy": DATA_RETENTION_POLICY,
         }))
     }
 
@@ -2203,7 +2289,10 @@ impl StudyMemoryStore for PostgresStudyStore {
         let owned = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(
                 SELECT 1 FROM study_sets
-                WHERE id = $1 AND user_id = $2 AND ingestion_status = 'ready'
+                WHERE id = $1
+                  AND user_id = $2
+                  AND ingestion_status = 'ready'
+                  AND deleted_at IS NULL
              )",
         )
         .bind(study_set_uuid)
@@ -2526,6 +2615,13 @@ impl StudyMemoryStore for PostgresStudyStore {
         // columns while its placeholder capture metadata is upgraded in place.
         // A replay with different envelope values matches no `WHERE` branch,
         // returns no row, and is a `Conflict` — the duplicate key never escapes.
+        let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        // `DATA-004`: take the session row's shared lock before writing, so a
+        // concurrent deletion is either fully before this transaction or refused by
+        // it. Without it a writer that validated first could commit its artifact
+        // after the purge had already run.
+        Self::lock_open_session_shared(&mut tx, user_id, study_set_uuid, voice_session_uuid)
+            .await?;
         let inserted = sqlx::query_scalar::<_, bool>(
             "INSERT INTO answer_attempts (
                 id,
@@ -2608,16 +2704,18 @@ impl StudyMemoryStore for PostgresStudyStore {
         .bind(&envelope.transcript_status)
         .bind(&envelope.transcript_confidence_bucket)
         .bind(&envelope.pre_provider_state)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(pg_error)?;
         let Some(inserted) = inserted else {
+            tx.rollback().await.map_err(pg_error)?;
             return Err(PortError::conflict(
                 "postgres",
                 &envelope.response_id,
                 "answer attempt envelope cannot be changed",
             ));
         };
+        tx.commit().await.map_err(pg_error)?;
         if inserted {
             self.increment_count(WriteCountKind::AnswerAttempt);
         }
@@ -2676,6 +2774,12 @@ impl StudyMemoryStore for PostgresStudyStore {
         // in one transaction, so authority can never exist for an evaluation that
         // was rolled back.
         let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        // `DATA-004`: take the session row's shared lock before writing, so a
+        // concurrent deletion is either fully before this transaction or refused by
+        // it. Without it a writer that validated first could commit its artifact
+        // after the purge had already run.
+        Self::lock_open_session_shared(&mut tx, user_id, study_set_uuid, voice_session_uuid)
+            .await?;
         let inserted = sqlx::query_scalar::<_, bool>(
             "INSERT INTO answer_attempts (
                 id,
@@ -2844,6 +2948,12 @@ impl StudyMemoryStore for PostgresStudyStore {
             &payload,
         )?;
         let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        // `DATA-004`: take the session row's shared lock before writing, so a
+        // concurrent deletion is either fully before this transaction or refused by
+        // it. Without it a writer that validated first could commit its artifact
+        // after the purge had already run.
+        Self::lock_open_session_shared(&mut tx, user_id, study_set_uuid, voice_session_uuid)
+            .await?;
         let event_insert = sqlx::query(
             "INSERT INTO concept_status_events (
                  user_id,
@@ -3036,6 +3146,12 @@ impl StudyMemoryStore for PostgresStudyStore {
         // transaction, against the same 0015 seam, with the same replay key,
         // schema checks, exam policy, and sequence behaviour.
         let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        // `DATA-004`: take the session row's shared lock before writing, so a
+        // concurrent deletion is either fully before this transaction or refused by
+        // it. Without it a writer that validated first could commit its artifact
+        // after the purge had already run.
+        Self::lock_open_session_shared(&mut tx, user_id, study_set_uuid, voice_session_uuid)
+            .await?;
         let written = Self::persist_review_schedule_decision_locked(
             &mut tx,
             ScheduleScope {
@@ -3123,6 +3239,12 @@ impl StudyMemoryStore for PostgresStudyStore {
         // `DATA-005`: the recap row and its browser authorization digest commit
         // together.
         let mut tx = self.pool.begin().await.map_err(pg_error)?;
+        // `DATA-004`: take the session row's shared lock before writing, so a
+        // concurrent deletion is either fully before this transaction or refused by
+        // it. Without it a writer that validated first could commit its artifact
+        // after the purge had already run.
+        Self::lock_open_session_shared(&mut tx, user_id, study_set_uuid, voice_session_uuid)
+            .await?;
         let inserted = sqlx::query_scalar::<_, bool>(
             "INSERT INTO session_recaps (
                  id,

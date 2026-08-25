@@ -84,6 +84,14 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
     sqlx::migrate!("../../migrations").run(pool).await
 }
 
+/// Seed the development fixture into a clean schema.
+///
+/// `COR-03`/`SEC-03`: this is insert-only. It refuses outright when any fixture
+/// root already exists — including a `HARD_PURGE_TEXT` tombstone — so seeding can
+/// never clear `deleted_at`, reactivate a question, overwrite a concept status, or
+/// otherwise put deleted learner material back. Normal durable startup must call
+/// [`run_migrations`] alone; this belongs to an explicit development or test
+/// entrypoint.
 pub async fn seed_postgres_fixture(pool: &PgPool) -> Result<(), FixtureSeedError> {
     let study_set_id = fixture_uuid("biology-midterm")?;
     let document_id = fixture_uuid("lec-5")?;
@@ -95,16 +103,43 @@ pub async fn seed_postgres_fixture(pool: &PgPool) -> Result<(), FixtureSeedError
         .execute(&mut *tx)
         .await?;
 
+    // Every fixture root is checked behind the same advisory lock that serializes
+    // the insert, so two concurrent seeds cannot both see "absent".
+    for (entity, exists_sql) in [
+        (
+            "study_sets",
+            "SELECT EXISTS(SELECT 1 FROM study_sets WHERE id = $1)",
+        ),
+        (
+            "study_documents",
+            "SELECT EXISTS(SELECT 1 FROM study_documents WHERE id = $1)",
+        ),
+        (
+            "source_spans",
+            "SELECT EXISTS(SELECT 1 FROM source_spans WHERE id = $1)",
+        ),
+    ] {
+        let id = match entity {
+            "study_sets" => study_set_id,
+            "study_documents" => document_id,
+            _ => source_id,
+        };
+        let exists = sqlx::query_scalar::<_, bool>(exists_sql)
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if exists {
+            tx.rollback().await?;
+            return Err(FixtureSeedError::ExistingFixture {
+                entity,
+                id: id.to_string(),
+            });
+        }
+    }
+
     sqlx::query(
         "INSERT INTO study_sets (id, user_id, title, course, ingestion_status, ingestion_error)
-         VALUES ($1, 'user-1', 'Biology Midterm', 'Biology 201', 'ready', NULL)
-         ON CONFLICT (id) DO UPDATE
-         SET user_id = EXCLUDED.user_id,
-             title = EXCLUDED.title,
-             course = EXCLUDED.course,
-             ingestion_status = EXCLUDED.ingestion_status,
-             ingestion_error = EXCLUDED.ingestion_error,
-             updated_at = NOW()",
+         VALUES ($1, 'user-1', 'Biology Midterm', 'Biology 201', 'ready', NULL)",
     )
     .bind(study_set_id)
     .execute(&mut *tx)
@@ -112,13 +147,7 @@ pub async fn seed_postgres_fixture(pool: &PgPool) -> Result<(), FixtureSeedError
 
     sqlx::query(
         "INSERT INTO study_documents (id, study_set_id, display_name, source_kind, processing_status, deleted_at)
-         VALUES ($1, $2, 'Lecture 5 - Electron Transport.pdf', 'pdf', 'ready', NULL)
-         ON CONFLICT (id) DO UPDATE
-         SET study_set_id = EXCLUDED.study_set_id,
-             display_name = EXCLUDED.display_name,
-             source_kind = EXCLUDED.source_kind,
-             processing_status = EXCLUDED.processing_status,
-             deleted_at = NULL",
+         VALUES ($1, $2, 'Lecture 5 - Electron Transport.pdf', 'pdf', 'ready', NULL)",
     )
     .bind(document_id)
     .bind(study_set_id)
@@ -129,14 +158,7 @@ pub async fn seed_postgres_fixture(pool: &PgPool) -> Result<(), FixtureSeedError
         "INSERT INTO source_spans (
              id, document_id, locator, excerpt, confidence, retrieval_reason, deleted_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6, NULL)
-         ON CONFLICT (id) DO UPDATE
-         SET document_id = EXCLUDED.document_id,
-             locator = EXCLUDED.locator,
-             excerpt = EXCLUDED.excerpt,
-             confidence = EXCLUDED.confidence,
-             retrieval_reason = EXCLUDED.retrieval_reason,
-             deleted_at = NULL",
+         VALUES ($1, $2, $3, $4, $5, $6, NULL)",
     )
     .bind(source_id)
     .bind(document_id)
@@ -175,14 +197,7 @@ pub async fn seed_postgres_fixture(pool: &PgPool) -> Result<(), FixtureSeedError
     ] {
         sqlx::query(
             "INSERT INTO concepts (id, study_set_id, label, status, source_span_id, public_id)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (id) DO UPDATE
-             SET study_set_id = EXCLUDED.study_set_id,
-                 label = EXCLUDED.label,
-                 status = EXCLUDED.status,
-                 source_span_id = EXCLUDED.source_span_id,
-                 public_id = EXCLUDED.public_id,
-                 updated_at = NOW()",
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(parse_uuid(concept_uuid)?)
         .bind(study_set_id)
@@ -212,16 +227,7 @@ pub async fn seed_postgres_fixture(pool: &PgPool) -> Result<(), FixtureSeedError
              1,
              $6,
              $7
-         )
-         ON CONFLICT (study_set_id, question_id) DO UPDATE
-         SET source_span_id = EXCLUDED.source_span_id,
-             prompt = EXCLUDED.prompt,
-             expected_terms = EXCLUDED.expected_terms,
-             follow_up = EXCLUDED.follow_up,
-             active = TRUE,
-             ingestion_ordinal = EXCLUDED.ingestion_ordinal,
-             concept_id = EXCLUDED.concept_id,
-             rubric_json = EXCLUDED.rubric_json",
+         )",
     )
     .bind(study_set_id)
     .bind(source_id)
@@ -237,8 +243,7 @@ pub async fn seed_postgres_fixture(pool: &PgPool) -> Result<(), FixtureSeedError
     // for this set is numbered 2.
     sqlx::query(
         "INSERT INTO study_question_ingestion_cursors (study_set_id, next_ordinal)
-         VALUES ($1, 2)
-         ON CONFLICT (study_set_id) DO UPDATE SET next_ordinal = 2",
+         VALUES ($1, 2)",
     )
     .bind(study_set_id)
     .execute(&mut *tx)
@@ -258,6 +263,12 @@ pub fn migration_sql() -> String {
 
 #[derive(Debug, Error)]
 pub enum FixtureSeedError {
+    /// A fixture root — including a deletion tombstone — is already present.
+    ///
+    /// `COR-03`/`SEC-03`: seeding refuses rather than writing over it, so deleted
+    /// learner material can never be resurrected by a seed.
+    #[error("fixture {entity} row {id} already exists; seeding refuses to overwrite it")]
+    ExistingFixture { entity: &'static str, id: String },
     #[error("fixture id mapping failed: {0}")]
     FixtureId(#[from] PortError),
     #[error("fixture UUID failed to parse: {0}")]
@@ -2208,10 +2219,22 @@ mod tests {
         // Seeded against the *pre-0014* schema, so this historical-path test cannot
         // be broken by a column a later migration adds to the production seed.
         seed_pre_0014_recap_fixture(&pool).await;
-        let store = PostgresStudyStore::new(pool.clone());
         let session_id = Uuid::new_v4().to_string();
-        record_count_table_session(&store, &session_id).await;
         let study_set_uuid = fixture_uuid("biology-midterm").expect("study set fixture UUID");
+        // The session row is inserted against the pre-0014 schema for the same
+        // reason the fixture above is: production store code targets the *final*
+        // schema — `DATA-004` made `record_voice_session`'s ownership guard read
+        // `study_sets.deleted_at`, which migration 0017 adds — and this test is
+        // about migration 0014's backfill, not about any writer.
+        sqlx::query(
+            "INSERT INTO voice_sessions (id, user_id, study_set_id, mode, status)
+             VALUES ($1, 'user-1', $2, 'quiz', 'open')",
+        )
+        .bind(parse_uuid(&session_id).expect("voice session UUID"))
+        .bind(study_set_uuid)
+        .execute(&pool)
+        .await
+        .expect("pre-0014 voice session row inserts");
         let voice_session_uuid = parse_uuid(&session_id).expect("voice session UUID");
         let source_uuid = fixture_uuid("src-lecture-5-slide-18").expect("source span fixture UUID");
 
@@ -6192,5 +6215,1082 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("session status query succeeds")
+    }
+
+    // ------------------------------------------------------------------
+    // Task 9 (`DATA-004`, `COR-03`, `SEC-03`)
+    //
+    // The coordinator recorded `D-05 = HARD_PURGE_TEXT` and `D-04 = CONFIRM_DELETE`
+    // (registry rows 76-77). Deleting a study set therefore has to *remove* every
+    // learner-authored and learner-derived text row and leave only content-free
+    // idempotency tombstones — on both backends, across a store reconstruction, and
+    // without a fixture seed being able to put any of it back.
+    //
+    // The proof is a canary: one string that exists nowhere in the product, written
+    // into every learner-text field the schema has. After deletion no row anywhere
+    // may still contain it.
+    // ------------------------------------------------------------------
+
+    /// A string that appears in no product code path, so any occurrence after a
+    /// deletion is learner material that survived it.
+    const DELETE_CANARY: &str = "VIVA_LEARNER_DELETE_CANARY_8F6A";
+
+    /// The constant title a `HARD_PURGE_TEXT` tombstone is scrubbed to.
+    const DELETED_TITLE: &str = "[deleted]";
+
+    /// The policy name the deletion response reports under the recorded D-05
+    /// selection.
+    const HARD_PURGE_TEXT_POLICY: &str = "hard_purge_text";
+
+    /// Every base table that can hold a scoped learner row.
+    ///
+    /// `review_items` is also the selected upstream D-01 v1 seam: migration `0015`
+    /// (`SERVER_PERSISTED_FSRS`) stores the schedule decision in `review_items`
+    /// columns rather than a separate table, which
+    /// `postgres_delete_canary_scan_covers_every_learner_text_table` asserts
+    /// directly so this list cannot silently miss a schedule table.
+    const CANARY_SCOPED_TABLES: &[&str] = &[
+        "answer_attempts",
+        "concept_status_events",
+        "concepts",
+        "event_authorization_digests",
+        "learning_challenge_resolutions",
+        "learning_turn_outcomes",
+        "question_progression_cursors",
+        "review_items",
+        "session_recaps",
+        "source_spans",
+        "study_documents",
+        "study_question_ingestion_cursors",
+        "study_questions",
+        "study_sets",
+        "voice_session_token_nonces",
+        "voice_sessions",
+        "voice_usage_events",
+    ];
+
+    fn canary_text(existing: &str) -> String {
+        format!("{DELETE_CANARY} {existing}")
+    }
+
+    /// The canonical learning-core seed with the canary written into every
+    /// learner-authored and learner-derived text field it owns.
+    ///
+    /// Identifiers are deliberately untouched: ids are the content-free metadata
+    /// the tombstone is allowed to keep, and moving them would make the fixture
+    /// unusable by the very store methods the canary has to travel through.
+    fn canary_learning_core_seed() -> LearningCoreSeed {
+        let mut seed = learning_core_seed();
+        for (_, title) in seed.documents.iter_mut() {
+            *title = canary_text(title);
+        }
+        for source in seed.sources.iter_mut() {
+            source.excerpt = canary_text(&source.excerpt);
+            source.retrieval_reason = canary_text(&source.retrieval_reason);
+        }
+        for (_, label, _) in seed.concepts.iter_mut() {
+            *label = canary_text(label);
+        }
+        for (question, _, _) in seed.questions.iter_mut() {
+            question.prompt = canary_text(&question.prompt);
+            question.follow_up = canary_text(&question.follow_up);
+            question.expected_terms = question
+                .expected_terms
+                .iter()
+                .map(|term| canary_text(term))
+                .collect();
+            for criterion in question.rubric.criteria.iter_mut() {
+                criterion.claim = canary_text(&criterion.claim);
+            }
+            // The question's embedded source is the same tuple the span row holds,
+            // and both backends compare them for equality, so the canary has to be
+            // applied identically to both copies.
+            question.source.excerpt = canary_text(&question.source.excerpt);
+            question.source.retrieval_reason = canary_text(&question.source.retrieval_reason);
+        }
+        seed
+    }
+
+    /// The study-set row's own learner text, which neither seeder parameterizes.
+    fn canary_study_set_record(seed: &LearningCoreSeed) -> crate::StudySetRecord {
+        crate::StudySetRecord {
+            study_set_id: LEARNING_SET_ID.to_owned(),
+            user_id: LEARNING_USER_ID.to_owned(),
+            title: canary_text("Cellular respiration"),
+            course: Some(canary_text("BIO 201")),
+            ingestion_status: agent_domain::StudySetIngestionStatus::Ready,
+            ingestion_error: Some(canary_text("last ingestion note")),
+            concept_ids: seed
+                .concepts
+                .iter()
+                .map(|(concept_id, _, _)| concept_id.clone())
+                .collect(),
+            question_ids: seed
+                .questions
+                .iter()
+                .map(|(question, _, _)| question.question_id.clone())
+                .collect(),
+        }
+    }
+
+    fn canary_memory_store(seed: &LearningCoreSeed) -> crate::InMemoryStudyStore {
+        let store = seed_learning_core_memory(seed);
+        store.upsert_study_set(canary_study_set_record(seed));
+        store
+    }
+
+    async fn seed_canary_postgres(pool: &sqlx::PgPool, seed: &LearningCoreSeed) {
+        seed_learning_core_postgres(pool, seed).await;
+        let record = canary_study_set_record(seed);
+        sqlx::query(
+            "UPDATE study_sets
+             SET title = $2, course = $3, ingestion_error = $4
+             WHERE id = $1",
+        )
+        .bind(fixture_uuid(LEARNING_SET_ID).expect("learning set UUID"))
+        .bind(&record.title)
+        .bind(record.course.as_deref())
+        .bind(record.ingestion_error.as_deref())
+        .execute(pool)
+        .await
+        .expect("canary study set text seeds");
+    }
+
+    /// A recap whose concept labels reach all four stored label arrays.
+    ///
+    /// The durable row stores labels bucketed by status (`recap_label_buckets`),
+    /// and `review_later` is driven by `review_schedule`, so a recap of nothing but
+    /// `Review` concepts would store no label at all and the canary would never
+    /// enter `session_recaps`.
+    fn canary_recap(voice_session_id: &str, seed: &LearningCoreSeed) -> StudySessionRecap {
+        let bucketed = [
+            ConceptStatus::Strong,
+            ConceptStatus::Shaky,
+            ConceptStatus::Missed,
+            ConceptStatus::Review,
+        ];
+        let concepts = seed
+            .concepts
+            .iter()
+            .enumerate()
+            .map(|(index, (concept_id, label, _))| RecapConceptOutcome {
+                concept_id: concept_id.clone(),
+                label: label.clone(),
+                status: bucketed[index % bucketed.len()].clone(),
+            })
+            .collect::<Vec<_>>();
+        let review_schedule = concepts
+            .iter()
+            .filter(|concept| concept.status == ConceptStatus::Review)
+            .map(|concept| ReviewScheduleSummary {
+                concept_id: concept.concept_id.clone(),
+                due_at: "2031-04-06T09:00:00.000Z".to_owned(),
+                authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+            })
+            .collect();
+        StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            headline: canary_text("You are close on the electron transport chain"),
+            summary: canary_text("Two concepts strong, one to revisit"),
+            concepts,
+            review_schedule,
+            next_action: canary_text("Revisit the proton gradient"),
+            source_moments: Vec::new(),
+            deferred_turns: 0,
+        }
+    }
+
+    fn canary_usage(voice_session_id: &str) -> VoiceUsageRecord {
+        VoiceUsageRecord {
+            voice_session_id: Some(voice_session_id.to_owned()),
+            provider: "synthetic".to_owned(),
+            model: "synthetic-viva".to_owned(),
+            duration_seconds: 3,
+            text_input_tokens: 30,
+            text_output_tokens: 12,
+            audio_input_tokens: 0,
+            audio_output_tokens: 0,
+            cost_estimate_usd: 0.00003,
+            first_audio_latency_ms: None,
+            answer_eval_latency_ms: Some(2),
+            source_retrieval_latency_ms: None,
+            source_grounded_correction_count: 0,
+        }
+    }
+
+    fn canary_nonce(voice_session_id: &str) -> SessionTokenNonceClaim {
+        SessionTokenNonceClaim {
+            user_id: LEARNING_USER_ID.to_owned(),
+            study_set_id: LEARNING_SET_ID.to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            nonce: format!("nonce-{DELETE_CANARY}"),
+            expires_at: 1_800_000_000,
+        }
+    }
+
+    /// Write one of every learner artifact the schema can hold, with the canary in
+    /// every field the port lets a caller choose.
+    ///
+    /// The evaluation *label* is deliberately not canaried: it is a closed rubric
+    /// vocabulary and a canary value is refused by `validate_fail_closed`, which is
+    /// the behaviour we want. The canary reaches that table through the stored
+    /// outcome's feedback instead.
+    async fn drive_canary_session(
+        store: &dyn StudyMemoryStore,
+        voice_session_id: &str,
+        seed: &LearningCoreSeed,
+    ) {
+        open_learning_session(store, voice_session_id).await;
+
+        let selected = store
+            .select_next_question(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                voice_session_id,
+                "resp-canary-1",
+                ProgressionPolicyId::OrderedV1,
+            )
+            .await
+            .expect("canary selection succeeds");
+        let QuestionProgressionResult::Selected { question, .. } = &selected else {
+            panic!("the ordered policy selects a question: {selected:?}");
+        };
+        let question = question.clone();
+
+        store
+            .record_answer_evaluation(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                voice_session_id,
+                "resp-canary-1",
+                AnswerEvaluation {
+                    question_id: question.question_id.clone(),
+                    answer_text: canary_text("the learner's own words"),
+                    label: "mostly correct".to_owned(),
+                    concise_feedback: canary_text("close, name the complex"),
+                    retry_prompt: canary_text("which complex pumps first?"),
+                    source: question.source.clone(),
+                    concept_status: ConceptStatus::Shaky,
+                    confidence_score: 0.7,
+                },
+            )
+            .await
+            .expect("canary evaluation persists");
+
+        let mut outcome = outcome_named("evaluated_strong");
+        outcome.response_id = "resp-canary-1".to_owned();
+        outcome.question_id = question.question_id.clone();
+        if let TurnResolution::Evaluated {
+            concise_feedback,
+            retry_prompt,
+            ..
+        } = &mut outcome.resolution
+        {
+            *concise_feedback = canary_text("you named the gradient correctly");
+            *retry_prompt = Some(canary_text("say it once more with the complex"));
+        }
+        store
+            .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, voice_session_id, outcome)
+            .await
+            .expect("canary turn outcome persists");
+
+        store
+            .record_challenge_resolution(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                voice_session_id,
+                ChallengeResolution {
+                    schema: agent_domain::learning_outcome::VIVA_CHALLENGE_RESOLUTION_SCHEMA
+                        .to_owned(),
+                    correction_id: format!("corr-{DELETE_CANARY}"),
+                    challenged_response_id: "resp-canary-1".to_owned(),
+                    source_id: question.source.source_id.clone(),
+                    disposition: agent_domain::ChallengeDisposition::SourceConfirmed,
+                    replacement_response_id: None,
+                },
+            )
+            .await
+            .expect("canary challenge resolution persists");
+
+        store
+            .record_concept_status(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                voice_session_id,
+                "resp-canary-status",
+                &seed.concepts[0].0,
+                ConceptStatus::Shaky,
+            )
+            .await
+            .expect("canary concept status persists");
+
+        store
+            .record_recap(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                voice_session_id,
+                "resp-canary-recap",
+                canary_recap(voice_session_id, seed),
+            )
+            .await
+            .expect("canary recap persists");
+
+        assert_eq!(
+            store
+                .record_voice_usage(canary_usage(voice_session_id))
+                .await
+                .expect("canary usage persists"),
+            StudyStoreWriteOutcome::Inserted
+        );
+
+        store
+            .claim_session_token_nonce(canary_nonce(voice_session_id))
+            .await
+            .expect("canary nonce claims");
+    }
+
+    /// The number of rows in one table whose full serialized row still contains the
+    /// canary. `to_jsonb(row)::text` covers every column, including arrays and
+    /// JSONB, so a new learner column cannot escape the scan by being added later.
+    async fn canary_rows_in_table(pool: &sqlx::PgPool, table: &str) -> i64 {
+        assert!(
+            CANARY_SCOPED_TABLES.contains(&table),
+            "{table} is not one of this test's enumerated tables"
+        );
+        let sql = format!(
+            "SELECT COUNT(*) FROM {table} AS scanned WHERE to_jsonb(scanned)::text LIKE $1"
+        );
+        sqlx::query_scalar::<_, i64>(&sql)
+            .bind(format!("%{DELETE_CANARY}%"))
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|error| panic!("canary scan of {table} succeeds: {error:?}"))
+    }
+
+    /// Every enumerated table, with the tables that still hold the canary named.
+    async fn tables_still_holding_the_canary(pool: &sqlx::PgPool) -> Vec<String> {
+        let mut held = Vec::new();
+        for table in CANARY_SCOPED_TABLES {
+            if canary_rows_in_table(pool, table).await > 0 {
+                held.push((*table).to_owned());
+            }
+        }
+        held
+    }
+
+    async fn study_set_tombstone_row(pool: &sqlx::PgPool) -> sqlx::postgres::PgRow {
+        sqlx::query(
+            "SELECT title, course, exam_at, exam_date, ingestion_status, ingestion_error,
+                    deleted_at IS NOT NULL AS tombstoned
+             FROM study_sets
+             WHERE id = $1",
+        )
+        .bind(fixture_uuid(LEARNING_SET_ID).expect("learning set UUID"))
+        .fetch_one(pool)
+        .await
+        .expect("the deleted study set keeps exactly one tombstone row")
+    }
+
+    async fn assert_hard_purge_tombstone(pool: &sqlx::PgPool) {
+        use sqlx::Row as _;
+        let row = study_set_tombstone_row(pool).await;
+        assert!(
+            row.try_get::<bool, _>("tombstoned")
+                .expect("tombstone flag"),
+            "the tombstone is `deleted_at`, not an ingestion status"
+        );
+        assert_eq!(
+            row.try_get::<String, _>("title").expect("title"),
+            DELETED_TITLE
+        );
+        assert_eq!(
+            row.try_get::<Option<String>, _>("course").expect("course"),
+            None
+        );
+        assert_eq!(
+            row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("exam_at")
+                .expect("exam_at"),
+            None
+        );
+        assert_eq!(
+            row.try_get::<Option<chrono::NaiveDate>, _>("exam_date")
+                .expect("exam_date"),
+            None
+        );
+        assert_eq!(
+            row.try_get::<String, _>("ingestion_status")
+                .expect("ingestion status"),
+            "deleted"
+        );
+        assert_eq!(
+            row.try_get::<Option<String>, _>("ingestion_error")
+                .expect("ingestion error"),
+            None
+        );
+
+        for (table, sql) in [
+            (
+                "study_questions",
+                "SELECT COUNT(*) FROM study_questions WHERE study_set_id = $1",
+            ),
+            (
+                "concepts",
+                "SELECT COUNT(*) FROM concepts WHERE study_set_id = $1",
+            ),
+            (
+                "study_documents",
+                "SELECT COUNT(*) FROM study_documents WHERE study_set_id = $1",
+            ),
+            (
+                "study_question_ingestion_cursors",
+                "SELECT COUNT(*) FROM study_question_ingestion_cursors WHERE study_set_id = $1",
+            ),
+        ] {
+            let remaining = sqlx::query_scalar::<_, i64>(sql)
+                .bind(fixture_uuid(LEARNING_SET_ID).expect("learning set UUID"))
+                .fetch_one(pool)
+                .await
+                .unwrap_or_else(|error| panic!("{table} count succeeds: {error:?}"));
+            assert_eq!(
+                remaining, 0,
+                "HARD_PURGE_TEXT deletes {table} outright rather than deactivating it"
+            );
+        }
+    }
+
+    /// The in-memory backend applies exactly the selected `HARD_PURGE_TEXT` policy.
+    #[tokio::test]
+    async fn memory_selected_d05_policy_removes_exact_canary_fields() {
+        let seed = canary_learning_core_seed();
+        let store = canary_memory_store(&seed);
+        let session_id = "vs-0001";
+        drive_canary_session(&store, session_id, &seed).await;
+
+        // Not a vacuous proof: the canary really is in this backend's state first.
+        let before = serde_json::to_string(&store.snapshot()).expect("state serializes");
+        assert!(
+            before.contains(DELETE_CANARY),
+            "the canary must be present before deletion or the test proves nothing"
+        );
+
+        let receipt = store
+            .delete_study_set(LEARNING_USER_ID, LEARNING_SET_ID)
+            .await
+            .expect("study set deletion succeeds");
+        assert_eq!(receipt["status"], "deleted");
+        assert_eq!(receipt["policy"], HARD_PURGE_TEXT_POLICY);
+        assert_eq!(receipt["study_set_id"], LEARNING_SET_ID);
+
+        let state = store.snapshot();
+        let after = serde_json::to_string(&state).expect("state serializes");
+        assert!(
+            !after.contains(DELETE_CANARY),
+            "learner text survived an in-memory HARD_PURGE_TEXT deletion"
+        );
+
+        // What remains is exactly the content-free tombstone.
+        let tombstone = state
+            .study_sets
+            .get(LEARNING_SET_ID)
+            .expect("the tombstone keeps repeated deletes idempotent");
+        assert_eq!(tombstone.title, DELETED_TITLE);
+        assert_eq!(tombstone.course, None);
+        assert_eq!(tombstone.ingestion_error, None);
+        assert!(tombstone.concept_ids.is_empty());
+        assert!(tombstone.question_ids.is_empty());
+        assert!(
+            state.deleted_study_sets.contains_key(LEARNING_SET_ID),
+            "`deleted_at` is the deletion authority in this backend too"
+        );
+        assert!(!state.study_set_exam_dates.contains_key(LEARNING_SET_ID));
+        assert!(state
+            .documents
+            .values()
+            .all(|record| record.study_set_id != LEARNING_SET_ID));
+        assert!(state
+            .source_spans
+            .values()
+            .all(|record| record.study_set_id != LEARNING_SET_ID));
+        assert!(state
+            .concepts
+            .values()
+            .all(|record| record.study_set_id != LEARNING_SET_ID));
+        assert!(state
+            .questions
+            .values()
+            .all(|record| record.study_set_id != LEARNING_SET_ID));
+        assert!(state.answer_attempts.is_empty());
+        assert!(state.concept_statuses.is_empty());
+        assert!(state.review_items.is_empty());
+        assert!(state.review_schedule_decisions.is_empty());
+        assert!(state.recaps.is_empty());
+        assert!(state.voice_usage_events.is_empty());
+        assert!(state.turn_outcomes.is_empty());
+        assert!(state.challenge_resolutions.is_empty());
+        assert!(state.question_progressions.is_empty());
+        assert!(state.event_authorizations.is_empty());
+        assert!(state.session_token_nonces.is_empty());
+
+        // The session tombstone keeps its identity and nothing else.
+        let session = state
+            .sessions
+            .iter()
+            .find(|session| session.voice_session_id == session_id)
+            .expect("the deleted session keeps a content-free tombstone");
+        assert_eq!(session.status, "deleted");
+        assert_eq!(session.terminal_reason.as_deref(), Some("deleted"));
+
+        // The tombstone is not an active study set on any read path.
+        assert!(store
+            .library_snapshot(LEARNING_USER_ID)
+            .await
+            .expect("library snapshot")
+            .study_sets
+            .iter()
+            .all(|summary| summary.id != LEARNING_SET_ID));
+        // This backend reports an unavailable set as a typed error rather than
+        // `Ok(None)`; the durable backend reports `Ok(None)`. That `Option`-versus-
+        // error split predates this task and belongs to Plan 06's port contract —
+        // what matters here is that neither backend returns a question.
+        assert_eq!(
+            store
+                .active_question(LEARNING_USER_ID, LEARNING_SET_ID)
+                .await
+                .expect_err("a tombstone has no active question")
+                .kind(),
+            PortErrorKind::Unavailable
+        );
+        assert_eq!(
+            store
+                .authenticated_study_projection(LEARNING_USER_ID, LEARNING_SET_ID, session_id)
+                .await
+                .expect_err("a tombstone has no authenticated projection")
+                .kind(),
+            PortErrorKind::Unavailable
+        );
+
+        // Repeated deletion is idempotent and returns the same content-free receipt.
+        let repeat = store
+            .delete_study_set(LEARNING_USER_ID, LEARNING_SET_ID)
+            .await
+            .expect("repeated deletion is idempotent");
+        assert_eq!(repeat, receipt);
+        assert_eq!(
+            serde_json::to_string(&store.snapshot()).expect("state serializes"),
+            after,
+            "a repeated delete mutates nothing"
+        );
+    }
+
+    /// The durable backend applies exactly the same selected policy, row by row.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_selected_d05_policy_removes_exact_canary_fields() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        let seed = canary_learning_core_seed();
+        seed_canary_postgres(&pool, &seed).await;
+        let store = PostgresStudyStore::new(pool.clone());
+        let session_id = "vs-0001";
+        drive_canary_session(&store, session_id, &seed).await;
+
+        // Not a vacuous proof, and exact: these are the tables a learner's own text
+        // reaches, and the deletion has to empty every one of them. The tables
+        // deliberately absent hold no free text at all — `answer_attempts` keeps a
+        // closed-vocabulary evaluation label, digests keep hashes, and the cursor,
+        // schedule, status-event, usage, and session rows keep identifiers.
+        assert_eq!(
+            tables_still_holding_the_canary(&pool).await,
+            vec![
+                "concepts".to_owned(),
+                "learning_challenge_resolutions".to_owned(),
+                "learning_turn_outcomes".to_owned(),
+                "session_recaps".to_owned(),
+                "source_spans".to_owned(),
+                "study_documents".to_owned(),
+                "study_questions".to_owned(),
+                "study_sets".to_owned(),
+                "voice_session_token_nonces".to_owned(),
+            ],
+            "the canary must reach every learner-text table before deletion"
+        );
+
+        let receipt = store
+            .delete_study_set(LEARNING_USER_ID, LEARNING_SET_ID)
+            .await
+            .expect("study set deletion succeeds");
+        assert_eq!(receipt["status"], "deleted");
+        assert_eq!(receipt["policy"], HARD_PURGE_TEXT_POLICY);
+        assert_eq!(receipt["study_set_id"], LEARNING_SET_ID);
+
+        assert_eq!(
+            tables_still_holding_the_canary(&pool).await,
+            Vec::<String>::new(),
+            "HARD_PURGE_TEXT leaves no row containing learner text"
+        );
+        assert_hard_purge_tombstone(&pool).await;
+        assert_eq!(
+            learning_session_tombstone(&pool, session_id).await,
+            (
+                "deleted".to_owned(),
+                "deleted".to_owned(),
+                Some("deleted".to_owned())
+            )
+        );
+
+        // The tombstone is excluded from every active read path.
+        assert!(store
+            .library_snapshot(LEARNING_USER_ID)
+            .await
+            .expect("library snapshot")
+            .study_sets
+            .iter()
+            .all(|summary| summary.id != LEARNING_SET_ID));
+        assert_eq!(
+            store
+                .active_question(LEARNING_USER_ID, LEARNING_SET_ID)
+                .await
+                .expect("active question lookup"),
+            None
+        );
+        assert_eq!(
+            store
+                .authenticated_study_projection(LEARNING_USER_ID, LEARNING_SET_ID, session_id)
+                .await
+                .expect_err("a tombstone has no authenticated projection")
+                .kind(),
+            PortErrorKind::Unavailable
+        );
+
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// Neither a store reconstruction nor a fixture seed may bring deleted material
+    /// back (`COR-03`, `SEC-03`).
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_deleted_fixture_is_not_resurrected_by_seed_or_store_reconstruction() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("a clean schema accepts exactly one seed");
+        let store = PostgresStudyStore::new(pool.clone());
+        store
+            .delete_study_set("user-1", "biology-midterm")
+            .await
+            .expect("the seeded fixture set is deleted");
+
+        let deleted_set = fixture_uuid("biology-midterm").expect("fixture set UUID");
+        let tombstone_title = |pool: sqlx::PgPool| async move {
+            sqlx::query_scalar::<_, String>("SELECT title FROM study_sets WHERE id = $1")
+                .bind(deleted_set)
+                .fetch_one(&pool)
+                .await
+                .expect("the tombstone row survives")
+        };
+        assert_eq!(tombstone_title(pool.clone()).await, DELETED_TITLE);
+
+        // Reconstructing the store rebuilds nothing: the tombstone is durable.
+        let reconstructed = PostgresStudyStore::new(pool.clone());
+        assert!(reconstructed
+            .library_snapshot("user-1")
+            .await
+            .expect("library snapshot after reconstruction")
+            .study_sets
+            .iter()
+            .all(|summary| summary.id != "biology-midterm"));
+        assert_eq!(tombstone_title(pool.clone()).await, DELETED_TITLE);
+
+        // Seeding refuses rather than reviving.
+        let refusal = seed_postgres_fixture(&pool)
+            .await
+            .expect_err("seeding must refuse to write over an existing fixture or tombstone");
+        assert!(
+            matches!(&refusal, FixtureSeedError::ExistingFixture { entity, .. } if *entity == "study_sets"),
+            "seed refusal is the typed existing-fixture refusal: {refusal:?}"
+        );
+        assert!(
+            refusal.to_string().contains("already exists"),
+            "seed refusal must name the existing fixture: {refusal}"
+        );
+        assert_eq!(tombstone_title(pool.clone()).await, DELETED_TITLE);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM study_questions WHERE study_set_id = $1"
+            )
+            .bind(deleted_set)
+            .fetch_one(&pool)
+            .await
+            .expect("question count"),
+            0,
+            "seeding must not reactivate or recreate deleted questions"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM study_sets WHERE id = $1 AND deleted_at IS NULL"
+            )
+            .bind(deleted_set)
+            .fetch_one(&pool)
+            .await
+            .expect("tombstone count"),
+            0,
+            "seeding must never clear `deleted_at`"
+        );
+
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// A repeated delete is a no-op that returns the same content-free receipt.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_repeated_delete_is_idempotent_and_content_free() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        let seed = canary_learning_core_seed();
+        seed_canary_postgres(&pool, &seed).await;
+        let store = PostgresStudyStore::new(pool.clone());
+        drive_canary_session(&store, "vs-0001", &seed).await;
+
+        let first = store
+            .delete_study_set(LEARNING_USER_ID, LEARNING_SET_ID)
+            .await
+            .expect("first deletion succeeds");
+        let after_first = study_set_snapshot_json(&pool).await;
+
+        let second = store
+            .delete_study_set(LEARNING_USER_ID, LEARNING_SET_ID)
+            .await
+            .expect("repeated deletion is idempotent, not an error");
+        assert_eq!(
+            first, second,
+            "a repeated delete returns the stored tombstone's own receipt"
+        );
+        assert_eq!(
+            after_first,
+            study_set_snapshot_json(&pool).await,
+            "a repeated delete performs no ensure, seed, session update, or child mutation"
+        );
+
+        // The receipt itself is content-free: identifiers, a timestamp, and constants.
+        let receipt = first.as_object().expect("the receipt is a JSON object");
+        let mut keys = receipt.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "deleted_at".to_owned(),
+                "policy".to_owned(),
+                "status".to_owned(),
+                "study_set_id".to_owned(),
+            ]
+        );
+        assert_eq!(receipt["policy"], HARD_PURGE_TEXT_POLICY);
+        assert!(!serde_json::to_string(&first)
+            .expect("receipt serializes")
+            .contains(DELETE_CANARY));
+
+        // A tombstone the finalizer cannot recognize is a durability failure, never
+        // a licence to rehydrate or re-scrub it.
+        sqlx::query("UPDATE study_sets SET title = $2 WHERE id = $1")
+            .bind(fixture_uuid(LEARNING_SET_ID).expect("learning set UUID"))
+            .bind(canary_text("resurrected title"))
+            .execute(&pool)
+            .await
+            .expect("malformed tombstone is forced for the negative control");
+        assert_eq!(
+            store
+                .delete_study_set(LEARNING_USER_ID, LEARNING_SET_ID)
+                .await
+                .expect_err("a malformed tombstone is not silently rescrubbed")
+                .kind(),
+            PortErrorKind::Durability
+        );
+
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// The deleted session's tombstone constants, by fixture logical id.
+    async fn learning_session_tombstone(
+        pool: &sqlx::PgPool,
+        voice_session_id: &str,
+    ) -> (String, String, Option<String>) {
+        use sqlx::Row as _;
+        let row =
+            sqlx::query("SELECT mode, status, terminal_reason FROM voice_sessions WHERE id = $1")
+                .bind(fixture_uuid(voice_session_id).expect("session UUID"))
+                .fetch_one(pool)
+                .await
+                .expect("the deleted session keeps a content-free tombstone row");
+        (
+            row.try_get("mode").expect("mode"),
+            row.try_get("status").expect("status"),
+            row.try_get("terminal_reason").expect("terminal reason"),
+        )
+    }
+
+    async fn study_set_snapshot_json(pool: &sqlx::PgPool) -> String {
+        sqlx::query_scalar::<_, String>(
+            "SELECT to_jsonb(scanned)::text FROM study_sets AS scanned WHERE id = $1",
+        )
+        .bind(fixture_uuid(LEARNING_SET_ID).expect("learning set UUID"))
+        .fetch_one(pool)
+        .await
+        .expect("the tombstone row serializes")
+    }
+
+    /// The canary scan itself is complete: it names every base table in the final
+    /// schema, so a future learner table cannot be added outside the proof.
+    #[tokio::test]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_delete_canary_scan_covers_every_learner_text_table() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+
+        let mut base_tables = sqlx::query_scalar::<_, String>(
+            "SELECT table_name
+             FROM information_schema.tables
+             WHERE table_schema = current_schema()
+               AND table_type = 'BASE TABLE'
+               AND table_name <> '_sqlx_migrations'
+             ORDER BY table_name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("the final schema lists its base tables");
+        base_tables.sort();
+        let mut enumerated = CANARY_SCOPED_TABLES
+            .iter()
+            .map(|table| (*table).to_owned())
+            .collect::<Vec<_>>();
+        enumerated.sort();
+        assert_eq!(
+            base_tables, enumerated,
+            "every base table in the final schema must be in the canary scan"
+        );
+
+        // The selected D-01 v1 seam is `review_items` columns, not a table of its
+        // own, so the scan's `review_items` entry is the schedule/history coverage
+        // the plan requires.
+        for branch_table in ["review_schedule_decisions", "review_history_events"] {
+            assert!(
+                !base_tables.contains(&branch_table.to_owned()),
+                "{branch_table} must not exist: 0015 stores the selected v1 decision in review_items"
+            );
+        }
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name = 'review_items'
+                   AND column_name = 'schedule_decision'
+             )"
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("column lookup succeeds"));
+
+        // And the scan finds nothing after a real deletion.
+        let seed = canary_learning_core_seed();
+        seed_canary_postgres(&pool, &seed).await;
+        let store = PostgresStudyStore::new(pool.clone());
+        drive_canary_session(&store, "vs-0001", &seed).await;
+        store
+            .delete_study_set(LEARNING_USER_ID, LEARNING_SET_ID)
+            .await
+            .expect("study set deletion succeeds");
+        assert_eq!(
+            tables_still_holding_the_canary(&pool).await,
+            Vec::<String>::new()
+        );
+
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// Deletion serializes against every artifact writer: whichever order wins, the
+    /// committed end state is the content-free tombstone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_delete_serializes_against_every_artifact_writer() {
+        let fixture_schema = PostgresSchemaFixture::migrated().await;
+        let pool = fixture_schema.pool().clone();
+        let seed = canary_learning_core_seed();
+        seed_canary_postgres(&pool, &seed).await;
+        let writer = Arc::new(PostgresStudyStore::new(pool.clone()));
+        let deleter = Arc::new(PostgresStudyStore::new(pool.clone()));
+        let session_id = "vs-0001";
+        drive_canary_session(writer.as_ref(), session_id, &seed).await;
+
+        // Six independent writers and the deletion are released together.
+        let barrier = Arc::new(tokio::sync::Barrier::new(7));
+        let mut racers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        let usage_store = Arc::clone(&writer);
+        let usage_barrier = Arc::clone(&barrier);
+        racers.push(tokio::spawn(async move {
+            usage_barrier.wait().await;
+            let _ = usage_store
+                .record_voice_usage(canary_usage("vs-0001"))
+                .await;
+        }));
+
+        let recap_store = Arc::clone(&writer);
+        let recap_barrier = Arc::clone(&barrier);
+        let recap_seed = canary_learning_core_seed();
+        racers.push(tokio::spawn(async move {
+            recap_barrier.wait().await;
+            let _ = recap_store
+                .record_recap(
+                    LEARNING_USER_ID,
+                    LEARNING_SET_ID,
+                    "vs-0001",
+                    "resp-canary-race-recap",
+                    canary_recap("vs-0001", &recap_seed),
+                )
+                .await;
+        }));
+
+        let status_store = Arc::clone(&writer);
+        let status_barrier = Arc::clone(&barrier);
+        let raced_concept = seed.concepts[1].0.clone();
+        racers.push(tokio::spawn(async move {
+            status_barrier.wait().await;
+            let _ = status_store
+                .record_concept_status(
+                    LEARNING_USER_ID,
+                    LEARNING_SET_ID,
+                    "vs-0001",
+                    "resp-canary-race-status",
+                    &raced_concept,
+                    ConceptStatus::Strong,
+                )
+                .await;
+        }));
+
+        let nonce_store = Arc::clone(&writer);
+        let nonce_barrier = Arc::clone(&barrier);
+        racers.push(tokio::spawn(async move {
+            nonce_barrier.wait().await;
+            let mut claim = canary_nonce("vs-0001");
+            claim.nonce = format!("{}-race", claim.nonce);
+            let _ = nonce_store.claim_session_token_nonce(claim).await;
+        }));
+
+        let outcome_store = Arc::clone(&writer);
+        let outcome_barrier = Arc::clone(&barrier);
+        let raced_question = seed.questions[0].0.question_id.clone();
+        racers.push(tokio::spawn(async move {
+            outcome_barrier.wait().await;
+            let mut outcome = outcome_named("evaluated_strong");
+            outcome.response_id = "resp-canary-race-outcome".to_owned();
+            outcome.question_id = raced_question;
+            if let TurnResolution::Evaluated {
+                concise_feedback, ..
+            } = &mut outcome.resolution
+            {
+                *concise_feedback = canary_text("late feedback");
+            }
+            let _ = outcome_store
+                .record_turn_outcome(LEARNING_USER_ID, LEARNING_SET_ID, "vs-0001", outcome)
+                .await;
+        }));
+
+        let selection_store = Arc::clone(&writer);
+        let selection_barrier = Arc::clone(&barrier);
+        racers.push(tokio::spawn(async move {
+            selection_barrier.wait().await;
+            let _ = selection_store
+                .select_next_question(
+                    LEARNING_USER_ID,
+                    LEARNING_SET_ID,
+                    "vs-0001",
+                    "resp-canary-race-select",
+                    ProgressionPolicyId::OrderedV1,
+                )
+                .await;
+        }));
+
+        let delete_store = Arc::clone(&deleter);
+        let delete_barrier = Arc::clone(&barrier);
+        let delete = tokio::spawn(async move {
+            delete_barrier.wait().await;
+            delete_store
+                .delete_study_set(LEARNING_USER_ID, LEARNING_SET_ID)
+                .await
+        });
+
+        for racer in racers {
+            racer.await.expect("racer joins");
+        }
+        delete
+            .await
+            .expect("delete joins")
+            .expect("study set deletion succeeds under the race");
+
+        // Whichever order won, the committed state is the tombstone.
+        assert_eq!(
+            tables_still_holding_the_canary(&pool).await,
+            Vec::<String>::new(),
+            "a writer that raced deletion must not leave learner text behind"
+        );
+        assert_hard_purge_tombstone(&pool).await;
+        assert_eq!(
+            learning_session_tombstone(&pool, session_id).await,
+            (
+                "deleted".to_owned(),
+                "deleted".to_owned(),
+                Some("deleted".to_owned())
+            )
+        );
+
+        // Every artifact writer refuses a tombstoned set afterwards.
+        assert_eq!(
+            writer
+                .record_voice_usage(canary_usage(session_id))
+                .await
+                .expect_err("usage after deletion is refused")
+                .kind(),
+            PortErrorKind::Conflict
+        );
+        assert_eq!(
+            writer
+                .record_voice_session(&SessionConfig {
+                    session_id: Some(SessionId::new("11111111-1111-4111-8111-11111111abcd")),
+                    user_id: Some(LEARNING_USER_ID.to_owned()),
+                    study_set_id: Some(LEARNING_SET_ID.to_owned()),
+                    mode: Some(StudyMode::Quiz),
+                    ..SessionConfig::default()
+                })
+                .await
+                .expect_err("a tombstoned set opens no new session")
+                .kind(),
+            PortErrorKind::Unavailable
+        );
+        assert_eq!(
+            writer
+                .claim_session_token_nonce(canary_nonce(session_id))
+                .await
+                .expect_err("a tombstoned set claims no nonce")
+                .kind(),
+            PortErrorKind::Unavailable
+        );
+
+        fixture_schema
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
     }
 }

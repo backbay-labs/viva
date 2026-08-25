@@ -43,6 +43,36 @@ use uuid::Uuid;
 const MAX_PASTE_SOURCE_EXCERPT_CHARS: usize = 360;
 const MAX_PASTE_SOURCE_SPANS: usize = 4;
 
+/// `D-05 HARD_PURGE_TEXT`: the constant title a deleted study set is scrubbed to.
+///
+/// The tombstone keeps only content-free idempotency and audit metadata — ids,
+/// timestamps, and these constants — so a repeated delete stays idempotent and a
+/// fixture seed cannot recreate the material behind it.
+pub(crate) const DELETED_STUDY_SET_TITLE: &str = "[deleted]";
+
+/// The constant a deleted study set's ingestion status and a deleted session's
+/// mode, status, and terminal reason are all set to.
+pub(crate) const DELETED_ROW_CONSTANT: &str = "deleted";
+
+/// The selected `D-05` retention policy, reported verbatim by the deletion
+/// receipt so a caller never has to infer which branch ran.
+pub(crate) const DATA_RETENTION_POLICY: &str = "hard_purge_text";
+
+/// The one deletion receipt both backends return.
+///
+/// Every field is content-free: the set's own identifier, the constant status and
+/// policy, and the durable `deleted_at` instant. It is derivable from the
+/// tombstone alone, which is what lets a repeated delete return byte-identical
+/// bytes without re-reading anything it just purged.
+pub(crate) fn deletion_receipt(study_set_id: &str, deleted_at: &str) -> Value {
+    json!({
+        "study_set_id": study_set_id,
+        "status": DELETED_ROW_CONSTANT,
+        "policy": DATA_RETENTION_POLICY,
+        "deleted_at": deleted_at,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StudySetRecord {
     pub study_set_id: String,
@@ -607,6 +637,15 @@ pub struct InMemoryStudyState {
     /// not cost another entry; the bound is structural rather than a cap.
     pub event_authorizations: HashSet<EventAuthorizationRecord>,
     pub session_token_nonces: Vec<SessionTokenNonceClaim>,
+    /// `DATA-004`: this backend's `study_sets.deleted_at`, keyed by study set id
+    /// and holding the RFC3339 UTC instant the deletion committed.
+    ///
+    /// It is a separate map rather than a `StudySetRecord` field because that
+    /// record is public API of this crate and other lanes build it with exhaustive
+    /// struct literals. The authority is the same either way: every ordinary read
+    /// goes through `study_set_locked`, which refuses a set named here.
+    #[serde(default)]
+    pub deleted_study_sets: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1100,6 +1139,17 @@ impl InMemoryStudyStore {
                 "memory",
                 study_set_id,
                 "study set is not available for this user",
+            ));
+        }
+        // `DATA-004`: the ordinary ownership guard is tombstone-aware. Deletion
+        // itself deliberately does not come through here — it runs its own locked,
+        // tombstone-aware lookup so a repeated delete can answer idempotently
+        // instead of treating its own tombstone as an active set.
+        if state.deleted_study_sets.contains_key(study_set_id) {
+            return Err(PortError::unavailable(
+                "memory",
+                study_set_id,
+                "study set has been deleted",
             ));
         }
         Ok(study_set)
@@ -3385,6 +3435,14 @@ impl StudyMemoryStore for InMemoryStudyStore {
             .study_sets
             .values()
             .filter(|study_set| study_set.user_id == user_id)
+            // `DATA-004`: the library is an active read, so a tombstone is not in
+            // it. Under `HARD_PURGE_TEXT` the tombstone exists only to keep a
+            // repeated delete idempotent and to stop a seed recreating the set.
+            .filter(|study_set| {
+                !state
+                    .deleted_study_sets
+                    .contains_key(&study_set.study_set_id)
+            })
             .map(|study_set| {
                 let mut documents = state
                     .documents
@@ -3546,39 +3604,46 @@ impl StudyMemoryStore for InMemoryStudyStore {
         study_set_id: &str,
     ) -> Result<Value, PortError> {
         let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
-        Self::study_set_locked(&state, user_id, study_set_id)?;
 
-        let mut deleted_documents = 0usize;
-        for document in state
-            .documents
-            .values_mut()
-            .filter(|document| document.study_set_id == study_set_id && !document.tombstoned)
-        {
-            document.tombstoned = true;
-            deleted_documents += 1;
+        // `DATA-004`: deletion runs its own tombstone-aware ownership lookup rather
+        // than `study_set_locked`, which now refuses a tombstone. Without that split
+        // a repeated delete would treat its own tombstone as an unavailable set and
+        // stop being idempotent.
+        let owned = state.study_sets.get(study_set_id).ok_or_else(|| {
+            PortError::unavailable("memory", study_set_id, "study set does not exist")
+        })?;
+        if owned.user_id != user_id {
+            return Err(PortError::unavailable(
+                "memory",
+                study_set_id,
+                "study set is not available for this user",
+            ));
         }
 
-        let mut deleted_source_spans = 0usize;
-        for span in state
-            .source_spans
-            .values_mut()
-            .filter(|span| span.study_set_id == study_set_id && !span.tombstoned)
-        {
-            span.tombstoned = true;
-            deleted_source_spans += 1;
+        if let Some(deleted_at) = state.deleted_study_sets.get(study_set_id).cloned() {
+            // Already finalized. Perform no session update and no child mutation:
+            // return the receipt the tombstone itself implies. A tombstone that does
+            // not look like one is a durability failure, not a licence to rescrub.
+            let tombstone = state
+                .study_sets
+                .get(study_set_id)
+                .expect("the tombstone was just read under this lock");
+            if tombstone.title != DELETED_STUDY_SET_TITLE
+                || tombstone.course.is_some()
+                || tombstone.ingestion_error.is_some()
+                || !tombstone.concept_ids.is_empty()
+                || !tombstone.question_ids.is_empty()
+            {
+                return Err(PortError::durability(
+                    "memory",
+                    study_set_id,
+                    "deleted study set tombstone is malformed",
+                ));
+            }
+            return Ok(deletion_receipt(study_set_id, &deleted_at));
         }
 
-        let mut disabled_questions = 0usize;
-        for question in state
-            .questions
-            .values_mut()
-            .filter(|question| question.study_set_id == study_set_id && question.active)
-        {
-            question.active = false;
-            disabled_questions += 1;
-        }
-
-        let mut hidden_sessions = 0usize;
+        // Sessions keep their identity and nothing else.
         let mut affected_sessions = HashSet::new();
         for session in state
             .sessions
@@ -3586,25 +3651,47 @@ impl StudyMemoryStore for InMemoryStudyStore {
             .filter(|session| session.user_id == user_id && session.study_set_id == study_set_id)
         {
             affected_sessions.insert(session.voice_session_id.clone());
-            if session.status == "deleted" {
-                continue;
-            }
-            session.status = "deleted".to_owned();
-            session.ended_at.get_or_insert_with(|| "deleted".to_owned());
-            session.terminal_reason = Some("deleted".to_owned());
-            hidden_sessions += 1;
+            session.status = DELETED_ROW_CONSTANT.to_owned();
+            session
+                .ended_at
+                .get_or_insert_with(|| DELETED_ROW_CONSTANT.to_owned());
+            session.terminal_reason = Some(DELETED_ROW_CONSTANT.to_owned());
         }
-
         remove_session_artifacts(&mut state, user_id, study_set_id, &affected_sessions);
 
-        Ok(json!({
-            "study_set_id": study_set_id,
-            "status": "deleted",
-            "deleted_documents": deleted_documents,
-            "deleted_source_spans": deleted_source_spans,
-            "disabled_questions": disabled_questions,
-            "hidden_sessions": hidden_sessions,
-        }))
+        // `D-05 HARD_PURGE_TEXT`: learner-authored and learner-derived material is
+        // removed, not deactivated. Tombstoning a document and deactivating a
+        // question left the excerpt, the display name, the concept label, and the
+        // prompt in memory forever, which is exactly what this branch forbids.
+        state
+            .questions
+            .retain(|_, record| record.study_set_id != study_set_id);
+        state
+            .concepts
+            .retain(|_, record| record.study_set_id != study_set_id);
+        state
+            .source_spans
+            .retain(|_, record| record.study_set_id != study_set_id);
+        state
+            .documents
+            .retain(|_, record| record.study_set_id != study_set_id);
+        state.study_set_exam_dates.remove(study_set_id);
+
+        let deleted_at = format_rfc3339_millis(Utc::now());
+        let tombstone = state
+            .study_sets
+            .get_mut(study_set_id)
+            .expect("the study set was just read under this lock");
+        tombstone.title = DELETED_STUDY_SET_TITLE.to_owned();
+        tombstone.course = None;
+        tombstone.ingestion_error = None;
+        tombstone.concept_ids.clear();
+        tombstone.question_ids.clear();
+        state
+            .deleted_study_sets
+            .insert(study_set_id.to_owned(), deleted_at.clone());
+
+        Ok(deletion_receipt(study_set_id, &deleted_at))
     }
 
     async fn delete_session_history(
@@ -3631,19 +3718,23 @@ impl StudyMemoryStore for InMemoryStudyStore {
             ));
         }
 
-        let already_deleted = session.status == "deleted";
-        session.status = "deleted".to_owned();
-        session.ended_at.get_or_insert_with(|| "deleted".to_owned());
-        session.terminal_reason = Some("deleted".to_owned());
+        session.status = DELETED_ROW_CONSTANT.to_owned();
+        session
+            .ended_at
+            .get_or_insert_with(|| DELETED_ROW_CONSTANT.to_owned());
+        session.terminal_reason = Some(DELETED_ROW_CONSTANT.to_owned());
 
         let affected_sessions = HashSet::from([voice_session_id.to_owned()]);
         remove_session_artifacts(&mut state, user_id, study_set_id, &affected_sessions);
 
+        // The same content-free shape the durable backend returns. The old
+        // `already_deleted` flag existed on this backend only, had no reader, and
+        // made a repeated delete's response differ from the first one's.
         Ok(json!({
             "voice_session_id": voice_session_id,
             "study_set_id": study_set_id,
-            "status": "deleted",
-            "already_deleted": already_deleted,
+            "status": DELETED_ROW_CONSTANT,
+            "policy": DATA_RETENTION_POLICY,
         }))
     }
 
