@@ -240,7 +240,8 @@ pub fn parse_client_frame_json(json: &str) -> Result<ClientFrame, VoiceProtocolD
 /// allowlist that runs before any conversion to a domain type. Rejections carry a code
 /// and a JSON path and never the rejected value.
 fn validate_client_frame_wire(value: &Value) -> Result<(), VoiceProtocolDiagnostic> {
-    let frame = require_wire_object(Some(value), "$")?;
+    let frame = require_wire_envelope(value)?;
+    require_wire_version(frame)?;
     // A browser has no tool authority, so a forged tool result is forbidden rather than
     // merely unknown. The v4 plain text frame is simply not a v5 frame.
     let frame_type = frame.get("type").and_then(Value::as_str);
@@ -261,27 +262,724 @@ fn validate_client_frame_wire(value: &Value) -> Result<(), VoiceProtocolDiagnost
 
     match frame_type {
         "session_config" => {
+            require_only_wire_keys(
+                frame,
+                &[
+                    "type",
+                    "version",
+                    "client_generation_id",
+                    SESSION_CREDENTIAL_KEY,
+                    "session",
+                ],
+                "$",
+            )?;
             require_wire_credential(frame.get(SESSION_CREDENTIAL_KEY))?;
             validate_session_config_wire(frame.get("session"))?;
         }
-        "session_refresh" => validate_session_refresh_context_wire(frame.get("context"))?,
+        "session_refresh" => {
+            require_only_wire_keys(
+                frame,
+                &["type", "version", "client_generation_id", "context"],
+                "$",
+            )?;
+            validate_session_refresh_context_wire(frame.get("context"))?;
+        }
         "audio_chunk" => {
+            require_only_wire_keys(
+                frame,
+                &[
+                    "type",
+                    "version",
+                    "client_generation_id",
+                    "turn_id",
+                    "sequence",
+                    "frame",
+                ],
+                "$",
+            )?;
             require_wire_id(frame.get("turn_id"), "$.turn_id")?;
+            require_wire_sequence(frame.get("sequence"), "$.sequence")?;
             validate_audio_chunk_payload(value)?;
         }
         "audio_end" => {
+            require_only_wire_keys(
+                frame,
+                &[
+                    "type",
+                    "version",
+                    "client_generation_id",
+                    "turn_id",
+                    "final_sequence",
+                ],
+                "$",
+            )?;
             require_wire_id(frame.get("turn_id"), "$.turn_id")?;
+            require_wire_sequence(frame.get("final_sequence"), "$.final_sequence")?;
         }
         "turn_intent" => {
+            require_only_wire_keys(
+                frame,
+                &[
+                    "type",
+                    "version",
+                    "client_generation_id",
+                    "turn_id",
+                    "intent",
+                ],
+                "$",
+            )?;
             require_wire_id(frame.get("turn_id"), "$.turn_id")?;
             validate_turn_intent_wire(frame.get("intent"))?;
         }
         "cancel" => {
+            require_only_wire_keys(
+                frame,
+                &["type", "version", "client_generation_id", "turn_id"],
+                "$",
+            )?;
             if frame.contains_key("turn_id") {
                 require_wire_id(frame.get("turn_id"), "$.turn_id")?;
             }
         }
-        _ => {}
+        _ => {
+            require_only_wire_keys(frame, &["type", "version", "client_generation_id"], "$")?;
+        }
+    }
+    Ok(())
+}
+
+/// `VOICE-DIAGNOSTIC-001`: the closed server frame and event vocabularies, and the
+/// explicit wire allowlist that runs before any conversion to a domain type.
+const VIVA_SERVER_FRAME_TYPES: [&str; 4] = ["ready", "audio_turn_accepted", "event", "error"];
+
+const VIVA_SERVER_EVENT_TYPES: [&str; 12] = [
+    "session_phase",
+    "question_started",
+    "transcript_delta",
+    "transcript_final",
+    "answer_evaluated",
+    "source_reference",
+    "concept_status",
+    "manuscript_intent",
+    "recap_ready",
+    "audio_delta",
+    "cancellation",
+    "structured_error",
+];
+
+const SOURCE_REFERENCE_KEYS: [&str; 6] = SOURCE_CONTEXT_KEYS;
+
+/// The closed value vocabularies the wire allowlist enforces before any conversion to a
+/// domain type. They are written as literals so both language contracts read identically.
+const STUDY_SESSION_PHASES: [&str; 6] = [
+    "ready",
+    "listening",
+    "thinking",
+    "feedback",
+    "correction",
+    "recap",
+];
+const CONCEPT_STATUSES: [&str; 4] = ["strong", "shaky", "missed", "review"];
+const EVALUATION_LABELS: [&str; 7] = [
+    "strong",
+    "mostly correct",
+    "partially correct",
+    "vague",
+    "wrong",
+    "off-topic",
+    "insufficient evidence",
+];
+const MANUSCRIPT_REGISTERS: [&str; 5] = [
+    "examining",
+    "reflecting",
+    "correcting",
+    "sourcing",
+    "recapping",
+];
+const MANUSCRIPT_EMPHASES: [&str; 3] = ["quiet", "measured", "marked"];
+const MANUSCRIPT_ENTITY_KINDS: [&str; 3] = ["concept", "source", "marginal_note"];
+
+fn validate_server_frame_wire(value: &Value) -> Result<(), VoiceProtocolDiagnostic> {
+    let frame = require_wire_envelope(value)?;
+    require_wire_version(frame)?;
+    let Some(frame_type) = frame
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|kind| VIVA_SERVER_FRAME_TYPES.contains(kind))
+    else {
+        return Err(diagnostic(
+            VoiceProtocolDiagnosticCode::UnknownFrame,
+            "$.type",
+        ));
+    };
+
+    match frame_type {
+        "ready" => {
+            require_only_wire_keys(
+                frame,
+                &[
+                    "type",
+                    "version",
+                    "protocol",
+                    "sample_rate_hz",
+                    "input_encoding",
+                    "brain",
+                    "store",
+                ],
+                "$",
+            )?;
+            validate_protocol_advertisement_wire(frame.get("protocol"))?;
+            if require_wire_u64(frame.get("sample_rate_hz"), "$.sample_rate_hz")?
+                != u64::from(VIVA_VOICE_SAMPLE_RATE_HZ)
+            {
+                return Err(diagnostic(
+                    VoiceProtocolDiagnosticCode::InvalidField,
+                    "$.sample_rate_hz",
+                ));
+            }
+            if require_wire_string(frame.get("input_encoding"), "$.input_encoding")?
+                != VIVA_VOICE_INPUT_ENCODING
+            {
+                return Err(diagnostic(
+                    VoiceProtocolDiagnosticCode::InvalidField,
+                    "$.input_encoding",
+                ));
+            }
+            let brain = require_wire_object(frame.get("brain"), "$.brain")?;
+            require_only_wire_keys(
+                brain,
+                &["provider", "configured", "selectable", "live_runtime"],
+                "$.brain",
+            )?;
+            require_non_empty_wire_string(brain.get("provider"), "$.brain.provider")?;
+            for key in ["configured", "selectable", "live_runtime"] {
+                require_wire_bool(brain.get(key), format!("$.brain.{key}"))?;
+            }
+            let store = require_wire_object(frame.get("store"), "$.store")?;
+            require_only_wire_keys(
+                store,
+                &[
+                    "backend",
+                    "available",
+                    "durable",
+                    "nonce_replay_protection",
+                    "raw_audio_persistence",
+                    "transcript_persistence",
+                    "uuid_schema_translation",
+                ],
+                "$.store",
+            )?;
+            require_non_empty_wire_string(store.get("backend"), "$.store.backend")?;
+            for key in [
+                "available",
+                "durable",
+                "nonce_replay_protection",
+                "raw_audio_persistence",
+                "transcript_persistence",
+                "uuid_schema_translation",
+            ] {
+                require_wire_bool(store.get(key), format!("$.store.{key}"))?;
+            }
+        }
+        "audio_turn_accepted" => {
+            require_only_wire_keys(
+                frame,
+                &[
+                    "type",
+                    "version",
+                    "client_generation_id",
+                    "turn_id",
+                    "final_sequence",
+                ],
+                "$",
+            )?;
+            require_wire_id(frame.get("client_generation_id"), "$.client_generation_id")?;
+            require_wire_id(frame.get("turn_id"), "$.turn_id")?;
+            require_wire_sequence(frame.get("final_sequence"), "$.final_sequence")?;
+        }
+        "event" => {
+            require_only_wire_keys(frame, &["type", "version", "event"], "$")?;
+            validate_server_event_wire(frame.get("event"), "$.event")?;
+        }
+        _ => {
+            require_only_wire_keys(frame, &["type", "version", "error"], "$")?;
+            let error = require_wire_object(frame.get("error"), "$.error")?;
+            require_only_wire_keys(error, &["code", "message", "retryable"], "$.error")?;
+            let code = require_wire_string(error.get("code"), "$.error.code")?;
+            let Some(code) = VoiceServerErrorCode::from_wire(code) else {
+                return Err(diagnostic(
+                    VoiceProtocolDiagnosticCode::InvalidField,
+                    "$.error.code",
+                ));
+            };
+            require_non_empty_wire_string(error.get("message"), "$.error.message")?;
+            // Retryability is derived from the code, never trusted from the wire.
+            if require_wire_bool(error.get("retryable"), "$.error.retryable")? != code.retryable() {
+                return Err(diagnostic(
+                    VoiceProtocolDiagnosticCode::Invariant,
+                    "$.error.retryable",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_protocol_advertisement_wire(
+    value: Option<&Value>,
+) -> Result<(), VoiceProtocolDiagnostic> {
+    let advertisement = require_wire_object(value, "$.protocol")?;
+    require_only_wire_keys(
+        advertisement,
+        &["preferred_version", "supported_versions"],
+        "$.protocol",
+    )?;
+    let supported = require_wire_array(
+        advertisement.get("supported_versions"),
+        "$.protocol.supported_versions",
+    )?;
+    let versions: Vec<u32> = supported
+        .iter()
+        .map(|version| {
+            version
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    diagnostic(
+                        VoiceProtocolDiagnosticCode::InvalidField,
+                        "$.protocol.supported_versions",
+                    )
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let negotiated =
+        negotiate_voice_protocol_version(&VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS, &versions)?;
+    if advertisement
+        .get("preferred_version")
+        .and_then(Value::as_u64)
+        != Some(u64::from(negotiated))
+    {
+        return Err(diagnostic(
+            VoiceProtocolDiagnosticCode::UnsupportedVersion,
+            "$.protocol.preferred_version",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_server_event_wire(
+    value: Option<&Value>,
+    path: &str,
+) -> Result<(), VoiceProtocolDiagnostic> {
+    let event = require_wire_object(value, path)?;
+    let Some(event_type) = event
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|kind| VIVA_SERVER_EVENT_TYPES.contains(kind))
+    else {
+        return Err(diagnostic(
+            VoiceProtocolDiagnosticCode::UnknownFrame,
+            format!("{path}.type"),
+        ));
+    };
+
+    match event_type {
+        "session_phase" => {
+            require_only_wire_keys(event, &["type", "phase", "terminal_reason"], path)?;
+            require_wire_enum(
+                event.get("phase"),
+                &STUDY_SESSION_PHASES,
+                format!("{path}.phase"),
+            )?;
+            if event.contains_key("terminal_reason") {
+                require_wire_terminal_reason(
+                    event.get("terminal_reason"),
+                    format!("{path}.terminal_reason"),
+                )?;
+            }
+        }
+        "question_started" => {
+            require_only_wire_keys(event, &["type", "response_id", "question"], path)?;
+            require_strict_wire_id(event.get("response_id"), format!("{path}.response_id"))?;
+            validate_study_question_wire(event.get("question"), &format!("{path}.question"))?;
+        }
+        "transcript_delta" => {
+            require_only_wire_keys(event, &["type", "response_id", "text"], path)?;
+            require_strict_wire_id(event.get("response_id"), format!("{path}.response_id"))?;
+            require_wire_string(event.get("text"), format!("{path}.text"))?;
+        }
+        "transcript_final" => {
+            require_only_wire_keys(event, &["type", "response_id", "text", "confidence"], path)?;
+            require_strict_wire_id(event.get("response_id"), format!("{path}.response_id"))?;
+            require_wire_string(event.get("text"), format!("{path}.text"))?;
+            require_wire_provider_confidence(
+                event.get("confidence"),
+                format!("{path}.confidence"),
+            )?;
+        }
+        "answer_evaluated" => {
+            require_only_wire_keys(event, &["type", "response_id", "evaluation"], path)?;
+            require_strict_wire_id(event.get("response_id"), format!("{path}.response_id"))?;
+            validate_answer_evaluation_wire(
+                event.get("evaluation"),
+                &format!("{path}.evaluation"),
+            )?;
+        }
+        "source_reference" => {
+            require_only_wire_keys(event, &["type", "response_id", "source"], path)?;
+            require_strict_wire_id(event.get("response_id"), format!("{path}.response_id"))?;
+            validate_source_reference_wire(event.get("source"), &format!("{path}.source"))?;
+        }
+        "concept_status" => {
+            require_only_wire_keys(
+                event,
+                &["type", "response_id", "concept_id", "status"],
+                path,
+            )?;
+            require_strict_wire_id(event.get("response_id"), format!("{path}.response_id"))?;
+            require_strict_wire_id(event.get("concept_id"), format!("{path}.concept_id"))?;
+            require_wire_enum(
+                event.get("status"),
+                &CONCEPT_STATUSES,
+                format!("{path}.status"),
+            )?;
+        }
+        "manuscript_intent" => {
+            require_only_wire_keys(event, &["type", "response_id", "intent"], path)?;
+            require_strict_wire_id(event.get("response_id"), format!("{path}.response_id"))?;
+            validate_manuscript_intent_wire(event.get("intent"), &format!("{path}.intent"))?;
+        }
+        "recap_ready" => {
+            require_only_wire_keys(
+                event,
+                &["type", "response_id", "recap", "partial_reason"],
+                path,
+            )?;
+            require_strict_wire_id(event.get("response_id"), format!("{path}.response_id"))?;
+            validate_recap_wire(event.get("recap"), &format!("{path}.recap"))?;
+            if event.contains_key("partial_reason") {
+                require_wire_terminal_reason(
+                    event.get("partial_reason"),
+                    format!("{path}.partial_reason"),
+                )?;
+            }
+        }
+        "audio_delta" => {
+            require_only_wire_keys(event, &["type", "response_id", "frame"], path)?;
+            require_strict_wire_id(event.get("response_id"), format!("{path}.response_id"))?;
+            let frame = require_wire_object(event.get("frame"), format!("{path}.frame"))?;
+            require_only_wire_keys(frame, &["pcm16_base64"], &format!("{path}.frame"))?;
+            require_non_empty_wire_string(
+                frame.get("pcm16_base64"),
+                format!("{path}.frame.pcm16_base64"),
+            )?;
+        }
+        "cancellation" => {
+            require_only_wire_keys(event, &["type", "response_id"], path)?;
+            match event.get("response_id") {
+                None => {
+                    return Err(diagnostic(
+                        VoiceProtocolDiagnosticCode::MissingField,
+                        format!("{path}.response_id"),
+                    ))
+                }
+                Some(Value::Null) => {}
+                other => {
+                    require_strict_wire_id(other, format!("{path}.response_id"))?;
+                }
+            }
+        }
+        _ => {
+            require_only_wire_keys(event, &["type", "source", "message"], path)?;
+            require_non_empty_wire_string(event.get("source"), format!("{path}.source"))?;
+            require_non_empty_wire_string(event.get("message"), format!("{path}.message"))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_study_question_wire(
+    value: Option<&Value>,
+    path: &str,
+) -> Result<(), VoiceProtocolDiagnostic> {
+    let question = require_wire_object(value, path)?;
+    require_only_wire_keys(
+        question,
+        &[
+            "question_id",
+            "concept_id",
+            "prompt",
+            "expected_terms",
+            "follow_up",
+            "rubric",
+            "source",
+        ],
+        path,
+    )?;
+    require_strict_wire_id(question.get("question_id"), format!("{path}.question_id"))?;
+    require_strict_wire_id(question.get("concept_id"), format!("{path}.concept_id"))?;
+    require_non_empty_wire_string(question.get("prompt"), format!("{path}.prompt"))?;
+    for (index, term) in require_wire_array(
+        question.get("expected_terms"),
+        format!("{path}.expected_terms"),
+    )?
+    .iter()
+    .enumerate()
+    {
+        require_wire_string(Some(term), format!("{path}.expected_terms[{index}]"))?;
+    }
+    require_non_empty_wire_string(question.get("follow_up"), format!("{path}.follow_up"))?;
+
+    let rubric_path = format!("{path}.rubric");
+    let rubric = require_wire_object(question.get("rubric"), rubric_path.clone())?;
+    require_only_wire_keys(rubric, &["policy_version", "criteria"], &rubric_path)?;
+    require_non_empty_wire_string(
+        rubric.get("policy_version"),
+        format!("{rubric_path}.policy_version"),
+    )?;
+    for (index, criterion) in
+        require_wire_array(rubric.get("criteria"), format!("{rubric_path}.criteria"))?
+            .iter()
+            .enumerate()
+    {
+        let criterion_path = format!("{rubric_path}.criteria[{index}]");
+        let criterion = require_wire_object(Some(criterion), criterion_path.clone())?;
+        require_only_wire_keys(
+            criterion,
+            &[
+                "criterion_id",
+                "concept_id",
+                "claim",
+                "source_id",
+                "required",
+            ],
+            &criterion_path,
+        )?;
+        require_strict_wire_id(
+            criterion.get("criterion_id"),
+            format!("{criterion_path}.criterion_id"),
+        )?;
+        require_strict_wire_id(
+            criterion.get("concept_id"),
+            format!("{criterion_path}.concept_id"),
+        )?;
+        require_non_empty_wire_string(criterion.get("claim"), format!("{criterion_path}.claim"))?;
+        require_strict_wire_id(
+            criterion.get("source_id"),
+            format!("{criterion_path}.source_id"),
+        )?;
+        require_wire_bool(
+            criterion.get("required"),
+            format!("{criterion_path}.required"),
+        )?;
+    }
+    validate_source_reference_wire(question.get("source"), &format!("{path}.source"))
+}
+
+fn validate_source_reference_wire(
+    value: Option<&Value>,
+    path: &str,
+) -> Result<(), VoiceProtocolDiagnostic> {
+    let source = require_wire_object(value, path)?;
+    require_only_wire_keys(source, &SOURCE_REFERENCE_KEYS, path)?;
+    for key in [
+        "source_id",
+        "document_id",
+        "span",
+        "excerpt",
+        "retrieval_reason",
+    ] {
+        require_non_empty_wire_string(source.get(key), format!("{path}.{key}"))?;
+    }
+    require_wire_source_confidence(source.get("confidence"), format!("{path}.confidence"))
+}
+
+fn validate_answer_evaluation_wire(
+    value: Option<&Value>,
+    path: &str,
+) -> Result<(), VoiceProtocolDiagnostic> {
+    let evaluation = require_wire_object(value, path)?;
+    require_only_wire_keys(
+        evaluation,
+        &[
+            "question_id",
+            "answer_text",
+            "label",
+            "concise_feedback",
+            "retry_prompt",
+            "source",
+            "concept_status",
+            "confidence_score",
+        ],
+        path,
+    )?;
+    require_strict_wire_id(evaluation.get("question_id"), format!("{path}.question_id"))?;
+    require_wire_string(evaluation.get("answer_text"), format!("{path}.answer_text"))?;
+    require_wire_enum(
+        evaluation.get("label"),
+        &EVALUATION_LABELS,
+        format!("{path}.label"),
+    )?;
+    require_non_empty_wire_string(
+        evaluation.get("concise_feedback"),
+        format!("{path}.concise_feedback"),
+    )?;
+    require_non_empty_wire_string(
+        evaluation.get("retry_prompt"),
+        format!("{path}.retry_prompt"),
+    )?;
+    validate_source_reference_wire(evaluation.get("source"), &format!("{path}.source"))?;
+    require_wire_enum(
+        evaluation.get("concept_status"),
+        &CONCEPT_STATUSES,
+        format!("{path}.concept_status"),
+    )?;
+    require_wire_unit_interval(
+        evaluation.get("confidence_score"),
+        format!("{path}.confidence_score"),
+    )
+    .map(|_| ())
+}
+
+/// The `viva.study_session_recap.v2` shape the merged Plan 04/06 domain emits: concept
+/// outcomes and a review schedule folded from persisted evidence, not free-form lists.
+fn validate_recap_wire(value: Option<&Value>, path: &str) -> Result<(), VoiceProtocolDiagnostic> {
+    let recap = require_wire_object(value, path)?;
+    require_only_wire_keys(
+        recap,
+        &[
+            "schema",
+            "voice_session_id",
+            "headline",
+            "summary",
+            "concepts",
+            "review_schedule",
+            "next_action",
+            "source_moments",
+            "deferred_turns",
+        ],
+        path,
+    )?;
+    require_non_empty_wire_string(recap.get("schema"), format!("{path}.schema"))?;
+    require_strict_wire_id(
+        recap.get("voice_session_id"),
+        format!("{path}.voice_session_id"),
+    )?;
+    for key in ["headline", "summary", "next_action"] {
+        require_non_empty_wire_string(recap.get(key), format!("{path}.{key}"))?;
+    }
+    for (index, concept) in require_wire_array(recap.get("concepts"), format!("{path}.concepts"))?
+        .iter()
+        .enumerate()
+    {
+        let concept_path = format!("{path}.concepts[{index}]");
+        let concept = require_wire_object(Some(concept), concept_path.clone())?;
+        require_only_wire_keys(concept, &["concept_id", "label", "status"], &concept_path)?;
+        require_strict_wire_id(
+            concept.get("concept_id"),
+            format!("{concept_path}.concept_id"),
+        )?;
+        require_non_empty_wire_string(concept.get("label"), format!("{concept_path}.label"))?;
+        require_wire_enum(
+            concept.get("status"),
+            &CONCEPT_STATUSES,
+            format!("{concept_path}.status"),
+        )?;
+    }
+    for (index, entry) in require_wire_array(
+        recap.get("review_schedule"),
+        format!("{path}.review_schedule"),
+    )?
+    .iter()
+    .enumerate()
+    {
+        let entry_path = format!("{path}.review_schedule[{index}]");
+        let entry = require_wire_object(Some(entry), entry_path.clone())?;
+        require_only_wire_keys(entry, &["concept_id", "due_at", "authority"], &entry_path)?;
+        require_strict_wire_id(entry.get("concept_id"), format!("{entry_path}.concept_id"))?;
+        require_non_empty_wire_string(entry.get("due_at"), format!("{entry_path}.due_at"))?;
+        let authority_path = format!("{entry_path}.authority");
+        if !matches!(
+            require_wire_string(entry.get("authority"), authority_path.clone())?,
+            "server_persisted_fsrs" | "core_fsrs_read_time"
+        ) {
+            return Err(diagnostic(
+                VoiceProtocolDiagnosticCode::InvalidField,
+                authority_path,
+            ));
+        }
+    }
+    for (index, moment) in require_wire_array(
+        recap.get("source_moments"),
+        format!("{path}.source_moments"),
+    )?
+    .iter()
+    .enumerate()
+    {
+        let moment_path = format!("{path}.source_moments[{index}]");
+        let moment = require_wire_object(Some(moment), moment_path.clone())?;
+        require_only_wire_keys(moment, &["response_id", "source_id"], &moment_path)?;
+        require_strict_wire_id(
+            moment.get("response_id"),
+            format!("{moment_path}.response_id"),
+        )?;
+        require_strict_wire_id(moment.get("source_id"), format!("{moment_path}.source_id"))?;
+    }
+    require_wire_sequence(
+        recap.get("deferred_turns"),
+        format!("{path}.deferred_turns"),
+    )
+    .map(|_| ())
+}
+
+fn validate_manuscript_intent_wire(
+    value: Option<&Value>,
+    path: &str,
+) -> Result<(), VoiceProtocolDiagnostic> {
+    let intent = require_wire_object(value, path)?;
+    let allowed: &[&str] = match intent.get("type").and_then(Value::as_str) {
+        Some("scene_intent") => &["type", "register", "emphasis"],
+        Some("entity_intent") => &["type", "entity_id", "entity_kind", "register", "emphasis"],
+        Some("marginalia_intent") => &[
+            "type",
+            "marginalia_id",
+            "anchor_entity_id",
+            "register",
+            "emphasis",
+        ],
+        _ => {
+            return Err(diagnostic(
+                VoiceProtocolDiagnosticCode::InvalidField,
+                format!("{path}.type"),
+            ))
+        }
+    };
+    require_only_wire_keys(intent, allowed, path)?;
+    for key in allowed.iter().filter(|key| key.ends_with("_id")) {
+        let id = require_strict_wire_id(intent.get(*key), format!("{path}.{key}"))?;
+        if id.chars().count() > MAX_MANUSCRIPT_ID_LENGTH {
+            return Err(diagnostic(
+                VoiceProtocolDiagnosticCode::InvalidField,
+                format!("{path}.{key}"),
+            ));
+        }
+    }
+    require_wire_enum(
+        intent.get("register"),
+        &MANUSCRIPT_REGISTERS,
+        format!("{path}.register"),
+    )?;
+    require_wire_enum(
+        intent.get("emphasis"),
+        &MANUSCRIPT_EMPHASES,
+        format!("{path}.emphasis"),
+    )?;
+    if intent.contains_key("entity_kind") {
+        require_wire_enum(
+            intent.get("entity_kind"),
+            &MANUSCRIPT_ENTITY_KINDS,
+            format!("{path}.entity_kind"),
+        )?;
     }
     Ok(())
 }
@@ -398,10 +1096,106 @@ fn diagnostic(
     VoiceProtocolDiagnostic::new(code, path)
 }
 
-fn require_wire_object<'a>(
-    value: Option<&'a Value>,
+/// The root of a wire frame must be a JSON object, never an array or a scalar.
+fn require_wire_envelope(value: &Value) -> Result<&Map<String, Value>, VoiceProtocolDiagnostic> {
+    value
+        .as_object()
+        .ok_or_else(|| diagnostic(VoiceProtocolDiagnosticCode::InvalidEnvelope, "$"))
+}
+
+/// v5 is the only accepted version; a missing or other version is never upgraded.
+fn require_wire_version(frame: &Map<String, Value>) -> Result<(), VoiceProtocolDiagnostic> {
+    if frame.get("version").and_then(Value::as_u64) != Some(u64::from(VIVA_VOICE_PROTOCOL_VERSION))
+    {
+        return Err(diagnostic(
+            VoiceProtocolDiagnosticCode::UnsupportedVersion,
+            "$.version",
+        ));
+    }
+    Ok(())
+}
+
+fn require_wire_bool(
+    value: Option<&Value>,
     path: impl Into<String>,
-) -> Result<&'a Map<String, Value>, VoiceProtocolDiagnostic> {
+) -> Result<bool, VoiceProtocolDiagnostic> {
+    let path = path.into();
+    match value {
+        None => Err(diagnostic(
+            VoiceProtocolDiagnosticCode::MissingField,
+            path.clone(),
+        )),
+        Some(Value::Bool(flag)) => Ok(*flag),
+        Some(_) => Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path)),
+    }
+}
+
+fn require_wire_u64(
+    value: Option<&Value>,
+    path: impl Into<String>,
+) -> Result<u64, VoiceProtocolDiagnostic> {
+    let path = path.into();
+    match value {
+        None => Err(diagnostic(
+            VoiceProtocolDiagnosticCode::MissingField,
+            path.clone(),
+        )),
+        Some(number) => number
+            .as_u64()
+            .ok_or_else(|| diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path.clone())),
+    }
+}
+
+/// Sequence numbers start at 0 and are whole; fractional, negative, and out-of-range
+/// values fail closed before any allocation.
+fn require_wire_sequence(
+    value: Option<&Value>,
+    path: impl Into<String>,
+) -> Result<u32, VoiceProtocolDiagnostic> {
+    let path = path.into();
+    let number = require_wire_u64(value, path.clone())?;
+    u32::try_from(number).map_err(|_| diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path))
+}
+
+/// Provider confidence is `null` when the provider supplied none. A number is valid only
+/// inside `[0, 1]`; an omitted key is rejected so a fixture default can never become
+/// product data.
+fn require_wire_provider_confidence(
+    value: Option<&Value>,
+    path: impl Into<String>,
+) -> Result<(), VoiceProtocolDiagnostic> {
+    let path = path.into();
+    match value {
+        None => Err(diagnostic(
+            VoiceProtocolDiagnosticCode::MissingField,
+            path.clone(),
+        )),
+        Some(Value::Null) => Ok(()),
+        Some(_) => require_wire_unit_interval(value, path).map(|_| ()),
+    }
+}
+
+fn require_wire_unit_interval(
+    value: Option<&Value>,
+    path: impl Into<String>,
+) -> Result<f64, VoiceProtocolDiagnostic> {
+    let path = path.into();
+    match value {
+        None => Err(diagnostic(
+            VoiceProtocolDiagnosticCode::MissingField,
+            path.clone(),
+        )),
+        Some(number) => number
+            .as_f64()
+            .filter(|score| score.is_finite() && (0.0..=1.0).contains(score))
+            .ok_or_else(|| diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path.clone())),
+    }
+}
+
+fn require_wire_object(
+    value: Option<&Value>,
+    path: impl Into<String>,
+) -> Result<&Map<String, Value>, VoiceProtocolDiagnostic> {
     let path = path.into();
     match value {
         None | Some(Value::Null) => Err(diagnostic(
@@ -413,10 +1207,10 @@ fn require_wire_object<'a>(
     }
 }
 
-fn require_wire_array<'a>(
-    value: Option<&'a Value>,
+fn require_wire_array(
+    value: Option<&Value>,
     path: impl Into<String>,
-) -> Result<&'a Vec<Value>, VoiceProtocolDiagnostic> {
+) -> Result<&Vec<Value>, VoiceProtocolDiagnostic> {
     let path = path.into();
     match value {
         None => Err(diagnostic(
@@ -428,10 +1222,10 @@ fn require_wire_array<'a>(
     }
 }
 
-fn require_wire_string<'a>(
-    value: Option<&'a Value>,
+fn require_wire_string(
+    value: Option<&Value>,
     path: impl Into<String>,
-) -> Result<&'a str, VoiceProtocolDiagnostic> {
+) -> Result<&str, VoiceProtocolDiagnostic> {
     let path = path.into();
     match value {
         None => Err(diagnostic(
@@ -443,10 +1237,10 @@ fn require_wire_string<'a>(
     }
 }
 
-fn require_non_empty_wire_string<'a>(
-    value: Option<&'a Value>,
+fn require_non_empty_wire_string(
+    value: Option<&Value>,
     path: impl Into<String>,
-) -> Result<&'a str, VoiceProtocolDiagnostic> {
+) -> Result<&str, VoiceProtocolDiagnostic> {
     let path = path.into();
     let text = require_wire_string(value, path.clone())?;
     if text.trim().is_empty() {
@@ -456,10 +1250,10 @@ fn require_non_empty_wire_string<'a>(
 }
 
 /// Wire identity: present, non-blank, and bounded.
-fn require_wire_id<'a>(
-    value: Option<&'a Value>,
+fn require_wire_id(
+    value: Option<&Value>,
     path: impl Into<String>,
-) -> Result<&'a str, VoiceProtocolDiagnostic> {
+) -> Result<&str, VoiceProtocolDiagnostic> {
     let path = path.into();
     let text = require_wire_string(value, path.clone())?;
     if text.trim().is_empty() || text.chars().count() > MAX_WIRE_ID_LENGTH {
@@ -469,10 +1263,10 @@ fn require_wire_id<'a>(
 }
 
 /// `VOICE-TURN-001`'s id vocabulary, also used for bound session identity.
-fn require_strict_wire_id<'a>(
-    value: Option<&'a Value>,
+fn require_strict_wire_id(
+    value: Option<&Value>,
     path: impl Into<String>,
-) -> Result<&'a str, VoiceProtocolDiagnostic> {
+) -> Result<&str, VoiceProtocolDiagnostic> {
     let path = path.into();
     let text = require_wire_string(value, path.clone())?;
     if !is_strict_wire_id(text) {
@@ -502,10 +1296,40 @@ fn is_strict_wire_id(text: &str) -> bool {
 fn require_wire_credential(value: Option<&Value>) -> Result<(), VoiceProtocolDiagnostic> {
     let path = format!("$.{SESSION_CREDENTIAL_KEY}");
     let text = require_wire_string(value, path.clone())?;
-    if text.trim().is_empty() {
+    let segments: Vec<&str> = text.split('.').collect();
+    if segments.len() != 3 || segments[0] != VIVA_SESSION_CREDENTIAL_PREFIX {
         return Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path));
     }
+    // Shape only: the claims and signature segments must be canonical unpadded
+    // base64url. Signature verification is Plan 08's, never this module's.
+    if !segments[1..]
+        .iter()
+        .all(|segment| is_canonical_unpadded_base64url(segment))
+    {
+        return Err(diagnostic(
+            VoiceProtocolDiagnosticCode::NoncanonicalBase64Url,
+            path,
+        ));
+    }
     Ok(())
+}
+
+/// The wire prefix every `viva1` session credential carries.
+const VIVA_SESSION_CREDENTIAL_PREFIX: &str = "viva1";
+/// Manuscript ids are render anchors, never learner text.
+const MAX_MANUSCRIPT_ID_LENGTH: usize = 96;
+
+/// Canonical unpadded base64url: no padding, no standard-alphabet characters, and no
+/// non-zero unused bits in the final group. This is the only place the contract uses the
+/// url alphabet; audio payloads are padded standard base64.
+fn is_canonical_unpadded_base64url(segment: &str) -> bool {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    !segment.is_empty()
+        && URL_SAFE_NO_PAD
+            .decode(segment)
+            .map(|bytes| URL_SAFE_NO_PAD.encode(bytes) == segment)
+            .unwrap_or(false)
 }
 
 fn require_only_wire_keys(
@@ -520,6 +1344,33 @@ fn require_only_wire_keys(
                 format!("{path}.{key}"),
             ));
         }
+    }
+    Ok(())
+}
+
+fn require_wire_enum(
+    value: Option<&Value>,
+    allowed: &[&str],
+    path: impl Into<String>,
+) -> Result<(), VoiceProtocolDiagnostic> {
+    let path = path.into();
+    if !allowed.contains(&require_wire_string(value, path.clone())?) {
+        return Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path));
+    }
+    Ok(())
+}
+
+fn require_wire_terminal_reason(
+    value: Option<&Value>,
+    path: impl Into<String>,
+) -> Result<(), VoiceProtocolDiagnostic> {
+    let path = path.into();
+    let reason = require_wire_string(value, path.clone())?;
+    if !TerminalSessionReason::ALL
+        .iter()
+        .any(|known| known.as_str() == reason)
+    {
+        return Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path));
     }
     Ok(())
 }
@@ -551,6 +1402,7 @@ fn require_wire_source_confidence(
 
 pub fn parse_server_frame_json(json: &str) -> Result<ServerFrame, VoiceProtocolDiagnostic> {
     let value = parse_voice_wire_json(json)?;
+    validate_server_frame_wire(&value)?;
     serde_json::from_value(value).map_err(|_| {
         VoiceProtocolDiagnostic::new(VoiceProtocolDiagnosticCode::InvalidEnvelope, "$")
     })
@@ -572,12 +1424,8 @@ fn parse_voice_wire_json(json: &str) -> Result<Value, VoiceProtocolDiagnostic> {
 /// stored, logged, or copied into a diagnostic. The aggregate turn bound stays in
 /// Plan 03's stateful assembler, which consumes the same constants.
 fn validate_audio_chunk_payload(value: &Value) -> Result<(), VoiceProtocolDiagnostic> {
-    let Some(frame) = value.get("frame") else {
-        return Err(VoiceProtocolDiagnostic::new(
-            VoiceProtocolDiagnosticCode::MissingField,
-            "$.frame",
-        ));
-    };
+    let frame = require_wire_object(value.get("frame"), "$.frame")?;
+    require_only_wire_keys(frame, &["pcm16_base64"], "$.frame")?;
     let Some(encoded) = frame.get("pcm16_base64") else {
         return Err(VoiceProtocolDiagnostic::new(
             VoiceProtocolDiagnosticCode::MissingField,
@@ -864,8 +1712,79 @@ pub enum ServerFrame {
     },
     Error {
         version: u32,
-        message: String,
+        error: ServerError,
     },
+}
+
+/// `VOICE-ERROR-001`: the closed typed vocabulary a server error frame may carry.
+/// Retryability is a property of the code, never a value a sender may choose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoiceServerErrorCode {
+    AuthExpired,
+    AuthInvalid,
+    AuthIdentityMismatch,
+    AuthReplayed,
+    ClientFrameMalformed,
+    ClientFrameTooLarge,
+    ClientTurnTooLarge,
+    ClientAuthorityForbidden,
+    InternalSerialization,
+}
+
+impl VoiceServerErrorCode {
+    pub const ALL: [Self; 9] = [
+        Self::AuthExpired,
+        Self::AuthInvalid,
+        Self::AuthIdentityMismatch,
+        Self::AuthReplayed,
+        Self::ClientFrameMalformed,
+        Self::ClientFrameTooLarge,
+        Self::ClientTurnTooLarge,
+        Self::ClientAuthorityForbidden,
+        Self::InternalSerialization,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthExpired => "VOICE_AUTH_EXPIRED",
+            Self::AuthInvalid => "VOICE_AUTH_INVALID",
+            Self::AuthIdentityMismatch => "VOICE_AUTH_IDENTITY_MISMATCH",
+            Self::AuthReplayed => "VOICE_AUTH_REPLAYED",
+            Self::ClientFrameMalformed => "VOICE_CLIENT_FRAME_MALFORMED",
+            Self::ClientFrameTooLarge => "VOICE_CLIENT_FRAME_TOO_LARGE",
+            Self::ClientTurnTooLarge => "VOICE_CLIENT_TURN_TOO_LARGE",
+            Self::ClientAuthorityForbidden => "VOICE_CLIENT_AUTHORITY_FORBIDDEN",
+            Self::InternalSerialization => "VOICE_INTERNAL_SERIALIZATION",
+        }
+    }
+
+    /// Only an expired credential and a server-side serialization fault are worth
+    /// retrying; every other typed code is a terminal client or auth defect.
+    pub const fn retryable(self) -> bool {
+        matches!(self, Self::AuthExpired | Self::InternalSerialization)
+    }
+
+    pub fn from_wire(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|known| known.as_str() == code)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl ServerError {
+    pub fn new(code: VoiceServerErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code: code.as_str().to_owned(),
+            message: message.into(),
+            retryable: code.retryable(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -873,7 +1792,7 @@ pub enum ServerFrame {
 pub enum VivaServerEvent {
     SessionPhase {
         phase: StudySessionPhase,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_reason: Option<TerminalSessionReason>,
     },
     QuestionStarted {
@@ -909,7 +1828,7 @@ pub enum VivaServerEvent {
     RecapReady {
         response_id: String,
         recap: StudySessionRecap,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         partial_reason: Option<TerminalSessionReason>,
     },
     AudioDelta {
@@ -1122,10 +2041,12 @@ impl ServerFrame {
         }
     }
 
-    pub fn error(message: impl Into<String>) -> Self {
+    /// A typed server error. The constructor derives `retryable` from the code, so an
+    /// error frame whose retryability contradicts its code is unrepresentable.
+    pub fn error(code: VoiceServerErrorCode, message: impl Into<String>) -> Self {
         Self::Error {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            message: message.into(),
+            error: ServerError::new(code, message),
         }
     }
 
@@ -1172,7 +2093,7 @@ mod tests {
 
     use agent_domain::{BrainInput, RealtimeBrain};
     use serde::Deserialize;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tokio::time::timeout;
 
     use super::*;
@@ -2728,5 +3649,185 @@ mod tests {
             assert!(!rendered.contains(credential));
             assert!(!rendered.contains("viva1"));
         }
+    }
+    /// `VOICE-DIFFERENTIAL-001`: one shared case format, executed in file order with no
+    /// id filter. A valid case must reserialize byte for byte; a rejecting case must
+    /// produce the exact code and path and leak nothing about the input.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DifferentialCaseFile {
+        schema: String,
+        protocol_version: u32,
+        cases: Vec<DifferentialCase>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DifferentialCase {
+        id: String,
+        wire_json: String,
+        valid: bool,
+        diagnostic_code: Option<String>,
+        path: Option<String>,
+    }
+
+    /// Substrings no diagnostic may ever carry: credentials, learner facts, raw JSON.
+    const DIAGNOSTIC_LEAK_NEEDLES: [&str; 6] = [
+        "viva1",
+        "fixture-user",
+        "fixture-study-set",
+        "NADH",
+        "AQIDBA",
+        "{",
+    ];
+
+    /// Every nested object boundary of a wire frame, root first.
+    fn object_boundaries(value: &Value, path: Vec<String>, out: &mut Vec<Vec<String>>) {
+        match value {
+            Value::Object(map) => {
+                out.push(path.clone());
+                for (key, entry) in map {
+                    let mut next = path.clone();
+                    next.push(key.clone());
+                    object_boundaries(entry, next, &mut *out);
+                }
+            }
+            Value::Array(items) => {
+                for (index, entry) in items.iter().enumerate() {
+                    let mut next = path.clone();
+                    next.push(index.to_string());
+                    object_boundaries(entry, next, &mut *out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn with_injected(source: &Value, path: &[String], key: &str, injected: Value) -> Value {
+        let mut clone = source.clone();
+        let mut cursor = &mut clone;
+        for step in path {
+            cursor = match cursor {
+                Value::Object(map) => map.get_mut(step).expect("object step"),
+                Value::Array(items) => items
+                    .get_mut(step.parse::<usize>().expect("array index"))
+                    .expect("array step"),
+                other => other,
+            };
+        }
+        cursor
+            .as_object_mut()
+            .expect("injection target is an object")
+            .insert(key.to_owned(), injected);
+        clone
+    }
+
+    fn run_differential_cases<T: serde::Serialize>(
+        raw: &str,
+        parse: impl Fn(&str) -> Result<T, VoiceProtocolDiagnostic>,
+    ) -> usize {
+        let file: DifferentialCaseFile =
+            serde_json::from_str(raw).expect("differential case file parses strictly");
+        assert_eq!(file.schema, "viva.voice-differential-cases.v1");
+        assert_eq!(file.protocol_version, VIVA_VOICE_PROTOCOL_VERSION);
+        assert!(!file.cases.is_empty());
+
+        let mut seen = std::collections::BTreeSet::new();
+        for differential_case in &file.cases {
+            let id = differential_case.id.as_str();
+            assert!(seen.insert(id), "{id} is duplicated");
+
+            if differential_case.valid {
+                assert_eq!(differential_case.diagnostic_code, None, "{id}");
+                assert_eq!(differential_case.path, None, "{id}");
+                let frame = parse(&differential_case.wire_json)
+                    .unwrap_or_else(|error| panic!("{id} parses: {error}"));
+                assert_eq!(
+                    serde_json::to_string(&frame).expect("frame serializes"),
+                    differential_case.wire_json,
+                    "{id} does not reserialize byte for byte"
+                );
+
+                // Mutation controls: an unknown field at any object boundary rejects, and
+                // no other protocol version is accepted.
+                let source: Value =
+                    serde_json::from_str(&differential_case.wire_json).expect("valid case is JSON");
+                let mut boundaries = Vec::new();
+                object_boundaries(&source, Vec::new(), &mut boundaries);
+                assert!(!boundaries.is_empty(), "{id}");
+                for boundary in &boundaries {
+                    let mutated = with_injected(
+                        &source,
+                        boundary,
+                        "VOICE_unknown_fixture_field",
+                        Value::Bool(true),
+                    );
+                    let diagnostic = parse(&mutated.to_string())
+                        .map(|_| ())
+                        .expect_err("an unknown field rejects");
+                    assert_eq!(
+                        diagnostic.code,
+                        VoiceProtocolDiagnosticCode::UnknownField,
+                        "{id} accepted an unknown field at {boundary:?}"
+                    );
+                    assert!(
+                        diagnostic.path.ends_with("VOICE_unknown_fixture_field"),
+                        "{id} reported {} for an injected field",
+                        diagnostic.path
+                    );
+                }
+                for version in [4_u64, 6] {
+                    let mutated = with_injected(&source, &[], "version", Value::from(version));
+                    let diagnostic = parse(&mutated.to_string())
+                        .map(|_| ())
+                        .expect_err("another protocol version rejects");
+                    assert_eq!(
+                        diagnostic.code,
+                        VoiceProtocolDiagnosticCode::UnsupportedVersion,
+                        "{id}"
+                    );
+                    assert_eq!(diagnostic.path, "$.version", "{id}");
+                }
+                continue;
+            }
+
+            let diagnostic = parse(&differential_case.wire_json)
+                .map(|_| ())
+                .expect_err(id);
+            assert_eq!(
+                Some(diagnostic.code.as_str().to_owned()),
+                differential_case.diagnostic_code,
+                "{id}"
+            );
+            assert_eq!(
+                Some(diagnostic.path.clone()),
+                differential_case.path,
+                "{id}"
+            );
+
+            let rendered = format!("{diagnostic}");
+            for needle in DIAGNOSTIC_LEAK_NEEDLES {
+                assert!(!rendered.contains(needle), "{id} leaked {needle}");
+            }
+        }
+        file.cases.len()
+    }
+
+    #[test]
+    fn voice_v5_client_differential_cases() {
+        let executed = run_differential_cases(
+            include_str!("../../../fixtures/voice-protocol/v5/client-differential-cases.json"),
+            parse_client_frame_json,
+        );
+        assert!(executed >= 25, "the client corpus is too small: {executed}");
+    }
+
+    #[test]
+    fn voice_v5_server_differential_cases() {
+        let executed = run_differential_cases(
+            include_str!("../../../fixtures/voice-protocol/v5/server-differential-cases.json"),
+            parse_server_frame_json,
+        );
+        assert!(executed >= 25, "the server corpus is too small: {executed}");
     }
 }

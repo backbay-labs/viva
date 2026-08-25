@@ -176,11 +176,32 @@ export type AgentStudySourceReference = {
   retrieval_reason: string;
 };
 
+/**
+ * One server-owned question. `concept_id` and `rubric` mirror the merged Plan 06
+ * `agent_domain::StudyQuestion` (`LEARN-002`): the concept a question is bound to and
+ * the criteria an answer is graded against are server facts carried with the question,
+ * never values a provider may choose at evaluation time.
+ */
+export type AgentEvaluationRubricCriterion = {
+  criterion_id: string;
+  concept_id: string;
+  claim: string;
+  source_id: string;
+  required: boolean;
+};
+
+export type AgentEvaluationRubric = {
+  policy_version: string;
+  criteria: AgentEvaluationRubricCriterion[];
+};
+
 export type AgentStudyQuestion = {
   question_id: string;
+  concept_id: string;
   prompt: string;
   expected_terms: string[];
   follow_up: string;
+  rubric: AgentEvaluationRubric;
   source: AgentStudySourceReference;
 };
 
@@ -204,22 +225,41 @@ export type AgentEvaluationLabel =
   | "off-topic"
   | "insufficient evidence";
 
-export type AgentRecapSourceMoment = {
-  text: string;
-  source: AgentStudySourceReference;
+/**
+ * The recap the learner sees, mirroring the merged Plan 04/06
+ * `agent_domain::learning_recap::StudySessionRecap` (`viva.study_session_recap.v2`). It
+ * is folded from persisted session evidence, so it carries concept outcomes and a review
+ * schedule rather than free-form concept-name lists.
+ */
+export type AgentReviewScheduleAuthority = "server_persisted_fsrs" | "core_fsrs_read_time";
+
+export type AgentReviewScheduleSummary = {
+  concept_id: string;
+  due_at: string;
+  authority: AgentReviewScheduleAuthority;
+};
+
+export type AgentRecapConceptOutcome = {
+  concept_id: string;
+  label: string;
   status: AgentConceptStatus;
 };
 
+export type AgentRecapSourceMoment = {
+  response_id: string;
+  source_id: string;
+};
+
 export type AgentStudySessionRecap = {
+  schema: string;
   voice_session_id: string;
   headline: string;
   summary: string;
-  strong_concepts: string[];
-  shaky_concepts: string[];
-  missed_concepts: string[];
-  review_later: string[];
+  concepts: AgentRecapConceptOutcome[];
+  review_schedule: AgentReviewScheduleSummary[];
   next_action: string;
   source_moments: AgentRecapSourceMoment[];
+  deferred_turns: number;
 };
 
 export type ManuscriptRegister =
@@ -419,11 +459,53 @@ export type VivaServerEvent =
   | { type: "cancellation"; response_id?: string | null }
   | { type: "structured_error"; source: string; message: string };
 
+/** `VOICE-ERROR-001`: the closed typed vocabulary a server error frame may carry. */
+export const VIVA_VOICE_SERVER_ERROR_CODES = [
+  "VOICE_AUTH_EXPIRED",
+  "VOICE_AUTH_INVALID",
+  "VOICE_AUTH_IDENTITY_MISMATCH",
+  "VOICE_AUTH_REPLAYED",
+  "VOICE_CLIENT_FRAME_MALFORMED",
+  "VOICE_CLIENT_FRAME_TOO_LARGE",
+  "VOICE_CLIENT_TURN_TOO_LARGE",
+  "VOICE_CLIENT_AUTHORITY_FORBIDDEN",
+  "VOICE_INTERNAL_SERIALIZATION",
+] as const;
+
+export type VivaVoiceServerErrorCode = (typeof VIVA_VOICE_SERVER_ERROR_CODES)[number];
+
+/**
+ * Retryability is a property of the code, not a value the sender may choose. The parser
+ * verifies it rather than trusting the frame.
+ */
+const RETRYABLE_SERVER_ERROR_CODES: readonly VivaVoiceServerErrorCode[] = [
+  "VOICE_AUTH_EXPIRED",
+  "VOICE_INTERNAL_SERIALIZATION",
+];
+
+export type VivaServerError = {
+  code: VivaVoiceServerErrorCode;
+  message: string;
+  retryable: boolean;
+};
+
+export type VivaErrorFrame = {
+  type: "error";
+  version: typeof VIVA_VOICE_PROTOCOL_VERSION;
+  error: VivaServerError;
+};
+
+export type VivaEventFrame = {
+  type: "event";
+  version: typeof VIVA_VOICE_PROTOCOL_VERSION;
+  event: VivaServerEvent;
+};
+
 export type VivaServerFrame =
   | VivaReadyFrame
   | AgentAudioTurnAcceptedFrame
-  | { type: "event"; version: typeof VIVA_VOICE_PROTOCOL_VERSION; event: VivaServerEvent }
-  | { type: "error"; version: typeof VIVA_VOICE_PROTOCOL_VERSION; message: string };
+  | VivaEventFrame
+  | VivaErrorFrame;
 
 export function audioChunkClientFrame(
   input: Readonly<{
@@ -474,127 +556,447 @@ export function sessionConfigFrame(
   };
 }
 
+/** `VOICE-DIAGNOSTIC-001`: the closed server frame vocabulary. */
+const VIVA_SERVER_FRAME_TYPES = ["ready", "audio_turn_accepted", "event", "error"] as const;
+
+const VIVA_SERVER_EVENT_TYPES = [
+  "session_phase",
+  "question_started",
+  "transcript_delta",
+  "transcript_final",
+  "answer_evaluated",
+  "source_reference",
+  "concept_status",
+  "manuscript_intent",
+  "recap_ready",
+  "audio_delta",
+  "cancellation",
+  "structured_error",
+] as const;
+
+/**
+ * `VOICE-RUNTIME-001`: strict at every nested boundary, reconstructing and returning
+ * only allowed fields rather than the caller's object, and throwing only redaction-safe
+ * diagnostics. Self-contained pure ESM: no host access of any kind.
+ */
 export function parseVivaServerFrame(value: unknown): VivaServerFrame {
-  const frame = requireRecord(value, "server frame");
+  const frame = requireWireEnvelope(value);
+  requireWireVersion(frame);
   const type = frame.type;
-  if (frame.version !== VIVA_VOICE_PROTOCOL_VERSION) {
-    throw unsupportedVersion();
+  if (!VIVA_SERVER_FRAME_TYPES.includes(type as (typeof VIVA_SERVER_FRAME_TYPES)[number])) {
+    throw voiceDiagnostic(
+      "VOICE_PROTOCOL_UNKNOWN_FRAME",
+      "$.type",
+      "Unknown Viva voice server frame",
+    );
   }
 
   if (type === "ready") {
-    if (frame.sample_rate_hz !== VIVA_VOICE_SAMPLE_RATE_HZ) {
-      throw new Error("Unexpected Viva voice sample rate");
-    }
-    if (frame.input_encoding !== VIVA_VOICE_INPUT_ENCODING) {
-      throw new Error("Unexpected Viva voice input encoding");
-    }
+    requireOnlyWireKeys(
+      frame,
+      ["type", "version", "protocol", "sample_rate_hz", "input_encoding", "brain", "store"],
+      "$",
+    );
     return {
       type: "ready",
       version: VIVA_VOICE_PROTOCOL_VERSION,
       protocol: parseVivaVoiceProtocolAdvertisement(frame.protocol),
-      sample_rate_hz: VIVA_VOICE_SAMPLE_RATE_HZ,
-      input_encoding: VIVA_VOICE_INPUT_ENCODING,
+      sample_rate_hz: requireExactWireValue(
+        frame.sample_rate_hz,
+        VIVA_VOICE_SAMPLE_RATE_HZ,
+        "$.sample_rate_hz",
+      ),
+      input_encoding: requireExactWireValue(
+        frame.input_encoding,
+        VIVA_VOICE_INPUT_ENCODING,
+        "$.input_encoding",
+      ),
       brain: parseBrainReadiness(frame.brain),
       store: parseStoreReadiness(frame.store),
     };
   }
 
   if (type === "audio_turn_accepted") {
-    requireNonEmptyString(frame.client_generation_id, "client_generation_id");
-    requireNonEmptyString(frame.turn_id, "turn_id");
-    requireSequenceNumber(frame.final_sequence, "final_sequence");
-    return frame as VivaServerFrame;
-  }
-
-  if (type === "event") {
+    requireOnlyWireKeys(
+      frame,
+      ["type", "version", "client_generation_id", "turn_id", "final_sequence"],
+      "$",
+    );
     return {
-      type: "event",
+      type: "audio_turn_accepted",
       version: VIVA_VOICE_PROTOCOL_VERSION,
-      event: parseVivaServerEvent(frame.event),
+      client_generation_id: requireWireId(
+        frame.client_generation_id,
+        "$.client_generation_id",
+        "client_generation_id",
+      ),
+      turn_id: requireWireId(frame.turn_id, "$.turn_id", "turn_id"),
+      final_sequence: requireSequenceNumberAt(frame.final_sequence, "$.final_sequence"),
     };
   }
 
-  if (type === "error" && typeof frame.message === "string") {
-    return frame as VivaServerFrame;
+  if (type === "event") {
+    requireOnlyWireKeys(frame, ["type", "version", "event"], "$");
+    return {
+      type: "event",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+      event: parseVivaServerEvent(frame.event, "$.event"),
+    };
   }
 
-  throw new Error("Unknown Viva voice server frame");
+  requireOnlyWireKeys(frame, ["type", "version", "error"], "$");
+  return {
+    type: "error",
+    version: VIVA_VOICE_PROTOCOL_VERSION,
+    error: parseVivaServerError(frame.error),
+  };
 }
 
-export function parseVivaServerEvent(value: unknown): VivaServerEvent {
-  const event = requireRecord(value, "server event");
-  switch (event.type) {
-    case "session_phase":
-      requireStudyPhase(event.phase);
-      if ("terminal_reason" in event && event.terminal_reason !== undefined) {
-        requireTerminalSessionReason(event.terminal_reason);
-      }
-      return event as VivaServerEvent;
+function parseVivaServerError(value: unknown): VivaServerError {
+  const error = requireRecordAt(value, "$.error");
+  requireOnlyWireKeys(error, ["code", "message", "retryable"], "$.error");
+  const code = requireStringAt(error.code, "$.error.code");
+  if (!VIVA_VOICE_SERVER_ERROR_CODES.includes(code as VivaVoiceServerErrorCode)) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", "$.error.code", "Unknown server error");
+  }
+  const message = requireNonEmptyStringAt(error.message, "$.error.message");
+  const retryable = requireBooleanAt(error.retryable, "$.error.retryable");
+  // Retryability is derived from the code, never trusted from the wire.
+  if (retryable !== RETRYABLE_SERVER_ERROR_CODES.includes(code as VivaVoiceServerErrorCode)) {
+    throw voiceDiagnostic(
+      "VOICE_PROTOCOL_INVARIANT",
+      "$.error.retryable",
+      "Server error retryability contradicts its code",
+    );
+  }
+  return { code: code as VivaVoiceServerErrorCode, message, retryable };
+}
+
+export function parseVivaServerEvent(value: unknown, path = "$.event"): VivaServerEvent {
+  const event = requireRecordAt(value, path);
+  const type = event.type;
+  if (!VIVA_SERVER_EVENT_TYPES.includes(type as (typeof VIVA_SERVER_EVENT_TYPES)[number])) {
+    throw voiceDiagnostic(
+      "VOICE_PROTOCOL_UNKNOWN_FRAME",
+      `${path}.type`,
+      "Unknown Viva voice server event",
+    );
+  }
+
+  switch (type) {
+    case "session_phase": {
+      requireOnlyWireKeys(event, ["type", "phase", "terminal_reason"], path);
+      const phase = requireStudyPhaseAt(event.phase, `${path}.phase`);
+      if (!("terminal_reason" in event)) return { type: "session_phase", phase };
+      return {
+        type: "session_phase",
+        phase,
+        terminal_reason: requireTerminalSessionReasonAt(
+          event.terminal_reason,
+          `${path}.terminal_reason`,
+        ),
+      };
+    }
     case "question_started":
-      requireString(event.response_id, "response_id");
-      parseStudyQuestion(event.question);
-      return event as VivaServerEvent;
+      requireOnlyWireKeys(event, ["type", "response_id", "question"], path);
+      return {
+        type: "question_started",
+        response_id: requireStrictWireId(event.response_id, `${path}.response_id`),
+        question: parseStudyQuestion(event.question, `${path}.question`),
+      };
     case "transcript_delta":
-      requireString(event.response_id, "response_id");
-      requireString(event.text, "text");
-      return event as VivaServerEvent;
+      requireOnlyWireKeys(event, ["type", "response_id", "text"], path);
+      return {
+        type: "transcript_delta",
+        response_id: requireStrictWireId(event.response_id, `${path}.response_id`),
+        text: requireStringAt(event.text, `${path}.text`),
+      };
     case "transcript_final":
-      requireString(event.response_id, "response_id");
-      requireString(event.text, "text");
-      if (
-        "confidence" in event &&
-        event.confidence !== null &&
-        typeof event.confidence !== "number"
-      ) {
-        throw new Error("Invalid confidence");
-      }
-      return event as VivaServerEvent;
+      requireOnlyWireKeys(event, ["type", "response_id", "text", "confidence"], path);
+      return {
+        type: "transcript_final",
+        response_id: requireStrictWireId(event.response_id, `${path}.response_id`),
+        text: requireStringAt(event.text, `${path}.text`),
+        confidence: requireProviderConfidence(event.confidence, `${path}.confidence`),
+      };
     case "answer_evaluated":
-      requireString(event.response_id, "response_id");
-      parseAnswerEvaluation(event.evaluation);
-      return event as VivaServerEvent;
+      requireOnlyWireKeys(event, ["type", "response_id", "evaluation"], path);
+      return {
+        type: "answer_evaluated",
+        response_id: requireStrictWireId(event.response_id, `${path}.response_id`),
+        evaluation: parseAnswerEvaluation(event.evaluation, `${path}.evaluation`),
+      };
     case "source_reference":
-      requireString(event.response_id, "response_id");
-      parseStudySourceReference(event.source);
-      return event as VivaServerEvent;
+      requireOnlyWireKeys(event, ["type", "response_id", "source"], path);
+      return {
+        type: "source_reference",
+        response_id: requireStrictWireId(event.response_id, `${path}.response_id`),
+        source: parseStudySourceReference(event.source, `${path}.source`),
+      };
     case "concept_status":
-      requireString(event.response_id, "response_id");
-      requireString(event.concept_id, "concept_id");
-      requireConceptStatus(event.status);
-      return event as VivaServerEvent;
+      requireOnlyWireKeys(event, ["type", "response_id", "concept_id", "status"], path);
+      return {
+        type: "concept_status",
+        response_id: requireStrictWireId(event.response_id, `${path}.response_id`),
+        concept_id: requireStrictWireId(event.concept_id, `${path}.concept_id`),
+        status: requireConceptStatusAt(event.status, `${path}.status`),
+      };
     case "manuscript_intent":
+      requireOnlyWireKeys(event, ["type", "response_id", "intent"], path);
       return {
         type: "manuscript_intent",
-        response_id: requireString(event.response_id, "response_id"),
-        intent: parseManuscriptIntent(event.intent),
+        response_id: requireStrictWireId(event.response_id, `${path}.response_id`),
+        intent: parseManuscriptIntent(event.intent, `${path}.intent`),
       };
-    case "recap_ready":
-      requireString(event.response_id, "response_id");
-      if ("partial_reason" in event && event.partial_reason !== undefined) {
-        requireTerminalSessionReason(event.partial_reason);
+    case "recap_ready": {
+      requireOnlyWireKeys(event, ["type", "response_id", "recap", "partial_reason"], path);
+      const responseId = requireStrictWireId(event.response_id, `${path}.response_id`);
+      const recap = parseStudySessionRecap(event.recap, `${path}.recap`);
+      if (!("partial_reason" in event)) {
+        return { type: "recap_ready", response_id: responseId, recap };
       }
-      parseStudySessionRecap(event.recap);
-      return event as VivaServerEvent;
+      return {
+        type: "recap_ready",
+        response_id: responseId,
+        recap,
+        partial_reason: requireTerminalSessionReasonAt(
+          event.partial_reason,
+          `${path}.partial_reason`,
+        ),
+      };
+    }
     case "audio_delta":
-      requireString(event.response_id, "response_id");
-      parseAudioFrame(event.frame);
-      return event as VivaServerEvent;
-    case "cancellation":
-      if (
-        "response_id" in event &&
-        event.response_id !== null &&
-        typeof event.response_id !== "string"
-      ) {
-        throw new Error("Invalid response_id");
+      requireOnlyWireKeys(event, ["type", "response_id", "frame"], path);
+      return {
+        type: "audio_delta",
+        response_id: requireStrictWireId(event.response_id, `${path}.response_id`),
+        frame: parseServerAudioFrame(event.frame, `${path}.frame`),
+      };
+    case "cancellation": {
+      requireOnlyWireKeys(event, ["type", "response_id"], path);
+      if (!("response_id" in event)) {
+        throw voiceDiagnostic(
+          "VOICE_PROTOCOL_MISSING_FIELD",
+          `${path}.response_id`,
+          "Missing response_id",
+        );
       }
-      return event as VivaServerEvent;
-    case "structured_error":
-      requireString(event.source, "source");
-      requireString(event.message, "message");
-      return event as VivaServerEvent;
+      if (event.response_id === null) return { type: "cancellation", response_id: null };
+      return {
+        type: "cancellation",
+        response_id: requireStrictWireId(event.response_id, `${path}.response_id`),
+      };
+    }
     default:
-      throw new Error("Unknown Viva voice server event");
+      requireOnlyWireKeys(event, ["type", "source", "message"], path);
+      return {
+        type: "structured_error",
+        source: requireNonEmptyStringAt(event.source, `${path}.source`),
+        message: requireNonEmptyStringAt(event.message, `${path}.message`),
+      };
   }
+}
+
+/**
+ * Provider confidence is `null` when the provider supplied none. A number is valid only
+ * inside `[0, 1]`; an omitted key is rejected so a fixture default can never become
+ * product data.
+ */
+function requireProviderConfidence(value: unknown, path: string): number | null {
+  if (value === undefined) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_MISSING_FIELD", path, "Missing confidence");
+  }
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid confidence");
+  }
+  return value;
+}
+
+function parseServerAudioFrame(value: unknown, path: string): AgentAudioFrame {
+  const frame = requireRecordAt(value, path);
+  requireOnlyWireKeys(frame, ["pcm16_base64"], path);
+  return { pcm16_base64: requireNonEmptyStringAt(frame.pcm16_base64, `${path}.pcm16_base64`) };
+}
+
+function parseStudySourceReference(value: unknown, path: string): AgentStudySourceReference {
+  const source = requireRecordAt(value, path);
+  requireOnlyWireKeys(
+    source,
+    ["source_id", "document_id", "span", "excerpt", "confidence", "retrieval_reason"],
+    path,
+  );
+  return {
+    source_id: requireNonEmptyStringAt(source.source_id, `${path}.source_id`),
+    document_id: requireNonEmptyStringAt(source.document_id, `${path}.document_id`),
+    span: requireNonEmptyStringAt(source.span, `${path}.span`),
+    excerpt: requireNonEmptyStringAt(source.excerpt, `${path}.excerpt`),
+    confidence: requireSourceConfidenceAt(source.confidence, `${path}.confidence`),
+    retrieval_reason: requireNonEmptyStringAt(source.retrieval_reason, `${path}.retrieval_reason`),
+  };
+}
+
+function parseStudyQuestion(value: unknown, path: string): AgentStudyQuestion {
+  const question = requireRecordAt(value, path);
+  requireOnlyWireKeys(
+    question,
+    ["question_id", "concept_id", "prompt", "expected_terms", "follow_up", "rubric", "source"],
+    path,
+  );
+  return {
+    question_id: requireStrictWireId(question.question_id, `${path}.question_id`),
+    concept_id: requireStrictWireId(question.concept_id, `${path}.concept_id`),
+    prompt: requireNonEmptyStringAt(question.prompt, `${path}.prompt`),
+    expected_terms: requireWireStringArray(question.expected_terms, `${path}.expected_terms`),
+    follow_up: requireNonEmptyStringAt(question.follow_up, `${path}.follow_up`),
+    rubric: parseEvaluationRubric(question.rubric, `${path}.rubric`),
+    source: parseStudySourceReference(question.source, `${path}.source`),
+  };
+}
+
+function parseEvaluationRubric(value: unknown, path: string): AgentEvaluationRubric {
+  const rubric = requireRecordAt(value, path);
+  requireOnlyWireKeys(rubric, ["policy_version", "criteria"], path);
+  return {
+    policy_version: requireNonEmptyStringAt(rubric.policy_version, `${path}.policy_version`),
+    criteria: requireArrayAt(rubric.criteria, `${path}.criteria`).map((criterion, index) => {
+      const criterionPath = `${path}.criteria[${index}]`;
+      const record = requireRecordAt(criterion, criterionPath);
+      requireOnlyWireKeys(
+        record,
+        ["criterion_id", "concept_id", "claim", "source_id", "required"],
+        criterionPath,
+      );
+      return {
+        criterion_id: requireStrictWireId(record.criterion_id, `${criterionPath}.criterion_id`),
+        concept_id: requireStrictWireId(record.concept_id, `${criterionPath}.concept_id`),
+        claim: requireNonEmptyStringAt(record.claim, `${criterionPath}.claim`),
+        source_id: requireStrictWireId(record.source_id, `${criterionPath}.source_id`),
+        required: requireBooleanAt(record.required, `${criterionPath}.required`),
+      };
+    }),
+  };
+}
+
+function parseAnswerEvaluation(value: unknown, path: string): AgentAnswerEvaluation {
+  const evaluation = requireRecordAt(value, path);
+  requireOnlyWireKeys(
+    evaluation,
+    [
+      "question_id",
+      "answer_text",
+      "label",
+      "concise_feedback",
+      "retry_prompt",
+      "source",
+      "concept_status",
+      "confidence_score",
+    ],
+    path,
+  );
+  const confidenceScore = evaluation.confidence_score;
+  if (confidenceScore === undefined) {
+    throw voiceDiagnostic(
+      "VOICE_PROTOCOL_MISSING_FIELD",
+      `${path}.confidence_score`,
+      "Missing confidence_score",
+    );
+  }
+  if (
+    typeof confidenceScore !== "number" ||
+    !Number.isFinite(confidenceScore) ||
+    confidenceScore < 0 ||
+    confidenceScore > 1
+  ) {
+    throw voiceDiagnostic(
+      "VOICE_PROTOCOL_INVALID_FIELD",
+      `${path}.confidence_score`,
+      "Invalid confidence_score",
+    );
+  }
+  return {
+    question_id: requireStrictWireId(evaluation.question_id, `${path}.question_id`),
+    answer_text: requireStringAt(evaluation.answer_text, `${path}.answer_text`),
+    label: requireEvaluationLabelAt(evaluation.label, `${path}.label`),
+    concise_feedback: requireNonEmptyStringAt(
+      evaluation.concise_feedback,
+      `${path}.concise_feedback`,
+    ),
+    retry_prompt: requireNonEmptyStringAt(evaluation.retry_prompt, `${path}.retry_prompt`),
+    source: parseStudySourceReference(evaluation.source, `${path}.source`),
+    concept_status: requireConceptStatusAt(evaluation.concept_status, `${path}.concept_status`),
+    confidence_score: confidenceScore,
+  };
+}
+
+function parseStudySessionRecap(value: unknown, path: string): AgentStudySessionRecap {
+  const recap = requireRecordAt(value, path);
+  requireOnlyWireKeys(
+    recap,
+    [
+      "schema",
+      "voice_session_id",
+      "headline",
+      "summary",
+      "concepts",
+      "review_schedule",
+      "next_action",
+      "source_moments",
+      "deferred_turns",
+    ],
+    path,
+  );
+  return {
+    schema: requireNonEmptyStringAt(recap.schema, `${path}.schema`),
+    voice_session_id: requireStrictWireId(recap.voice_session_id, `${path}.voice_session_id`),
+    headline: requireNonEmptyStringAt(recap.headline, `${path}.headline`),
+    summary: requireNonEmptyStringAt(recap.summary, `${path}.summary`),
+    concepts: requireArrayAt(recap.concepts, `${path}.concepts`).map((concept, index) => {
+      const conceptPath = `${path}.concepts[${index}]`;
+      const record = requireRecordAt(concept, conceptPath);
+      requireOnlyWireKeys(record, ["concept_id", "label", "status"], conceptPath);
+      return {
+        concept_id: requireStrictWireId(record.concept_id, `${conceptPath}.concept_id`),
+        label: requireNonEmptyStringAt(record.label, `${conceptPath}.label`),
+        status: requireConceptStatusAt(record.status, `${conceptPath}.status`),
+      };
+    }),
+    review_schedule: requireArrayAt(recap.review_schedule, `${path}.review_schedule`).map(
+      (entry, index) => {
+        const entryPath = `${path}.review_schedule[${index}]`;
+        const record = requireRecordAt(entry, entryPath);
+        requireOnlyWireKeys(record, ["concept_id", "due_at", "authority"], entryPath);
+        return {
+          concept_id: requireStrictWireId(record.concept_id, `${entryPath}.concept_id`),
+          due_at: requireNonEmptyStringAt(record.due_at, `${entryPath}.due_at`),
+          authority: requireReviewScheduleAuthorityAt(record.authority, `${entryPath}.authority`),
+        };
+      },
+    ),
+    next_action: requireNonEmptyStringAt(recap.next_action, `${path}.next_action`),
+    source_moments: requireArrayAt(recap.source_moments, `${path}.source_moments`).map(
+      (moment, index) => {
+        const momentPath = `${path}.source_moments[${index}]`;
+        const record = requireRecordAt(moment, momentPath);
+        requireOnlyWireKeys(record, ["response_id", "source_id"], momentPath);
+        return {
+          response_id: requireStrictWireId(record.response_id, `${momentPath}.response_id`),
+          source_id: requireStrictWireId(record.source_id, `${momentPath}.source_id`),
+        };
+      },
+    ),
+    deferred_turns: requireSequenceNumberAt(recap.deferred_turns, `${path}.deferred_turns`),
+  };
+}
+
+function requireReviewScheduleAuthorityAt(
+  value: unknown,
+  path: string,
+): AgentReviewScheduleAuthority {
+  if (value !== "server_persisted_fsrs" && value !== "core_fsrs_read_time") {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid review authority");
+  }
+  return value;
 }
 
 /**
@@ -603,10 +1005,8 @@ export function parseVivaServerEvent(value: unknown): VivaServerEvent {
  * field, and every rejection is a code/path-only diagnostic that never echoes the input.
  */
 export function parseVivaClientFrame(value: unknown): VivaBrowserClientFrame {
-  const frame = requireRecord(value, "client frame");
-  if (frame.version !== VIVA_VOICE_PROTOCOL_VERSION) {
-    throw unsupportedVersion();
-  }
+  const frame = requireWireEnvelope(value);
+  requireWireVersion(frame);
   // A browser has no tool authority, so a forged tool result is forbidden rather than
   // merely unknown. The v4 plain text frame is simply not a v5 frame.
   if (frame.type === "tool_result") {
@@ -631,6 +1031,11 @@ export function parseVivaClientFrame(value: unknown): VivaBrowserClientFrame {
 
   switch (frame.type) {
     case "session_config":
+      requireOnlyWireKeys(
+        frame,
+        ["type", "version", "client_generation_id", SESSION_CREDENTIAL_KEY, "session"],
+        "$",
+      );
       return {
         type: "session_config",
         version: VIVA_VOICE_PROTOCOL_VERSION,
@@ -639,6 +1044,7 @@ export function parseVivaClientFrame(value: unknown): VivaBrowserClientFrame {
         session: parseSessionConfig(frame.session),
       };
     case "session_refresh":
+      requireOnlyWireKeys(frame, ["type", "version", "client_generation_id", "context"], "$");
       return {
         type: "session_refresh",
         version: VIVA_VOICE_PROTOCOL_VERSION,
@@ -646,23 +1052,38 @@ export function parseVivaClientFrame(value: unknown): VivaBrowserClientFrame {
         context: parseSessionRefreshContext(frame.context),
       };
     case "audio_chunk":
+      requireOnlyWireKeys(
+        frame,
+        ["type", "version", "client_generation_id", "turn_id", "sequence", "frame"],
+        "$",
+      );
       return {
         type: "audio_chunk",
         version: VIVA_VOICE_PROTOCOL_VERSION,
         client_generation_id: clientGenerationId,
         turn_id: requireWireId(frame.turn_id, "$.turn_id", "turn_id"),
-        sequence: requireSequenceNumber(frame.sequence, "sequence"),
+        sequence: requireSequenceNumberAt(frame.sequence, "$.sequence"),
         frame: parseAudioChunkPayload(frame.frame),
       };
     case "audio_end":
+      requireOnlyWireKeys(
+        frame,
+        ["type", "version", "client_generation_id", "turn_id", "final_sequence"],
+        "$",
+      );
       return {
         type: "audio_end",
         version: VIVA_VOICE_PROTOCOL_VERSION,
         client_generation_id: clientGenerationId,
         turn_id: requireWireId(frame.turn_id, "$.turn_id", "turn_id"),
-        final_sequence: requireSequenceNumber(frame.final_sequence, "final_sequence"),
+        final_sequence: requireSequenceNumberAt(frame.final_sequence, "$.final_sequence"),
       };
     case "turn_intent":
+      requireOnlyWireKeys(
+        frame,
+        ["type", "version", "client_generation_id", "turn_id", "intent"],
+        "$",
+      );
       return {
         type: "turn_intent",
         version: VIVA_VOICE_PROTOCOL_VERSION,
@@ -671,6 +1092,7 @@ export function parseVivaClientFrame(value: unknown): VivaBrowserClientFrame {
         intent: parseClientTurnIntent(frame.intent),
       };
     case "cancel": {
+      requireOnlyWireKeys(frame, ["type", "version", "client_generation_id", "turn_id"], "$");
       const cancel: VivaCancelClientFrame = {
         type: "cancel",
         version: VIVA_VOICE_PROTOCOL_VERSION,
@@ -682,6 +1104,7 @@ export function parseVivaClientFrame(value: unknown): VivaBrowserClientFrame {
       return cancel;
     }
     default:
+      requireOnlyWireKeys(frame, ["type", "version", "client_generation_id"], "$");
       return {
         type: "stop",
         version: VIVA_VOICE_PROTOCOL_VERSION,
@@ -782,9 +1205,9 @@ function parseClientTurnIntent(value: unknown): VivaClientTurnIntent {
 /**
  * `VOICE-SIZE-002`: the wire envelope is measured in UTF-8 bytes and rejected above the
  * unchanged 64 KiB text-frame cap *before* any nested parsing, so an oversized payload
- * is never allocated into a document tree.
+ * is never allocated into a parsed tree.
  */
-export function parseVivaClientFrameJson(json: string): VivaClientFrame {
+export function parseVivaClientFrameJson(json: string): VivaBrowserClientFrame {
   return parseVivaClientFrame(parseVivaVoiceWireJson(json));
 }
 
@@ -811,17 +1234,6 @@ function parseVivaVoiceWireJson(json: string): unknown {
   }
 }
 
-/**
- * Sequence numbers start at 0, are contiguous, and cannot be reused. Fractional,
- * negative, and unsafe integers fail closed before any allocation.
- */
-function requireSequenceNumber(value: unknown, label: string): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`Invalid ${label}`);
-  }
-  return value;
-}
-
 /** The one JSON path a rejected audio payload is ever reported at. */
 const PCM16_BASE64_PATH = "$.frame.pcm16_base64";
 
@@ -832,7 +1244,8 @@ const PCM16_BASE64_PATH = "$.frame.pcm16_base64";
  * stateful assembler, which consumes the same constants.
  */
 function parseAudioChunkPayload(value: unknown): AgentAudioFrame {
-  const frame = requireRecord(value, "audio chunk");
+  const frame = requireRecordAt(value, "$.frame");
+  requireOnlyWireKeys(frame, ["pcm16_base64"], "$.frame");
   if (!("pcm16_base64" in frame)) {
     throw new VivaVoiceProtocolError(
       "VOICE_PROTOCOL_MISSING_FIELD",
@@ -885,80 +1298,6 @@ function decodeCanonicalPaddedBase64(encoded: string): Uint8Array | null {
     bytes[index] = binary.charCodeAt(index);
   }
   return btoa(binary) === encoded ? bytes : null;
-}
-
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`Invalid ${label}`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function parseAudioFrame(value: unknown): AgentAudioFrame {
-  const frame = requireRecord(value, "audio frame");
-  requireString(frame.pcm16_base64, "pcm16_base64");
-  return frame as AgentAudioFrame;
-}
-
-function parseStudySourceReference(value: unknown): AgentStudySourceReference {
-  const source = requireRecord(value, "source reference");
-  requireNonEmptyString(source.source_id, "source_id");
-  requireNonEmptyString(source.document_id, "document_id");
-  requireNonEmptyString(source.span, "span");
-  requireNonEmptyString(source.excerpt, "excerpt");
-  requireSourceConfidence(source.confidence);
-  requireNonEmptyString(source.retrieval_reason, "retrieval_reason");
-  return source as AgentStudySourceReference;
-}
-
-function parseStudyQuestion(value: unknown): AgentStudyQuestion {
-  const question = requireRecord(value, "study question");
-  requireNonEmptyString(question.question_id, "question_id");
-  requireNonEmptyString(question.prompt, "prompt");
-  requireStringArray(question.expected_terms, "expected_terms");
-  requireNonEmptyString(question.follow_up, "follow_up");
-  parseStudySourceReference(question.source);
-  return question as AgentStudyQuestion;
-}
-
-function parseAnswerEvaluation(value: unknown): AgentAnswerEvaluation {
-  const evaluation = requireRecord(value, "answer evaluation");
-  requireNonEmptyString(evaluation.question_id, "question_id");
-  requireString(evaluation.answer_text, "answer_text");
-  requireEvaluationLabel(evaluation.label);
-  requireNonEmptyString(evaluation.concise_feedback, "concise_feedback");
-  requireNonEmptyString(evaluation.retry_prompt, "retry_prompt");
-  parseStudySourceReference(evaluation.source);
-  requireConceptStatus(evaluation.concept_status);
-  if (
-    typeof evaluation.confidence_score !== "number" ||
-    !Number.isFinite(evaluation.confidence_score) ||
-    evaluation.confidence_score < 0 ||
-    evaluation.confidence_score > 1
-  ) {
-    throw new Error("Invalid confidence_score");
-  }
-  return evaluation as AgentAnswerEvaluation;
-}
-
-function parseStudySessionRecap(value: unknown): AgentStudySessionRecap {
-  const recap = requireRecord(value, "session recap");
-  requireString(recap.voice_session_id, "voice_session_id");
-  requireString(recap.headline, "headline");
-  requireString(recap.summary, "summary");
-  requireStringArray(recap.strong_concepts, "strong_concepts");
-  requireStringArray(recap.shaky_concepts, "shaky_concepts");
-  requireStringArray(recap.missed_concepts, "missed_concepts");
-  requireStringArray(recap.review_later, "review_later");
-  requireString(recap.next_action, "next_action");
-  const moments = requireArray(recap.source_moments, "source_moments");
-  for (const moment of moments) {
-    const record = requireRecord(moment, "source moment");
-    requireNonEmptyString(record.text, "source moment text");
-    parseStudySourceReference(record.source);
-    requireConceptStatus(record.status);
-  }
-  return recap as AgentStudySessionRecap;
 }
 
 const SESSION_CONFIG_KEYS = [
@@ -1119,10 +1458,47 @@ function requireWireCredential(value: unknown): string {
     throw voiceDiagnostic("VOICE_PROTOCOL_MISSING_FIELD", path, "Missing signed credential");
   }
   const text = requireStringAt(value, path);
-  if (text.trim().length === 0) {
+  const segments = text.split(".");
+  if (segments.length !== 3 || segments[0] !== VIVA_SESSION_CREDENTIAL_PREFIX) {
     throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid signed credential");
   }
+  // Shape only: the claims and signature segments must be canonical unpadded
+  // base64url. Signature verification is Plan 08's, never this module's.
+  for (const segment of segments.slice(1)) {
+    if (!isCanonicalUnpaddedBase64Url(segment)) {
+      throw voiceDiagnostic(
+        "VOICE_PROTOCOL_NONCANONICAL_BASE64URL",
+        path,
+        "Non-canonical signed credential segment",
+      );
+    }
+  }
   return text;
+}
+
+/** The wire prefix every `viva1` session credential carries. */
+const VIVA_SESSION_CREDENTIAL_PREFIX = "viva1";
+
+const CANONICAL_UNPADDED_BASE64URL = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Canonical unpadded base64url: no padding, no standard-alphabet characters, and no
+ * non-zero unused bits in the final group. This is the only place the contract uses the
+ * url alphabet; audio payloads are padded standard base64.
+ */
+function isCanonicalUnpaddedBase64Url(segment: string): boolean {
+  if (!CANONICAL_UNPADDED_BASE64URL.test(segment) || segment.length % 4 === 1) return false;
+  const standard = `${segment.replace(/-/g, "+").replace(/_/g, "/")}${"=".repeat(
+    (4 - (segment.length % 4)) % 4,
+  )}`;
+  let binary: string;
+  try {
+    binary = atob(standard);
+  } catch {
+    return false;
+  }
+  const reencoded = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return reencoded === segment;
 }
 
 function requireOnlyWireKeys(
@@ -1165,25 +1541,19 @@ function unsupportedVersion(): VivaVoiceProtocolError {
 }
 
 /**
- * The frozen unversioned v4-era fixtures predate the advertisement and are retired once
- * every consumer migrates to `fixtures/voice-protocol/v5/` (Plan 05 Task 9 Step 6).
- * Until then they still parse through this single ready representation and receive the
- * canonical v5 advertisement; a present-but-non-v5 advertisement always fails closed.
+ * `VOICE-READY-001`: the advertisement is a required ready field, strictly validated and
+ * reconstructed. A frame without one, or with one that names another version, is not v5
+ * and fails closed rather than being silently upgraded.
  */
 function parseVivaVoiceProtocolAdvertisement(value: unknown): VivaVoiceProtocolAdvertisement {
-  if (value === undefined) {
-    return {
-      preferred_version: VIVA_VOICE_PROTOCOL_VERSION,
-      supported_versions: VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS,
-    };
-  }
-  const advertisement = requireRecord(value, "protocol advertisement");
-  const supportedVersions = requireArray(
+  const advertisement = requireRecordAt(value, "$.protocol");
+  requireOnlyWireKeys(advertisement, ["preferred_version", "supported_versions"], "$.protocol");
+  const supportedVersions = requireArrayAt(
     advertisement.supported_versions,
-    "supported_versions",
+    "$.protocol.supported_versions",
   ).map((version) => {
     if (typeof version !== "number" || !Number.isSafeInteger(version)) {
-      throw new VivaVoiceProtocolError(
+      throw voiceDiagnostic(
         "VOICE_PROTOCOL_INVALID_FIELD",
         "$.protocol.supported_versions",
         "Invalid Viva voice supported versions",
@@ -1196,7 +1566,7 @@ function parseVivaVoiceProtocolAdvertisement(value: unknown): VivaVoiceProtocolA
     supportedVersions,
   );
   if (advertisement.preferred_version !== negotiated) {
-    throw new VivaVoiceProtocolError(
+    throw voiceDiagnostic(
       "VOICE_PROTOCOL_UNSUPPORTED_VERSION",
       "$.protocol.preferred_version",
       "Unsupported Viva voice protocol version",
@@ -1209,94 +1579,111 @@ function parseVivaVoiceProtocolAdvertisement(value: unknown): VivaVoiceProtocolA
 }
 
 function parseBrainReadiness(value: unknown): AgentBrainReadiness {
-  const brain = requireRecord(value, "brain readiness");
+  const brain = requireRecordAt(value, "$.brain");
+  requireOnlyWireKeys(brain, ["provider", "configured", "selectable", "live_runtime"], "$.brain");
   return {
-    provider: requireNonEmptyString(brain.provider, "provider"),
-    configured: requireBoolean(brain.configured, "configured"),
-    selectable: requireBoolean(brain.selectable, "selectable"),
-    live_runtime: requireBoolean(brain.live_runtime, "live_runtime"),
+    provider: requireNonEmptyStringAt(brain.provider, "$.brain.provider"),
+    configured: requireBooleanAt(brain.configured, "$.brain.configured"),
+    selectable: requireBooleanAt(brain.selectable, "$.brain.selectable"),
+    live_runtime: requireBooleanAt(brain.live_runtime, "$.brain.live_runtime"),
   };
 }
 
 function parseStoreReadiness(value: unknown): AgentStoreReadiness {
-  const store = requireRecord(value, "store readiness");
+  const store = requireRecordAt(value, "$.store");
+  requireOnlyWireKeys(
+    store,
+    [
+      "backend",
+      "available",
+      "durable",
+      "nonce_replay_protection",
+      "raw_audio_persistence",
+      "transcript_persistence",
+      "uuid_schema_translation",
+    ],
+    "$.store",
+  );
   return {
-    backend: requireNonEmptyString(store.backend, "store backend"),
-    available: requireBoolean(store.available, "store available"),
-    durable: requireBoolean(store.durable, "store durable"),
-    nonce_replay_protection: requireBoolean(
+    backend: requireNonEmptyStringAt(store.backend, "$.store.backend"),
+    available: requireBooleanAt(store.available, "$.store.available"),
+    durable: requireBooleanAt(store.durable, "$.store.durable"),
+    nonce_replay_protection: requireBooleanAt(
       store.nonce_replay_protection,
-      "store nonce replay protection",
+      "$.store.nonce_replay_protection",
     ),
-    raw_audio_persistence: requireBoolean(store.raw_audio_persistence, "raw audio persistence"),
-    transcript_persistence: requireBoolean(store.transcript_persistence, "transcript persistence"),
-    uuid_schema_translation: requireBoolean(
+    raw_audio_persistence: requireBooleanAt(
+      store.raw_audio_persistence,
+      "$.store.raw_audio_persistence",
+    ),
+    transcript_persistence: requireBooleanAt(
+      store.transcript_persistence,
+      "$.store.transcript_persistence",
+    ),
+    uuid_schema_translation: requireBooleanAt(
       store.uuid_schema_translation,
-      "uuid schema translation",
+      "$.store.uuid_schema_translation",
     ),
   };
 }
 
-function parseManuscriptIntent(value: unknown): ManuscriptIntent {
-  const intent = requireRecord(value, "manuscript intent");
+function parseManuscriptIntent(value: unknown, path: string): ManuscriptIntent {
+  const intent = requireRecordAt(value, path);
   switch (intent.type) {
-    case "scene_intent": {
-      requireOnlyKeys(intent, ["type", "register", "emphasis"]);
+    case "scene_intent":
+      requireOnlyWireKeys(intent, ["type", "register", "emphasis"], path);
       return {
         type: "scene_intent",
-        register: requireManuscriptRegister(intent.register),
-        emphasis: requireManuscriptEmphasis(intent.emphasis),
+        register: requireManuscriptRegister(intent.register, `${path}.register`),
+        emphasis: requireManuscriptEmphasis(intent.emphasis, `${path}.emphasis`),
       };
-    }
-    case "entity_intent": {
-      requireOnlyKeys(intent, ["type", "entity_id", "entity_kind", "register", "emphasis"]);
+    case "entity_intent":
+      requireOnlyWireKeys(
+        intent,
+        ["type", "entity_id", "entity_kind", "register", "emphasis"],
+        path,
+      );
       return {
         type: "entity_intent",
-        entity_id: requireManuscriptId(intent.entity_id, "entity_id"),
-        entity_kind: requireManuscriptEntityKind(intent.entity_kind),
-        register: requireManuscriptRegister(intent.register),
-        emphasis: requireManuscriptEmphasis(intent.emphasis),
+        entity_id: requireManuscriptId(intent.entity_id, `${path}.entity_id`),
+        entity_kind: requireManuscriptEntityKind(intent.entity_kind, `${path}.entity_kind`),
+        register: requireManuscriptRegister(intent.register, `${path}.register`),
+        emphasis: requireManuscriptEmphasis(intent.emphasis, `${path}.emphasis`),
       };
-    }
-    case "marginalia_intent": {
-      requireOnlyKeys(intent, [
-        "type",
-        "marginalia_id",
-        "anchor_entity_id",
-        "register",
-        "emphasis",
-      ]);
+    case "marginalia_intent":
+      requireOnlyWireKeys(
+        intent,
+        ["type", "marginalia_id", "anchor_entity_id", "register", "emphasis"],
+        path,
+      );
       return {
         type: "marginalia_intent",
-        marginalia_id: requireManuscriptId(intent.marginalia_id, "marginalia_id"),
-        anchor_entity_id: requireManuscriptId(intent.anchor_entity_id, "anchor_entity_id"),
-        register: requireManuscriptRegister(intent.register),
-        emphasis: requireManuscriptEmphasis(intent.emphasis),
+        marginalia_id: requireManuscriptId(intent.marginalia_id, `${path}.marginalia_id`),
+        anchor_entity_id: requireManuscriptId(intent.anchor_entity_id, `${path}.anchor_entity_id`),
+        register: requireManuscriptRegister(intent.register, `${path}.register`),
+        emphasis: requireManuscriptEmphasis(intent.emphasis, `${path}.emphasis`),
       };
-    }
     default:
-      throw new Error("Invalid manuscript intent");
+      throw voiceDiagnostic(
+        "VOICE_PROTOCOL_INVALID_FIELD",
+        `${path}.type`,
+        "Invalid manuscript intent",
+      );
   }
 }
 
-function requireOnlyKeys(record: Record<string, unknown>, allowed: string[]): void {
-  const allowedKeys = new Set(allowed);
-  for (const key of Object.keys(record)) {
-    if (!allowedKeys.has(key)) {
-      throw new Error("Invalid manuscript intent");
-    }
-  }
-}
+/** Manuscript ids are render anchors, never learner text; they share the id vocabulary. */
+const MAX_MANUSCRIPT_ID_LENGTH = 96;
 
-function requireManuscriptId(value: unknown, label: string): string {
-  const text = requireNonEmptyString(value, label);
-  if (text.length > 96 || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/.test(text)) {
-    throw new Error(`Invalid manuscript ${label}`);
+function requireManuscriptId(value: unknown, path: string): string {
+  const text = requireStrictWireId(value, path);
+  if (text.length > MAX_MANUSCRIPT_ID_LENGTH) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid manuscript id");
   }
   return text;
 }
 
-function requireManuscriptRegister(value: unknown): ManuscriptRegister {
+function requireManuscriptRegister(value: unknown, path: string): ManuscriptRegister {
   if (
     value !== "examining" &&
     value !== "reflecting" &&
@@ -1304,41 +1691,32 @@ function requireManuscriptRegister(value: unknown): ManuscriptRegister {
     value !== "sourcing" &&
     value !== "recapping"
   ) {
-    throw new Error("Invalid manuscript register");
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid manuscript register");
   }
   return value;
 }
 
-function requireManuscriptEmphasis(value: unknown): ManuscriptEmphasis {
+function requireManuscriptEmphasis(value: unknown, path: string): ManuscriptEmphasis {
   if (value !== "quiet" && value !== "measured" && value !== "marked") {
-    throw new Error("Invalid manuscript emphasis");
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid manuscript emphasis");
   }
   return value;
 }
 
-function requireManuscriptEntityKind(value: unknown): ManuscriptEntityKind {
+function requireManuscriptEntityKind(value: unknown, path: string): ManuscriptEntityKind {
   if (value !== "concept" && value !== "source" && value !== "marginal_note") {
-    throw new Error("Invalid manuscript entity kind");
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid manuscript entity kind");
   }
   return value;
 }
 
-function requireStringArray(value: unknown, label: string): string[] {
-  const array = requireArray(value, label);
-  for (const item of array) {
-    requireString(item, label);
-  }
-  return array as string[];
+function requireWireStringArray(value: unknown, path: string): string[] {
+  return requireArrayAt(value, path).map((item, index) =>
+    requireStringAt(item, `${path}[${index}]`),
+  );
 }
 
-function requireArray(value: unknown, label: string): unknown[] {
-  if (!Array.isArray(value)) {
-    throw new Error(`Invalid ${label}`);
-  }
-  return value;
-}
-
-function requireStudyPhase(value: unknown): AgentStudySessionPhase {
+function requireStudyPhaseAt(value: unknown, path: string): AgentStudySessionPhase {
   if (
     value !== "ready" &&
     value !== "listening" &&
@@ -1347,33 +1725,26 @@ function requireStudyPhase(value: unknown): AgentStudySessionPhase {
     value !== "correction" &&
     value !== "recap"
   ) {
-    throw new Error("Invalid session phase");
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid session phase");
   }
   return value;
 }
 
-function requireTerminalSessionReason(value: unknown): AgentTerminalSessionReason {
+function requireTerminalSessionReasonAt(value: unknown, path: string): AgentTerminalSessionReason {
   if (!VIVA_AGENT_TERMINAL_SESSION_REASONS.includes(value as AgentTerminalSessionReason)) {
-    throw new Error("Invalid terminal session reason");
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid terminal session reason");
   }
   return value as AgentTerminalSessionReason;
 }
 
-function requireSourceConfidence(value: unknown): AgentSourceConfidence {
-  if (value !== "high" && value !== "medium" && value !== "low") {
-    throw new Error("Invalid source confidence");
-  }
-  return value;
-}
-
-function requireConceptStatus(value: unknown): AgentConceptStatus {
+function requireConceptStatusAt(value: unknown, path: string): AgentConceptStatus {
   if (value !== "strong" && value !== "shaky" && value !== "missed" && value !== "review") {
-    throw new Error("Invalid concept status");
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid concept status");
   }
   return value;
 }
 
-function requireEvaluationLabel(value: unknown): AgentEvaluationLabel {
+function requireEvaluationLabelAt(value: unknown, path: string): AgentEvaluationLabel {
   if (
     value !== "strong" &&
     value !== "mostly correct" &&
@@ -1383,29 +1754,52 @@ function requireEvaluationLabel(value: unknown): AgentEvaluationLabel {
     value !== "off-topic" &&
     value !== "insufficient evidence"
   ) {
-    throw new Error("Invalid evaluation label");
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid evaluation label");
   }
   return value;
 }
 
-function requireString(value: unknown, label: string): string {
-  if (typeof value !== "string") {
-    throw new Error(`Missing ${label}`);
+function requireBooleanAt(value: unknown, path: string): boolean {
+  if (value === undefined) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_MISSING_FIELD", path, "Missing boolean");
   }
-  return value;
-}
-
-function requireBoolean(value: unknown, label: string): boolean {
   if (typeof value !== "boolean") {
-    throw new Error(`Missing ${label}`);
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid boolean");
   }
   return value;
 }
 
-function requireNonEmptyString(value: unknown, label: string): string {
-  const text = requireString(value, label);
-  if (text.trim().length === 0) {
-    throw new Error(`Missing ${label}`);
+function requireExactWireValue<T>(value: unknown, expected: T, path: string): T {
+  if (value === undefined) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_MISSING_FIELD", path, "Missing pinned value");
   }
-  return text;
+  if (value !== expected) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Unexpected pinned value");
+  }
+  return expected;
+}
+
+/** The root of a wire frame must be a JSON object, never an array or a scalar. */
+function requireWireEnvelope(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_ENVELOPE", "$", "Invalid Viva voice envelope");
+  }
+  return value as Record<string, unknown>;
+}
+
+/** v5 is the only accepted version; a missing or other version is never upgraded. */
+function requireWireVersion(frame: Record<string, unknown>): void {
+  if (frame.version !== VIVA_VOICE_PROTOCOL_VERSION) {
+    throw unsupportedVersion();
+  }
+}
+
+function requireSequenceNumberAt(value: unknown, path: string): number {
+  if (value === undefined) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_MISSING_FIELD", path, "Missing sequence");
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid sequence");
+  }
+  return value;
 }

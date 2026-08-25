@@ -11,8 +11,10 @@ import sessionFixture from "../../../agent/fixtures/voice-protocol/session-confi
 import evidencePackFixture from "../../../agent/fixtures/voice-protocol/synthetic-evidence-pack.json";
 import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
 import authDecisionFixture from "../../../agent/fixtures/voice-protocol/v5/auth-decision.json";
+import clientDifferentialFixture from "../../../agent/fixtures/voice-protocol/v5/client-differential-cases.json";
 import signedSessionConfigFixture from "../../../agent/fixtures/voice-protocol/v5/client-session-config-signed.json";
 import sessionRefreshFixture from "../../../agent/fixtures/voice-protocol/v5/client-session-refresh.json";
+import serverDifferentialFixture from "../../../agent/fixtures/voice-protocol/v5/server-differential-cases.json";
 import readyV5Fixture from "../../../agent/fixtures/voice-protocol/v5/server-ready.json";
 import {
   type AgentSessionConfig,
@@ -192,9 +194,11 @@ describe("Viva voice agent contract", () => {
       turn_id: "turn-01",
       final_sequence: 0,
     };
-    expect(() => parseVivaClientFrame({ ...end, final_sequence: -1 })).toThrow(
-      "Invalid final_sequence",
+    const finalSequence = captureVoiceProtocolError(() =>
+      parseVivaClientFrame({ ...end, final_sequence: -1 }),
     );
+    expect(finalSequence.code).toBe("VOICE_PROTOCOL_INVALID_FIELD");
+    expect(finalSequence.path).toBe("$.final_sequence");
     expect(() => parseVivaClientFrame({ ...end, client_generation_id: undefined })).toThrow(
       "Missing client_generation_id",
     );
@@ -227,38 +231,21 @@ describe("Viva voice agent contract", () => {
     ).toThrow("Missing client_generation_id");
   });
 
-  test("parses shared ready fixture from Rust service", () => {
-    const ready = parseVivaServerFrame(readyFixture);
-
-    if (ready.type !== "ready") throw new Error("Expected ready frame");
-    expect(ready.version).toBe(VIVA_VOICE_PROTOCOL_VERSION);
-    expect(ready.sample_rate_hz).toBe(VIVA_VOICE_SAMPLE_RATE_HZ);
-    expect(ready.input_encoding).toBe(VIVA_VOICE_INPUT_ENCODING);
-    expect(ready.brain).toEqual({
-      provider: "synthetic",
-      configured: true,
-      selectable: true,
-      live_runtime: false,
-    });
-    expect(ready.store).toEqual({
-      backend: "in_memory",
-      available: true,
-      durable: false,
-      nonce_replay_protection: true,
-      raw_audio_persistence: false,
-      transcript_persistence: false,
-      uuid_schema_translation: true,
-    });
+  test("rejects the retiring unversioned ready fixture as pre-v5", () => {
+    // `VOICE-READY-001` makes the protocol advertisement a required ready field. The
+    // frozen root corpus predates it, so strict v5 parsing rejects it instead of
+    // inventing an advertisement. Task 9 Step 6 deletes the corpus outright.
+    const rejection = captureVoiceProtocolError(() => parseVivaServerFrame(readyFixture));
+    expect(rejection.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
+    expect(rejection.path).toBe("$.protocol");
   });
 
-  test("parses shared server event fixture from Rust service", () => {
-    const frame = parseVivaServerFrame(eventFixture);
-
-    if (frame.type !== "event") throw new Error("Expected event frame");
-    expect(frame.event.type).toBe("question_started");
-    if (frame.event.type !== "question_started") throw new Error("Expected question event");
-    expect(frame.event.response_id).toBe("response-1");
-    expect(frame.event.question.source.confidence).toBe("high");
+  test("rejects the retiring unversioned question fixture as pre-v5", () => {
+    // The merged Plan 06 `StudyQuestion` carries `concept_id` and `rubric`; the frozen
+    // root event corpus predates both, so strict v5 parsing rejects it.
+    const rejection = captureVoiceProtocolError(() => parseVivaServerFrame(eventFixture));
+    expect(rejection.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
+    expect(rejection.path).toBe("$.event.question.concept_id");
   });
 
   test("parses terminal session phases with sanitized enum reasons", () => {
@@ -326,15 +313,15 @@ describe("Viva voice agent contract", () => {
         response_id: "response-1",
         partial_reason: "provider_timeout",
         recap: {
+          schema: "viva.study_session_recap.v2",
           voice_session_id: "voice-session-1",
           headline: "Partial recap",
           summary: "Durable state only.",
-          strong_concepts: [],
-          shaky_concepts: [],
-          missed_concepts: [],
-          review_later: [],
+          concepts: [],
+          review_schedule: [],
           next_action: "Retry when available.",
           source_moments: [],
+          deferred_turns: 0,
         },
       },
     });
@@ -353,15 +340,15 @@ describe("Viva voice agent contract", () => {
           response_id: "response-1",
           partial_reason: "raw provider payload",
           recap: {
+            schema: "viva.study_session_recap.v2",
             voice_session_id: "voice-session-1",
             headline: "Partial recap",
             summary: "Durable state only.",
-            strong_concepts: [],
-            shaky_concepts: [],
-            missed_concepts: [],
-            review_later: [],
+            concepts: [],
+            review_schedule: [],
             next_action: "Retry when available.",
             source_moments: [],
+            deferred_turns: 0,
           },
         },
       }),
@@ -408,7 +395,7 @@ describe("Viva voice agent contract", () => {
             },
           },
         }),
-      ).toThrow("Invalid manuscript intent");
+      ).toThrow("Unknown Viva voice field");
     }
   });
 
@@ -453,7 +440,7 @@ describe("Viva voice agent contract", () => {
           },
         },
       }),
-    ).toThrow("Missing entity_id");
+    ).toThrow("Invalid id");
 
     expect(() =>
       parseVivaServerFrame({
@@ -471,7 +458,7 @@ describe("Viva voice agent contract", () => {
           },
         },
       }),
-    ).toThrow("Invalid manuscript entity_id");
+    ).toThrow("Invalid id");
 
     expect(() =>
       parseVivaServerFrame({
@@ -489,7 +476,7 @@ describe("Viva voice agent contract", () => {
           },
         },
       }),
-    ).toThrow("Invalid manuscript marginalia_id");
+    ).toThrow("Invalid manuscript id");
   });
 
   test("builds and parses shared audio chunk fixture", () => {
@@ -565,43 +552,47 @@ describe("Viva voice agent contract", () => {
     expect(forgedToolResult.path).toBe("$.type");
   });
 
-  test("parses shared synthetic study session fixture", () => {
-    const serverFrames = fullSessionFixture.server.map(parseVivaServerFrame);
-    // `VOICE-VERSION-001`: the frozen unversioned corpus is v4 client wire shape —
-    // token-less `session_config` and plain `text` — so v5 rejects it rather than
-    // silently upgrading it. Task 9 Step 6 deletes the corpus outright.
+  test("rejects the frozen unversioned synthetic session corpus in both directions", () => {
+    // `VOICE-VERSION-001`: the frozen corpus is v4 wire shape — token-less
+    // `session_config`, plain `text`, ready frames without the advertisement, and
+    // questions without `concept_id`/`rubric`. v5 rejects it rather than silently
+    // upgrading it, and Task 9 Step 6 deletes it outright.
     for (const frame of fullSessionFixture.client) {
       expect(VIVA_VOICE_DIAGNOSTIC_CODES).toContain(
         captureVoiceProtocolError(() => parseVivaClientFrame(frame)).code,
       );
     }
+    const readyRejection = captureVoiceProtocolError(() =>
+      parseVivaServerFrame(fullSessionFixture.server[0]),
+    );
+    expect(readyRejection.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
+    expect(readyRejection.path).toBe("$.protocol");
 
-    expect(serverFrames.some((frame) => frame.type === "ready")).toBe(true);
-    expect(
-      serverFrames.some(
-        (frame) => frame.type === "event" && frame.event.type === "answer_evaluated",
-      ),
-    ).toBe(true);
-    expect(
-      serverFrames.some((frame) => frame.type === "event" && frame.event.type === "recap_ready"),
-    ).toBe(true);
+    // The corpus still records the shapes the v5 corpus must eventually cover.
+    const eventTypes = fullSessionFixture.server.flatMap((frame) =>
+      frame.type === "event" ? [(frame as { event: { type: string } }).event.type] : [],
+    );
+    expect(eventTypes).toContain("answer_evaluated");
+    expect(eventTypes).toContain("recap_ready");
   });
 
-  test("parses shared fake Cartesia/Gemini study session fixture", () => {
-    const serverFrames = fakeSessionFixture.server.map(parseVivaServerFrame);
-    const eventTypes = serverFrames.flatMap((frame) =>
-      frame.type === "event" ? [frame.event.type] : [],
-    );
-
-    // The v4 `session_config` in this frozen corpus carries no signed credential, so
-    // v5 rejects it; its bounded audio frames are already v5 shaped and still parse.
+  test("rejects the frozen unversioned fake-provider corpus but keeps its audio shape", () => {
+    // The v4 `session_config` carries no signed credential and the ready frame carries
+    // no advertisement, so both reject; the bounded audio frames Plan 03 introduced are
+    // already v5 shaped and still parse.
     expect(
       captureVoiceProtocolError(() => parseVivaClientFrame(fakeSessionFixture.client[0])).code,
     ).toBe("VOICE_PROTOCOL_MISSING_FIELD");
     expect(parseVivaClientFrame(fakeSessionFixture.client[1]).type).toBe("audio_chunk");
     expect(parseVivaClientFrame(fakeSessionFixture.client[2]).type).toBe("audio_end");
-    expect(serverFrames[0]?.type).toBe("ready");
-    expect(serverFrames[3]?.type).toBe("audio_turn_accepted");
+    expect(
+      captureVoiceProtocolError(() => parseVivaServerFrame(fakeSessionFixture.server[0])).path,
+    ).toBe("$.protocol");
+    expect(parseVivaServerFrame(fakeSessionFixture.server[3]).type).toBe("audio_turn_accepted");
+
+    const eventTypes = fakeSessionFixture.server.flatMap((frame) =>
+      frame.type === "event" ? [(frame as { event: { type: string } }).event.type] : [],
+    );
     expect(eventTypes).toEqual([
       "session_phase",
       "question_started",
@@ -746,7 +737,7 @@ describe("Viva voice agent contract", () => {
           },
         },
       }),
-    ).toThrow("Missing document_id");
+    ).toThrow("Invalid confidence_score");
   });
 });
 
@@ -875,25 +866,12 @@ describe("Viva voice v5 protocol negotiation and the single ready representation
     expect(parsed.store.durable).toBe(false);
   });
 
-  test("supplies the canonical advertisement for the retiring unversioned ready fixture", () => {
-    // The frozen root corpus predates the advertisement and is deleted once every
-    // consumer migrates (Plan 05 Task 9 Step 6). Until then it still parses through the
-    // one ready representation, and the parser supplies the canonical v5 advertisement
-    // instead of inventing a second ready shape. A present-but-wrong advertisement
-    // still fails closed, as the v4 case above proves.
-    const parsed = parseVivaServerFrame(readyFixture);
-
-    if (parsed.type !== "ready") throw new Error("Expected ready frame");
-    expect(parsed.protocol).toEqual(VIVA_VOICE_PROTOCOL_ADVERTISEMENT);
-    expect(Object.keys(parsed)).toEqual([
-      "type",
-      "version",
-      "protocol",
-      "sample_rate_hz",
-      "input_encoding",
-      "brain",
-      "store",
-    ]);
+  test("rejects a ready frame that omits the protocol advertisement", () => {
+    // `VOICE-READY-001` publishes exactly one ready representation and the strict v5
+    // parser requires its advertisement; a frame without one is not v5.
+    const rejection = captureVoiceProtocolError(() => parseVivaServerFrame(readyFixture));
+    expect(rejection.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
+    expect(rejection.path).toBe("$.protocol");
   });
 });
 
@@ -1686,6 +1664,448 @@ describe("Viva voice v5 signed first frame, generation identity, and browser aut
   });
 });
 
+/**
+ * `VOICE-DIAGNOSTIC-001` / `VOICE-RUNTIME-001` / `VOICE-DIFFERENTIAL-001`. Both runners
+ * execute every case in file order with no id filter, assert the exact accept/reject and
+ * the exact code/path, and prove no diagnostic ever echoes the rejected input.
+ */
+type DifferentialCase = {
+  id: string;
+  wire_json: string;
+  valid: boolean;
+  diagnostic_code: string | null;
+  path: string | null;
+};
+
+type DifferentialCaseFile = {
+  schema: string;
+  protocol_version: number;
+  cases: DifferentialCase[];
+};
+
+const clientDifferentialCases = clientDifferentialFixture as unknown as DifferentialCaseFile;
+const serverDifferentialCases = serverDifferentialFixture as unknown as DifferentialCaseFile;
+
+/** Substrings no diagnostic may ever carry: credentials, learner facts, raw JSON. */
+const DIAGNOSTIC_LEAK_NEEDLES = [
+  "viva1",
+  "fixture-user",
+  "fixture-study-set",
+  "fixture-session",
+  "NADH",
+  "AQIDBA==",
+  "{",
+  '"',
+];
+
+function runDifferentialCases(
+  file: DifferentialCaseFile,
+  parse: (wireJson: string) => unknown,
+): number {
+  expect(file.schema).toBe("viva.voice-differential-cases.v1");
+  expect(file.protocol_version).toBe(VIVA_VOICE_PROTOCOL_VERSION);
+  expect(file.cases.length).toBeGreaterThan(0);
+
+  const seen = new Set<string>();
+  for (const differentialCase of file.cases) {
+    const id = differentialCase.id;
+    expect({ id, duplicate: seen.has(id) }).toEqual({ id, duplicate: false });
+    seen.add(id);
+
+    if (differentialCase.valid) {
+      expect({ id, code: differentialCase.diagnostic_code, path: differentialCase.path }).toEqual({
+        id,
+        code: null,
+        path: null,
+      });
+      // A valid case reserializes byte for byte: the parser reconstructs the frame in
+      // wire order rather than handing back the caller's object.
+      expect({ id, wire: JSON.stringify(parse(differentialCase.wire_json)) }).toEqual({
+        id,
+        wire: differentialCase.wire_json,
+      });
+      continue;
+    }
+
+    expect({ id, code: differentialCase.diagnostic_code === null }).toEqual({ id, code: false });
+    const rejection = captureVoiceProtocolError(() => parse(differentialCase.wire_json));
+    expect({ id, code: rejection.code, path: rejection.path }).toEqual({
+      id,
+      code: differentialCase.diagnostic_code,
+      path: differentialCase.path,
+    });
+    expect(VIVA_VOICE_DIAGNOSTIC_CODES).toContain(rejection.code);
+
+    const rendered = `${rejection.name} ${rejection.code} ${rejection.path} ${rejection.message}`;
+    for (const needle of DIAGNOSTIC_LEAK_NEEDLES) {
+      expect({ id, needle, leaked: rendered.includes(needle) }).toEqual({
+        id,
+        needle,
+        leaked: false,
+      });
+    }
+  }
+  return file.cases.length;
+}
+
+/** Every nested object boundary of a parsed wire frame, root first. */
+function objectBoundaries(value: unknown, path: string[] = []): string[][] {
+  if (!value || typeof value !== "object") return [];
+  if (Array.isArray(value)) {
+    return value.flatMap((entry, index) => objectBoundaries(entry, [...path, String(index)]));
+  }
+  return [
+    path,
+    ...Object.entries(value as Record<string, unknown>).flatMap(([key, entry]) =>
+      objectBoundaries(entry, [...path, key]),
+    ),
+  ];
+}
+
+/** Replaces every scalar leaf of a mutable tree so shared references become visible. */
+function scrambleLeavesInPlace(value: unknown): void {
+  if (!value || typeof value !== "object") return;
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    const entry = record[key];
+    if (entry && typeof entry === "object") {
+      scrambleLeavesInPlace(entry);
+      continue;
+    }
+    if (typeof entry === "string") record[key] = "VOICE_scrambled_fixture_value";
+    else if (typeof entry === "number") record[key] = 999_999;
+    else if (typeof entry === "boolean") record[key] = !entry;
+    else record[key] = "VOICE_scrambled_fixture_value";
+  }
+}
+
+function withInjectedValue(source: unknown, path: string[], key: string, value: unknown): unknown {
+  const clone = structuredClone(source) as Record<string, unknown>;
+  let cursor: Record<string, unknown> = clone;
+  for (const step of path) {
+    cursor = cursor[step] as Record<string, unknown>;
+  }
+  cursor[key] = value;
+  return clone;
+}
+
+function withoutKey(source: unknown, path: string[], key: string): unknown {
+  const clone = structuredClone(source) as Record<string, unknown>;
+  let cursor: Record<string, unknown> = clone;
+  for (const step of path) {
+    cursor = cursor[step] as Record<string, unknown>;
+  }
+  delete cursor[key];
+  return clone;
+}
+
+describe("Viva voice v5 differential parsing", () => {
+  test("runs every client differential case with no id filter", () => {
+    const executed = runDifferentialCases(clientDifferentialCases, parseVivaClientFrameJson);
+    expect(executed).toBe(clientDifferentialCases.cases.length);
+  });
+
+  test("runs every server differential case with no id filter", () => {
+    const executed = runDifferentialCases(serverDifferentialCases, parseVivaServerFrameJson);
+    expect(executed).toBe(serverDifferentialCases.cases.length);
+  });
+
+  test("covers every browser-sendable variant and every server frame and event", () => {
+    const validClientTypes = clientDifferentialCases.cases
+      .filter((differentialCase) => differentialCase.valid)
+      .map((differentialCase) => (JSON.parse(differentialCase.wire_json) as { type: string }).type);
+    for (const frameType of VIVA_BROWSER_CLIENT_FRAME_TYPES) {
+      expect(validClientTypes).toContain(frameType);
+    }
+
+    const validServer = serverDifferentialCases.cases
+      .filter((differentialCase) => differentialCase.valid)
+      .map((differentialCase) => JSON.parse(differentialCase.wire_json) as Record<string, unknown>);
+    for (const frameType of ["ready", "audio_turn_accepted", "event", "error"]) {
+      expect(validServer.map((frame) => frame.type)).toContain(frameType);
+    }
+    const eventTypes = validServer.flatMap((frame) =>
+      frame.type === "event" ? [(frame.event as { type: string }).type] : [],
+    );
+    for (const eventType of [
+      "session_phase",
+      "question_started",
+      "transcript_delta",
+      "transcript_final",
+      "answer_evaluated",
+      "source_reference",
+      "concept_status",
+      "manuscript_intent",
+      "recap_ready",
+      "audio_delta",
+      "cancellation",
+      "structured_error",
+    ]) {
+      expect(eventTypes).toContain(eventType);
+    }
+  });
+
+  test("pins the exact authority and size differential rows", () => {
+    const rows = new Map(
+      clientDifferentialCases.cases.map((differentialCase) => [
+        differentialCase.id,
+        { code: differentialCase.diagnostic_code, path: differentialCase.path },
+      ]),
+    );
+    expect(rows.get("VOICE-CLIENT-REJECT-FORGED-TOOL-RESULT")).toEqual({
+      code: "VOICE_PROTOCOL_FORBIDDEN_AUTHORITY",
+      path: "$.type",
+    });
+    expect(rows.get("VOICE-CLIENT-REJECT-TEXT-FRAME-65537")).toEqual({
+      code: "VOICE_PROTOCOL_FRAME_TOO_LARGE",
+      path: "$",
+    });
+    expect(rows.get("VOICE-CLIENT-REJECT-AUDIO-CHUNK-8193")).toEqual({
+      code: "VOICE_PROTOCOL_FRAME_TOO_LARGE",
+      path: "$.frame.pcm16_base64",
+    });
+    // `VOICE-CLIENT-REJECT-TURN-2160002` is a stateful sequence row and lives in
+    // `audio-turn-lifecycle.json`, never in a single-frame parser file.
+    expect(rows.has("VOICE-CLIENT-REJECT-TURN-2160002")).toBe(false);
+    expect(
+      clientDifferentialCases.cases.some(
+        (differentialCase) => differentialCase.diagnostic_code === "VOICE_PROTOCOL_TURN_TOO_LARGE",
+      ),
+    ).toBe(false);
+  });
+
+  test("reconstructs nested server objects instead of returning the caller's object", () => {
+    const source = JSON.parse(JSON.stringify(readyV5Fixture)) as Record<string, unknown>;
+    const parsed = parseVivaServerFrame(source);
+
+    expect(parsed).not.toBe(source);
+    expect(JSON.stringify(parsed)).toBe(JSON.stringify(CANONICAL_V5_READY));
+    if (parsed.type !== "ready") throw new Error("Expected ready frame");
+    expect(parsed.brain).not.toBe(source.brain);
+    expect(parsed.store).not.toBe(source.store);
+    expect(parsed.protocol).not.toBe(source.protocol);
+
+    (source.brain as Record<string, unknown>).provider = "mutated-provider";
+    (source.store as Record<string, unknown>).durable = true;
+    (source.protocol as Record<string, unknown>).preferred_version = 4;
+    expect(parsed.brain.provider).toBe("synthetic");
+    expect(parsed.store.durable).toBe(false);
+    expect(parsed.protocol.preferred_version).toBe(5);
+  });
+
+  test("shares no mutable node with the caller for any valid case", () => {
+    // Scrambling every leaf of the caller's object after parsing must not move a byte of
+    // the returned frame: a parser that handed back the caller's object would fail here.
+    for (const [file, parse] of [
+      [clientDifferentialCases, parseVivaClientFrame] as const,
+      [serverDifferentialCases, parseVivaServerFrame] as const,
+    ]) {
+      for (const differentialCase of file.cases) {
+        if (!differentialCase.valid) continue;
+        const source = JSON.parse(differentialCase.wire_json) as unknown;
+        const parsed = parse(source);
+        const before = JSON.stringify(parsed);
+        expect({ id: differentialCase.id, same: (parsed as unknown) === source }).toEqual({
+          id: differentialCase.id,
+          same: false,
+        });
+
+        scrambleLeavesInPlace(source);
+        expect({ id: differentialCase.id, wire: JSON.stringify(parsed) }).toEqual({
+          id: differentialCase.id,
+          wire: before,
+        });
+      }
+    }
+  });
+
+  test("rejects an injected unknown field at every object boundary of every valid case", () => {
+    for (const [file, parse] of [
+      [clientDifferentialCases, parseVivaClientFrame] as const,
+      [serverDifferentialCases, parseVivaServerFrame] as const,
+    ]) {
+      for (const differentialCase of file.cases) {
+        if (!differentialCase.valid) continue;
+        const source = JSON.parse(differentialCase.wire_json) as unknown;
+        const boundaries = objectBoundaries(source);
+        expect({ id: differentialCase.id, boundaries: boundaries.length }).not.toEqual({
+          id: differentialCase.id,
+          boundaries: 0,
+        });
+        for (const boundary of boundaries) {
+          const mutated = withInjectedValue(source, boundary, "VOICE_unknown_fixture_field", true);
+          const rejection = captureVoiceProtocolError(() => parse(mutated));
+          expect({
+            id: differentialCase.id,
+            boundary: boundary.join("."),
+            code: rejection.code,
+            tail: rejection.path.endsWith("VOICE_unknown_fixture_field"),
+          }).toEqual({
+            id: differentialCase.id,
+            boundary: boundary.join("."),
+            code: "VOICE_PROTOCOL_UNKNOWN_FIELD",
+            tail: true,
+          });
+        }
+      }
+    }
+  });
+
+  /**
+   * The exact optional keys the v5 contract allows, qualified by the case that carries
+   * them. Deleting one of these must still parse; deleting anything else must not.
+   */
+  const OPTIONAL_WIRE_PATHS = new Set([
+    "VOICE-CLIENT-VALID-SESSION-CONFIG|session.mode",
+    "VOICE-CLIENT-VALID-SESSION-REFRESH|context.mode",
+    "VOICE-CLIENT-VALID-SESSION-REFRESH|context.initial_goal",
+    "VOICE-CLIENT-VALID-CANCEL-SCOPED|.turn_id",
+    "VOICE-SERVER-VALID-EVENT-SESSION-PHASE-TERMINAL|event.terminal_reason",
+    "VOICE-SERVER-VALID-EVENT-RECAP-READY-PARTIAL|event.partial_reason",
+  ]);
+
+  test("rejects v4, future versions, deleted keys, and flipped scalar types", () => {
+    for (const [file, parse] of [
+      [clientDifferentialCases, parseVivaClientFrame] as const,
+      [serverDifferentialCases, parseVivaServerFrame] as const,
+    ]) {
+      for (const differentialCase of file.cases) {
+        if (!differentialCase.valid) continue;
+        const source = JSON.parse(differentialCase.wire_json) as Record<string, unknown>;
+
+        for (const version of [4, 6]) {
+          const rejection = captureVoiceProtocolError(() => parse({ ...source, version }));
+          expect({
+            id: differentialCase.id,
+            version,
+            code: rejection.code,
+            path: rejection.path,
+          }).toEqual({
+            id: differentialCase.id,
+            version,
+            code: "VOICE_PROTOCOL_UNSUPPORTED_VERSION",
+            path: "$.version",
+          });
+        }
+
+        const withoutType = captureVoiceProtocolError(() => parse(withoutKey(source, [], "type")));
+        expect({ id: differentialCase.id, code: withoutType.code, path: withoutType.path }).toEqual(
+          {
+            id: differentialCase.id,
+            code: "VOICE_PROTOCOL_UNKNOWN_FRAME",
+            path: "$.type",
+          },
+        );
+
+        for (const boundary of objectBoundaries(source)) {
+          const container = boundary.reduce<Record<string, unknown>>(
+            (cursor, step) => cursor[step] as Record<string, unknown>,
+            source,
+          );
+          for (const key of Object.keys(container)) {
+            if (boundary.length === 0 && (key === "type" || key === "version")) continue;
+            const keyPath = `${boundary.join(".")}.${key}`;
+            const withoutIt = withoutKey(source, boundary, key);
+            if (OPTIONAL_WIRE_PATHS.has(`${differentialCase.id}|${keyPath}`)) {
+              // An optional key: the frame stays valid without it.
+              expect({
+                id: differentialCase.id,
+                keyPath,
+                parsed: parse(withoutIt) !== undefined,
+              }).toEqual({ id: differentialCase.id, keyPath, parsed: true });
+            } else {
+              const rejection = captureVoiceProtocolError(() => parse(withoutIt));
+              expect({
+                id: differentialCase.id,
+                key: keyPath,
+                inVocabulary: VIVA_VOICE_DIAGNOSTIC_CODES.includes(rejection.code),
+              }).toEqual({
+                id: differentialCase.id,
+                key: keyPath,
+                inVocabulary: true,
+              });
+            }
+
+            const flipped = captureVoiceProtocolError(() =>
+              parse(withInjectedValue(source, boundary, key, { flipped: true })),
+            );
+            expect({
+              id: differentialCase.id,
+              key: `${boundary.join(".")}.${key}`,
+              flippedInVocabulary: VIVA_VOICE_DIAGNOSTIC_CODES.includes(flipped.code),
+            }).toEqual({
+              id: differentialCase.id,
+              key: `${boundary.join(".")}.${key}`,
+              flippedInVocabulary: true,
+            });
+          }
+        }
+      }
+    }
+  });
+
+  test("rejects a padded token segment and a two-byte-over chunk", () => {
+    const segments = CANONICAL_FIXTURE_SESSION_TOKEN.split(".");
+    for (const index of [1, 2]) {
+      const padded = [...segments];
+      padded[index] = `${padded[index]}=`;
+      const rejection = captureVoiceProtocolError(() =>
+        parseVivaClientFrame({
+          ...CANONICAL_SIGNED_SESSION_CONFIG,
+          session_token: padded.join("."),
+        }),
+      );
+      expect(rejection.code).toBe("VOICE_PROTOCOL_NONCANONICAL_BASE64URL");
+      expect(rejection.path).toBe("$.session_token");
+    }
+
+    const oversized = captureVoiceProtocolError(() =>
+      parseVivaClientFrame({
+        type: "audio_chunk",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        client_generation_id: "viva-session-bootstrap-1-fixture",
+        turn_id: "turn-1",
+        sequence: 0,
+        frame: {
+          pcm16_base64: bytesToBase64(new Uint8Array(VIVA_AUDIO_MAX_CHUNK_BYTES + 2)),
+        },
+      }),
+    );
+    expect(oversized.code).toBe("VOICE_PROTOCOL_FRAME_TOO_LARGE");
+    expect(oversized.path).toBe("$.frame.pcm16_base64");
+  });
+
+  test("keeps agent-contract.ts self-contained pure ESM", async () => {
+    const source = await readAgentContractSource();
+
+    // `VOICE-RUNTIME-001`: no imports at all, so no Node builtin, no package root, and
+    // no fixture can reach this module.
+    expect(/^\s*import\s/m.test(source)).toBe(false);
+    expect(/\brequire\s*\(/.test(source)).toBe(false);
+    for (const host of [
+      "node:",
+      "process.env",
+      "readFileSync",
+      "fs/promises",
+      "./index",
+      "fixtures/",
+    ]) {
+      expect(source).not.toContain(host);
+    }
+    // Browser-only globals, matched at a token boundary so wire field names such as
+    // `document_id` are not false positives.
+    for (const global of [
+      /\bglobalThis\b/,
+      /\bwindow\s*\./,
+      /\bdocument\s*\./,
+      /\bWebSocket\b/,
+      /\blocalStorage\b/,
+    ]) {
+      expect(global.test(source)).toBe(false);
+    }
+  });
+});
+
 function captureVoiceProtocolError(run: () => unknown): VivaVoiceProtocolError {
   try {
     run();
@@ -1770,12 +2190,16 @@ function legacyActiveConceptIds(fixture: { client: unknown[] }): string[] {
   });
 }
 
+/**
+ * Reads `concept_status` ids out of the frozen unversioned corpus structurally, for the
+ * same reason `legacyActiveConceptIds` does: that corpus is pre-v5 and the strict parser
+ * rejects it. Retired with the corpus in Task 9 Step 6.
+ */
 function conceptStatusIdsFromFixture(fixture: { server: unknown[] }): string[] {
   return fixture.server.flatMap((frame) => {
-    const parsed = parseVivaServerFrame(frame);
-    if (parsed.type !== "event" || parsed.event.type !== "concept_status") {
-      return [];
-    }
-    return [parsed.event.concept_id];
+    if (!frame || typeof frame !== "object") return [];
+    const record = frame as { type?: unknown; event?: { type?: unknown; concept_id?: unknown } };
+    if (record.type !== "event" || record.event?.type !== "concept_status") return [];
+    return typeof record.event.concept_id === "string" ? [record.event.concept_id] : [];
   });
 }
