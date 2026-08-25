@@ -426,13 +426,100 @@ export type AgentStoreReadiness = {
   uuid_schema_translation: boolean;
 };
 
+/**
+ * `VOICE-TURN-002`: the complete snake_case wire mirror of Plan 04
+ * `EvaluationDeferralReason`. Adapter and provider reasons are deliberately absent - only
+ * a durably persisted domain outcome reaches the wire.
+ */
+export const VIVA_VOICE_DEFERRAL_REASONS = [
+  "empty_answer",
+  "transcript_uncertain",
+  "evaluator_unavailable",
+  "invalid_evaluator_output",
+  "insufficient_semantic_evidence",
+  "contradictory_evidence",
+] as const;
+
+export type VivaVoiceDeferralReason = (typeof VIVA_VOICE_DEFERRAL_REASONS)[number];
+
+/**
+ * `VOICE-TURN-002`: a typed non-mastery fact. It carries no provider message, feedback,
+ * confidence, concept status, schedule, mastery, `retryable`, or `terminal_reason`, and
+ * it is never intrinsically terminal. `can_retry_same_question` is the authoritative
+ * retry affordance; a client must not derive retryability from the reason string.
+ */
+export type VivaTurnDeferredEvent = {
+  type: "turn_deferred";
+  turn_id: string;
+  response_id: string;
+  question_id: string;
+  reason: VivaVoiceDeferralReason;
+  can_retry_same_question: boolean;
+};
+
+/** `VOICE-TURN-001`: a question start is bound to the active wire turn. */
+export type VivaQuestionStartedEvent = {
+  type: "question_started";
+  turn_id: string;
+  response_id: string;
+  question: AgentStudyQuestion;
+};
+
+/**
+ * `VOICE-TERMINAL-001`: a discriminated union, not an optional field whose meaning
+ * consumers guess. `partial: true` is terminal immediately; `partial: false` must not
+ * include `partial_reason`.
+ */
+export type VivaRecapReadyEvent =
+  | {
+      type: "recap_ready";
+      response_id: string;
+      recap: AgentStudySessionRecap;
+      partial: false;
+    }
+  | {
+      type: "recap_ready";
+      response_id: string;
+      recap: AgentStudySessionRecap;
+      partial: true;
+      partial_reason: AgentTerminalSessionReason;
+    };
+
+/** `VOICE-TERMINAL-002`: the closed terminality vocabulary of a structured error. */
+export const VIVA_VOICE_STRUCTURED_ERROR_TERMINALITIES = ["recoverable", "terminal"] as const;
+
+export type VivaVoiceStructuredErrorTerminality =
+  (typeof VIVA_VOICE_STRUCTURED_ERROR_TERMINALITIES)[number];
+
+/**
+ * `VOICE-TERMINAL-002`: a recoverable structured error never changes socket status or
+ * submission availability; a terminal one changes terminal state immediately and always
+ * states its reason. Provider failures that terminate stay terminal.
+ */
+export type VivaStructuredErrorEvent =
+  | {
+      type: "structured_error";
+      source: string;
+      code: string;
+      message: string;
+      terminality: "recoverable";
+    }
+  | {
+      type: "structured_error";
+      source: string;
+      code: string;
+      message: string;
+      terminality: "terminal";
+      terminal_reason: AgentTerminalSessionReason;
+    };
+
 export type VivaServerEvent =
   | {
       type: "session_phase";
       phase: AgentStudySessionPhase;
       terminal_reason?: AgentTerminalSessionReason;
     }
-  | { type: "question_started"; response_id: string; question: AgentStudyQuestion }
+  | VivaQuestionStartedEvent
   | { type: "transcript_delta"; response_id: string; text: string }
   | {
       type: "transcript_final";
@@ -441,6 +528,7 @@ export type VivaServerEvent =
       confidence?: number | null;
     }
   | { type: "answer_evaluated"; response_id: string; evaluation: AgentAnswerEvaluation }
+  | VivaTurnDeferredEvent
   | { type: "source_reference"; response_id: string; source: AgentStudySourceReference }
   | {
       type: "concept_status";
@@ -449,15 +537,27 @@ export type VivaServerEvent =
       status: AgentConceptStatus;
     }
   | { type: "manuscript_intent"; response_id: string; intent: ManuscriptIntent }
-  | {
-      type: "recap_ready";
-      response_id: string;
-      recap: AgentStudySessionRecap;
-      partial_reason?: AgentTerminalSessionReason;
-    }
+  | VivaRecapReadyEvent
   | { type: "audio_delta"; response_id: string; frame: AgentAudioFrame }
   | { type: "cancellation"; response_id?: string | null }
-  | { type: "structured_error"; source: string; message: string };
+  | VivaStructuredErrorEvent;
+
+/**
+ * The single authoritative terminality rule for a v5 server event, shared byte for byte
+ * with the Rust contract: a terminal session phase, a partial recap, and a terminal
+ * structured error are the only events that end a wire session. A deferred turn never is,
+ * and a client must not synthesize a terminal phase from one.
+ */
+export function vivaServerEventTerminalReason(
+  event: VivaServerEvent,
+): AgentTerminalSessionReason | null {
+  if (event.type === "session_phase") return event.terminal_reason ?? null;
+  if (event.type === "recap_ready") return event.partial ? event.partial_reason : null;
+  if (event.type === "structured_error") {
+    return event.terminality === "terminal" ? event.terminal_reason : null;
+  }
+  return null;
+}
 
 /** `VOICE-ERROR-001`: the closed typed vocabulary a server error frame may carry. */
 export const VIVA_VOICE_SERVER_ERROR_CODES = [
@@ -506,6 +606,130 @@ export type VivaServerFrame =
   | AgentAudioTurnAcceptedFrame
   | VivaEventFrame
   | VivaErrorFrame;
+
+/**
+ * `VOICE-ERROR-001`: the owner-provided v5 serialization fallback, byte-identical to the
+ * Rust `VOICE_SERIALIZATION_FALLBACK_FRAME`. Plan 08 replaces the hard-coded v1 literal
+ * in `ws.rs` with the Rust constant; this is its cross-language pin.
+ */
+export const VIVA_VOICE_SERIALIZATION_FALLBACK_FRAME =
+  '{"type":"error","version":5,"error":{"code":"VOICE_INTERNAL_SERIALIZATION","message":"Server frame serialization failed.","retryable":true}}';
+
+/** The one clean close code a v5 session may end on. */
+export const VIVA_VOICE_NORMAL_CLOSE_CODE = 1000;
+
+const VIVA_VOICE_AUTH_ERROR_CODES = [
+  "VOICE_AUTH_EXPIRED",
+  "VOICE_AUTH_INVALID",
+  "VOICE_AUTH_IDENTITY_MISMATCH",
+  "VOICE_AUTH_REPLAYED",
+] as const;
+
+const VIVA_VOICE_PROTOCOL_ERROR_CODES = [
+  "VOICE_CLIENT_FRAME_MALFORMED",
+  "VOICE_CLIENT_FRAME_TOO_LARGE",
+  "VOICE_CLIENT_TURN_TOO_LARGE",
+  "VOICE_CLIENT_AUTHORITY_FORBIDDEN",
+] as const;
+
+/**
+ * `VOICE-TERMINATION-001`: the typed close classification. The result carries no message
+ * and no close-reason text, so nothing a peer wrote can reach a consumer's control flow.
+ *
+ * Every `terminal` outcome is `retryable: false` because the current wire session and
+ * generation are finished; it never triggers same-session automatic reconnect. A
+ * learner-facing action may start a new session from the typed reason, but that is not
+ * this classifier's retry flag.
+ */
+export type VivaVoiceTermination =
+  | {
+      kind: "terminal";
+      terminalReason: AgentTerminalSessionReason;
+      retryable: false;
+      closeCode: number;
+    }
+  | {
+      kind: "auth";
+      errorCode: (typeof VIVA_VOICE_AUTH_ERROR_CODES)[number];
+      retryable: boolean;
+      closeCode: number;
+    }
+  | {
+      kind: "protocol";
+      errorCode: (typeof VIVA_VOICE_PROTOCOL_ERROR_CODES)[number];
+      retryable: false;
+      closeCode: number;
+    }
+  | {
+      kind: "service";
+      errorCode: "VOICE_INTERNAL_SERIALIZATION";
+      retryable: true;
+      closeCode: number;
+    }
+  | { kind: "normal"; retryable: false; closeCode: 1000 }
+  | { kind: "transport"; retryable: true; closeCode: number };
+
+/**
+ * Priority is terminal reason, then typed error category, then clean code 1000, then
+ * transport. Retryability is derived from the typed code and never read off the wire, and
+ * no message or close-reason string is ever inspected. Plan 10 deletes its regex
+ * classification over browser/parser messages in favour of this.
+ */
+export function classifyVivaVoiceTermination(input: {
+  error?: VivaServerError;
+  terminalReason?: AgentTerminalSessionReason;
+  closeCode: number;
+  wasClean: boolean;
+}): VivaVoiceTermination {
+  if (input.terminalReason !== undefined) {
+    return {
+      kind: "terminal",
+      terminalReason: input.terminalReason,
+      retryable: false,
+      closeCode: input.closeCode,
+    };
+  }
+
+  const code = input.error?.code;
+  if (code !== undefined) {
+    if (
+      VIVA_VOICE_AUTH_ERROR_CODES.includes(code as (typeof VIVA_VOICE_AUTH_ERROR_CODES)[number])
+    ) {
+      return {
+        kind: "auth",
+        errorCode: code as (typeof VIVA_VOICE_AUTH_ERROR_CODES)[number],
+        retryable: code === "VOICE_AUTH_EXPIRED",
+        closeCode: input.closeCode,
+      };
+    }
+    if (
+      VIVA_VOICE_PROTOCOL_ERROR_CODES.includes(
+        code as (typeof VIVA_VOICE_PROTOCOL_ERROR_CODES)[number],
+      )
+    ) {
+      return {
+        kind: "protocol",
+        errorCode: code as (typeof VIVA_VOICE_PROTOCOL_ERROR_CODES)[number],
+        retryable: false,
+        closeCode: input.closeCode,
+      };
+    }
+    if (code === "VOICE_INTERNAL_SERIALIZATION") {
+      return {
+        kind: "service",
+        errorCode: "VOICE_INTERNAL_SERIALIZATION",
+        retryable: true,
+        closeCode: input.closeCode,
+      };
+    }
+  }
+
+  if (input.wasClean && input.closeCode === VIVA_VOICE_NORMAL_CLOSE_CODE) {
+    return { kind: "normal", retryable: false, closeCode: VIVA_VOICE_NORMAL_CLOSE_CODE };
+  }
+
+  return { kind: "transport", retryable: true, closeCode: input.closeCode };
+}
 
 export function audioChunkClientFrame(
   input: Readonly<{
@@ -565,6 +789,7 @@ const VIVA_SERVER_EVENT_TYPES = [
   "transcript_delta",
   "transcript_final",
   "answer_evaluated",
+  "turn_deferred",
   "source_reference",
   "concept_status",
   "manuscript_intent",
@@ -698,9 +923,10 @@ export function parseVivaServerEvent(value: unknown, path = "$.event"): VivaServ
       };
     }
     case "question_started":
-      requireOnlyWireKeys(event, ["type", "response_id", "question"], path);
+      requireOnlyWireKeys(event, ["type", "turn_id", "response_id", "question"], path);
       return {
         type: "question_started",
+        turn_id: requireStrictWireId(event.turn_id, `${path}.turn_id`),
         response_id: requireStrictWireId(event.response_id, `${path}.response_id`),
         question: parseStudyQuestion(event.question, `${path}.question`),
       };
@@ -726,6 +952,27 @@ export function parseVivaServerEvent(value: unknown, path = "$.event"): VivaServ
         response_id: requireStrictWireId(event.response_id, `${path}.response_id`),
         evaluation: parseAnswerEvaluation(event.evaluation, `${path}.evaluation`),
       };
+    case "turn_deferred":
+      requireOnlyWireKeys(
+        event,
+        ["type", "turn_id", "response_id", "question_id", "reason", "can_retry_same_question"],
+        path,
+      );
+      return {
+        type: "turn_deferred",
+        turn_id: requireStrictWireId(event.turn_id, `${path}.turn_id`),
+        response_id: requireStrictWireId(event.response_id, `${path}.response_id`),
+        question_id: requireStrictWireId(event.question_id, `${path}.question_id`),
+        reason: requireWireEnumAt(
+          event.reason,
+          VIVA_VOICE_DEFERRAL_REASONS,
+          `${path}.reason`,
+        ) as VivaVoiceDeferralReason,
+        can_retry_same_question: requireBooleanAt(
+          event.can_retry_same_question,
+          `${path}.can_retry_same_question`,
+        ),
+      };
     case "source_reference":
       requireOnlyWireKeys(event, ["type", "response_id", "source"], path);
       return {
@@ -749,16 +996,30 @@ export function parseVivaServerEvent(value: unknown, path = "$.event"): VivaServ
         intent: parseManuscriptIntent(event.intent, `${path}.intent`),
       };
     case "recap_ready": {
-      requireOnlyWireKeys(event, ["type", "response_id", "recap", "partial_reason"], path);
+      requireOnlyWireKeys(
+        event,
+        ["type", "response_id", "recap", "partial", "partial_reason"],
+        path,
+      );
       const responseId = requireStrictWireId(event.response_id, `${path}.response_id`);
       const recap = parseStudySessionRecap(event.recap, `${path}.recap`);
-      if (!("partial_reason" in event)) {
-        return { type: "recap_ready", response_id: responseId, recap };
+      // `VOICE-TERMINAL-001`: `partial` is the discriminant. `true` is terminal and must
+      // state why; `false` may not carry a reason at all.
+      if (!requireBooleanAt(event.partial, `${path}.partial`)) {
+        if ("partial_reason" in event) {
+          throw voiceDiagnostic(
+            "VOICE_PROTOCOL_INVARIANT",
+            `${path}.partial_reason`,
+            "A complete recap cannot carry a partial reason",
+          );
+        }
+        return { type: "recap_ready", response_id: responseId, recap, partial: false };
       }
       return {
         type: "recap_ready",
         response_id: responseId,
         recap,
+        partial: true,
         partial_reason: requireTerminalSessionReasonAt(
           event.partial_reason,
           `${path}.partial_reason`,
@@ -787,13 +1048,43 @@ export function parseVivaServerEvent(value: unknown, path = "$.event"): VivaServ
         response_id: requireStrictWireId(event.response_id, `${path}.response_id`),
       };
     }
-    default:
-      requireOnlyWireKeys(event, ["type", "source", "message"], path);
+    default: {
+      requireOnlyWireKeys(
+        event,
+        ["type", "source", "code", "message", "terminality", "terminal_reason"],
+        path,
+      );
+      const source = requireNonEmptyStringAt(event.source, `${path}.source`);
+      const code = requireStrictWireId(event.code, `${path}.code`);
+      const message = requireNonEmptyStringAt(event.message, `${path}.message`);
+      // `VOICE-TERMINAL-002`: terminality is stated, never inferred from the message.
+      const terminality = requireWireEnumAt(
+        event.terminality,
+        VIVA_VOICE_STRUCTURED_ERROR_TERMINALITIES,
+        `${path}.terminality`,
+      ) as VivaVoiceStructuredErrorTerminality;
+      if (terminality === "recoverable") {
+        if ("terminal_reason" in event) {
+          throw voiceDiagnostic(
+            "VOICE_PROTOCOL_INVARIANT",
+            `${path}.terminal_reason`,
+            "A recoverable structured error cannot carry a terminal reason",
+          );
+        }
+        return { type: "structured_error", source, code, message, terminality: "recoverable" };
+      }
       return {
         type: "structured_error",
-        source: requireNonEmptyStringAt(event.source, `${path}.source`),
-        message: requireNonEmptyStringAt(event.message, `${path}.message`),
+        source,
+        code,
+        message,
+        terminality: "terminal",
+        terminal_reason: requireTerminalSessionReasonAt(
+          event.terminal_reason,
+          `${path}.terminal_reason`,
+        ),
       };
+    }
   }
 }
 
@@ -1730,11 +2021,24 @@ function requireStudyPhaseAt(value: unknown, path: string): AgentStudySessionPha
   return value;
 }
 
-function requireTerminalSessionReasonAt(value: unknown, path: string): AgentTerminalSessionReason {
-  if (!VIVA_AGENT_TERMINAL_SESSION_REASONS.includes(value as AgentTerminalSessionReason)) {
-    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid terminal session reason");
+/** A closed value vocabulary. A missing key and a value outside it report distinctly. */
+function requireWireEnumAt(value: unknown, allowed: readonly string[], path: string): string {
+  if (value === undefined) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_MISSING_FIELD", path, "Missing enumerated value");
   }
-  return value as AgentTerminalSessionReason;
+  const text = requireStringAt(value, path);
+  if (!allowed.includes(text)) {
+    throw voiceDiagnostic("VOICE_PROTOCOL_INVALID_FIELD", path, "Invalid enumerated value");
+  }
+  return text;
+}
+
+function requireTerminalSessionReasonAt(value: unknown, path: string): AgentTerminalSessionReason {
+  return requireWireEnumAt(
+    value,
+    VIVA_AGENT_TERMINAL_SESSION_REASONS,
+    path,
+  ) as AgentTerminalSessionReason;
 }
 
 function requireConceptStatusAt(value: unknown, path: string): AgentConceptStatus {

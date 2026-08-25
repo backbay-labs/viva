@@ -16,16 +16,24 @@ import signedSessionConfigFixture from "../../../agent/fixtures/voice-protocol/v
 import sessionRefreshFixture from "../../../agent/fixtures/voice-protocol/v5/client-session-refresh.json";
 import serverDifferentialFixture from "../../../agent/fixtures/voice-protocol/v5/server-differential-cases.json";
 import readyV5Fixture from "../../../agent/fixtures/voice-protocol/v5/server-ready.json";
+import terminalSequenceFixture from "../../../agent/fixtures/voice-protocol/v5/terminal-sequences.json";
+import transportOutcomeFixture from "../../../agent/fixtures/voice-protocol/v5/transport-outcomes.json";
+import turnIntentFixture from "../../../agent/fixtures/voice-protocol/v5/turn-intents.json";
+import turnOutcomeFixture from "../../../agent/fixtures/voice-protocol/v5/turn-outcomes.json";
 import {
   type AgentSessionConfig,
+  type AgentTerminalSessionReason,
   audioChunkClientFrame,
   audioEndClientFrame,
+  classifyVivaVoiceTermination,
   negotiateVivaVoiceProtocolVersion,
   parseVivaClientFrame,
   parseVivaClientFrameJson,
+  parseVivaServerEvent,
   parseVivaServerFrame,
   parseVivaServerFrameJson,
   sessionConfigFrame,
+  VIVA_AGENT_TERMINAL_SESSION_REASONS,
   VIVA_AUDIO_MAX_CHUNK_BASE64_CHARS,
   VIVA_AUDIO_MAX_CHUNK_BYTES,
   VIVA_AUDIO_MAX_CHUNK_SAMPLES,
@@ -35,6 +43,7 @@ import {
   VIVA_BROWSER_CLIENT_FRAME_TYPES,
   VIVA_VOICE_BYTES_PER_SAMPLE,
   VIVA_VOICE_CHANNELS,
+  VIVA_VOICE_DEFERRAL_REASONS,
   VIVA_VOICE_DIAGNOSTIC_CODES,
   VIVA_VOICE_INPUT_ENCODING,
   VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
@@ -42,8 +51,13 @@ import {
   VIVA_VOICE_PROTOCOL_ADVERTISEMENT,
   VIVA_VOICE_PROTOCOL_VERSION,
   VIVA_VOICE_SAMPLE_RATE_HZ,
+  VIVA_VOICE_SERIALIZATION_FALLBACK_FRAME,
+  VIVA_VOICE_SERVER_ERROR_CODES,
+  VIVA_VOICE_STRUCTURED_ERROR_TERMINALITIES,
   VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS,
+  type VivaServerEvent,
   VivaVoiceProtocolError,
+  vivaServerEventTerminalReason,
 } from "./agent-contract";
 import { seedStudySets } from "./index";
 
@@ -241,11 +255,12 @@ describe("Viva voice agent contract", () => {
   });
 
   test("rejects the retiring unversioned question fixture as pre-v5", () => {
-    // The merged Plan 06 `StudyQuestion` carries `concept_id` and `rubric`; the frozen
-    // root event corpus predates both, so strict v5 parsing rejects it.
+    // `VOICE-TURN-001` binds `question_started` to the active wire turn, and the merged
+    // Plan 06 `StudyQuestion` carries `concept_id` and `rubric`. The frozen root event
+    // corpus predates all three, so strict v5 parsing rejects it at the first one.
     const rejection = captureVoiceProtocolError(() => parseVivaServerFrame(eventFixture));
     expect(rejection.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
-    expect(rejection.path).toBe("$.event.question.concept_id");
+    expect(rejection.path).toBe("$.event.turn_id");
   });
 
   test("parses terminal session phases with sanitized enum reasons", () => {
@@ -301,7 +316,7 @@ describe("Viva voice agent contract", () => {
           terminal_reason: "raw transcript should never be accepted",
         },
       }),
-    ).toThrow("Invalid terminal session reason");
+    ).toThrow("Invalid enumerated value");
   });
 
   test("parses provider-failure partial recap markers as sanitized terminal reasons", () => {
@@ -311,6 +326,7 @@ describe("Viva voice agent contract", () => {
       event: {
         type: "recap_ready",
         response_id: "response-1",
+        partial: true,
         partial_reason: "provider_timeout",
         recap: {
           schema: "viva.study_session_recap.v2",
@@ -329,6 +345,7 @@ describe("Viva voice agent contract", () => {
     if (frame.type !== "event" || frame.event.type !== "recap_ready") {
       throw new Error("Expected recap event frame");
     }
+    if (!frame.event.partial) throw new Error("Expected a partial recap");
     expect(frame.event.partial_reason).toBe("provider_timeout");
 
     expect(() =>
@@ -338,6 +355,7 @@ describe("Viva voice agent contract", () => {
         event: {
           type: "recap_ready",
           response_id: "response-1",
+          partial: true,
           partial_reason: "raw provider payload",
           recap: {
             schema: "viva.study_session_recap.v2",
@@ -352,16 +370,16 @@ describe("Viva voice agent contract", () => {
           },
         },
       }),
-    ).toThrow("Invalid terminal session reason");
+    ).toThrow("Invalid enumerated value");
   });
 
-  test("parses shared structured error fixture from Rust service", () => {
-    const frame = parseVivaServerFrame(structuredErrorFixture);
-
-    if (frame.type !== "event") throw new Error("Expected event frame");
-    expect(frame.event.type).toBe("structured_error");
-    if (frame.event.type !== "structured_error") throw new Error("Expected structured error");
-    expect(frame.event.source).toBe("agent-service");
+  test("rejects the retiring unversioned structured error fixture as pre-v5", () => {
+    // `VOICE-TERMINAL-002` requires an explicit `code` and `terminality`; the frozen
+    // root fixture predates both. Positive coverage lives in the v5 corpora, and Task 9
+    // Step 6 deletes this fixture.
+    const rejection = captureVoiceProtocolError(() => parseVivaServerFrame(structuredErrorFixture));
+    expect(rejection.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
+    expect(rejection.path).toBe("$.event.code");
   });
 
   test("parses shared manuscript intent fixture from Rust service", () => {
@@ -1701,8 +1719,9 @@ const DIAGNOSTIC_LEAK_NEEDLES = [
 function runDifferentialCases(
   file: DifferentialCaseFile,
   parse: (wireJson: string) => unknown,
+  schema = "viva.voice-differential-cases.v1",
 ): number {
-  expect(file.schema).toBe("viva.voice-differential-cases.v1");
+  expect(file.schema).toBe(schema);
   expect(file.protocol_version).toBe(VIVA_VOICE_PROTOCOL_VERSION);
   expect(file.cases.length).toBeGreaterThan(0);
 
@@ -1961,7 +1980,6 @@ describe("Viva voice v5 differential parsing", () => {
     "VOICE-CLIENT-VALID-SESSION-REFRESH|context.initial_goal",
     "VOICE-CLIENT-VALID-CANCEL-SCOPED|.turn_id",
     "VOICE-SERVER-VALID-EVENT-SESSION-PHASE-TERMINAL|event.terminal_reason",
-    "VOICE-SERVER-VALID-EVENT-RECAP-READY-PARTIAL|event.partial_reason",
   ]);
 
   test("rejects v4, future versions, deleted keys, and flipped scalar types", () => {
@@ -2203,3 +2221,547 @@ function conceptStatusIdsFromFixture(fixture: { server: unknown[] }): string[] {
     return typeof record.event.concept_id === "string" ? [record.event.concept_id] : [];
   });
 }
+
+// ---------------------------------------------------------------------------
+// Task 7 - VOICE-TURN-001 / VOICE-TURN-002 / VOICE-TERMINAL-001 /
+// VOICE-TERMINAL-002 / VOICE-TERMINATION-001
+// ---------------------------------------------------------------------------
+
+type TerminalSequenceCase = {
+  id: string;
+  terminal_reason: string | null;
+  terminal_at_index: number | null;
+  wire_sequence_json: string[];
+};
+
+type TerminalSequenceFile = {
+  schema: string;
+  protocol_version: number;
+  sequences: TerminalSequenceCase[];
+};
+
+type TransportOutcomeCase = {
+  id: string;
+  input: {
+    error?: { code: string; message: string; retryable: boolean };
+    terminalReason?: string;
+    closeCode: number;
+    wasClean: boolean;
+  };
+  expected: Record<string, unknown>;
+};
+
+type TransportOutcomeFile = {
+  schema: string;
+  protocol_version: number;
+  cases: TransportOutcomeCase[];
+};
+
+const turnIntentCases = turnIntentFixture as unknown as DifferentialCaseFile;
+const turnOutcomeCases = turnOutcomeFixture as unknown as DifferentialCaseFile;
+const terminalSequences = terminalSequenceFixture as unknown as TerminalSequenceFile;
+const transportOutcomes = transportOutcomeFixture as unknown as TransportOutcomeFile;
+
+const TERMINATION_INPUT_KEYS = ["error", "terminalReason", "closeCode", "wasClean"];
+const TERMINATION_RESULT_KEYS = ["kind", "terminalReason", "errorCode", "retryable", "closeCode"];
+
+/** The canonical fixture recap, transcribed from the shared v5 differential corpus. */
+const CANONICAL_FIXTURE_RECAP = {
+  schema: "viva.study_session_recap.v2",
+  voice_session_id: "voice-session-fixture",
+  headline: "Fixture headline.",
+  summary: "Fixture summary.",
+  concepts: [{ concept_id: "concept-fixture-1", label: "Fixture concept", status: "strong" }],
+  review_schedule: [
+    {
+      concept_id: "concept-fixture-1",
+      due_at: "2026-09-01T00:00:00Z",
+      authority: "server_persisted_fsrs",
+    },
+  ],
+  next_action: "Fixture next action.",
+  source_moments: [{ response_id: "response-1", source_id: "src-lecture-5-slide-18" }],
+  deferred_turns: 0,
+};
+
+/**
+ * `VOICE-TURN-002`: a deferred turn is a typed non-mastery fact. None of these keys may
+ * appear on the wire event - a grade, a schedule, or a provider message smuggled here
+ * would become learner-visible product data with no durable outcome behind it.
+ */
+const DEFERRED_FORBIDDEN_KEYS = [
+  "provider_message",
+  "feedback",
+  "confidence",
+  "status",
+  "schedule",
+  "mastery",
+  "retryable",
+  "terminal_reason",
+];
+
+function turnDeferredEvents(): Array<Record<string, unknown>> {
+  return turnOutcomeCases.cases
+    .filter((outcome) => outcome.valid)
+    .map((outcome) => JSON.parse(outcome.wire_json) as { event: Record<string, unknown> })
+    .map((frame) => frame.event)
+    .filter((event) => event.type === "turn_deferred");
+}
+
+describe("Viva voice v5 turn intents and deferred outcomes", () => {
+  test("publishes the six exact Plan 04 deferral reasons and nothing else", () => {
+    expect([...VIVA_VOICE_DEFERRAL_REASONS]).toEqual([
+      "empty_answer",
+      "transcript_uncertain",
+      "evaluator_unavailable",
+      "invalid_evaluator_output",
+      "insufficient_semantic_evidence",
+      "contradictory_evidence",
+    ]);
+  });
+
+  test("runs every turn-intent case with no id filter", () => {
+    const executed = runDifferentialCases(
+      turnIntentCases,
+      parseVivaClientFrameJson,
+      "viva.voice-client-frame-cases.v1",
+    );
+    expect(executed).toBe(turnIntentCases.cases.length);
+  });
+
+  test("runs every turn-outcome case with no id filter", () => {
+    const executed = runDifferentialCases(
+      turnOutcomeCases,
+      parseVivaServerFrameJson,
+      "viva.voice-server-event-cases.v1",
+    );
+    expect(executed).toBe(turnOutcomeCases.cases.length);
+  });
+
+  test("covers all six deferral reasons and both retry affordances", () => {
+    const deferred = turnDeferredEvents();
+    expect(new Set(deferred.map((event) => event.reason as string))).toEqual(
+      new Set(VIVA_VOICE_DEFERRAL_REASONS),
+    );
+    expect(new Set(deferred.map((event) => event.can_retry_same_question as boolean))).toEqual(
+      new Set([true, false]),
+    );
+  });
+
+  test("every deferred event carries the exact turn/response/question identity only", () => {
+    const deferred = turnDeferredEvents();
+    expect(deferred.length).toBeGreaterThan(0);
+    for (const event of deferred) {
+      expect(Object.keys(event)).toEqual([
+        "type",
+        "turn_id",
+        "response_id",
+        "question_id",
+        "reason",
+        "can_retry_same_question",
+      ]);
+      for (const forbidden of DEFERRED_FORBIDDEN_KEYS) {
+        expect({ id: event.turn_id, forbidden, present: forbidden in event }).toEqual({
+          id: event.turn_id,
+          forbidden,
+          present: false,
+        });
+      }
+    }
+  });
+
+  test("a deferred event is never intrinsically terminal", () => {
+    for (const event of turnDeferredEvents()) {
+      expect(vivaServerEventTerminalReason(event as unknown as VivaServerEvent)).toBe(null);
+    }
+  });
+
+  test("question_started binds the active wire turn", () => {
+    const started = parseVivaServerEvent({
+      type: "question_started",
+      turn_id: "turn-1",
+      response_id: "response-1",
+      question: {
+        question_id: "q-fixture-1",
+        concept_id: "concept-fixture-1",
+        prompt: "Fixture prompt.",
+        expected_terms: ["fixture term"],
+        follow_up: "Fixture follow up.",
+        rubric: {
+          policy_version: "viva.semantic-rubric.v1",
+          criteria: [
+            {
+              criterion_id: "crit-fixture-1",
+              concept_id: "concept-fixture-1",
+              claim: "Fixture claim.",
+              source_id: "src-lecture-5-slide-18",
+              required: true,
+            },
+          ],
+        },
+        source: {
+          source_id: "src-lecture-5-slide-18",
+          document_id: "lec-5",
+          span: "slide:18",
+          excerpt: "Fixture excerpt.",
+          confidence: "high",
+          retrieval_reason: "server fixture source",
+        },
+      },
+    });
+    expect(started.type).toBe("question_started");
+    expect((started as { turn_id: string }).turn_id).toBe("turn-1");
+  });
+
+  test("question_started without an active turn binding is rejected", () => {
+    const rejection = captureVoiceProtocolError(() =>
+      parseVivaServerEvent({
+        type: "question_started",
+        response_id: "response-1",
+        question: {},
+      }),
+    );
+    expect([rejection.code, rejection.path]).toEqual([
+      "VOICE_PROTOCOL_MISSING_FIELD",
+      "$.event.turn_id",
+    ]);
+  });
+
+  test("a citation challenge can never deserialize as answer text", () => {
+    const challenge = parseVivaClientFrameJson(
+      JSON.stringify({
+        type: "turn_intent",
+        version: 5,
+        client_generation_id: "viva-session-bootstrap-1-fixture",
+        turn_id: "turn-2",
+        intent: {
+          kind: "citation_challenge",
+          response_id: "response-2",
+          source_id: "src-lecture-5-slide-18",
+        },
+      }),
+    );
+    expect(challenge.type).toBe("turn_intent");
+    const intent = (challenge as { intent: Record<string, unknown> }).intent;
+    expect(intent.kind).toBe("citation_challenge");
+    expect("text" in intent).toBe(false);
+  });
+});
+
+describe("Viva voice v5 terminality", () => {
+  test("the terminal-sequence corpus pins every terminal and recoverable outcome", () => {
+    expect(terminalSequences.schema).toBe("viva.voice-terminal-sequences.v1");
+    expect(terminalSequences.protocol_version).toBe(VIVA_VOICE_PROTOCOL_VERSION);
+    expect(terminalSequences.sequences.length).toBeGreaterThan(0);
+
+    const seen = new Set<string>();
+    for (const sequence of terminalSequences.sequences) {
+      expect({ id: sequence.id, duplicate: seen.has(sequence.id) }).toEqual({
+        id: sequence.id,
+        duplicate: false,
+      });
+      seen.add(sequence.id);
+
+      let firstTerminalIndex: number | null = null;
+      let firstTerminalReason: string | null = null;
+      sequence.wire_sequence_json.forEach((wireJson, index) => {
+        const frame = parseVivaServerFrameJson(wireJson);
+        expect({ id: sequence.id, index, wire: JSON.stringify(frame) }).toEqual({
+          id: sequence.id,
+          index,
+          wire: wireJson,
+        });
+        if (frame.type !== "event") return;
+        const reason = vivaServerEventTerminalReason(frame.event);
+        if (reason !== null && firstTerminalIndex === null) {
+          firstTerminalIndex = index;
+          firstTerminalReason = reason;
+        }
+      });
+
+      expect({ id: sequence.id, index: firstTerminalIndex, reason: firstTerminalReason }).toEqual({
+        id: sequence.id,
+        index: sequence.terminal_at_index,
+        reason: sequence.terminal_reason,
+      });
+    }
+  });
+
+  test("a partial recap stays terminal when the trailing phase frame is lost", () => {
+    const withTrailer = terminalSequences.sequences.find(
+      (sequence) => sequence.id === "VOICE-TERMINAL-PARTIAL-RECAP-THEN-PHASE",
+    );
+    const withoutTrailer = terminalSequences.sequences.find(
+      (sequence) => sequence.id === "VOICE-TERMINAL-PARTIAL-RECAP-TRAILING-PHASE-LOST",
+    );
+    expect(withTrailer === undefined).toBe(false);
+    expect(withoutTrailer === undefined).toBe(false);
+    expect(withoutTrailer?.wire_sequence_json).toEqual([
+      withTrailer?.wire_sequence_json[0] as string,
+    ]);
+    expect(withoutTrailer?.terminal_reason).toBe(withTrailer?.terminal_reason as string);
+    expect(withoutTrailer?.terminal_at_index).toBe(0);
+  });
+
+  test("VOICE_SESSION_REFRESH_POLICY_DENIED is recoverable and changes no terminal state", () => {
+    const denial = parseVivaServerEvent({
+      type: "structured_error",
+      source: "agent-service",
+      code: "VOICE_SESSION_REFRESH_POLICY_DENIED",
+      message: "Session refresh is not authorized.",
+      terminality: "recoverable",
+    });
+    expect(denial).toEqual({
+      type: "structured_error",
+      source: "agent-service",
+      code: "VOICE_SESSION_REFRESH_POLICY_DENIED",
+      message: "Session refresh is not authorized.",
+      terminality: "recoverable",
+    });
+    expect(vivaServerEventTerminalReason(denial)).toBe(null);
+  });
+
+  test("structured-error terminality is explicit in both directions", () => {
+    expect([...VIVA_VOICE_STRUCTURED_ERROR_TERMINALITIES]).toEqual(["recoverable", "terminal"]);
+
+    const recoverableWithReason = captureVoiceProtocolError(() =>
+      parseVivaServerEvent({
+        type: "structured_error",
+        source: "agent-service",
+        code: "VOICE_SESSION_REFRESH_POLICY_DENIED",
+        message: "Session refresh is not authorized.",
+        terminality: "recoverable",
+        terminal_reason: "provider_timeout",
+      }),
+    );
+    expect([recoverableWithReason.code, recoverableWithReason.path]).toEqual([
+      "VOICE_PROTOCOL_INVARIANT",
+      "$.event.terminal_reason",
+    ]);
+
+    const terminalWithoutReason = captureVoiceProtocolError(() =>
+      parseVivaServerEvent({
+        type: "structured_error",
+        source: "agent-service",
+        code: "VOICE_PROVIDER_FAILURE",
+        message: "Provider failed.",
+        terminality: "terminal",
+      }),
+    );
+    expect([terminalWithoutReason.code, terminalWithoutReason.path]).toEqual([
+      "VOICE_PROTOCOL_MISSING_FIELD",
+      "$.event.terminal_reason",
+    ]);
+  });
+
+  test("recap terminality is discriminated, never guessed", () => {
+    const normalWithReason = captureVoiceProtocolError(() =>
+      parseVivaServerFrameJson(
+        JSON.stringify({
+          type: "event",
+          version: 5,
+          event: {
+            type: "recap_ready",
+            response_id: "response-1",
+            recap: CANONICAL_FIXTURE_RECAP,
+            partial: false,
+            partial_reason: "provider_timeout",
+          },
+        }),
+      ),
+    );
+    expect([normalWithReason.code, normalWithReason.path]).toEqual([
+      "VOICE_PROTOCOL_INVARIANT",
+      "$.event.partial_reason",
+    ]);
+
+    const partialWithoutReason = captureVoiceProtocolError(() =>
+      parseVivaServerFrameJson(
+        JSON.stringify({
+          type: "event",
+          version: 5,
+          event: {
+            type: "recap_ready",
+            response_id: "response-1",
+            recap: CANONICAL_FIXTURE_RECAP,
+            partial: true,
+          },
+        }),
+      ),
+    );
+    expect([partialWithoutReason.code, partialWithoutReason.path]).toEqual([
+      "VOICE_PROTOCOL_MISSING_FIELD",
+      "$.event.partial_reason",
+    ]);
+
+    const missingPartial = captureVoiceProtocolError(() =>
+      parseVivaServerFrameJson(
+        JSON.stringify({
+          type: "event",
+          version: 5,
+          event: {
+            type: "recap_ready",
+            response_id: "response-1",
+            recap: CANONICAL_FIXTURE_RECAP,
+          },
+        }),
+      ),
+    );
+    expect([missingPartial.code, missingPartial.path]).toEqual([
+      "VOICE_PROTOCOL_MISSING_FIELD",
+      "$.event.partial",
+    ]);
+  });
+
+  test("a malformed server error message still reports its own path", () => {
+    const rejection = captureVoiceProtocolError(() =>
+      parseVivaServerFrameJson(
+        '{"type":"error","version":5,"error":{"code":"VOICE_AUTH_INVALID","message":7,"retryable":false}}',
+      ),
+    );
+    expect([rejection.code, rejection.path]).toEqual([
+      "VOICE_PROTOCOL_INVALID_FIELD",
+      "$.error.message",
+    ]);
+  });
+
+  test("the v5 serialization fallback frame parses back to its own typed error", () => {
+    expect(VIVA_VOICE_SERIALIZATION_FALLBACK_FRAME).toBe(
+      '{"type":"error","version":5,"error":{"code":"VOICE_INTERNAL_SERIALIZATION","message":"Server frame serialization failed.","retryable":true}}',
+    );
+    const frame = parseVivaServerFrameJson(VIVA_VOICE_SERIALIZATION_FALLBACK_FRAME);
+    expect(frame).toEqual({
+      type: "error",
+      version: 5,
+      error: {
+        code: "VOICE_INTERNAL_SERIALIZATION",
+        message: "Server frame serialization failed.",
+        retryable: true,
+      },
+    });
+    expect(JSON.stringify(frame)).toBe(VIVA_VOICE_SERIALIZATION_FALLBACK_FRAME);
+  });
+});
+
+describe("Viva voice v5 termination classification", () => {
+  test("runs every transport outcome case with no id filter", () => {
+    expect(transportOutcomes.schema).toBe("viva.voice-transport-outcomes.v1");
+    expect(transportOutcomes.protocol_version).toBe(VIVA_VOICE_PROTOCOL_VERSION);
+    expect(transportOutcomes.cases.length).toBeGreaterThan(0);
+
+    const seen = new Set<string>();
+    for (const outcome of transportOutcomes.cases) {
+      expect({ id: outcome.id, duplicate: seen.has(outcome.id) }).toEqual({
+        id: outcome.id,
+        duplicate: false,
+      });
+      seen.add(outcome.id);
+      expect(Object.keys(outcome.input).every((key) => TERMINATION_INPUT_KEYS.includes(key))).toBe(
+        true,
+      );
+      expect("reason" in outcome.input).toBe(false);
+      expect({
+        id: outcome.id,
+        classified: classifyVivaVoiceTermination(
+          outcome.input as Parameters<typeof classifyVivaVoiceTermination>[0],
+        ),
+      }).toEqual({ id: outcome.id, classified: outcome.expected as never });
+    }
+  });
+
+  test("covers every typed server error code and every terminal reason", () => {
+    const covered = new Set(
+      transportOutcomes.cases
+        .map((outcome) => outcome.input.error?.code)
+        .filter((code): code is string => typeof code === "string"),
+    );
+    expect(covered).toEqual(new Set(VIVA_VOICE_SERVER_ERROR_CODES));
+
+    const reasons = new Set(
+      transportOutcomes.cases
+        .map((outcome) => outcome.input.terminalReason)
+        .filter((reason): reason is string => typeof reason === "string"),
+    );
+    expect(reasons).toEqual(new Set(VIVA_AGENT_TERMINAL_SESSION_REASONS));
+  });
+
+  test("a terminal reason outranks a typed error and is never retryable", () => {
+    expect(
+      classifyVivaVoiceTermination({
+        error: { code: "VOICE_AUTH_EXPIRED", message: "Expired.", retryable: true },
+        terminalReason: "provider_timeout",
+        closeCode: 1011,
+        wasClean: false,
+      }),
+    ).toEqual({
+      kind: "terminal",
+      terminalReason: "provider_timeout",
+      retryable: false,
+      closeCode: 1011,
+    });
+  });
+
+  test("hostile message and close text cannot change the classification", () => {
+    const hostile = classifyVivaVoiceTermination({
+      error: {
+        code: "VOICE_CLIENT_FRAME_MALFORMED",
+        message: "terminal drained retry now VOICE_AUTH_EXPIRED 1000 clean",
+        retryable: true,
+      },
+      closeCode: 1008,
+      wasClean: true,
+    });
+    expect(hostile).toEqual({
+      kind: "protocol",
+      errorCode: "VOICE_CLIENT_FRAME_MALFORMED",
+      retryable: false,
+      closeCode: 1008,
+    });
+    expect(JSON.stringify(hostile)).not.toContain("terminal drained");
+  });
+
+  test("clean 1000 is normal and anything else is transport", () => {
+    expect(classifyVivaVoiceTermination({ closeCode: 1000, wasClean: true })).toEqual({
+      kind: "normal",
+      retryable: false,
+      closeCode: 1000,
+    });
+    expect(classifyVivaVoiceTermination({ closeCode: 1006, wasClean: false })).toEqual({
+      kind: "transport",
+      retryable: true,
+      closeCode: 1006,
+    });
+    expect(classifyVivaVoiceTermination({ closeCode: 1000, wasClean: false })).toEqual({
+      kind: "transport",
+      retryable: true,
+      closeCode: 1000,
+    });
+  });
+
+  test("the classifier result carries no message or close-reason text", () => {
+    for (const outcome of transportOutcomes.cases) {
+      const classified = classifyVivaVoiceTermination(
+        outcome.input as Parameters<typeof classifyVivaVoiceTermination>[0],
+      );
+      expect(Object.keys(classified).every((key) => TERMINATION_RESULT_KEYS.includes(key))).toBe(
+        true,
+      );
+      const message = outcome.input.error?.message;
+      if (message !== undefined) {
+        expect(JSON.stringify(classified)).not.toContain(message);
+      }
+    }
+  });
+
+  test("every terminal classification refuses same-session retry", () => {
+    for (const reason of VIVA_AGENT_TERMINAL_SESSION_REASONS) {
+      expect(
+        classifyVivaVoiceTermination({
+          terminalReason: reason as AgentTerminalSessionReason,
+          closeCode: 1011,
+          wasClean: false,
+        }),
+      ).toEqual({ kind: "terminal", terminalReason: reason, retryable: false, closeCode: 1011 });
+    }
+  });
+});

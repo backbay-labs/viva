@@ -1,10 +1,10 @@
 use std::fmt;
 
 use agent_domain::{
-    AnswerEvaluation, AudioFrame, BrainEvent, BrainProviderError, ConceptStatus, ManuscriptIntent,
-    RealtimeBrainCapabilities, SessionConfig, StudyMode, StudyQuestion, StudySessionPhase,
-    StudySessionRecap, StudySourceReference, StudyStoreBackend, StudyStoreCapabilities,
-    TerminalSessionReason,
+    AnswerEvaluation, AudioFrame, BrainEvent, ConceptStatus, EvaluationDeferralReason,
+    ManuscriptIntent, RealtimeBrainCapabilities, SessionConfig, StudyMode, StudyQuestion,
+    StudySessionPhase, StudySessionRecap, StudySourceReference, StudyStoreBackend,
+    StudyStoreCapabilities, TerminalSessionReason,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -352,12 +352,13 @@ fn validate_client_frame_wire(value: &Value) -> Result<(), VoiceProtocolDiagnost
 /// explicit wire allowlist that runs before any conversion to a domain type.
 const VIVA_SERVER_FRAME_TYPES: [&str; 4] = ["ready", "audio_turn_accepted", "event", "error"];
 
-const VIVA_SERVER_EVENT_TYPES: [&str; 12] = [
+const VIVA_SERVER_EVENT_TYPES: [&str; 13] = [
     "session_phase",
     "question_started",
     "transcript_delta",
     "transcript_final",
     "answer_evaluated",
+    "turn_deferred",
     "source_reference",
     "concept_status",
     "manuscript_intent",
@@ -366,6 +367,8 @@ const VIVA_SERVER_EVENT_TYPES: [&str; 12] = [
     "cancellation",
     "structured_error",
 ];
+
+const VOICE_STRUCTURED_ERROR_TERMINALITIES: [&str; 2] = ["recoverable", "terminal"];
 
 const SOURCE_REFERENCE_KEYS: [&str; 6] = SOURCE_CONTEXT_KEYS;
 
@@ -599,9 +602,36 @@ fn validate_server_event_wire(
             }
         }
         "question_started" => {
-            require_only_wire_keys(event, &["type", "response_id", "question"], path)?;
+            require_only_wire_keys(event, &["type", "turn_id", "response_id", "question"], path)?;
+            require_strict_wire_id(event.get("turn_id"), format!("{path}.turn_id"))?;
             require_strict_wire_id(event.get("response_id"), format!("{path}.response_id"))?;
             validate_study_question_wire(event.get("question"), &format!("{path}.question"))?;
+        }
+        "turn_deferred" => {
+            require_only_wire_keys(
+                event,
+                &[
+                    "type",
+                    "turn_id",
+                    "response_id",
+                    "question_id",
+                    "reason",
+                    "can_retry_same_question",
+                ],
+                path,
+            )?;
+            require_strict_wire_id(event.get("turn_id"), format!("{path}.turn_id"))?;
+            require_strict_wire_id(event.get("response_id"), format!("{path}.response_id"))?;
+            require_strict_wire_id(event.get("question_id"), format!("{path}.question_id"))?;
+            require_wire_enum(
+                event.get("reason"),
+                &VOICE_DEFERRAL_REASONS,
+                format!("{path}.reason"),
+            )?;
+            require_wire_bool(
+                event.get("can_retry_same_question"),
+                format!("{path}.can_retry_same_question"),
+            )?;
         }
         "transcript_delta" => {
             require_only_wire_keys(event, &["type", "response_id", "text"], path)?;
@@ -652,16 +682,23 @@ fn validate_server_event_wire(
         "recap_ready" => {
             require_only_wire_keys(
                 event,
-                &["type", "response_id", "recap", "partial_reason"],
+                &["type", "response_id", "recap", "partial", "partial_reason"],
                 path,
             )?;
             require_strict_wire_id(event.get("response_id"), format!("{path}.response_id"))?;
             validate_recap_wire(event.get("recap"), &format!("{path}.recap"))?;
-            if event.contains_key("partial_reason") {
+            // `VOICE-TERMINAL-001`: `partial` is the discriminant. `true` is terminal and
+            // must state why; `false` may not carry a reason at all.
+            if require_wire_bool(event.get("partial"), format!("{path}.partial"))? {
                 require_wire_terminal_reason(
                     event.get("partial_reason"),
                     format!("{path}.partial_reason"),
                 )?;
+            } else if event.contains_key("partial_reason") {
+                return Err(diagnostic(
+                    VoiceProtocolDiagnosticCode::Invariant,
+                    format!("{path}.partial_reason"),
+                ));
             }
         }
         "audio_delta" => {
@@ -690,9 +727,38 @@ fn validate_server_event_wire(
             }
         }
         _ => {
-            require_only_wire_keys(event, &["type", "source", "message"], path)?;
+            require_only_wire_keys(
+                event,
+                &[
+                    "type",
+                    "source",
+                    "code",
+                    "message",
+                    "terminality",
+                    "terminal_reason",
+                ],
+                path,
+            )?;
             require_non_empty_wire_string(event.get("source"), format!("{path}.source"))?;
+            require_strict_wire_id(event.get("code"), format!("{path}.code"))?;
             require_non_empty_wire_string(event.get("message"), format!("{path}.message"))?;
+            // `VOICE-TERMINAL-002`: terminality is stated, never inferred from the message.
+            let terminality = require_wire_enum(
+                event.get("terminality"),
+                &VOICE_STRUCTURED_ERROR_TERMINALITIES,
+                format!("{path}.terminality"),
+            )?;
+            if terminality == VoiceStructuredErrorTerminality::Terminal.as_str() {
+                require_wire_terminal_reason(
+                    event.get("terminal_reason"),
+                    format!("{path}.terminal_reason"),
+                )?;
+            } else if event.contains_key("terminal_reason") {
+                return Err(diagnostic(
+                    VoiceProtocolDiagnosticCode::Invariant,
+                    format!("{path}.terminal_reason"),
+                ));
+            }
         }
     }
     Ok(())
@@ -1348,16 +1414,17 @@ fn require_only_wire_keys(
     Ok(())
 }
 
-fn require_wire_enum(
-    value: Option<&Value>,
+fn require_wire_enum<'a>(
+    value: Option<&'a Value>,
     allowed: &[&str],
     path: impl Into<String>,
-) -> Result<(), VoiceProtocolDiagnostic> {
+) -> Result<&'a str, VoiceProtocolDiagnostic> {
     let path = path.into();
-    if !allowed.contains(&require_wire_string(value, path.clone())?) {
+    let text = require_wire_string(value, path.clone())?;
+    if !allowed.contains(&text) {
         return Err(diagnostic(VoiceProtocolDiagnosticCode::InvalidField, path));
     }
-    Ok(())
+    Ok(text)
 }
 
 fn require_wire_terminal_reason(
@@ -1718,16 +1785,25 @@ pub enum ServerFrame {
 
 /// `VOICE-ERROR-001`: the closed typed vocabulary a server error frame may carry.
 /// Retryability is a property of the code, never a value a sender may choose.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum VoiceServerErrorCode {
+    #[serde(rename = "VOICE_AUTH_EXPIRED")]
     AuthExpired,
+    #[serde(rename = "VOICE_AUTH_INVALID")]
     AuthInvalid,
+    #[serde(rename = "VOICE_AUTH_IDENTITY_MISMATCH")]
     AuthIdentityMismatch,
+    #[serde(rename = "VOICE_AUTH_REPLAYED")]
     AuthReplayed,
+    #[serde(rename = "VOICE_CLIENT_FRAME_MALFORMED")]
     ClientFrameMalformed,
+    #[serde(rename = "VOICE_CLIENT_FRAME_TOO_LARGE")]
     ClientFrameTooLarge,
+    #[serde(rename = "VOICE_CLIENT_TURN_TOO_LARGE")]
     ClientTurnTooLarge,
+    #[serde(rename = "VOICE_CLIENT_AUTHORITY_FORBIDDEN")]
     ClientAuthorityForbidden,
+    #[serde(rename = "VOICE_INTERNAL_SERIALIZATION")]
     InternalSerialization,
 }
 
@@ -1787,6 +1863,133 @@ impl ServerError {
     }
 }
 
+/// `VOICE-TERMINATION-001`: the typed inputs a close classification may read. There is
+/// deliberately no browser `CloseEvent.reason` and no free-form message here - a socket
+/// outcome is decided by typed facts, never by parsing prose.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceTerminationInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ServerError>,
+    #[serde(
+        default,
+        rename = "terminalReason",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub terminal_reason: Option<TerminalSessionReason>,
+    #[serde(rename = "closeCode")]
+    pub close_code: u32,
+    #[serde(rename = "wasClean")]
+    pub was_clean: bool,
+}
+
+/// `VOICE-TERMINATION-001`: the typed close classification. The result carries no message
+/// and no close-reason text, so nothing a peer wrote can reach a consumer's control flow.
+///
+/// Every `Terminal` outcome is `retryable: false` because the current wire session and
+/// generation are finished. A learner-facing action may start a *new* session from the
+/// typed reason; that is not this classifier's retry flag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VoiceTermination {
+    Terminal {
+        #[serde(rename = "terminalReason")]
+        terminal_reason: TerminalSessionReason,
+        retryable: bool,
+        #[serde(rename = "closeCode")]
+        close_code: u32,
+    },
+    Auth {
+        #[serde(rename = "errorCode")]
+        error_code: VoiceServerErrorCode,
+        retryable: bool,
+        #[serde(rename = "closeCode")]
+        close_code: u32,
+    },
+    Protocol {
+        #[serde(rename = "errorCode")]
+        error_code: VoiceServerErrorCode,
+        retryable: bool,
+        #[serde(rename = "closeCode")]
+        close_code: u32,
+    },
+    Service {
+        #[serde(rename = "errorCode")]
+        error_code: VoiceServerErrorCode,
+        retryable: bool,
+        #[serde(rename = "closeCode")]
+        close_code: u32,
+    },
+    Normal {
+        retryable: bool,
+        #[serde(rename = "closeCode")]
+        close_code: u32,
+    },
+    Transport {
+        retryable: bool,
+        #[serde(rename = "closeCode")]
+        close_code: u32,
+    },
+}
+
+/// Priority is terminal reason, then typed error category, then clean code 1000, then
+/// transport. Retryability is derived from the typed code and never read off the wire.
+pub fn classify_voice_termination(input: &VoiceTerminationInput) -> VoiceTermination {
+    if let Some(terminal_reason) = input.terminal_reason {
+        return VoiceTermination::Terminal {
+            terminal_reason,
+            retryable: false,
+            close_code: input.close_code,
+        };
+    }
+
+    if let Some(error_code) = input
+        .error
+        .as_ref()
+        .and_then(|error| VoiceServerErrorCode::from_wire(&error.code))
+    {
+        let close_code = input.close_code;
+        return match error_code {
+            VoiceServerErrorCode::AuthExpired
+            | VoiceServerErrorCode::AuthInvalid
+            | VoiceServerErrorCode::AuthIdentityMismatch
+            | VoiceServerErrorCode::AuthReplayed => VoiceTermination::Auth {
+                error_code,
+                retryable: error_code.retryable(),
+                close_code,
+            },
+            VoiceServerErrorCode::ClientFrameMalformed
+            | VoiceServerErrorCode::ClientFrameTooLarge
+            | VoiceServerErrorCode::ClientTurnTooLarge
+            | VoiceServerErrorCode::ClientAuthorityForbidden => VoiceTermination::Protocol {
+                error_code,
+                retryable: false,
+                close_code,
+            },
+            VoiceServerErrorCode::InternalSerialization => VoiceTermination::Service {
+                error_code,
+                retryable: true,
+                close_code,
+            },
+        };
+    }
+
+    if input.was_clean && input.close_code == VOICE_NORMAL_CLOSE_CODE {
+        return VoiceTermination::Normal {
+            retryable: false,
+            close_code: VOICE_NORMAL_CLOSE_CODE,
+        };
+    }
+
+    VoiceTermination::Transport {
+        retryable: true,
+        close_code: input.close_code,
+    }
+}
+
+/// The one clean close code a v5 session may end on.
+pub const VOICE_NORMAL_CLOSE_CODE: u32 = 1000;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VivaServerEvent {
@@ -1795,7 +1998,11 @@ pub enum VivaServerEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_reason: Option<TerminalSessionReason>,
     },
+    /// `VOICE-TURN-001`: `question_started` is bound to the active wire turn. The domain
+    /// event carries no turn identity, so this variant is only reachable through
+    /// [`VivaServerEvent::question_started`].
     QuestionStarted {
+        turn_id: String,
         response_id: String,
         question: StudyQuestion,
     },
@@ -1812,6 +2019,17 @@ pub enum VivaServerEvent {
         response_id: String,
         evaluation: AnswerEvaluation,
     },
+    /// `VOICE-TURN-002`: the wire mirror of a durably persisted Plan 04 `Deferred`
+    /// outcome. It carries no provider message, feedback, confidence, concept status,
+    /// schedule, mastery, `retryable`, or `terminal_reason`, and is never intrinsically
+    /// terminal. Only [`VivaServerEvent::turn_deferred`] constructs it.
+    TurnDeferred {
+        turn_id: String,
+        response_id: String,
+        question_id: String,
+        reason: EvaluationDeferralReason,
+        can_retry_same_question: bool,
+    },
     SourceReference {
         response_id: String,
         source: StudySourceReference,
@@ -1825,9 +2043,16 @@ pub enum VivaServerEvent {
         response_id: String,
         intent: ManuscriptIntent,
     },
+    /// `VOICE-TERMINAL-001`: recap terminality is discriminated, never an optional field
+    /// whose meaning a consumer guesses. `partial: true` is terminal immediately and
+    /// always carries its reason; `partial: false` never carries one. The pair is only
+    /// reachable through [`VivaServerEvent::recap_ready`] and
+    /// [`VivaServerEvent::partial_recap_ready`], and the wire allowlist rejects every
+    /// other combination with `VOICE_PROTOCOL_INVARIANT`.
     RecapReady {
         response_id: String,
         recap: StudySessionRecap,
+        partial: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         partial_reason: Option<TerminalSessionReason>,
     },
@@ -1838,15 +2063,217 @@ pub enum VivaServerEvent {
     Cancellation {
         response_id: Option<String>,
     },
+    /// `VOICE-TERMINAL-002`: a structured error states its own terminality. A recoverable
+    /// error never changes terminal state and may not carry a reason; a terminal error
+    /// changes it immediately and must. Only
+    /// [`VivaServerEvent::recoverable_structured_error`] and
+    /// [`VivaServerEvent::terminal_structured_error`] construct it.
     StructuredError {
         source: String,
+        code: String,
         message: String,
+        terminality: VoiceStructuredErrorTerminality,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_reason: Option<TerminalSessionReason>,
     },
 }
 
-impl From<BrainEvent> for VivaServerEvent {
-    fn from(event: BrainEvent) -> Self {
-        match event {
+/// `VOICE-TERMINAL-002`: the closed terminality vocabulary of a structured error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceStructuredErrorTerminality {
+    Recoverable,
+    Terminal,
+}
+
+impl VoiceStructuredErrorTerminality {
+    pub const ALL: [Self; 2] = [Self::Recoverable, Self::Terminal];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recoverable => "recoverable",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+/// The exact six snake_case wire mirrors of Plan 04 `EvaluationDeferralReason`. Adapter
+/// and provider reasons are deliberately absent: only a durably persisted domain outcome
+/// reaches the wire.
+pub const VOICE_DEFERRAL_REASONS: [&str; 6] = [
+    "empty_answer",
+    "transcript_uncertain",
+    "evaluator_unavailable",
+    "invalid_evaluator_output",
+    "insufficient_semantic_evidence",
+    "contradictory_evidence",
+];
+
+/// Protocol-owned structured-error codes for the internal events this contract maps.
+pub const VOICE_TELEMETRY_EVENT_SUPPRESSED_CODE: &str = "VOICE_TELEMETRY_EVENT_SUPPRESSED";
+pub const VOICE_TOOL_PROPOSAL_NOT_BROWSER_SENDABLE_CODE: &str =
+    "VOICE_TOOL_PROPOSAL_NOT_BROWSER_SENDABLE";
+pub const VOICE_UNSUPPORTED_BRAIN_EVENT_CODE: &str = "VOICE_UNSUPPORTED_BRAIN_EVENT";
+pub const VOICE_PROVIDER_FAILURE_CODE: &str = "VOICE_PROVIDER_FAILURE";
+pub const VOICE_PROVIDER_ERROR_UNCLASSIFIED_CODE: &str = "VOICE_PROVIDER_ERROR_UNCLASSIFIED";
+
+/// `VOICE-ERROR-001`: the owner-provided v5 serialization fallback. Plan 08 replaces the
+/// hard-coded v1 literal in `ws.rs` with this constant; a round-trip test pins it.
+pub const VOICE_SERIALIZATION_FALLBACK_FRAME: &str = "{\"type\":\"error\",\"version\":5,\"error\":{\"code\":\"VOICE_INTERNAL_SERIALIZATION\",\"message\":\"Server frame serialization failed.\",\"retryable\":true}}";
+
+impl VivaServerEvent {
+    /// `VOICE-TURN-001`: binds the active wire turn to a domain `QuestionStarted`. It
+    /// accepts no other event, so a turn id can never be attached to something that is
+    /// not a question start.
+    pub fn question_started(
+        turn_id: &str,
+        event: &BrainEvent,
+    ) -> Result<Self, VoiceProtocolDiagnostic> {
+        let BrainEvent::QuestionStarted {
+            response_id,
+            question,
+        } = event
+        else {
+            return Err(diagnostic(
+                VoiceProtocolDiagnosticCode::Invariant,
+                "$.event.type",
+            ));
+        };
+        Ok(Self::QuestionStarted {
+            turn_id: require_active_turn_id(turn_id)?,
+            response_id: response_id.clone(),
+            question: question.clone(),
+        })
+    }
+
+    /// `VOICE-TURN-002`: the only path from a durably persisted Plan 06
+    /// `BrainEvent::TurnDeferred` to the wire. Every domain field is copied losslessly and
+    /// the active wire `turn_id` is added; no provider message or learner fact is accepted.
+    pub fn turn_deferred(
+        turn_id: &str,
+        event: &BrainEvent,
+    ) -> Result<Self, VoiceProtocolDiagnostic> {
+        let BrainEvent::TurnDeferred {
+            response_id,
+            question_id,
+            reason,
+            can_retry_same_question,
+        } = event
+        else {
+            return Err(diagnostic(
+                VoiceProtocolDiagnosticCode::Invariant,
+                "$.event.type",
+            ));
+        };
+        Ok(Self::TurnDeferred {
+            turn_id: require_active_turn_id(turn_id)?,
+            response_id: response_id.clone(),
+            question_id: question_id.clone(),
+            reason: reason.clone(),
+            can_retry_same_question: *can_retry_same_question,
+        })
+    }
+
+    /// A complete, non-terminal recap. There is deliberately no constructor that accepts
+    /// `partial` plus an optional reason.
+    pub fn recap_ready(response_id: impl Into<String>, recap: StudySessionRecap) -> Self {
+        Self::RecapReady {
+            response_id: response_id.into(),
+            recap,
+            partial: false,
+            partial_reason: None,
+        }
+    }
+
+    /// `VOICE-TERMINAL-001`: a partial recap is terminal immediately and always states why.
+    pub fn partial_recap_ready(
+        response_id: impl Into<String>,
+        recap: StudySessionRecap,
+        partial_reason: TerminalSessionReason,
+    ) -> Self {
+        Self::RecapReady {
+            response_id: response_id.into(),
+            recap,
+            partial: true,
+            partial_reason: Some(partial_reason),
+        }
+    }
+
+    /// A structured error that changes neither socket status nor submission availability.
+    pub fn recoverable_structured_error(
+        source: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::StructuredError {
+            source: source.into(),
+            code: code.into(),
+            message: message.into(),
+            terminality: VoiceStructuredErrorTerminality::Recoverable,
+            terminal_reason: None,
+        }
+    }
+
+    /// A structured error that changes terminal state immediately. The reason is required
+    /// by the type, so a terminal error without one is unrepresentable.
+    pub fn terminal_structured_error(
+        source: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        terminal_reason: TerminalSessionReason,
+    ) -> Self {
+        Self::StructuredError {
+            source: source.into(),
+            code: code.into(),
+            message: message.into(),
+            terminality: VoiceStructuredErrorTerminality::Terminal,
+            terminal_reason: Some(terminal_reason),
+        }
+    }
+
+    /// The single authoritative terminality rule for a v5 server event, shared by Rust and
+    /// TypeScript: a terminal session phase, a partial recap, and a terminal structured
+    /// error are the only events that end a wire session. A deferred turn never is.
+    pub fn terminal_reason(&self) -> Option<TerminalSessionReason> {
+        match self {
+            Self::SessionPhase {
+                terminal_reason, ..
+            } => *terminal_reason,
+            Self::RecapReady {
+                partial,
+                partial_reason,
+                ..
+            } => partial.then_some(*partial_reason).flatten(),
+            Self::StructuredError {
+                terminality,
+                terminal_reason,
+                ..
+            } => match terminality {
+                VoiceStructuredErrorTerminality::Terminal => *terminal_reason,
+                VoiceStructuredErrorTerminality::Recoverable => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+/// A wire turn binding is a non-empty strict id. An unbound turn cannot be attached to a
+/// turn-scoped event.
+fn require_active_turn_id(turn_id: &str) -> Result<String, VoiceProtocolDiagnostic> {
+    if !is_strict_wire_id(turn_id) {
+        return Err(diagnostic(
+            VoiceProtocolDiagnosticCode::InvalidField,
+            "$.event.turn_id",
+        ));
+    }
+    Ok(turn_id.to_owned())
+}
+
+impl TryFrom<BrainEvent> for VivaServerEvent {
+    type Error = VoiceProtocolDiagnostic;
+
+    fn try_from(event: BrainEvent) -> Result<Self, Self::Error> {
+        Ok(match event {
             BrainEvent::SessionPhase { phase } => Self::SessionPhase {
                 phase,
                 terminal_reason: None,
@@ -1858,13 +2285,15 @@ impl From<BrainEvent> for VivaServerEvent {
                 phase,
                 terminal_reason: Some(terminal_reason),
             },
-            BrainEvent::QuestionStarted {
-                response_id,
-                question,
-            } => Self::QuestionStarted {
-                response_id,
-                question,
-            },
+            // `VOICE-TURN-001` / `VOICE-TURN-002`: both are bound to the active wire turn,
+            // which the domain event does not carry. Plan 08 must call the explicit
+            // turn constructors instead of this blanket conversion.
+            BrainEvent::QuestionStarted { .. } | BrainEvent::TurnDeferred { .. } => {
+                return Err(diagnostic(
+                    VoiceProtocolDiagnosticCode::Invariant,
+                    "$.event.turn_id",
+                ))
+            }
             BrainEvent::TranscriptDelta { response_id, text } => {
                 Self::TranscriptDelta { response_id, text }
             }
@@ -1907,11 +2336,7 @@ impl From<BrainEvent> for VivaServerEvent {
                 response_id,
                 intent,
             },
-            BrainEvent::RecapReady { response_id, recap } => Self::RecapReady {
-                response_id,
-                recap,
-                partial_reason: None,
-            },
+            BrainEvent::RecapReady { response_id, recap } => Self::recap_ready(response_id, recap),
             BrainEvent::AudioDelta { response_id, frame }
             | BrainEvent::ResponseAudio { response_id, frame } => {
                 Self::AudioDelta { response_id, frame }
@@ -1920,13 +2345,31 @@ impl From<BrainEvent> for VivaServerEvent {
                 response_id: "legacy-transcript".to_owned(),
                 text,
             },
-            BrainEvent::Usage(_) => Self::StructuredError {
-                source: "agent-service".to_owned(),
-                message: "telemetry event suppressed".to_owned(),
-            },
-            BrainEvent::Error(BrainProviderError {
-                source, message, ..
-            }) => Self::StructuredError { source, message },
+            BrainEvent::Usage(_) => Self::recoverable_structured_error(
+                "agent-service",
+                VOICE_TELEMETRY_EVENT_SUPPRESSED_CODE,
+                "telemetry event suppressed",
+            ),
+            // A classified provider failure carries the domain's own terminal reason;
+            // `VOICE-TERMINAL-002` forbids relabelling it recoverable to keep a socket.
+            // An unclassified one has no proven terminal reason, and the domain forbids
+            // inferring one from `source`/`message`, so it stays recoverable under a
+            // distinct code rather than fabricating terminality.
+            BrainEvent::Error(error) => {
+                match error.failure().map(|failure| failure.terminal_reason()) {
+                    Some(terminal_reason) => Self::terminal_structured_error(
+                        error.source.clone(),
+                        VOICE_PROVIDER_FAILURE_CODE,
+                        error.message.clone(),
+                        terminal_reason,
+                    ),
+                    None => Self::recoverable_structured_error(
+                        error.source.clone(),
+                        VOICE_PROVIDER_ERROR_UNCLASSIFIED_CODE,
+                        error.message.clone(),
+                    ),
+                }
+            }
             BrainEvent::InputSpeechStarted => Self::SessionPhase {
                 phase: StudySessionPhase::Listening,
                 terminal_reason: None,
@@ -1955,20 +2398,24 @@ impl From<BrainEvent> for VivaServerEvent {
                 phase: StudySessionPhase::Feedback,
                 terminal_reason: None,
             },
-            BrainEvent::ResponseToolProposal { response_id, .. } => Self::StructuredError {
-                source: "agent-service".to_owned(),
-                message: format!("tool proposal {response_id} cannot be sent directly to browser"),
-            },
+            BrainEvent::ResponseToolProposal { response_id, .. } => {
+                Self::recoverable_structured_error(
+                    "agent-service",
+                    VOICE_TOOL_PROPOSAL_NOT_BROWSER_SENDABLE_CODE,
+                    format!("tool proposal {response_id} cannot be sent directly to browser"),
+                )
+            }
             BrainEvent::SpeechIntent(intent) => Self::TranscriptFinal {
                 response_id: "speech-intent".to_owned(),
                 text: intent.text,
                 confidence: None,
             },
-            _ => Self::StructuredError {
-                source: "agent-service".to_owned(),
-                message: "unsupported brain event".to_owned(),
-            },
-        }
+            _ => Self::recoverable_structured_error(
+                "agent-service",
+                VOICE_UNSUPPORTED_BRAIN_EVENT_CODE,
+                "unsupported brain event",
+            ),
+        })
     }
 }
 
@@ -2003,18 +2450,49 @@ impl ServerFrame {
         }
     }
 
-    pub fn event(event: BrainEvent) -> Self {
+    /// Wraps a turn-independent domain event. Turn-bound events (`question_started`,
+    /// `turn_deferred`) reject here and must use their explicit constructors.
+    pub fn event(event: BrainEvent) -> Result<Self, VoiceProtocolDiagnostic> {
+        Ok(Self::from_event(VivaServerEvent::try_from(event)?))
+    }
+
+    fn from_event(event: VivaServerEvent) -> Self {
         Self::Event {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            event: Box::new(event.into()),
+            event: Box::new(event),
         }
+    }
+
+    /// `VOICE-TURN-001`: the owner-provided `question_started` constructor. Plan 08 calls
+    /// it with the active wire turn while updating socket turn accounting.
+    pub fn question_started(
+        turn_id: &str,
+        event: &BrainEvent,
+    ) -> Result<Self, VoiceProtocolDiagnostic> {
+        Ok(Self::from_event(VivaServerEvent::question_started(
+            turn_id, event,
+        )?))
+    }
+
+    /// `VOICE-TURN-002`: the owner-provided `turn_deferred` constructor. It accepts only
+    /// Plan 06's `BrainEvent::TurnDeferred`, validates the active turn id, and copies the
+    /// persisted outcome losslessly. Plan 08 calls it; it does not redeclare the mapping.
+    pub fn turn_deferred(
+        turn_id: &str,
+        event: &BrainEvent,
+    ) -> Result<Self, VoiceProtocolDiagnostic> {
+        Ok(Self::from_event(VivaServerEvent::turn_deferred(
+            turn_id, event,
+        )?))
     }
 
     pub fn browser_event(event: BrainEvent) -> Option<Self> {
         match event {
+            // Turn-bound: the wire turn id is not derivable from the domain event, so
+            // these are unreachable through the blanket path by construction.
+            BrainEvent::QuestionStarted { .. } | BrainEvent::TurnDeferred { .. } => None,
             BrainEvent::SessionPhase { .. }
             | BrainEvent::TerminalSessionPhase { .. }
-            | BrainEvent::QuestionStarted { .. }
             | BrainEvent::TranscriptDelta { .. }
             | BrainEvent::TranscriptFinal { .. }
             | BrainEvent::AnswerEvaluated { .. }
@@ -2030,7 +2508,7 @@ impl ServerFrame {
             | BrainEvent::ResponseCancelled
             | BrainEvent::ResponseCancelledFor { .. }
             | BrainEvent::ResponseStarted { .. }
-            | BrainEvent::ResponseTextStarted { .. } => Some(Self::event(event)),
+            | BrainEvent::ResponseTextStarted { .. } => Self::event(event).ok(),
             BrainEvent::Usage(_)
             | BrainEvent::ResponseCompleted { .. }
             | BrainEvent::ProviderFallbackActivated { .. }
@@ -2091,7 +2569,7 @@ fn default_ready_store() -> StudyStoreCapabilities {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use agent_domain::{BrainInput, RealtimeBrain};
+    use agent_domain::{BrainInput, BrainProviderError, RealtimeBrain};
     use serde::Deserialize;
     use serde_json::{json, Value};
     use tokio::time::timeout;
@@ -2270,37 +2748,70 @@ mod tests {
         assert_eq!(VIVA_AUDIO_MAX_TURN_BYTES, VIVA_AUDIO_MAX_TURN_SAMPLES * 2);
     }
 
+    /// The frozen unversioned `question_started` fixture predates `VOICE-TURN-001`'s
+    /// required wire `turn_id`, so v5 rejects it at that exact path. Positive coverage
+    /// lives in `turn-outcomes.json` and the two-turn session corpora; Task 9 Step 6
+    /// deletes this fixture.
     #[test]
-    fn serializes_shared_question_started_event_fixture() {
-        let frame = ServerFrame::event(BrainEvent::QuestionStarted {
-            response_id: "response-1".to_owned(),
-            question: agent_domain::fixture_question(),
-        });
+    fn rejects_legacy_question_started_event_fixture() {
+        let diagnostic = parse_server_frame_json(include_str!(
+            "../../../fixtures/voice-protocol/server-event-question-started.json"
+        ))
+        .map(|_| ())
+        .expect_err("a turn-less question start is not a v5 event");
+        assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::MissingField);
+        assert_eq!(diagnostic.path, "$.event.turn_id");
+    }
 
-        assert_eq!(
-            serde_json::to_value(frame).expect("serializes"),
-            serde_json::from_str::<serde_json::Value>(include_str!(
-                "../../../fixtures/voice-protocol/server-event-question-started.json"
-            ))
-            .expect("fixture is valid")
-        );
+    /// Likewise, the frozen structured-error fixture predates `VOICE-TERMINAL-002`'s
+    /// required `code` and `terminality`.
+    #[test]
+    fn rejects_legacy_structured_error_event_fixture() {
+        let diagnostic = parse_server_frame_json(include_str!(
+            "../../../fixtures/voice-protocol/server-event-structured-error.json"
+        ))
+        .map(|_| ())
+        .expect_err("an untyped structured error is not a v5 event");
+        assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::MissingField);
+        assert_eq!(diagnostic.path, "$.event.code");
     }
 
     #[test]
-    fn serializes_shared_structured_error_fixture() {
-        let frame = ServerFrame::event(BrainEvent::Error(BrainProviderError {
-            source: "agent-service".to_owned(),
-            message: "telemetry event suppressed".to_owned(),
-            failure: None,
-        }));
-
+    fn maps_provider_failures_to_their_own_terminal_reason() {
+        let failure =
+            agent_domain::BrainProviderFailure::new(agent_domain::BrainProviderFailureParts {
+                failure_class: agent_domain::BrainFailureClass::Timeout,
+                stage: agent_domain::BrainFailureStage::Provider,
+                retry_eligible: false,
+                latency_ms: 0,
+                provider: "fixture-provider".to_owned(),
+                model: "fixture-model".to_owned(),
+                metadata: "fixture".to_owned(),
+            });
+        let frame =
+            ServerFrame::event(BrainEvent::Error(BrainProviderError::from_failure(failure)))
+                .expect("a classified provider failure converts");
+        let ServerFrame::Event { event, .. } = &frame else {
+            panic!("expected an event frame");
+        };
         assert_eq!(
-            serde_json::to_value(frame).expect("serializes"),
-            serde_json::from_str::<serde_json::Value>(include_str!(
-                "../../../fixtures/voice-protocol/server-event-structured-error.json"
-            ))
-            .expect("fixture is valid")
+            event.terminal_reason(),
+            Some(TerminalSessionReason::ProviderTimeout)
         );
+
+        // An unclassified provider error has no proven terminal reason and the domain
+        // forbids inferring one from `source`/`message`, so it stays recoverable under a
+        // distinct code rather than fabricating terminality.
+        let unclassified = ServerFrame::event(BrainEvent::Error(BrainProviderError {
+            source: "agent-service".to_owned(),
+            message: "provider error".to_owned(),
+            failure: None,
+        }))
+        .expect("an unclassified provider error converts");
+        let ServerFrame::Event { event, .. } = &unclassified else {
+            panic!("expected an event frame");
+        };
+        assert_eq!(event.terminal_reason(), None);
     }
 
     #[test]
@@ -2311,7 +2822,8 @@ mod tests {
                 register: agent_domain::ManuscriptRegister::Examining,
                 emphasis: agent_domain::ManuscriptEmphasis::Measured,
             },
-        });
+        })
+        .expect("a turn-independent event converts");
 
         assert_eq!(
             serde_json::to_value(frame).expect("serializes"),
@@ -3726,9 +4238,17 @@ mod tests {
         raw: &str,
         parse: impl Fn(&str) -> Result<T, VoiceProtocolDiagnostic>,
     ) -> usize {
+        run_case_file(raw, "viva.voice-differential-cases.v1", parse)
+    }
+
+    fn run_case_file<T: serde::Serialize>(
+        raw: &str,
+        schema: &str,
+        parse: impl Fn(&str) -> Result<T, VoiceProtocolDiagnostic>,
+    ) -> usize {
         let file: DifferentialCaseFile =
             serde_json::from_str(raw).expect("differential case file parses strictly");
-        assert_eq!(file.schema, "viva.voice-differential-cases.v1");
+        assert_eq!(file.schema, schema);
         assert_eq!(file.protocol_version, VIVA_VOICE_PROTOCOL_VERSION);
         assert!(!file.cases.is_empty());
 
@@ -3829,5 +4349,503 @@ mod tests {
             parse_server_frame_json,
         );
         assert!(executed >= 25, "the server corpus is too small: {executed}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 7 - VOICE-TURN-001 / VOICE-TURN-002 / VOICE-TERMINAL-001 /
+    // VOICE-TERMINAL-002 / VOICE-TERMINATION-001
+    // -----------------------------------------------------------------------
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct TerminalSequenceFile {
+        schema: String,
+        protocol_version: u32,
+        sequences: Vec<TerminalSequenceCase>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct TerminalSequenceCase {
+        id: String,
+        terminal_reason: Option<String>,
+        terminal_at_index: Option<usize>,
+        wire_sequence_json: Vec<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct TransportOutcomeFile {
+        schema: String,
+        protocol_version: u32,
+        cases: Vec<TransportOutcomeCase>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct TransportOutcomeCase {
+        id: String,
+        input: VoiceTerminationInput,
+        expected: Value,
+    }
+
+    /// `VOICE-TURN-002`: none of these keys may appear on a deferred wire event.
+    const DEFERRED_FORBIDDEN_KEYS: [&str; 8] = [
+        "provider_message",
+        "feedback",
+        "confidence",
+        "status",
+        "schedule",
+        "mastery",
+        "retryable",
+        "terminal_reason",
+    ];
+
+    fn turn_deferred_events(raw: &str) -> Vec<serde_json::Map<String, Value>> {
+        let file: DifferentialCaseFile =
+            serde_json::from_str(raw).expect("turn outcome file parses strictly");
+        file.cases
+            .iter()
+            .filter(|outcome| outcome.valid)
+            .filter_map(|outcome| {
+                let frame: Value =
+                    serde_json::from_str(&outcome.wire_json).expect("valid case is JSON");
+                let event = frame.get("event")?.as_object()?.clone();
+                (event.get("type").and_then(Value::as_str) == Some("turn_deferred"))
+                    .then_some(event)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn voice_v5_turn_and_terminal_sequences_match() {
+        // The six exact snake_case mirrors of Plan 04 `EvaluationDeferralReason`.
+        assert_eq!(
+            VOICE_DEFERRAL_REASONS,
+            [
+                "empty_answer",
+                "transcript_uncertain",
+                "evaluator_unavailable",
+                "invalid_evaluator_output",
+                "insufficient_semantic_evidence",
+                "contradictory_evidence",
+            ]
+        );
+        // The domain enum is the authority: every variant's serde token must be one of
+        // the six, and the list is exhaustive by construction (a new variant fails to
+        // compile here rather than silently missing the wire).
+        for reason in [
+            EvaluationDeferralReason::EmptyAnswer,
+            EvaluationDeferralReason::TranscriptUncertain,
+            EvaluationDeferralReason::EvaluatorUnavailable,
+            EvaluationDeferralReason::InvalidEvaluatorOutput,
+            EvaluationDeferralReason::InsufficientSemanticEvidence,
+            EvaluationDeferralReason::ContradictoryEvidence,
+        ] {
+            let wire = serde_json::to_value(&reason).expect("reason serializes");
+            assert!(
+                VOICE_DEFERRAL_REASONS.contains(&wire.as_str().expect("reason is a string")),
+                "{wire} is not mirrored on the v5 wire"
+            );
+        }
+
+        // Turn intents and turn outcomes run in full, with no id filter.
+        let intents = run_case_file(
+            include_str!("../../../fixtures/voice-protocol/v5/turn-intents.json"),
+            "viva.voice-client-frame-cases.v1",
+            parse_client_frame_json,
+        );
+        assert!(
+            intents >= 8,
+            "the turn-intent corpus is too small: {intents}"
+        );
+        let outcomes = run_case_file(
+            include_str!("../../../fixtures/voice-protocol/v5/turn-outcomes.json"),
+            "viva.voice-server-event-cases.v1",
+            parse_server_frame_json,
+        );
+        assert!(
+            outcomes >= 15,
+            "the turn-outcome corpus is too small: {outcomes}"
+        );
+
+        // Every deferral reason and both retry affordances are covered, and no deferred
+        // event carries a grade, a schedule, or provider prose.
+        let deferred = turn_deferred_events(include_str!(
+            "../../../fixtures/voice-protocol/v5/turn-outcomes.json"
+        ));
+        assert!(!deferred.is_empty());
+        let reasons: std::collections::BTreeSet<&str> = deferred
+            .iter()
+            .map(|event| event["reason"].as_str().expect("reason is a string"))
+            .collect();
+        assert_eq!(
+            reasons,
+            VOICE_DEFERRAL_REASONS
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        let retries: std::collections::BTreeSet<bool> = deferred
+            .iter()
+            .map(|event| {
+                event["can_retry_same_question"]
+                    .as_bool()
+                    .expect("retry affordance is a bool")
+            })
+            .collect();
+        assert_eq!(retries, [false, true].into_iter().collect());
+        for event in &deferred {
+            assert_eq!(
+                event.keys().map(String::as_str).collect::<Vec<_>>(),
+                vec![
+                    "can_retry_same_question",
+                    "question_id",
+                    "reason",
+                    "response_id",
+                    "turn_id",
+                    "type",
+                ],
+                "a deferred event carries exactly the six contract keys"
+            );
+            for forbidden in DEFERRED_FORBIDDEN_KEYS {
+                assert!(
+                    !event.contains_key(forbidden),
+                    "deferred carried {forbidden}"
+                );
+            }
+            let parsed: VivaServerEvent = serde_json::from_value(Value::Object(event.clone()))
+                .expect("deferred event parses");
+            assert_eq!(parsed.terminal_reason(), None, "deferral is not terminal");
+        }
+
+        // `ServerFrame::turn_deferred` copies the persisted Plan 06 outcome losslessly and
+        // accepts nothing else.
+        let domain = BrainEvent::TurnDeferred {
+            response_id: "response-2".to_owned(),
+            question_id: "question-2".to_owned(),
+            reason: EvaluationDeferralReason::EvaluatorUnavailable,
+            can_retry_same_question: true,
+        };
+        let frame = ServerFrame::turn_deferred("turn-2", &domain).expect("constructs");
+        assert_eq!(
+            serde_json::to_value(&frame).expect("serializes"),
+            json!({
+                "type": "event",
+                "version": 5,
+                "event": {
+                    "type": "turn_deferred",
+                    "turn_id": "turn-2",
+                    "response_id": "response-2",
+                    "question_id": "question-2",
+                    "reason": "evaluator_unavailable",
+                    "can_retry_same_question": true,
+                },
+            })
+        );
+        let wrong_event = ServerFrame::turn_deferred(
+            "turn-2",
+            &BrainEvent::TranscriptDelta {
+                response_id: "response-2".to_owned(),
+                text: "not a deferral".to_owned(),
+            },
+        )
+        .expect_err("only a durable deferral may construct this event");
+        assert_eq!(wrong_event.code, VoiceProtocolDiagnosticCode::Invariant);
+        let blank_turn = ServerFrame::turn_deferred("", &domain)
+            .expect_err("an unbound turn cannot construct this event");
+        assert_eq!(blank_turn.code, VoiceProtocolDiagnosticCode::InvalidField);
+        assert_eq!(blank_turn.path, "$.event.turn_id");
+
+        // `question_started` is turn-bound too, and the domain event alone cannot supply it.
+        let started = ServerFrame::question_started(
+            "turn-1",
+            &BrainEvent::QuestionStarted {
+                response_id: "response-1".to_owned(),
+                question: agent_domain::fixture_question(),
+            },
+        )
+        .expect("constructs");
+        let started_value = serde_json::to_value(&started).expect("serializes");
+        assert_eq!(started_value["event"]["turn_id"], json!("turn-1"));
+        assert!(ServerFrame::event(BrainEvent::QuestionStarted {
+            response_id: "response-1".to_owned(),
+            question: agent_domain::fixture_question(),
+        })
+        .is_err());
+        assert!(ServerFrame::browser_event(BrainEvent::TurnDeferred {
+            response_id: "response-2".to_owned(),
+            question_id: "question-2".to_owned(),
+            reason: EvaluationDeferralReason::EmptyAnswer,
+            can_retry_same_question: false,
+        })
+        .is_none());
+
+        // Terminal sequences: terminality is a property of the frame, not of the trailer.
+        let terminal_file: TerminalSequenceFile = serde_json::from_str(include_str!(
+            "../../../fixtures/voice-protocol/v5/terminal-sequences.json"
+        ))
+        .expect("terminal sequence file parses strictly");
+        assert_eq!(terminal_file.schema, "viva.voice-terminal-sequences.v1");
+        assert_eq!(terminal_file.protocol_version, VIVA_VOICE_PROTOCOL_VERSION);
+        assert!(!terminal_file.sequences.is_empty());
+        let mut seen = std::collections::BTreeSet::new();
+        for sequence in &terminal_file.sequences {
+            assert!(
+                seen.insert(sequence.id.as_str()),
+                "{} duplicated",
+                sequence.id
+            );
+            let mut first_terminal: Option<(usize, String)> = None;
+            for (index, wire_json) in sequence.wire_sequence_json.iter().enumerate() {
+                let frame = parse_server_frame_json(wire_json)
+                    .unwrap_or_else(|error| panic!("{} [{index}]: {error}", sequence.id));
+                assert_eq!(
+                    serde_json::to_string(&frame).expect("frame serializes"),
+                    *wire_json,
+                    "{} [{index}] does not reserialize byte for byte",
+                    sequence.id
+                );
+                if let ServerFrame::Event { event, .. } = &frame {
+                    if let Some(reason) = event.terminal_reason() {
+                        if first_terminal.is_none() {
+                            let wire = serde_json::to_value(reason).expect("reason serializes");
+                            first_terminal = Some((
+                                index,
+                                wire.as_str().expect("reason is a string").to_owned(),
+                            ));
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                first_terminal.as_ref().map(|(index, _)| *index),
+                sequence.terminal_at_index,
+                "{}",
+                sequence.id
+            );
+            assert_eq!(
+                first_terminal.map(|(_, reason)| reason),
+                sequence.terminal_reason,
+                "{}",
+                sequence.id
+            );
+        }
+
+        // A partial recap remains terminal when the trailing phase frame is lost.
+        let with_trailer = terminal_file
+            .sequences
+            .iter()
+            .find(|sequence| sequence.id == "VOICE-TERMINAL-PARTIAL-RECAP-THEN-PHASE")
+            .expect("partial recap sequence");
+        let without_trailer = terminal_file
+            .sequences
+            .iter()
+            .find(|sequence| sequence.id == "VOICE-TERMINAL-PARTIAL-RECAP-TRAILING-PHASE-LOST")
+            .expect("truncated partial recap sequence");
+        assert_eq!(
+            without_trailer.wire_sequence_json,
+            vec![with_trailer.wire_sequence_json[0].clone()]
+        );
+        assert_eq!(
+            without_trailer.terminal_reason,
+            with_trailer.terminal_reason
+        );
+        assert_eq!(without_trailer.terminal_at_index, Some(0));
+
+        // Structured-error terminality is explicit in both directions.
+        // Split so the source scan above still proves this module carries no D-03 branch.
+        let policy_denied_code = format!("VOICE_SESSION_REFRESH{}", "_POLICY_DENIED");
+        let recoverable = parse_server_frame_json(
+            &json!({
+                "type": "event",
+                "version": 5,
+                "event": {
+                    "type": "structured_error",
+                    "source": "agent-service",
+                    "code": policy_denied_code,
+                    "message": "Session refresh is not authorized.",
+                    "terminality": "recoverable",
+                },
+            })
+            .to_string(),
+        )
+        .expect("a recoverable policy denial parses");
+        if let ServerFrame::Event { event, .. } = &recoverable {
+            assert_eq!(event.terminal_reason(), None);
+        } else {
+            panic!("expected an event frame");
+        }
+        let recoverable_with_reason = parse_server_frame_json(
+            &json!({
+                "type": "event",
+                "version": 5,
+                "event": {
+                    "type": "structured_error",
+                    "source": "agent-service",
+                    "code": policy_denied_code,
+                    "message": "Session refresh is not authorized.",
+                    "terminality": "recoverable",
+                    "terminal_reason": "provider_timeout",
+                },
+            })
+            .to_string(),
+        )
+        .map(|_| ())
+        .expect_err("a recoverable error may not carry a terminal reason");
+        assert_eq!(
+            recoverable_with_reason.code,
+            VoiceProtocolDiagnosticCode::Invariant
+        );
+        assert_eq!(recoverable_with_reason.path, "$.event.terminal_reason");
+        let terminal_without_reason = parse_server_frame_json(
+            &json!({
+                "type": "event",
+                "version": 5,
+                "event": {
+                    "type": "structured_error",
+                    "source": "agent-service",
+                    "code": "VOICE_PROVIDER_FAILURE",
+                    "message": "Provider failed.",
+                    "terminality": "terminal",
+                },
+            })
+            .to_string(),
+        )
+        .map(|_| ())
+        .expect_err("a terminal error must carry its reason");
+        assert_eq!(
+            terminal_without_reason.code,
+            VoiceProtocolDiagnosticCode::MissingField
+        );
+        assert_eq!(terminal_without_reason.path, "$.event.terminal_reason");
+
+        // The owner-provided v5 serialization fallback round-trips to its own typed error.
+        assert_eq!(
+            VOICE_SERIALIZATION_FALLBACK_FRAME,
+            "{\"type\":\"error\",\"version\":5,\"error\":{\"code\":\"VOICE_INTERNAL_SERIALIZATION\",\"message\":\"Server frame serialization failed.\",\"retryable\":true}}"
+        );
+        let fallback =
+            parse_server_frame_json(VOICE_SERIALIZATION_FALLBACK_FRAME).expect("fallback parses");
+        assert_eq!(
+            serde_json::to_string(&fallback).expect("fallback serializes"),
+            VOICE_SERIALIZATION_FALLBACK_FRAME
+        );
+        assert_eq!(
+            fallback,
+            ServerFrame::error(
+                VoiceServerErrorCode::InternalSerialization,
+                "Server frame serialization failed."
+            )
+        );
+
+        // Termination classification: fixture-driven, priority-ordered, text-free.
+        let transport_file: TransportOutcomeFile = serde_json::from_str(include_str!(
+            "../../../fixtures/voice-protocol/v5/transport-outcomes.json"
+        ))
+        .expect("transport outcome file parses strictly");
+        assert_eq!(transport_file.schema, "viva.voice-transport-outcomes.v1");
+        assert_eq!(transport_file.protocol_version, VIVA_VOICE_PROTOCOL_VERSION);
+        assert!(!transport_file.cases.is_empty());
+        let mut codes = std::collections::BTreeSet::new();
+        let mut reasons = std::collections::BTreeSet::new();
+        let mut ids = std::collections::BTreeSet::new();
+        for outcome in &transport_file.cases {
+            assert!(ids.insert(outcome.id.as_str()), "{} duplicated", outcome.id);
+            let classified = classify_voice_termination(&outcome.input);
+            assert_eq!(
+                serde_json::to_value(&classified).expect("classification serializes"),
+                outcome.expected,
+                "{}",
+                outcome.id
+            );
+            if let Some(error) = &outcome.input.error {
+                codes.insert(error.code.clone());
+                let rendered = serde_json::to_string(&classified).expect("serializes");
+                assert!(
+                    !rendered.contains(&error.message),
+                    "{} leaked a close message",
+                    outcome.id
+                );
+            }
+            if let Some(reason) = &outcome.input.terminal_reason {
+                reasons.insert(
+                    serde_json::to_value(reason)
+                        .expect("reason serializes")
+                        .as_str()
+                        .expect("reason is a string")
+                        .to_owned(),
+                );
+            }
+        }
+        assert_eq!(
+            codes,
+            VoiceServerErrorCode::ALL
+                .into_iter()
+                .map(|code| code.as_str().to_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(
+            reasons.len(),
+            TerminalSessionReason::ALL.len(),
+            "every terminal reason must be covered"
+        );
+
+        // A terminal reason outranks a typed error, and hostile prose changes nothing.
+        assert_eq!(
+            classify_voice_termination(&VoiceTerminationInput {
+                error: Some(ServerError::new(
+                    VoiceServerErrorCode::AuthExpired,
+                    "Expired."
+                )),
+                terminal_reason: Some(TerminalSessionReason::ProviderTimeout),
+                close_code: 1011,
+                was_clean: false,
+            }),
+            VoiceTermination::Terminal {
+                terminal_reason: TerminalSessionReason::ProviderTimeout,
+                retryable: false,
+                close_code: 1011,
+            }
+        );
+        assert_eq!(
+            classify_voice_termination(&VoiceTerminationInput {
+                error: Some(ServerError::new(
+                    VoiceServerErrorCode::ClientFrameMalformed,
+                    "terminal drained retry now 1000 clean",
+                )),
+                terminal_reason: None,
+                close_code: 1008,
+                was_clean: true,
+            }),
+            VoiceTermination::Protocol {
+                error_code: VoiceServerErrorCode::ClientFrameMalformed,
+                retryable: false,
+                close_code: 1008,
+            }
+        );
+        assert_eq!(
+            classify_voice_termination(&VoiceTerminationInput {
+                error: None,
+                terminal_reason: None,
+                close_code: 1000,
+                was_clean: true,
+            }),
+            VoiceTermination::Normal {
+                retryable: false,
+                close_code: 1000,
+            }
+        );
+        assert_eq!(
+            classify_voice_termination(&VoiceTerminationInput {
+                error: None,
+                terminal_reason: None,
+                close_code: 1000,
+                was_clean: false,
+            }),
+            VoiceTermination::Transport {
+                retryable: true,
+                close_code: 1000,
+            }
+        );
     }
 }

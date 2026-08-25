@@ -46,7 +46,7 @@
     },
     {
       "id": "VOICE-SERVER-VALID-EVENT-QUESTION-STARTED",
-      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"turn_id\":\"turn-1\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
       "valid": true,
       "diagnostic_code": null,
       "path": null
@@ -116,14 +116,14 @@
     },
     {
       "id": "VOICE-SERVER-VALID-EVENT-RECAP-READY",
-      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0}}}",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":false}}",
       "valid": true,
       "diagnostic_code": null,
       "path": null
     },
     {
       "id": "VOICE-SERVER-VALID-EVENT-RECAP-READY-PARTIAL",
-      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial_reason\":\"provider_timeout\"}}",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":true,\"partial_reason\":\"provider_timeout\"}}",
       "valid": true,
       "diagnostic_code": null,
       "path": null
@@ -151,7 +151,21 @@
     },
     {
       "id": "VOICE-SERVER-VALID-EVENT-STRUCTURED-ERROR",
-      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"message\":\"telemetry event suppressed\"}}",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_TELEMETRY_EVENT_SUPPRESSED\",\"message\":\"telemetry event suppressed\",\"terminality\":\"recoverable\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-STRUCTURED-ERROR-TERMINAL",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_PROVIDER_FAILURE\",\"message\":\"Provider stream failed.\",\"terminality\":\"terminal\",\"terminal_reason\":\"provider_malformed_stream\"}}",
+      "valid": true,
+      "diagnostic_code": null,
+      "path": null
+    },
+    {
+      "id": "VOICE-SERVER-VALID-EVENT-TURN-DEFERRED",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true}}",
       "valid": true,
       "diagnostic_code": null,
       "path": null
@@ -298,21 +312,21 @@
     },
     {
       "id": "VOICE-SERVER-REJECT-UNKNOWN-QUESTION-KEY",
-      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"},\"tenant\":\"fixture-tenant\"}}}",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"turn_id\":\"turn-1\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"},\"tenant\":\"fixture-tenant\"}}}",
       "valid": false,
       "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
       "path": "$.event.question.tenant"
     },
     {
       "id": "VOICE-SERVER-REJECT-MISSING-QUESTION-CONCEPT",
-      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"turn_id\":\"turn-1\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
       "valid": false,
       "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
       "path": "$.event.question.concept_id"
     },
     {
       "id": "VOICE-SERVER-REJECT-UNKNOWN-RUBRIC-CRITERION-KEY",
-      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true,\"tenant\":\"fixture-tenant\"}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"turn_id\":\"turn-1\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true,\"tenant\":\"fixture-tenant\"}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
       "valid": false,
       "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
       "path": "$.event.question.rubric.criteria[0].tenant"
@@ -361,38 +375,136 @@
     },
     {
       "id": "VOICE-SERVER-REJECT-UNKNOWN-RECAP-KEY",
-      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0,\"tenant\":\"fixture-tenant\"}}}",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0,\"tenant\":\"fixture-tenant\"},\"partial\":false}}",
       "valid": false,
       "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
       "path": "$.event.recap.tenant"
     },
     {
       "id": "VOICE-SERVER-REJECT-UNKNOWN-RECAP-MOMENT-KEY",
-      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\",\"tenant\":\"fixture-tenant\"}],\"deferred_turns\":0}}}",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\",\"tenant\":\"fixture-tenant\"}],\"deferred_turns\":0},\"partial\":false}}",
       "valid": false,
       "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
       "path": "$.event.recap.source_moments[0].tenant"
     },
     {
       "id": "VOICE-SERVER-REJECT-RECAP-REVIEW-AUTHORITY",
-      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"client_guess\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0}}}",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"client_guess\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":false}}",
       "valid": false,
       "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
       "path": "$.event.recap.review_schedule[0].authority"
     },
     {
       "id": "VOICE-SERVER-REJECT-UNKNOWN-RECAP-CONCEPT-KEY",
-      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\",\"tenant\":\"fixture-tenant\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0}}}",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\",\"tenant\":\"fixture-tenant\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":false}}",
       "valid": false,
       "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
       "path": "$.event.recap.concepts[0].tenant"
     },
     {
       "id": "VOICE-SERVER-REJECT-RECAP-PARTIAL-REASON",
-      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial_reason\":\"bored\"}}",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":true,\"partial_reason\":\"bored\"}}",
       "valid": false,
       "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
       "path": "$.event.partial_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-RECAP-MISSING-PARTIAL",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.partial"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-RECAP-COMPLETE-WITH-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":false,\"partial_reason\":\"provider_timeout\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVARIANT",
+      "path": "$.event.partial_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-RECAP-PARTIAL-WITHOUT-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"recap_ready\",\"response_id\":\"response-1\",\"recap\":{\"schema\":\"viva.study_session_recap.v2\",\"voice_session_id\":\"voice-session-fixture\",\"headline\":\"Fixture headline.\",\"summary\":\"Fixture summary.\",\"concepts\":[{\"concept_id\":\"concept-fixture-1\",\"label\":\"Fixture concept\",\"status\":\"strong\"}],\"review_schedule\":[{\"concept_id\":\"concept-fixture-1\",\"due_at\":\"2026-09-01T00:00:00Z\",\"authority\":\"server_persisted_fsrs\"}],\"next_action\":\"Fixture next action.\",\"source_moments\":[{\"response_id\":\"response-1\",\"source_id\":\"src-lecture-5-slide-18\"}],\"deferred_turns\":0},\"partial\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.partial_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-QUESTION-STARTED-WITHOUT-TURN",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"question_started\",\"response_id\":\"response-1\",\"question\":{\"question_id\":\"q-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"prompt\":\"Fixture prompt.\",\"expected_terms\":[\"fixture term\"],\"follow_up\":\"Fixture follow up.\",\"rubric\":{\"policy_version\":\"viva.semantic-rubric.v1\",\"criteria\":[{\"criterion_id\":\"crit-fixture-1\",\"concept_id\":\"concept-fixture-1\",\"claim\":\"Fixture claim.\",\"source_id\":\"src-lecture-5-slide-18\",\"required\":true}]},\"source\":{\"source_id\":\"src-lecture-5-slide-18\",\"document_id\":\"lec-5\",\"span\":\"slide:18\",\"excerpt\":\"Fixture excerpt.\",\"confidence\":\"high\",\"retrieval_reason\":\"server fixture source\"}}}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.turn_id"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-DEFERRED-UNKNOWN-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"provider_gave_up\",\"can_retry_same_question\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-DEFERRED-RETRYABLE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"retryable\":true}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.retryable"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-DEFERRED-TERMINAL-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"terminal_reason\":\"provider_timeout\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.terminal_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-DEFERRED-LEARNER-FACT",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"turn_deferred\",\"turn_id\":\"turn-2\",\"response_id\":\"response-2\",\"question_id\":\"question-2\",\"reason\":\"evaluator_unavailable\",\"can_retry_same_question\":true,\"confidence\":0.91}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_UNKNOWN_FIELD",
+      "path": "$.event.confidence"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-STRUCTURED-ERROR-MISSING-CODE",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"message\":\"telemetry event suppressed\",\"terminality\":\"recoverable\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.code"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-STRUCTURED-ERROR-MISSING-TERMINALITY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_TELEMETRY_EVENT_SUPPRESSED\",\"message\":\"telemetry event suppressed\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.terminality"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-STRUCTURED-ERROR-UNKNOWN-TERMINALITY",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_TELEMETRY_EVENT_SUPPRESSED\",\"message\":\"telemetry event suppressed\",\"terminality\":\"fatal\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.terminality"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-STRUCTURED-ERROR-RECOVERABLE-WITH-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_TELEMETRY_EVENT_SUPPRESSED\",\"message\":\"telemetry event suppressed\",\"terminality\":\"recoverable\",\"terminal_reason\":\"provider_timeout\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVARIANT",
+      "path": "$.event.terminal_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-STRUCTURED-ERROR-TERMINAL-WITHOUT-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_PROVIDER_FAILURE\",\"message\":\"Provider stream failed.\",\"terminality\":\"terminal\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_MISSING_FIELD",
+      "path": "$.event.terminal_reason"
+    },
+    {
+      "id": "VOICE-SERVER-REJECT-STRUCTURED-ERROR-TERMINAL-BAD-REASON",
+      "wire_json": "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_PROVIDER_FAILURE\",\"message\":\"Provider stream failed.\",\"terminality\":\"terminal\",\"terminal_reason\":\"bored\"}}",
+      "valid": false,
+      "diagnostic_code": "VOICE_PROTOCOL_INVALID_FIELD",
+      "path": "$.event.terminal_reason"
     },
     {
       "id": "VOICE-SERVER-REJECT-UNKNOWN-MANUSCRIPT-KEY",
