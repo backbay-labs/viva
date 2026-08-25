@@ -11,6 +11,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use agent_domain::tool_executor::VIVA_STUDY_MODE;
 use agent_domain::{
     learning_outcome::{
         VIVA_CHALLENGE_RESOLUTION_SCHEMA, VIVA_SEMANTIC_RUBRIC_POLICY_VERSION,
@@ -57,6 +58,7 @@ use agent_domain::{
     ReviewScheduleSummary,
     ReviewSchedulingContextV1,
     RubricCriterionV1,
+    SessionConfig,
     SessionLearningEvidence,
     SourceConfidence,
     StudyMode,
@@ -4156,4 +4158,177 @@ async fn tool_authority_only_mutation_sequence_is_outcome_transitions_schedule_t
             "record_recap:response-2".to_owned(),
         ]
     );
+}
+
+// ===========================================================================
+// LEARN-005B — D-03B: one oral-exam engine
+//
+// The learner-facing label for that engine is Plan 13's exact `Begin oral exam`
+// action. `quiz` below is the internal identifier the server reports on the
+// wire; nothing here presents it as a second choice a learner could make.
+//
+// Three of these cases assert the Plan-06-owned `brain.rs` vocabulary
+// (`StudyMode` variants, `SessionConfig.initial_goal`) and stay RED in this lane
+// until Plan 06 Task 1A removes `Teach`/`Mock`/`Cram` and `initial_goal`. That
+// RED is Plan 06's required witness, not a defect in the cases below.
+// ===========================================================================
+
+/// A session config carrying only bound identity — the shape D-03B leaves once
+/// mode and goal stop being client inputs.
+fn quiz_only_config() -> Value {
+    json!({
+        "session_id": VOICE_SESSION_ID,
+        "user_id": USER_ID,
+        "study_set_id": STUDY_SET_ID,
+        "source_context": [],
+        "active_concepts": [CONCEPT_ETC, CONCEPT_GRADIENT],
+    })
+}
+
+#[test]
+fn quiz_only_session_config_declares_no_initial_goal() {
+    // Plan 06 owns the removal; this is its receiving contract.
+    let mut raw = quiz_only_config();
+    raw["initial_goal"] = json!("Ace the midterm");
+    let config: SessionConfig =
+        serde_json::from_value(raw).expect("an unknown goal key is ignored, not stored");
+    let encoded = serde_json::to_value(&config).expect("session config serializes");
+    let fields = encoded.as_object().expect("session config is an object");
+    assert!(
+        !fields.contains_key("initial_goal"),
+        "`initial_goal` is not part of the session contract: {encoded}"
+    );
+}
+
+#[test]
+fn quiz_only_mode_vocabulary_is_exactly_quiz() {
+    // Plan 06 owns the removal; this is its receiving contract.
+    assert_eq!(
+        serde_json::to_value(StudyMode::Quiz).expect("mode serializes"),
+        json!(VIVA_STUDY_MODE)
+    );
+    assert_eq!(
+        serde_json::to_value(StudyMode::default()).expect("mode serializes"),
+        json!(VIVA_STUDY_MODE)
+    );
+    for retired in ["teach", "mock", "cram"] {
+        assert!(
+            serde_json::from_value::<StudyMode>(json!(retired)).is_err(),
+            "`{retired}` is not a mode this engine publishes"
+        );
+    }
+}
+
+#[test]
+fn quiz_only_projection_session_rejects_a_non_quiz_mode() {
+    // Plan 06 owns the removal; this is its receiving contract.
+    let session: StudyProjectionSessionV1 = serde_json::from_value(json!({
+        "id": VOICE_SESSION_ID,
+        "mode": VIVA_STUDY_MODE,
+        "goal": Value::Null,
+    }))
+    .expect("the one engine parses");
+    assert_eq!(session.mode, StudyMode::Quiz);
+    assert_eq!(session.goal, None);
+
+    for retired in ["teach", "mock", "cram"] {
+        assert!(
+            serde_json::from_value::<StudyProjectionSessionV1>(json!({
+                "id": VOICE_SESSION_ID,
+                "mode": retired,
+                "goal": Value::Null,
+            }))
+            .is_err(),
+            "the projection must not be able to report mode `{retired}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn quiz_only_non_quiz_session_config_is_refused_at_admission() {
+    for retired in ["teach", "mock", "cram"] {
+        let mut raw = quiz_only_config();
+        raw["mode"] = json!(retired);
+        match serde_json::from_value::<SessionConfig>(raw) {
+            // Once Plan 06 publishes only `Quiz`, a forged mode never parses.
+            Err(_) => {}
+            // Until then, admission itself must refuse it rather than accept a
+            // mode this engine cannot execute.
+            Ok(config) => {
+                let error = AuthorizedStudySession::from_config(&config)
+                    .err()
+                    .unwrap_or_else(|| {
+                        panic!("`{retired}` must be refused at admission, not admitted")
+                    });
+                assert!(
+                    matches!(error, ToolExecutionError::InvalidArguments(_)),
+                    "`{retired}` produced {error:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn quiz_only_authorized_session_never_defaults_an_untrusted_mode() {
+    // The admitted session carries bound identity and nothing else: there is no
+    // mode field for an absent or forged client value to land in. This literal
+    // is the assertion — it does not compile if one comes back.
+    let config: SessionConfig =
+        serde_json::from_value(quiz_only_config()).expect("the bound config parses");
+    let admitted = AuthorizedStudySession::from_config(&config).expect("identity is admitted");
+    let expected = AuthorizedStudySession {
+        user_id: USER_ID.to_owned(),
+        study_set_id: STUDY_SET_ID.to_owned(),
+        voice_session_id: VOICE_SESSION_ID.to_owned(),
+        active_concepts: vec![CONCEPT_ETC.to_owned(), CONCEPT_GRADIENT.to_owned()],
+    };
+    assert_eq!(admitted.user_id, expected.user_id);
+    assert_eq!(admitted.study_set_id, expected.study_set_id);
+    assert_eq!(admitted.voice_session_id, expected.voice_session_id);
+    assert_eq!(admitted.active_concepts, expected.active_concepts);
+
+    // The one engine is what the tool reports, whatever the proposal claims.
+    let fixture = progression_fixture();
+    let store = Arc::new(FakeProgressionStore::from_fixture(&fixture));
+    let result = VivaToolExecutor::with_clock(
+        Arc::clone(&store) as Arc<dyn agent_domain::StudyMemoryStore>,
+        AuthorizedStudySession {
+            user_id: USER_ID.to_owned(),
+            study_set_id: STUDY_SET_ID.to_owned(),
+            voice_session_id: fixture.voice_session_id.clone(),
+            active_concepts: Vec::new(),
+        },
+        Arc::new(UnreachableEvaluator),
+        Arc::new(FixedClock::new(
+            agent_domain::parse_utc_instant(NOW).expect("clock instant parses"),
+        )),
+    )
+    .execute(
+        "sel-1",
+        ToolProposal::select_next_question(STUDY_SET_ID, &fixture.voice_session_id, "cram"),
+    )
+    .await
+    .expect("select_next_question succeeds")
+    .result;
+    assert_eq!(result["mode"], json!(VIVA_STUDY_MODE));
+}
+
+#[tokio::test]
+async fn quiz_only_authenticated_projection_reports_quiz_and_no_goal() {
+    let store = Arc::new(FakeLearningStore::ready());
+    let projection = agent_domain::StudyMemoryStore::authenticated_study_projection(
+        store.as_ref(),
+        USER_ID,
+        STUDY_SET_ID,
+        VOICE_SESSION_ID,
+    )
+    .await
+    .expect("the authenticated projection is readable");
+    assert_eq!(projection.session.mode, StudyMode::Quiz);
+    assert_eq!(projection.session.goal, None);
+
+    let encoded = serde_json::to_value(&projection).expect("projection serializes");
+    assert_eq!(encoded["session"]["mode"], json!(VIVA_STUDY_MODE));
+    assert_eq!(encoded["session"]["goal"], Value::Null);
 }
