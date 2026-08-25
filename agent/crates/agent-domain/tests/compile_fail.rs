@@ -27,3 +27,17 @@ fn port_error_reason_cannot_be_destructured_for_classification() {
 fn study_store_write_outcome_cannot_be_dropped_silently() {
     trybuild::TestCases::new().compile_fail("tests/ui/study_store_write_outcome_unused.rs");
 }
+
+/// Plan 06 Task 3A Step 2A (`DOMAIN-011`): the recorded D-04 selector is
+/// `CONFIRM_DELETE`, so the domain compiles no soft-delete/restore surface at all.
+/// These two cases are registered only on the selected branch; under
+/// `SOFT_DELETE_UNDO` they would be replaced by `tests/deletion_contract.rs`.
+#[test]
+fn confirm_delete_publishes_no_restore_types() {
+    trybuild::TestCases::new().compile_fail("tests/ui/d04_restore_types_absent.rs");
+}
+
+#[test]
+fn confirm_delete_publishes_no_restore_or_finalizer_ports() {
+    trybuild::TestCases::new().compile_fail("tests/ui/d04_restore_methods_absent.rs");
+}

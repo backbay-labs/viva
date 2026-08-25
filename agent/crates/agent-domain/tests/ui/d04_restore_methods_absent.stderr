@@ -1,0 +1,17 @@
+error[E0599]: no method named `restore_study_set` found for reference `&dyn StudyMemoryStore` in the current scope
+  --> tests/ui/d04_restore_methods_absent.rs:14:11
+   |
+14 |     store.restore_study_set().await;
+   |           ^^^^^^^^^^^^^^^^^
+   |
+help: there is a method `delete_study_set` with a similar name, but with different arguments
+  --> src/ports.rs
+   |
+   | #[async_trait]
+   | ^^^^^^^^^^^^^^
+
+error[E0599]: no method named `finalize_expired_study_set_deletions` found for reference `&dyn StudyMemoryStore` in the current scope
+  --> tests/ui/d04_restore_methods_absent.rs:15:11
+   |
+15 |     store.finalize_expired_study_set_deletions(100).await;
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&dyn StudyMemoryStore`

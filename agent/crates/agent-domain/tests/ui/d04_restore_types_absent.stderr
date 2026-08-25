@@ -1,0 +1,10 @@
+error[E0432]: unresolved imports `agent_domain::RestoreStudySetInputV1`, `agent_domain::RestoreStudySetOutcomeKindV1`, `agent_domain::RestoreStudySetOutcomeV1`, `agent_domain::SoftDeleteReceiptV1`
+  --> tests/ui/d04_restore_types_absent.rs:15:5
+   |
+15 |     RestoreStudySetInputV1, RestoreStudySetOutcomeKindV1, RestoreStudySetOutcomeV1,
+   |     ^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^ no `RestoreStudySetOutcomeV1` in the root
+   |     |                       |
+   |     |                       no `RestoreStudySetOutcomeKindV1` in the root
+   |     no `RestoreStudySetInputV1` in the root
+16 |     SoftDeleteReceiptV1,
+   |     ^^^^^^^^^^^^^^^^^^^ no `SoftDeleteReceiptV1` in the root
