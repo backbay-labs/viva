@@ -73,6 +73,21 @@ pub struct StudySessionDurableCounts {
     pub prior_recaps: usize,
 }
 
+/// Plan 06 Task 4 (`DOMAIN-008`): the domain bounds on answer evidence.
+///
+/// 45 seconds x 24,000 Hz x 2 PCM16 bytes is the largest answer capture the
+/// BAC-510 turn bound can produce, so it is also the largest byte count any
+/// store may be asked to record.
+pub const MAX_ANSWER_BYTE_COUNT: u64 = 2_160_000;
+/// The largest typed answer, in characters.
+pub const MAX_ANSWER_CHAR_COUNT: u64 = 65_536;
+/// The BAC-510 maximum submitted-answer resolution, in milliseconds.
+pub const MAX_ANSWER_DURATION_MS: u64 = 45_000;
+/// `AnswerContentPolicy::DigestOnly` stores exactly one durable content trace:
+/// an HMAC-SHA256 digest rendered as this many lowercase hexadecimal
+/// characters.
+pub const ANSWER_DIGEST_HMAC_HEX_LENGTH: usize = 64;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnswerCaptureMode {
@@ -156,11 +171,80 @@ impl AnswerAttemptEnvelope {
         if self.pre_provider_state.trim().is_empty() {
             return Err("answer attempt envelope is missing pre_provider_state");
         }
-        if self.content_policy == AnswerContentPolicy::None && self.answer_digest_hmac.is_some() {
-            return Err("answer digest requires digest_only content policy");
+
+        // The content-policy converse, both ways: `DigestOnly` means exactly one
+        // durable content trace and `None` means none at all. The digest shape is
+        // checked on ASCII bytes; an invalid digest is never trimmed, lowercased,
+        // or re-encoded into acceptance.
+        match (self.content_policy, self.answer_digest_hmac.as_deref()) {
+            (AnswerContentPolicy::DigestOnly, None) => {
+                return Err("digest_only content policy requires answer_digest_hmac");
+            }
+            (AnswerContentPolicy::DigestOnly, Some(digest)) => {
+                if !is_canonical_answer_digest_hmac(digest) {
+                    return Err("answer_digest_hmac must be 64 lowercase hexadecimal characters");
+                }
+            }
+            (AnswerContentPolicy::None, Some(_)) => {
+                return Err("answer digest requires digest_only content policy");
+            }
+            (AnswerContentPolicy::None, None) => {}
         }
+
+        // Capture-mode field presence and absence. A byte count is the one
+        // measure both modes record; a character count is typed-only evidence and
+        // an audio capture is a whole number of PCM16 samples.
+        let Some(byte_count) = self.byte_count else {
+            return Err("answer attempt envelope is missing byte_count");
+        };
+        match self.capture_mode {
+            AnswerCaptureMode::Typed => {
+                if self.char_count.is_none() {
+                    return Err("typed answer capture requires char_count");
+                }
+            }
+            AnswerCaptureMode::Audio => {
+                if self.char_count.is_some() {
+                    return Err("audio answer capture must not carry char_count");
+                }
+                if byte_count % 2 != 0 {
+                    return Err("audio answer capture requires an even PCM16 byte_count");
+                }
+            }
+        }
+
+        // Positive, inclusive bounds. A present count of zero is not evidence of
+        // an empty answer; it is an envelope that cannot be trusted.
+        if byte_count == 0 || byte_count > MAX_ANSWER_BYTE_COUNT {
+            return Err("answer byte_count must be positive and within MAX_ANSWER_BYTE_COUNT");
+        }
+        if let Some(char_count) = self.char_count {
+            if char_count == 0 || char_count > MAX_ANSWER_CHAR_COUNT {
+                return Err("answer char_count must be positive and within MAX_ANSWER_CHAR_COUNT");
+            }
+        }
+        if let Some(duration_ms) = self.duration_ms {
+            if duration_ms == 0 || duration_ms > MAX_ANSWER_DURATION_MS {
+                return Err(
+                    "answer duration_ms must be positive and within MAX_ANSWER_DURATION_MS",
+                );
+            }
+        }
+
         Ok(())
     }
+}
+
+/// Exactly `ANSWER_DIGEST_HMAC_HEX_LENGTH` lowercase hexadecimal ASCII bytes.
+///
+/// Byte length is the right measure here: every accepted character is ASCII, so
+/// a value whose byte length differs from its character length is rejected by
+/// construction rather than by a separate check.
+fn is_canonical_answer_digest_hmac(digest: &str) -> bool {
+    digest.len() == ANSWER_DIGEST_HMAC_HEX_LENGTH
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 #[derive(Clone, Debug, PartialEq)]

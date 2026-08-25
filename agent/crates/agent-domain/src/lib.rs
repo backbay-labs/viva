@@ -63,7 +63,8 @@ pub use ports::{
     StudyLibrarySnapshot, StudyMemoryStore, StudySessionDurableCounts, StudySetIngestionRecord,
     StudySetIngestionStatus, StudySetSummary, StudySourceSpanSummary, StudyStoreBackend,
     StudyStoreCapabilities, StudyStoreWriteCounts, StudyStoreWriteOutcome, ToolIssuer,
-    VoiceUsageRecord,
+    VoiceUsageRecord, ANSWER_DIGEST_HMAC_HEX_LENGTH, MAX_ANSWER_BYTE_COUNT, MAX_ANSWER_CHAR_COUNT,
+    MAX_ANSWER_DURATION_MS,
 };
 pub use review_schedule::{
     decide_review_schedule, format_rfc3339_millis, parse_utc_instant, status_rating, Clock,
