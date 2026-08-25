@@ -20,6 +20,20 @@ const FRAME_BYTE_LENGTH = pcm16FrameByteLength({ sampleRateHz: VIVA_AUDIO_SAMPLE
 const FRAME_SAMPLE_LENGTH = FRAME_BYTE_LENGTH / VIVA_PCM16_BYTES_PER_SAMPLE;
 const SUCCESS: AudioApiResult = { status: "success" };
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  reject: (error: unknown) => void;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((nextResolve, nextReject) => {
+    resolve = nextResolve;
+    reject = nextReject;
+  });
+  return { promise, reject, resolve };
+}
+
 type FakeRecorderOptions = {
   onAudioReadyResult?: AudioApiResult;
   startResult?: Promise<AudioApiResult>;
@@ -95,11 +109,14 @@ class FakeAudioManager implements AudioManagerLike {
   readonly activity: boolean[] = [];
   readonly permissionCalls: number[] = [];
 
-  constructor(readonly permission: PermissionStatus = "Granted") {}
+  constructor(
+    readonly permission: PermissionStatus = "Granted",
+    private readonly permissionResult?: Promise<PermissionStatus>,
+  ) {}
 
   requestRecordingPermissions(): Promise<PermissionStatus> {
     this.permissionCalls.push(1);
-    return Promise.resolve(this.permission);
+    return this.permissionResult ?? Promise.resolve(this.permission);
   }
 
   async setAudioSessionActivity(enabled: boolean): Promise<void> {
@@ -171,6 +188,71 @@ describe("createMobileVivaAudioCaptureSource", () => {
       expect(manager.activity).toEqual([]);
       expect(recorder.calls.start).toBe(0);
     }
+  });
+
+  test("cancels permission-pending starts before creating a recorder", async () => {
+    const permission = deferred<PermissionStatus>();
+    const recorder = new FakeRecorder();
+    const manager = new FakeAudioManager("Granted", permission.promise);
+    let recorderFactoryCalls = 0;
+    const source = createMobileVivaAudioCaptureSource({
+      audioManager: manager,
+      recorderFactory: () => {
+        recorderFactoryCalls += 1;
+        return recorder;
+      },
+    });
+
+    const startPromise = source.start(() => {});
+    await flush();
+    const firstStop = Promise.resolve(source.stop());
+    const secondStop = Promise.resolve(source.stop());
+    let stopSettled = false;
+    void firstStop.then(() => {
+      stopSettled = true;
+    });
+    await flush();
+
+    expect(stopSettled).toBe(false);
+    expect(manager.permissionCalls).toEqual([1]);
+    expect(recorderFactoryCalls).toBe(0);
+
+    permission.resolve("Granted");
+    await Promise.all([startPromise, firstStop, secondStop]);
+
+    expect(recorderFactoryCalls).toBe(0);
+    expect(recorder.calls.start).toBe(0);
+    expect(recorder.calls.stop).toBe(0);
+    expect(manager.activity).toEqual([]);
+  });
+
+  test("waits for a deferred native start before stopping and deactivating the session", async () => {
+    const nativeStart = deferred<AudioApiResult>();
+    const recorder = new FakeRecorder({ startResult: nativeStart.promise });
+    const { manager, source } = makeSource(recorder);
+
+    const startPromise = source.start(() => {});
+    await flush();
+    expect(recorder.calls.start).toBe(1);
+    expect(manager.activity).toEqual([true]);
+
+    const firstStop = Promise.resolve(source.stop());
+    const secondStop = Promise.resolve(source.stop());
+    let stopSettled = false;
+    void firstStop.then(() => {
+      stopSettled = true;
+    });
+    await flush();
+    expect(stopSettled).toBe(false);
+    expect(recorder.calls.stop).toBe(0);
+
+    nativeStart.resolve(SUCCESS);
+    await Promise.all([startPromise, firstStop, secondStop]);
+
+    expect(recorder.calls.stop).toBe(1);
+    expect(recorder.calls.clearOnAudioReady).toBe(1);
+    expect(recorder.calls.clearOnError).toBe(1);
+    expect(manager.activity).toEqual([true, false]);
   });
 
   test("registers the shared frame size and streams two 24 kHz buffers with finite RMS", async () => {

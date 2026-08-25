@@ -144,6 +144,12 @@ function invokeSafely(callback: (() => void) | undefined): void {
   }
 }
 
+type CaptureGeneration = {
+  cancelled: boolean;
+  id: number;
+  promise: Promise<void>;
+};
+
 export function createMobileVivaAudioCaptureSource(
   options: MobileVivaAudioCaptureSourceOptions = {},
 ): VivaAudioCaptureSource {
@@ -153,6 +159,8 @@ export function createMobileVivaAudioCaptureSource(
   let audioSessionActive = false;
   let callbacksCleared = true;
   let teardownPromise: Promise<void> | null = null;
+  let generationId = 0;
+  let currentGeneration: CaptureGeneration | null = null;
   let endHandler: ((reason: "devicechange" | "processor_error" | "stopped") => void) | undefined;
   let errorHandler: ((error: unknown) => void) | undefined;
 
@@ -198,25 +206,42 @@ export function createMobileVivaAudioCaptureSource(
     }
   };
 
-  const teardown = (): Promise<void> => {
+  const ownsGeneration = (generation: CaptureGeneration): boolean =>
+    currentGeneration === generation &&
+    currentGeneration.id === generation.id &&
+    !generation.cancelled;
+
+  const cleanupResources = async (): Promise<void> => {
+    const currentRecorder = recorder;
+    if (currentRecorder) {
+      try {
+        const result = await currentRecorder.stop();
+        inspectResult("AudioRecorder.stop", result);
+      } catch (error) {
+        reportError(error);
+      }
+    }
+    await deactivateAudioSession();
+    recorder = null;
+    audioManager = null;
+    endHandler = undefined;
+    errorHandler = undefined;
+  };
+
+  const teardown = (
+    generation: CaptureGeneration | null = currentGeneration,
+    waitForStart = true,
+  ): Promise<void> => {
     if (teardownPromise) return teardownPromise;
+    if (generation) generation.cancelled = true;
     active = false;
     clearCallbacks();
-    const currentRecorder = recorder;
+
+    const pendingStart = waitForStart ? generation?.promise : undefined;
     teardownPromise = (async () => {
-      if (currentRecorder) {
-        try {
-          const result = await currentRecorder.stop();
-          inspectResult("AudioRecorder.stop", result);
-        } catch (error) {
-          reportError(error);
-        }
-      }
-      await deactivateAudioSession();
-      recorder = null;
-      audioManager = null;
-      endHandler = undefined;
-      errorHandler = undefined;
+      if (pendingStart) await pendingStart.catch(() => undefined);
+      await cleanupResources();
+      if (currentGeneration === generation) currentGeneration = null;
     })();
     return teardownPromise;
   };
@@ -227,97 +252,120 @@ export function createMobileVivaAudioCaptureSource(
 
   const source: VivaAudioCaptureSource = {
     sampleRateHz: VIVA_AUDIO_SAMPLE_RATE_HZ,
-    async start(onSamples, startOptions?: MobileVivaAudioCaptureStartOptions) {
-      if (active) return;
+    start(onSamples, startOptions?: MobileVivaAudioCaptureStartOptions) {
+      if (active) return Promise.resolve();
+      if (currentGeneration && !currentGeneration.cancelled) {
+        return currentGeneration.promise;
+      }
       if (teardownPromise) {
-        await teardownPromise;
-        teardownPromise = null;
-      }
-
-      const nextAudioManager =
-        options.audioManager ?? options.audioManagerFactory?.() ?? defaultAudioManagerFactory();
-
-      try {
-        const permission = await nextAudioManager.requestRecordingPermissions();
-        if (permission !== "Granted") {
-          throw new MobileAudioPermissionError(permission);
-        }
-
-        recorder = (options.recorderFactory ?? defaultRecorderFactory)();
-        audioManager = nextAudioManager;
-        active = true;
-        callbacksCleared = false;
-        endHandler = startOptions?.onEnded;
-        errorHandler = startOptions?.onError;
-
-        inspectResult(
-          "AudioManager.setAudioSessionOptions",
-          audioManager.setAudioSessionOptions({
-            iosCategory: "playAndRecord",
-            iosOptions: ["defaultToSpeaker"],
-          }),
-        );
-        const activityResult = await audioManager.setAudioSessionActivity(true);
-        inspectResult("AudioManager.setAudioSessionActivity(true)", activityResult);
-        audioSessionActive = true;
-
-        const bufferLength =
-          pcm16FrameByteLength({ sampleRateHz: VIVA_AUDIO_SAMPLE_RATE_HZ }) /
-          VIVA_PCM16_BYTES_PER_SAMPLE;
-        inspectResult(
-          "AudioRecorder.onAudioReady",
-          recorder.onAudioReady(
-            {
-              bufferLength,
-              channelCount: 1,
-              sampleRate: VIVA_AUDIO_SAMPLE_RATE_HZ,
-            },
-            (event) => {
-              if (!active || !recorder) return;
-              try {
-                const samples = event.buffer.getChannelData(0);
-                const sampleRateHz = validSampleRate(event.buffer.sampleRate)
-                  ? event.buffer.sampleRate
-                  : VIVA_AUDIO_SAMPLE_RATE_HZ;
-                const frame = {
-                  rms: finiteRms(samples),
-                  sampleRateHz,
-                  samples,
-                };
-                onSamples(samples, sampleRateHz, frame);
-              } catch (error) {
-                reportError(error);
-                active = false;
-                clearCallbacks();
-                notifyEnded("processor_error");
-                void teardown();
-              }
-            },
-          ),
-        );
-
-        recorder.onError((error) => {
-          if (!active) return;
-          reportError(error);
-          active = false;
-          clearCallbacks();
-          notifyEnded("processor_error");
-          void teardown();
+        const pendingTeardown = teardownPromise;
+        return pendingTeardown.then(() => {
+          if (teardownPromise === pendingTeardown) teardownPromise = null;
+          return source.start(onSamples, startOptions);
         });
-
-        if (!active) throw new Error("AudioRecorder capture stopped during setup");
-        const startResult = await recorder.start();
-        inspectResult("AudioRecorder.start", startResult);
-        if (!active) throw new Error("AudioRecorder capture stopped during start");
-      } catch (error) {
-        const startError = errorFromUnknown(error);
-        await teardown();
-        throw startError;
       }
+
+      const generation: CaptureGeneration = {
+        cancelled: false,
+        id: ++generationId,
+        promise: Promise.resolve(),
+      };
+      currentGeneration = generation;
+
+      const runStart = async (): Promise<void> => {
+        try {
+          const nextAudioManager =
+            options.audioManager ?? options.audioManagerFactory?.() ?? defaultAudioManagerFactory();
+          const permission = await nextAudioManager.requestRecordingPermissions();
+          if (!ownsGeneration(generation)) return;
+          if (permission !== "Granted") {
+            throw new MobileAudioPermissionError(permission);
+          }
+
+          if (!ownsGeneration(generation)) return;
+          const nextRecorder = (options.recorderFactory ?? defaultRecorderFactory)();
+          recorder = nextRecorder;
+          audioManager = nextAudioManager;
+          active = true;
+          callbacksCleared = false;
+          endHandler = startOptions?.onEnded;
+          errorHandler = startOptions?.onError;
+
+          inspectResult(
+            "AudioManager.setAudioSessionOptions",
+            audioManager.setAudioSessionOptions({
+              iosCategory: "playAndRecord",
+              iosOptions: ["defaultToSpeaker"],
+            }),
+          );
+          const activityResult = await audioManager.setAudioSessionActivity(true);
+          inspectResult("AudioManager.setAudioSessionActivity(true)", activityResult);
+          audioSessionActive = true;
+          if (!ownsGeneration(generation)) return;
+
+          const bufferLength =
+            pcm16FrameByteLength({ sampleRateHz: VIVA_AUDIO_SAMPLE_RATE_HZ }) /
+            VIVA_PCM16_BYTES_PER_SAMPLE;
+          inspectResult(
+            "AudioRecorder.onAudioReady",
+            nextRecorder.onAudioReady(
+              {
+                bufferLength,
+                channelCount: 1,
+                sampleRate: VIVA_AUDIO_SAMPLE_RATE_HZ,
+              },
+              (event) => {
+                if (!active || !ownsGeneration(generation) || recorder !== nextRecorder) return;
+                try {
+                  const samples = event.buffer.getChannelData(0);
+                  const sampleRateHz = validSampleRate(event.buffer.sampleRate)
+                    ? event.buffer.sampleRate
+                    : VIVA_AUDIO_SAMPLE_RATE_HZ;
+                  const frame = {
+                    rms: finiteRms(samples),
+                    sampleRateHz,
+                    samples,
+                  };
+                  onSamples(samples, sampleRateHz, frame);
+                } catch (error) {
+                  reportError(error);
+                  active = false;
+                  clearCallbacks();
+                  notifyEnded("processor_error");
+                  void teardown(generation);
+                }
+              },
+            ),
+          );
+
+          nextRecorder.onError((error) => {
+            if (!active || !ownsGeneration(generation)) return;
+            reportError(error);
+            active = false;
+            clearCallbacks();
+            notifyEnded("processor_error");
+            void teardown(generation);
+          });
+
+          if (!ownsGeneration(generation)) return;
+          const startResult = await nextRecorder.start();
+          inspectResult("AudioRecorder.start", startResult);
+          if (!ownsGeneration(generation)) return;
+        } catch (error) {
+          if (generation.cancelled || currentGeneration !== generation || teardownPromise) return;
+          const startError = errorFromUnknown(error);
+          await teardown(generation, false);
+          throw startError;
+        }
+      };
+
+      const startPromise = runStart();
+      generation.promise = startPromise;
+      return startPromise;
     },
     stop() {
-      if (!active && !teardownPromise) return Promise.resolve();
-      return teardown();
+      if (!active && !currentGeneration && !teardownPromise) return Promise.resolve();
+      return teardown(currentGeneration);
     },
   };
 
