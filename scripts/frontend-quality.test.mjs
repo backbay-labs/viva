@@ -49,6 +49,16 @@ import { vivaContrastPairs } from "../packages/tokens/src/index.ts";
  * `scripts/frontend-accessibility.mjs --assets` proves the same thing by
  * observing real network requests from a mounted page.
  *
+ * `checkTargetSize` (added by Task 7) is the static, no-browser half of the
+ * `FRONTEND-012` 44x44 touch-target claim for `apps/web/app/error.tsx`'s
+ * "Try again" button: it resolves the combined `.button`/`.button-primary`
+ * class rules to a numeric px block size and rejects any width cap below
+ * the target. It exists because Next's global error boundary only mounts
+ * after a real render-time exception, which `scripts/frontend-accessibility.mjs`'s
+ * normal page navigation never triggers — every other 44px button target
+ * in this codebase is proven by that script's real Playwright-measured
+ * bounding boxes instead.
+ *
  * Later tasks extend this file with further asset checks; they must keep
  * reusing these checkers rather than re-implementing their parsing.
  */
@@ -1495,4 +1505,232 @@ test("checkNoRemoteFontLinks accepts the real, self-hosted layout.tsx", () => {
   const result = checkNoRemoteFontLinks(layoutSource);
   assert.deepEqual(result.errors, []);
   assert.equal(result.ok, true);
+});
+
+/*
+ * Touch-target size checker (`FRONTEND-012`, Task 7): the static,
+ * no-browser half of `error.tsx`'s "Try again" button's 44x44 CSS px
+ * touch-target claim. See `checkTargetSize`'s own doc comment for why this
+ * one button is proven statically here instead of by
+ * `scripts/frontend-accessibility.mjs`.
+ */
+
+/**
+ * Resolves a single CSS length declaration to a numeric CSS px value.
+ * Supports bare `px`/`rem` literals (16px root — the browser default this
+ * app relies on everywhere; nothing in `apps/web/app/styles/base.css`
+ * overrides `html`'s font-size, matching `--viva-target-min: 44px` ==
+ * `2.75rem` elsewhere in this file) and `var(--custom-property[,
+ * fallback])`, resolved against `tokenLiterals` and falling back to the
+ * `var()`'s own fallback argument when the referenced token is absent from
+ * `tokenLiterals`. Returns `null` — never `0` or a guess — for anything
+ * this cannot reduce to a literal number, so "unresolvable" and "resolved
+ * but insufficient" stay distinct, explicit failure states.
+ *
+ * @param {string} value
+ * @param {Record<string, string>} tokenLiterals
+ * @returns {number | null}
+ */
+function resolveLengthPx(value, tokenLiterals) {
+  const trimmed = value.trim();
+  const pxMatch = /^(-?[\d.]+)px$/.exec(trimmed);
+  if (pxMatch) return Number.parseFloat(pxMatch[1]);
+  const remMatch = /^(-?[\d.]+)rem$/.exec(trimmed);
+  if (remMatch) return Number.parseFloat(remMatch[1]) * 16;
+  const varMatch = /^var\(\s*(--[\w-]+)\s*(?:,\s*([\s\S]+))?\)$/.exec(trimmed);
+  if (varMatch) {
+    const [, tokenName, fallback] = varMatch;
+    if (tokenLiterals[tokenName] !== undefined) {
+      return resolveLengthPx(tokenLiterals[tokenName], tokenLiterals);
+    }
+    if (fallback !== undefined) return resolveLengthPx(fallback, tokenLiterals);
+  }
+  return null;
+}
+
+const BLOCK_SIZE_PROPERTIES = new Set(["min-height", "min-block-size", "height", "block-size"]);
+const CAPPING_INLINE_SIZE_PROPERTIES = new Set([
+  "width",
+  "max-width",
+  "inline-size",
+  "max-inline-size",
+]);
+
+/**
+ * The static, no-browser half of the `FRONTEND-012` 44x44 touch-target
+ * claim for `error.tsx`'s "Try again" button — the one actionable control
+ * in this codebase `scripts/frontend-accessibility.mjs` cannot mount,
+ * since Next's global error boundary only renders after a real
+ * render-time exception, which the Playwright harness's normal page
+ * navigation never triggers.
+ *
+ * Resolves every `min-height`/`min-block-size`/`height`/`block-size`
+ * declaration across every *exact* class-selector match (e.g. `.button`,
+ * `.button-primary`) in the given CSS sources, and requires at least one
+ * to resolve to `>= minPx`. Separately rejects any `width`/`max-width`/
+ * `inline-size`/`max-inline-size` declaration on those same selectors that
+ * resolves below `minPx`, so a future "compact" variant cannot silently
+ * cap the button under the target size. Also rejects a selector named in
+ * `selectors` that has no rule at all in the given sources — a silent,
+ * vacuous pass would be worse than no check.
+ *
+ * The inline (width) dimension for *this specific* button is guaranteed
+ * in practice by its fixed, non-empty "Try again" label plus `.button`'s
+ * horizontal padding; real rendered text width is not re-derived here,
+ * since this file has no layout engine. Every *other* 44px button target
+ * in this codebase is proven the way this one's height claim is
+ * structurally unreachable for: `scripts/frontend-accessibility.mjs
+ * --owned-surfaces`'s real Playwright-measured bounding boxes.
+ *
+ * @param {[string, string][]} cssSources array of `[ownerName, cssText]`
+ * @param {{ selectors: string[], minPx: number, tokenLiterals?: Record<string, string> }} target
+ */
+function checkTargetSize(cssSources, { selectors, minPx, tokenLiterals = {} }) {
+  const errors = [];
+  const selectorSet = new Set(selectors);
+  const foundSelectors = new Set();
+  let bestBlockSizePx = null;
+
+  for (const [ownerName, cssText] of cssSources) {
+    for (const { selector, body } of extractSelectorRules(cssText)) {
+      if (!selectorSet.has(selector)) continue;
+      foundSelectors.add(selector);
+      for (const declaration of splitDeclarations(body)) {
+        const property = declaration.property.toLowerCase();
+        if (BLOCK_SIZE_PROPERTIES.has(property)) {
+          const resolved = resolveLengthPx(declaration.value, tokenLiterals);
+          if (resolved === null) {
+            errors.push(
+              `${ownerName} selector "${selector}" declares ${property}: ${declaration.value}, which does not resolve to a literal px/rem/var() value`,
+            );
+          } else if (bestBlockSizePx === null || resolved > bestBlockSizePx) {
+            bestBlockSizePx = resolved;
+          }
+        } else if (CAPPING_INLINE_SIZE_PROPERTIES.has(property)) {
+          const resolved = resolveLengthPx(declaration.value, tokenLiterals);
+          if (resolved !== null && resolved < minPx) {
+            errors.push(
+              `${ownerName} selector "${selector}" caps ${property} at ${resolved}px, below the required ${minPx}px target`,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  for (const selector of selectors) {
+    if (!foundSelectors.has(selector)) {
+      errors.push(`no rule for selector "${selector}" was found in the given CSS sources`);
+    }
+  }
+
+  if (bestBlockSizePx === null) {
+    errors.push(
+      `none of [${selectors.join(", ")}] declares a min-height/min-block-size/height/block-size resolving to a literal px value`,
+    );
+  } else if (bestBlockSizePx < minPx) {
+    errors.push(
+      `[${selectors.join(", ")}] resolves to a ${bestBlockSizePx}px block size, below the required ${minPx}px target`,
+    );
+  }
+
+  return { ok: errors.length === 0, errors, resolvedBlockSizePx: bestBlockSizePx };
+}
+
+test("checkTargetSize rejects a min-height that resolves below the target, naming the resolved px value", () => {
+  const fixture = `.button { min-height: 2.2rem; }`;
+  const result = checkTargetSize([["fixture", fixture]], {
+    selectors: [".button"],
+    minPx: 44,
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((error) => error.includes("35.2")),
+    `expected an error naming the resolved 35.2px value, got: ${JSON.stringify(result.errors)}`,
+  );
+});
+
+test("checkTargetSize accepts a literal rem min-height that resolves to exactly the target", () => {
+  const fixture = `.button { min-height: 2.75rem; }`;
+  const result = checkTargetSize([["fixture", fixture]], {
+    selectors: [".button"],
+    minPx: 44,
+  });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
+  assert.equal(result.resolvedBlockSizePx, 44);
+});
+
+test("checkTargetSize resolves var(--viva-target-min) against the supplied token literal", () => {
+  const fixture = `.button-primary { min-height: var(--viva-target-min); }`;
+  const result = checkTargetSize([["fixture", fixture]], {
+    selectors: [".button-primary"],
+    minPx: 44,
+    tokenLiterals: { "--viva-target-min": "44px" },
+  });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
+});
+
+test("checkTargetSize rejects a width cap below the target even when min-height is sufficient", () => {
+  const fixture = `
+    .button { min-height: 2.75rem; }
+    .button-primary { max-width: 32px; }
+  `;
+  const result = checkTargetSize([["fixture", fixture]], {
+    selectors: [".button", ".button-primary"],
+    minPx: 44,
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((error) => error.includes("max-width") && error.includes("32")),
+    `expected an error naming the max-width cap, got: ${JSON.stringify(result.errors)}`,
+  );
+});
+
+test("checkTargetSize rejects selectors that are present but declare no block-size constraint at all", () => {
+  const fixture = `
+    .button { color: blue; }
+    .button-primary { color: red; }
+  `;
+  const result = checkTargetSize([["fixture", fixture]], {
+    selectors: [".button", ".button-primary"],
+    minPx: 44,
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((error) => error.includes("none of")),
+    `expected a "none of [...] declares" error, got: ${JSON.stringify(result.errors)}`,
+  );
+});
+
+test("checkTargetSize rejects a selector missing from the given CSS sources entirely", () => {
+  const fixture = `.button { min-height: 2.75rem; }`;
+  const result = checkTargetSize([["fixture", fixture]], {
+    selectors: [".button", ".button-nonexistent"],
+    minPx: 44,
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((error) => error.includes(".button-nonexistent")),
+    `expected an error naming the missing .button-nonexistent selector, got: ${JSON.stringify(result.errors)}`,
+  );
+});
+
+test("checkTargetSize accepts the real, committed .button/.button-primary rules error.tsx's Try again button uses", () => {
+  const baseCss = readRepoFile("apps/web/app/styles/base.css");
+  const uiWebStylesCss = readRepoFile("packages/ui-web/src/styles.css");
+  const result = checkTargetSize(
+    [
+      ["apps/web/app/styles/base.css", baseCss],
+      ["packages/ui-web/src/styles.css", uiWebStylesCss],
+    ],
+    { selectors: [".button", ".button-primary"], minPx: 44 },
+  );
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
+  assert.ok(
+    result.resolvedBlockSizePx >= 44,
+    `expected the real .button/.button-primary rules to resolve to >= 44px, got: ${result.resolvedBlockSizePx}`,
+  );
 });
