@@ -17,11 +17,14 @@ import { fileURLToPath } from "node:url";
  * `checkCssOwnership` (added by Task 2) is the CSS-ownership checker: it
  * rejects a `globals.css` that still contains a selector block or the
  * wrong/extra imports, rejects a selector's identical declarations
- * authored in more than one of the four owned sheets, and rejects a
- * `@viva/ui-web` primitive class with no selector in the package's own
- * `styles.css`. Later tasks extend this file with asset checks; they
- * must keep reusing these checkers rather than re-implementing their
- * parsing.
+ * authored in more than one of the four owned sheets, rejects a
+ * `.viva-hero`/`.viva-library`- or
+ * `.live-session`/`.session-`/`.question-`/`.marginalia`/`.source-`/`.voice-`-
+ * named selector authored outside its assigned landing/session sheet (the
+ * plan's Step 1 partition), and rejects a `@viva/ui-web` primitive class
+ * with no selector in the package's own `styles.css`. Later tasks extend
+ * this file with asset checks; they must keep reusing these checkers
+ * rather than re-implementing their parsing.
  */
 
 const MINIMUM_OCHRE_TEXT_CONTRAST = 4.5;
@@ -335,15 +338,67 @@ function splitTopLevelCommaList(header) {
 }
 
 /**
+ * Extracts every class-name token (`.foo`, `.foo__bar`, `.foo--bar`, …)
+ * that appears anywhere in a — possibly compound/descendant — selector
+ * string, ignoring element names, combinators, pseudo-classes/-elements,
+ * and attribute selectors. `.marginalia[data-state="recap"]` yields only
+ * `marginalia`; `.viva-library__actions button.viva-library__action--danger`
+ * yields `viva-library__actions` and `viva-library__action--danger`.
+ *
+ * @param {string} selector
+ * @returns {string[]}
+ */
+function classTokens(selector) {
+  return [...selector.matchAll(/\.[\w-]+/g)].map((match) => match[0].slice(1));
+}
+
+/**
+ * Task 2 Step 1's required selector partition, expressed as the two
+ * groups that have a closed-form class-name pattern. `base.css` is this
+ * partition's residual bucket — reset, root document, focus utility,
+ * error/loading/not-found shell, and the cross-cutting chrome shared by
+ * every route (the plan's Step 1 list is illustrative of what belongs
+ * there, not an exhaustive selector-name grammar to validate against) —
+ * so it has no pattern here and is checked only as a required *non*-owner
+ * below. `@viva/ui-web`'s own primitive bucket is already fully enforced
+ * by `requiredUiWebSelectors`; the one documented overlap is `source-chip`
+ * itself, which is both a real ui-web primitive *and* matches the session
+ * group's `.source-*` pattern — see the carve-out in `checkCssOwnership`.
+ */
+const PARTITION_GROUPS = [
+  {
+    owner: "apps/web/app/styles/landing.css",
+    label: ".viva-hero/.viva-library",
+    matches: (token) => /^viva-(hero|library)(?:[_-]|$)/.test(token),
+  },
+  {
+    owner: "apps/web/app/styles/session.css",
+    label: ".live-session/.session-*/.question-*/.marginalia-*/.source-*/.voice-*",
+    matches: (token) =>
+      /^live-session(?:[_-]|$)/.test(token) ||
+      /^session-/.test(token) ||
+      /^question-/.test(token) ||
+      /^marginalia(?:[_-]|$)/.test(token) ||
+      /^source-/.test(token) ||
+      /^voice-/.test(token),
+  },
+];
+
+/**
  * Checks the CSS-ownership invariants Task 2 establishes: `globalsCss`
  * contains only ordered `@import` statements/comments, in the exact
  * resolved order `@viva/ui-web/styles.css -> ./styles/base.css ->
  * ./styles/landing.css -> ./styles/session.css`, and no longer imports
  * `@viva/tokens/theme.css` directly; no *identical* rule (same selector,
  * same declarations) is authored in more than one of the four owned
- * sheets; and every selector in `requiredUiWebSelectors` (the classes
- * `@viva/ui-web`'s own components emit, without the leading `.`) has at
- * least one declaration in `uiWebStylesCss`.
+ * sheets; a selector matching `PARTITION_GROUPS`'s `.viva-hero`/
+ * `.viva-library` or `.live-session`/`.session-*`/`.question-*`/
+ * `.marginalia-*`/`.source-*`/`.voice-*` patterns is authored only in
+ * that group's owner sheet, never `base.css`, the other route's sheet, or
+ * (aside from a declared ui-web primitive such as `source-chip`)
+ * `uiWebStylesCss`; and every selector in `requiredUiWebSelectors` (the
+ * classes `@viva/ui-web`'s own components emit, without the leading `.`)
+ * has at least one declaration in `uiWebStylesCss`.
  *
  * A selector legitimately appearing in more than one sheet with
  * *different* declarations (for example a base chip-family rule in
@@ -424,6 +479,32 @@ function checkCssOwnership({
           `duplicate authority for selector "${selector}": the identical rule is authored in more than one owner (${uniqueOwners.join(
             ", ",
           )})`,
+        );
+      }
+    }
+  }
+
+  // Task 2 Step 1's required partition: a selector matching one of
+  // PARTITION_GROUPS's two closed-form patterns must be authored only in
+  // that group's owner sheet. The one documented exception is a
+  // `source-*` selector that is itself a *declared* `@viva/ui-web`
+  // primitive (SourceChip) — that one may also live in `uiWebStylesCss`,
+  // since it is real package styling, not a misplaced session selector.
+  // An undeclared `source-*` class in `uiWebStylesCss` still fails, so
+  // this carve-out cannot be used to smuggle an arbitrary session
+  // selector into the package sheet.
+  for (const [ownerName, cssText] of owners) {
+    for (const { selector } of extractSelectorRules(cssText)) {
+      const tokens = classTokens(selector);
+      for (const group of PARTITION_GROUPS) {
+        const matchingTokens = tokens.filter((token) => group.matches(token));
+        if (matchingTokens.length === 0 || ownerName === group.owner) continue;
+        const isDeclaredUiWebPrimitive =
+          ownerName === "packages/ui-web/src/styles.css" &&
+          matchingTokens.every((token) => requiredUiWebSelectors.includes(token));
+        if (isDeclaredUiWebPrimitive) continue;
+        errors.push(
+          `selector "${selector}" in ${ownerName} matches the ${group.label} partition, which Task 2 assigns to ${group.owner}`,
         );
       }
     }
@@ -563,6 +644,84 @@ test("checkCssOwnership accepts the same selector layered with different declara
   });
   assert.equal(result.ok, true);
   assert.deepEqual(result.errors, []);
+});
+
+test("checkCssOwnership rejects a landing-owned selector authored outside landing.css", () => {
+  const result = checkCssOwnership({
+    globalsCss:
+      '@import "@viva/ui-web/styles.css";\n@import "./styles/base.css";\n@import "./styles/landing.css";\n@import "./styles/session.css";\n',
+    uiWebStylesCss: "",
+    baseCss: "",
+    landingCss: "",
+    sessionCss: ".viva-hero__stray {\n  color: red;\n}\n",
+    requiredUiWebSelectors: [],
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some(
+      (error) =>
+        error.includes(".viva-hero__stray") && error.includes("apps/web/app/styles/landing.css"),
+    ),
+    `expected a partition error assigning .viva-hero__stray to landing.css, got: ${JSON.stringify(result.errors)}`,
+  );
+});
+
+test("checkCssOwnership rejects a session-owned selector authored outside session.css", () => {
+  const result = checkCssOwnership({
+    globalsCss:
+      '@import "@viva/ui-web/styles.css";\n@import "./styles/base.css";\n@import "./styles/landing.css";\n@import "./styles/session.css";\n',
+    uiWebStylesCss: "",
+    baseCss: "",
+    landingCss: ".session-action {\n  color: red;\n}\n",
+    sessionCss: "",
+    requiredUiWebSelectors: [],
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some(
+      (error) =>
+        error.includes(".session-action") && error.includes("apps/web/app/styles/session.css"),
+    ),
+    `expected a partition error assigning .session-action to session.css, got: ${JSON.stringify(result.errors)}`,
+  );
+});
+
+test("checkCssOwnership rejects an undeclared source-* selector in styles.css, proving the SourceChip carve-out is scoped rather than a blanket hole", () => {
+  const result = checkCssOwnership({
+    globalsCss:
+      '@import "@viva/ui-web/styles.css";\n@import "./styles/base.css";\n@import "./styles/landing.css";\n@import "./styles/session.css";\n',
+    uiWebStylesCss: ".source-unlisted {\n  color: red;\n}\n",
+    baseCss: "",
+    landingCss: "",
+    sessionCss: "",
+    // Deliberately omits "source-unlisted" — only a *declared* ui-web
+    // primitive (like the real "source-chip") gets the session-partition
+    // carve-out below; an invented source-* class must not.
+    requiredUiWebSelectors: [],
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some(
+      (error) =>
+        error.includes(".source-unlisted") && error.includes("apps/web/app/styles/session.css"),
+    ),
+    `expected a partition error for the undeclared .source-unlisted, got: ${JSON.stringify(result.errors)}`,
+  );
+});
+
+test("checkCssOwnership accepts landing- and session-owned selectors correctly placed, plus the declared source-chip primitive layered in styles.css", () => {
+  const result = checkCssOwnership({
+    globalsCss:
+      '@import "@viva/ui-web/styles.css";\n@import "./styles/base.css";\n@import "./styles/landing.css";\n@import "./styles/session.css";\n',
+    uiWebStylesCss: ".source-chip {\n  color: var(--viva-plum);\n}\n",
+    baseCss: "",
+    landingCss: ".viva-hero {\n  display: grid;\n}\n.viva-library__row {\n  display: flex;\n}\n",
+    sessionCss:
+      ".live-session {\n  display: grid;\n}\n.session-action {\n  border: 0;\n}\n.question-stage {\n  padding: 1rem;\n}\n.marginalia {\n  display: block;\n}\n.voice-trace {\n  display: block;\n}\n.source-chip {\n  background: rgba(0, 0, 0, 0.1);\n}\n",
+    requiredUiWebSelectors: ["source-chip"],
+  });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
 });
 
 test("checkCssOwnership rejects a required @viva/ui-web primitive with no style", () => {
