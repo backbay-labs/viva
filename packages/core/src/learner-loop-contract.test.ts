@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { VIVA_AGENT_TERMINAL_SESSION_REASONS } from "./agent-contract";
 import {
   VIVA_LEARNER_LOOP_ACTION_INTENTS,
   VIVA_LEARNER_LOOP_AUTHORITIES,
@@ -6,6 +7,8 @@ import {
   VIVA_LEARNER_LOOP_EVIDENCE_FIELDS,
   VIVA_LEARNER_LOOP_MAX_TURN_MS,
   VIVA_LEARNER_LOOP_RESOLUTION_KINDS,
+  VIVA_LEARNER_LOOP_TERMINAL_REASONS,
+  VIVA_PRE_LOOP_TERMINAL_REASONS,
   VIVA_RUNTIME_COPY_CAUSES,
   validateLearnerLoopContract,
 } from "./learner-loop-contract";
@@ -515,5 +518,80 @@ describe("LEARN-006 learner loop contract validates unknown input", () => {
     expect(Object.isFrozen(parsed)).toBe(true);
     expect(Object.isFrozen(parsed.states)).toBe(true);
     expect(Object.isFrozen(parsed.states[0]?.copy)).toBe(true);
+  });
+});
+
+/**
+ * `LEARN-006A` — one terminal-reason authority.
+ *
+ * The learner loop must not keep its own copy of a terminal reason. Every value
+ * it accepts comes from the agent protocol's terminal vocabulary or from the
+ * pre-loop vocabulary; a literal repeated here is a second declaration that can
+ * silently outlive the arm it duplicates.
+ */
+const NON_TERMINAL_REASON_CANDIDATES = Object.freeze([
+  "roll_back",
+  "store_unavailable",
+  "session_disconnected",
+  "pre_loop_upload",
+  "recap_success",
+]);
+
+describe("LEARN-006A composes the terminal-reason allowlist once", () => {
+  test("equals the two authoritative arrays in order and has no duplicates", () => {
+    expect([...VIVA_LEARNER_LOOP_TERMINAL_REASONS]).toEqual([
+      ...VIVA_AGENT_TERMINAL_SESSION_REASONS,
+      ...VIVA_PRE_LOOP_TERMINAL_REASONS,
+    ]);
+    expect(new Set(VIVA_LEARNER_LOOP_TERMINAL_REASONS).size).toBe(
+      VIVA_LEARNER_LOOP_TERMINAL_REASONS.length,
+    );
+  });
+
+  test("carries durability_degraded exactly once, through the agent vocabulary", () => {
+    expect(
+      VIVA_LEARNER_LOOP_TERMINAL_REASONS.filter((reason) => reason === "durability_degraded"),
+    ).toEqual(["durability_degraded"]);
+    expect([...VIVA_AGENT_TERMINAL_SESSION_REASONS]).toContain("durability_degraded");
+    expect([...VIVA_PRE_LOOP_TERMINAL_REASONS]).not.toContain("durability_degraded");
+  });
+
+  test("is the only set validateLearnerLoopContract accepts terminal reasons from", () => {
+    // `session_cap` is terminal and is not a submitted-answer resolution, so
+    // retargeting its terminal reason exercises the allowlist without colliding
+    // with another state's resolution key.
+    for (const reason of VIVA_LEARNER_LOOP_TERMINAL_REASONS) {
+      const contract = rawContract();
+      rawState(contract, "session_cap").terminal_reason = reason;
+
+      const parsed = validateLearnerLoopContract(contract as unknown);
+      const session = parsed.states.find((state) => state.id === "session_cap");
+      expect(session?.terminal_reason).toBe(reason);
+    }
+
+    const allowed = new Set<string>(VIVA_LEARNER_LOOP_TERMINAL_REASONS);
+    for (const reason of NON_TERMINAL_REASON_CANDIDATES) {
+      expect(allowed.has(reason)).toBe(false);
+
+      const contract = rawContract();
+      rawState(contract, "session_cap").terminal_reason = reason;
+
+      expect(() => validateLearnerLoopContract(contract as unknown)).toThrow(
+        `Unknown learner loop terminal reason ${reason}`,
+      );
+    }
+  });
+
+  test("covers every terminal reason the canonical contract declares", () => {
+    const allowed = new Set<string>(VIVA_LEARNER_LOOP_TERMINAL_REASONS);
+    const declared = VIVA_LEARNER_LOOP_CONTRACT.states
+      .map((state) => state.terminal_reason)
+      .filter((reason): reason is NonNullable<typeof reason> => reason !== undefined);
+
+    expect(declared.length).toBeGreaterThan(0);
+    for (const reason of declared) {
+      expect(allowed.has(reason)).toBe(true);
+    }
+    expect(declared).toContain("durability_degraded");
   });
 });

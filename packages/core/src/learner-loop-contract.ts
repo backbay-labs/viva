@@ -103,10 +103,22 @@ export const VIVA_LEARNER_LOOP_ACTION_INTENTS = [
 
 export type LearnerLoopActionIntent = (typeof VIVA_LEARNER_LOOP_ACTION_INTENTS)[number];
 
-export type LearnerLoopTerminalReason =
-  | AgentTerminalSessionReason
-  | VivaPreLoopTerminalReason
-  | "durability_degraded";
+export type LearnerLoopTerminalReason = AgentTerminalSessionReason | VivaPreLoopTerminalReason;
+
+/**
+ * Every terminal reason the learner loop may name, composed once.
+ *
+ * The learner loop is a consumer of two vocabularies, never a third author:
+ * `VIVA_AGENT_TERMINAL_SESSION_REASONS` owns the in-session reasons — including
+ * `durability_degraded`, which appears here exactly once through that array —
+ * and `VIVA_PRE_LOOP_TERMINAL_REASONS` owns the pre-session ones. A literal
+ * repeated in this module would be a second declaration able to outlive the arm
+ * it duplicates, so `validateLearnerLoopContract` reads only this array.
+ */
+export const VIVA_LEARNER_LOOP_TERMINAL_REASONS: readonly LearnerLoopTerminalReason[] = [
+  ...VIVA_AGENT_TERMINAL_SESSION_REASONS,
+  ...VIVA_PRE_LOOP_TERMINAL_REASONS,
+];
 
 export type LearnerLoopCopy = {
   capsule_label: string;
@@ -547,11 +559,7 @@ export function validateLearnerLoopContract(value: unknown): LearnerLoopContract
     invalid("Learner loop states must be a nonempty array");
   }
 
-  const knownTerminalReasons = new Set<string>([
-    ...VIVA_AGENT_TERMINAL_SESSION_REASONS,
-    ...VIVA_PRE_LOOP_TERMINAL_REASONS,
-    "durability_degraded",
-  ]);
+  const knownTerminalReasons = new Set<string>(VIVA_LEARNER_LOOP_TERMINAL_REASONS);
 
   const stateIds = new Set<string>();
   const resolutionKeys = new Set<string>();
