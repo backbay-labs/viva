@@ -61,6 +61,26 @@ class FakeCaptureSource implements VivaAudioCaptureSource {
   }
 }
 
+class PendingCaptureSource implements VivaAudioCaptureSource {
+  readonly sampleRateHz = VIVA_AUDIO_SAMPLE_RATE_HZ;
+  private resolveStart: (() => void) | undefined;
+  stopCalls = 0;
+
+  start(): Promise<void> {
+    return new Promise((resolve) => {
+      this.resolveStart = resolve;
+    });
+  }
+
+  stop(): void {
+    this.stopCalls += 1;
+  }
+
+  finishStart(): void {
+    this.resolveStart?.();
+  }
+}
+
 describe("createMobileCaptureSession", () => {
   test("keeps exact full PCM16 frames and a smoothed finite input level", async () => {
     const source = new FakeCaptureSource();
@@ -164,5 +184,23 @@ describe("createMobileCaptureSession", () => {
     expect(ended).toEqual(["processor_error"]);
     expect(session.getFrames()).toHaveLength(0);
     expect(session.isActive()).toBe(false);
+  });
+
+  test("stays inactive when a canceled pending start later resolves", async () => {
+    const source = new PendingCaptureSource();
+    const session = createMobileCaptureSession({ source });
+
+    const startPromise = session.start();
+    expect(session.isActive()).toBe(true);
+
+    await session.cancel();
+    expect(session.isActive()).toBe(false);
+    expect(source.stopCalls).toBe(1);
+
+    source.finishStart();
+    await startPromise;
+
+    expect(session.isActive()).toBe(false);
+    expect(session.getFrames()).toHaveLength(0);
   });
 });

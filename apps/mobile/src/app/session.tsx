@@ -328,10 +328,15 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
 
     try {
       await agent.capture.start();
-      if (agent.playback.isActive()) {
+      const playbackActive = agent.playback.isActive();
+      if (playbackActive || !agent.capture.isActive()) {
         outcome = "failed";
         await agent.capture.cancel();
-        setCaptureMessage("Wait for the examiner to finish, then start your answer.");
+        setCaptureMessage(
+          playbackActive
+            ? "Wait for the examiner to finish, then start your answer."
+            : "Microphone capture was interrupted. Start listening again when you are ready.",
+        );
         setCaptureState("idle");
         return;
       }
