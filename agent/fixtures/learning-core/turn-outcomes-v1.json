@@ -1,0 +1,753 @@
+{
+  "schema": "viva.learning_core.turn_outcomes.v1",
+  "rubric": {
+    "policy_version": "viva.semantic-rubric.v1",
+    "criteria": [
+      {
+        "criterion_id": "crit-etc-donor",
+        "concept_id": "concept-electron-transport-chain",
+        "claim": "NADH donates high-energy electrons to the first complex of the electron transport chain.",
+        "source_id": "src-lec5-slide-18",
+        "required": true
+      },
+      {
+        "criterion_id": "crit-etc-complex-order",
+        "concept_id": "concept-electron-transport-chain",
+        "claim": "Electrons pass through the chain complexes in order of increasing electron affinity.",
+        "source_id": "src-lec5-slide-18",
+        "required": true
+      },
+      {
+        "criterion_id": "crit-etc-gradient",
+        "concept_id": "concept-proton-gradient",
+        "claim": "Electron flow pumps protons across the inner mitochondrial membrane.",
+        "source_id": "src-lec5-slide-19",
+        "required": true
+      },
+      {
+        "criterion_id": "crit-etc-coupling",
+        "concept_id": "concept-proton-gradient",
+        "claim": "The proton gradient is the stored energy that drives ATP synthesis.",
+        "source_id": "src-lec5-slide-20",
+        "required": false
+      }
+    ]
+  },
+  "outcomes": {
+    "evaluated_strong": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0001",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:30:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "evaluated",
+        "label": "strong",
+        "confidence": 0.9,
+        "assessments": [
+          {
+            "criterion_id": "crit-etc-donor",
+            "assessment": "satisfied",
+            "confidence": 0.94
+          },
+          {
+            "criterion_id": "crit-etc-complex-order",
+            "assessment": "satisfied",
+            "confidence": 0.9
+          },
+          {
+            "criterion_id": "crit-etc-gradient",
+            "assessment": "satisfied",
+            "confidence": 0.91
+          },
+          {
+            "criterion_id": "crit-etc-coupling",
+            "assessment": "satisfied",
+            "confidence": 0.88
+          }
+        ],
+        "concept_transitions": [
+          {
+            "concept_id": "concept-electron-transport-chain",
+            "from_status": "review",
+            "to_status": "strong",
+            "criterion_ids": ["crit-etc-donor", "crit-etc-complex-order"]
+          },
+          {
+            "concept_id": "concept-proton-gradient",
+            "from_status": "review",
+            "to_status": "strong",
+            "criterion_ids": ["crit-etc-gradient", "crit-etc-coupling"]
+          }
+        ],
+        "concise_feedback": "Every required criterion held: the electron donation, the ordered complexes, and the pumped proton gradient.",
+        "retry_prompt": null,
+        "disposition": "advance"
+      }
+    },
+    "evaluated_synonym_accepted": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0002",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:31:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "evaluated",
+        "label": "strong",
+        "confidence": 0.87,
+        "assessments": [
+          {
+            "criterion_id": "crit-etc-donor",
+            "assessment": "satisfied",
+            "confidence": 0.9
+          },
+          {
+            "criterion_id": "crit-etc-complex-order",
+            "assessment": "satisfied",
+            "confidence": 0.89
+          },
+          {
+            "criterion_id": "crit-etc-gradient",
+            "assessment": "satisfied",
+            "confidence": 0.87
+          },
+          {
+            "criterion_id": "crit-etc-coupling",
+            "assessment": "not_demonstrated",
+            "confidence": 0.7
+          }
+        ],
+        "concept_transitions": [
+          {
+            "concept_id": "concept-electron-transport-chain",
+            "from_status": "review",
+            "to_status": "strong",
+            "criterion_ids": ["crit-etc-donor", "crit-etc-complex-order"]
+          },
+          {
+            "concept_id": "concept-proton-gradient",
+            "from_status": "review",
+            "to_status": "strong",
+            "criterion_ids": ["crit-etc-gradient", "crit-etc-coupling"]
+          }
+        ],
+        "concise_feedback": "Equivalent wording satisfied each required criterion without repeating the wording used in the source.",
+        "retry_prompt": null,
+        "disposition": "advance"
+      }
+    },
+    "evaluated_mostly_correct": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0003",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:32:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "evaluated",
+        "label": "mostly_correct",
+        "confidence": 0.79,
+        "assessments": [
+          {
+            "criterion_id": "crit-etc-donor",
+            "assessment": "satisfied",
+            "confidence": 0.88
+          },
+          {
+            "criterion_id": "crit-etc-complex-order",
+            "assessment": "satisfied",
+            "confidence": 0.86
+          },
+          {
+            "criterion_id": "crit-etc-gradient",
+            "assessment": "satisfied",
+            "confidence": 0.79
+          },
+          {
+            "criterion_id": "crit-etc-coupling",
+            "assessment": "satisfied",
+            "confidence": 0.81
+          }
+        ],
+        "concept_transitions": [
+          {
+            "concept_id": "concept-electron-transport-chain",
+            "from_status": "review",
+            "to_status": "strong",
+            "criterion_ids": ["crit-etc-donor", "crit-etc-complex-order"]
+          },
+          {
+            "concept_id": "concept-proton-gradient",
+            "from_status": "review",
+            "to_status": "shaky",
+            "criterion_ids": ["crit-etc-gradient", "crit-etc-coupling"]
+          }
+        ],
+        "concise_feedback": "The chain description held. The proton gradient claim was correct but only weakly supported.",
+        "retry_prompt": "Say precisely where the pumped protons accumulate.",
+        "disposition": "advance"
+      }
+    },
+    "evaluated_optional_contradiction_is_shaky": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0004",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:33:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "evaluated",
+        "label": "mostly_correct",
+        "confidence": 0.9,
+        "assessments": [
+          {
+            "criterion_id": "crit-etc-donor",
+            "assessment": "satisfied",
+            "confidence": 0.93
+          },
+          {
+            "criterion_id": "crit-etc-complex-order",
+            "assessment": "satisfied",
+            "confidence": 0.9
+          },
+          {
+            "criterion_id": "crit-etc-gradient",
+            "assessment": "satisfied",
+            "confidence": 0.95
+          },
+          {
+            "criterion_id": "crit-etc-coupling",
+            "assessment": "contradicted",
+            "confidence": 0.9
+          }
+        ],
+        "concept_transitions": [
+          {
+            "concept_id": "concept-electron-transport-chain",
+            "from_status": "review",
+            "to_status": "strong",
+            "criterion_ids": ["crit-etc-donor", "crit-etc-complex-order"]
+          },
+          {
+            "concept_id": "concept-proton-gradient",
+            "from_status": "review",
+            "to_status": "shaky",
+            "criterion_ids": ["crit-etc-gradient", "crit-etc-coupling"]
+          }
+        ],
+        "concise_feedback": "Required criteria held, but the optional coupling claim was contradicted, so the concept stays shaky.",
+        "retry_prompt": "Restate what the proton gradient actually powers.",
+        "disposition": "advance"
+      }
+    },
+    "evaluated_partially_correct": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0005",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:34:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "evaluated",
+        "label": "partially_correct",
+        "confidence": 0.7,
+        "assessments": [
+          {
+            "criterion_id": "crit-etc-donor",
+            "assessment": "satisfied",
+            "confidence": 0.86
+          },
+          {
+            "criterion_id": "crit-etc-complex-order",
+            "assessment": "satisfied",
+            "confidence": 0.87
+          },
+          {
+            "criterion_id": "crit-etc-gradient",
+            "assessment": "not_demonstrated",
+            "confidence": 0.7
+          },
+          {
+            "criterion_id": "crit-etc-coupling",
+            "assessment": "satisfied",
+            "confidence": 0.83
+          }
+        ],
+        "concept_transitions": [
+          {
+            "concept_id": "concept-electron-transport-chain",
+            "from_status": "review",
+            "to_status": "strong",
+            "criterion_ids": ["crit-etc-donor", "crit-etc-complex-order"]
+          },
+          {
+            "concept_id": "concept-proton-gradient",
+            "from_status": "review",
+            "to_status": "missed",
+            "criterion_ids": ["crit-etc-gradient", "crit-etc-coupling"]
+          }
+        ],
+        "concise_feedback": "The chain itself was accurate. Nothing in the answer established the proton gradient.",
+        "retry_prompt": "Explain what electron flow does to the protons.",
+        "disposition": "advance"
+      }
+    },
+    "evaluated_vague": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0006",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:35:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "evaluated",
+        "label": "vague",
+        "confidence": 0.64,
+        "assessments": [
+          {
+            "criterion_id": "crit-etc-donor",
+            "assessment": "satisfied",
+            "confidence": 0.78
+          },
+          {
+            "criterion_id": "crit-etc-complex-order",
+            "assessment": "not_demonstrated",
+            "confidence": 0.68
+          },
+          {
+            "criterion_id": "crit-etc-gradient",
+            "assessment": "not_demonstrated",
+            "confidence": 0.64
+          },
+          {
+            "criterion_id": "crit-etc-coupling",
+            "assessment": "not_demonstrated",
+            "confidence": 0.61
+          }
+        ],
+        "concept_transitions": [
+          {
+            "concept_id": "concept-electron-transport-chain",
+            "from_status": "review",
+            "to_status": "shaky",
+            "criterion_ids": ["crit-etc-donor", "crit-etc-complex-order"]
+          },
+          {
+            "concept_id": "concept-proton-gradient",
+            "from_status": "review",
+            "to_status": "missed",
+            "criterion_ids": ["crit-etc-gradient", "crit-etc-coupling"]
+          }
+        ],
+        "concise_feedback": "Only the electron donation was established. The rest of the answer stayed general.",
+        "retry_prompt": "Take it one step further than the donation step.",
+        "disposition": "advance"
+      }
+    },
+    "evaluated_insufficient_evidence": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0007",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:36:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "evaluated",
+        "label": "insufficient_evidence",
+        "confidence": 0.66,
+        "assessments": [
+          {
+            "criterion_id": "crit-etc-donor",
+            "assessment": "not_demonstrated",
+            "confidence": 0.72
+          },
+          {
+            "criterion_id": "crit-etc-complex-order",
+            "assessment": "not_demonstrated",
+            "confidence": 0.69
+          },
+          {
+            "criterion_id": "crit-etc-gradient",
+            "assessment": "not_demonstrated",
+            "confidence": 0.66
+          },
+          {
+            "criterion_id": "crit-etc-coupling",
+            "assessment": "not_demonstrated",
+            "confidence": 0.63
+          }
+        ],
+        "concept_transitions": [
+          {
+            "concept_id": "concept-electron-transport-chain",
+            "from_status": "review",
+            "to_status": "missed",
+            "criterion_ids": ["crit-etc-donor", "crit-etc-complex-order"]
+          },
+          {
+            "concept_id": "concept-proton-gradient",
+            "from_status": "review",
+            "to_status": "missed",
+            "criterion_ids": ["crit-etc-gradient", "crit-etc-coupling"]
+          }
+        ],
+        "concise_feedback": "No required criterion was demonstrated, so nothing in the answer could be credited.",
+        "retry_prompt": "Start with what NADH hands off, then follow the electrons.",
+        "disposition": "advance"
+      }
+    },
+    "evaluated_required_contradiction_is_wrong": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0008",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:37:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "evaluated",
+        "label": "wrong",
+        "confidence": 0.9,
+        "assessments": [
+          {
+            "criterion_id": "crit-etc-donor",
+            "assessment": "satisfied",
+            "confidence": 0.92
+          },
+          {
+            "criterion_id": "crit-etc-complex-order",
+            "assessment": "satisfied",
+            "confidence": 0.9
+          },
+          {
+            "criterion_id": "crit-etc-gradient",
+            "assessment": "contradicted",
+            "confidence": 0.9
+          },
+          {
+            "criterion_id": "crit-etc-coupling",
+            "assessment": "not_demonstrated",
+            "confidence": 0.74
+          }
+        ],
+        "concept_transitions": [
+          {
+            "concept_id": "concept-electron-transport-chain",
+            "from_status": "review",
+            "to_status": "strong",
+            "criterion_ids": ["crit-etc-donor", "crit-etc-complex-order"]
+          },
+          {
+            "concept_id": "concept-proton-gradient",
+            "from_status": "review",
+            "to_status": "missed",
+            "criterion_ids": ["crit-etc-gradient", "crit-etc-coupling"]
+          }
+        ],
+        "concise_feedback": "A required claim was contradicted: the answer reversed the direction of proton movement.",
+        "retry_prompt": "Which side of the inner membrane gains protons?",
+        "disposition": "retry_current"
+      }
+    },
+    "evaluated_replacement_supersedes_challenged": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0009",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:38:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": "resp-0008",
+      "resolution": {
+        "kind": "evaluated",
+        "label": "strong",
+        "confidence": 0.88,
+        "assessments": [
+          {
+            "criterion_id": "crit-etc-donor",
+            "assessment": "satisfied",
+            "confidence": 0.92
+          },
+          {
+            "criterion_id": "crit-etc-complex-order",
+            "assessment": "satisfied",
+            "confidence": 0.9
+          },
+          {
+            "criterion_id": "crit-etc-gradient",
+            "assessment": "satisfied",
+            "confidence": 0.88
+          },
+          {
+            "criterion_id": "crit-etc-coupling",
+            "assessment": "satisfied",
+            "confidence": 0.86
+          }
+        ],
+        "concept_transitions": [
+          {
+            "concept_id": "concept-electron-transport-chain",
+            "from_status": "strong",
+            "to_status": "strong",
+            "criterion_ids": ["crit-etc-donor", "crit-etc-complex-order"]
+          },
+          {
+            "concept_id": "concept-proton-gradient",
+            "from_status": "missed",
+            "to_status": "strong",
+            "criterion_ids": ["crit-etc-gradient", "crit-etc-coupling"]
+          }
+        ],
+        "concise_feedback": "The corrected answer put the protons on the intermembrane side, so the gradient claim now holds.",
+        "retry_prompt": null,
+        "disposition": "advance"
+      }
+    },
+    "deferred_empty_answer": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0010",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:39:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "deferred",
+        "reason": "empty_answer",
+        "can_retry_same_question": true,
+        "disposition": "retry_current"
+      }
+    },
+    "deferred_transcript_uncertain": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0011",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:40:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "deferred",
+        "reason": "transcript_uncertain",
+        "can_retry_same_question": true,
+        "disposition": "retry_current"
+      }
+    },
+    "deferred_evaluator_unavailable": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0012",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:41:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "deferred",
+        "reason": "evaluator_unavailable",
+        "can_retry_same_question": false,
+        "disposition": "deferred"
+      }
+    },
+    "deferred_invalid_evaluator_output": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0013",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:42:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "deferred",
+        "reason": "invalid_evaluator_output",
+        "can_retry_same_question": false,
+        "disposition": "deferred"
+      }
+    },
+    "deferred_insufficient_semantic_evidence": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0014",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:43:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "deferred",
+        "reason": "insufficient_semantic_evidence",
+        "can_retry_same_question": true,
+        "disposition": "retry_current"
+      }
+    },
+    "deferred_contradictory_evidence": {
+      "schema": "viva.turn_outcome.v1",
+      "response_id": "resp-0015",
+      "question_id": "q-etc-electron-flow",
+      "rubric_policy_version": "viva.semantic-rubric.v1",
+      "recorded_at": "2026-08-24T14:44:00.000Z",
+      "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+      "supersedes_response_id": null,
+      "resolution": {
+        "kind": "deferred",
+        "reason": "contradictory_evidence",
+        "can_retry_same_question": true,
+        "disposition": "retry_current"
+      }
+    }
+  },
+  "persisted": {
+    "first_record": {
+      "turn_outcome": {
+        "schema": "viva.turn_outcome.v1",
+        "response_id": "resp-0001",
+        "question_id": "q-etc-electron-flow",
+        "rubric_policy_version": "viva.semantic-rubric.v1",
+        "recorded_at": "2026-08-24T14:30:00.000Z",
+        "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+        "supersedes_response_id": null,
+        "resolution": {
+          "kind": "evaluated",
+          "label": "strong",
+          "confidence": 0.9,
+          "assessments": [
+            {
+              "criterion_id": "crit-etc-donor",
+              "assessment": "satisfied",
+              "confidence": 0.94
+            },
+            {
+              "criterion_id": "crit-etc-complex-order",
+              "assessment": "satisfied",
+              "confidence": 0.9
+            },
+            {
+              "criterion_id": "crit-etc-gradient",
+              "assessment": "satisfied",
+              "confidence": 0.91
+            },
+            {
+              "criterion_id": "crit-etc-coupling",
+              "assessment": "satisfied",
+              "confidence": 0.88
+            }
+          ],
+          "concept_transitions": [
+            {
+              "concept_id": "concept-electron-transport-chain",
+              "from_status": "review",
+              "to_status": "strong",
+              "criterion_ids": ["crit-etc-donor", "crit-etc-complex-order"]
+            },
+            {
+              "concept_id": "concept-proton-gradient",
+              "from_status": "review",
+              "to_status": "strong",
+              "criterion_ids": ["crit-etc-gradient", "crit-etc-coupling"]
+            }
+          ],
+          "concise_feedback": "Every required criterion held: the electron donation, the ordered complexes, and the pumped proton gradient.",
+          "retry_prompt": null,
+          "disposition": "advance"
+        }
+      },
+      "record": {
+        "schema": "viva.turn_outcome_record.v1",
+        "response_id": "resp-0001",
+        "replayed": false
+      }
+    },
+    "replay_record": {
+      "turn_outcome": {
+        "schema": "viva.turn_outcome.v1",
+        "response_id": "resp-0001",
+        "question_id": "q-etc-electron-flow",
+        "rubric_policy_version": "viva.semantic-rubric.v1",
+        "recorded_at": "2026-08-24T14:30:00.000Z",
+        "source_ids": ["src-lec5-slide-18", "src-lec5-slide-19", "src-lec5-slide-20"],
+        "supersedes_response_id": null,
+        "resolution": {
+          "kind": "evaluated",
+          "label": "strong",
+          "confidence": 0.9,
+          "assessments": [
+            {
+              "criterion_id": "crit-etc-donor",
+              "assessment": "satisfied",
+              "confidence": 0.94
+            },
+            {
+              "criterion_id": "crit-etc-complex-order",
+              "assessment": "satisfied",
+              "confidence": 0.9
+            },
+            {
+              "criterion_id": "crit-etc-gradient",
+              "assessment": "satisfied",
+              "confidence": 0.91
+            },
+            {
+              "criterion_id": "crit-etc-coupling",
+              "assessment": "satisfied",
+              "confidence": 0.88
+            }
+          ],
+          "concept_transitions": [
+            {
+              "concept_id": "concept-electron-transport-chain",
+              "from_status": "review",
+              "to_status": "strong",
+              "criterion_ids": ["crit-etc-donor", "crit-etc-complex-order"]
+            },
+            {
+              "concept_id": "concept-proton-gradient",
+              "from_status": "review",
+              "to_status": "strong",
+              "criterion_ids": ["crit-etc-gradient", "crit-etc-coupling"]
+            }
+          ],
+          "concise_feedback": "Every required criterion held: the electron donation, the ordered complexes, and the pumped proton gradient.",
+          "retry_prompt": null,
+          "disposition": "advance"
+        }
+      },
+      "record": {
+        "schema": "viva.turn_outcome_record.v1",
+        "response_id": "resp-0001",
+        "replayed": true
+      }
+    }
+  },
+  "challenges": {
+    "source_confirmed": {
+      "schema": "viva.challenge_resolution.v1",
+      "correction_id": "corr-0001",
+      "challenged_response_id": "resp-0008",
+      "source_id": "src-lec5-slide-19",
+      "disposition": "source_confirmed",
+      "replacement_response_id": null
+    },
+    "reevaluation_required": {
+      "schema": "viva.challenge_resolution.v1",
+      "correction_id": "corr-0002",
+      "challenged_response_id": "resp-0008",
+      "source_id": "src-lec5-slide-19",
+      "disposition": "reevaluation_required",
+      "replacement_response_id": "resp-0009"
+    },
+    "deferred": {
+      "schema": "viva.challenge_resolution.v1",
+      "correction_id": "corr-0003",
+      "challenged_response_id": "resp-0006",
+      "source_id": "src-lec5-slide-18",
+      "disposition": "deferred",
+      "replacement_response_id": null
+    }
+  }
+}
