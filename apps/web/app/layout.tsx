@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import localFont from "next/font/local";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -7,24 +8,34 @@ export const metadata: Metadata = {
     "Voice-first AI study companion. Upload your materials and Viva turns them into a living oral exam — asking, listening, correcting, and bringing back what you miss.",
 };
 
+/**
+ * Self-hosted (`FRONTEND-007`) — see `apps/web/app/fonts/PROVENANCE.md` for
+ * the pinned upstream `google/fonts` commit, source paths, and SHA-256 of
+ * every committed WOFF2. `next/font/local` generates the `@font-face`
+ * rules and a scoped CSS custom property at build time from these local
+ * files only, so no request ever reaches a remote Google-hosted font
+ * origin. Each `src` entry's `weight` range matches the variable axis
+ * range that file was partially instanced to, so `font-weight` values
+ * within that range still interpolate.
+ */
+const cormorant = localFont({
+  src: [
+    { path: "./fonts/cormorant-latin-roman.woff2", style: "normal", weight: "400 600" },
+    { path: "./fonts/cormorant-latin-italic.woff2", style: "italic", weight: "400 500" },
+  ],
+  display: "swap",
+  variable: "--viva-font-serif",
+});
+
+const hankenGrotesk = localFont({
+  src: [{ path: "./fonts/hanken-grotesk-latin.woff2", style: "normal", weight: "400 700" }],
+  display: "swap",
+  variable: "--viva-font-sans",
+});
+
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en">
-      <head>
-        {/*
-          Cormorant (serif) + Hanken Grotesk (sans) are the families the design
-          tokens already name (@viva/tokens, --serif/--sans). Loaded via a stylesheet
-          <link> rather than next/font on purpose: next/font/google fetches at build
-          time and fails the build with no network; the <link> degrades gracefully to
-          Georgia/system instead. Keep it this way unless self-hosting the fonts.
-        */}
-        <link href="https://fonts.googleapis.com" rel="preconnect" />
-        <link crossOrigin="anonymous" href="https://fonts.gstatic.com" rel="preconnect" />
-        <link
-          href="https://fonts.googleapis.com/css2?family=Cormorant:ital,wght@0,400;0,500;0,600;1,400;1,500&family=Hanken+Grotesk:wght@400;500;600;700&display=swap"
-          rel="stylesheet"
-        />
-      </head>
+    <html className={`${cormorant.variable} ${hankenGrotesk.variable}`} lang="en">
       <body>{children}</body>
     </html>
   );

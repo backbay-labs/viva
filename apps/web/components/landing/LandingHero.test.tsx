@@ -38,4 +38,12 @@ describe("LandingHero", () => {
     expect(markup).toContain("/viva-muse.webp");
     expect(markup).toContain('aria-hidden="true"');
   });
+
+  test("the muse image declares its real intrinsic dimensions (FRONTEND-007)", () => {
+    // 1672x941 is the real pixel size of both apps/web/public/viva-muse.png
+    // and viva-muse.webp — declaring it lets the browser reserve layout
+    // space before either image decodes, instead of a post-decode reflow.
+    expect(markup).toContain('width="1672"');
+    expect(markup).toContain('height="941"');
+  });
 });

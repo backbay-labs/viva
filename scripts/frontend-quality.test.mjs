@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -32,8 +33,21 @@ import { vivaContrastPairs } from "../packages/tokens/src/index.ts";
  * but the `color` (text) property may only ever resolve through the
  * AA-contrast `--viva-ochre-text` token.
  *
- * Later tasks extend this file with asset checks; they must keep reusing
- * these checkers rather than re-implementing their parsing.
+ * `checkFontProvenance` and `checkNoRemoteFontLinks` (added by Task 4) are
+ * the self-hosted-font checkers (`FRONTEND-007`): every committed WOFF2
+ * under `apps/web/app/fonts` must be recorded in that directory's
+ * `PROVENANCE.md` with the pinned upstream `google/fonts` commit SHA, its
+ * exact upstream source path, and a SHA-256 that matches the real
+ * committed file byte-for-byte; every font family's OFL license text must
+ * also be committed; and the combined WOFF2 payload must stay at or under
+ * the 300 KiB budget. `checkNoRemoteFontLinks` is the fast, no-browser
+ * source-level half of "no request host is fonts.googleapis.com or
+ * fonts.gstatic.com" — `scripts/frontend-accessibility.mjs --assets`
+ * proves the same thing by observing real network requests from a mounted
+ * page.
+ *
+ * Later tasks extend this file with further asset checks; they must keep
+ * reusing these checkers rather than re-implementing their parsing.
  */
 
 /** @typedef {{ name: string, value: string }} Declaration */
@@ -973,6 +987,271 @@ test("checkOchreTextRole accepts the real, split repository CSS", () => {
     ["apps/web/app/styles/landing.css", readRepoFile("apps/web/app/styles/landing.css")],
     ["apps/web/app/styles/session.css", readRepoFile("apps/web/app/styles/session.css")],
   ]);
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
+});
+
+/*
+ * Self-hosted font provenance checker (`FRONTEND-007`, Task 4): see the
+ * file header comment above.
+ */
+
+const FONT_PROVENANCE_BUDGET_BYTES = 300 * 1024;
+
+/**
+ * Parses `apps/web/app/fonts/PROVENANCE.md`: a 40-hex-character upstream
+ * `google/fonts` commit SHA appearing anywhere in the text, plus one record
+ * per markdown table row that contains both a `*.woff2` cell and a bare
+ * 64-hex-character SHA-256 cell — that record's source path is the row's
+ * first remaining cell that looks like a path (contains `/`). Deliberately
+ * tolerant of surrounding markdown table syntax (leading/trailing `|`,
+ * ``` ` ``` code-span backticks around cells, header/separator rows, and
+ * extra columns such as a weight-range cell) so the real, human-authored
+ * file does not need to match a brittle exact format.
+ *
+ * @param {string} provenanceMd
+ * @returns {{ upstreamCommit: string | null, records: Array<{ file: string, sourcePath: string, sha256: string }> }}
+ */
+function parseFontProvenance(provenanceMd) {
+  const commitMatch = provenanceMd.match(/\b([0-9a-f]{40})\b/);
+  const records = [];
+  for (const line of provenanceMd.split("\n")) {
+    const cells = line
+      .split("|")
+      .map((cell) =>
+        cell
+          .trim()
+          .replace(/^`+|`+$/g, "")
+          .trim(),
+      )
+      .filter((cell) => cell.length > 0);
+    if (cells.length < 3) continue;
+    const file = cells.find((cell) => /\.woff2$/.test(cell));
+    const sha256 = cells.find((cell) => /^[0-9a-f]{64}$/i.test(cell));
+    if (!file || !sha256) continue;
+    const sourcePath = cells.find((cell) => cell !== file && cell !== sha256 && cell.includes("/"));
+    records.push({ file, sourcePath: sourcePath ?? "", sha256: sha256.toLowerCase() });
+  }
+  return { upstreamCommit: commitMatch ? commitMatch[1] : null, records };
+}
+
+/**
+ * @param {{
+ *   provenanceMd: string | null,
+ *   fontFiles: Map<string, Buffer>,
+ *   oflFiles: Map<string, string>,
+ * }} input
+ */
+function checkFontProvenance({ provenanceMd, fontFiles, oflFiles }) {
+  const errors = [];
+  if (!provenanceMd) {
+    errors.push("apps/web/app/fonts/PROVENANCE.md is missing");
+    return { ok: false, errors };
+  }
+
+  const { upstreamCommit, records } = parseFontProvenance(provenanceMd);
+  if (!upstreamCommit) {
+    errors.push("PROVENANCE.md does not record a 40-character upstream google/fonts commit SHA");
+  }
+  if (records.length === 0) {
+    errors.push("PROVENANCE.md records no committed-file/source-path/SHA-256 rows");
+  }
+
+  const recordedFiles = new Set();
+  for (const record of records) {
+    recordedFiles.add(record.file);
+    const bytes = fontFiles.get(record.file);
+    if (!bytes) {
+      errors.push(`PROVENANCE.md records ${record.file} but no such file is committed`);
+      continue;
+    }
+    const actualSha256 = createHash("sha256").update(bytes).digest("hex");
+    if (actualSha256 !== record.sha256) {
+      errors.push(
+        `${record.file} sha256 is ${actualSha256} but PROVENANCE.md records ${record.sha256}`,
+      );
+    }
+    if (!record.sourcePath.includes("/")) {
+      errors.push(
+        `PROVENANCE.md's source path for ${record.file} does not look like a real upstream path: "${record.sourcePath}"`,
+      );
+    }
+  }
+
+  let totalBytes = 0;
+  for (const [file, bytes] of fontFiles) {
+    totalBytes += bytes.length;
+    if (!recordedFiles.has(file)) {
+      errors.push(
+        `${file} is committed under apps/web/app/fonts but not recorded in PROVENANCE.md`,
+      );
+    }
+  }
+  if (fontFiles.size === 0) {
+    errors.push("no WOFF2 files are committed under apps/web/app/fonts");
+  } else if (totalBytes > FONT_PROVENANCE_BUDGET_BYTES) {
+    errors.push(
+      `committed WOFF2 total is ${totalBytes} bytes, exceeds the ${FONT_PROVENANCE_BUDGET_BYTES}-byte (300 KiB) FRONTEND-007 budget`,
+    );
+  }
+
+  for (const [name, content] of oflFiles) {
+    if (!content || !/SIL OPEN FONT LICENSE/i.test(content)) {
+      errors.push(`${name} does not look like a real committed OFL license text`);
+    }
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
+/**
+ * The fast, no-browser half of "no request host is fonts.googleapis.com or
+ * fonts.gstatic.com" (`scripts/frontend-accessibility.mjs --assets` proves
+ * the same thing by observing real network requests from a mounted page).
+ *
+ * @param {string} layoutTsxSource
+ */
+function checkNoRemoteFontLinks(layoutTsxSource) {
+  const errors = [];
+  if (/fonts\.googleapis\.com|fonts\.gstatic\.com/.test(layoutTsxSource)) {
+    errors.push(
+      "apps/web/app/layout.tsx still references a Google Fonts host (fonts.googleapis.com/fonts.gstatic.com)",
+    );
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+test("checkFontProvenance rejects a missing PROVENANCE.md", () => {
+  const result = checkFontProvenance({
+    provenanceMd: null,
+    fontFiles: new Map(),
+    oflFiles: new Map(),
+  });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes("PROVENANCE.md is missing")));
+});
+
+test("checkFontProvenance rejects a committed WOFF2 whose bytes do not match its recorded SHA-256", () => {
+  const bytes = Buffer.from("stand-in font bytes, not a real font file");
+  const wrongSha256 = "0".repeat(64);
+  const provenanceMd = [
+    `pinned commit \`${"a".repeat(40)}\``,
+    `| cormorant-latin-roman.woff2 | ofl/cormorant/Cormorant[wght].ttf | ${wrongSha256} |`,
+  ].join("\n");
+  const result = checkFontProvenance({
+    provenanceMd,
+    fontFiles: new Map([["cormorant-latin-roman.woff2", bytes]]),
+    oflFiles: new Map([["OFL-Cormorant.txt", "...SIL OPEN FONT LICENSE Version 1.1..."]]),
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some(
+      (error) => error.includes("cormorant-latin-roman.woff2") && error.includes("sha256"),
+    ),
+  );
+});
+
+test("checkFontProvenance rejects a committed WOFF2 total over the 300 KiB FRONTEND-007 budget", () => {
+  const big = Buffer.alloc(301 * 1024, 1);
+  const sha256 = createHash("sha256").update(big).digest("hex");
+  const provenanceMd = [
+    `pinned commit \`${"a".repeat(40)}\``,
+    `| cormorant-latin-roman.woff2 | ofl/cormorant/Cormorant[wght].ttf | ${sha256} |`,
+  ].join("\n");
+  const result = checkFontProvenance({
+    provenanceMd,
+    fontFiles: new Map([["cormorant-latin-roman.woff2", big]]),
+    oflFiles: new Map([["OFL-Cormorant.txt", "...SIL OPEN FONT LICENSE Version 1.1..."]]),
+  });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes("300 KiB")));
+});
+
+test("checkFontProvenance rejects a font whose family has no committed OFL license text", () => {
+  const bytes = Buffer.from("stand-in font bytes, not a real font file");
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const provenanceMd = [
+    `pinned commit \`${"a".repeat(40)}\``,
+    `| cormorant-latin-roman.woff2 | ofl/cormorant/Cormorant[wght].ttf | ${sha256} |`,
+  ].join("\n");
+  const result = checkFontProvenance({
+    provenanceMd,
+    fontFiles: new Map([["cormorant-latin-roman.woff2", bytes]]),
+    oflFiles: new Map([["OFL-Cormorant.txt", "TODO: paste the license here"]]),
+  });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes("OFL-Cormorant.txt")));
+});
+
+test("checkFontProvenance rejects a committed WOFF2 with no PROVENANCE.md row at all", () => {
+  const bytes = Buffer.from("stand-in font bytes, not a real font file");
+  const provenanceMd = `pinned commit \`${"a".repeat(40)}\`\n(no table rows)`;
+  const result = checkFontProvenance({
+    provenanceMd,
+    fontFiles: new Map([["cormorant-latin-roman.woff2", bytes]]),
+    oflFiles: new Map([["OFL-Cormorant.txt", "...SIL OPEN FONT LICENSE Version 1.1..."]]),
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some(
+      (error) => error.includes("cormorant-latin-roman.woff2") && error.includes("not recorded"),
+    ),
+  );
+});
+
+test("checkFontProvenance accepts a correctly recorded WOFF2 under budget", () => {
+  const bytes = Buffer.from("stand-in font bytes, not a real font file");
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const provenanceMd = [
+    `Upstream: google/fonts, pinned commit \`${"a".repeat(40)}\`.`,
+    "",
+    "| Committed file | Upstream source path | SHA-256 |",
+    "| --- | --- | --- |",
+    `| cormorant-latin-roman.woff2 | ofl/cormorant/Cormorant[wght].ttf | ${sha256} |`,
+  ].join("\n");
+  const result = checkFontProvenance({
+    provenanceMd,
+    fontFiles: new Map([["cormorant-latin-roman.woff2", bytes]]),
+    oflFiles: new Map([["OFL-Cormorant.txt", "...SIL OPEN FONT LICENSE Version 1.1..."]]),
+  });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
+});
+
+test("checkFontProvenance accepts the real committed font provenance", () => {
+  const fontsDirUrl = new URL("../apps/web/app/fonts/", import.meta.url);
+  const provenanceMd = fs.readFileSync(new URL("PROVENANCE.md", fontsDirUrl), "utf8");
+  const fontFiles = new Map();
+  const oflFiles = new Map();
+  for (const entry of fs.readdirSync(fileURLToPath(fontsDirUrl))) {
+    if (entry.endsWith(".woff2")) {
+      fontFiles.set(entry, fs.readFileSync(new URL(entry, fontsDirUrl)));
+    } else if (entry.startsWith("OFL-")) {
+      oflFiles.set(entry, fs.readFileSync(new URL(entry, fontsDirUrl), "utf8"));
+    }
+  }
+  const result = checkFontProvenance({ provenanceMd, fontFiles, oflFiles });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
+});
+
+test("checkNoRemoteFontLinks rejects a layout source that still links fonts.googleapis.com", () => {
+  const result = checkNoRemoteFontLinks(
+    '<link href="https://fonts.googleapis.com/css2?family=Cormorant" rel="stylesheet" />',
+  );
+  assert.equal(result.ok, false);
+});
+
+test("checkNoRemoteFontLinks rejects a layout source that still preconnects to fonts.gstatic.com", () => {
+  const result = checkNoRemoteFontLinks(
+    '<link crossOrigin="anonymous" href="https://fonts.gstatic.com" rel="preconnect" />',
+  );
+  assert.equal(result.ok, false);
+});
+
+test("checkNoRemoteFontLinks accepts the real, self-hosted layout.tsx", () => {
+  const layoutSource = readRepoFile("apps/web/app/layout.tsx");
+  const result = checkNoRemoteFontLinks(layoutSource);
   assert.deepEqual(result.errors, []);
   assert.equal(result.ok, true);
 });

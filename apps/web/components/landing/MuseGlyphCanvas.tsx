@@ -27,11 +27,18 @@ export type MuseGlyphCanvasProps = {
 
 type RGB = { r: number; g: number; b: number };
 
-const PARCHMENT: RGB = { r: 246, g: 239, b: 228 };
-const PLUM: RGB = { r: 93, g: 70, b: 125 };
-const LAVENDER: RGB = { r: 146, g: 119, b: 176 };
-const INK: RGB = { r: 92, g: 84, b: 96 };
-const GOLD: RGB = { r: 216, g: 170, b: 98 };
+/** Parses a `#rrggbb` literal. Only used as a last-resort fallback if a
+ * design token somehow fails to resolve in the browser (see
+ * `resolveTokenRgb` below) — never a second source of truth for a color a
+ * token already names. */
+function hexToRgb(hex: string): RGB {
+  const normalized = hex.replace("#", "");
+  return {
+    r: Number.parseInt(normalized.slice(0, 2), 16),
+    g: Number.parseInt(normalized.slice(2, 4), 16),
+    b: Number.parseInt(normalized.slice(4, 6), 16),
+  };
+}
 
 // Heavy on dots/operators so most of the field reads as faint marginalia.
 const GLYPH_POOL = ["·", "·", "·", "+", "→", "∴", "§", "H⁺", "e⁻", "+"];
@@ -139,6 +146,35 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const cv = canvas;
+
+    // `FRONTEND-007`: resolve the field's colors from the real design
+    // tokens (`packages/tokens/src/theme.css`, the one runtime token
+    // authority) instead of a second hardcoded approximation of them.
+    // Resolved once per mount, not per frame — style recalculation is
+    // comparatively expensive, and these values never change over a
+    // mount's lifetime. The hex fallbacks only cover a token somehow
+    // failing to resolve; they are not a parallel palette to keep in sync.
+    function resolveTokenRgb(customProperty: string, fallbackHex: string): RGB {
+      const probe = document.createElement("span");
+      probe.style.position = "absolute";
+      probe.style.visibility = "hidden";
+      probe.style.color = `var(${customProperty})`;
+      document.body.appendChild(probe);
+      const resolved = getComputedStyle(probe).color;
+      probe.remove();
+      const match = resolved.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      return match
+        ? { r: Number(match[1]), g: Number(match[2]), b: Number(match[3]) }
+        : hexToRgb(fallbackHex);
+    }
+    // --viva-bg is the muse artwork's own parchment background, so
+    // ink-density sampling (inkWeight, below) diffs against it. The other
+    // four are the glyph/spark ink colors themselves.
+    const PARCHMENT = resolveTokenRgb("--viva-bg", "#f6efe4");
+    const PLUM = resolveTokenRgb("--viva-amethyst-deep", "#5d347f");
+    const LAVENDER = resolveTokenRgb("--viva-lavender-strong", "#b38de5");
+    const INK = resolveTokenRgb("--viva-ink-soft", "#4e4259");
+    const GOLD = resolveTokenRgb("--viva-gold", "#d6a85f");
 
     let glyphs: Glyph[] = [];
     let sparks: Spark[] = [];

@@ -36,9 +36,29 @@ import {
  *   button/joint gating, at which point Task 12 turns it green on the
  *   combined tree.
  *
- * Later tasks add the remaining assets/deletion/bootstrap/static-export
- * modes named in their own RED commands; this file's mode dispatch is
- * written so those are additive.
+ * Task 4 adds `--assets` (`FRONTEND-007`): mounts `/` and proves the
+ * self-hosted-font and conditional-Muse-fallback contract against real
+ * browser/network state rather than source text —
+ *
+ * - no request during a normal load has host `fonts.googleapis.com` or
+ *   `fonts.gstatic.com`;
+ * - `document.fonts.check` succeeds (after `document.fonts.load`) for the
+ *   serif-normal, serif-italic, and sans roles, resolved from the real
+ *   `--viva-font-serif`/`--viva-font-sans` computed values rather than a
+ *   hardcoded generated family name;
+ * - the visible `.viva-muse__img` has intrinsic `width="1672"`/
+ *   `height="941"`, `decoding="async"`, and eager/high-priority loading;
+ * - a normal WebP-capable load requests `/viva-muse.webp` and never
+ *   `/viva-muse.png`;
+ * - when the harness fulfills `/viva-muse.webp` with invalid image bytes,
+ *   `.viva-muse__img` recovers to `complete && naturalWidth === 1672` via a
+ *   real PNG request, and a real Chrome DevTools Protocol `Network`-domain
+ *   session records at most one non-cached (HTTP 200) `/viva-muse.png`
+ *   body transfer.
+ *
+ * Later tasks add the remaining deletion/bootstrap/static-export modes
+ * named in their own RED commands; this file's mode dispatch is written so
+ * those are additive.
  */
 
 const ALLOWLISTED_COMPUTED_PROPERTIES = [
@@ -229,6 +249,18 @@ async function main() {
     return;
   }
 
+  if (args.includes("--assets")) {
+    const failures = await runAssetsCheck();
+    if (failures.length > 0) {
+      console.error(`--assets FAILED: ${failures.length} issue(s)`);
+      for (const line of failures) console.error(`  - ${line}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log("--assets OK: 0 issues");
+    return;
+  }
+
   if (args.includes("--session-handoff")) {
     const scopeFlagIndex = args.indexOf("--disclosure-scope");
     const disclosureScope = scopeFlagIndex !== -1 ? args[scopeFlagIndex + 1] : undefined;
@@ -289,7 +321,7 @@ async function main() {
   fail(
     "no recognized mode flag. Supported: --write-computed-style-baseline <path>, " +
       "--compare-computed-style-baseline <path>, --owned-surfaces, --session-handoff " +
-      "--disclosure-scope all-live-content; later tasks add more modes.",
+      "--disclosure-scope all-live-content, --assets; later tasks add more modes.",
   );
 }
 
@@ -888,6 +920,294 @@ async function runSessionHandoffCheck({ disclosureScope }) {
       await browser.close();
     }
   });
+  return failures;
+}
+
+/* --------------------------------------------------------------------- *
+ * Task 4 (`FRONTEND-007`): `--assets`.
+ * -------------------------------------------------------------------- */
+
+/**
+ * `withFrontendDevServer` hands back a `http://127.0.0.1:<port>` `baseUrl`.
+ * Next.js dev's cross-origin dev-resource protection (`allowedDevOrigins`,
+ * on by default) allows `localhost` unconditionally but does not recognize
+ * a bare `127.0.0.1` as the same origin as the `next dev` child's own
+ * (default `0.0.0.0`) bind address; the resulting blocked HMR/dev-client
+ * websocket handshake was observed, empirically, to leave the page fully
+ * server-rendered but *never client-hydrated* — no React root ever
+ * attaches (confirmed via `window.__REACT_DEVTOOLS_GLOBAL_HOOK__` and a
+ * DOM node's absent `__reactFiber*` property), so no `onError`/state-driven
+ * behavior can run at all. `--owned-surfaces`/`--session-handoff` never hit
+ * this because their checks are all computed-style/DOM-structure/native-
+ * keyboard-focus checks that need no hydration; `--assets`' conditional
+ * Muse-fallback proof is the first check in this file that requires real
+ * client-side React state updates, which is what surfaced it. Rewriting
+ * only the *navigation* URL's host to `localhost` (`next dev`'s default
+ * `0.0.0.0` bind still answers there) fixes hydration without touching
+ * `scripts/frontend-harness.mjs`, which Task 4 does not own.
+ *
+ * @param {string} baseUrl
+ */
+function toHydratableUrl(baseUrl) {
+  return baseUrl.replace("127.0.0.1", "localhost");
+}
+
+/**
+ * Mounts `/` twice — once for a normal, uninterrupted load (host/asset/font
+ * checks) and once with `/viva-muse.webp` deliberately fulfilled with
+ * invalid image bytes (the conditional-fallback recovery proof) — and
+ * returns a flat list of human-readable failure strings; empty means every
+ * asset check passed.
+ */
+async function runAssetsCheck() {
+  const artifactDir = path.join(repoRoot, "artifacts/frontend-accessibility");
+  mkdirSync(artifactDir, { recursive: true });
+  const stub = await startLibrarySnapshotStub(LIBRARY_SNAPSHOT_FIXTURE);
+  const failures = [];
+  try {
+    await withFrontendDevServer(
+      { artifactDir, extraEnv: harnessExtraEnv(stub.url) },
+      async ({ baseUrl }) => {
+        const hydratableBaseUrl = toHydratableUrl(baseUrl);
+        const browser = await launchChromium();
+        try {
+          failures.push(...(await checkNormalAssetLoad(browser, hydratableBaseUrl)));
+          failures.push(...(await checkMuseFallbackRecovery(browser, hydratableBaseUrl)));
+        } finally {
+          await browser.close();
+        }
+      },
+    );
+  } finally {
+    await stub.close();
+  }
+  return failures;
+}
+
+/**
+ * A normal, uninterrupted load: no request may reach a Google Fonts host;
+ * both self-hosted font roles (serif normal/italic, sans) must actually be
+ * loadable; the visible Muse `<img>` must declare its real intrinsic
+ * dimensions and eager/high-priority/async-decode loading; and a normal
+ * WebP-capable Chromium must request `/viva-muse.webp` and never
+ * `/viva-muse.png`.
+ *
+ * @param {import("playwright").Browser} browser
+ * @param {string} baseUrl
+ */
+async function checkNormalAssetLoad(browser, baseUrl) {
+  const failures = [];
+  const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const page = await context.newPage();
+  const requestedUrls = [];
+  page.on("request", (request) => requestedUrls.push(request.url()));
+  try {
+    await gotoRouteReady(page, baseUrl, "/");
+
+    for (const url of requestedUrls) {
+      let host;
+      try {
+        host = new URL(url).host;
+      } catch {
+        continue;
+      }
+      if (host === "fonts.googleapis.com" || host === "fonts.gstatic.com") {
+        failures.push(`[assets] page requested a Google Fonts host: ${url}`);
+      }
+    }
+
+    const requestedWebp = requestedUrls.some((url) => url.endsWith("/viva-muse.webp"));
+    const requestedPng = requestedUrls.some((url) => url.endsWith("/viva-muse.png"));
+    if (!requestedWebp) {
+      failures.push("[assets] a normal load never requested /viva-muse.webp");
+    }
+    if (requestedPng) {
+      failures.push(
+        "[assets] a normal WebP-capable load unexpectedly requested /viva-muse.png too",
+      );
+    }
+
+    const museImg = await page.evaluate(() => {
+      const img = document.querySelector(".viva-muse__img");
+      if (!img) return null;
+      return {
+        width: img.getAttribute("width"),
+        height: img.getAttribute("height"),
+        decoding: img.getAttribute("decoding"),
+        fetchPriority: img.getAttribute("fetchpriority"),
+        loading: img.getAttribute("loading"),
+      };
+    });
+    if (!museImg) {
+      failures.push("[assets] .viva-muse__img is not present in the DOM");
+    } else {
+      if (museImg.width !== "1672") {
+        failures.push(
+          `[assets] .viva-muse__img width attribute is ${JSON.stringify(museImg.width)}, expected "1672"`,
+        );
+      }
+      if (museImg.height !== "941") {
+        failures.push(
+          `[assets] .viva-muse__img height attribute is ${JSON.stringify(museImg.height)}, expected "941"`,
+        );
+      }
+      if (museImg.decoding !== "async") {
+        failures.push(
+          `[assets] .viva-muse__img decoding attribute is ${JSON.stringify(museImg.decoding)}, expected "async"`,
+        );
+      }
+      if (museImg.fetchPriority !== "high") {
+        failures.push(
+          `[assets] .viva-muse__img fetchpriority attribute is ${JSON.stringify(museImg.fetchPriority)}, expected "high"`,
+        );
+      }
+      if (museImg.loading === "lazy") {
+        failures.push(
+          '[assets] .viva-muse__img has loading="lazy", expected eager (the default) or an explicit "eager"',
+        );
+      }
+    }
+
+    for (const role of [
+      { cssVar: "--viva-font-serif", style: "normal", label: "serif normal" },
+      { cssVar: "--viva-font-serif", style: "italic", label: "serif italic" },
+      { cssVar: "--viva-font-sans", style: "normal", label: "sans" },
+    ]) {
+      const result = await checkFontRoleLoadable(page, role);
+      if (!result.ok) {
+        failures.push(`[assets] ${role.label} font role: ${result.reason}`);
+      }
+    }
+  } finally {
+    await context.close();
+  }
+  return failures;
+}
+
+/**
+ * Resolves `cssVar`'s real computed value on `<html>` (set by `next/font/
+ * local`'s `variable` class — never guessed/hardcoded), isolates its first
+ * (non-fallback) family name, and proves that exact family is loadable via
+ * `document.fonts.load` followed by `document.fonts.check` — the pair the
+ * Font Loading API spec requires for a reliable check of a not-yet-used
+ * face, rather than `check()` alone (which only reports already-known
+ * status and may false-negative on a face nothing has rendered with yet).
+ *
+ * @param {import("playwright").Page} page
+ * @param {{ cssVar: string, style: "normal" | "italic" }} role
+ */
+async function checkFontRoleLoadable(page, { cssVar, style }) {
+  return await page.evaluate(
+    async ({ cssVar, style }) => {
+      const raw = getComputedStyle(document.documentElement).getPropertyValue(cssVar).trim();
+      if (!raw) {
+        return {
+          ok: false,
+          reason: `${cssVar} is not defined on <html> (next/font/local variable class missing)`,
+        };
+      }
+      const firstFamily = raw
+        .split(",")[0]
+        .trim()
+        .replace(/^['"]|['"]$/g, "");
+      if (!firstFamily) {
+        return { ok: false, reason: `${cssVar} has no usable family name: "${raw}"` };
+      }
+      const fontShorthand = `${style === "italic" ? "italic " : ""}16px "${firstFamily}"`;
+      try {
+        await document.fonts.load(fontShorthand);
+      } catch (error) {
+        return {
+          ok: false,
+          reason: `document.fonts.load(${JSON.stringify(fontShorthand)}) threw: ${error}`,
+        };
+      }
+      const ok = document.fonts.check(fontShorthand);
+      return {
+        ok,
+        reason: ok ? null : `document.fonts.check(${JSON.stringify(fontShorthand)}) returned false`,
+      };
+    },
+    { cssVar, style },
+  );
+}
+
+/**
+ * Fulfills every `/viva-muse.webp` request with deliberately invalid image
+ * bytes (real HTTP 200, real `image/webp` content type, undecodable body),
+ * then proves the mounted `MuseBackdrop` recovers: it must remove the
+ * failed `<source type="image/webp">` so the browser's `<picture>`
+ * source-selection algorithm re-runs and the `<img>` loads `/viva-muse.png`
+ * instead, reaching `complete && naturalWidth === 1672`. A real Chrome
+ * DevTools Protocol `Network` session (not Playwright's own request/
+ * response events, which do not reliably distinguish a cache replay from a
+ * real transfer) counts non-cached (HTTP 200) `/viva-muse.png` body
+ * transfers: the visible `<picture>` image and `MuseGlyphCanvas`'s separate
+ * offscreen sampler `Image()` may both fall back to PNG, but at most one of
+ * them may need a real network body transfer — the plan's own words allow
+ * them to "share that cached response".
+ *
+ * @param {import("playwright").Browser} browser
+ * @param {string} baseUrl
+ */
+async function checkMuseFallbackRecovery(browser, baseUrl) {
+  const failures = [];
+  const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const page = await context.newPage();
+  const invalidWebpBytes = Buffer.from(
+    "deliberately not a valid WebP bitstream, so the browser image decoder must fail",
+  );
+  const requestedUrls = [];
+  page.on("request", (request) => requestedUrls.push(request.url()));
+  await page.route("**/viva-muse.webp", (route) =>
+    route.fulfill({ status: 200, contentType: "image/webp", body: invalidWebpBytes }),
+  );
+
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("Network.enable");
+  let nonCachedPngTransferCount = 0;
+  cdp.on("Network.responseReceived", (event) => {
+    if (event.response.url.endsWith("/viva-muse.png") && event.response.status === 200) {
+      nonCachedPngTransferCount += 1;
+    }
+  });
+
+  try {
+    await gotoRouteReady(page, baseUrl, "/");
+
+    const recovered = await page
+      .waitForFunction(
+        () => {
+          const img = document.querySelector(".viva-muse__img");
+          return Boolean(img?.complete && img.naturalWidth === 1672);
+        },
+        undefined,
+        { timeout: 15_000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+    if (!recovered) {
+      failures.push(
+        "[assets] after /viva-muse.webp is fulfilled with invalid bytes, .viva-muse__img never " +
+          "reached complete && naturalWidth === 1672 (PNG fallback did not recover)",
+      );
+    }
+
+    if (!requestedUrls.some((url) => url.endsWith("/viva-muse.png"))) {
+      failures.push(
+        "[assets] after the WebP decode failure, the page never requested /viva-muse.png",
+      );
+    }
+
+    if (nonCachedPngTransferCount > 1) {
+      failures.push(
+        `[assets] CDP recorded ${nonCachedPngTransferCount} non-cached (HTTP 200) /viva-muse.png ` +
+          "body transfers, expected at most 1",
+      );
+    }
+  } finally {
+    await context.close();
+  }
   return failures;
 }
 
