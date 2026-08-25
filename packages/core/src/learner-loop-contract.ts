@@ -337,20 +337,44 @@ function member<Allowed extends string>(
   return value as Allowed;
 }
 
-function deepFreeze<Value>(value: Value): Value {
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      deepFreeze(entry);
-    }
-    return Object.freeze(value);
-  }
-  if (typeof value === "object" && value !== null) {
-    for (const entry of Object.values(value)) {
-      deepFreeze(entry);
-    }
-    return Object.freeze(value);
-  }
+/**
+ * The one deep-freeze utility for validated `@viva/core` contracts.
+ *
+ * Every validator in this package rebuilds its result from validated parts and
+ * then hands that single instance to every consumer at once — the recovery-copy
+ * projection, the web session projection, the authenticated study projection,
+ * and the persisted scheduling decision. `Object.freeze` alone stops only the
+ * top-level assignment, leaving the interesting state (a state's learner copy,
+ * a projection's concepts, a decision's FSRS card) writable, so one surface
+ * could rewrite what every other surface then renders.
+ *
+ * `seen` makes the walk cycle-safe: a self-referential value is frozen once and
+ * skipped on the way back instead of recursing until the stack overflows. Each
+ * node is frozen before its children are visited, so a cycle that reaches its
+ * own parent finds it already recorded.
+ *
+ * Freezing is applied only to data this package reconstructed. It is never
+ * applied to caller-owned input or to an imported JSON module object, because
+ * freezing those would change a value the caller still owns.
+ */
+export function deepFreeze<Value>(value: Value): Value {
+  freezeReachable(value, new WeakSet<object>());
   return value;
+}
+
+function freezeReachable(value: unknown, seen: WeakSet<object>): void {
+  if (typeof value !== "object" || value === null) {
+    return;
+  }
+  const node: object = value;
+  if (seen.has(node)) {
+    return;
+  }
+  seen.add(node);
+  Object.freeze(node);
+  for (const entry of Object.values(node)) {
+    freezeReachable(entry, seen);
+  }
 }
 
 function validateCopy(value: unknown, stateId: string): LearnerLoopCopy {

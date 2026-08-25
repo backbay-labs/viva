@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { VIVA_AGENT_TERMINAL_SESSION_REASONS } from "./agent-contract";
 import {
+  deepFreeze,
   VIVA_LEARNER_LOOP_ACTION_INTENTS,
   VIVA_LEARNER_LOOP_AUTHORITIES,
   VIVA_LEARNER_LOOP_CONTRACT,
@@ -676,5 +677,87 @@ describe("LEARN-007 successful session completion", () => {
     expect(() => validateLearnerLoopContract(contract as unknown)).toThrow(
       "Unknown learner loop terminal reason recap_success",
     );
+  });
+});
+
+/**
+ * Assert that a write to deep-frozen data fails instead of silently succeeding.
+ *
+ * ES modules are always strict mode, so assigning to a frozen property — or
+ * extending a frozen array — throws a `TypeError`. The engine's message differs
+ * between assignment and extension, so the assertion is on the error type.
+ */
+function expectFrozenWrite(mutate: () => void): void {
+  let thrown: unknown;
+  try {
+    mutate();
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown instanceof TypeError ? "TypeError" : String(thrown)).toBe("TypeError");
+}
+
+/**
+ * `LEARN-010` — the validated contract is data, not a mutable scratch object.
+ *
+ * Every consumer (the recovery-copy projection, the web session projection, the
+ * four raw-JSON script consumers) reads the same single validated instance. A
+ * shallow freeze leaves the interesting state — a state's learner copy, its
+ * runtime causes, its operator diagnostics — writable, so one surface could
+ * quietly rewrite the copy every other surface then renders. These tests assert
+ * the freeze reaches those nested values, and that the one freeze utility
+ * terminates on a self-referential value instead of overflowing the stack.
+ */
+describe("LEARN-010 deep-frozen learner loop contract", () => {
+  test("the one deep-freeze utility terminates on a self-referential value", () => {
+    type SelfReferential = { name: string; self?: SelfReferential; children: SelfReferential[] };
+    const node: SelfReferential = { name: "root", children: [] };
+    node.self = node;
+    node.children.push(node);
+
+    expect(deepFreeze(node)).toBe(node);
+    expect(Object.isFrozen(node)).toBe(true);
+    expect(Object.isFrozen(node.children)).toBe(true);
+    expectFrozenWrite(() => {
+      node.name = "rewritten";
+    });
+  });
+
+  test("freezes nested state copy, runtime causes, and operator diagnostics", () => {
+    const before = JSON.stringify(VIVA_LEARNER_LOOP_CONTRACT);
+    const state = VIVA_LEARNER_LOOP_CONTRACT.states[0];
+
+    expect(Object.isFrozen(VIVA_LEARNER_LOOP_CONTRACT)).toBe(true);
+    expect(Object.isFrozen(VIVA_LEARNER_LOOP_CONTRACT.states)).toBe(true);
+    expect(Object.isFrozen(state)).toBe(true);
+    expectFrozenWrite(() => {
+      VIVA_LEARNER_LOOP_CONTRACT.states.push(state);
+    });
+    expectFrozenWrite(() => {
+      state.copy.capsule_label = "rewritten";
+    });
+    expectFrozenWrite(() => {
+      state.copy.next_action_intent = "disabled";
+    });
+    expectFrozenWrite(() => {
+      state.runtime_copy_causes.push("recap_success");
+    });
+    expectFrozenWrite(() => {
+      state.operator_diagnostics.push("stage");
+    });
+
+    expect(JSON.stringify(VIVA_LEARNER_LOOP_CONTRACT)).toBe(before);
+  });
+
+  test("a separately validated contract is frozen the same way", () => {
+    const contract = validateLearnerLoopContract(rawContract() as unknown);
+    const state = contract.states[0];
+
+    expect(contract).not.toBe(VIVA_LEARNER_LOOP_CONTRACT);
+    expect(Object.isFrozen(contract)).toBe(true);
+    expect(Object.isFrozen(state.copy)).toBe(true);
+    expectFrozenWrite(() => {
+      state.stage = "rewritten";
+    });
   });
 });

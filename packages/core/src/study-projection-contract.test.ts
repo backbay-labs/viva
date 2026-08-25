@@ -467,3 +467,85 @@ describe("LEARN-008 authenticated study projection contract", () => {
     ).toThrow("Authenticated study projection session identity mismatch");
   });
 });
+
+/**
+ * Assert that a write to deep-frozen data fails instead of silently succeeding.
+ *
+ * ES modules are always strict mode, so assigning to a frozen property — or
+ * extending a frozen array — throws a `TypeError`. The engine's message differs
+ * between assignment and extension, so the assertion is on the error type.
+ */
+function expectFrozenWrite(mutate: () => void): void {
+  let thrown: unknown;
+  try {
+    mutate();
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown instanceof TypeError ? "TypeError" : String(thrown)).toBe("TypeError");
+}
+
+/**
+ * `LEARN-010` — the validated projection is the only read model, so it is
+ * handed to every session and library surface at once.
+ *
+ * The validator already rebuilds the projection from validated parts; freezing
+ * that result is what stops a surface from editing the shared object after the
+ * fact — writing a concept status the server never sent, appending a citation,
+ * or moving a persisted `dueAt` the browser is only allowed to format.
+ */
+describe("LEARN-010 the validated projection is deeply immutable", () => {
+  test("concepts, citations, and schedule entries cannot be rewritten after validation", () => {
+    const projection = validateAuthenticatedStudyProjectionV1(readyCase() as unknown);
+    const before = JSON.stringify(projection);
+    const question = projection.activeQuestion;
+    if (question === null) {
+      throw new Error("fixture case has no active question");
+    }
+
+    expect(Object.isFrozen(projection)).toBe(true);
+    expect(Object.isFrozen(projection.concepts)).toBe(true);
+    expect(Object.isFrozen(projection.reviewSchedule)).toBe(true);
+    expect(Object.isFrozen(question.sourceCitations)).toBe(true);
+
+    expectFrozenWrite(() => {
+      (projection as { version: number }).version = 2;
+    });
+    expectFrozenWrite(() => {
+      projection.studySet.ingestionStatus = "failed";
+    });
+    expectFrozenWrite(() => {
+      projection.concepts[0].status = "strong";
+    });
+    expectFrozenWrite(() => {
+      projection.concepts.push(projection.concepts[0]);
+    });
+    expectFrozenWrite(() => {
+      question.sourceCitations[0].label = "rewritten";
+    });
+    expectFrozenWrite(() => {
+      question.sourceCitations.push(question.sourceCitations[0]);
+    });
+    expectFrozenWrite(() => {
+      projection.reviewSchedule[0].dueAt = "2099-01-01T00:00:00.000Z";
+    });
+    expectFrozenWrite(() => {
+      projection.questionProgress.completed = 99;
+    });
+
+    expect(JSON.stringify(projection)).toBe(before);
+  });
+
+  test("the identity-bound validator returns the same frozen projection", () => {
+    const projection = validateAuthenticatedStudyProjectionV1ForIdentity(readyCase() as unknown, {
+      studySetId: "set-cellular-respiration",
+      sessionId: "vs-1001",
+    });
+
+    expect(Object.isFrozen(projection)).toBe(true);
+    expect(Object.isFrozen(projection.session)).toBe(true);
+    expectFrozenWrite(() => {
+      projection.session.goal = "cram";
+    });
+  });
+});

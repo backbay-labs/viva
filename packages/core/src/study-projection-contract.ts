@@ -28,6 +28,8 @@
  * a session carries no goal.
  */
 
+import { deepFreeze } from "./learner-loop-contract";
+
 export const VIVA_STUDY_SET_INGESTION_STATUSES = [
   "pending",
   "processing",
@@ -437,6 +439,11 @@ function validateReviewSchedule(
  * The result is rebuilt from validated parts: nothing is normalized, defaulted,
  * or carried through unchecked, so a caller can never receive a learner fact the
  * server did not state.
+ *
+ * It is then deep-frozen. This one object is the read model every session and
+ * library surface renders; a surface that could edit it in place could write a
+ * concept status, append a citation, or move a persisted `dueAt` that the server
+ * never sent, and the next reader would render it as fact.
  */
 export function validateAuthenticatedStudyProjectionV1(
   value: unknown,
@@ -480,7 +487,7 @@ export function validateAuthenticatedStudyProjectionV1(
     }
   }
 
-  return {
+  return deepFreeze({
     version: 1,
     studySet,
     session,
@@ -488,7 +495,7 @@ export function validateAuthenticatedStudyProjectionV1(
     activeQuestion,
     questionProgress,
     reviewSchedule,
-  };
+  });
 }
 
 /**

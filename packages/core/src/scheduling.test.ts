@@ -463,3 +463,109 @@ describe("reviewIntervalFromProjection", () => {
     ).toThrow(/authority/i);
   });
 });
+
+/**
+ * Assert that a write to deep-frozen data fails instead of silently succeeding.
+ *
+ * ES modules are always strict mode, so assigning to a frozen property — or
+ * extending a frozen array — throws a `TypeError`. The engine's message differs
+ * between assignment and extension, so the assertion is on the error type.
+ */
+function expectFrozenWrite(mutate: () => void): void {
+  let thrown: unknown;
+  try {
+    mutate();
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown instanceof TypeError ? "TypeError" : String(thrown)).toBe("TypeError");
+}
+
+/**
+ * `LEARN-010` — a persisted scheduling decision and its FSRS card are facts.
+ *
+ * `decideReviewSchedule` is the one authority; its result is persisted verbatim
+ * and mirrored into the recap, the concept `dueAt`, and the authenticated study
+ * projection. A caller that can edit the returned decision — or the card inside
+ * it — can make those four surfaces disagree about the same concept without any
+ * store write. The same batch removes the uncapped status-only estimate: a
+ * concept the server never scheduled has no interval, not a guess.
+ */
+describe("LEARN-010 immutable schedule decisions and honest exports", () => {
+  const decisionInput = {
+    status: "shaky" as const,
+    now: NOW,
+    hintCount: null,
+    missCount: null,
+    examAt: null,
+    priorCard: null,
+  };
+
+  const scheduleInput: ReviewScheduleInput = {
+    conceptId: "nadh",
+    label: "NADH",
+    status: "shaky",
+    misses: 0,
+    hinted: false,
+    centrality: 40,
+    now: NOW,
+  };
+
+  test("a persisted schedule decision cannot be rewritten after it is returned", () => {
+    const decision = decideReviewSchedule(decisionInput);
+    const before = JSON.stringify(decision);
+    const mutable = decision as unknown as { due_at: string; policy_id: string };
+
+    expect(Object.isFrozen(decision)).toBe(true);
+    expectFrozenWrite(() => {
+      mutable.due_at = "2099-01-01T00:00:00.000Z";
+    });
+    expectFrozenWrite(() => {
+      mutable.policy_id = "viva.fixture.1";
+    });
+
+    expect(JSON.stringify(decision)).toBe(before);
+  });
+
+  test("the persisted FSRS card is frozen in the decision and in the schedule item", () => {
+    const decision = decideReviewSchedule({ ...decisionInput, priorCard: MATURE_CARD });
+    const before = JSON.stringify(decision.card);
+    const card = decision.card as unknown as { stability: number; reps: number };
+
+    expect(Object.isFrozen(decision.card)).toBe(true);
+    expectFrozenWrite(() => {
+      card.stability = 999;
+    });
+    expectFrozenWrite(() => {
+      card.reps = 0;
+    });
+    expect(JSON.stringify(decision.card)).toBe(before);
+
+    const item = scheduleConceptReview({ ...scheduleInput, priorCard: MATURE_CARD });
+    const itemCard = item.card as unknown as { difficulty: number };
+
+    expect(Object.isFrozen(item.card)).toBe(true);
+    expectFrozenWrite(() => {
+      itemCard.difficulty = 1;
+    });
+  });
+
+  test("freezing the decision does not change the schedule it produces", () => {
+    const item = scheduleConceptReview(scheduleInput);
+    const decision = decideReviewSchedule(decisionInput);
+
+    expect(item.authoritativeDueAt.toISOString()).toBe(decision.due_at);
+    expect(item.card).toEqual(decision.card);
+  });
+
+  test("production exports carry no empty-card status-only estimate", async () => {
+    const scheduling = await import("./scheduling");
+    const exported = Object.keys(scheduling);
+
+    expect(exported).not.toContain("dueDateForStatus");
+    expect(exported).not.toContain("reviewIntervalForStatus");
+    expect(exported.filter((name) => /ForStatus$/.test(name))).toEqual([]);
+    expect(exported).toContain("reviewIntervalFromProjection");
+    expect(exported).toContain("decideReviewSchedule");
+  });
+});

@@ -1,4 +1,5 @@
 import {
+  deepFreeze,
   type LearnerLoopActionIntent,
   type LearnerLoopEvidenceField,
   type LearnerLoopResolutionKind,
@@ -58,9 +59,13 @@ function learnerAction(label: string, intent: LearnerLoopActionIntent): LearnerR
  * the primary intent silently rewrites what the second button does — a state
  * that offers `retry_agent` first and a deliberately `disabled` follow-up would
  * otherwise ship two retry buttons.
+ *
+ * The entry is deep-frozen for the same reason the source contract is: it is
+ * derived copy, and a consumer that edits it in place changes what every other
+ * consumer of the same entry renders.
  */
 export function learnerRecoveryCopyEntry(state: LearnerLoopState): LearnerRecoveryCopyEntry {
-  return {
+  return deepFreeze({
     state_id: state.id,
     state_label: state.label,
     resolution_kind: state.resolution_kind,
@@ -85,16 +90,17 @@ export function learnerRecoveryCopyEntry(state: LearnerLoopState): LearnerRecove
       stage: state.stage,
       terminal_reason: state.terminal_reason,
     },
-  } satisfies LearnerRecoveryCopyEntry;
+  } satisfies LearnerRecoveryCopyEntry);
 }
 
-export const VIVA_LEARNER_RECOVERY_COPY_CONTRACT = Object.freeze({
-  schema: VIVA_LEARNER_RECOVERY_COPY_SCHEMA,
-  source_schema: VIVA_LEARNER_LOOP_CONTRACT.schema,
-  source_max_submitted_answer_resolution_ms:
-    VIVA_LEARNER_LOOP_CONTRACT.max_submitted_answer_resolution_ms,
-  states: VIVA_LEARNER_LOOP_CONTRACT.states.map(learnerRecoveryCopyEntry),
-} satisfies LearnerRecoveryCopyContract);
+export const VIVA_LEARNER_RECOVERY_COPY_CONTRACT: Readonly<LearnerRecoveryCopyContract> =
+  deepFreeze({
+    schema: VIVA_LEARNER_RECOVERY_COPY_SCHEMA,
+    source_schema: VIVA_LEARNER_LOOP_CONTRACT.schema,
+    source_max_submitted_answer_resolution_ms:
+      VIVA_LEARNER_LOOP_CONTRACT.max_submitted_answer_resolution_ms,
+    states: VIVA_LEARNER_LOOP_CONTRACT.states.map(learnerRecoveryCopyEntry),
+  } satisfies LearnerRecoveryCopyContract);
 
 export function learnerRecoveryCopyForState(stateId: string): LearnerRecoveryCopyEntry | undefined {
   return VIVA_LEARNER_RECOVERY_COPY_CONTRACT.states.find((state) => state.state_id === stateId);

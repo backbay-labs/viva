@@ -1,12 +1,6 @@
-import {
-  createEmptyCard,
-  FSRSAlgorithm,
-  fsrs,
-  type Grade,
-  generatorParameters,
-  Rating,
-} from "ts-fsrs";
+import { FSRSAlgorithm, type Grade, generatorParameters, Rating } from "ts-fsrs";
 import type { ConceptStatus } from "./index";
+import { deepFreeze } from "./learner-loop-contract";
 
 /**
  * Spaced-repetition scheduling for Viva.
@@ -42,9 +36,6 @@ const AUTHORITATIVE_PARAMETERS = generatorParameters({
   enable_short_term: true,
 });
 const authoritativeAlgorithm = new FSRSAlgorithm(AUTHORITATIVE_PARAMETERS);
-
-/** Legacy UI-only estimator retained for label projection; never the authority. */
-const scheduler = fsrs(generatorParameters({ enable_short_term: false }));
 
 const DAY_MS = 86_400_000;
 
@@ -201,6 +192,12 @@ function assertFiniteCard(card: PersistedFsrsCardV1): void {
 /**
  * The single authoritative D-01 calculation. `now` is injected by the caller; this
  * function never reads a clock and never uses a fixed status-to-interval table.
+ *
+ * The returned decision — including the persisted FSRS card inside it — is
+ * deep-frozen. It is persisted verbatim and then mirrored into the recap, the
+ * concept `dueAt`, and the authenticated study projection; a caller that could
+ * edit it after the fact could make those surfaces disagree about one concept
+ * without any store write.
  */
 export function decideReviewSchedule(input: ReviewScheduleDecisionInput): ReviewScheduleDecisionV1 {
   const rating = VIVA_REVIEW_STATUS_RATINGS[input.status];
@@ -253,7 +250,7 @@ export function decideReviewSchedule(input: ReviewScheduleDecisionInput): Review
   };
   assertFiniteCard(card);
 
-  return {
+  return deepFreeze({
     schema_version: VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
     policy_id: VIVA_REVIEW_SCHEDULE_POLICY_ID,
     generated_at: toIsoMillis(input.now),
@@ -267,7 +264,7 @@ export function decideReviewSchedule(input: ReviewScheduleDecisionInput): Review
     due_at: toIsoMillis(dueAt),
     cap_reason: capReason,
     card,
-  };
+  });
 }
 
 export function humanInterval(from: Date, to: Date): string {
@@ -275,21 +272,6 @@ export function humanInterval(from: Date, to: Date): string {
   if (days <= 0) return "today";
   if (days === 1) return "tomorrow";
   return `in ${days} days`;
-}
-
-/**
- * UI-only status estimate for an unseen concept. Uncapped and card-free: it answers
- * "what does a first review of this status look like", never "when is this concept
- * due". Learner-facing schedules come from `scheduleConceptReview`.
- */
-export function dueDateForStatus(status: ConceptStatus, now: Date): Date {
-  const card = createEmptyCard(now);
-  const { card: scheduled } = scheduler.next(card, now, conceptStatusToRating(status));
-  return scheduled.due;
-}
-
-export function reviewIntervalForStatus(status: ConceptStatus, now: Date): string {
-  return humanInterval(now, dueDateForStatus(status, now));
 }
 
 /**

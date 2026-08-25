@@ -239,3 +239,84 @@ describe("LEARN-007 session completion recovery copy", () => {
     }
   });
 });
+
+/**
+ * Assert that a write to deep-frozen data fails instead of silently succeeding.
+ *
+ * ES modules are always strict mode, so assigning to a frozen property — or
+ * extending a frozen array — throws a `TypeError`. The engine's message differs
+ * between assignment and extension, so the assertion is on the error type.
+ */
+function expectFrozenWrite(mutate: () => void): void {
+  let thrown: unknown;
+  try {
+    mutate();
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown instanceof TypeError ? "TypeError" : String(thrown)).toBe("TypeError");
+}
+
+/**
+ * `LEARN-010` — the recovery copy contract is derived, validated data.
+ *
+ * `Object.freeze` on the contract object alone left `states`, each entry, and
+ * each learner action writable, so a consumer could rewrite the button label or
+ * intent that every other consumer then renders. The copy is generated once from
+ * the validated learner-loop contract; nothing downstream may edit it in place.
+ */
+describe("LEARN-010 the recovery copy contract is deeply immutable", () => {
+  test("states, learner actions, and operator diagnostics cannot be rewritten", () => {
+    const contract = VIVA_LEARNER_RECOVERY_COPY_CONTRACT;
+    const before = JSON.stringify(contract);
+    const first = contract.states[0];
+
+    expect(Object.isFrozen(contract)).toBe(true);
+    expect(Object.isFrozen(contract.states)).toBe(true);
+    expect(Object.isFrozen(first)).toBe(true);
+    expectFrozenWrite(() => {
+      contract.states.push(first);
+    });
+    expectFrozenWrite(() => {
+      first.learner.capsule_label = "rewritten";
+    });
+    expectFrozenWrite(() => {
+      first.learner.primary_action.label = "rewritten";
+    });
+    expectFrozenWrite(() => {
+      first.learner.secondary_action.intent = "disabled";
+    });
+    expectFrozenWrite(() => {
+      first.operator.diagnostic_fields.push("stage");
+    });
+    expectFrozenWrite(() => {
+      first.runtime_copy_causes.push("recap_success");
+    });
+
+    expect(JSON.stringify(contract)).toBe(before);
+  });
+
+  test("a freshly projected entry is frozen the same way", () => {
+    const entry = learnerRecoveryCopyEntry(VIVA_LEARNER_LOOP_CONTRACT.states[0]);
+    const before = JSON.stringify(entry);
+
+    expect(Object.isFrozen(entry)).toBe(true);
+    expect(Object.isFrozen(entry.learner)).toBe(true);
+    expect(Object.isFrozen(entry.operator)).toBe(true);
+    expectFrozenWrite(() => {
+      entry.state_label = "rewritten";
+    });
+    expectFrozenWrite(() => {
+      entry.learner.primary_action.intent = "disabled";
+    });
+
+    expect(JSON.stringify(entry)).toBe(before);
+  });
+
+  test("the looked-up entry is the frozen contract entry, not a mutable copy", () => {
+    const entry = learnerRecoveryCopyForState("durability_degraded");
+
+    expect(entry).not.toBeUndefined();
+    expect(Object.isFrozen(entry)).toBe(true);
+  });
+});
