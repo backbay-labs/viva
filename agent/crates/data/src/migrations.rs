@@ -3386,6 +3386,167 @@ pub(crate) mod tests {
             .expect("isolated test schema drops cleanly");
     }
 
+    /// Which `answer_attempts` writer a race round drives.
+    ///
+    /// `DATA-002` names both — "concurrent envelope/evaluation writes" — and they
+    /// are two separate conflict-safe upserts over the same two unique indexes, so
+    /// each one is raced on its own.
+    #[derive(Clone, Copy, Debug)]
+    enum RacedAttemptWriter {
+        Envelope,
+        Evaluation,
+    }
+
+    /// Drives two identical writers at the same `(voice_session_id, response_id)`,
+    /// over `rounds` fresh response identities, and asserts the `DATA-002` result
+    /// after every round.
+    ///
+    /// Migration `0011` puts two unique indexes on `answer_attempts` and one
+    /// `ON CONFLICT` clause can arbitrate only one of them. Two *identical* writers
+    /// collide on both: they carry the same `(voice_session_id, response_id)` and
+    /// the same `(voice_session_id, idempotency_key)`. When the loser's arbiter
+    /// pre-check runs before the winner's tuple reaches the arbiter index, the loser
+    /// inserts speculatively, meets the winner on
+    /// `answer_attempts_voice_session_idempotency_idx` instead, and PostgreSQL
+    /// raises a hard SQLSTATE 23505 that `ON CONFLICT` cannot absorb. Whether that
+    /// happens is decided by nanoseconds inside the loser's index insertions, so a
+    /// single execution proves nothing about it: the single-shot race test passed 20
+    /// of 20 isolated runs while failing 2 of 10 full-suite runs.
+    ///
+    /// Two things make it a gate instead of a coin flip. The racers are released
+    /// together by a barrier on a real two-worker runtime, so both statements are in
+    /// flight at once rather than one being sent after the other has been awaited;
+    /// and the round is repeated. At the rate measured on this lane's hardware the
+    /// branch is taken in roughly one round in thirty, which
+    /// `IDENTICAL_RACER_ROUNDS` turns into a near-certainty per run.
+    ///
+    /// Every round asserts convergence, not merely "no panic": both callers `Ok`,
+    /// exactly one physical row, the full expected tuple, and — across the whole
+    /// test — one counted insert per round summed over both store instances.
+    async fn race_identical_attempt_writers(writer: RacedAttemptWriter, rounds: usize) {
+        let fixture = PostgresSchemaFixture::migrated().await;
+        let pool = fixture.pool().clone();
+        seed_postgres_fixture(&pool)
+            .await
+            .expect("fixture seed applies");
+        let first_store = PostgresStudyStore::new(pool.clone());
+        let second_store = PostgresStudyStore::new(pool.clone());
+        let session_id = Uuid::new_v4().to_string();
+        record_count_table_session(&first_store, &session_id).await;
+        let question_id = fixture_question().question_id;
+        let evaluation = fixture_evaluation("mostly correct", ConceptStatus::Strong, 0.84);
+
+        for round in 0..rounds {
+            let response_id = format!("response-race-{round}");
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let racers = [first_store.clone(), second_store.clone()].map(|store| {
+                let session_id = session_id.clone();
+                let response_id = response_id.clone();
+                let evaluation = evaluation.clone();
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    match writer {
+                        RacedAttemptWriter::Envelope => store
+                            .record_answer_attempt_envelope(
+                                "user-1",
+                                "biology-midterm",
+                                &session_id,
+                                fixture_envelope(&response_id),
+                            )
+                            .await
+                            .map(|_| ()),
+                        RacedAttemptWriter::Evaluation => store
+                            .record_answer_evaluation(
+                                "user-1",
+                                "biology-midterm",
+                                &session_id,
+                                &response_id,
+                                evaluation,
+                            )
+                            .await
+                            .map(|_| ()),
+                    }
+                })
+            });
+
+            for racer in racers {
+                if let Err(error) = racer.await.expect("racer joins") {
+                    panic!("round {round} of the identical {writer:?} race failed: {error:?}");
+                }
+            }
+
+            let rows = attempt_rows(&pool, &session_id, &response_id).await;
+            assert_eq!(
+                rows.len(),
+                1,
+                "round {round} of the identical {writer:?} race did not converge on one row"
+            );
+            let converged = &rows[0];
+            assert_eq!(converged.question_id, question_id);
+            assert_eq!(converged.submission_sequence, 1);
+            match writer {
+                RacedAttemptWriter::Envelope => {
+                    assert_eq!(
+                        converged.idempotency_key,
+                        format!("{question_id}:1:{response_id}")
+                    );
+                    assert_eq!(converged.pre_provider_state, "captured");
+                    assert_eq!(converged.byte_count, Some(24));
+                    assert_eq!(converged.locale.as_deref(), Some("en-US"));
+                    assert_eq!(converged.evaluation_label, None);
+                    assert_eq!(converged.concept_status, None);
+                }
+                RacedAttemptWriter::Evaluation => {
+                    assert_eq!(
+                        converged.idempotency_key,
+                        format!("{session_id}:{question_id}:1:{response_id}:compat")
+                    );
+                    assert_eq!(converged.pre_provider_state, "evaluation_only_compat");
+                    assert_eq!(
+                        converged.evaluation_label.as_deref(),
+                        Some("mostly correct")
+                    );
+                    assert_eq!(converged.concept_status.as_deref(), Some("strong"));
+                }
+            }
+        }
+
+        // One physical row per round, counted exactly once across both instances.
+        assert_eq!(
+            first_store.write_counts().answer_attempts
+                + second_store.write_counts().answer_attempts,
+            rounds
+        );
+
+        fixture
+            .cleanup()
+            .await
+            .expect("isolated test schema drops cleanly");
+    }
+
+    /// Rounds per raced writer.
+    ///
+    /// Sized from the rate measured on this lane's hardware at which the
+    /// non-arbiter duplicate-key branch is actually taken — about one round in
+    /// thirty — so a regression fails these tests on essentially every run instead
+    /// of the one run in five that made the original defect an intermittent
+    /// full-suite failure, while keeping each test inside a few seconds.
+    const IDENTICAL_RACER_ROUNDS: usize = 160;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_record_answer_evaluation_identical_racers_converge_over_many_rounds() {
+        race_identical_attempt_writers(RacedAttemptWriter::Evaluation, IDENTICAL_RACER_ROUNDS)
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_record_answer_envelope_identical_racers_converge_over_many_rounds() {
+        race_identical_attempt_writers(RacedAttemptWriter::Envelope, IDENTICAL_RACER_ROUNDS).await;
+    }
+
     /// `DATA-002`: "without a duplicate-key adapter error". Task 4 Step 4 states
     /// the same rule from the other side — "it never leaks SQLSTATE 23505".
     ///
