@@ -19,6 +19,7 @@ declare module "bun:test" {
     toContain: (expected: unknown) => void;
     toEqual: (expected: unknown) => void;
     toHaveLength: (expected: number) => void;
+    toHaveProperty: (keyPath: string | number | Array<string | number>, value?: unknown) => void;
     toMatchObject: (expected: object) => void;
     toThrow: (expected?: string | RegExp | Error) => void;
   };
