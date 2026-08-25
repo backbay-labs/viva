@@ -66,15 +66,31 @@ export function drainSessionPlayback(input: {
   });
 }
 
+/**
+ * A `session_cap` terminal on a generation that never delivered a question is
+ * the server's duplicate-session admission guard, not a finished session: the
+ * agent allows one active session per learner and study set, and a lease from
+ * an uncleanly dropped connection frees only when the server's 45-second idle
+ * timer reaps it. That state is a retryable hold.
+ */
+export function isSessionAdmissionRejection(input: {
+  questionEverStarted: boolean;
+  terminalReason?: AgentTerminalSessionReason;
+}): boolean {
+  return input.terminalReason === "session_cap" && !input.questionEverStarted;
+}
+
 export function shouldNavigateToRecap(input: {
   hasRecap: boolean;
   hasPendingAudio: boolean;
   playbackActive: boolean;
   playbackWaitExpired: boolean;
+  questionEverStarted: boolean;
   status: VivaAgentSessionState["status"];
   terminalReason?: AgentTerminalSessionReason;
 }): boolean {
   if (!input.hasRecap) {
+    if (isSessionAdmissionRejection(input)) return false;
     return input.terminalReason !== undefined;
   }
 
@@ -147,9 +163,21 @@ export function correctionModelFromEvaluation(
 
 export function stageCopyForConnection(input: {
   close?: VivaAgentCloseDiagnostics;
+  questionEverStarted: boolean;
   status: VivaAgentSessionState["status"];
   terminalReason?: AgentTerminalSessionReason;
 }): SessionStageCopy {
+  if (isSessionAdmissionRejection(input)) {
+    return {
+      canRetry: true,
+      detail:
+        "The server allows one active session per study set, and an interrupted connection's slot frees within about a minute. Wait a moment, then retry.",
+      statusLabel: "previous session closing",
+      terminal: false,
+      title: "Your previous session is still closing.",
+    };
+  }
+
   const terminal = input.terminalReason !== undefined || input.close?.wasClean === true;
   if (terminal) {
     const reason = input.terminalReason?.replace(/_/g, " ");

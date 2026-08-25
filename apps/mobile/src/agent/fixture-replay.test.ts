@@ -94,10 +94,11 @@ describe("mobile pipeline replays the canonical session fixtures", () => {
     expect(derived.canSubmitAnswer).toBe(true);
 
     expect(state.audio).toHaveLength(1);
-    expect(state.audio[0]).toEqual({
-      responseId: "response-1",
-      frame: { pcm16_base64: "AQIDBA==" },
-    });
+    expect(state.audio[0]?.responseId).toBe("response-1");
+    // 600 ms examiner tone: 14,400 samples × 2 bytes → 28,800 bytes → 38,400
+    // base64 chars, starting from a silent fade-in sample (0x0000 → "AAD…").
+    expect(state.audio[0]?.frame.pcm16_base64).toHaveLength(38_400);
+    expect(state.audio[0]?.frame.pcm16_base64.startsWith("AAD")).toBe(true);
     expect(state.cancelledResponseIds).toEqual(["response-2"]);
   });
 });

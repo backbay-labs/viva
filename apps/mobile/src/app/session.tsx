@@ -253,6 +253,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
         hasPendingAudio: agent.agentState.audio.length > 0,
         playbackActive: agent.speaking,
         playbackWaitExpired: recapPlaybackWaitExpired,
+        questionEverStarted: Boolean(agent.derived.question),
         status: agent.status,
         terminalReason: agent.derived.terminalReason,
       })
@@ -261,6 +262,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     }
   }, [
     agent.agentState.audio.length,
+    agent.derived.question,
     agent.derived.terminalReason,
     agent.speaking,
     agent.status,
@@ -413,6 +415,7 @@ function LiveSessionScreen({ studySet }: { studySet: StudySet }) {
     : undefined;
   const connectionCopy = stageCopyForConnection({
     close: agent.derived.close,
+    questionEverStarted: Boolean(agent.derived.question),
     status: agent.status,
     terminalReason: agent.derived.terminalReason,
   });

@@ -87,6 +87,7 @@ describe("stageCopyForConnection", () => {
   test("never describes an unclean close as a finished session", () => {
     const model = stageCopyForConnection({
       close: { code: 1006, reason: "", wasClean: false },
+      questionEverStarted: true,
       status: "closed",
     });
     expect(model.title).toBe("The connection was interrupted.");
@@ -99,28 +100,57 @@ describe("stageCopyForConnection", () => {
     expect(
       stageCopyForConnection({
         close: { code: 1000, reason: "client stop", wasClean: true },
+        questionEverStarted: true,
         status: "closed",
       }),
     ).toMatchObject({ canRetry: false, terminal: true, title: "This session has ended." });
     expect(
-      stageCopyForConnection({ status: "closed", terminalReason: "session_cap" }),
+      stageCopyForConnection({
+        questionEverStarted: true,
+        status: "closed",
+        terminalReason: "session_cap",
+      }),
     ).toMatchObject({ canRetry: false, terminal: true, title: "This session has ended." });
     expect(
-      stageCopyForConnection({ status: "open", terminalReason: "durability_degraded" }),
+      stageCopyForConnection({
+        questionEverStarted: true,
+        status: "open",
+        terminalReason: "durability_degraded",
+      }),
     ).toMatchObject({ canRetry: false, statusLabel: "ended", terminal: true });
     expect(
-      stageCopyForConnection({ status: "error", terminalReason: "provider_timeout" }),
+      stageCopyForConnection({
+        questionEverStarted: true,
+        status: "error",
+        terminalReason: "provider_timeout",
+      }),
     ).toMatchObject({ canRetry: false, statusLabel: "ended", terminal: true });
   });
 
+  test("treats session_cap before any question as a retryable admission hold", () => {
+    const model = stageCopyForConnection({
+      close: { code: 1008, reason: "", wasClean: false },
+      questionEverStarted: false,
+      status: "closed",
+      terminalReason: "session_cap",
+    });
+    expect(model.title).toBe("Your previous session is still closing.");
+    expect(model.canRetry).toBe(true);
+    expect(model.terminal).toBe(false);
+    expect(model.statusLabel).toBe("previous session closing");
+    expect(model.detail).toContain("one active session per study set");
+  });
+
   test("distinguishes connecting, open preparation, and error", () => {
-    expect(stageCopyForConnection({ status: "connecting" }).title).toBe(
+    expect(stageCopyForConnection({ questionEverStarted: false, status: "connecting" }).title).toBe(
       "Connecting to your examiner…",
     );
-    expect(stageCopyForConnection({ status: "open" }).title).toBe(
+    expect(stageCopyForConnection({ questionEverStarted: false, status: "open" }).title).toBe(
       "Your examiner is preparing the first question…",
     );
-    expect(stageCopyForConnection({ status: "error" }).canRetry).toBe(true);
+    expect(stageCopyForConnection({ questionEverStarted: false, status: "error" }).canRetry).toBe(
+      true,
+    );
   });
 });
 
@@ -158,6 +188,7 @@ describe("terminal session lifecycle", () => {
         hasRecap: true,
         playbackActive: false,
         playbackWaitExpired: false,
+        questionEverStarted: true,
         status: "open",
       }),
     ).toBe(false);
@@ -167,6 +198,7 @@ describe("terminal session lifecycle", () => {
         hasRecap: true,
         playbackActive: true,
         playbackWaitExpired: false,
+        questionEverStarted: true,
         status: "closed",
         terminalReason: "turn_cap",
       }),
@@ -177,6 +209,7 @@ describe("terminal session lifecycle", () => {
         hasRecap: true,
         playbackActive: false,
         playbackWaitExpired: false,
+        questionEverStarted: true,
         status: "open",
       }),
     ).toBe(true);
@@ -190,6 +223,7 @@ describe("terminal session lifecycle", () => {
         hasRecap: true,
         playbackActive: true,
         playbackWaitExpired: true,
+        questionEverStarted: true,
         status: "open",
       }),
     ).toBe(true);
@@ -202,6 +236,7 @@ describe("terminal session lifecycle", () => {
         hasRecap: false,
         playbackActive: true,
         playbackWaitExpired: false,
+        questionEverStarted: true,
         status: "closed",
         terminalReason: "turn_cap",
       }),
@@ -212,6 +247,7 @@ describe("terminal session lifecycle", () => {
         hasRecap: false,
         playbackActive: true,
         playbackWaitExpired: false,
+        questionEverStarted: true,
         status: "error",
         terminalReason: "provider_timeout",
       }),
@@ -222,6 +258,7 @@ describe("terminal session lifecycle", () => {
         hasRecap: false,
         playbackActive: false,
         playbackWaitExpired: false,
+        questionEverStarted: true,
         status: "open",
         terminalReason: "turn_cap",
       }),
@@ -232,9 +269,36 @@ describe("terminal session lifecycle", () => {
         hasRecap: false,
         playbackActive: false,
         playbackWaitExpired: false,
+        questionEverStarted: true,
         status: "closed",
       }),
     ).toBe(false);
+  });
+
+  test("holds on the session screen when session_cap rejects admission before any question", () => {
+    expect(
+      shouldNavigateToRecap({
+        hasPendingAudio: false,
+        hasRecap: false,
+        playbackActive: false,
+        playbackWaitExpired: false,
+        questionEverStarted: false,
+        status: "closed",
+        terminalReason: "session_cap",
+      }),
+    ).toBe(false);
+    // A session_cap after a real session (question delivered) is still terminal.
+    expect(
+      shouldNavigateToRecap({
+        hasPendingAudio: false,
+        hasRecap: false,
+        playbackActive: false,
+        playbackWaitExpired: false,
+        questionEverStarted: true,
+        status: "closed",
+        terminalReason: "session_cap",
+      }),
+    ).toBe(true);
   });
 });
 
