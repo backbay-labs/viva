@@ -1192,7 +1192,8 @@ async function checkBeginButtonNavigatesOnce(page, baseUrl) {
  * -------------------------------------------------------------------- */
 
 /** The seeded bootstrap sentinel `LIBRARY_SNAPSHOT_FIXTURE` already carries (see its own header comment). */
-const SESSION_BOOTSTRAP_SENTINEL = LIBRARY_SNAPSHOT_FIXTURE.study_sets[0].actions.start.session_bootstrap_token;
+const SESSION_BOOTSTRAP_SENTINEL =
+  LIBRARY_SNAPSHOT_FIXTURE.study_sets[0].actions.start.session_bootstrap_token;
 const SESSION_BOOTSTRAP_ACCESSIBLE_NAME = `Start ${LIBRARY_SNAPSHOT_FIXTURE.study_sets[0].title}`;
 const SYNTHETIC_SESSION_TOKEN = "synthetic-session-token-for-frontend-accessibility-check";
 const SYNTHETIC_REFRESH_TOKEN = "synthetic-refresh-token-for-frontend-accessibility-check";
@@ -1232,6 +1233,43 @@ async function visibleBodyMarkup(page) {
     for (const el of Array.from(clone.querySelectorAll("script, style, template"))) el.remove();
     return clone.outerHTML;
   });
+}
+
+/**
+ * D-07 Branch A Step 3's "adds no persistent browser storage": reads every
+ * `localStorage`/`sessionStorage` key and `document.cookie` in one
+ * `page.evaluate` round trip and fails if the serialized snapshot contains
+ * the bootstrap sentinel, the minted session token, or the minted refresh
+ * token. Storage is the one capability surface `FRONTEND-011`'s Step 1 names
+ * ("no credential field enters DOM, URL query, storage, or logs") that had
+ * no negative control anywhere in this script before this check — today's
+ * real code never touches storage, so this exists to catch a future
+ * regression, not a live leak.
+ *
+ * @param {import("playwright").Page} page
+ */
+async function checkNoSessionBootstrapStorageLeak(page) {
+  const failures = [];
+  const storageSnapshot = await page.evaluate(() =>
+    JSON.stringify({
+      cookie: document.cookie,
+      local: { ...localStorage },
+      session: { ...sessionStorage },
+    }),
+  );
+  for (const [needle, label] of [
+    [SESSION_BOOTSTRAP_SENTINEL, "the bootstrap sentinel"],
+    [SYNTHETIC_SESSION_TOKEN, "the minted session token"],
+    [SYNTHETIC_REFRESH_TOKEN, "the minted refresh token"],
+  ]) {
+    if (storageSnapshot.includes(needle)) {
+      failures.push(
+        `[session-bootstrap] browser storage (localStorage/sessionStorage/cookie) persisted ` +
+          `${label}: ${storageSnapshot}`,
+      );
+    }
+  }
+  return failures;
 }
 
 /**
@@ -1293,7 +1331,10 @@ async function checkSessionBootstrapSecrecyAndFragment(browser, baseUrl) {
   const requestRecords = [];
   page.on("request", (request) => {
     const headers = request.headers();
-    requestRecords.push({ referer: headers.referer ?? headers.referrer ?? null, url: request.url() });
+    requestRecords.push({
+      referer: headers.referer ?? headers.referrer ?? null,
+      url: request.url(),
+    });
   });
   const capturedStartRequests = [];
   await page.route("**/api/viva-session/start", async (route) => {
@@ -1315,9 +1356,13 @@ async function checkSessionBootstrapSecrecyAndFragment(browser, baseUrl) {
       );
     }
 
-    await page.getByRole("button", { name: SESSION_BOOTSTRAP_ACCESSIBLE_NAME, exact: true }).click();
     await page
-      .waitForFunction(() => location.hash.includes("session_token="), undefined, { timeout: 10_000 })
+      .getByRole("button", { name: SESSION_BOOTSTRAP_ACCESSIBLE_NAME, exact: true })
+      .click();
+    await page
+      .waitForFunction(() => location.hash.includes("session_token="), undefined, {
+        timeout: 10_000,
+      })
       .catch(() => {});
 
     const afterClickMarkup = await visibleBodyMarkup(page);
@@ -1360,7 +1405,9 @@ async function checkSessionBootstrapSecrecyAndFragment(browser, baseUrl) {
       );
     }
     if (currentUrl.searchParams.has("session_token") || currentUrl.searchParams.has("token")) {
-      failures.push("[session-bootstrap] the minted session token leaked into the URL query string");
+      failures.push(
+        "[session-bootstrap] the minted session token leaked into the URL query string",
+      );
     }
     if (!currentUrl.hash.includes("session_token=")) {
       failures.push(
@@ -1368,13 +1415,25 @@ async function checkSessionBootstrapSecrecyAndFragment(browser, baseUrl) {
       );
     }
 
+    // D-07 Branch A Step 3's "adds no persistent browser storage" — the one
+    // capability surface Step 1's own list (DOM text, attributes, URLs, and
+    // logs) does not separately enumerate but that a credential could just
+    // as easily leak into. Read after the click/navigation, i.e. after every
+    // real production code path that could have written to it has run.
+    failures.push(...(await checkNoSessionBootstrapStorageLeak(page)));
+
     for (const record of requestRecords) {
-      if (record.url.includes(SESSION_BOOTSTRAP_SENTINEL) || record.url.includes(SYNTHETIC_SESSION_TOKEN)) {
-        failures.push(`[session-bootstrap] a request URL leaked a session credential: ${record.url}`);
+      if (
+        record.url.includes(SESSION_BOOTSTRAP_SENTINEL) ||
+        record.url.includes(SYNTHETIC_SESSION_TOKEN)
+      ) {
+        failures.push(
+          `[session-bootstrap] a request URL leaked a session credential: ${record.url}`,
+        );
       }
       if (
-        (record.referer && record.referer.includes(SESSION_BOOTSTRAP_SENTINEL)) ||
-        (record.referer && record.referer.includes(SYNTHETIC_SESSION_TOKEN))
+        record.referer?.includes(SESSION_BOOTSTRAP_SENTINEL) ||
+        record.referer?.includes(SYNTHETIC_SESSION_TOKEN)
       ) {
         failures.push(
           `[session-bootstrap] a request referrer leaked a session credential: ${record.referer}`,
@@ -1387,7 +1446,9 @@ async function checkSessionBootstrapSecrecyAndFragment(browser, baseUrl) {
         text.includes(SYNTHETIC_SESSION_TOKEN) ||
         text.includes(SYNTHETIC_REFRESH_TOKEN)
       ) {
-        failures.push(`[session-bootstrap] a browser console message leaked a session credential: ${text}`);
+        failures.push(
+          `[session-bootstrap] a browser console message leaked a session credential: ${text}`,
+        );
       }
     }
   } finally {
@@ -1421,12 +1482,17 @@ async function checkSessionBootstrapFetchBound(browser, baseUrl) {
 
   try {
     await gotoRouteReady(page, baseUrl, "/");
-    await page.getByRole("button", { name: SESSION_BOOTSTRAP_ACCESSIBLE_NAME, exact: true }).click();
+    await page
+      .getByRole("button", { name: SESSION_BOOTSTRAP_ACCESSIBLE_NAME, exact: true })
+      .click();
 
     const startedAt = Date.now();
     const surfaced = await page
       .waitForFunction(
-        () => (document.querySelector(".viva-library__status")?.textContent ?? "").includes("timed out"),
+        () =>
+          (document.querySelector(".viva-library__status")?.textContent ?? "").includes(
+            "timed out",
+          ),
         undefined,
         { timeout: 8_000 },
       )
@@ -1450,6 +1516,7 @@ async function checkSessionBootstrapFetchBound(browser, baseUrl) {
     if (currentUrl.pathname === "/session") {
       failures.push("[session-bootstrap] a timed-out start request still navigated to /session");
     }
+    failures.push(...(await checkNoSessionBootstrapStorageLeak(page)));
     for (const text of consoleTexts) {
       if (text.includes(SESSION_BOOTSTRAP_SENTINEL)) {
         failures.push(
