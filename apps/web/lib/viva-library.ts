@@ -230,8 +230,9 @@ function stripBrowserOnlyTokenFields(
  * capability start/retry path (`LibraryStatusPanel.tsx`). This section holds
  * the pure logic that path composes around: the exact "complete start
  * response" shape a successful mint returns, a bounded (6000ms) timeout
- * wrapper around the start fetch so a hung mint can never hang the UI
- * forever, and the "small local indirection" this task owns in place of
+ * wrapper around the start fetch — headers *and* body, one shared deadline —
+ * so a hung mint can never hang the UI forever, and the "small local
+ * indirection" this task owns in place of
  * Plan 10's not-yet-published `replaceBrowserSessionCredential`
  * (`apps/web/lib/use-viva-agent-session.ts` has no such export in this tree
  * — confirmed by reading that file before writing this code; Plan 10 wires
@@ -347,23 +348,30 @@ export type VivaBoundedFetchResult =
   | { ok: true; response: Response }
   | { ok: false; reason: "timeout" };
 
+export type VivaBoundedOperationResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; reason: "timeout" };
+
 /**
- * Web UI R6 ledger alias' start-deadline proof: bounds `fetchImpl` with an
- * `AbortController` that fires at `timeoutMs` (default
+ * The shared bound primitive `fetchWithVivaSessionStartTimeout` and
+ * `LibraryStatusPanel.tsx`'s `requestServerSession` both build on: races
+ * `operation(signal)` against `timeoutMs` (default
  * `VIVA_SESSION_START_FETCH_TIMEOUT_MS`, the plan's locked 6000ms policy —
- * the same value named for Plan 10's session-entry refresh timeout). A
- * never-settling fetch resolves to `{ ok: false, reason: "timeout" }` once
- * the bound fires; any other rejection propagates unchanged, so a genuine
+ * the same value named for Plan 10's session-entry refresh timeout).
+ * `signal` aborts exactly once, at the bound, and stays live for the whole
+ * of `operation` — not only its first `await` — so a caller that chains a
+ * response-body read (`response.json()`) after an already-settled fetch
+ * inside the same `operation` still aborts at the bound if that read hangs;
+ * the bound covers the complete round trip, not merely header arrival. Any
+ * other rejection from `operation` propagates unchanged, so a genuine
  * network failure is never mislabeled a timeout. The timer is always
- * cleared, on every exit path, so a settled fetch never leaves a pending
- * timer behind.
+ * cleared, on every exit path, so a settled operation never leaves a
+ * pending timer behind.
  */
-export async function fetchWithVivaSessionStartTimeout(
-  fetchImpl: VivaBoundedFetch,
-  input: string,
-  init: RequestInit,
+export async function withVivaSessionStartTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
   options: { timeoutMs?: number; timers?: VivaFetchTimers } = {},
-): Promise<VivaBoundedFetchResult> {
+): Promise<VivaBoundedOperationResult<T>> {
   const timeoutMs = options.timeoutMs ?? VIVA_SESSION_START_FETCH_TIMEOUT_MS;
   const timers = options.timers ?? REAL_FETCH_TIMERS;
   const controller = new AbortController();
@@ -373,14 +381,35 @@ export async function fetchWithVivaSessionStartTimeout(
     controller.abort();
   }, timeoutMs);
   try {
-    const response = await fetchImpl(input, { ...init, signal: controller.signal });
-    return { ok: true, response };
+    const value = await operation(controller.signal);
+    return { ok: true, value };
   } catch (error) {
     if (timedOut) return { ok: false, reason: "timeout" };
     throw error;
   } finally {
     timers.clearTimeout(timeoutId);
   }
+}
+
+/**
+ * Fetch-shaped convenience wrapper over `withVivaSessionStartTimeout`: bounds
+ * only `fetchImpl`'s own settling (i.e. header arrival), handing back the raw
+ * `Response` for the caller to read. Kept for callers that intentionally want
+ * just the network step bounded; `LibraryStatusPanel.tsx`'s production start
+ * flow instead calls `withVivaSessionStartTimeout` directly so its bound also
+ * covers the response body read (see that primitive's doc comment).
+ */
+export async function fetchWithVivaSessionStartTimeout(
+  fetchImpl: VivaBoundedFetch,
+  input: string,
+  init: RequestInit,
+  options: { timeoutMs?: number; timers?: VivaFetchTimers } = {},
+): Promise<VivaBoundedFetchResult> {
+  const result = await withVivaSessionStartTimeout(
+    (signal) => fetchImpl(input, { ...init, signal }),
+    options,
+  );
+  return result.ok ? { ok: true, response: result.value } : result;
 }
 
 function trimmedOrNull(value: string | null | undefined): string | null {

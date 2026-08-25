@@ -627,7 +627,86 @@ describe("D-07 Branch A session-bootstrap composition: vault seam and fetch boun
       globalThis.fetch = originalFetch;
     }
   });
+
+  // Adversarial-review finding (important, first-attempt Task 6): the
+  // previous `timeoutMs: 5` test above only proves a request whose *headers*
+  // never arrive is bounded. `fetchWithVivaSessionStartTimeout` cleared its
+  // timer the instant `fetch()` itself settled, so a response whose headers
+  // arrived immediately but whose *body* never completed ran `response.json()`
+  // with no live timer at all — an unbounded hang the 6000ms policy never
+  // covered. `hangingStartResponse` below mirrors the exact
+  // `hangingJsonResponse` idiom `apps/web/lib/viva-session-api.test.ts`
+  // already uses for the equivalent server-side gap (`ReadableStream` that
+  // only errors when the same `AbortSignal` fires), so this proves the fix
+  // at the real `fetch`/`Response`/`AbortSignal` layer, not only through the
+  // synthetic `manualFakeTimers()` double in `viva-library.test.ts`.
+  test("bounds the start fetch across the response body read too: headers arriving promptly never disarms the bound before a stalled body completes", async () => {
+    const navigations: string[] = [];
+    const vaultCalls: unknown[] = [];
+    const row = projectLibrarySnapshot(librarySnapshotWithBootstrap("body-hang-sentinel"))
+      .libraryRows[0];
+    if (!row) throw new Error("fixture must include a library row");
+    try {
+      globalThis.fetch = (async (_input: unknown, init?: RequestInit) =>
+        hangingStartResponse(init?.signal ?? undefined)) as typeof fetch;
+
+      // `rejectAfter` is a safety backstop, not the mechanism under test: if
+      // `startServerSession` regresses to the pre-fix unbounded behavior,
+      // this makes the test fail fast with a clear message instead of
+      // hanging the whole `bun test` process (this repo's local `bun:test`
+      // ambient types, `types/bun-test/index.d.ts`, declare no per-test
+      // timeout parameter to lean on instead).
+      const outcome = await Promise.race([
+        startServerSession(row, "start", row.start, {
+          navigate: (target) => navigations.push(target),
+          sessionCredentialVault: {
+            replaceBrowserSessionCredential: (input) => vaultCalls.push(input),
+          },
+          timeoutMs: 5,
+        }),
+        rejectAfter(500, "the start fetch's response-body read did not time out"),
+      ]);
+
+      expect(outcome).toEqual({ ok: false, reason: "timed_out" });
+      expect(navigations).toEqual([]);
+      expect(vaultCalls).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
+
+/**
+ * A `Response` whose headers resolve immediately (status 200, JSON content
+ * type) but whose body is a `ReadableStream` that never enqueues or closes
+ * on its own — `response.json()` against it hangs until `signal` aborts, at
+ * which point the stream errors and the read rejects. Mirrors
+ * `hangingJsonResponse` in `apps/web/lib/viva-session-api.test.ts` (that
+ * file's equivalent proof for the server-side upstream-body-read bound);
+ * this is the browser-side counterpart for `requestServerSession`'s fetch.
+ */
+function hangingStartResponse(signal: AbortSignal | undefined): Response {
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            controller.error(new DOMException("The operation was aborted.", "AbortError"));
+          },
+          { once: true },
+        );
+      },
+    }),
+    { headers: { "content-type": "application/json" }, status: 200 },
+  );
+}
+
+/** A real (short) timer-based race, only ever used as a RED/safety backstop so a genuinely unbounded hang fails fast with a clear message instead of hanging the whole `bun test` process. */
+async function rejectAfter(ms: number, message: string): Promise<never> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+  throw new Error(message);
+}
 
 /**
  * D-07 Branch A (`FRONTEND-011`) mounted proof, using the happy-dom runtime
@@ -729,6 +808,19 @@ describe("LibraryStatusPanel mounted session-bootstrap composition (D-07 Branch 
       expect(mountedContainer.innerHTML).not.toContain(sentinel);
       expect(mountedContainer.innerHTML).not.toContain("viva1.mounted-session-token");
       expect(mountedContainer.innerHTML).not.toContain("viva1.mounted-refresh-token");
+
+      // Mirrors `checkNoSessionBootstrapStorageLeak` in
+      // `scripts/frontend-accessibility.mjs`: D-07 Branch A Step 3's "adds
+      // no persistent browser storage" — read after the same real click,
+      // not merely asserted by omission.
+      const storageSnapshot = JSON.stringify({
+        cookie: document.cookie,
+        local: { ...localStorage },
+        session: { ...sessionStorage },
+      });
+      expect(storageSnapshot).not.toContain(sentinel);
+      expect(storageSnapshot).not.toContain("viva1.mounted-session-token");
+      expect(storageSnapshot).not.toContain("viva1.mounted-refresh-token");
     } finally {
       if (root) {
         act(() => {

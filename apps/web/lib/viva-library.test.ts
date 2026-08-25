@@ -11,6 +11,7 @@ import {
   type VivaFetchTimers,
   type VivaLibrarySnapshot,
   type VivaSessionStartResponse,
+  withVivaSessionStartTimeout,
 } from "./viva-library";
 
 const snapshot: VivaLibrarySnapshot = {
@@ -716,6 +717,72 @@ describe("D-07 Branch A session bootstrap composition (FRONTEND-011)", () => {
       expect(timers.scheduled).toEqual([{ delayMs: 25 }]);
       timers.fireAll();
       expect(await resultPromise).toEqual({ ok: false, reason: "timeout" });
+    });
+  });
+
+  // Adversarial-review finding (important, first-attempt Task 6): the 6000ms
+  // bound covered only header arrival — `fetchWithVivaSessionStartTimeout`
+  // cleared its timer as soon as `fetchImpl` settled, before
+  // `LibraryStatusPanel.tsx`'s `requestServerSession` ever read
+  // `response.json()`, so a same-origin response whose headers arrived
+  // promptly but whose body never completed could hang the UI forever
+  // despite the header comment's claim otherwise. `withVivaSessionStartTimeout`
+  // is the generalized primitive both `fetchWithVivaSessionStartTimeout` and
+  // `requestServerSession` now share; this proves its bound spans an
+  // `operation` with more than one internal phase/await, not only the first.
+  describe("withVivaSessionStartTimeout (shared bound primitive; proves the bound outlives an intermediate await)", () => {
+    test("keeps the same bound alive across an intermediate phase — a slow second phase after the first settles still aborts at the bound", async () => {
+      const timers = manualFakeTimers();
+      let resolveFirstPhase: (() => void) | undefined;
+      const firstPhase = new Promise<void>((resolve) => {
+        resolveFirstPhase = resolve;
+      });
+
+      const resultPromise = withVivaSessionStartTimeout(
+        async (signal) => {
+          // Phase 1: simulates a network fetch settling — the exact point
+          // where the unfixed `fetchWithVivaSessionStartTimeout` cleared its
+          // timer and disarmed the bound, before any response body was ever
+          // read.
+          await firstPhase;
+          // Phase 2: simulates reading the response body, which never
+          // settles on its own — only the still-live shared signal can end
+          // it.
+          await new Promise((_resolve, reject) => {
+            signal.addEventListener("abort", () => {
+              reject(new DOMException("The operation was aborted.", "AbortError"));
+            });
+          });
+        },
+        { timers },
+      );
+
+      resolveFirstPhase?.();
+      // Flush the microtask queue so phase 1 actually completes and phase
+      // 2's abort listener is registered before the bound fires — this
+      // never waits on real wall-clock time.
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(timers.cleared).toBe(false);
+      timers.fireAll();
+
+      expect(await resultPromise).toEqual({ ok: false, reason: "timeout" });
+      expect(timers.cleared).toBe(true);
+    });
+
+    test("resolves with the operation's value and clears its timer once the whole (possibly multi-phase) operation settles before the bound fires", async () => {
+      const timers = manualFakeTimers();
+      const result = await withVivaSessionStartTimeout(
+        async (signal) => {
+          await Promise.resolve();
+          expect(signal.aborted).toBe(false);
+          return "operation-value";
+        },
+        { timers },
+      );
+      expect(result).toEqual({ ok: true, value: "operation-value" });
+      expect(timers.cleared).toBe(true);
     });
   });
 

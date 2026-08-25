@@ -11,11 +11,11 @@ import {
 import {
   type BrowserSessionCredentialVault,
   browserSessionCredentialVaultInputFromStartResponse,
-  fetchWithVivaSessionStartTimeout,
   pendingBrowserSessionCredentialVault,
   projectLibrarySnapshot,
   type VivaLibrarySnapshot,
   type VivaSessionStartResponse,
+  withVivaSessionStartTimeout,
 } from "../../lib/viva-library";
 import { librarySessionTarget } from "../../lib/viva-session-entry";
 
@@ -397,6 +397,19 @@ function completeServerSessionStart(
   navigate(target);
 }
 
+/**
+ * Discriminated shape `requestServerSession`'s bounded `operation` resolves
+ * to internally, before being unwrapped back into that function's own return
+ * shape. Keeping this inside the single `withVivaSessionStartTimeout` call
+ * (rather than returning early from separate, independently-bounded steps)
+ * is what keeps the fetch *and* both possible `response.json()` reads under
+ * one shared deadline/abort signal — see that primitive's doc comment.
+ */
+type ServerSessionAttemptOutcome =
+  | { bootstrapCapabilityExpired: boolean; kind: "failed" }
+  | { kind: "invalid" }
+  | { kind: "ok"; startResponse: VivaSessionStartResponse; target: string };
+
 async function requestServerSession(
   row: LibraryRow,
   actionName: "resume" | "start",
@@ -406,54 +419,65 @@ async function requestServerSession(
   | { ok: true; startResponse: VivaSessionStartResponse; target: string }
   | { bootstrapCapabilityExpired: boolean; ok: false; timedOut: boolean }
 > {
-  const bounded = await fetchWithVivaSessionStartTimeout(
-    fetch,
-    "/api/viva-session/start",
-    {
-      body: JSON.stringify({
-        session_id: actionName === "resume" ? action.sessionId : undefined,
-        session_bootstrap_token: action.sessionBootstrapToken,
-        study_set_id: row.id,
-        user_id: row.userId,
-      }),
-      cache: "no-store",
-      headers: { "content-type": "application/json" },
-      method: "POST",
+  const bounded = await withVivaSessionStartTimeout<ServerSessionAttemptOutcome>(
+    async (signal) => {
+      const response = await fetch("/api/viva-session/start", {
+        body: JSON.stringify({
+          session_id: actionName === "resume" ? action.sessionId : undefined,
+          session_bootstrap_token: action.sessionBootstrapToken,
+          study_set_id: row.id,
+          user_id: row.userId,
+        }),
+        cache: "no-store",
+        headers: { "content-type": "application/json" },
+        method: "POST",
+        signal,
+      });
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as { error?: unknown } | null;
+        return {
+          bootstrapCapabilityExpired:
+            response.status === 403 && body?.error === "session_bootstrap_capability_required",
+          kind: "failed",
+        };
+      }
+      const payload = (await response.json()) as VivaSessionStartResponse;
+      if (
+        !payload.session?.session_id ||
+        !payload.session.study_set_id ||
+        !payload.session.user_id ||
+        !payload.session_token
+      ) {
+        return { kind: "invalid" };
+      }
+      return {
+        kind: "ok",
+        startResponse: payload,
+        target: librarySessionTarget({
+          sessionId: payload.session.session_id,
+          sessionToken: payload.session_token,
+          studySetId: payload.session.study_set_id,
+          userId: payload.session.user_id,
+        }),
+      };
     },
     { timeoutMs },
   );
   if (!bounded.ok) {
     return { bootstrapCapabilityExpired: false, ok: false, timedOut: true };
   }
-  const response = bounded.response;
-  if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { error?: unknown } | null;
+  const outcome = bounded.value;
+  if (outcome.kind === "failed") {
     return {
-      bootstrapCapabilityExpired:
-        response.status === 403 && body?.error === "session_bootstrap_capability_required",
+      bootstrapCapabilityExpired: outcome.bootstrapCapabilityExpired,
       ok: false,
       timedOut: false,
     };
   }
-  const payload = (await response.json()) as VivaSessionStartResponse;
-  if (
-    !payload.session?.session_id ||
-    !payload.session.study_set_id ||
-    !payload.session.user_id ||
-    !payload.session_token
-  ) {
+  if (outcome.kind === "invalid") {
     return { bootstrapCapabilityExpired: false, ok: false, timedOut: false };
   }
-  return {
-    ok: true,
-    startResponse: payload,
-    target: librarySessionTarget({
-      sessionId: payload.session.session_id,
-      sessionToken: payload.session_token,
-      studySetId: payload.session.study_set_id,
-      userId: payload.session.user_id,
-    }),
-  };
+  return { ok: true, startResponse: outcome.startResponse, target: outcome.target };
 }
 
 function navigateToSession(target: string) {
