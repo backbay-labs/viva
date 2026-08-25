@@ -49,6 +49,9 @@ function readDiff(base) {
       cwd: root,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
+      // A-12: Node's 1 MiB default truncates large lane diffs and turned every
+      // oversized PR into a hard "Unable to compute redaction diff" failure.
+      maxBuffer: 256 * 1024 * 1024,
     });
   } catch (error) {
     const detail = typeof error.stderr === "string" ? error.stderr.trim() : "";
