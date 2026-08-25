@@ -46,7 +46,10 @@ use agent_domain::{
     PersistedTurnOutcome,
     PortError,
     PortErrorKind,
+    ProgressionPolicyId,
     QuestionDisposition,
+    QuestionProgressionCursor,
+    QuestionProgressionResult,
     RecapBuildError,
     ReviewScheduleAuthority,
     ReviewScheduleCapReasonV1,
@@ -3034,4 +3037,777 @@ async fn scheduling_outcome_persistence_failure_fails_the_turn_and_retry_repairs
             .reps,
         1
     );
+}
+
+// ===========================================================================
+// LEARN-004B — deterministic ordered question progression (D-02B)
+//
+// The store below is a Plan-04-owned in-test `OrderedV1` cursor with real
+// hand-derived behaviour, and every expectation is read from the shared fixture
+// `agent/fixtures/learning-core/question-progression-v1.json` rather than from
+// this file. `active_question` fails closed here, so a selection that took the
+// store's global first-active-question shortcut could not pass any case below.
+// ===========================================================================
+
+const QUESTION_PROGRESSION_FIXTURE: &str =
+    include_str!("../../../fixtures/learning-core/question-progression-v1.json");
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProgressionFixture {
+    #[allow(dead_code)]
+    schema: String,
+    policy: ProgressionPolicyId,
+    voice_session_id: String,
+    active_question_ids: Vec<String>,
+    inactive_question_ids: Vec<String>,
+    questions: BTreeMap<String, StudyQuestion>,
+    cursors: BTreeMap<String, QuestionProgressionCursor>,
+    results: BTreeMap<String, QuestionProgressionResult>,
+}
+
+fn progression_fixture() -> ProgressionFixture {
+    serde_json::from_str(QUESTION_PROGRESSION_FIXTURE)
+        .expect("the shared question-progression fixture parses into the Plan 04 types")
+}
+
+/// The Plan-04-owned `OrderedV1` cursor.
+///
+/// `OrderedV1` selects the first active, source-valid question by persisted
+/// ingestion ordinal that is not already completed. Inactive questions are skipped
+/// and never counted in `total`. A selection is authorized once per `response_id`,
+/// so a replay — or two callers racing on one response — returns the stored result
+/// and leaves the revision alone.
+struct FakeProgressionStore {
+    voice_session_id: String,
+    questions: BTreeMap<String, StudyQuestion>,
+    /// Active question IDs in persisted ingestion order.
+    active_order: Vec<String>,
+    cursor: Mutex<QuestionProgressionCursor>,
+    selections: Mutex<BTreeMap<String, QuestionProgressionResult>>,
+    outcomes: Mutex<Vec<TurnOutcome>>,
+    requested_policies: Mutex<Vec<ProgressionPolicyId>>,
+}
+
+impl FakeProgressionStore {
+    fn from_fixture(fixture: &ProgressionFixture) -> Self {
+        Self {
+            voice_session_id: fixture.voice_session_id.clone(),
+            questions: fixture.questions.clone(),
+            active_order: fixture.active_question_ids.clone(),
+            cursor: Mutex::new(
+                fixture
+                    .cursors
+                    .get("initial")
+                    .expect("the fixture pins an initial cursor")
+                    .clone(),
+            ),
+            selections: Mutex::new(BTreeMap::new()),
+            outcomes: Mutex::new(Vec::new()),
+            requested_policies: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn cursor(&self) -> QuestionProgressionCursor {
+        self.cursor.lock().expect("cursor lock").clone()
+    }
+
+    fn requested_policies(&self) -> Vec<ProgressionPolicyId> {
+        self.requested_policies
+            .lock()
+            .expect("policies lock")
+            .clone()
+    }
+
+    fn total(&self) -> u32 {
+        u32::try_from(self.active_order.len()).expect("small question count")
+    }
+}
+
+#[async_trait::async_trait]
+impl agent_domain::StudyMemoryStore for FakeProgressionStore {
+    /// The global shortcut `LEARN-004B` replaces. A selection that still called it
+    /// would fail rather than quietly return the first active question.
+    async fn active_question(
+        &self,
+        _user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<StudyQuestion>, PortError> {
+        Err(PortError::unavailable(
+            "fake_progression_store",
+            study_set_id,
+            "session progression replaced the global active-question shortcut",
+        ))
+    }
+
+    async fn study_context(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+    ) -> Result<Option<Value>, PortError> {
+        Ok(None)
+    }
+
+    async fn source_reference(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        Ok(None)
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        response_id: &str,
+        _evaluation: AnswerEvaluation,
+    ) -> Result<Value, PortError> {
+        Err(PortError::unavailable(
+            "fake_progression_store",
+            response_id,
+            "record_answer_evaluation is retired by the turn-outcome authority",
+        ))
+    }
+
+    async fn record_concept_status(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        _response_id: &str,
+        concept_id: &str,
+        _status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        Err(PortError::unavailable(
+            "fake_progression_store",
+            concept_id,
+            "independent concept status writes are retired",
+        ))
+    }
+
+    async fn schedule_review_item(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        concept_id: &str,
+        _due_at: &str,
+    ) -> Result<Value, PortError> {
+        Err(PortError::unavailable(
+            "fake_progression_store",
+            concept_id,
+            "legacy due-date writes are not implemented by this store",
+        ))
+    }
+
+    async fn record_recap(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+        _response_id: &str,
+        _recap: agent_domain::StudySessionRecap,
+    ) -> Result<Value, PortError> {
+        Err(PortError::unavailable(
+            "fake_progression_store",
+            voice_session_id,
+            "recap persistence is not part of the progression contract",
+        ))
+    }
+
+    /// The outcome transaction is where a disposition reaches the cursor: an
+    /// `Advance` completes the current question, while `RetryCurrent` and
+    /// `Deferred` keep it and complete nothing.
+    async fn record_turn_outcome(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        _voice_session_id: &str,
+        outcome: TurnOutcome,
+    ) -> Result<PersistedTurnOutcome, PortError> {
+        let mut outcomes = self.outcomes.lock().expect("outcomes lock");
+        if let Some(stored) = outcomes
+            .iter()
+            .find(|stored| stored.response_id == outcome.response_id)
+        {
+            if *stored != outcome {
+                return Err(PortError::conflict(
+                    "fake_progression_store",
+                    &outcome.response_id,
+                    "a different payload was already recorded for this response",
+                ));
+            }
+            return Ok(PersistedTurnOutcome {
+                turn_outcome: stored.clone(),
+                record: TurnOutcomeRecordReceipt {
+                    schema: VIVA_TURN_OUTCOME_RECORD_SCHEMA.to_owned(),
+                    response_id: outcome.response_id.clone(),
+                    replayed: true,
+                },
+            });
+        }
+
+        let disposition = match &outcome.resolution {
+            TurnResolution::Evaluated { disposition, .. }
+            | TurnResolution::Deferred { disposition, .. } => *disposition,
+        };
+        let mut cursor = self.cursor.lock().expect("cursor lock");
+        if disposition == QuestionDisposition::Advance {
+            if let Some(current) = cursor.current_question_id.take() {
+                if !cursor.completed_question_ids.contains(&current) {
+                    cursor.completed_question_ids.push(current);
+                }
+            }
+        }
+        drop(cursor);
+
+        outcomes.push(outcome.clone());
+        Ok(PersistedTurnOutcome {
+            record: TurnOutcomeRecordReceipt {
+                schema: VIVA_TURN_OUTCOME_RECORD_SCHEMA.to_owned(),
+                response_id: outcome.response_id.clone(),
+                replayed: false,
+            },
+            turn_outcome: outcome,
+        })
+    }
+
+    async fn select_next_question(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        policy: ProgressionPolicyId,
+    ) -> Result<QuestionProgressionResult, PortError> {
+        self.requested_policies
+            .lock()
+            .expect("policies lock")
+            .push(policy);
+        if voice_session_id != self.voice_session_id {
+            return Err(PortError::invalid_input(
+                "fake_progression_store",
+                voice_session_id,
+                "the cursor belongs to a different voice session",
+            ));
+        }
+        // D-02B selected the ordered policy; the adaptive one has no
+        // implementation here and fails closed rather than answering.
+        if policy != ProgressionPolicyId::OrderedV1 {
+            return Err(PortError::unavailable(
+                "fake_progression_store",
+                voice_session_id,
+                "only the selected ordered_v1 progression policy is implemented",
+            ));
+        }
+
+        // One authorized selection per response: a replay, and two callers racing
+        // on the same response, both settle on the stored result.
+        let mut selections = self.selections.lock().expect("selections lock");
+        if let Some(stored) = selections.get(response_id) {
+            return Ok(stored.clone());
+        }
+
+        let mut cursor = self.cursor.lock().expect("cursor lock");
+        let total = self.total();
+        let current = cursor
+            .current_question_id
+            .clone()
+            .filter(|id| !cursor.completed_question_ids.contains(id));
+        let selected = match current {
+            Some(id) => Some(id),
+            None => self
+                .active_order
+                .iter()
+                .find(|id| !cursor.completed_question_ids.contains(id))
+                .cloned(),
+        };
+
+        let result = match selected {
+            None => {
+                cursor.current_question_id = None;
+                cursor.revision += 1;
+                QuestionProgressionResult::Exhausted {
+                    completed: u32::try_from(cursor.completed_question_ids.len())
+                        .expect("small question count"),
+                    total,
+                    revision: cursor.revision,
+                }
+            }
+            Some(question_id) => {
+                let ordinal = self
+                    .active_order
+                    .iter()
+                    .position(|id| id == &question_id)
+                    .map(|index| u32::try_from(index + 1).expect("small question count"))
+                    .ok_or_else(|| {
+                        PortError::invalid_input(
+                            "fake_progression_store",
+                            &question_id,
+                            "the cursor names a question that is not active",
+                        )
+                    })?;
+                let question = self.questions.get(&question_id).cloned().ok_or_else(|| {
+                    PortError::invalid_input(
+                        "fake_progression_store",
+                        &question_id,
+                        "the cursor names a question this store does not hold",
+                    )
+                })?;
+                let repeat = cursor.current_question_id.as_deref() == Some(question_id.as_str());
+                let attempt = cursor
+                    .attempt_counts
+                    .entry(question_id.clone())
+                    .or_insert(0);
+                *attempt += 1;
+                let attempt = *attempt;
+                cursor.current_question_id = Some(question_id);
+                cursor.revision += 1;
+                if repeat {
+                    QuestionProgressionResult::Retry {
+                        question,
+                        ordinal,
+                        total,
+                        attempt,
+                        revision: cursor.revision,
+                    }
+                } else {
+                    QuestionProgressionResult::Selected {
+                        question,
+                        ordinal,
+                        total,
+                        selection_reason: "ordered_v1:first_active_uncompleted".to_owned(),
+                        revision: cursor.revision,
+                    }
+                }
+            }
+        };
+        selections.insert(response_id.to_owned(), result.clone());
+        Ok(result)
+    }
+}
+
+fn progression_session(fixture: &ProgressionFixture) -> AuthorizedStudySession {
+    AuthorizedStudySession {
+        user_id: USER_ID.to_owned(),
+        study_set_id: STUDY_SET_ID.to_owned(),
+        voice_session_id: fixture.voice_session_id.clone(),
+        mode: StudyMode::Quiz,
+        active_concepts: Vec::new(),
+    }
+}
+
+fn progression_executor(
+    store: Arc<FakeProgressionStore>,
+    fixture: &ProgressionFixture,
+) -> VivaToolExecutor {
+    VivaToolExecutor::with_clock(
+        store,
+        progression_session(fixture),
+        Arc::new(UnreachableEvaluator),
+        Arc::new(FixedClock::new(
+            agent_domain::parse_utc_instant(NOW).expect("clock instant parses"),
+        )),
+    )
+}
+
+/// Run the `select_next_question` tool and return its whole result payload.
+async fn select_next(
+    store: &Arc<FakeProgressionStore>,
+    fixture: &ProgressionFixture,
+    response_id: &str,
+) -> Value {
+    progression_executor(Arc::clone(store), fixture)
+        .execute(
+            response_id,
+            ToolProposal::select_next_question(STUDY_SET_ID, &fixture.voice_session_id, "quiz"),
+        )
+        .await
+        .expect("select_next_question succeeds")
+        .result
+}
+
+fn progression_from(result: &Value) -> QuestionProgressionResult {
+    serde_json::from_value(result["progression"].clone())
+        .expect("the tool result carries a QuestionProgressionResult")
+}
+
+/// A persisted outcome whose only job here is to carry a disposition to the cursor.
+fn outcome_with(
+    response_id: &str,
+    question_id: &str,
+    disposition: QuestionDisposition,
+) -> TurnOutcome {
+    let resolution = if disposition == QuestionDisposition::Deferred {
+        TurnResolution::Deferred {
+            reason: EvaluationDeferralReason::EvaluatorUnavailable,
+            can_retry_same_question: false,
+            disposition,
+        }
+    } else {
+        TurnResolution::Evaluated {
+            label: EvaluationLabel::Strong,
+            confidence: 0.9,
+            assessments: Vec::new(),
+            concept_transitions: Vec::new(),
+            concise_feedback: "Server-authorized feedback.".to_owned(),
+            retry_prompt: None,
+            disposition,
+        }
+    };
+    TurnOutcome {
+        schema: VIVA_TURN_OUTCOME_SCHEMA.to_owned(),
+        response_id: response_id.to_owned(),
+        question_id: question_id.to_owned(),
+        rubric_policy_version: VIVA_SEMANTIC_RUBRIC_POLICY_VERSION.to_owned(),
+        recorded_at: NOW.to_owned(),
+        source_ids: Vec::new(),
+        supersedes_response_id: None,
+        resolution,
+    }
+}
+
+async fn record_disposition(
+    store: &Arc<FakeProgressionStore>,
+    response_id: &str,
+    question_id: &str,
+    disposition: QuestionDisposition,
+) {
+    agent_domain::StudyMemoryStore::record_turn_outcome(
+        store.as_ref(),
+        USER_ID,
+        STUDY_SET_ID,
+        &store.voice_session_id,
+        outcome_with(response_id, question_id, disposition),
+    )
+    .await
+    .expect("the outcome and its disposition are persisted together");
+}
+
+/// Advance the canonical fixture sequence up to (but not including) the second
+/// question's selection: q1 selected, retried, deferred, then advanced.
+async fn walk_to_second_question(store: &Arc<FakeProgressionStore>, fixture: &ProgressionFixture) {
+    select_next(store, fixture, "sel-1").await;
+    record_disposition(
+        store,
+        "out-1",
+        "q-etc-electron-flow",
+        QuestionDisposition::RetryCurrent,
+    )
+    .await;
+    select_next(store, fixture, "sel-2").await;
+    record_disposition(
+        store,
+        "out-2",
+        "q-etc-electron-flow",
+        QuestionDisposition::Deferred,
+    )
+    .await;
+    select_next(store, fixture, "sel-3").await;
+    record_disposition(
+        store,
+        "out-3",
+        "q-etc-electron-flow",
+        QuestionDisposition::Advance,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ordered_progression_walks_the_shared_fixture_sequence() {
+    let fixture = progression_fixture();
+    assert_eq!(fixture.policy, ProgressionPolicyId::OrderedV1);
+    let store = Arc::new(FakeProgressionStore::from_fixture(&fixture));
+
+    let expect = |name: &str| fixture.results[name].clone();
+    let expect_cursor = |name: &str| fixture.cursors[name].clone();
+
+    let first = select_next(&store, &fixture, "sel-1").await;
+    assert_eq!(progression_from(&first), expect("selected_first"));
+    assert_eq!(store.cursor(), expect_cursor("after_first_selection"));
+
+    record_disposition(
+        &store,
+        "out-1",
+        "q-etc-electron-flow",
+        QuestionDisposition::RetryCurrent,
+    )
+    .await;
+    let retried = select_next(&store, &fixture, "sel-2").await;
+    assert_eq!(
+        progression_from(&retried),
+        expect("retry_current_increments_attempt")
+    );
+    assert_eq!(store.cursor(), expect_cursor("after_retry_current"));
+
+    record_disposition(
+        &store,
+        "out-2",
+        "q-etc-electron-flow",
+        QuestionDisposition::Deferred,
+    )
+    .await;
+    let deferred = select_next(&store, &fixture, "sel-3").await;
+    assert_eq!(
+        progression_from(&deferred),
+        expect("deferred_keeps_current_question")
+    );
+    assert_eq!(store.cursor(), expect_cursor("after_deferred_retry"));
+    assert!(
+        !store
+            .cursor()
+            .completed_question_ids
+            .contains(&"q-etc-electron-flow".to_owned()),
+        "a deferral completes nothing"
+    );
+
+    record_disposition(
+        &store,
+        "out-3",
+        "q-etc-electron-flow",
+        QuestionDisposition::Advance,
+    )
+    .await;
+    let second = select_next(&store, &fixture, "sel-4").await;
+    assert_eq!(
+        progression_from(&second),
+        expect("selected_second_after_advance")
+    );
+    assert_eq!(store.cursor(), expect_cursor("after_advance_to_second"));
+
+    record_disposition(
+        &store,
+        "out-4",
+        "q-gradient-direction",
+        QuestionDisposition::Advance,
+    )
+    .await;
+    let third = select_next(&store, &fixture, "sel-5").await;
+    assert_eq!(
+        progression_from(&third),
+        expect("selected_third_after_advance")
+    );
+    assert_eq!(store.cursor(), expect_cursor("after_advance_to_third"));
+
+    record_disposition(
+        &store,
+        "out-5",
+        "q-atp-synthase-coupling",
+        QuestionDisposition::Advance,
+    )
+    .await;
+    let exhausted = select_next(&store, &fixture, "sel-6").await;
+    assert_eq!(
+        progression_from(&exhausted),
+        expect("exhausted_emits_no_question")
+    );
+    assert_eq!(store.cursor(), expect_cursor("after_exhaustion"));
+}
+
+#[tokio::test]
+async fn ordered_progression_exhaustion_emits_no_fabricated_question() {
+    let fixture = progression_fixture();
+    let store = Arc::new(FakeProgressionStore::from_fixture(&fixture));
+    walk_to_second_question(&store, &fixture).await;
+    select_next(&store, &fixture, "sel-4").await;
+    record_disposition(
+        &store,
+        "out-4",
+        "q-gradient-direction",
+        QuestionDisposition::Advance,
+    )
+    .await;
+    select_next(&store, &fixture, "sel-5").await;
+    record_disposition(
+        &store,
+        "out-5",
+        "q-atp-synthase-coupling",
+        QuestionDisposition::Advance,
+    )
+    .await;
+
+    let result = select_next(&store, &fixture, "sel-6").await;
+    let mut keys = result["progression"]
+        .as_object()
+        .expect("the progression is an object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "completed".to_owned(),
+            "result".to_owned(),
+            "revision".to_owned(),
+            "total".to_owned()
+        ],
+        "an exhausted session carries no question at all"
+    );
+    let encoded = serde_json::to_string(&result).expect("the tool result serializes");
+    for question_id in fixture.questions.keys() {
+        assert!(!encoded.contains(question_id.as_str()), "{encoded}");
+    }
+}
+
+#[tokio::test]
+async fn ordered_progression_replay_does_not_advance_twice() {
+    let fixture = progression_fixture();
+    let store = Arc::new(FakeProgressionStore::from_fixture(&fixture));
+    walk_to_second_question(&store, &fixture).await;
+
+    let first = select_next(&store, &fixture, "sel-4").await;
+    let cursor_after_first = store.cursor();
+    let replayed = select_next(&store, &fixture, "sel-4").await;
+
+    assert_eq!(
+        progression_from(&replayed),
+        fixture.results["replay_returns_same_selection"]
+    );
+    assert_eq!(progression_from(&replayed), progression_from(&first));
+    assert_eq!(store.cursor(), cursor_after_first);
+    assert_eq!(store.cursor(), fixture.cursors["after_advance_to_second"]);
+}
+
+#[tokio::test]
+async fn ordered_progression_reconnect_resumes_the_persisted_cursor() {
+    let fixture = progression_fixture();
+    let store = Arc::new(FakeProgressionStore::from_fixture(&fixture));
+    walk_to_second_question(&store, &fixture).await;
+    let before = select_next(&store, &fixture, "sel-4").await;
+
+    // A reconnect is a brand-new executor over the same persisted cursor.
+    let resumed = progression_executor(Arc::clone(&store), &fixture)
+        .execute(
+            "sel-4",
+            ToolProposal::select_next_question(STUDY_SET_ID, &fixture.voice_session_id, "quiz"),
+        )
+        .await
+        .expect("the reconnected session resumes")
+        .result;
+
+    assert_eq!(progression_from(&resumed), progression_from(&before));
+    assert_eq!(store.cursor(), fixture.cursors["reconnect_resumes_cursor"]);
+}
+
+#[tokio::test]
+async fn ordered_progression_concurrent_selection_settles_on_one_revision() {
+    let fixture = progression_fixture();
+    let store = Arc::new(FakeProgressionStore::from_fixture(&fixture));
+    walk_to_second_question(&store, &fixture).await;
+
+    let (left, right) = tokio::join!(
+        select_next(&store, &fixture, "sel-4"),
+        select_next(&store, &fixture, "sel-4"),
+    );
+
+    assert_eq!(progression_from(&left), progression_from(&right));
+    assert_eq!(
+        progression_from(&left),
+        fixture.results["concurrent_selection_single_revision"]
+    );
+    assert_eq!(
+        store.cursor(),
+        fixture.cursors["concurrent_selection_single_revision"]
+    );
+}
+
+#[tokio::test]
+async fn ordered_progression_skips_inactive_questions_and_never_counts_them() {
+    let fixture = progression_fixture();
+    let archived = fixture
+        .inactive_question_ids
+        .first()
+        .expect("the fixture pins an inactive question")
+        .clone();
+    assert!(fixture.questions.contains_key(&archived));
+    let store = Arc::new(FakeProgressionStore::from_fixture(&fixture));
+
+    let mut seen: Vec<String> = Vec::new();
+    for (index, response_id) in ["sel-1", "sel-4", "sel-5", "sel-6"].iter().enumerate() {
+        if index > 0 {
+            let previous = seen[index - 1].clone();
+            record_disposition(
+                &store,
+                &format!("out-{index}"),
+                &previous,
+                QuestionDisposition::Advance,
+            )
+            .await;
+        }
+        let result = select_next(&store, &fixture, response_id).await;
+        match progression_from(&result) {
+            QuestionProgressionResult::Selected {
+                question, total, ..
+            }
+            | QuestionProgressionResult::Retry {
+                question, total, ..
+            } => {
+                assert_eq!(total, 3, "an inactive question is never counted");
+                assert_ne!(question.question_id, archived);
+                seen.push(question.question_id);
+            }
+            QuestionProgressionResult::Exhausted { total, .. } => {
+                assert_eq!(total, 3);
+                seen.push(String::new());
+            }
+        }
+    }
+    assert_eq!(seen[..3], fixture.active_question_ids[..3]);
+}
+
+#[tokio::test]
+async fn ordered_progression_tool_returns_the_progression_and_the_bound_mode() {
+    let fixture = progression_fixture();
+    let store = Arc::new(FakeProgressionStore::from_fixture(&fixture));
+
+    let result = select_next(&store, &fixture, "sel-1").await;
+    let mut keys = result
+        .as_object()
+        .expect("the tool result is an object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(keys, vec!["mode".to_owned(), "progression".to_owned()]);
+    assert_eq!(result["mode"], json!("quiz"));
+    assert_eq!(
+        result["progression"],
+        serde_json::to_value(&fixture.results["selected_first"])
+            .expect("fixture result serializes")
+    );
+
+    // The tool asked for exactly the selected D-02B policy, and never reached the
+    // fail-closed global active-question shortcut.
+    assert_eq!(
+        store.requested_policies(),
+        vec![ProgressionPolicyId::OrderedV1]
+    );
+    let shortcut =
+        agent_domain::StudyMemoryStore::active_question(store.as_ref(), USER_ID, STUDY_SET_ID)
+            .await
+            .expect_err("the global shortcut is unavailable in a session-scoped progression");
+    assert_eq!(shortcut.kind(), PortErrorKind::Unavailable);
+}
+
+#[tokio::test]
+async fn ordered_progression_binds_the_authorized_session() {
+    let fixture = progression_fixture();
+    let store = Arc::new(FakeProgressionStore::from_fixture(&fixture));
+
+    let error = progression_executor(Arc::clone(&store), &fixture)
+        .execute(
+            "sel-1",
+            ToolProposal::select_next_question(STUDY_SET_ID, "vs-someone-else", "quiz"),
+        )
+        .await
+        .expect_err("a selection for another session must be refused");
+    assert!(
+        matches!(error, ToolExecutionError::InvalidArguments(_)),
+        "{error:?}"
+    );
+    assert_eq!(store.cursor(), fixture.cursors["initial"]);
 }

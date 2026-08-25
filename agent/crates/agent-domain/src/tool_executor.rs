@@ -15,6 +15,7 @@ use crate::{
         VIVA_CHALLENGE_RESOLUTION_SCHEMA, VIVA_SEMANTIC_RUBRIC_POLICY_VERSION,
         VIVA_TURN_OUTCOME_SCHEMA,
     },
+    learning_progression::ProgressionPolicyId,
     learning_recap::{RecapBuildError, SessionLearningEvidence},
     AnswerAttemptEnvelope, Clock, ConceptStatus, PortError, ReviewOutcomeV1, ReviewScheduleError,
     SessionConfig, StudyMemoryStore, StudyMode, StudyQuestion, StudySessionRecap,
@@ -128,7 +129,7 @@ impl VivaToolExecutor {
     ) -> Result<ToolResult, ToolExecutionError> {
         bind_study_set_and_session(&proposal, &self.session)?;
         let result = match proposal.name() {
-            "select_next_question" => self.select_next_question().await?,
+            "select_next_question" => self.select_next_question(response_id).await?,
             "evaluate_spoken_answer" => self.evaluate_spoken_answer(response_id, &proposal).await?,
             "retrieve_source_reference" => self.retrieve_source_reference(&proposal).await?,
             "mark_concept_status" => self.mark_concept_status(response_id, &proposal).await?,
@@ -159,9 +160,32 @@ impl VivaToolExecutor {
             .map_err(ToolExecutionError::from)
     }
 
-    async fn select_next_question(&self) -> Result<Value, ToolExecutionError> {
-        let question = self.active_question().await?;
-        Ok(json!({ "question": question, "mode": self.session.mode.as_str() }))
+    /// `LEARN-004B` (D-02B): return the session's own next question.
+    ///
+    /// Progression is a persisted, session-scoped cursor, so this asks the store
+    /// for the authorized selection under the selected `OrderedV1` policy and
+    /// reports exactly what came back. It never calls the global
+    /// [`Self::active_question`] shortcut, which answers with the study set's
+    /// first active question and therefore cannot advance, retry, resume, or
+    /// exhaust a session.
+    ///
+    /// The authorized response identity is the idempotency source: the store
+    /// authorizes one selection per response, so a replay — or two callers racing
+    /// on one response — settles on a single cursor revision. An exhausted session
+    /// returns [`QuestionProgressionResult::Exhausted`], which carries no question
+    /// at all rather than a fabricated one.
+    async fn select_next_question(&self, response_id: &str) -> Result<Value, ToolExecutionError> {
+        let progression = self
+            .store
+            .select_next_question(
+                &self.session.user_id,
+                &self.session.study_set_id,
+                &self.session.voice_session_id,
+                response_id,
+                ProgressionPolicyId::OrderedV1,
+            )
+            .await?;
+        Ok(json!({ "progression": progression, "mode": self.session.mode.as_str() }))
     }
 
     /// The only production path that can produce evaluated mastery.
