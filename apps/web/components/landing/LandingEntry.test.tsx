@@ -91,15 +91,18 @@ describe("LandingEntry", () => {
     const markup = renderToStaticMarkup(<LandingEntry onEnter={() => {}} />);
 
     expect(markup).toContain("All you must know,");
-    expect(markup).toContain("Where should Viva begin?");
+    expect(markup).toContain("Begin oral exam");
+    expect(markup).not.toContain("Where should Viva begin?");
     expect(markup).not.toContain("What are we studying?");
     expect(markup).not.toContain("Generate local preview");
   });
 
-  test("routes command and suggestion directly to the single session entrypoint", () => {
-    const intents: string[] = [];
+  test("routes the one honest begin action directly to the single session entrypoint (D-03 Branch B)", () => {
+    let calls = 0;
     const element = LandingEntry({
-      onEnter: (intent) => intents.push(intent),
+      onEnter: () => {
+        calls += 1;
+      },
     }) as ReactElement<{ children: ReactElement[] }>;
     const hero = Children.toArray(element.props.children).find(
       (child): child is ReactElement<LandingHeroProps> =>
@@ -110,11 +113,10 @@ describe("LandingEntry", () => {
     );
 
     expect(hero?.type).toBe(LandingHero);
-    hero?.props.onSubmit?.("oxidative phosphorylation");
-    hero?.props.onSuggestion?.("Review missed concepts");
+    hero?.props.onBegin?.();
 
     expect(landingEntryTarget()).toBe("/session");
-    expect(intents).toEqual(["oxidative phosphorylation", "Review missed concepts"]);
+    expect(calls).toBe(1);
   });
 
   test("renders server-owned library and completed session history when provided", () => {

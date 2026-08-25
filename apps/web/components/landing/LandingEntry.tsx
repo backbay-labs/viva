@@ -6,19 +6,20 @@ import { LandingHero } from "./LandingHero";
 import { LibraryStatusPanel } from "./LibraryStatusPanel";
 
 /**
- * Entry boundary for "/". The muse hero is the front door; submitting the command surface or
- * tapping a suggestion crosses into the single event-driven manuscript route.
+ * Entry boundary for "/". The muse hero is the front door; the one honest
+ * "Begin oral exam" action crosses into the single event-driven manuscript
+ * route (D-03 Branch B: Viva makes no unsigned mode/goal promise).
  */
 export function LandingEntry({
   initialLibrarySnapshot,
   onEnter = enterSession,
 }: {
   initialLibrarySnapshot?: VivaLibrarySnapshot | null;
-  onEnter?: (intent: string) => void;
+  onEnter?: () => void;
 }) {
   return (
     <main className="viva-landing">
-      <LandingHero onSubmit={onEnter} onSuggestion={onEnter} />
+      <LandingHero onBegin={onEnter} />
       <LibraryStatusPanel snapshot={initialLibrarySnapshot} />
     </main>
   );

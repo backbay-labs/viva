@@ -56,6 +56,21 @@ import {
  *   session records at most one non-cached (HTTP 200) `/viva-muse.png`
  *   body transfer.
  *
+ * Task 5 adds `--landing-affordance` (`FRONTEND-003`, D-03 Branch B — the
+ * only recorded D-03 branch in this program): mounts `/` and proves the
+ * removed unsigned mode/goal affordances are actually gone from the real
+ * page, not merely from source text, and that the one remaining primary
+ * action really navigates to the session entry —
+ *
+ * - no textbox named "Where should Viva begin?" (the removed command input)
+ *   is present;
+ * - no "Answer out loud" ornamental mic button is present;
+ * - none of the three removed suggestion chips ("Quiz Lecture 5", "Mock
+ *   viva · 10 min", "Review missed concepts") are present;
+ * - exactly one visible, enabled "Begin oral exam" button exists, at least
+ *   44x44 CSS px;
+ * - clicking it navigates the main frame to `/session` exactly once.
+ *
  * Later tasks add the remaining deletion/bootstrap/static-export modes
  * named in their own RED commands; this file's mode dispatch is written so
  * those are additive.
@@ -249,6 +264,18 @@ async function main() {
     return;
   }
 
+  if (args.includes("--landing-affordance")) {
+    const failures = await runLandingAffordanceCheck();
+    if (failures.length > 0) {
+      console.error(`--landing-affordance FAILED: ${failures.length} issue(s)`);
+      for (const line of failures) console.error(`  - ${line}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log("--landing-affordance OK: 0 issues");
+    return;
+  }
+
   if (args.includes("--assets")) {
     const failures = await runAssetsCheck();
     if (failures.length > 0) {
@@ -321,7 +348,8 @@ async function main() {
   fail(
     "no recognized mode flag. Supported: --write-computed-style-baseline <path>, " +
       "--compare-computed-style-baseline <path>, --owned-surfaces, --session-handoff " +
-      "--disclosure-scope all-live-content, --assets; later tasks add more modes.",
+      "--disclosure-scope all-live-content, --assets, --landing-affordance; later tasks add " +
+      "more modes.",
   );
 }
 
@@ -771,9 +799,11 @@ async function checkKeyboardTraversal(browser, baseUrl) {
     }
 
     const nameOf = (item) => item.ariaLabel ?? item.text;
-    const reachedMainAction = tabbed.some(
-      (item) => nameOf(item) === "Start studying" || nameOf(item) === "Answer out loud",
-    );
+    // D-03 Branch B (Task 5, `FRONTEND-003`) replaced the old command
+    // surface's "Start studying"/"Answer out loud" controls with the one
+    // honest "Begin oral exam" button; this is the hero's only main action
+    // now.
+    const reachedMainAction = tabbed.some((item) => nameOf(item) === "Begin oral exam");
     const reachedLibraryAction = tabbed.some((item) => /^(Start|Resume) /.test(nameOf(item) ?? ""));
     const reachedDeleteAction = tabbed.some((item) => /^Delete /.test(nameOf(item) ?? ""));
     if (!reachedMainAction) {
@@ -920,6 +950,197 @@ async function runSessionHandoffCheck({ disclosureScope }) {
       await browser.close();
     }
   });
+  return failures;
+}
+
+/* --------------------------------------------------------------------- *
+ * Task 5 (`FRONTEND-003`): `--landing-affordance`.
+ * -------------------------------------------------------------------- */
+
+/**
+ * D-03 Branch B (the only recorded D-03 branch in this program): mounts `/`
+ * and proves the removed unsigned mode/goal affordances are gone from the
+ * real page and that the one remaining primary action really navigates to
+ * the session entry. Clicking the begin button exercises real client-side
+ * React state (its `onClick` handler), so — like Task 4's `--assets` checks
+ * below — this needs a real hydrated page; see `toHydratableUrl` (defined
+ * below, but a hoisted function declaration) for why `baseUrl` must be
+ * rewritten first.
+ */
+async function runLandingAffordanceCheck() {
+  const artifactDir = path.join(repoRoot, "artifacts/frontend-accessibility");
+  mkdirSync(artifactDir, { recursive: true });
+  const stub = await startLibrarySnapshotStub(LIBRARY_SNAPSHOT_FIXTURE);
+  const failures = [];
+  try {
+    await withFrontendDevServer(
+      { artifactDir, extraEnv: harnessExtraEnv(stub.url) },
+      async ({ baseUrl }) => {
+        const hydratableBaseUrl = toHydratableUrl(baseUrl);
+        const browser = await launchChromium();
+        try {
+          const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+          const page = await context.newPage();
+          try {
+            await gotoRouteReady(page, hydratableBaseUrl, "/");
+            failures.push(...(await checkLandingAffordanceMarkup(page)));
+            // Only attempt the click/navigation proof once the markup check
+            // above confirms exactly one real begin button exists — clicking
+            // a missing/duplicated button would just throw and mask the
+            // same underlying defect behind a confusing second failure.
+            if (failures.length === 0) {
+              failures.push(...(await checkBeginButtonNavigatesOnce(page, hydratableBaseUrl)));
+            }
+          } finally {
+            await context.close();
+          }
+        } finally {
+          await browser.close();
+        }
+      },
+    );
+  } finally {
+    await stub.close();
+  }
+  return failures;
+}
+
+/**
+ * Scans the real mounted `/` DOM for the affordances D-03 Branch B removes
+ * (a "Where should Viva begin?" textbox, an "Answer out loud" mic, and the
+ * three suggestion chips) and for exactly one visible, enabled, >= 44x44
+ * CSS px "Begin oral exam" button.
+ *
+ * @param {import("playwright").Page} page
+ */
+async function checkLandingAffordanceMarkup(page) {
+  const result = await page.evaluate(() => {
+    function isElementVisible(el) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const style = getComputedStyle(el);
+      if (style.visibility === "hidden" || style.display === "none") return false;
+      if (Number.parseFloat(style.opacity) === 0) return false;
+      if (el.closest('[aria-hidden="true"], [hidden]')) return false;
+      return true;
+    }
+    function isDisabled(el) {
+      if ("disabled" in el && el.disabled) return true;
+      return el.getAttribute("aria-disabled") === "true";
+    }
+
+    const bodyText = document.body.textContent ?? "";
+    const hasCommandTextbox = Array.from(
+      document.querySelectorAll(
+        'input[aria-label="Where should Viva begin?"], input[placeholder="Where should Viva begin?"]',
+      ),
+    ).some(isElementVisible);
+    const hasMic = Array.from(document.querySelectorAll('[aria-label="Answer out loud"]')).some(
+      isElementVisible,
+    );
+
+    const beginButtons = Array.from(document.querySelectorAll("button")).filter(
+      (el) =>
+        !isDisabled(el) &&
+        isElementVisible(el) &&
+        (el.textContent ?? "").trim() === "Begin oral exam",
+    );
+    const rect = beginButtons[0]?.getBoundingClientRect() ?? null;
+
+    return {
+      hasCommandTextbox,
+      hasMic,
+      hasQuizChip: bodyText.includes("Quiz Lecture 5"),
+      hasMockChip: bodyText.includes("Mock viva · 10 min"),
+      hasReviewChip: bodyText.includes("Review missed concepts"),
+      beginButtonCount: beginButtons.length,
+      beginButtonBox: rect ? { width: rect.width, height: rect.height } : null,
+    };
+  });
+
+  const failures = [];
+  if (result.hasCommandTextbox) {
+    failures.push(
+      '[landing-affordance] the removed command textbox "Where should Viva begin?" is still present',
+    );
+  }
+  if (result.hasMic) {
+    failures.push(
+      '[landing-affordance] the removed ornamental "Answer out loud" mic is still present',
+    );
+  }
+  if (result.hasQuizChip) {
+    failures.push('[landing-affordance] the removed "Quiz Lecture 5" suggestion is still present');
+  }
+  if (result.hasMockChip) {
+    failures.push(
+      '[landing-affordance] the removed "Mock viva · 10 min" suggestion is still present',
+    );
+  }
+  if (result.hasReviewChip) {
+    failures.push(
+      '[landing-affordance] the removed "Review missed concepts" suggestion is still present',
+    );
+  }
+  if (result.beginButtonCount !== 1) {
+    failures.push(
+      `[landing-affordance] expected exactly one visible, enabled "Begin oral exam" button, ` +
+        `found ${result.beginButtonCount}`,
+    );
+  } else if (
+    result.beginButtonBox &&
+    (result.beginButtonBox.width < TOUCH_TARGET_MIN_PX - 0.1 ||
+      result.beginButtonBox.height < TOUCH_TARGET_MIN_PX - 0.1)
+  ) {
+    failures.push(
+      `[landing-affordance] "Begin oral exam" button measured ` +
+        `${Math.round(result.beginButtonBox.width * 100) / 100}x` +
+        `${Math.round(result.beginButtonBox.height * 100) / 100}px, need >= ` +
+        `${TOUCH_TARGET_MIN_PX}x${TOUCH_TARGET_MIN_PX}px`,
+    );
+  }
+  return failures;
+}
+
+/**
+ * Clicks the real "Begin oral exam" button and proves the main frame
+ * navigates to `/session` exactly once — real Chromium navigation state,
+ * not a spied callback.
+ *
+ * @param {import("playwright").Page} page
+ * @param {string} baseUrl
+ */
+async function checkBeginButtonNavigatesOnce(page, baseUrl) {
+  const failures = [];
+  const navigations = [];
+  page.on("framenavigated", (frame) => {
+    if (frame === page.mainFrame()) navigations.push(frame.url());
+  });
+
+  try {
+    await page.getByRole("button", { name: "Begin oral exam", exact: true }).click();
+    await page.waitForURL(`${baseUrl}/session`, { timeout: 30_000 });
+  } catch (error) {
+    failures.push(
+      `[landing-affordance] clicking "Begin oral exam" did not navigate to /session: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return failures;
+  }
+
+  if (navigations.length !== 1) {
+    failures.push(
+      `[landing-affordance] expected exactly one main-frame navigation after clicking "Begin ` +
+        `oral exam", observed ${navigations.length}: ${JSON.stringify(navigations)}`,
+    );
+  }
+  const finalUrl = new URL(page.url());
+  if (finalUrl.pathname !== "/session") {
+    failures.push(
+      `[landing-affordance] expected the begin button to navigate to /session, landed on ` +
+        `${finalUrl.pathname}${finalUrl.search}${finalUrl.hash}`,
+    );
+  }
   return failures;
 }
 

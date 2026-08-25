@@ -864,216 +864,48 @@
   animation: vivaFadeUp 1.2s ease 0.2s both;
 }
 
-.viva-command {
+.viva-hero__begin {
   position: relative;
-  display: flex;
-  align-items: center;
-  gap: 0.55rem;
-  width: min(820px, 100%);
-  height: 76px;
-  margin-top: clamp(2.25rem, 3.4vw, 2.75rem);
-  padding: 8px 10px;
-  border-radius: 999px;
-  background: linear-gradient(180deg, rgba(255, 254, 250, 0.86) 0%, rgba(249, 241, 230, 0.66) 100%);
-  -webkit-backdrop-filter: blur(20px) saturate(1.06);
-  backdrop-filter: blur(20px) saturate(1.06);
-  border: 1px solid rgba(66, 43, 82, 0.13);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.92),
-    inset 0 -1px 0 rgba(67, 36, 95, 0.06),
-    0 2px 0 rgba(255, 255, 255, 0.5),
-    0 24px 70px rgba(71, 47, 24, 0.14),
-    0 8px 26px rgba(55, 34, 76, 0.08);
-  animation: vivaFadeUp 1.2s ease 0.3s both;
-  transition:
-    border-color 240ms ease,
-    box-shadow 240ms ease;
-}
-
-.viva-command::before {
-  content: "";
-  position: absolute;
-  inset: 3px;
-  border-radius: inherit;
-  border: 1px solid rgba(255, 255, 255, 0.72);
-  pointer-events: none;
-}
-
-.viva-command:focus-within {
-  border-color: rgba(129, 84, 189, 0.4);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.92),
-    0 26px 74px rgba(71, 47, 24, 0.16),
-    0 10px 28px rgba(55, 34, 76, 0.1);
-}
-
-.viva-command:has(:focus-visible) {
-  border-color: var(--viva-amethyst);
-  box-shadow:
-    0 0 0 3px var(--viva-amethyst),
-    0 24px 70px rgba(71, 47, 24, 0.14);
-}
-
-.viva-command__input {
-  flex: 1;
-  min-width: 0;
-  height: 100%;
-  padding-left: 0.4rem;
-  border: 0;
-  background: transparent;
-  outline: none;
-  font-family: var(--serif);
-  font-size: 1.26rem;
-  letter-spacing: -0.005em;
-  color: var(--viva-ink);
-}
-
-.viva-command__input::placeholder {
-  color: rgba(36, 24, 47, 0.64);
-  opacity: 1;
-}
-
-.viva-command__mic,
-.viva-command__submit {
-  flex: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 50%;
-  cursor: pointer;
-  transition:
-    transform 220ms ease,
-    box-shadow 220ms ease,
-    filter 220ms ease;
-}
-
-.viva-command__mic {
-  width: 52px;
-  height: 52px;
-  background: radial-gradient(
-    circle at 35% 25%,
-    rgba(255, 255, 255, 0.92),
-    rgba(229, 214, 246, 0.74) 56%,
-    rgba(210, 190, 235, 0.58)
-  );
-  border: 1px solid rgba(120, 90, 160, 0.18);
-  box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.9),
-    inset 0 -2px 4px rgba(120, 90, 160, 0.12),
-    0 4px 12px rgba(70, 46, 90, 0.1);
-}
-
-.viva-command__submit {
-  width: 54px;
-  height: 54px;
+  min-height: var(--viva-target-min);
+  margin-top: clamp(2.25rem, 3.4vw, 2.75rem);
+  padding: 0 2.4rem;
+  border-radius: 999px;
   background: linear-gradient(145deg, #9b6bd4 0%, #7b4bbb 52%, #65379d 100%);
   border: 1px solid rgba(80, 40, 120, 0.4);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.35),
     inset 0 -2px 6px rgba(35, 18, 55, 0.18),
-    0 10px 26px rgba(103, 61, 153, 0.28);
+    0 10px 26px rgba(103, 61, 153, 0.28),
+    0 24px 70px rgba(71, 47, 24, 0.14);
+  color: var(--viva-paper);
+  cursor: pointer;
+  font-family: var(--sans);
+  font-size: 1.05rem;
+  font-weight: 650;
+  letter-spacing: -0.006em;
+  animation: vivaFadeUp 1.2s ease 0.3s both;
+  transition:
+    transform 220ms ease,
+    box-shadow 220ms ease;
 }
 
-.viva-command__mic:hover {
-  transform: translateY(-1px);
-  box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.92),
-    inset 0 -2px 4px rgba(120, 90, 160, 0.14),
-    0 7px 16px rgba(70, 46, 90, 0.14);
-}
-
-.viva-command__submit:hover {
+.viva-hero__begin:hover {
   transform: translateY(-1px);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.4),
     inset 0 -2px 6px rgba(35, 18, 55, 0.2),
-    0 14px 32px rgba(103, 61, 153, 0.36);
+    0 14px 32px rgba(103, 61, 153, 0.36),
+    0 24px 70px rgba(71, 47, 24, 0.14);
 }
 
-.viva-command__mic:focus-visible,
-.viva-command__submit:focus-visible {
+.viva-hero__begin:focus-visible {
   outline: none;
   box-shadow:
-    0 0 0 2px var(--viva-paper),
-    0 0 0 4px var(--viva-amethyst);
-}
-
-.viva-hero__chips {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: center;
-  gap: 0.55rem;
-  margin-top: clamp(1.15rem, 1.6vw, 1.4rem);
-}
-
-.viva-hero__try {
-  margin-right: 0.35rem;
-  font-family: var(--sans);
-  font-size: 0.72rem;
-  font-weight: 600;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--viva-muted);
-  animation: vivaFadeUp 0.9s ease 0.36s both;
-}
-
-.viva-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  height: var(--viva-target-min);
-  padding: 0 0.95rem;
-  border-radius: 999px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.66), rgba(249, 242, 232, 0.46));
-  border: 1px solid rgba(66, 43, 82, 0.1);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.72),
-    0 6px 16px rgba(70, 46, 24, 0.06);
-  -webkit-backdrop-filter: blur(12px);
-  backdrop-filter: blur(12px);
-  color: var(--viva-ink-soft);
-  font-family: var(--sans);
-  font-size: 0.84rem;
-  font-weight: 500;
-  letter-spacing: -0.004em;
-  cursor: pointer;
-  animation: vivaFadeUp 0.9s ease both;
-  transition:
-    transform 220ms ease,
-    border-color 220ms ease,
-    box-shadow 220ms ease;
-}
-
-.viva-chip:nth-of-type(1) {
-  animation-delay: 0.42s;
-}
-
-.viva-chip:nth-of-type(2) {
-  animation-delay: 0.5s;
-}
-
-.viva-chip:nth-of-type(3) {
-  animation-delay: 0.58s;
-}
-
-.viva-chip:hover {
-  transform: translateY(-1px);
-  border-color: var(--viva-border-strong);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.78),
-    0 9px 20px rgba(70, 46, 24, 0.08);
-}
-
-.viva-chip:focus-visible {
-  outline: none;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.8),
-    0 0 0 3px var(--viva-amethyst);
-}
-
-.viva-chip__icon {
-  flex: none;
+    0 0 0 3px var(--viva-paper),
+    0 0 0 6px var(--viva-amethyst);
 }
 
 .viva-hero__tagline {
@@ -1427,31 +1259,9 @@
     max-width: 36ch;
   }
 
-  .viva-command {
-    height: 64px;
-  }
-
-  .viva-command__mic {
-    width: 46px;
-    height: 46px;
-  }
-
-  .viva-command__submit {
-    width: 48px;
-    height: 48px;
-  }
-
-  .viva-command__input {
-    font-size: 1.1rem;
-  }
-
-  .viva-chip {
-    padding: 0 1rem;
-    font-size: 0.88rem;
-  }
-
-  .viva-hero__try {
-    display: none;
+  .viva-hero__begin {
+    padding: 0 1.9rem;
+    font-size: 1rem;
   }
 
   .viva-hero__tagline {
@@ -1465,8 +1275,7 @@
   .viva-context,
   .viva-copy__headline,
   .viva-copy__sub,
-  .viva-command,
-  .viva-chip,
+  .viva-hero__begin,
   .viva-hero__tagline {
     animation-duration: 0.001ms;
     animation-iteration-count: 1;
@@ -1481,10 +1290,7 @@
 @media (forced-colors: active) {
   .field input:focus,
   .field textarea:focus,
-  .viva-command:has(:focus-visible),
-  .viva-command__mic:focus-visible,
-  .viva-command__submit:focus-visible,
-  .viva-chip:focus-visible {
+  .viva-hero__begin:focus-visible {
     outline: 2px solid;
     outline-offset: 2px;
   }
