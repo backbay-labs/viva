@@ -6,6 +6,7 @@ use tokio::{sync::mpsc, task::AbortHandle};
 
 use crate::{
     ids::SessionId,
+    learning_outcome::EvaluationDeferralReason,
     tools::{ToolPlan, ToolProposal, ToolResult},
     AnswerEvaluation, AudioFrame, StudyQuestion, StudySessionPhase, StudySessionRecap,
     StudySourceReference, TerminalSessionReason,
@@ -194,6 +195,16 @@ pub enum BrainEvent {
         response_id: String,
         evaluation: AnswerEvaluation,
     },
+    /// A turn whose evaluation was deferred. This is a typed non-mastery fact: it
+    /// carries no provider prose, feedback, confidence, concept status, schedule, or
+    /// mastery. Plans 04/07 derive `AnswerEvaluated`/`ConceptStatus` only from a
+    /// persisted `TurnOutcome`; there is deliberately no second evaluated event.
+    TurnDeferred {
+        response_id: String,
+        question_id: String,
+        reason: EvaluationDeferralReason,
+        can_retry_same_question: bool,
+    },
     SourceReference {
         response_id: String,
         source: StudySourceReference,
@@ -267,6 +278,7 @@ impl BrainEvent {
             Self::QuestionStarted { response_id, .. }
             | Self::TranscriptDelta { response_id, .. }
             | Self::AnswerEvaluated { response_id, .. }
+            | Self::TurnDeferred { response_id, .. }
             | Self::SourceReference { response_id, .. }
             | Self::ConceptStatus { response_id, .. }
             | Self::ManuscriptIntent { response_id, .. }

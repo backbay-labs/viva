@@ -11,9 +11,13 @@ use std::{fmt, sync::Arc, time::Duration};
 
 mod brain;
 mod ids;
+pub mod learning_outcome;
+pub mod learning_progression;
+pub mod learning_recap;
 pub mod ports;
 pub mod review_schedule;
 mod study;
+pub mod study_projection;
 pub mod tool_executor;
 mod tools;
 
@@ -25,6 +29,22 @@ pub use brain::{
     SpeechIntent, StudyMode,
 };
 pub use ids::{CallId, SessionId, ToolName};
+// Plan 04 owns every declaration below: `agent-domain` re-exports the authoritative
+// learning seam so Plans 05/07/08/09 consume one public path, and never redeclares,
+// mirrors, or aliases a learner fact at a consumer boundary.
+pub use learning_outcome::{
+    AnswerEvaluator, ChallengeDisposition, ChallengeResolution, ConceptStatusTransition,
+    CriterionAssessment, CriterionAssessmentKind, EvaluationDecision, EvaluationDeferralReason,
+    EvaluationError, EvaluationLabel, EvaluationRequest, EvaluationRubricV1, PersistedTurnOutcome,
+    QuestionDisposition, RubricCriterionV1, TurnOutcome, TurnOutcomeRecordReceipt, TurnResolution,
+};
+pub use learning_progression::{
+    ProgressionPolicyId, QuestionProgressionCursor, QuestionProgressionResult,
+};
+pub use learning_recap::{
+    ConceptLabel, RecapBuildError, RecapConceptOutcome, ReviewScheduleAuthority,
+    ReviewScheduleSummary, SessionLearningEvidence,
+};
 pub use ports::{
     AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
     CreateFileStudySet, CreatePasteStudySet, LibraryNextReviewSummary, LibrarySessionRecapSummary,
@@ -45,6 +65,7 @@ pub use study::{
     fixture_question, fixture_source_reference, AnswerEvaluation, RecapSourceMoment, StudyQuestion,
     StudySessionPhase, StudySessionRecap, StudySourceReference, TerminalSessionReason,
 };
+pub use study_projection::AuthenticatedStudyProjectionV1;
 pub use tool_executor::{AuthorizedStudySession, ToolExecutionError, VivaToolExecutor};
 pub use tools::{ToolPlan, ToolProposal, ToolResult};
 

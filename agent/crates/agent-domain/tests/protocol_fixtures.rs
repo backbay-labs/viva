@@ -1,8 +1,75 @@
+use std::collections::BTreeMap;
+
 use agent_domain::{
-    fixture_source_reference, AudioFrame, BrainEvent, SessionConfig, SourceConfidence,
-    SourceContext, StudyMode, ToolProposal,
+    fixture_source_reference, AudioFrame, AuthenticatedStudyProjectionV1, BrainEvent,
+    ChallengeResolution, EvaluationDeferralReason, EvaluationLabel, EvaluationRubricV1,
+    PersistedTurnOutcome, ProgressionPolicyId, QuestionProgressionCursor,
+    QuestionProgressionResult, SessionConfig, SessionLearningEvidence, SourceConfidence,
+    SourceContext, StudyMode, StudyQuestion, ToolProposal, TurnOutcome, TurnResolution,
 };
-use serde_json::json;
+use agent_domain::{
+    learning_outcome::{
+        VIVA_CHALLENGE_RESOLUTION_SCHEMA, VIVA_SEMANTIC_RUBRIC_POLICY_VERSION,
+        VIVA_TURN_OUTCOME_RECORD_SCHEMA, VIVA_TURN_OUTCOME_SCHEMA,
+    },
+    learning_recap::{StudySessionRecap, VIVA_STUDY_SESSION_RECAP_SCHEMA},
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+const TURN_OUTCOMES_FIXTURE: &str =
+    include_str!("../../../fixtures/learning-core/turn-outcomes-v1.json");
+const RECAPS_FIXTURE: &str = include_str!("../../../fixtures/learning-core/recaps-v1.json");
+const QUESTION_PROGRESSION_FIXTURE: &str =
+    include_str!("../../../fixtures/learning-core/question-progression-v1.json");
+const STUDY_PROJECTION_FIXTURE: &str =
+    include_str!("../../../fixtures/learning-core/study-projection-v1.json");
+
+/// Fixture envelopes are the *file* shape, not a mirror of any Plan 04 type: every
+/// learner value inside them is parsed by the authoritative Plan 04 declaration.
+/// `deny_unknown_fields` makes each envelope reject an injected key so the negative
+/// controls below observe a real rejection rather than a silently ignored field.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnOutcomesFixture {
+    schema: String,
+    rubric: EvaluationRubricV1,
+    outcomes: BTreeMap<String, TurnOutcome>,
+    persisted: BTreeMap<String, PersistedTurnOutcome>,
+    challenges: BTreeMap<String, ChallengeResolution>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecapsFixture {
+    schema: String,
+    evidence: BTreeMap<String, SessionLearningEvidence>,
+    recaps: BTreeMap<String, StudySessionRecap>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuestionProgressionFixture {
+    schema: String,
+    policy: ProgressionPolicyId,
+    voice_session_id: String,
+    active_question_ids: Vec<String>,
+    inactive_question_ids: Vec<String>,
+    questions: BTreeMap<String, StudyQuestion>,
+    cursors: BTreeMap<String, QuestionProgressionCursor>,
+    results: BTreeMap<String, QuestionProgressionResult>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StudyProjectionFixture {
+    schema: String,
+    projections: BTreeMap<String, AuthenticatedStudyProjectionV1>,
+}
+
+fn fixture_value(raw: &str) -> Value {
+    serde_json::from_str(raw).expect("learning-core fixture is valid JSON")
+}
 
 #[test]
 fn protocol_fixtures_preserve_source_grounded_shapes() {
@@ -63,6 +130,314 @@ fn shared_session_config_fixture_matches_rust_domain_types() {
 }
 
 #[test]
+fn shared_turn_outcomes() {
+    let fixture: TurnOutcomesFixture =
+        serde_json::from_str(TURN_OUTCOMES_FIXTURE).expect("turn outcomes fixture parses");
+
+    assert_eq!(fixture.schema, "viva.learning_core.turn_outcomes.v1");
+    assert_eq!(
+        fixture.rubric.policy_version,
+        VIVA_SEMANTIC_RUBRIC_POLICY_VERSION
+    );
+    assert!(!fixture.rubric.criteria.is_empty());
+    assert!(!fixture.outcomes.is_empty());
+    assert!(!fixture.persisted.is_empty());
+    assert!(!fixture.challenges.is_empty());
+
+    let mut evaluated = 0_usize;
+    let mut deferred = 0_usize;
+    for (case, outcome) in &fixture.outcomes {
+        assert_eq!(
+            outcome.schema, VIVA_TURN_OUTCOME_SCHEMA,
+            "outcome {case} must carry the authoritative turn-outcome schema",
+        );
+        assert_eq!(
+            outcome.rubric_policy_version, VIVA_SEMANTIC_RUBRIC_POLICY_VERSION,
+            "outcome {case} must be paired with the literal rubric policy",
+        );
+        match &outcome.resolution {
+            TurnResolution::Evaluated { label, .. } => {
+                evaluated += 1;
+                // Every evaluated label is the Plan 04 enum, and round-trips through
+                // exactly the six locked wire tokens — never a free string.
+                let token = serde_json::to_value(label).expect("label serializes");
+                let token = token.as_str().expect("label is a JSON string").to_owned();
+                assert!(
+                    matches!(
+                        token.as_str(),
+                        "strong"
+                            | "mostly_correct"
+                            | "partially_correct"
+                            | "vague"
+                            | "wrong"
+                            | "insufficient_evidence"
+                    ),
+                    "outcome {case} label {token} is outside the locked rubric vocabulary",
+                );
+                let round_tripped: EvaluationLabel =
+                    serde_json::from_value(Value::String(token.clone()))
+                        .expect("label round-trips through EvaluationLabel");
+                assert_eq!(
+                    round_tripped, *label,
+                    "outcome {case} label must round-trip"
+                );
+            }
+            TurnResolution::Deferred { .. } => deferred += 1,
+        }
+    }
+    assert!(evaluated > 0, "fixture must pin evaluated resolutions");
+    assert!(deferred > 0, "fixture must pin deferred resolutions");
+
+    for (case, persisted) in &fixture.persisted {
+        assert_eq!(
+            persisted.record.schema, VIVA_TURN_OUTCOME_RECORD_SCHEMA,
+            "persisted case {case} must carry the record receipt schema",
+        );
+        assert_eq!(
+            persisted.record.response_id, persisted.turn_outcome.response_id,
+            "persisted case {case} receipt must copy the validated outcome response id",
+        );
+    }
+    assert!(
+        fixture
+            .persisted
+            .values()
+            .any(|persisted| persisted.record.replayed),
+        "fixture must pin an idempotent replay receipt",
+    );
+
+    for (case, challenge) in &fixture.challenges {
+        assert_eq!(
+            challenge.schema, VIVA_CHALLENGE_RESOLUTION_SCHEMA,
+            "challenge case {case} must carry the challenge-resolution schema",
+        );
+    }
+}
+
+#[test]
+fn shared_turn_outcomes_rejects_injected_unknown_key() {
+    let mut value = fixture_value(TURN_OUTCOMES_FIXTURE);
+    value
+        .as_object_mut()
+        .expect("turn outcomes fixture is an object")
+        .insert("injected_unknown".to_owned(), json!(true));
+
+    serde_json::from_value::<TurnOutcomesFixture>(value)
+        .expect_err("an unknown envelope key must be rejected, not ignored");
+}
+
+#[test]
+fn shared_turn_outcomes_rejects_unknown_resolution_discriminator() {
+    let mut value = fixture_value(TURN_OUTCOMES_FIXTURE);
+    value["outcomes"]["evaluated_strong"]["resolution"]["kind"] = json!("fabricated_mastery");
+
+    serde_json::from_value::<TurnOutcomesFixture>(value)
+        .expect_err("an unknown turn-resolution discriminator must be rejected");
+}
+
+#[test]
+fn shared_turn_outcomes_rejects_unknown_evaluation_label() {
+    let mut value = fixture_value(TURN_OUTCOMES_FIXTURE);
+    value["outcomes"]["evaluated_strong"]["resolution"]["label"] = json!("brilliant");
+
+    serde_json::from_value::<TurnOutcomesFixture>(value)
+        .expect_err("a label outside the locked rubric vocabulary must be rejected");
+}
+
+#[test]
+fn shared_recaps() {
+    let fixture: RecapsFixture =
+        serde_json::from_str(RECAPS_FIXTURE).expect("recaps fixture parses");
+
+    assert_eq!(fixture.schema, "viva.learning_core.recaps.v1");
+    assert!(!fixture.evidence.is_empty());
+    assert_eq!(
+        fixture.evidence.keys().collect::<Vec<_>>(),
+        fixture.recaps.keys().collect::<Vec<_>>(),
+        "every evidence case must have exactly one expected recap",
+    );
+
+    for (case, recap) in &fixture.recaps {
+        assert_eq!(
+            recap.schema, VIVA_STUDY_SESSION_RECAP_SCHEMA,
+            "recap {case} must carry the authoritative recap schema",
+        );
+        let evidence = &fixture.evidence[case];
+        assert_eq!(
+            recap.voice_session_id, evidence.voice_session_id,
+            "recap {case} must project its own session's evidence",
+        );
+    }
+
+    for (case, evidence) in &fixture.evidence {
+        for outcome in &evidence.outcomes {
+            assert_eq!(
+                outcome.schema, VIVA_TURN_OUTCOME_SCHEMA,
+                "evidence {case} must carry authoritative turn outcomes",
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_recaps_rejects_injected_unknown_key() {
+    let mut value = fixture_value(RECAPS_FIXTURE);
+    value
+        .as_object_mut()
+        .expect("recaps fixture is an object")
+        .insert("injected_unknown".to_owned(), json!({ "due_at": "now" }));
+
+    serde_json::from_value::<RecapsFixture>(value)
+        .expect_err("an unknown envelope key must be rejected, not ignored");
+}
+
+#[test]
+fn shared_recaps_rejects_unknown_review_authority() {
+    let mut value = fixture_value(RECAPS_FIXTURE);
+    value["recaps"]["all_missed"]["review_schedule"][0]["authority"] = json!("client_guessed");
+
+    serde_json::from_value::<RecapsFixture>(value)
+        .expect_err("a review-schedule authority outside D-01 must be rejected");
+}
+
+#[test]
+fn shared_question_progression() {
+    let fixture: QuestionProgressionFixture = serde_json::from_str(QUESTION_PROGRESSION_FIXTURE)
+        .expect("question progression fixture parses");
+
+    assert_eq!(fixture.schema, "viva.learning_core.question_progression.v1");
+    // D-02B: ordered progression is the selected policy.
+    assert_eq!(fixture.policy, ProgressionPolicyId::OrderedV1);
+    assert!(!fixture.voice_session_id.is_empty());
+    assert!(!fixture.active_question_ids.is_empty());
+    assert!(!fixture.inactive_question_ids.is_empty());
+
+    for question_id in &fixture.active_question_ids {
+        assert!(
+            fixture.questions.contains_key(question_id),
+            "active question {question_id} must be declared in the fixture",
+        );
+    }
+    for cursor in fixture.cursors.values() {
+        assert_eq!(cursor.policy, ProgressionPolicyId::OrderedV1);
+    }
+
+    let mut selected = 0_usize;
+    let mut retried = 0_usize;
+    let mut exhausted = 0_usize;
+    for (case, result) in &fixture.results {
+        match result {
+            QuestionProgressionResult::Selected {
+                question, total, ..
+            } => {
+                selected += 1;
+                assert_eq!(
+                    *total as usize,
+                    fixture.active_question_ids.len(),
+                    "case {case} must count only active questions",
+                );
+                assert!(fixture.questions.contains_key(&question.question_id));
+            }
+            QuestionProgressionResult::Retry {
+                question, attempt, ..
+            } => {
+                retried += 1;
+                assert!(*attempt > 1, "case {case} retry must report attempt > 1");
+                assert!(fixture.questions.contains_key(&question.question_id));
+            }
+            QuestionProgressionResult::Exhausted {
+                completed, total, ..
+            } => {
+                exhausted += 1;
+                assert_eq!(
+                    completed, total,
+                    "case {case} exhaustion means every active question is completed",
+                );
+            }
+        }
+    }
+    assert!(selected > 0 && retried > 0 && exhausted > 0);
+}
+
+#[test]
+fn shared_question_progression_rejects_injected_unknown_key() {
+    let mut value = fixture_value(QUESTION_PROGRESSION_FIXTURE);
+    value
+        .as_object_mut()
+        .expect("question progression fixture is an object")
+        .insert("injected_unknown".to_owned(), json!("adaptive"));
+
+    serde_json::from_value::<QuestionProgressionFixture>(value)
+        .expect_err("an unknown envelope key must be rejected, not ignored");
+}
+
+#[test]
+fn shared_question_progression_rejects_unknown_result_discriminator() {
+    let mut value = fixture_value(QUESTION_PROGRESSION_FIXTURE);
+    value["results"]["exhausted_emits_no_question"]["result"] = json!("fabricated_question");
+
+    serde_json::from_value::<QuestionProgressionFixture>(value)
+        .expect_err("an unknown progression result discriminator must be rejected");
+}
+
+#[test]
+fn shared_study_projection() {
+    let fixture: StudyProjectionFixture =
+        serde_json::from_str(STUDY_PROJECTION_FIXTURE).expect("study projection fixture parses");
+
+    assert_eq!(fixture.schema, "viva.learning_core.study_projection.v1");
+    assert!(!fixture.projections.is_empty());
+
+    for (case, projection) in &fixture.projections {
+        let rendered = serde_json::to_value(projection).expect("projection serializes");
+        assert_eq!(
+            rendered["version"],
+            json!(1),
+            "projection {case} must pin the literal version 1",
+        );
+        for item in &projection.review_schedule {
+            assert!(
+                projection
+                    .concepts
+                    .iter()
+                    .any(|concept| concept.id == item.concept_id),
+                "projection {case} schedules a concept it does not include",
+            );
+        }
+        if let Some(question) = &projection.active_question {
+            assert!(
+                projection
+                    .concepts
+                    .iter()
+                    .any(|concept| concept.id == question.concept_id),
+                "projection {case} active question references an excluded concept",
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_study_projection_rejects_injected_unknown_key() {
+    let mut value = fixture_value(STUDY_PROJECTION_FIXTURE);
+    value
+        .as_object_mut()
+        .expect("study projection fixture is an object")
+        .insert("injected_unknown".to_owned(), json!(1));
+
+    serde_json::from_value::<StudyProjectionFixture>(value)
+        .expect_err("an unknown envelope key must be rejected, not ignored");
+}
+
+#[test]
+fn shared_study_projection_rejects_unpinned_version() {
+    let mut value = fixture_value(STUDY_PROJECTION_FIXTURE);
+    value["projections"]["ready_session_with_active_question"]["version"] = json!(2);
+
+    serde_json::from_value::<StudyProjectionFixture>(value)
+        .expect_err("a projection version other than 1 must fail closed");
+}
+
+#[test]
 fn audio_frame_serializes_to_base64_contract() {
     let frame = AudioFrame::from_pcm16_text("Ready.");
     let value = serde_json::to_value(&frame).expect("audio frame serializes");
@@ -80,4 +455,35 @@ fn brain_events_carry_response_ids_for_stale_suppression() {
     };
 
     assert_eq!(event.response_id(), Some("response-1"));
+}
+
+#[test]
+fn turn_deferred_is_a_typed_non_mastery_event() {
+    let event = BrainEvent::TurnDeferred {
+        response_id: "response-deferred-1".to_owned(),
+        question_id: "q-etc-electron-flow".to_owned(),
+        reason: EvaluationDeferralReason::EvaluatorUnavailable,
+        can_retry_same_question: true,
+    };
+
+    assert_eq!(event.response_id(), Some("response-deferred-1"));
+
+    let rendered = serde_json::to_value(&event).expect("turn deferred event serializes");
+    let payload = rendered["TurnDeferred"]
+        .as_object()
+        .expect("turn deferred payload is an object");
+    let mut fields = payload.keys().cloned().collect::<Vec<_>>();
+    fields.sort();
+    assert_eq!(
+        fields,
+        vec![
+            "can_retry_same_question".to_owned(),
+            "question_id".to_owned(),
+            "reason".to_owned(),
+            "response_id".to_owned(),
+        ],
+        "TurnDeferred carries no evaluation, concept status, schedule, recap, provider prose, or generic payload",
+    );
+    assert_eq!(payload["reason"], json!("evaluator_unavailable"));
+    assert_eq!(payload["can_retry_same_question"], json!(true));
 }

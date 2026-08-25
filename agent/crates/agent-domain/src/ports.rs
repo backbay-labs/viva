@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    learning_outcome::{ChallengeResolution, PersistedTurnOutcome, TurnOutcome},
+    learning_progression::{ProgressionPolicyId, QuestionProgressionResult},
+    learning_recap::SessionLearningEvidence,
     review_schedule::{ReviewScheduleDecisionV1, ReviewSchedulingContextV1},
+    study_projection::AuthenticatedStudyProjectionV1,
     AnswerEvaluation, ConceptStatus, ManuscriptIntent, SessionConfig, SourceConfidence,
     StudyQuestion, StudySessionRecap, StudySourceReference, ToolProposal,
 };
@@ -709,6 +713,82 @@ pub trait StudyMemoryStore: Send + Sync {
 
     async fn record_voice_usage(&self, _event: VoiceUsageRecord) -> Result<(), PortError> {
         Ok(())
+    }
+
+    /// Persist one authoritative Plan 04 [`TurnOutcome`] and return the exact
+    /// persisted pair. The receipt's `replayed` flag is insert-versus-replay truth
+    /// owned by the store; no caller may reconstruct or fabricate it.
+    ///
+    /// This default — like the four below — is an intentional fail-closed
+    /// compatibility boundary for partial/test stores, not RED-only scaffolding and
+    /// not acceptable production behavior. There is no successful default.
+    async fn record_turn_outcome(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+        _outcome: TurnOutcome,
+    ) -> Result<PersistedTurnOutcome, PortError> {
+        Err(PortError::unavailable(
+            "study_memory_store",
+            voice_session_id,
+            "record_turn_outcome is not implemented",
+        ))
+    }
+
+    async fn session_learning_evidence(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<SessionLearningEvidence, PortError> {
+        Err(PortError::unavailable(
+            "study_memory_store",
+            voice_session_id,
+            "session_learning_evidence is not implemented",
+        ))
+    }
+
+    async fn record_challenge_resolution(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+        _resolution: ChallengeResolution,
+    ) -> Result<ChallengeResolution, PortError> {
+        Err(PortError::unavailable(
+            "study_memory_store",
+            voice_session_id,
+            "record_challenge_resolution is not implemented",
+        ))
+    }
+
+    async fn select_next_question(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+        _response_id: &str,
+        _policy: ProgressionPolicyId,
+    ) -> Result<QuestionProgressionResult, PortError> {
+        Err(PortError::unavailable(
+            "study_memory_store",
+            voice_session_id,
+            "select_next_question is not implemented",
+        ))
+    }
+
+    async fn authenticated_study_projection(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<AuthenticatedStudyProjectionV1, PortError> {
+        Err(PortError::unavailable(
+            "study_memory_store",
+            voice_session_id,
+            "authenticated_study_projection is not implemented",
+        ))
     }
 }
 
