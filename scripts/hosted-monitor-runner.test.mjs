@@ -806,9 +806,20 @@ test("hosted monitor S3 uploads honor the publication deadline", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (_url, options = {}) =>
     new Promise((_resolve, reject) => {
-      options.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
-        once: true,
-      });
+      // A real in-flight upload holds a socket handle that keeps the event
+      // loop alive while putS3Object's deliberately unref'd deadline timer
+      // counts down. The mock must supply that liveness itself: without it,
+      // Node 22's test runner drains the loop before the deadline fires and
+      // cancels this test and every test after it.
+      const socketLiveness = setTimeout(() => {}, 60_000);
+      options.signal?.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(socketLiveness);
+          reject(new Error("aborted"));
+        },
+        { once: true },
+      );
     });
   try {
     await assert.rejects(
