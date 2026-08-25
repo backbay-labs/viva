@@ -223,6 +223,200 @@ function stripBrowserOnlyTokenFields(
   return output;
 }
 
+/* --------------------------------------------------------------------- *
+ * D-07 Branch A (`retain-token-only`, `FRONTEND-011`): same-origin session-
+ * bootstrap composition. Branch A keeps `attachVivaSessionBootstrapTokensTo-
+ * LibrarySnapshot`, `/api/viva-session/start`, and the landing bootstrap-
+ * capability start/retry path (`LibraryStatusPanel.tsx`). This section holds
+ * the pure logic that path composes around: the exact "complete start
+ * response" shape a successful mint returns, a bounded (6000ms) timeout
+ * wrapper around the start fetch — headers *and* body, one shared deadline —
+ * so a hung mint can never hang the UI forever, and the "small local
+ * indirection" this task owns in place of
+ * Plan 10's not-yet-published `replaceBrowserSessionCredential`
+ * (`apps/web/lib/use-viva-agent-session.ts` has no such export in this tree
+ * — confirmed by reading that file before writing this code; Plan 10 wires
+ * the real export into this seam once it exists, which is Phase 13B
+ * integration work, not this task's). Nothing here reads `window`,
+ * `localStorage`/`sessionStorage`, or calls `console.*` — the browser-bound
+ * capability this composes around must never persist or log.
+ * -------------------------------------------------------------------- */
+
+/**
+ * `POST /api/viva-session/start`'s response shape (`apps/web/app/api/viva-
+ * session/shared.ts`, Plan-11-owned — not edited by this task). Today's real
+ * route returns only `session`/`session_token`; the three optional fields
+ * are the wire-level extension D-07 Branch A's retain-token-only refresh
+ * contract will add. This type accepts either shape so the code below is
+ * provably correct against both.
+ */
+export type VivaSessionStartResponse = {
+  refresh_expires_at?: string;
+  refresh_token?: string;
+  session?: {
+    session_id?: string;
+    study_set_id?: string;
+    user_id?: string;
+  };
+  session_absolute_expires_at?: string;
+  session_token?: string;
+};
+
+/** D-07's selected branch, as a locked literal — never persisted, only ever handed to the vault seam. */
+export const VIVA_SESSION_CREDENTIAL_VAULT_MODE = "retain-token-only" as const;
+
+/**
+ * The exact fields Plan 10's `replaceBrowserSessionCredential` must receive:
+ * `session_token`, `refresh_token`, `refresh_expires_at`,
+ * `session_absolute_expires_at`, identity, and the locked `mode`.
+ */
+export type BrowserSessionCredentialVaultInput = {
+  mode: typeof VIVA_SESSION_CREDENTIAL_VAULT_MODE;
+  refresh_expires_at: string | null;
+  refresh_token: string | null;
+  session_absolute_expires_at: string | null;
+  session_id: string;
+  session_token: string;
+  study_set_id: string;
+  user_id: string;
+};
+
+/** The in-memory credential-vault seam Plan 10's real hook will satisfy. */
+export type BrowserSessionCredentialVault = {
+  replaceBrowserSessionCredential: (input: BrowserSessionCredentialVaultInput) => void;
+};
+
+/**
+ * Builds the complete vault input from a start response, or `null` when the
+ * response lacks the minimum required fields (`session_token` and the full
+ * session identity) to mint one at all. `refresh_token`/`refresh_expires_at`/
+ * `session_absolute_expires_at` are optional in the response today — their
+ * absence yields `null` fields here rather than rejecting the whole mint, so
+ * this composes correctly against both today's real route response and its
+ * eventual refresh-credential extension.
+ */
+export function browserSessionCredentialVaultInputFromStartResponse(
+  response: VivaSessionStartResponse,
+): BrowserSessionCredentialVaultInput | null {
+  const sessionToken = trimmedOrNull(response.session_token);
+  const sessionId = trimmedOrNull(response.session?.session_id);
+  const studySetId = trimmedOrNull(response.session?.study_set_id);
+  const userId = trimmedOrNull(response.session?.user_id);
+  if (!sessionToken || !sessionId || !studySetId || !userId) return null;
+  return {
+    mode: VIVA_SESSION_CREDENTIAL_VAULT_MODE,
+    refresh_expires_at: trimmedOrNull(response.refresh_expires_at),
+    refresh_token: trimmedOrNull(response.refresh_token),
+    session_absolute_expires_at: trimmedOrNull(response.session_absolute_expires_at),
+    session_id: sessionId,
+    session_token: sessionToken,
+    study_set_id: studySetId,
+    user_id: userId,
+  };
+}
+
+/**
+ * Phase-13A placeholder for Plan 10's not-yet-published
+ * `replaceBrowserSessionCredential`. Every successful same-origin start
+ * composes its call around this seam so the wiring is provable now; the
+ * function itself stays inert (no storage, no network, no console output —
+ * never a leak surface) until Plan 10's real export lands and this default
+ * is swapped for it.
+ */
+export const pendingBrowserSessionCredentialVault: BrowserSessionCredentialVault = {
+  replaceBrowserSessionCredential: () => {},
+};
+
+/** The shared 6000ms abort/timeout bound for the same-origin session-start mint and its expiry retry. */
+export const VIVA_SESSION_START_FETCH_TIMEOUT_MS = 6000;
+
+/** The client-injected `setTimeout`/`clearTimeout` pair `fetchWithVivaSessionStartTimeout` binds its abort to. */
+export type VivaFetchTimers = {
+  clearTimeout: (id: ReturnType<typeof setTimeout>) => void;
+  setTimeout: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+};
+
+const REAL_FETCH_TIMERS: VivaFetchTimers = {
+  clearTimeout: (id) => clearTimeout(id),
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+};
+
+/** The exact fetch function shape `fetchWithVivaSessionStartTimeout` wraps — real `fetch` in production, an injectable double in tests. */
+export type VivaBoundedFetch = (input: string, init: RequestInit) => Promise<Response>;
+
+export type VivaBoundedFetchResult =
+  | { ok: true; response: Response }
+  | { ok: false; reason: "timeout" };
+
+export type VivaBoundedOperationResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; reason: "timeout" };
+
+/**
+ * The shared bound primitive `fetchWithVivaSessionStartTimeout` and
+ * `LibraryStatusPanel.tsx`'s `requestServerSession` both build on: races
+ * `operation(signal)` against `timeoutMs` (default
+ * `VIVA_SESSION_START_FETCH_TIMEOUT_MS`, the plan's locked 6000ms policy —
+ * the same value named for Plan 10's session-entry refresh timeout).
+ * `signal` aborts exactly once, at the bound, and stays live for the whole
+ * of `operation` — not only its first `await` — so a caller that chains a
+ * response-body read (`response.json()`) after an already-settled fetch
+ * inside the same `operation` still aborts at the bound if that read hangs;
+ * the bound covers the complete round trip, not merely header arrival. Any
+ * other rejection from `operation` propagates unchanged, so a genuine
+ * network failure is never mislabeled a timeout. The timer is always
+ * cleared, on every exit path, so a settled operation never leaves a
+ * pending timer behind.
+ */
+export async function withVivaSessionStartTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  options: { timeoutMs?: number; timers?: VivaFetchTimers } = {},
+): Promise<VivaBoundedOperationResult<T>> {
+  const timeoutMs = options.timeoutMs ?? VIVA_SESSION_START_FETCH_TIMEOUT_MS;
+  const timers = options.timers ?? REAL_FETCH_TIMERS;
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeoutId = timers.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  try {
+    const value = await operation(controller.signal);
+    return { ok: true, value };
+  } catch (error) {
+    if (timedOut) return { ok: false, reason: "timeout" };
+    throw error;
+  } finally {
+    timers.clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Fetch-shaped convenience wrapper over `withVivaSessionStartTimeout`: bounds
+ * only `fetchImpl`'s own settling (i.e. header arrival), handing back the raw
+ * `Response` for the caller to read. Kept for callers that intentionally want
+ * just the network step bounded; `LibraryStatusPanel.tsx`'s production start
+ * flow instead calls `withVivaSessionStartTimeout` directly so its bound also
+ * covers the response body read (see that primitive's doc comment).
+ */
+export async function fetchWithVivaSessionStartTimeout(
+  fetchImpl: VivaBoundedFetch,
+  input: string,
+  init: RequestInit,
+  options: { timeoutMs?: number; timers?: VivaFetchTimers } = {},
+): Promise<VivaBoundedFetchResult> {
+  const result = await withVivaSessionStartTimeout(
+    (signal) => fetchImpl(input, { ...init, signal }),
+    options,
+  );
+  return result.ok ? { ok: true, response: result.value } : result;
+}
+
+function trimmedOrNull(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
 function projectStudySetRow(studySet: VivaLibraryStudySet): ProjectedLibraryRow {
   return {
     id: studySet.id,

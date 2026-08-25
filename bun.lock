@@ -55,13 +55,17 @@
       "name": "@viva/ui-web",
       "version": "0.1.0",
       "dependencies": {
-        "react": "19.2.3",
+        "@viva/tokens": "workspace:*",
       },
       "devDependencies": {
         "@types/react": "^19",
         "@types/react-dom": "^19",
+        "react": "19.2.3",
         "react-dom": "19.2.3",
         "typescript": "^5.9.3",
+      },
+      "peerDependencies": {
+        "react": "^19.2.3",
       },
     },
   },

@@ -1,0 +1,209 @@
+/**
+ * `apps/web/app/styles/base.css` — reset, root document, and the small
+ * cross-cutting utility atoms (typography, buttons, card treatment) used
+ * across every route, plus the error/loading/not-found shell.
+ *
+ * This is a mechanical extraction from the former
+ * `apps/web/app/globals.css` (FRONTEND-001): selectors were moved, not
+ * restyled.
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  margin: 0;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  color: inherit;
+}
+
+.display {
+  color: var(--ink);
+  font-family: var(--serif);
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1.02;
+}
+
+.cap {
+  color: var(--ink-3);
+  font-size: 0.78rem;
+}
+
+.button,
+.text-button {
+  align-items: center;
+  border: 0;
+  cursor: pointer;
+  display: inline-flex;
+  font-weight: 700;
+  gap: 0.6rem;
+  justify-content: center;
+}
+
+.button {
+  border-radius: 999px;
+  min-height: 2.75rem;
+  padding: 0.78rem 1.2rem;
+}
+
+.button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.button-primary {
+  background: var(--ink);
+  box-shadow: var(--shadow-md);
+  color: var(--paper-edge);
+}
+
+.button-secondary {
+  background: var(--paper-2);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-sm);
+  color: var(--ink);
+}
+
+.button-warn {
+  background: transparent;
+  border: 1px solid rgba(193, 134, 74, 0.38);
+  color: var(--amber);
+}
+
+.button-warn span {
+  background: var(--amber);
+  border-radius: 50%;
+  height: 0.44rem;
+  width: 0.44rem;
+}
+
+.text-button {
+  background: transparent;
+  color: var(--plum);
+  padding: 0;
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+
+.soft-card {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+}
+
+.app-shell {
+  background: var(--bg);
+  display: flex;
+  min-height: 100vh;
+}
+
+.loading-shell,
+.not-found-shell {
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+}
+
+.empty-state {
+  max-width: 34rem;
+  text-align: center;
+}
+
+.empty-state h1 {
+  font-size: clamp(2.2rem, 8vw, 4rem);
+  margin: 0.5rem 0 1rem;
+}
+
+.nav-rail__review-card {
+  background: var(--bg);
+  border: 1px solid var(--line-soft);
+  border-radius: 0.88rem;
+  display: grid;
+  gap: 0.24rem;
+  margin-bottom: 1rem;
+  padding: 0.9rem;
+}
+
+.nav-rail__review-card p {
+  margin: 0 0 0.2rem;
+}
+
+.nav-rail__review-card small {
+  color: var(--ink-3);
+}
+
+.main-panel {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  position: relative;
+}
+
+.screen-topbar {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.screen-topbar h1 {
+  font-size: clamp(2rem, 4vw, 2.5rem);
+  margin: 0;
+}
+
+.screen-topbar span {
+  color: var(--ink-2);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms;
+    scroll-behavior: auto;
+    transition-duration: 1ms;
+  }
+}
+
+@media (max-width: 720px) {
+  .app-shell {
+    display: block;
+  }
+
+  .main-panel {
+    min-height: 100vh;
+    padding-bottom: 5rem;
+  }
+
+  .screen-topbar {
+    align-items: flex-start;
+  }
+
+  .screen-topbar .button-secondary,
+  .screen-topbar .button-primary {
+    min-height: 2.35rem;
+    padding: 0.58rem 0.8rem;
+  }
+}
