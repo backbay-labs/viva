@@ -964,3 +964,574 @@ mod fixture_evaluator_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// `SyntheticBrain` trust and lifecycle guards.
+//
+// Task 1 replaced how this runtime obtains learner facts, which obsoleted the
+// *assertions* of the pre-Task-1 suite but not the *invariants* those tests
+// existed to pin. The five restored below are re-expressed against the
+// authoritative-outcome flow: a browser-supplied source context is still never
+// the trusted source, a browser-supplied concept list is still never an
+// authorized concept event, the per-generation response identity is still the
+// one persisted, dropping a session still aborts the turn before any store
+// write, and one assembled long-form turn is still exactly one graded turn.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod synthetic_runtime_guards {
+    use agent_domain::{
+        ConceptStatus, RealtimeBrain, SessionId, SourceConfidence, SourceContext, StudyMode,
+    };
+    use tokio::time::timeout;
+
+    use super::*;
+
+    /// Values a hostile browser could put in `SessionConfig.source_context`.
+    /// None of them is evidence, so none of them may reach a learner-visible
+    /// event.
+    const FORGED_DOCUMENT_ID: &str = "browser-forged-doc";
+    const FORGED_SPAN: &str = "browser:999";
+    const FORGED_EXCERPT: &str = "Browser forged excerpt";
+    const FORGED_RETRIEVAL_REASON: &str = "browser supplied injection";
+    /// A real concept of the seeded set that this session's rubric does *not*
+    /// name, supplied by the client through `SessionConfig.active_concepts`.
+    const FORGED_ACTIVE_CONCEPT: &str = "atp-synthase";
+
+    const SPOKEN_ANSWER: &str = "NADH gives electrons to the electron transport chain.";
+
+    /// The seeded development study set publishes concept ids that its own
+    /// question's rubric does not name, so a graded turn needs the rubric's
+    /// concept published before the executor can bind a prior status to it.
+    fn learning_ready_store() -> Arc<data::InMemoryStudyStore> {
+        let store = data::InMemoryStudyStore::seeded_fixture();
+        let question = fixture_question();
+        let mut concept_ids = vec![
+            "oxidative-phosphorylation".to_owned(),
+            "nadh".to_owned(),
+            FORGED_ACTIVE_CONCEPT.to_owned(),
+            "cellular-respiration".to_owned(),
+        ];
+        for criterion in &question.rubric.criteria {
+            if !concept_ids.contains(&criterion.concept_id) {
+                concept_ids.push(criterion.concept_id.clone());
+            }
+            store.upsert_concept(data::ConceptRecord {
+                study_set_id: "biology-midterm".to_owned(),
+                concept_id: criterion.concept_id.clone(),
+                label: "Oxidative phosphorylation".to_owned(),
+                status: ConceptStatus::Review,
+                source_span_id: criterion.source_id.clone(),
+            });
+        }
+        store.upsert_study_set(data::StudySetRecord {
+            study_set_id: "biology-midterm".to_owned(),
+            user_id: "user-1".to_owned(),
+            title: "Biology Midterm".to_owned(),
+            course: Some("Biology 201".to_owned()),
+            ingestion_status: agent_domain::StudySetIngestionStatus::Ready,
+            ingestion_error: None,
+            concept_ids,
+            question_ids: vec![question.question_id.clone()],
+        });
+        Arc::new(store)
+    }
+
+    fn session_config() -> SessionConfig {
+        SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        }
+    }
+
+    fn forged_source_context() -> Vec<SourceContext> {
+        vec![SourceContext {
+            // The one honest-looking field: the forgery names a real server
+            // source id so only the *content* fields distinguish it.
+            source_id: "src-lecture-5-slide-18".to_owned(),
+            document_id: FORGED_DOCUMENT_ID.to_owned(),
+            span: FORGED_SPAN.to_owned(),
+            excerpt: FORGED_EXCERPT.to_owned(),
+            confidence: SourceConfidence::Low,
+            retrieval_reason: FORGED_RETRIEVAL_REASON.to_owned(),
+        }]
+    }
+
+    async fn next_event(session: &mut RealtimeSession) -> BrainEvent {
+        timeout(Duration::from_secs(5), session.events.recv())
+            .await
+            .expect("event arrives")
+            .expect("event stream stays open")
+    }
+
+    async fn wait_for_transcript_final(session: &mut RealtimeSession) {
+        loop {
+            if matches!(
+                next_event(session).await,
+                BrainEvent::TranscriptFinal { .. }
+            ) {
+                return;
+            }
+        }
+    }
+
+    /// Every event of one answer turn, ending at the turn's terminal event.
+    async fn drain_turn(session: &mut RealtimeSession) -> Vec<BrainEvent> {
+        let mut events = Vec::new();
+        while let Ok(Some(event)) = timeout(Duration::from_secs(5), session.events.recv()).await {
+            let terminal = matches!(
+                event,
+                BrainEvent::ResponseCompleted { .. } | BrainEvent::Error(_)
+            );
+            events.push(event);
+            if terminal {
+                break;
+            }
+        }
+        events
+    }
+
+    fn emitted_concept_statuses(events: &[BrainEvent]) -> Vec<(String, ConceptStatus)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                BrainEvent::ConceptStatus {
+                    concept_id, status, ..
+                } => Some((concept_id.clone(), status.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The single persisted outcome's own concept transitions — the only thing
+    /// that may become a `ConceptStatus` event.
+    fn persisted_transitions(store: &data::InMemoryStudyStore) -> Vec<(String, ConceptStatus)> {
+        let snapshot = store.snapshot();
+        assert_eq!(
+            snapshot.turn_outcomes.len(),
+            1,
+            "exactly one turn outcome is persisted"
+        );
+        match &snapshot.turn_outcomes[0].outcome.resolution {
+            TurnResolution::Evaluated {
+                concept_transitions,
+                ..
+            } => concept_transitions
+                .iter()
+                .map(|transition| (transition.concept_id.clone(), transition.to_status.clone()))
+                .collect(),
+            TurnResolution::Deferred { .. } => Vec::new(),
+        }
+    }
+
+    /// A browser can put anything in `SessionConfig.source_context`. It is not
+    /// evidence: the source a learner is shown is the server's own, and no
+    /// forged field may reach any emitted event.
+    #[tokio::test]
+    async fn ignores_browser_source_context_for_trusted_source_output() {
+        let store = learning_ready_store();
+        let mut session = SyntheticBrain::with_study_store(store.clone())
+            .open(SessionConfig {
+                source_context: forged_source_context(),
+                ..session_config()
+            })
+            .await
+            .expect("synthetic runtime opens");
+
+        let mut events = vec![
+            next_event(&mut session).await,
+            next_event(&mut session).await,
+        ];
+        assert!(matches!(
+            events[0],
+            BrainEvent::SessionPhase {
+                phase: StudySessionPhase::Ready
+            }
+        ));
+        match &events[1] {
+            BrainEvent::QuestionStarted { question, .. } => {
+                assert_eq!(question.source.document_id, "lec-5");
+                assert_eq!(question.source.span, "slide:18");
+                assert_eq!(
+                    question.source.retrieval_reason,
+                    "server fixture source for oxidative phosphorylation"
+                );
+            }
+            other => panic!("expected question_started, got {other:?}"),
+        }
+
+        session
+            .input
+            .send(BrainInput::Text(SPOKEN_ANSWER.to_owned()))
+            .await
+            .expect("text input accepted");
+        events.extend(drain_turn(&mut session).await);
+
+        // The whole turn, not just the question: the retrieved source reference
+        // and the evaluation carry a source too.
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BrainEvent::SourceReference { .. })),
+            "the turn retrieved a server source: {events:?}"
+        );
+        let serialized = serde_json::to_string(&events).expect("events serialize");
+        for forged in [
+            FORGED_DOCUMENT_ID,
+            FORGED_SPAN,
+            FORGED_EXCERPT,
+            FORGED_RETRIEVAL_REASON,
+        ] {
+            assert!(
+                !serialized.contains(forged),
+                "a browser-supplied source field reached the learner: `{forged}` in {serialized}"
+            );
+        }
+    }
+
+    /// A browser-supplied `active_concepts` list is a hint about what the page is
+    /// showing, never an authorization. Only the persisted outcome's own
+    /// transitions become concept events.
+    #[tokio::test]
+    async fn uses_server_active_concepts_for_authorized_concept_events() {
+        let store = learning_ready_store();
+        let mut session = SyntheticBrain::with_study_store(store.clone())
+            .open(SessionConfig {
+                active_concepts: vec![FORGED_ACTIVE_CONCEPT.to_owned()],
+                ..session_config()
+            })
+            .await
+            .expect("synthetic runtime opens");
+        let _ = next_event(&mut session).await;
+        let _ = next_event(&mut session).await;
+        session
+            .input
+            .send(BrainInput::Text(SPOKEN_ANSWER.to_owned()))
+            .await
+            .expect("text input accepted");
+        let events = drain_turn(&mut session).await;
+
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, BrainEvent::Error(_))),
+            "the turn completed without a failure: {events:?}"
+        );
+        let expected = persisted_transitions(&store);
+        assert!(
+            !expected.is_empty(),
+            "the persisted outcome names at least one concept: {events:?}"
+        );
+        assert_eq!(emitted_concept_statuses(&events), expected, "{events:?}");
+        assert!(
+            !expected
+                .iter()
+                .any(|(concept_id, _)| concept_id == FORGED_ACTIVE_CONCEPT),
+            "the client-supplied concept must not be in the persisted outcome either"
+        );
+        let serialized = serde_json::to_string(&emitted_concept_statuses(&events))
+            .expect("concept statuses serialize");
+        assert!(
+            !serialized.contains(FORGED_ACTIVE_CONCEPT),
+            "a client-supplied concept became an authorized concept event: {serialized}"
+        );
+    }
+
+    /// The client generation id is the browser's restore identity. It must reach
+    /// both the response identity and the persisted attempt envelope, or a
+    /// bfcache restore silently double-writes.
+    #[tokio::test]
+    async fn persists_client_generation_id_on_synthetic_answer_attempts() {
+        let store = learning_ready_store();
+        let mut session = SyntheticBrain::with_study_store(store.clone())
+            .open(SessionConfig {
+                client_generation_id: Some("bfcache_restore-3".to_owned()),
+                ..session_config()
+            })
+            .await
+            .expect("synthetic runtime opens");
+
+        let response_id = "response-1-generation-bfcache_restore-3";
+        let _ = next_event(&mut session).await;
+        match next_event(&mut session).await {
+            BrainEvent::QuestionStarted {
+                response_id: question_response_id,
+                ..
+            } => assert_eq!(question_response_id, response_id),
+            event => panic!("expected generated question response id, got {event:?}"),
+        }
+        session
+            .input
+            .send(BrainInput::TextWithMetadata {
+                text: SPOKEN_ANSWER.to_owned(),
+                client_generation_id: Some("bfcache_restore-3".to_owned()),
+            })
+            .await
+            .expect("text input accepted");
+        let events = drain_turn(&mut session).await;
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, BrainEvent::Error(_))),
+            "the turn completed without a failure: {events:?}"
+        );
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.answer_attempts.len(), 1);
+        assert_eq!(snapshot.answer_attempts[0].response_id, response_id);
+        assert_eq!(
+            snapshot.answer_attempts[0].envelope.response_id,
+            response_id
+        );
+        assert_eq!(
+            snapshot.answer_attempts[0]
+                .envelope
+                .client_generation_id
+                .as_deref(),
+            Some("bfcache_restore-3"),
+        );
+        assert_eq!(snapshot.turn_outcomes.len(), 1);
+        assert_eq!(snapshot.turn_outcomes[0].outcome.response_id, response_id);
+    }
+
+    /// Nothing a learner never saw is ever written.
+    ///
+    /// Two ways the browser can walk away mid-turn, and the store must be
+    /// untouched after both. The second is the one that isolates
+    /// [`ActiveResponse`]'s own `Drop`: the event receiver stays alive, so every
+    /// `send` still succeeds and only the abort can stop the in-flight response
+    /// before it reaches the executor.
+    #[tokio::test]
+    async fn dropping_session_aborts_active_synthetic_response_before_store_writes() {
+        // The whole session goes away.
+        let store = learning_ready_store();
+        let mut session = SyntheticBrain::with_study_store(store.clone())
+            .open(session_config())
+            .await
+            .expect("synthetic runtime opens");
+        let _ = next_event(&mut session).await;
+        let _ = next_event(&mut session).await;
+        session
+            .input
+            .send(BrainInput::Text(SPOKEN_ANSWER.to_owned()))
+            .await
+            .expect("text input accepted");
+        wait_for_transcript_final(&mut session).await;
+
+        drop(session);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_untouched_by_the_abandoned_turn(&store);
+
+        // Only the input side goes away, with the reader still attached.
+        let store = learning_ready_store();
+        let session = SyntheticBrain::with_study_store(store.clone())
+            .open(session_config())
+            .await
+            .expect("synthetic runtime opens");
+        let RealtimeSession {
+            input,
+            events: mut event_rx,
+            task_guard,
+        } = session;
+        for _ in 0..2 {
+            let _ = timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("event arrives");
+        }
+        input
+            .send(BrainInput::Text(SPOKEN_ANSWER.to_owned()))
+            .await
+            .expect("text input accepted");
+        loop {
+            let event = timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("event arrives")
+                .expect("event stream stays open");
+            if matches!(event, BrainEvent::TranscriptFinal { .. }) {
+                break;
+            }
+        }
+        drop(input);
+
+        // Past every remaining stage of the turn, with the reader still draining
+        // so no send can fail and stand in for the abort.
+        let mut trailing = Vec::new();
+        while let Ok(Some(event)) = timeout(Duration::from_secs(3), event_rx.recv()).await {
+            trailing.push(event);
+        }
+        drop(task_guard);
+        assert!(
+            trailing
+                .iter()
+                .all(|event| !matches!(event, BrainEvent::ResponseCompleted { .. })),
+            "the abandoned turn must not run to completion: {trailing:?}"
+        );
+        assert_untouched_by_the_abandoned_turn(&store);
+    }
+
+    fn assert_untouched_by_the_abandoned_turn(store: &data::InMemoryStudyStore) {
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.answer_attempts.len(), 0);
+        assert_eq!(snapshot.turn_outcomes.len(), 0);
+        assert_eq!(snapshot.concept_statuses.len(), 0);
+        assert_eq!(snapshot.review_items.len(), 0);
+        assert_eq!(snapshot.review_schedule_decisions.len(), 0);
+        assert_eq!(snapshot.recaps.len(), 0);
+    }
+
+    /// The WebSocket assembler admits one `BrainInput` per completed browser
+    /// turn, so thousands of bounded chunks still produce exactly one graded
+    /// turn.
+    #[tokio::test]
+    async fn one_assembled_forty_five_second_turn_produces_one_evaluated_turn() {
+        let store = learning_ready_store();
+        let mut session = SyntheticBrain::with_study_store(store.clone())
+            .open(session_config())
+            .await
+            .expect("synthetic runtime opens");
+        let _ = next_event(&mut session).await;
+        let _ = next_event(&mut session).await;
+
+        // 45 seconds of mono pcm_s16le at 24 kHz: 2,250 bounded 20 ms chunks.
+        session
+            .input
+            .send(BrainInput::AudioWithMetadata {
+                frame: agent_domain::AudioFrame::from_pcm16_bytes(vec![0_u8; 2_160_000]),
+                client_generation_id: Some("generation-1".to_owned()),
+            })
+            .await
+            .expect("audio input accepted");
+
+        // Read past the first evaluation to the turn's terminal event, so a
+        // second evaluation would be counted rather than hidden by an early
+        // break.
+        let mut events = drain_turn(&mut session).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BrainEvent::ResponseCompleted { .. })),
+            "the assembled turn reached its terminal event: {events:?}"
+        );
+
+        // Close the input side and drain the remainder of the stream: any second
+        // provider turn for the same assembled frame surfaces here.
+        let RealtimeSession {
+            input,
+            events: mut event_rx,
+            task_guard: _task_guard,
+        } = session;
+        drop(input);
+        while let Ok(Some(event)) = timeout(Duration::from_secs(5), event_rx.recv()).await {
+            events.push(event);
+        }
+
+        let transcripts = events
+            .iter()
+            .filter_map(|event| match event {
+                BrainEvent::TranscriptFinal { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(transcripts, vec!["received 2160000 PCM16 bytes".to_owned()]);
+        let resolutions = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    BrainEvent::AnswerEvaluated { .. } | BrainEvent::TurnDeferred { .. }
+                )
+            })
+            .count();
+        assert_eq!(resolutions, 1, "{events:?}");
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.answer_attempts.len(), 1);
+        assert_eq!(snapshot.turn_outcomes.len(), 1);
+    }
+
+    /// The residual product-flow invariants of the pre-Task-1
+    /// `emits_deterministic_product_study_flow_and_cancel_id`: its
+    /// adapter-authored mastery assertions are obsolete, but the response-id
+    /// allocation for a cancel with no active response, the usage report, the
+    /// terminal correction phase, and the recap-on-`Stop` are all still live.
+    #[tokio::test]
+    async fn cancel_without_an_active_response_allocates_the_next_response_id_and_recaps_on_stop() {
+        let store = learning_ready_store();
+        let mut session = SyntheticBrain::with_study_store(store.clone())
+            .open(session_config())
+            .await
+            .expect("synthetic runtime opens");
+        let _ = next_event(&mut session).await;
+        match next_event(&mut session).await {
+            BrainEvent::QuestionStarted { response_id, .. } => {
+                assert_eq!(response_id, "response-1");
+            }
+            other => panic!("expected question_started, got {other:?}"),
+        }
+
+        session
+            .input
+            .send(BrainInput::Text(SPOKEN_ANSWER.to_owned()))
+            .await
+            .expect("text input accepted");
+        let events = drain_turn(&mut session).await;
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                BrainEvent::SessionPhase {
+                    phase: StudySessionPhase::Correction
+                }
+            )),
+            "the turn ends dwelling in correction: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BrainEvent::Usage(_))),
+            "the turn reports usage: {events:?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&BrainEvent::ResponseCompleted {
+                response_id: "response-1".to_owned()
+            })
+        );
+
+        // The completed turn consumed response-1, so a cancel with nothing in
+        // flight names the response the next turn would have used rather than
+        // re-cancelling a finished one.
+        session
+            .input
+            .send(BrainInput::CancelResponse)
+            .await
+            .expect("cancel accepted");
+        assert_eq!(
+            next_event(&mut session).await,
+            BrainEvent::ResponseCancelledFor {
+                response_id: "response-2".to_owned()
+            }
+        );
+
+        // The recap is produced when the student ends the session, from the
+        // persisted evidence rather than from adapter-authored copy.
+        session
+            .input
+            .send(BrainInput::Stop)
+            .await
+            .expect("stop accepted");
+        let mut saw_recap = false;
+        while let Ok(Some(event)) = timeout(Duration::from_secs(5), session.events.recv()).await {
+            if let BrainEvent::RecapReady { recap, .. } = event {
+                assert_eq!(recap.voice_session_id, "voice-session-1");
+                saw_recap = true;
+                break;
+            }
+        }
+        assert!(saw_recap);
+        assert_eq!(store.snapshot().recaps.len(), 1);
+    }
+}
