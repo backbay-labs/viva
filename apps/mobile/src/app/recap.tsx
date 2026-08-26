@@ -13,9 +13,9 @@ import { VoiceOrb } from "@/components/voice-orb";
 import { colors, fonts, layout, radius, space } from "@/theme/tokens";
 
 const LEDGER_COLORS: Record<RecapColorToken, string> = {
-  ochre: colors.ochre,
-  plumVivid: colors.plumVivid,
-  sageDeep: colors.sageDeep,
+  ochre: colors.ochreMark,
+  plumVivid: colors.plumMark,
+  sageDeep: colors.sageMark,
 };
 
 export default function RecapScreen() {
@@ -424,7 +424,8 @@ const styles = StyleSheet.create({
     opacity: 0.62,
   },
   safeArea: {
-    backgroundColor: colors.canvas,
+    // The atmosphere is mounted once at the root and shows through every screen.
+    backgroundColor: "transparent",
     flex: 1,
   },
   scheduledNote: {

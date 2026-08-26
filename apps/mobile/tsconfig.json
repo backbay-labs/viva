@@ -2,6 +2,16 @@
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
     "strict": true,
+    // This package's automatic @types inclusion doesn't reach the workspace
+    // root's node_modules/@types (its typeRoots scan stops short of finding
+    // "node" there), so node:fs/node:path imports (used by
+    // src/theme/vellum-asset.test.ts) go unresolved without this. Naming a type
+    // package here is a hard reference — TS2688 if it cannot be found — so
+    // @types/node is a devDependency of this package rather than something
+    // borrowed from apps/web's hoist, which a filtered install of this
+    // workspace alone would not provide. Pinned to the same "^20" apps/web
+    // uses, so the workspace resolves one copy.
+    "types": ["node"],
     "paths": {
       "@/*": ["./src/*"],
       "@/assets/*": ["./assets/*"],

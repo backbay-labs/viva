@@ -1004,7 +1004,8 @@ const styles = StyleSheet.create({
     color: colors.inkSecondary,
   },
   safeArea: {
-    backgroundColor: colors.canvasDeep,
+    // The atmosphere is mounted once at the root and shows through every screen.
+    backgroundColor: "transparent",
     flex: 1,
   },
   scrollContent: {

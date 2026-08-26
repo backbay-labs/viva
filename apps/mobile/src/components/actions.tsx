@@ -30,6 +30,7 @@ export function ActionButton({
   icon,
   loading = false,
   onPress,
+  onPressIn,
   style,
   tone = "primary",
   ...props
@@ -38,13 +39,17 @@ export function ActionButton({
     <Pressable
       accessibilityRole="button"
       disabled={disabled || loading}
-      onPress={(event) => {
+      onPress={onPress}
+      onPressIn={(event) => {
+        // Fires on press-IN, not release: the impact has to coincide with the
+        // moment the surface deepens, or the tap you feel and the dent you see
+        // are different events. See the component spec section 12.
         void Haptics.impactAsync(
           tone === "primary"
             ? Haptics.ImpactFeedbackStyle.Medium
             : Haptics.ImpactFeedbackStyle.Light,
         );
-        onPress?.(event);
+        onPressIn?.(event);
       }}
       style={({ pressed }) => [
         styles.base,

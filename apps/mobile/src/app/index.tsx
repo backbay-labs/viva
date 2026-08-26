@@ -141,7 +141,7 @@ export default function HomeScreen() {
             }}
             style={({ pressed }) => [
               pressed && styles.orbPressed,
-              !activeStudySetId && styles.disabled,
+              !activeStudySetId && styles.orbDormant,
             ]}
           >
             <VoiceOrb size={166} state="ready" />
@@ -234,8 +234,14 @@ const styles = StyleSheet.create({
     fontSize: 22,
     lineHeight: 27,
   },
-  disabled: {
-    opacity: 0.5,
+  // Deliberately gentler than ActionButton's 0.52. The orb is a radial
+  // gradient, so fading it toward the ground collapses the eclipse into a flat
+  // pale disc and the screen reads washed out rather than idle. 0.82 keeps the
+  // form legible while still reading a step quieter; the status pill and the
+  // dimmed CTA carry the "unavailable" message, which is where a user looks for
+  // it anyway.
+  orbDormant: {
+    opacity: 0.82,
   },
   contextChevron: {
     color: colors.inkMuted,
@@ -305,12 +311,18 @@ const styles = StyleSheet.create({
     textTransform: "lowercase",
   },
   promise: {
-    color: colors.inkSecondary,
+    // inkMuted, not inkSecondary: this line sits in `heroCopy`, which has no
+    // background of its own, so it renders straight onto the atmosphere. On the
+    // flat canvas this branch replaced, inkSecondary measured 6.13:1; against
+    // the vellum's darkest excursion it is 3.52:1, under the 4.5:1 bar for
+    // 17dp regular. See MARK_TOKENS in @/theme/tokens.
+    color: colors.inkMuted,
     fontSize: 17,
     lineHeight: 24,
   },
   safeArea: {
-    backgroundColor: colors.canvas,
+    // The atmosphere is mounted once at the root and shows through every screen.
+    backgroundColor: "transparent",
     flex: 1,
   },
   scrollContent: {

@@ -1,10 +1,12 @@
 import type { PropsWithChildren } from "react";
 import { StyleSheet, Text, type TextProps, type TextStyle } from "react-native";
 
-import { colors, fonts, type as typeScale } from "@/theme/tokens";
+import { type TextTone, TONE_COLORS } from "@/components/type-tones";
+import { fonts, type as typeScale } from "@/theme/tokens";
+
+export { type TextTone, TONE_COLORS };
 
 type TextVariant = "caption" | "display" | "eyebrow" | "lead" | "title" | "body";
-type TextTone = "ink" | "muted" | "plum" | "sage" | "ochre";
 
 type VivaTextProps = PropsWithChildren<
   TextProps & {
@@ -14,11 +16,11 @@ type VivaTextProps = PropsWithChildren<
 >;
 
 const toneStyles: Record<TextTone, TextStyle> = {
-  ink: { color: colors.inkStrong },
-  muted: { color: colors.inkMuted },
-  plum: { color: colors.plumVivid },
-  sage: { color: colors.sageDeep },
-  ochre: { color: colors.ochre },
+  ink: { color: TONE_COLORS.ink },
+  muted: { color: TONE_COLORS.muted },
+  plum: { color: TONE_COLORS.plum },
+  sage: { color: TONE_COLORS.sage },
+  ochre: { color: TONE_COLORS.ochre },
 };
 
 export function VivaText({
