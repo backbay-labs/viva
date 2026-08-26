@@ -2439,6 +2439,142 @@ describe("Viva shared security store adapters", () => {
   });
 });
 
+describe("Viva session body byte cap", () => {
+  beforeEach(() => {
+    console.warn = () => {};
+    resetVivaSessionMintRateLimitsForTests();
+    applyCanonicalOriginTestEnv();
+    applySharedSecurityStoreTestEnv();
+  });
+
+  afterEach(() => {
+    console.warn = originalConsoleWarn;
+    globalThis.fetch = originalFetch;
+    resetVivaSessionMintRateLimitsForTests();
+    for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
+  });
+
+  test("body byte cap accepts a session request at exactly 16 KiB and rejects one byte more", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+    }) as typeof fetch;
+
+    const atLimit = await startSession(
+      streamingSessionRequest(paddedSessionPayload(16 * 1024), [4096, 1, 8191, 4096]),
+    );
+    resetVivaSessionMintRateLimitsForTests();
+    const overLimit = await startSession(
+      streamingSessionRequest(paddedSessionPayload(16 * 1024 + 1), [4096, 1, 8191, 4097]),
+    );
+    const overBody = (await overLimit.json()) as VivaSessionRouteFailureClass;
+
+    expect(atLimit.status).toBe(200);
+    expect(overLimit.status).toBe(413);
+    expect(overBody).toEqual({
+      error: "viva_request_body_too_large",
+      failure_class: "session_bootstrap_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_session_unavailable",
+      token_refresh_outcome: "invalid",
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  test("multibyte body is measured in bytes, not JavaScript string length", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+    }) as typeof fetch;
+
+    // Four bytes per astral character: well under 16 KiB by string length, over it by bytes.
+    const payload = paddedSessionPayload(16 * 1024 + 4, "\u{1F600}");
+    const response = await startSession(streamingSessionRequest(payload, [8192, 4096, 4096]));
+    const body = (await response.json()) as VivaSessionRouteFailureClass;
+
+    expect(new TextEncoder().encode(payload).byteLength).toBeGreaterThan(16 * 1024);
+    expect(payload.length).toBeLessThan(16 * 1024);
+    expect(response.status).toBe(413);
+    expect(body.error).toBe("viva_request_body_too_large");
+    expect(calls).toEqual([]);
+  });
+
+  test("body byte cap cannot be bypassed by a lying or missing content-length", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+    }) as typeof fetch;
+    const oversized = paddedSessionPayload(16 * 1024 + 1);
+
+    const lying = await startSession(
+      streamingSessionRequest(oversized, [8192, 8193], { "content-length": "42" }),
+    );
+    resetVivaSessionMintRateLimitsForTests();
+    const absent = await startSession(streamingSessionRequest(oversized, [8192, 8193]));
+    resetVivaSessionMintRateLimitsForTests();
+    const declaredTooLarge = await startSession(
+      streamingSessionRequest(paddedSessionPayload(1024), [1024], {
+        "content-length": String(64 * 1024),
+      }),
+    );
+
+    expect([lying.status, absent.status, declaredTooLarge.status]).toEqual([413, 413, 413]);
+    expect(calls).toEqual([]);
+  });
+
+  test("oversized upstream library response cancels the stream and returns a sanitized 502", async () => {
+    let cancelled = false;
+    globalThis.fetch = (async () =>
+      new Response(
+        oversizedJsonStream(1024 * 1024 + 1, () => (cancelled = true)),
+        {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        },
+      )) as typeof fetch;
+
+    const response = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const body = (await response.json()) as VivaSessionRouteFailureClass;
+
+    expect(response.status).toBe(502);
+    expect(body).toEqual({
+      error: "viva_upstream_response_too_large",
+      failure_class: "session_bootstrap_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_session_unavailable",
+      token_refresh_outcome: "failed",
+    });
+    expect(cancelled).toBe(true);
+  });
+
+  test("body byte cap responses carry route-owned no-store, pragma, and nosniff headers", async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse(
+        200,
+        librarySnapshot({ startToken: "viva1.redacted-start-token" }),
+      )) as typeof fetch;
+
+    const success = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    resetVivaSessionMintRateLimitsForTests();
+    const rejected = await startSession(
+      streamingSessionRequest(paddedSessionPayload(16 * 1024 + 1), [16385]),
+    );
+
+    for (const response of [success, rejected]) {
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("pragma")).toBe("no-cache");
+      expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    }
+  });
+});
+
 function applyCanonicalOriginTestEnv() {
   process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
   process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
@@ -2501,6 +2637,85 @@ function isBoundedRetryAfter(value: string | null | undefined): boolean {
 
 function isCanonicalUuidV4(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+}
+
+/**
+ * A valid start payload padded to an exact byte budget with a filler claim. The padding lives in
+ * an unknown top-level field so the request stays structurally valid JSON; the byte cap must fire
+ * before any parsing decides what to do with it.
+ */
+function paddedSessionPayload(totalBytes: number, fillChar = "a"): string {
+  const base = { ...sessionStartPayload(), padding: "" };
+  const encoder = new TextEncoder();
+  const overhead = encoder.encode(JSON.stringify(base)).byteLength;
+  const fillerBytes = encoder.encode(fillChar).byteLength;
+  const remaining = Math.max(0, totalBytes - overhead);
+  const payload = JSON.stringify({
+    ...base,
+    padding: fillChar.repeat(Math.ceil(remaining / fillerBytes)),
+  });
+  return payload;
+}
+
+/** Streams a body in the given chunk sizes, so the cap is proven against a stream, not a string. */
+function streamingSessionRequest(
+  payload: string,
+  chunkSizes: readonly number[],
+  headers: Record<string, string> = {},
+): NextRequest {
+  const bytes = new TextEncoder().encode(payload);
+  let offset = 0;
+  let chunkIndex = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset >= bytes.byteLength) {
+        controller.close();
+        return;
+      }
+      // Uneven chunks, cycled, so no boundary lines up with the cap.
+      const size = chunkSizes[chunkIndex % chunkSizes.length] ?? bytes.byteLength;
+      chunkIndex += 1;
+      const take = Math.min(Math.max(1, size), bytes.byteLength - offset);
+      controller.enqueue(bytes.slice(offset, offset + take));
+      offset += take;
+    },
+  });
+  const requestHeaders = new Headers({
+    "content-type": "application/json",
+    host: "web.example",
+    origin: "https://web.example",
+    "x-forwarded-for": "203.0.113.10",
+    ...headers,
+  });
+  const request = new Request("https://web.example/api/viva-session/start", {
+    body,
+    duplex: "half",
+    headers: requestHeaders,
+    method: "POST",
+  } as RequestInit & { duplex: "half" }) as unknown as NextRequest;
+  Object.defineProperty(request, "nextUrl", {
+    value: new URL("https://web.example/api/viva-session/start"),
+  });
+  return request;
+}
+
+function oversizedJsonStream(totalBytes: number, onCancel: () => void): ReadableStream<Uint8Array> {
+  const chunk = new TextEncoder().encode("a".repeat(64 * 1024));
+  let sent = 0;
+  return new ReadableStream<Uint8Array>({
+    cancel() {
+      onCancel();
+    },
+    pull(controller) {
+      if (sent === 0) controller.enqueue(new TextEncoder().encode('{"study_sets":["'));
+      if (sent >= totalBytes) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunk);
+      sent += chunk.byteLength;
+    },
+  });
 }
 
 function projectionRequest(headers: Record<string, string> = {}): NextRequest {

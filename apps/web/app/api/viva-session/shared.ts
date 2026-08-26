@@ -435,7 +435,6 @@ export const VIVA_SESSION_AUTH_FAILURE_PROFILES = {
 
 const SESSION_SECURITY_STORE_PATH = "/v1/session-security";
 const SESSION_SECURITY_STORE_TIMEOUT_MS = 2_000;
-const SESSION_SECURITY_STORE_RESPONSE_MAX_BYTES = 16 * 1024;
 const SESSION_SECURITY_STORE_UNAVAILABLE = { ok: false, reason: "unavailable" } as const;
 const SESSION_SECURITY_STORE_RESPONSE_KEYS: ReadonlySet<string> = new Set([
   "operation",
@@ -874,10 +873,11 @@ function projectionAdmissionJson(
   failureClass: string,
   options: { retryAfterSeconds?: number } = {},
 ): NextResponse<VivaSessionProjectionFailureClass> {
-  const headers = new Headers({ "cache-control": "no-store" });
-  if (options.retryAfterSeconds !== undefined) {
-    headers.set("retry-after", String(options.retryAfterSeconds));
-  }
+  const headers = vivaWebApiResponseHeaders(
+    options.retryAfterSeconds === undefined
+      ? {}
+      : { "retry-after": String(options.retryAfterSeconds) },
+  );
   return NextResponse.json(
     { error, failure_class: failureClass, stage: "pre_loop" as const },
     { headers, status },
@@ -1195,57 +1195,165 @@ async function sessionSecurityStoreCommand<T extends { ok: boolean }>(
   }
 }
 
-async function readBoundedStoreResponse(
-  response: Response,
-  signal: AbortSignal,
-): Promise<Uint8Array | null> {
-  const declared = response.headers.get("content-length");
-  if (declared !== null) {
-    const length = Number.parseInt(declared, 10);
-    if (
-      !Number.isSafeInteger(length) ||
-      length < 0 ||
-      length > SESSION_SECURITY_STORE_RESPONSE_MAX_BYTES
-    ) {
-      await cancelStreamQuietly(response.body);
-      return null;
+/**
+ * The one byte budget table for every web-owned request and response body.
+ *
+ * D-04 `CONFIRM_DELETE` is the recorded branch, so the two D-04 Branch B budgets the plan lists
+ * (`restoreRequest`, `restoreUpstreamResponse`) are deliberately ABSENT: Task 7B is skipped by the
+ * recorded decision matrix, and an unselected branch must leave no artifact behind. Task 7B adds
+ * them together with the restore route if the sponsor ever reselects.
+ */
+export const WEB_API_BODY_LIMITS = {
+  libraryRequest: 2 * 1024 * 1024,
+  libraryResponse: 2 * 1024 * 1024,
+  projectionResponse: 1 * 1024 * 1024,
+  securityStoreResponse: 16 * 1024,
+  sessionRequest: 16 * 1024,
+  sessionUpstreamResponse: 1 * 1024 * 1024,
+} as const;
+
+export type VivaBoundedBodyRejection = "aborted" | "too_large";
+
+/** Carries only a coarse reason; no decoder, parser, or upstream text ever reaches a response. */
+export class VivaBoundedBodyError extends Error {
+  readonly reason: VivaBoundedBodyRejection;
+
+  constructor(reason: VivaBoundedBodyRejection) {
+    super(`viva_bounded_body_${reason}`);
+    this.name = "VivaBoundedBodyError";
+    this.reason = reason;
+  }
+}
+
+export function vivaBoundedBodyRejection(error: unknown): VivaBoundedBodyRejection | null {
+  return error instanceof VivaBoundedBodyError ? error.reason : null;
+}
+
+/**
+ * The single bounded body reader.
+ *
+ * An invalid, negative, or already-over-limit declared length rejects BEFORE the reader is
+ * acquired, so a hostile `content-length` costs nothing; a lying or absent one cannot beat the
+ * streaming byte count. Bytes are counted as `byteLength`, never as string length. The reader is
+ * cancelled exactly once on limit, abort, or error, and no chunk is retained afterwards.
+ */
+export async function readBoundedBody(
+  body: ReadableStream<Uint8Array> | null,
+  options: { contentLength: string | null; limit: number; signal: AbortSignal },
+): Promise<Uint8Array> {
+  if (options.contentLength !== null) {
+    const declared = Number.parseInt(options.contentLength, 10);
+    if (!Number.isSafeInteger(declared) || declared < 0 || declared > options.limit) {
+      await cancelStreamQuietly(body);
+      throw new VivaBoundedBodyError("too_large");
     }
   }
-  const body = response.body;
+  if (options.signal.aborted) {
+    await cancelStreamQuietly(body);
+    throw new VivaBoundedBodyError("aborted");
+  }
   if (!body) return new Uint8Array();
+
   const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
+  let chunks: Uint8Array[] = [];
   let total = 0;
-  let bounded = true;
+  let rejection: VivaBoundedBodyRejection | null = null;
+  // A stalled producer never resolves `read()`, so the abort has to race it rather than being
+  // polled between reads; otherwise a hostile client holds the route open past its deadline.
+  let abortHandler: (() => void) | undefined;
+  const aborted = new Promise<"aborted">((resolve) => {
+    if (options.signal.aborted) {
+      resolve("aborted");
+      return;
+    }
+    abortHandler = () => resolve("aborted");
+    options.signal.addEventListener("abort", abortHandler, { once: true });
+  });
   try {
     while (true) {
-      if (signal.aborted) {
-        bounded = false;
+      const outcome = await Promise.race([reader.read(), aborted]);
+      if (outcome === "aborted") {
+        rejection = "aborted";
         break;
       }
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      if (!chunk.value) continue;
-      total += chunk.value.byteLength;
-      if (total > SESSION_SECURITY_STORE_RESPONSE_MAX_BYTES) {
-        bounded = false;
+      if (outcome.done) break;
+      if (!outcome.value) continue;
+      total += outcome.value.byteLength;
+      if (total > options.limit) {
+        rejection = "too_large";
         break;
       }
-      chunks.push(chunk.value);
+      chunks.push(outcome.value);
     }
   } catch {
-    bounded = false;
+    rejection = options.signal.aborted ? "aborted" : "too_large";
   } finally {
-    await cancelReaderQuietly(reader);
+    if (abortHandler) options.signal.removeEventListener("abort", abortHandler);
+    if (rejection) await cancelReaderQuietly(reader);
+    releaseReaderQuietly(reader);
   }
-  if (!bounded) return null;
+  if (rejection) {
+    chunks = [];
+    throw new VivaBoundedBodyError(rejection);
+  }
+
   const merged = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
     merged.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  chunks = [];
   return merged;
+}
+
+export type VivaBoundedJsonParse =
+  | { ok: true; value: unknown }
+  | { ok: false; reason: "duplicate_key" | "malformed" };
+
+/**
+ * One fatal UTF-8 decode, one duplicate-key scan before `JSON.parse`, one parse. Callers map the
+ * closed reason onto their route's coarse public error; no decoder or parser message escapes.
+ */
+export function parseBoundedJson(bytes: Uint8Array): VivaBoundedJsonParse {
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return { ok: false, reason: "malformed" };
+  }
+  const scan = scanJsonForDuplicateObjectKeys(text);
+  if (!scan.ok) {
+    return { ok: false, reason: scan.reason === "duplicate_claim" ? "duplicate_key" : "malformed" };
+  }
+  try {
+    return { ok: true, value: JSON.parse(text) as unknown };
+  } catch {
+    return { ok: false, reason: "malformed" };
+  }
+}
+
+async function readBoundedStoreResponse(
+  response: Response,
+  signal: AbortSignal,
+): Promise<Uint8Array | null> {
+  try {
+    return await readBoundedBody(response.body, {
+      contentLength: response.headers.get("content-length"),
+      limit: WEB_API_BODY_LIMITS.securityStoreResponse,
+      signal,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function releaseReaderQuietly(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    reader.releaseLock();
+  } catch {
+    // Cancelling already released the lock; nothing else to do.
+  }
 }
 
 async function cancelReaderQuietly(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
@@ -1343,21 +1451,41 @@ async function readSessionPayload(
   | { ok: true; value: SessionRequestPayload }
   | { ok: false; response: NextResponse<VivaSessionRouteFailureClass> }
 > {
+  const invalid = () => ({
+    ok: false as const,
+    response: sessionJsonError(400, "invalid_session_request", "invalid", logContext),
+  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), sessionBootstrapTimeoutMs());
+  let bytes: Uint8Array;
   try {
-    const value = (await request.json()) as unknown;
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
+    bytes = await readBoundedBody(request.body, {
+      contentLength: request.headers.get("content-length"),
+      limit: WEB_API_BODY_LIMITS.sessionRequest,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (vivaBoundedBodyRejection(error) === "too_large") {
       return {
         ok: false,
-        response: sessionJsonError(400, "invalid_session_request", "invalid", logContext),
+        response: sessionPreLoopJsonError(
+          413,
+          "viva_request_body_too_large",
+          "invalid",
+          "session_bootstrap_unavailable",
+          PRE_LOOP_SESSION_TERMINAL_REASON,
+          logContext,
+        ),
       };
     }
-    return { ok: true, value: value as SessionRequestPayload };
-  } catch {
-    return {
-      ok: false,
-      response: sessionJsonError(400, "invalid_session_request", "invalid", logContext),
-    };
+    return invalid();
+  } finally {
+    clearTimeout(timeoutId);
   }
+
+  const parsed = parseBoundedJson(bytes);
+  if (!parsed.ok || !isRecord(parsed.value)) return invalid();
+  return { ok: true, value: parsed.value as SessionRequestPayload };
 }
 
 async function mintSessionFromLibrary(input: {
@@ -1440,7 +1568,21 @@ async function mintSessionFromLibrary(input: {
         ),
       };
     }
-    snapshot = await readJson(response);
+    const upstreamBody = await readBoundedUpstreamSnapshot(response, controller.signal);
+    if (!upstreamBody.ok) {
+      return {
+        ok: false,
+        response: sessionPreLoopJsonError(
+          502,
+          "viva_upstream_response_too_large",
+          "failed",
+          "session_bootstrap_unavailable",
+          PRE_LOOP_SESSION_TERMINAL_REASON,
+          logContext,
+        ),
+      };
+    }
+    snapshot = upstreamBody.value;
     if (timedOut) {
       return {
         ok: false,
@@ -1563,14 +1705,29 @@ function nonPositiveCount(value: number | undefined): boolean {
   return typeof value === "number" && value <= 0;
 }
 
-async function readJson(response: Response): Promise<VivaLibrarySnapshot> {
+/**
+ * The upstream library/mint body is read under the same bounded reader as everything else. An
+ * overage cancels the stream and is reported to the caller as a distinct outcome, so the route
+ * returns the exact 502 the error table names instead of silently degrading to an empty snapshot.
+ */
+async function readBoundedUpstreamSnapshot(
+  response: Response,
+  signal: AbortSignal,
+): Promise<{ ok: true; value: VivaLibrarySnapshot } | { ok: false }> {
+  let bytes: Uint8Array;
   try {
-    const value = (await response.json()) as unknown;
-    if (!value || typeof value !== "object") return {};
-    return value as VivaLibrarySnapshot;
-  } catch {
-    return {};
+    bytes = await readBoundedBody(response.body, {
+      contentLength: response.headers.get("content-length"),
+      limit: WEB_API_BODY_LIMITS.sessionUpstreamResponse,
+      signal,
+    });
+  } catch (error) {
+    if (vivaBoundedBodyRejection(error) === "too_large") return { ok: false };
+    return { ok: true, value: {} };
   }
+  const parsed = parseBoundedJson(bytes);
+  if (!parsed.ok || !isRecord(parsed.value)) return { ok: true, value: {} };
+  return { ok: true, value: parsed.value as VivaLibrarySnapshot };
 }
 
 /**
@@ -2214,14 +2371,25 @@ function sessionPreLoopJsonError(
   });
 }
 
+/**
+ * The one web-owned response header set. Built from this allowlist and nothing else: no upstream
+ * cache, cookie, or auth header is ever cloned onto a browser-facing response.
+ */
+export function vivaWebApiResponseHeaders(extra: Record<string, string> = {}): Headers {
+  const headers = new Headers({
+    "cache-control": "no-store",
+    pragma: "no-cache",
+    "x-content-type-options": "nosniff",
+  });
+  for (const [name, value] of Object.entries(extra)) headers.set(name, value);
+  return headers;
+}
+
 function sessionJson(
   body: VivaSessionRouteOutcome,
   status: number,
 ): NextResponse<VivaSessionRouteOutcome> {
-  return NextResponse.json(body, {
-    headers: { "cache-control": "no-store" },
-    status,
-  });
+  return NextResponse.json(body, { headers: vivaWebApiResponseHeaders(), status });
 }
 
 function sessionJsonError(
@@ -2256,10 +2424,11 @@ function sessionJsonError(
     status,
     options,
   );
-  const headers = new Headers({ "cache-control": "no-store" });
-  if (options.retryAfterSeconds !== undefined) {
-    headers.set("retry-after", String(options.retryAfterSeconds));
-  }
+  const headers = vivaWebApiResponseHeaders(
+    options.retryAfterSeconds === undefined
+      ? {}
+      : { "retry-after": String(options.retryAfterSeconds) },
+  );
   return NextResponse.json(body, { headers, status });
 }
 

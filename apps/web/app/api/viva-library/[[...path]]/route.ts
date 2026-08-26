@@ -4,10 +4,16 @@ import {
   attachVivaSessionBootstrapTokensToLibrarySnapshot,
   isVivaCanonicalMutatingRequest,
   isVivaLibraryControlToken,
+  parseBoundedJson,
+  readBoundedBody,
   type VivaLibraryControlScope,
   verifyVivaLibraryControlToken,
   vivaAgentScopedCredential,
+  vivaBoundedBodyRejection,
   vivaCanonicalWebOrigin,
+  vivaSessionSecurityStore,
+  vivaWebApiResponseHeaders,
+  WEB_API_BODY_LIMITS,
 } from "../../viva-session/shared";
 
 export const dynamic = "force-dynamic";
@@ -54,9 +60,16 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   if (controlGuard) return controlGuard;
   const originGuard = guardDestructiveRequestOrigin(request, controlTarget);
   if (originGuard) return originGuard;
+  const storeGuard = guardDestructiveSecurityStore(request, controlTarget);
+  if (storeGuard) return storeGuard;
+
+  const ingestion = libraryIngestionContract(request.method, path);
+  const ingestionOriginGuard = guardIngestionRequestOrigin(request, ingestion);
+  if (ingestionOriginGuard) return ingestionOriginGuard;
 
   const serverBearer = serverBearerForBrowserLibraryRequest(request, path, controlTarget);
   if (!serverBearer.ok) return serverBearer.response;
+  const { snapshotFilter } = serverBearer;
   const headers = vivaLibraryProxyHeaders(request, {
     forwardControlToken: !serverBearer.consumedControlToken,
     serverBearerToken: serverBearer.token,
@@ -73,10 +86,27 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   );
   const terminalReason = libraryPreLoopTerminalReason(path, request.method);
   try {
-    const body =
-      request.method === "POST"
-        ? await requestTextWithAbort(request, controller.signal)
-        : undefined;
+    let body: string | undefined;
+    if (request.method === "POST") {
+      const requestBody = await readBoundedLibraryRequestBody(
+        request,
+        ingestion,
+        controller.signal,
+      );
+      if (!requestBody.ok) {
+        if (requestBody.reason === "too_large") {
+          return libraryRequestTooLargeResponse(terminalReason);
+        }
+        // A stalled request body is the route deadline expiring, not a malformed body.
+        if (requestBody.reason === "aborted") {
+          return terminalReason
+            ? libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason)
+            : libraryProxyJsonError(504, "viva_library_proxy_timeout");
+        }
+        return libraryIngestionInvalidResponse();
+      }
+      body = requestBody.value;
+    }
     response = await fetch(upstream, {
       body,
       cache: "no-store",
@@ -86,11 +116,13 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
     });
     if (!response.ok && terminalReason) {
       if (isUpstreamValidationFailure(response.status)) {
+        // A browser snapshot never relays an upstream validation body, not even a stripped one.
         if (isBrowserLibrarySnapshotRequest(request.method, path)) {
           await cancelResponseBody(response);
           return libraryPreLoopJsonError(502, "viva_library_pre_loop_unavailable", terminalReason);
         }
-        const preserved = await browserSafeLibraryResponse(response, path, {});
+        // Every other upstream 400/422 is preserved, but only after bounded reading and stripping.
+        const preserved = await browserSafeLibraryResponse(response, path, controller.signal, {});
         if (timedOut) {
           return libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason);
         }
@@ -104,21 +136,11 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
         ? libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason)
         : libraryProxyJsonError(504, "viva_library_proxy_timeout");
     }
-    if (isBrowserLibrarySnapshotRequest(request.method, path) && !response.ok) {
-      return vivaLibraryProxyJsonError(response.status, "viva_library_proxy_unavailable");
+    return await browserSafeLibraryResponse(response, path, controller.signal, { snapshotFilter });
+  } catch (error) {
+    if (vivaBoundedBodyRejection(error) === "too_large") {
+      return libraryUpstreamTooLargeResponse(terminalReason);
     }
-    const responseHeaders = new Headers();
-    const contentType = response.headers.get("content-type");
-    if (contentType) responseHeaders.set("content-type", contentType);
-    responseHeaders.set("cache-control", "no-store");
-    const responseBody = await browserSafeLibraryResponseBody(response, path, contentType, {
-      snapshotFilter: browserLibrarySnapshotFilter(request, path),
-    });
-    return new NextResponse(responseBody, {
-      headers: responseHeaders,
-      status: response.status,
-    });
-  } catch {
     if (terminalReason) {
       return libraryPreLoopJsonError(
         timedOut ? 504 : 502,
@@ -133,6 +155,117 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+/**
+ * The exact accepted field set for each ingestion route. A body is validated against this and
+ * then REBUILT field by field, so a browser-supplied identity, status, or authority field can
+ * never ride along just because the agent currently ignores it.
+ */
+type LibraryIngestionContract = {
+  optional: readonly string[];
+  required: readonly string[];
+};
+
+const LIBRARY_INGESTION_CONTRACTS: Record<string, LibraryIngestionContract> = {
+  paste: { optional: ["course", "exam_date"], required: ["title", "pasted_text"] },
+  retry: { optional: ["content_type"], required: ["file_name", "file_base64"] },
+  upload: {
+    optional: ["course", "exam_date", "content_type"],
+    required: ["title", "file_name", "file_base64"],
+  },
+};
+
+function libraryIngestionContract(method: string, path: string[]): LibraryIngestionContract | null {
+  if (method !== "POST") return null;
+  const route = path.join("/");
+  if (route === "study-sets/paste") return LIBRARY_INGESTION_CONTRACTS.paste ?? null;
+  if (route === "study-sets/files") return LIBRARY_INGESTION_CONTRACTS.upload ?? null;
+  if (path.length === 4 && path[0] === "study-sets" && path[2] === "files" && path[3] === "retry") {
+    return LIBRARY_INGESTION_CONTRACTS.retry ?? null;
+  }
+  return null;
+}
+
+/**
+ * Ingestion POSTs are mutating routes, so Task 3 Step 3's same-origin primitive applies here too
+ * (A-23.4 routed this decision to Task 5). Without it the BFF would rewrite an attacker's
+ * cross-origin request into a same-origin outbound `Origin` for the agent. Refusal reuses the
+ * ingestion route's single coarse body, exactly as the destructive routes reuse one body for
+ * "malformed, expired, wrong origin/scope, replay"; no new public vocabulary is invented.
+ */
+function guardIngestionRequestOrigin(
+  request: NextRequest,
+  ingestion: LibraryIngestionContract | null,
+): NextResponse | null {
+  if (!ingestion) return null;
+  return isVivaCanonicalMutatingRequest(request) ? null : libraryIngestionInvalidResponse();
+}
+
+async function readBoundedLibraryRequestBody(
+  request: NextRequest,
+  ingestion: LibraryIngestionContract | null,
+  signal: AbortSignal,
+): Promise<
+  { ok: true; value: string } | { ok: false; reason: "aborted" | "invalid" | "too_large" }
+> {
+  let bytes: Uint8Array;
+  try {
+    bytes = await readBoundedBody(request.body, {
+      contentLength: request.headers.get("content-length"),
+      limit: WEB_API_BODY_LIMITS.libraryRequest,
+      signal,
+    });
+  } catch (error) {
+    return { ok: false, reason: vivaBoundedBodyRejection(error) ?? "invalid" };
+  }
+  if (!ingestion) return { ok: true, value: new TextDecoder().decode(bytes) };
+
+  const parsed = parseBoundedJson(bytes);
+  if (!parsed.ok) return { ok: false, reason: "invalid" };
+  const rebuilt = reconstructIngestionBody(parsed.value, ingestion);
+  return rebuilt ? { ok: true, value: JSON.stringify(rebuilt) } : { ok: false, reason: "invalid" };
+}
+
+function reconstructIngestionBody(
+  value: unknown,
+  contract: LibraryIngestionContract,
+): Record<string, string> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const allowed = new Set([...contract.required, ...contract.optional]);
+  for (const key of Object.keys(source)) {
+    if (!allowed.has(key)) return null;
+  }
+  const rebuilt: Record<string, string> = {};
+  for (const key of contract.required) {
+    const field = source[key];
+    if (typeof field !== "string" || field.length === 0) return null;
+    rebuilt[key] = field;
+  }
+  for (const key of contract.optional) {
+    if (!(key in source)) continue;
+    const field = source[key];
+    if (typeof field !== "string" || field.length === 0) return null;
+    rebuilt[key] = field;
+  }
+  return rebuilt;
+}
+
+function libraryIngestionInvalidResponse(): NextResponse {
+  return libraryAccessDeniedJsonError(400, "viva_library_request_invalid");
+}
+
+function libraryRequestTooLargeResponse(terminalReason: string | null): NextResponse {
+  return terminalReason
+    ? libraryPreLoopJsonError(413, "viva_request_body_too_large", terminalReason)
+    : libraryProxyJsonError(413, "viva_request_body_too_large");
+}
+
+function libraryUpstreamTooLargeResponse(terminalReason: string | null): NextResponse {
+  return terminalReason
+    ? libraryPreLoopJsonError(502, "viva_upstream_response_too_large", terminalReason)
+    : libraryProxyJsonError(502, "viva_upstream_response_too_large");
 }
 
 /**
@@ -218,17 +351,6 @@ function isBrowserLibrarySnapshotRequest(method: string, path: string[]): boolea
   return method === "GET" && path.join("/") === "study-sets/library";
 }
 
-function browserLibrarySnapshotFilter(
-  request: NextRequest,
-  path: string[],
-): { allowedStudySetIds: Set<string>; userId: string } | undefined {
-  if (!isBrowserLibrarySnapshotRequest(request.method, path)) return undefined;
-  const userId = request.nextUrl.searchParams.get("user_id")?.trim();
-  const allowedStudySetIds = configuredAllowlist("VIVA_SESSION_ALLOWED_STUDY_SET_IDS");
-  if (!userId || !allowedStudySetIds) return undefined;
-  return { allowedStudySetIds, userId };
-}
-
 function vivaLibraryProxyTimeoutMs(path: string[], method: string): number {
   const maxTimeout =
     libraryPreLoopTerminalReason(path, method) === "pre_loop_upload_unavailable"
@@ -239,44 +361,16 @@ function vivaLibraryProxyTimeoutMs(path: string[], method: string): number {
   return maxTimeout;
 }
 
-async function requestTextWithAbort(request: NextRequest, signal: AbortSignal): Promise<string> {
-  if (!request.body) return "";
-  const reader = request.body.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  let abortHandler: (() => void) | undefined;
-  const abortError = new Error("viva_library_proxy_timeout");
-  const abort = new Promise<never>((_, reject) => {
-    abortHandler = () => {
-      void reader.cancel().catch(() => undefined);
-      reject(abortError);
-    };
-    signal.addEventListener("abort", abortHandler, { once: true });
-  });
-
-  try {
-    while (true) {
-      if (signal.aborted) throw abortError;
-      const chunk = await Promise.race([reader.read(), abort]);
-      if (signal.aborted) throw abortError;
-      if (chunk.done) break;
-      text += decoder.decode(chunk.value, { stream: true });
-    }
-    return text + decoder.decode();
-  } finally {
-    if (abortHandler) signal.removeEventListener("abort", abortHandler);
-    reader.releaseLock();
-  }
-}
-
 function vivaAgentServerHttpBaseUrl(): string | null {
   return process.env.VIVA_AGENT_HTTP_URL?.trim() || null;
 }
 
-function noStoreHeaders(headers: HeadersInit = {}): Headers {
-  const output = new Headers(headers);
-  output.set("cache-control", "no-store");
-  return output;
+/**
+ * Route-owned response headers only. The optional extras are this route's own allowlist —
+ * the validated upstream content type and nothing else — never a cloned upstream header.
+ */
+function noStoreHeaders(extra: Record<string, string> = {}): Headers {
+  return vivaWebApiResponseHeaders(extra);
 }
 
 function vivaLibraryProxyJsonError(status: number, error: string): NextResponse<{ error: string }> {
@@ -463,6 +557,27 @@ function guardDestructiveRequestOrigin(
   return vivaLibraryProxyJsonError(403, "viva_library_control_capability_required");
 }
 
+/**
+ * A destructive delete is a one-time capability consumption, and the shared store is what makes
+ * "one time" true across instances. If no shared store can be selected, the route refuses before
+ * it contacts the agent rather than performing an unbounded, unrevocable delete.
+ */
+function guardDestructiveSecurityStore(
+  request: NextRequest,
+  controlTarget: LibraryControlRouteTarget | null,
+): NextResponse | null {
+  if (request.method !== "DELETE" || !controlTarget?.studySetId) return null;
+  if (vivaSessionSecurityStore().ok) return null;
+  return NextResponse.json(
+    {
+      error: "viva_library_control_unavailable",
+      failure_class: "pre_loop_unavailable",
+      stage: "pre_loop",
+    },
+    { headers: noStoreHeaders(), status: 503 },
+  );
+}
+
 function libraryControlRouteTarget(
   method: string,
   path: string[],
@@ -505,60 +620,69 @@ function trimTrailingSlash(value: string): string {
   return value.endsWith("/") ? value.slice(0, -1) : value;
 }
 
-async function browserSafeLibraryResponseBody(
+/**
+ * The ONE bounded response builder every upstream response goes through.
+ *
+ * Order matters and is fixed: bounded read -> parse -> (Task 6 stripping) -> snapshot allowlist
+ * filtering -> BFF capability minting. Headers are rebuilt from a route-owned allowlist — the
+ * upstream content type plus this route's own cache/security headers — so no upstream cookie,
+ * auth, or cache header is ever cloned onto a browser-facing response. An overage cancels the
+ * upstream stream and raises, and the caller maps it to the recorded 502.
+ */
+async function browserSafeLibraryResponse(
   response: Response,
+  path: string[],
+  signal: AbortSignal,
+  options: {
+    snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
+  },
+): Promise<NextResponse> {
+  const contentType = response.headers.get("content-type");
+  const bytes = await readBoundedBody(response.body, {
+    contentLength: response.headers.get("content-length"),
+    limit: WEB_API_BODY_LIMITS.libraryResponse,
+    signal,
+  });
+  const responseHeaders = noStoreHeaders(contentType ? { "content-type": contentType } : {});
+  const body = browserSafeLibraryResponseBody(bytes, path, contentType, options);
+  return new NextResponse(typeof body === "string" ? body : new Uint8Array(body), {
+    headers: responseHeaders,
+    status: response.status,
+  });
+}
+
+function browserSafeLibraryResponseBody(
+  bytes: Uint8Array,
   path: string[],
   contentType: string | null,
   options: {
     snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
   },
-): Promise<ArrayBuffer | string> {
+): Uint8Array | string {
   if (
-    response.ok &&
-    path.join("/") === "study-sets/library" &&
-    contentType?.toLowerCase().includes("application/json")
+    path.join("/") !== "study-sets/library" ||
+    !contentType?.toLowerCase().includes("application/json")
   ) {
-    try {
-      const value = await response.json();
-      const filtered = options.snapshotFilter
-        ? filterBearerBackedLibrarySnapshot(value, options.snapshotFilter)
-        : value;
-      const withBootstrapTokens = options.snapshotFilter
-        ? attachVivaSessionBootstrapTokensToLibrarySnapshot(filtered, {
-            allowedStudySetIds: options.snapshotFilter.allowedStudySetIds,
-            userId: options.snapshotFilter.userId,
-          })
-        : filtered;
-      const withControlTokens = options.snapshotFilter
-        ? attachVivaLibraryControlTokensToLibrarySnapshot(withBootstrapTokens, {
-            allowedStudySetIds: options.snapshotFilter.allowedStudySetIds,
-            userId: options.snapshotFilter.userId,
-          })
-        : withBootstrapTokens;
-      return JSON.stringify(stripBrowserLibraryCapabilityTokens(withControlTokens));
-    } catch {
-      return "{}";
-    }
+    return bytes;
   }
-  return response.arrayBuffer();
-}
-
-async function browserSafeLibraryResponse(
-  response: Response,
-  path: string[],
-  options: {
-    snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
-  },
-): Promise<NextResponse> {
-  const responseHeaders = new Headers();
-  const contentType = response.headers.get("content-type");
-  if (contentType) responseHeaders.set("content-type", contentType);
-  responseHeaders.set("cache-control", "no-store");
-  const responseBody = await browserSafeLibraryResponseBody(response, path, contentType, options);
-  return new NextResponse(responseBody, {
-    headers: responseHeaders,
-    status: response.status,
-  });
+  const parsed = parseBoundedJson(bytes);
+  if (!parsed.ok) return "{}";
+  const filtered = options.snapshotFilter
+    ? filterBearerBackedLibrarySnapshot(parsed.value, options.snapshotFilter)
+    : parsed.value;
+  const withBootstrapTokens = options.snapshotFilter
+    ? attachVivaSessionBootstrapTokensToLibrarySnapshot(filtered, {
+        allowedStudySetIds: options.snapshotFilter.allowedStudySetIds,
+        userId: options.snapshotFilter.userId,
+      })
+    : filtered;
+  const withControlTokens = options.snapshotFilter
+    ? attachVivaLibraryControlTokensToLibrarySnapshot(withBootstrapTokens, {
+        allowedStudySetIds: options.snapshotFilter.allowedStudySetIds,
+        userId: options.snapshotFilter.userId,
+      })
+    : withBootstrapTokens;
+  return JSON.stringify(stripBrowserLibraryCapabilityTokens(withControlTokens));
 }
 
 function filterBearerBackedLibrarySnapshot(

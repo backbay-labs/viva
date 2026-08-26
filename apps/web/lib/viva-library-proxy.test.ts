@@ -1,7 +1,7 @@
 import * as bunTest from "bun:test";
 import type { NextRequest } from "next/server";
 import { DELETE, GET, POST } from "../app/api/viva-library/[[...path]]/route";
-import { signVivaLibraryControlToken } from "../app/api/viva-session/shared";
+import { signVivaLibraryControlToken, WEB_API_BODY_LIMITS } from "../app/api/viva-session/shared";
 
 const { afterEach, beforeEach, describe, expect, test } = bunTest as typeof bunTest & {
   afterEach: (fn: () => void) => void;
@@ -1047,7 +1047,7 @@ describe("Viva library proxy", () => {
       });
       const request = new Request("http://localhost:3000/api/viva-library/study-sets/files", {
         body,
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", origin: "http://localhost:3000" },
         method: "POST",
       }) as unknown as NextRequest;
       Object.defineProperty(request, "nextUrl", {
@@ -1061,7 +1061,13 @@ describe("Viva library proxy", () => {
       expect(response.status).toBe(201);
       expect(calls).toHaveLength(1);
       expect(calls[0]?.input).toBe("http://agent.test/study-sets/files");
-      expect(calls[0]?.body).toBe(body);
+      // WEBAPI-014: the forwarded body is now REBUILT from the accepted fields, so it carries the
+      // same values under the same exact key set, in the contract's own order rather than the
+      // caller's. Byte-identical passthrough is exactly what field-by-field reconstruction ends.
+      expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual(JSON.parse(body));
+      expect(Object.keys(JSON.parse(calls[0]?.body ?? "{}")).sort()).toEqual(
+        Object.keys(JSON.parse(body)).sort(),
+      );
       const headers = new Headers(calls[0]?.init?.headers);
       expect(headers.get("content-type")).toBe("application/json");
       expect(headers.get("origin")).toBe("http://localhost:3000");
@@ -1140,7 +1146,7 @@ describe("Viva library proxy", () => {
           file_name: "Lecture 9.pdf",
           title: "Bio PDF",
         }),
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", origin: "http://localhost:3000" },
         method: "POST",
       }) as unknown as NextRequest;
       Object.defineProperty(request, "nextUrl", {
@@ -1883,7 +1889,533 @@ describe("Viva library canonical origin and scoped service credential", () => {
       restoreAll();
     }
   });
+
+  test("shared security store is mandatory before a public destructive delete reaches the agent", async () => {
+    const calls: string[] = [];
+    const savedNodeEnv = process.env.NODE_ENV;
+    const savedStoreUrl = process.env.VIVA_SESSION_SECURITY_STORE_REST_URL;
+    const savedStoreToken = process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN;
+    try {
+      applyEnv();
+      process.env.VIVA_WEB_CANONICAL_ORIGIN = "https://web.example";
+      process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
+      restoreEnv("NODE_ENV", "production");
+      delete process.env.VIVA_SESSION_SECURITY_STORE_REST_URL;
+      delete process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN;
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        calls.push(String(input));
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        });
+      }) as typeof fetch;
+      const token = signVivaLibraryControlToken({
+        scope: "study_set_delete",
+        studySetId: "biology-midterm",
+        userId: "user-1",
+      });
+      if (!token) throw new Error("fixture must sign a study-set delete control capability");
+
+      const request = {
+        headers: new Headers({
+          origin: "https://web.example",
+          "sec-fetch-site": "same-origin",
+          "x-viva-library-control-token": token,
+        }),
+        method: "DELETE",
+        nextUrl: new URL(
+          "https://web.example/api/viva-library/study-sets/biology-midterm?user_id=user-1",
+        ),
+      } as unknown as NextRequest;
+
+      const response = await DELETE(request, {
+        params: Promise.resolve({ path: ["study-sets", "biology-midterm"] }),
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(503);
+      expect(body).toEqual({
+        error: "viva_library_control_unavailable",
+        failure_class: "pre_loop_unavailable",
+        stage: "pre_loop",
+      });
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(calls).toEqual([]);
+      expect(JSON.stringify(body)).not.toContain("VIVA_SESSION_SECURITY_STORE");
+    } finally {
+      restoreAll();
+      restoreEnv("NODE_ENV", savedNodeEnv);
+      restoreEnv("VIVA_SESSION_SECURITY_STORE_REST_URL", savedStoreUrl);
+      restoreEnv("VIVA_SESSION_SECURITY_STORE_REST_TOKEN", savedStoreToken);
+    }
+  });
 });
+
+describe("Viva library body byte cap and ingestion request shapes", () => {
+  const CANONICAL = "http://localhost:3000";
+  const trackedEnv = [
+    "VIVA_AGENT_HTTP_URL",
+    "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+    "VIVA_LIBRARY_PROXY_TIMEOUT_MS",
+    "VIVA_SESSION_ALLOWED_STUDY_SET_IDS",
+    "VIVA_SESSION_ALLOWED_USER_IDS",
+    "VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET",
+    "VIVA_WEB_CANONICAL_ORIGIN",
+  ] as const;
+  const savedEnv = new Map<string, string | undefined>();
+
+  beforeEach(() => {
+    for (const name of trackedEnv) savedEnv.set(name, process.env[name]);
+    process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+    process.env.VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN = LIBRARY_READ_BEARER;
+    process.env.VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN = LIBRARY_DELETE_BEARER;
+    process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+    process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+    process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = LIBRARY_BOOTSTRAP_SECRET;
+    process.env.VIVA_WEB_CANONICAL_ORIGIN = CANONICAL;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    for (const [name, value] of savedEnv) restoreEnv(name, value);
+    savedEnv.clear();
+  });
+
+  test("bounded reader budgets pin the recorded per-route byte caps", () => {
+    expect(WEB_API_BODY_LIMITS).toEqual({
+      libraryRequest: 2 * 1024 * 1024,
+      libraryResponse: 2 * 1024 * 1024,
+      projectionResponse: 1 * 1024 * 1024,
+      securityStoreResponse: 16 * 1024,
+      sessionRequest: 16 * 1024,
+      sessionUpstreamResponse: 1 * 1024 * 1024,
+    });
+  });
+
+  test("body byte cap accepts a library request at exactly 2 MiB and rejects one byte more", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+        status: 201,
+      });
+    }) as typeof fetch;
+
+    const atLimit = await POST(pasteRequestAtBytes(2 * 1024 * 1024, [65_536, 1, 4095]), {
+      params: Promise.resolve({ path: ["study-sets", "paste"] }),
+    });
+    const overLimit = await POST(pasteRequestAtBytes(2 * 1024 * 1024 + 1, [65_536, 1, 4095]), {
+      params: Promise.resolve({ path: ["study-sets", "paste"] }),
+    });
+    const overBody = await overLimit.json();
+
+    expect(atLimit.status).toBe(201);
+    expect(overLimit.status).toBe(413);
+    expect(overBody).toEqual({
+      error: "viva_request_body_too_large",
+      failure_class: "pre_loop_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_ingestion_unavailable",
+    });
+    expect(calls).toEqual(["http://agent.test/study-sets/paste"]);
+  });
+
+  test("multibyte body is measured in bytes over uneven chunks, not string length", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+        status: 201,
+      });
+    }) as typeof fetch;
+
+    const request = pasteRequestAtBytes(2 * 1024 * 1024 + 4, [7, 65_536, 13], "\u{1F600}");
+    const response = await POST(request, {
+      params: Promise.resolve({ path: ["study-sets", "paste"] }),
+    });
+
+    expect(response.status).toBe(413);
+    expect(calls).toEqual([]);
+  });
+
+  test("oversized upstream response cancels the stream and returns a sanitized 502", async () => {
+    let cancelled = false;
+    globalThis.fetch = (async () =>
+      new Response(
+        oversizedLibraryStream(2 * 1024 * 1024 + 1, () => (cancelled = true)),
+        {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        },
+      )) as typeof fetch;
+
+    const response = await GET(librarySnapshotRequest(), {
+      params: Promise.resolve({ path: ["study-sets", "library"] }),
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(502);
+    expect(body).toEqual({
+      error: "viva_upstream_response_too_large",
+      failure_class: "pre_loop_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_ingestion_unavailable",
+    });
+    expect(cancelled).toBe(true);
+  });
+
+  test("four concurrent hostile streams settle under the route deadline without an upstream call", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+        status: 201,
+      });
+    }) as typeof fetch;
+
+    const startedAt = Date.now();
+    const responses = await Promise.all(
+      Array.from({ length: 4 }, () =>
+        POST(pasteRequestAtBytes(2 * 1024 * 1024 + 1, [1, 65_536, 3]), {
+          params: Promise.resolve({ path: ["study-sets", "paste"] }),
+        }),
+      ),
+    );
+    const elapsed = Date.now() - startedAt;
+
+    expect(responses.map((response) => response.status)).toEqual([413, 413, 413, 413]);
+    expect(calls).toEqual([]);
+    expect(elapsed).toBeLessThan(15_000);
+  });
+
+  test("byte-limit cancellation retains no chunks across the next request", async () => {
+    const bodies: string[] = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+        status: 201,
+      });
+    }) as typeof fetch;
+
+    const rejected = await POST(pasteRequestAtBytes(2 * 1024 * 1024 + 1, [65_536]), {
+      params: Promise.resolve({ path: ["study-sets", "paste"] }),
+    });
+    const accepted = await POST(ingestionRequest("study-sets/paste", validPasteBody()), {
+      params: Promise.resolve({ path: ["study-sets", "paste"] }),
+    });
+
+    expect(rejected.status).toBe(413);
+    expect(accepted.status).toBe(201);
+    expect(bodies).toHaveLength(1);
+    expect(JSON.parse(bodies[0] ?? "{}")).toEqual(validPasteBody());
+    expect((bodies[0] ?? "").length).toBeLessThan(1024);
+  });
+
+  test("ingestion requests accept exactly their contract fields and forward a reconstructed body", async () => {
+    const sent: Array<{ body: string; input: string }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      sent.push({ body: String(init?.body ?? ""), input: String(input) });
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+        status: 201,
+      });
+    }) as typeof fetch;
+
+    const cases = [
+      {
+        accepted: validPasteBody(),
+        path: ["study-sets", "paste"],
+        route: "study-sets/paste",
+      },
+      {
+        accepted: {
+          content_type: "application/pdf",
+          course: "Biology 201",
+          exam_date: "2026-09-01",
+          file_base64: "JVBERi0xLjc=",
+          file_name: "Lecture 9.pdf",
+          title: "Bio PDF",
+        },
+        path: ["study-sets", "files"],
+        route: "study-sets/files",
+      },
+      {
+        accepted: {
+          content_type: "application/pdf",
+          file_base64: "JVBERi0xLjc=",
+          file_name: "Lecture 9.pdf",
+        },
+        path: ["study-sets", "biology-midterm", "files", "retry"],
+        route: "study-sets/biology-midterm/files/retry",
+      },
+    ];
+
+    const statuses: number[] = [];
+    for (const testCase of cases) {
+      const response = await POST(ingestionRequest(testCase.route, testCase.accepted), {
+        params: Promise.resolve({ path: testCase.path }),
+      });
+      statuses.push(response.status);
+    }
+
+    expect(statuses).toEqual([201, 201, 201]);
+    expect(sent).toHaveLength(3);
+    for (const [index, testCase] of cases.entries()) {
+      const forwarded = JSON.parse(sent[index]?.body ?? "{}") as Record<string, unknown>;
+      expect(forwarded).toEqual(testCase.accepted);
+      expect(Object.keys(forwarded).sort()).toEqual(Object.keys(testCase.accepted).sort());
+    }
+  });
+
+  test("ingestion requests reject missing, duplicate, unknown, and identity fields before upstream", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+        status: 201,
+      });
+    }) as typeof fetch;
+
+    const hostileBodies = [
+      // missing required
+      '{"course":"Biology 201"}',
+      '{"title":"Bio"}',
+      // duplicate key
+      '{"title":"Bio","pasted_text":"a","pasted_text":"b"}',
+      // unknown field
+      '{"title":"Bio","pasted_text":"a","notes":"x"}',
+      // browser-supplied identity fields
+      '{"title":"Bio","pasted_text":"a","user_id":"user-1"}',
+      '{"title":"Bio","pasted_text":"a","study_set_id":"biology-midterm"}',
+      '{"title":"Bio","pasted_text":"a","session_id":"voice-session-1"}',
+      // server-owned status / authority fields
+      '{"title":"Bio","pasted_text":"a","ingestion_status":"ready"}',
+      '{"title":"Bio","pasted_text":"a","server_owned":true}',
+      // wrong types
+      '{"title":"Bio","pasted_text":123}',
+      '{"title":"","pasted_text":"a"}',
+      '{"title":"Bio","pasted_text":"a","course":null}',
+      // not an object / malformed
+      '["title","pasted_text"]',
+      "{not json",
+    ];
+
+    const observed: Array<{ body: unknown; status: number }> = [];
+    for (const raw of hostileBodies) {
+      const response = await POST(rawIngestionRequest("study-sets/paste", raw), {
+        params: Promise.resolve({ path: ["study-sets", "paste"] }),
+      });
+      observed.push({ body: await response.json(), status: response.status });
+    }
+
+    const expected = {
+      body: {
+        error: "viva_library_request_invalid",
+        failure_class: "access_denied",
+        stage: "pre_loop",
+      },
+      status: 400,
+    };
+    expect(observed).toEqual(hostileBodies.map(() => expected));
+    expect(calls).toEqual([]);
+    expect(JSON.stringify(observed)).not.toContain("biology-midterm");
+    expect(JSON.stringify(observed)).not.toContain("user-1");
+  });
+
+  test("cross-origin ingestion posts are refused with the coarse ingestion body before upstream", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+        status: 201,
+      });
+    }) as typeof fetch;
+
+    const refused = [
+      await POST(ingestionRequest("study-sets/paste", validPasteBody(), { origin: "" }), {
+        params: Promise.resolve({ path: ["study-sets", "paste"] }),
+      }),
+      await POST(
+        ingestionRequest("study-sets/paste", validPasteBody(), { origin: "https://evil.example" }),
+        { params: Promise.resolve({ path: ["study-sets", "paste"] }) },
+      ),
+      await POST(
+        ingestionRequest("study-sets/paste", validPasteBody(), {
+          "sec-fetch-site": "cross-site",
+        }),
+        { params: Promise.resolve({ path: ["study-sets", "paste"] }) },
+      ),
+    ];
+    const sameOrigin = await POST(
+      ingestionRequest("study-sets/paste", validPasteBody(), { "sec-fetch-site": "same-origin" }),
+      { params: Promise.resolve({ path: ["study-sets", "paste"] }) },
+    );
+
+    expect(refused.map((response) => response.status)).toEqual([400, 400, 400]);
+    for (const response of refused) {
+      expect(await response.json()).toEqual({
+        error: "viva_library_request_invalid",
+        failure_class: "access_denied",
+        stage: "pre_loop",
+      });
+    }
+    expect(sameOrigin.status).toBe(201);
+    expect(calls).toEqual(["http://agent.test/study-sets/paste"]);
+  });
+
+  test("library proxy responses carry route-owned headers and never clone upstream cookie, auth, or cache headers", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ ok: true }), {
+        headers: {
+          "cache-control": "public, max-age=31536000",
+          "content-type": "application/json",
+          "set-cookie": "session=upstream-cookie; Path=/",
+          "www-authenticate": 'Bearer realm="agent"',
+          "x-api-key": "upstream-api-key",
+        },
+        status: 201,
+      })) as typeof fetch;
+
+    const success = await POST(ingestionRequest("study-sets/paste", validPasteBody()), {
+      params: Promise.resolve({ path: ["study-sets", "paste"] }),
+    });
+    const rejected = await POST(rawIngestionRequest("study-sets/paste", "{not json"), {
+      params: Promise.resolve({ path: ["study-sets", "paste"] }),
+    });
+
+    for (const response of [success, rejected]) {
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("pragma")).toBe("no-cache");
+      expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(response.headers.get("set-cookie")).toBe(null);
+      expect(response.headers.get("www-authenticate")).toBe(null);
+      expect(response.headers.get("x-api-key")).toBe(null);
+      expect(response.headers.get("authorization")).toBe(null);
+    }
+  });
+
+  function librarySnapshotRequest(): NextRequest {
+    return {
+      headers: new Headers(),
+      method: "GET",
+      nextUrl: new URL(`${CANONICAL}/api/viva-library/study-sets/library?user_id=user-1`),
+    } as unknown as NextRequest;
+  }
+});
+
+function validPasteBody(): Record<string, string> {
+  return {
+    course: "Biology 201",
+    exam_date: "2026-09-01",
+    pasted_text: "Glycolysis yields two ATP.",
+    title: "Bio paste",
+  };
+}
+
+function ingestionRequest(
+  route: string,
+  body: Record<string, unknown>,
+  headers: Record<string, string> = {},
+): NextRequest {
+  return rawIngestionRequest(route, JSON.stringify(body), headers);
+}
+
+function rawIngestionRequest(
+  route: string,
+  body: string,
+  headers: Record<string, string> = {},
+): NextRequest {
+  const requestHeaders = new Headers({
+    "content-type": "application/json",
+    origin: "http://localhost:3000",
+    ...headers,
+  });
+  if (headers.origin === "") requestHeaders.delete("origin");
+  const request = new Request(`http://localhost:3000/api/viva-library/${route}`, {
+    body,
+    headers: requestHeaders,
+    method: "POST",
+  }) as unknown as NextRequest;
+  Object.defineProperty(request, "nextUrl", {
+    value: new URL(`http://localhost:3000/api/viva-library/${route}`),
+  });
+  return request;
+}
+
+/** A valid paste body padded to an exact byte budget and streamed in uneven, cycled chunks. */
+function pasteRequestAtBytes(
+  totalBytes: number,
+  chunkSizes: readonly number[],
+  fillChar = "a",
+): NextRequest {
+  const encoder = new TextEncoder();
+  const base = { ...validPasteBody(), pasted_text: "" };
+  const overhead = encoder.encode(JSON.stringify(base)).byteLength;
+  const fillerBytes = encoder.encode(fillChar).byteLength;
+  const remaining = Math.max(0, totalBytes - overhead);
+  const payload = JSON.stringify({
+    ...base,
+    pasted_text: fillChar.repeat(Math.ceil(remaining / fillerBytes)),
+  });
+  const bytes = encoder.encode(payload);
+  let offset = 0;
+  let chunkIndex = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset >= bytes.byteLength) {
+        controller.close();
+        return;
+      }
+      const size = chunkSizes[chunkIndex % chunkSizes.length] ?? bytes.byteLength;
+      chunkIndex += 1;
+      const take = Math.min(Math.max(1, size), bytes.byteLength - offset);
+      controller.enqueue(bytes.slice(offset, offset + take));
+      offset += take;
+    },
+  });
+  const request = new Request("http://localhost:3000/api/viva-library/study-sets/paste", {
+    body,
+    duplex: "half",
+    headers: new Headers({
+      "content-type": "application/json",
+      origin: "http://localhost:3000",
+    }),
+    method: "POST",
+  } as RequestInit & { duplex: "half" }) as unknown as NextRequest;
+  Object.defineProperty(request, "nextUrl", {
+    value: new URL("http://localhost:3000/api/viva-library/study-sets/paste"),
+  });
+  return request;
+}
+
+function oversizedLibraryStream(
+  totalBytes: number,
+  onCancel: () => void,
+): ReadableStream<Uint8Array> {
+  const chunk = new TextEncoder().encode("a".repeat(64 * 1024));
+  let sent = 0;
+  return new ReadableStream<Uint8Array>({
+    cancel() {
+      onCancel();
+    },
+    pull(controller) {
+      if (sent === 0) controller.enqueue(new TextEncoder().encode('{"study_sets":["'));
+      if (sent >= totalBytes) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunk);
+      sent += chunk.byteLength;
+    },
+  });
+}
 
 function fileUploadRequest(): NextRequest {
   const request = new Request("http://localhost:3000/api/viva-library/study-sets/files", {
@@ -1893,7 +2425,7 @@ function fileUploadRequest(): NextRequest {
       file_name: "Lecture 9.pdf",
       title: "Bio PDF",
     }),
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", origin: "http://localhost:3000" },
     method: "POST",
   }) as unknown as NextRequest;
   Object.defineProperty(request, "nextUrl", {
@@ -1909,7 +2441,7 @@ function stalledUploadRequest(): NextRequest {
         controller.enqueue(new TextEncoder().encode('{"title":"Bio PDF","stalled":"'));
       },
     }),
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", origin: "http://localhost:3000" },
     method: "POST",
     duplex: "half",
   } as RequestInit & { duplex: "half" }) as unknown as NextRequest;
