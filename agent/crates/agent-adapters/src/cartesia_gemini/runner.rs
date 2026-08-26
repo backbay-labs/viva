@@ -2,7 +2,7 @@ use std::{
     fmt,
     future::Future,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -96,11 +96,16 @@ impl CartesiaGeminiRunner<FakeCartesiaGeminiTransports> {
     pub(crate) fn fake(store: Arc<dyn StudyMemoryStore>, config: CartesiaGeminiConfig) -> Self {
         Self {
             config,
-            transports: FakeCartesiaGeminiTransports,
+            transports: FakeCartesiaGeminiTransports::new(),
             store: Some(store),
             evaluator: synthetic_fixture_answer_evaluator(),
             evaluator_provenance: EvaluatorProvenance::SyntheticFixture,
         }
+    }
+
+    /// How many times this fixture runtime asked Sonic to speak.
+    pub(crate) fn sonic_call_count(&self) -> u32 {
+        self.transports.sonic_call_count()
     }
 }
 
@@ -2009,8 +2014,26 @@ pub(crate) trait CartesiaGeminiTransports: Clone + Send + Sync + 'static {
     ) -> Result<Vec<AudioFrame>, BrainError>;
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct FakeCartesiaGeminiTransports;
+/// The fixture transports, plus the one observation a test cannot make from the
+/// event stream: whether the speech provider was *asked* to speak at all.
+///
+/// A turn that must not speak is not proven by the absence of `AudioDelta` —
+/// synthesis could have run and its frames been dropped. The counter below makes
+/// "zero Sonic calls" directly observable.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FakeCartesiaGeminiTransports {
+    sonic_calls: Arc<AtomicU32>,
+}
+
+impl FakeCartesiaGeminiTransports {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn sonic_call_count(&self) -> u32 {
+        self.sonic_calls.load(Ordering::SeqCst)
+    }
+}
 
 #[async_trait]
 impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
@@ -2136,6 +2159,9 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         transcript: &str,
         interrupt: FakeRuntimeInterrupt,
     ) -> Result<Vec<AudioFrame>, BrainError> {
+        // Counted on entry, before any outcome: an asked-for synthesis that then
+        // failed is still a call the provider saw.
+        self.sonic_calls.fetch_add(1, Ordering::SeqCst);
         let _request = sonic_generation_request(&config.sonic, response_id, transcript, false);
         if interrupt == FakeRuntimeInterrupt::WriterFailureBeforeSonicAudio {
             return Err(fake_transport_failure("writer_failed_before_audio"));

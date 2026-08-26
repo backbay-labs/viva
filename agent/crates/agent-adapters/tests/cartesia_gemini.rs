@@ -2800,7 +2800,19 @@ fn learning_events_match_outcome(
 }
 
 async fn run_fixture_outcome_turn(store: Arc<FixtureOutcomeStore>) -> Vec<BrainEvent> {
-    let mut session = FakeCartesiaGeminiRuntime::new(store)
+    run_fixture_outcome_turn_observed(store).await.0
+}
+
+/// The turn's events plus how many times the runtime asked Sonic to speak.
+///
+/// The count is a transport observation the event stream cannot make: a turn
+/// that emitted no `AudioDelta` may still have called the speech provider and
+/// dropped its frames.
+async fn run_fixture_outcome_turn_observed(
+    store: Arc<FixtureOutcomeStore>,
+) -> (Vec<BrainEvent>, u32) {
+    let runtime = FakeCartesiaGeminiRuntime::new(store);
+    let mut session = runtime
         .open(fixture_session_config())
         .await
         .expect("runner opens");
@@ -2813,7 +2825,8 @@ async fn run_fixture_outcome_turn(store: Arc<FixtureOutcomeStore>) -> Vec<BrainE
     while let Ok(Some(event)) = timeout(Duration::from_millis(400), session.events.recv()).await {
         events.push(event);
     }
-    events
+    let sonic_calls = runtime.sonic_call_count();
+    (events, sonic_calls)
 }
 
 #[tokio::test]
@@ -2841,7 +2854,10 @@ async fn live_runner_emits_learning_events_only_from_persisted_turn_outcome() {
         learning_core_sources(),
         outcome.clone(),
     ));
-    let events = run_fixture_outcome_turn(Arc::clone(&store)).await;
+    let (events, sonic_calls) = run_fixture_outcome_turn_observed(Arc::clone(&store)).await;
+    // The positive control for every "zero Sonic calls" assertion in this file:
+    // a graded turn does speak, exactly once.
+    assert_eq!(sonic_calls, 1, "{events:?}");
 
     let evaluations = events
         .iter()
@@ -2955,7 +2971,10 @@ async fn deferred_turn_emits_recovery_without_mastery_schedule_or_graded_recap()
         learning_core_sources(),
         outcome.clone(),
     ));
-    let events = run_fixture_outcome_turn(Arc::clone(&store)).await;
+    let (events, sonic_calls) = run_fixture_outcome_turn_observed(Arc::clone(&store)).await;
+    // A deferral is a recovery signal, not a response to speak: the speech
+    // provider is never even asked.
+    assert_eq!(sonic_calls, 0, "{events:?}");
 
     let deferred = events
         .iter()
@@ -3043,7 +3062,10 @@ async fn live_empty_model_output_fails_without_biology_speech_or_sonic_call() {
         learning_core_sources(),
         outcome,
     ));
-    let events = run_fixture_outcome_turn(Arc::clone(&store)).await;
+    let (events, sonic_calls) = run_fixture_outcome_turn_observed(Arc::clone(&store)).await;
+    // The plan's literal proof: zero Sonic calls, not merely zero audio events.
+    // The refusal happens before the speech provider is ever asked.
+    assert_eq!(sonic_calls, 0, "{events:?}");
 
     let failures = events
         .iter()

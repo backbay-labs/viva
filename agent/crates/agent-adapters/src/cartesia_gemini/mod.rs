@@ -668,6 +668,15 @@ impl FakeCartesiaGeminiRuntime {
         }
     }
 
+    /// How many times this runtime asked the speech provider to speak.
+    ///
+    /// A turn that must stay silent — a deferral, a refused empty model output —
+    /// is only proven silent by this counter: an absent `AudioDelta` is also
+    /// consistent with a synthesis that ran and had its frames dropped.
+    pub fn sonic_call_count(&self) -> u32 {
+        self.runner.sonic_call_count()
+    }
+
     pub async fn replay_audio_turn(
         &self,
         session_config: SessionConfig,
