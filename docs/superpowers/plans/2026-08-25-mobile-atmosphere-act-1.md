@@ -264,8 +264,15 @@ token fails CI rather than silently shipping unreadable metadata."
 `VivaText` maps semantic tones to colours in one place, so most of the fix lands there. 22 call sites use `tone="muted"`, 9 use `tone="ochre"`, 2 use `tone="sage"`, 11 use `tone="plum"` — all of them are fixed by changing the map, not the call sites.
 
 **Files:**
+- Create: `apps/mobile/src/components/type-tones.ts`
 - Modify: `apps/mobile/src/components/type.tsx:18-24`
-- Create: `apps/mobile/src/components/type.test.ts`
+- Create: `apps/mobile/src/components/type-tones.test.ts`
+
+> **Corrected during execution.** The tone map and `TextTone` must live in a **separate,
+> RN-free module** that `type.tsx` re-exports. `bun:test` cannot import `react-native` at all —
+> it fails parsing Flow syntax at `react-native/index.js:27` (`import typeof * as ...`) — so a
+> test importing `@/components/type` never runs. Everything asserted in this repo's tests must
+> come from a module with no React Native import anywhere in its graph.
 
 **Interfaces:**
 - Consumes: `colors.sageInk`, `colors.ochreInk`, `colors.plumInk`, `colors.inkMuted` from Task 1.
