@@ -3977,6 +3977,642 @@ async fn websocket_records_auth_failure_for_forged_config_refresh() {
     }));
 }
 
+/// `SERVICE-009` / architecture recommendation R2: the service consumes exactly one
+/// typed first-frame parser and one published ready shape. These are source-level
+/// absence characterizations, so an accidental re-introduction of a private shadow
+/// type fails here instead of drifting silently.
+const WS_SOURCE: &str = include_str!("../src/ws.rs");
+const PROTOCOL_SOURCE: &str = include_str!("../src/protocol.rs");
+const LIB_SOURCE: &str = include_str!("../src/lib.rs");
+
+#[test]
+fn protocol_v5_fixture_shadow_types_are_absent() {
+    // `SERVICE-009`: Plan 05's `VOICE-READY-001` removed the duplicate ready shape.
+    assert!(
+        !PROTOCOL_SOURCE.contains("ReadyFrame"),
+        "protocol.rs still declares a duplicate ReadyFrame: return the defect to Plan 05"
+    );
+    assert!(
+        !LIB_SOURCE.contains("ReadyFrame"),
+        "lib.rs still re-exports ReadyFrame: return the defect to Plan 05"
+    );
+
+    // `SERVICE-007`: the private parallel first-frame struct is deleted; the initial
+    // frame is Plan 05's public `ClientFrame::SessionConfig`.
+    assert!(
+        !WS_SOURCE.contains("InitialClientFrame"),
+        "ws.rs still declares a private first-frame shadow of ClientFrame::SessionConfig"
+    );
+
+    // `SERVICE-008` overlap: no service-local wire error JSON survives; the only
+    // fallback is Plan 05's published constant.
+    assert!(
+        WS_SOURCE.contains("VOICE_SERIALIZATION_FALLBACK_FRAME"),
+        "ws.rs must serialize through Plan 05's published fallback constant"
+    );
+    assert!(
+        !WS_SOURCE.contains("VOICE_INTERNAL_SERIALIZATION"),
+        "ws.rs must not restate the fallback frame body"
+    );
+}
+
+#[derive(Deserialize)]
+struct VoiceFixtureManifest {
+    protocol_version: u32,
+    fixtures: Vec<VoiceFixtureManifestRow>,
+}
+
+#[derive(Deserialize)]
+struct VoiceFixtureManifestRow {
+    id: String,
+    path: String,
+}
+
+/// `SERVICE-007`: the two exact v5 client fixtures deserialize through the imported
+/// contract, and their declared version is the imported constant rather than a
+/// number restated here.
+#[test]
+fn protocol_v5_fixture_client_frames_bind_the_imported_version() {
+    assert_eq!(VIVA_VOICE_PROTOCOL_VERSION, 5);
+
+    let signed_config: ClientFrame = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/v5/client-session-config-signed.json"
+    ))
+    .expect("signed session config fixture parses");
+    let ClientFrame::SessionConfig {
+        version,
+        client_generation_id,
+        session_token,
+        session,
+    } = &signed_config
+    else {
+        panic!("signed config fixture is not a session_config frame");
+    };
+    assert_eq!(*version, VIVA_VOICE_PROTOCOL_VERSION);
+    assert_eq!(signed_config.version(), VIVA_VOICE_PROTOCOL_VERSION);
+    assert_eq!(client_generation_id, "viva-session-bootstrap-1-fixture");
+    assert!(session_token.starts_with("viva1."));
+    assert_eq!(session.user_id.as_deref(), Some("fixture-user"));
+    assert_eq!(session.study_set_id.as_deref(), Some("fixture-study-set"));
+    assert_eq!(
+        session.session_id.as_ref().map(ToString::to_string),
+        Some("fixture-session".to_owned())
+    );
+
+    let refresh: ClientFrame = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/v5/client-session-refresh.json"
+    ))
+    .expect("session refresh fixture parses");
+    let ClientFrame::SessionRefresh {
+        version,
+        client_generation_id,
+        context,
+    } = &refresh
+    else {
+        panic!("refresh fixture is not a session_refresh frame");
+    };
+    assert_eq!(*version, VIVA_VOICE_PROTOCOL_VERSION);
+    assert_eq!(refresh.version(), VIVA_VOICE_PROTOCOL_VERSION);
+    assert_eq!(client_generation_id, "viva-session-bootstrap-1-fixture");
+    assert!(!context.is_empty());
+
+    let manifest: VoiceFixtureManifest = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/v5/manifest.json"
+    ))
+    .expect("manifest parses");
+    assert_eq!(manifest.protocol_version, VIVA_VOICE_PROTOCOL_VERSION);
+    for (id, path) in [
+        (
+            "VOICE-CLIENT-SESSION-CONFIG-SIGNED",
+            "agent/fixtures/voice-protocol/v5/client-session-config-signed.json",
+        ),
+        (
+            "VOICE-CLIENT-SESSION-REFRESH",
+            "agent/fixtures/voice-protocol/v5/client-session-refresh.json",
+        ),
+    ] {
+        assert!(
+            manifest
+                .fixtures
+                .iter()
+                .any(|row| row.id == id && row.path == path),
+            "manifest does not name {id}"
+        );
+    }
+}
+
+/// A provider that keeps every `BrainInput` the socket admits, so a refresh test can
+/// read the server-owned session identity the provider actually received.
+struct RecordingInputBrain {
+    inputs: Arc<Mutex<Vec<BrainInput>>>,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for RecordingInputBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "recording_input".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(&self, _config: SessionConfig) -> Result<RealtimeSession, BrainError> {
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(16);
+        let (event_tx, events) = mpsc::channel(16);
+        let inputs = self.inputs.clone();
+        tokio::spawn(async move {
+            while let Some(received) = input_rx.recv().await {
+                inputs.lock().expect("input log lock").push(received);
+            }
+            drop(event_tx);
+        });
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: None,
+        })
+    }
+}
+
+fn refresh_identity_state(
+    store: Arc<dyn StudyMemoryStore>,
+    inner: Arc<data::InMemoryStudyStore>,
+    access: VoiceWsAccess,
+) -> (AppState, Arc<Mutex<Vec<BrainInput>>>) {
+    let inputs = Arc::new(Mutex::new(Vec::new()));
+    let _ = inner;
+    let state = AppState::with_study_store(
+        Arc::new(RecordingInputBrain {
+            inputs: inputs.clone(),
+        }),
+        "recording_input",
+        access,
+        2,
+        store,
+    );
+    (state, inputs)
+}
+
+fn recorded_context_refreshes(inputs: &Arc<Mutex<Vec<BrainInput>>>) -> Vec<serde_json::Value> {
+    inputs
+        .lock()
+        .expect("input log lock")
+        .iter()
+        .filter_map(|input| match input {
+            BrainInput::SessionContextRefresh(value) => Some(value.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `SERVICE-007` (review Minor M2): the trusted socket rotates the voice session ID
+/// the provider and store see, so the browser cannot know it. A context refresh must
+/// therefore be validated against the identity the client is allowed to assert and
+/// rewritten to the unchanged server session ID — not rejected as an identity
+/// mismatch, which is what the pre-remediation binding did.
+#[tokio::test]
+async fn refresh_identity_trusted_context_refresh_binds_the_server_session_id() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner: inner.clone(),
+        audit: audit.clone(),
+    });
+    let (state, inputs) = refresh_identity_state(store, inner, VoiceWsAccess::default());
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut socket, "recording_input").await;
+
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+    let opened = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::ConfigAccepted).await;
+    assert!(opened
+        .iter()
+        .any(|event| event.detail == "session config accepted"));
+
+    // The same bound generation and the identity the browser knows: its own.
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+
+    let refreshed = wait_for_evidence_detail(
+        &evidence,
+        VoiceEvidenceEventKind::ConfigAccepted,
+        "config refresh received",
+    )
+    .await;
+    assert!(
+        refreshed,
+        "a trusted context refresh naming the client's own session must be accepted"
+    );
+
+    let contexts = recorded_context_refreshes(&inputs);
+    assert_eq!(
+        contexts.len(),
+        1,
+        "exactly one context refresh is forwarded"
+    );
+    let forwarded = contexts[0]["session_id"]
+        .as_str()
+        .expect("forwarded refresh carries a session id")
+        .to_owned();
+    assert_ne!(
+        forwarded, "voice-session-1",
+        "the provider must never be re-pointed at the browser-asserted session id"
+    );
+    assert_eq!(
+        forwarded,
+        uuid::Uuid::from_u128(1).to_string(),
+        "the refresh must carry the unchanged rotated server session id"
+    );
+    assert_eq!(
+        audit.nonce_calls.load(Ordering::SeqCst),
+        0,
+        "a context refresh performs zero nonce-store calls"
+    );
+
+    socket.close(None).await.unwrap();
+}
+
+/// `SERVICE-007`: the bound `client_generation_id` is the socket's generation. A
+/// stale or different generation cannot refresh this socket's context.
+#[tokio::test]
+async fn refresh_identity_stale_generation_is_rejected() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner: inner.clone(),
+        audit: audit.clone(),
+    });
+    let (state, inputs) = refresh_identity_state(store, inner, VoiceWsAccess::default());
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut socket, "recording_input").await;
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+    let _ = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::ConfigAccepted).await;
+
+    // The bound generation is accepted, so the rejection below can only be the
+    // generation comparison rather than a blanket refusal of every refresh.
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        wait_for_evidence_detail(
+            &evidence,
+            VoiceEvidenceEventKind::ConfigAccepted,
+            "config refresh received",
+        )
+        .await,
+        "the bound generation must be accepted"
+    );
+
+    let session: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/session-config.json"
+    ))
+    .unwrap();
+    socket
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "session_config",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": "voice-test-generation-2",
+                "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
+                "session": session,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let frames = read_server_frames_until_close(&mut socket).await;
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Error { error, .. } if error.code == VoiceServerErrorCode::AuthIdentityMismatch.as_str()
+        )),
+        "a different generation must fail the bound identity comparison, got {frames:?}"
+    );
+    assert_eq!(
+        recorded_context_refreshes(&inputs).len(),
+        1,
+        "a stale generation never reaches the provider"
+    );
+    assert_eq!(audit.nonce_calls.load(Ordering::SeqCst), 0);
+}
+
+/// The exact recoverable policy-denial event Plan 05 publishes for `D-03B QUIZ_ONLY`.
+const REFRESH_POLICY_DENIED_WIRE: &str = "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_SESSION_REFRESH_POLICY_DENIED\",\"message\":\"Session refresh is not authorized.\",\"terminality\":\"recoverable\"}}";
+
+fn refresh_policy_denied_fixture_frame() -> String {
+    #[derive(Deserialize)]
+    struct TerminalSequences {
+        sequences: Vec<TerminalSequence>,
+    }
+
+    #[derive(Deserialize)]
+    struct TerminalSequence {
+        id: String,
+        terminal_reason: Option<String>,
+        terminal_at_index: Option<usize>,
+        wire_sequence_json: Vec<String>,
+    }
+
+    let file: TerminalSequences = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/v5/terminal-sequences.json"
+    ))
+    .expect("terminal sequences fixture parses");
+    let case = file
+        .sequences
+        .into_iter()
+        .find(|sequence| sequence.id == "VOICE-RECOVERABLE-SESSION-REFRESH-POLICY-DENIED")
+        .expect("the recoverable refresh-denial case is published");
+    assert_eq!(
+        case.terminal_reason, None,
+        "the denial is classified nonterminal"
+    );
+    assert_eq!(case.terminal_at_index, None);
+    case.wire_sequence_json
+        .into_iter()
+        .next()
+        .expect("the denial event is the first entry")
+}
+
+/// `SERVICE-007` / `D-03B QUIZ_ONLY`: the in-socket `session_refresh` frame parses,
+/// but the one engine has no client-selectable context, so the service answers with
+/// Plan 05's recoverable structured error, keeps the socket and its deadlines, and
+/// performs no provider or store work.
+#[tokio::test]
+async fn refresh_identity_session_refresh_is_recoverable_policy_denial() {
+    assert_eq!(
+        refresh_policy_denied_fixture_frame(),
+        REFRESH_POLICY_DENIED_WIRE
+    );
+
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner: inner.clone(),
+        audit: audit.clone(),
+    });
+    let (state, inputs) = refresh_identity_state(store, inner, VoiceWsAccess::default());
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut socket, "recording_input").await;
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+    let _ = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::ConfigAccepted).await;
+
+    for _ in 0..2 {
+        socket
+            .send(WsMessage::Text(
+                serde_json::json!({
+                    "type": "session_refresh",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                    "context": { "mode": "quiz", "initial_goal": "Review the fixture source." },
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let raw = read_server_text_frame(&mut socket).await;
+        assert_eq!(
+            raw, REFRESH_POLICY_DENIED_WIRE,
+            "the denial must match Plan 05's published bytes exactly"
+        );
+    }
+
+    // The socket is still live: a valid context refresh still works afterwards.
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        wait_for_evidence_detail(
+            &evidence,
+            VoiceEvidenceEventKind::ConfigAccepted,
+            "config refresh received",
+        )
+        .await,
+        "a recoverable denial must not end the session"
+    );
+
+    assert_eq!(
+        recorded_context_refreshes(&inputs).len(),
+        1,
+        "the denied refreshes performed no provider work"
+    );
+    assert_eq!(audit.nonce_calls.load(Ordering::SeqCst), 0);
+    socket.close(None).await.unwrap();
+}
+
+/// `SERVICE-007`: token renewal and identity rebinding never happen inside an open
+/// socket. Plan 05's strict parser refuses every authority member on `session_refresh`,
+/// and a second `session_config` presenting a different credential is refused before
+/// any nonce, provider, or store work.
+#[tokio::test]
+async fn refresh_identity_new_access_token_requires_a_new_socket() {
+    for forbidden in [
+        serde_json::json!({ "session_token": "viva1.aaa.bbb" }),
+        serde_json::json!({ "user_id": "user-2" }),
+        serde_json::json!({ "study_set_id": "other-set" }),
+        serde_json::json!({ "session_id": "voice-session-2" }),
+        serde_json::json!({ "source_context": [] }),
+        serde_json::json!({ "active_concepts": [] }),
+    ] {
+        let mut frame = serde_json::json!({
+            "type": "session_refresh",
+            "version": VIVA_VOICE_PROTOCOL_VERSION,
+            "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+            "context": { "mode": "quiz" },
+        });
+        for (key, value) in forbidden.as_object().expect("object") {
+            frame[key] = value.clone();
+        }
+        assert!(
+            agent_service::parse_client_frame_json(&frame.to_string()).is_err(),
+            "session_refresh must not carry {forbidden}"
+        );
+    }
+
+    let inner = provider_limiter_test_store();
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner: inner.clone(),
+        audit: audit.clone(),
+    });
+    let (state, inputs) = refresh_identity_state(
+        store,
+        inner,
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some(NONCE_AUDIT_SECRET.into()),
+            allowed_origins: vec![],
+        },
+    );
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let first = nonce_audit_token("voice-session-1", "refresh-nonce-1");
+    let second = nonce_audit_token("voice-session-1", "refresh-nonce-2");
+
+    let (mut socket, _) = connect_async(token_only_request(&url, &first))
+        .await
+        .unwrap();
+    assert_ready_provider(&mut socket, "recording_input").await;
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&first).into(),
+        ))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        audit.nonce_successes.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    // A different credential cannot be presented on the open socket.
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&second).into(),
+        ))
+        .await
+        .unwrap();
+    let frames = read_server_frames_until_close(&mut socket).await;
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Error { error, .. } if error.code == VoiceServerErrorCode::AuthIdentityMismatch.as_str()
+        )),
+        "a renewed credential must not rebind an open socket, got {frames:?}"
+    );
+    assert!(
+        recorded_context_refreshes(&inputs).is_empty(),
+        "a renewed credential never reaches the provider"
+    );
+    assert_eq!(
+        audit.nonce_successes.load(Ordering::SeqCst),
+        1,
+        "the second credential's nonce is never consumed in the old socket"
+    );
+
+    // It succeeds only as the initial config of a new socket and generation.
+    let (mut renewed, _) = connect_async(token_only_request(&url, &second))
+        .await
+        .unwrap();
+    assert_ready_provider(&mut renewed, "recording_input").await;
+    renewed
+        .send(WsMessage::Text(
+            session_config_json_with_token(&second).into(),
+        ))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        audit.nonce_successes.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    renewed.close(None).await.unwrap();
+}
+
+/// `SERVICE-007`: the absolute socket deadline is server configuration. Recoverable
+/// refresh denials neither reset nor extend it.
+#[tokio::test]
+async fn refresh_identity_absolute_deadline_survives_context_refreshes() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner: inner.clone(),
+        audit,
+    });
+    let (state, _inputs) = refresh_identity_state(store, inner, VoiceWsAccess::default());
+    let state = state.with_ws_timeouts(WsTimeouts {
+        session: Duration::from_millis(900),
+        ..WsTimeouts::default()
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut socket, "recording_input").await;
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+
+    let started = Instant::now();
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        socket
+            .send(WsMessage::Text(
+                serde_json::json!({
+                    "type": "session_refresh",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                    "context": { "mode": "quiz" },
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let frames = read_server_frames_until_close(&mut socket).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the original absolute deadline must not be reset by context refreshes"
+    );
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::StructuredError { code, .. }
+                        if code == "VOICE_SESSION_REFRESH_POLICY_DENIED"
+                )
+        )),
+        "the socket answered at least one refresh before its deadline, got {frames:?}"
+    );
+}
+
 #[tokio::test]
 async fn websocket_failure_control_claim_forces_sanitized_provider_terminal_path() {
     let origin = "https://control.example";
@@ -11459,6 +12095,40 @@ async fn wait_for_evidence_kind(
     })
     .await;
     evidence.snapshot()
+}
+
+/// Waits for one exact sanitized evidence detail under a kind, without asserting on
+/// a timeout: the caller decides whether its absence is the failure.
+async fn wait_for_evidence_detail(
+    evidence: &VoiceEvidenceRecorder,
+    kind: VoiceEvidenceEventKind,
+    detail: &str,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if evidence
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == kind && event.detail == detail)
+        {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    false
+}
+
+/// The next server frame as raw wire bytes, for byte-for-byte fixture comparison.
+async fn read_server_text_frame(socket: &mut TestWebSocket) -> String {
+    match tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    {
+        WsMessage::Text(text) => text.to_string(),
+        other => panic!("expected text server frame, got {other:?}"),
+    }
 }
 
 async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {

@@ -27,7 +27,6 @@ use futures_util::{
     SinkExt, StreamExt,
 };
 use observe::{VoiceEvidenceEvent, VoiceEvidenceEventKind};
-use serde::Deserialize;
 use serde_json::json;
 use tokio::{
     sync::{mpsc, watch, OwnedSemaphorePermit},
@@ -45,7 +44,8 @@ use crate::{
         VoiceLimitConfig, VoiceWsAccessError,
     },
     protocol::{
-        ClientFrame, ClientTurnIntent, ServerFrame, VivaServerEvent, VoiceServerErrorCode,
+        parse_client_frame_json, ClientFrame, ClientTurnIntent, ServerFrame, VivaServerEvent,
+        VoiceProtocolDiagnostic, VoiceProtocolDiagnosticCode, VoiceServerErrorCode,
         VIVA_AUDIO_MAX_CHUNK_BYTES, VIVA_AUDIO_MAX_TURN_BYTES, VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
         VIVA_VOICE_PROTOCOL_VERSION, VOICE_SERIALIZATION_FALLBACK_FRAME,
     },
@@ -433,8 +433,7 @@ async fn handle_socket(
             }
         },
     };
-    let session_binding = AuthorizedClientSession::from_config(&initial.config)
-        .expect("authorized session config has required identity");
+    let session_binding = initial.session_binding.clone();
     let voice_session_id = initial.config.session_id.as_deref().map(ToOwned::to_owned);
     let _failure_control_identity_lease = match (
         initial.failure_control,
@@ -928,6 +927,25 @@ async fn handle_socket(
                     }
                     Err(ClientMessageError::TurnCap) => unreachable!("pre-send parsing cannot trip turn cap"),
                 };
+                // `D-03B QUIZ_ONLY`: service policy refuses the parsed context change
+                // on the same socket. No provider input, store write, lease, or
+                // deadline is touched, and Plan 05 classifies the frame nonterminal.
+                if let Some(denial) = client_input.recoverable_denial() {
+                    if send_json(
+                        &mut sender,
+                        &ServerFrame::Event {
+                            version: VIVA_VOICE_PROTOCOL_VERSION,
+                            event: Box::new(denial.event()),
+                        },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        terminal_reason = "send_failed";
+                        break;
+                    }
+                    continue;
+                }
                 if !pending_provider_admission.is_terminated()
                     && client_input.action() == ClientAction::Cancel
                 {
@@ -3049,7 +3067,11 @@ async fn handle_client_message(
             let _ = input.try_send(brain_input);
             Ok(action)
         }
-        ClientInputAction::Keepalive => Ok(ClientAction::Keepalive),
+        // The session loop answers a recoverable denial with its own frame before
+        // reaching this point; nothing is ever forwarded for it.
+        ClientInputAction::Keepalive | ClientInputAction::RecoverableDenial(_) => {
+            Ok(ClientAction::Keepalive)
+        }
         ClientInputAction::AudioTurnBuffered => Ok(ClientAction::AudioChunk),
         ClientInputAction::AudioTurnDiscarded => Ok(ClientAction::AudioTurnCancel),
     }
@@ -3104,7 +3126,11 @@ async fn send_client_input_action_with_drain(
             let _ = input.try_send(brain_input);
             Ok(action)
         }
-        ClientInputAction::Keepalive => Ok(ClientAction::Keepalive),
+        // The session loop answers a recoverable denial with its own frame before
+        // reaching this point; nothing is ever forwarded for it.
+        ClientInputAction::Keepalive | ClientInputAction::RecoverableDenial(_) => {
+            Ok(ClientAction::Keepalive)
+        }
         ClientInputAction::AudioTurnBuffered => Ok(ClientAction::AudioChunk),
         ClientInputAction::AudioTurnDiscarded => Ok(ClientAction::AudioTurnCancel),
     }
@@ -3165,38 +3191,101 @@ fn audio_identity_is_valid(client_generation_id: &str, turn_id: &str) -> bool {
     !client_generation_id.trim().is_empty() && !turn_id.trim().is_empty()
 }
 
+/// `SERVICE-007`: why the stateful turn assembler refused a frame. Plan 05's parser
+/// owns every per-frame diagnostic; these are the aggregate outcomes only this
+/// assembler can decide, and each maps to exactly one published diagnostic code and
+/// JSON path. No variant carries a payload, an identifier, or a byte count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AudioAssemblyRejection {
+    /// A generation or turn id that is empty, or that does not own the open turn.
+    InvalidIdentity,
+    /// A payload that is empty or not a whole number of PCM16 samples.
+    InvalidPayload,
+    /// One chunk above the per-frame ceiling.
+    ChunkTooLarge,
+    /// The aggregate turn bound, which no single frame can carry.
+    TurnTooLarge,
+    /// A chunk sequence that is not the next one this turn expects.
+    Sequence,
+    /// An `audio_end` whose `final_sequence` does not close the open turn.
+    FinalSequence,
+}
+
+impl AudioAssemblyRejection {
+    /// The one classification of a stateful assembler rejection. Both the published
+    /// diagnostic and the wire error are derived from it, so the two can never drift.
+    fn code(self) -> VoiceProtocolDiagnosticCode {
+        match self {
+            Self::InvalidIdentity | Self::InvalidPayload => {
+                VoiceProtocolDiagnosticCode::InvalidField
+            }
+            Self::ChunkTooLarge => VoiceProtocolDiagnosticCode::FrameTooLarge,
+            Self::TurnTooLarge => VoiceProtocolDiagnosticCode::TurnTooLarge,
+            Self::Sequence | Self::FinalSequence => VoiceProtocolDiagnosticCode::AudioSequence,
+        }
+    }
+
+    fn path(self) -> &'static str {
+        match self {
+            Self::InvalidIdentity => "$.turn_id",
+            Self::InvalidPayload | Self::ChunkTooLarge | Self::TurnTooLarge => {
+                "$.frame.pcm16_base64"
+            }
+            Self::Sequence => "$.sequence",
+            Self::FinalSequence => "$.final_sequence",
+        }
+    }
+
+    fn diagnostic(self) -> VoiceProtocolDiagnostic {
+        VoiceProtocolDiagnostic::new(self.code(), self.path())
+    }
+}
+
+impl From<VoiceProtocolDiagnostic> for ClientFrameError {
+    /// The closed wire vocabulary a stateful assembler diagnostic maps to. The
+    /// diagnostic keeps the sanitized code and path; the wire error keeps the coarse
+    /// client-visible classification.
+    fn from(diagnostic: VoiceProtocolDiagnostic) -> Self {
+        match diagnostic.code {
+            VoiceProtocolDiagnosticCode::FrameTooLarge => Self::oversized_audio_chunk(),
+            VoiceProtocolDiagnosticCode::TurnTooLarge => Self::oversized_audio_turn(),
+            _ => Self::invalid_audio_frame(),
+        }
+    }
+}
+
 fn accept_audio_chunk(
     assembly: &mut Option<IncomingAudioTurn>,
     client_generation_id: String,
     turn_id: String,
     sequence: u32,
     frame: AudioFrame,
-) -> Result<AudioAssemblyAction, ClientFrameError> {
-    let reject = |assembly: &mut Option<IncomingAudioTurn>, error: ClientFrameError| {
+) -> Result<AudioAssemblyAction, VoiceProtocolDiagnostic> {
+    let reject = |assembly: &mut Option<IncomingAudioTurn>, rejection: AudioAssemblyRejection| {
         *assembly = None;
-        Err(error)
+        Err(rejection.diagnostic())
     };
 
     if !audio_identity_is_valid(&client_generation_id, &turn_id) {
-        return reject(assembly, ClientFrameError::invalid_audio_frame());
+        return reject(assembly, AudioAssemblyRejection::InvalidIdentity);
     }
 
     // Decode before mutation: a rejected payload never reaches the retained turn.
     let pcm16 = frame.pcm16_bytes();
     if pcm16.is_empty() {
-        return reject(assembly, ClientFrameError::invalid_audio_frame());
+        return reject(assembly, AudioAssemblyRejection::InvalidPayload);
     }
     if pcm16.len() > VIVA_AUDIO_MAX_CHUNK_BYTES {
-        return reject(assembly, ClientFrameError::oversized_audio_chunk());
+        return reject(assembly, AudioAssemblyRejection::ChunkTooLarge);
     }
     if !pcm16.len().is_multiple_of(2) {
-        return reject(assembly, ClientFrameError::invalid_audio_frame());
+        return reject(assembly, AudioAssemblyRejection::InvalidPayload);
     }
 
     match assembly.as_mut() {
         None => {
             if sequence != 0 {
-                return reject(assembly, ClientFrameError::invalid_audio_frame());
+                return reject(assembly, AudioAssemblyRejection::Sequence);
             }
             *assembly = Some(IncomingAudioTurn {
                 client_generation_id,
@@ -3206,20 +3295,20 @@ fn accept_audio_chunk(
             });
         }
         Some(turn) => {
-            if turn.client_generation_id != client_generation_id
-                || turn.turn_id != turn_id
-                || turn.next_sequence != sequence
-            {
-                return reject(assembly, ClientFrameError::invalid_audio_frame());
+            if turn.client_generation_id != client_generation_id || turn.turn_id != turn_id {
+                return reject(assembly, AudioAssemblyRejection::InvalidIdentity);
+            }
+            if turn.next_sequence != sequence {
+                return reject(assembly, AudioAssemblyRejection::Sequence);
             }
             let Some(total) = turn.pcm16.len().checked_add(pcm16.len()) else {
-                return reject(assembly, ClientFrameError::oversized_audio_turn());
+                return reject(assembly, AudioAssemblyRejection::TurnTooLarge);
             };
             if total > VIVA_AUDIO_MAX_TURN_BYTES {
-                return reject(assembly, ClientFrameError::oversized_audio_turn());
+                return reject(assembly, AudioAssemblyRejection::TurnTooLarge);
             }
             let Some(next_sequence) = turn.next_sequence.checked_add(1) else {
-                return reject(assembly, ClientFrameError::invalid_audio_frame());
+                return reject(assembly, AudioAssemblyRejection::Sequence);
             };
             turn.pcm16.extend_from_slice(pcm16);
             turn.next_sequence = next_sequence;
@@ -3233,15 +3322,15 @@ fn accept_audio_end(
     client_generation_id: &str,
     turn_id: &str,
     final_sequence: u32,
-) -> Result<AudioAssemblyAction, ClientFrameError> {
+) -> Result<AudioAssemblyAction, VoiceProtocolDiagnostic> {
     let Some(turn) = assembly.take() else {
-        return Err(ClientFrameError::invalid_audio_frame());
+        return Err(AudioAssemblyRejection::FinalSequence.diagnostic());
     };
-    if turn.client_generation_id != client_generation_id
-        || turn.turn_id != turn_id
-        || turn.next_sequence != final_sequence.saturating_add(1)
-    {
-        return Err(ClientFrameError::invalid_audio_frame());
+    if turn.client_generation_id != client_generation_id || turn.turn_id != turn_id {
+        return Err(AudioAssemblyRejection::InvalidIdentity.diagnostic());
+    }
+    if turn.next_sequence != final_sequence.saturating_add(1) {
+        return Err(AudioAssemblyRejection::FinalSequence.diagnostic());
     }
     Ok(AudioAssemblyAction::Complete {
         client_generation_id: turn.client_generation_id,
@@ -3255,12 +3344,12 @@ fn accept_audio_cancel(
     assembly: &mut Option<IncomingAudioTurn>,
     client_generation_id: &str,
     turn_id: &str,
-) -> Result<AudioAssemblyAction, ClientFrameError> {
+) -> Result<AudioAssemblyAction, VoiceProtocolDiagnostic> {
     let Some(turn) = assembly.take() else {
-        return Err(ClientFrameError::invalid_audio_frame());
+        return Err(AudioAssemblyRejection::InvalidIdentity.diagnostic());
     };
     if turn.client_generation_id != client_generation_id || turn.turn_id != turn_id {
-        return Err(ClientFrameError::invalid_audio_frame());
+        return Err(AudioAssemblyRejection::InvalidIdentity.diagnostic());
     }
     Ok(AudioAssemblyAction::Cancelled)
 }
@@ -3281,8 +3370,18 @@ fn client_input_action(
                 return Err(ClientFrameError::invalid());
             }
             match frame {
-                ClientFrame::SessionConfig { session, .. } => {
-                    let sanitized = sanitize_refresh_session_config(session, session_binding)?;
+                ClientFrame::SessionConfig {
+                    client_generation_id,
+                    session_token,
+                    session,
+                    ..
+                } => {
+                    let sanitized = sanitize_refresh_session_config(
+                        session,
+                        &client_generation_id,
+                        &session_token,
+                        session_binding,
+                    )?;
                     Ok(ClientInputAction::Send {
                         brain_input: BrainInput::SessionContextRefresh(
                             serde_json::to_value(sanitized)
@@ -3374,9 +3473,23 @@ fn client_input_action(
                 }
                 // `D-03B QUIZ_ONLY`: the one engine has no client-selectable mode and
                 // no client goal, so every attempted context change is refused. The
-                // frame reaches neither the provider nor the store.
-                ClientFrame::SessionRefresh { .. } => {
-                    Err(ClientFrameError::session_refresh_policy_denied())
+                // frame reaches neither the provider nor the store, and the refusal
+                // is recoverable: the socket and its deadlines are unchanged.
+                ClientFrame::SessionRefresh {
+                    client_generation_id,
+                    ..
+                } => {
+                    // `session_refresh` is the only in-socket frame that could smuggle
+                    // a renewed credential or a second identity, so it is re-read
+                    // through Plan 05's strict parser: token, user, study, session,
+                    // source and active-concept members are refused there, before this
+                    // service applies any policy.
+                    parse_client_frame_json(&text).map_err(|_| ClientFrameError::invalid())?;
+                    bind_context_refresh(
+                        &client_generation_id,
+                        session_binding,
+                        SESSION_REFRESH_POLICY,
+                    )
                 }
                 ClientFrame::Cancel {
                     client_generation_id,
@@ -3483,6 +3596,10 @@ fn session_config_from_message(message: Message) -> Result<SessionConfig, Client
     }
 }
 
+/// `SERVICE-007`: the first frame is Plan 05's public `ClientFrame::SessionConfig`,
+/// read through Plan 05's strict wire parser. There is no service-private shadow of
+/// the initial frame, so `client_generation_id` and the signed credential are
+/// structurally required rather than optional.
 fn initial_session_config_from_message(
     message: Message,
 ) -> Result<InitialSessionConfig, ClientFrameError> {
@@ -3492,42 +3609,57 @@ fn initial_session_config_from_message(
     if text.len() > VIVA_VOICE_MAX_TEXT_FRAME_BYTES {
         return Err(ClientFrameError::oversized_text());
     }
-    let frame: InitialClientFrame =
+    let frame: ClientFrame =
         serde_json::from_str(&text).map_err(|_| ClientFrameError::invalid())?;
-    if frame.version != VIVA_VOICE_PROTOCOL_VERSION {
+    if frame.version() != VIVA_VOICE_PROTOCOL_VERSION {
         return Err(ClientFrameError::invalid());
     }
-    if frame.frame_type != "session_config" {
+    let ClientFrame::SessionConfig {
+        client_generation_id,
+        session_token,
+        session,
+        ..
+    } = frame
+    else {
         return Err(ClientFrameError::invalid_first_frame());
+    };
+    if client_generation_id.trim().is_empty() {
+        return Err(ClientFrameError::invalid());
     }
-    let client_generation_id = validated_client_generation_id(frame.client_generation_id)?;
     Ok(InitialSessionConfig {
         client_generation_id,
-        session: frame.session,
-        session_token: frame.session_token,
+        session,
+        session_token,
     })
 }
 
+/// Compares the identity a client frame asserts with the identity the server bound,
+/// then strips every browser-authored authority field. `expected_session_id` is the
+/// session id the client is allowed to name: the signed claim in signed mode, or the
+/// configured trusted identity on loopback. It is never the rotated server id, which
+/// the browser has no way to learn.
 fn sanitize_client_session_config(
     mut config: SessionConfig,
-    session_binding: &AuthorizedClientSession,
+    user_id: &str,
+    study_set_id: &str,
+    expected_session_id: &str,
 ) -> Result<SessionConfig, ClientFrameError> {
     let Some(session_id) = config.session_id.as_deref() else {
         return Err(ClientFrameError::invalid_session_identity());
     };
-    if session_id.trim().is_empty() || session_id != session_binding.session_id {
+    if session_id.trim().is_empty() || session_id != expected_session_id {
         return Err(ClientFrameError::invalid_session_identity());
     }
-    let Some(user_id) = config.user_id.as_deref() else {
+    let Some(asserted_user_id) = config.user_id.as_deref() else {
         return Err(ClientFrameError::invalid_session_identity());
     };
-    if user_id.trim().is_empty() || user_id != session_binding.user_id {
+    if asserted_user_id.trim().is_empty() || asserted_user_id != user_id {
         return Err(ClientFrameError::invalid_session_identity());
     }
-    let Some(study_set_id) = config.study_set_id.as_deref() else {
+    let Some(asserted_study_set_id) = config.study_set_id.as_deref() else {
         return Err(ClientFrameError::invalid_session_identity());
     };
-    if study_set_id.trim().is_empty() || study_set_id != session_binding.study_set_id {
+    if asserted_study_set_id.trim().is_empty() || asserted_study_set_id != study_set_id {
         return Err(ClientFrameError::invalid_session_identity());
     }
     config.source_context.clear();
@@ -3544,15 +3676,13 @@ fn authorize_initial_session_config(
 ) -> Result<AuthorizedInitialSessionConfig, ClientFrameError> {
     let mut rotate_trusted_session = false;
     let mut failure_control = None;
-    let (binding, token_nonce_claim) = if let Some(secret) = state
+    let (identity, auth_mode, token_nonce_claim) = if let Some(secret) = state
         .ws_access
         .session_token_secret
         .as_ref()
         .map(RedactedSecret::as_str)
     {
-        let token = initial.session_token.as_deref().ok_or_else(|| {
-            ClientFrameError::session_auth_failed(SessionAuthFailureCode::Malformed)
-        })?;
+        let token = initial.session_token.as_str();
         // `D-07` branch `retain-token-only`: when the upgrade already verified a
         // credential, the first frame must present that exact one. It is compared
         // in constant time and its verified claims are reused; the frame is never
@@ -3598,11 +3728,12 @@ fn authorize_initial_session_config(
             );
         }
         (
-            AuthorizedClientSession {
+            SessionIdentity {
                 user_id: claims.user_id.clone(),
                 study_set_id: claims.study_set_id.clone(),
-                session_id: claims.session_id.clone(),
+                signed_session_id: claims.session_id.clone(),
             },
+            SessionAuthMode::Signed,
             Some(SessionTokenNonceClaim {
                 user_id: claims.user_id,
                 study_set_id: claims.study_set_id,
@@ -3614,76 +3745,187 @@ fn authorize_initial_session_config(
     } else {
         rotate_trusted_session = true;
         (
-            AuthorizedClientSession {
+            SessionIdentity {
                 user_id: state.trusted_user_id.clone(),
                 study_set_id: state.trusted_study_set_id.clone(),
-                session_id: state.trusted_session_id.clone(),
+                signed_session_id: state.trusted_session_id.clone(),
             },
+            SessionAuthMode::Trusted,
             None,
         )
     };
-    let mut config = sanitize_client_session_config(initial.session, &binding)?;
-    config.client_generation_id = initial.client_generation_id;
+    let mut config = sanitize_client_session_config(
+        initial.session,
+        &identity.user_id,
+        &identity.study_set_id,
+        &identity.signed_session_id,
+    )?;
+    config.client_generation_id = Some(initial.client_generation_id.clone());
     if rotate_trusted_session {
         config.session_id = Some(agent_domain::SessionId::new(
             state.next_trusted_voice_session_id(),
         ));
     }
+    let server_session_id = config
+        .session_id
+        .as_ref()
+        .map(ToString::to_string)
+        .ok_or_else(ClientFrameError::invalid_session_identity)?;
+    let session_binding = AuthorizedClientSession {
+        user_id: identity.user_id,
+        study_set_id: identity.study_set_id,
+        // Provider and store identity. In signed mode it is the verified claim; on
+        // trusted loopback it is the rotated server value the browser never sees.
+        session_id: server_session_id,
+        client_session_id: identity.signed_session_id,
+        client_generation_id: initial.client_generation_id,
+        bound_session_token: initial.session_token,
+        auth_mode,
+    };
     Ok(AuthorizedInitialSessionConfig {
         config,
+        session_binding,
         token_nonce_claim,
         failure_control,
     })
 }
 
+/// `SERVICE-007`: the identity a first frame proves. `signed_session_id` is what the
+/// browser may assert on later frames; the server session id is derived from it and
+/// kept in [`AuthorizedClientSession`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionIdentity {
+    user_id: String,
+    study_set_id: String,
+    signed_session_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionAuthMode {
+    Trusted,
+    Signed,
+}
+
+/// `D-03B QUIZ_ONLY`: the only refresh policy this service compiles. `D-03A`'s
+/// claim-bound branch would compare a server-bound learning intent; that branch is
+/// not selected, so neither its variant nor its comparison exists here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LearningIntentRefreshPolicy {
+    QuizOnlyNoRefresh,
+}
+
+const SESSION_REFRESH_POLICY: LearningIntentRefreshPolicy =
+    LearningIntentRefreshPolicy::QuizOnlyNoRefresh;
+
+/// The one engine has no client-selectable mode and no client goal, so every
+/// attempted context change is refused before any provider or store work. The
+/// denial is recoverable: it changes no session deadline and ends no socket.
+fn validate_refresh_context(policy: LearningIntentRefreshPolicy) -> RecoverablePolicyDenial {
+    match policy {
+        LearningIntentRefreshPolicy::QuizOnlyNoRefresh => RecoverablePolicyDenial::SessionRefresh,
+    }
+}
+
+/// A refusal the browser can recover from: Plan 05 classifies it nonterminal, so the
+/// socket, its leases, and every deadline are unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoverablePolicyDenial {
+    SessionRefresh,
+}
+
+impl RecoverablePolicyDenial {
+    fn event(self) -> VivaServerEvent {
+        match self {
+            Self::SessionRefresh => VivaServerEvent::recoverable_structured_error(
+                "agent-service",
+                "VOICE_SESSION_REFRESH_POLICY_DENIED",
+                "Session refresh is not authorized.",
+            ),
+        }
+    }
+}
+
+/// Binds an in-socket `session_refresh` to this socket's generation, then applies the
+/// selected `D-03` policy. A different or stale generation is a terminal identity
+/// failure; a policy denial is recoverable.
+fn bind_context_refresh(
+    client_generation_id: &str,
+    authorized: &AuthorizedClientSession,
+    policy: LearningIntentRefreshPolicy,
+) -> Result<ClientInputAction, ClientFrameError> {
+    if client_generation_id != authorized.client_generation_id {
+        return Err(ClientFrameError::generation_mismatch());
+    }
+    Ok(ClientInputAction::RecoverableDenial(
+        validate_refresh_context(policy),
+    ))
+}
+
+/// A later `session_config` re-assertion. It may only restate the identity this
+/// socket already bound: the same generation, the same credential in signed mode,
+/// and the session id the browser is allowed to name. The provider-facing identity
+/// is rewritten to the unchanged server session id, so a rotated trusted session
+/// stays invisible to the browser and unaffected by the refresh.
 fn sanitize_refresh_session_config(
     config: SessionConfig,
+    client_generation_id: &str,
+    session_token: &str,
     session_binding: &AuthorizedClientSession,
 ) -> Result<SessionConfig, ClientFrameError> {
-    sanitize_client_session_config(config, session_binding)
+    if client_generation_id != session_binding.client_generation_id {
+        return Err(ClientFrameError::generation_mismatch());
+    }
+    if session_binding.auth_mode == SessionAuthMode::Signed
+        && !crate::config::constant_time_eq(
+            session_binding.bound_session_token.as_bytes(),
+            session_token.as_bytes(),
+        )
+    {
+        // Access-token renewal never happens inside an open socket.
+        return Err(ClientFrameError::session_auth_failed(
+            SessionAuthFailureCode::IdentityMismatch,
+        ));
+    }
+    let mut config = sanitize_client_session_config(
+        config,
+        &session_binding.user_id,
+        &session_binding.study_set_id,
+        &session_binding.client_session_id,
+    )?;
+    config.session_id = Some(agent_domain::SessionId::new(
+        session_binding.session_id.clone(),
+    ));
+    Ok(config)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AuthorizedClientSession {
     user_id: String,
     study_set_id: String,
+    /// Provider and store identity; never client-supplied on a later frame.
     session_id: String,
+    /// The session id the browser is allowed to assert.
+    client_session_id: String,
+    client_generation_id: String,
+    /// The credential this socket bound. Compared in constant time on a later
+    /// `session_config`; unread on the trusted loopback path.
+    bound_session_token: String,
+    auth_mode: SessionAuthMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct InitialSessionConfig {
-    client_generation_id: Option<String>,
+    client_generation_id: String,
     session: SessionConfig,
-    session_token: Option<String>,
+    session_token: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AuthorizedInitialSessionConfig {
     config: SessionConfig,
+    session_binding: AuthorizedClientSession,
     token_nonce_claim: Option<SessionTokenNonceClaim>,
     failure_control: Option<FailureControlScenario>,
-}
-
-#[derive(Debug, Deserialize)]
-struct InitialClientFrame {
-    #[serde(rename = "type")]
-    frame_type: String,
-    version: u32,
-    session: SessionConfig,
-    #[serde(default)]
-    client_generation_id: Option<String>,
-    #[serde(default)]
-    session_token: Option<String>,
-}
-
-impl AuthorizedClientSession {
-    fn from_config(config: &SessionConfig) -> Option<Self> {
-        Some(Self {
-            user_id: config.user_id.clone()?,
-            study_set_id: config.study_set_id.clone()?,
-            session_id: config.session_id.as_ref()?.to_string(),
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3725,6 +3967,9 @@ enum ClientInputAction {
     AudioTurnBuffered,
     /// A matching scoped cancel discarded the assembly; no provider turn exists.
     AudioTurnDiscarded,
+    /// A parsed frame service policy refuses without ending the session. Nothing is
+    /// forwarded and no deadline moves.
+    RecoverableDenial(RecoverablePolicyDenial),
 }
 
 impl ClientInputAction {
@@ -3732,7 +3977,7 @@ impl ClientInputAction {
         match self {
             Self::Send { action, .. } | Self::TrySend { action, .. } => *action,
             Self::SendAudioTurn { .. } => ClientAction::Audio,
-            Self::Keepalive => ClientAction::Keepalive,
+            Self::Keepalive | Self::RecoverableDenial(_) => ClientAction::Keepalive,
             Self::AudioTurnBuffered => ClientAction::AudioChunk,
             Self::AudioTurnDiscarded => ClientAction::AudioTurnCancel,
         }
@@ -3741,6 +3986,13 @@ impl ClientInputAction {
     fn accepted_audio_turn(&self) -> Option<AcceptedAudioTurn> {
         match self {
             Self::SendAudioTurn { accepted, .. } => Some(accepted.clone()),
+            _ => None,
+        }
+    }
+
+    fn recoverable_denial(&self) -> Option<RecoverablePolicyDenial> {
+        match self {
+            Self::RecoverableDenial(denial) => Some(*denial),
             _ => None,
         }
     }
@@ -3891,17 +4143,10 @@ impl ClientFrameError {
         }
     }
 
-    /// `D-03B QUIZ_ONLY`: the in-socket context refresh is parsed by Plan 05 but
-    /// carries no change this engine can honour.
-    fn session_refresh_policy_denied() -> Self {
-        Self {
-            auth_failure_code: None,
-            code: VoiceServerErrorCode::ClientAuthorityForbidden,
-            message: "session refresh is not authorized",
-            close_code: close_code::POLICY,
-            close_reason: "session refresh denied",
-            terminal_reason: "session_refresh_policy_denied",
-        }
+    /// `SERVICE-007`: a later frame naming a generation this socket did not bind is
+    /// an identity failure, not a refresh. It never rebinds identity or a credential.
+    fn generation_mismatch() -> Self {
+        Self::session_auth_failed(SessionAuthFailureCode::IdentityMismatch)
     }
 
     fn oversized_text() -> Self {
@@ -4468,6 +4713,7 @@ mod tests {
     use super::*;
     use agent_adapters::SyntheticBrain;
     use agent_domain::{BrainProviderFailure, BrainProviderFailureParts};
+    use serde::Deserialize;
     use std::{
         pin::Pin,
         sync::Arc,
@@ -4479,6 +4725,10 @@ mod tests {
             user_id: "user-1".to_owned(),
             study_set_id: "biology-midterm".to_owned(),
             session_id: "voice-session-1".to_owned(),
+            client_session_id: "voice-session-1".to_owned(),
+            client_generation_id: "1".to_owned(),
+            bound_session_token: "placeholder-session-material".to_owned(),
+            auth_mode: SessionAuthMode::Trusted,
         }
     }
 
@@ -5419,14 +5669,8 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(
-            initial.client_generation_id.as_deref(),
-            Some("token_refresh-3")
-        );
-        assert_eq!(
-            initial.session_token.as_deref(),
-            Some("placeholder-session-material")
-        );
+        assert_eq!(initial.client_generation_id, "token_refresh-3");
+        assert_eq!(initial.session_token, "placeholder-session-material");
         assert_eq!(initial.session.client_generation_id, None);
     }
 
@@ -5540,6 +5784,20 @@ mod tests {
         .is_err());
     }
 
+    /// The identity comparison a first frame runs, expressed against the binding the
+    /// socket produced from it.
+    fn sanitize_fixture_config(
+        config: SessionConfig,
+        binding: &AuthorizedClientSession,
+    ) -> Result<SessionConfig, ClientFrameError> {
+        sanitize_client_session_config(
+            config,
+            &binding.user_id,
+            &binding.study_set_id,
+            &binding.client_session_id,
+        )
+    }
+
     #[test]
     fn sanitizes_session_config_identity_and_strips_browser_source_context() {
         let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
@@ -5551,7 +5809,7 @@ mod tests {
         );
         let config = session_config_from_message(message).unwrap();
         let binding = fixture_binding();
-        let sanitized = sanitize_client_session_config(config, &binding).unwrap();
+        let sanitized = sanitize_fixture_config(config, &binding).unwrap();
 
         assert_eq!(sanitized.user_id.as_deref(), Some("user-1"));
         assert_eq!(sanitized.study_set_id.as_deref(), Some("biology-midterm"));
@@ -5562,35 +5820,35 @@ mod tests {
         let mut missing_session = sanitized.clone();
         missing_session.session_id = None;
         assert_eq!(
-            sanitize_client_session_config(missing_session, &binding),
+            sanitize_fixture_config(missing_session, &binding),
             Err(ClientFrameError::invalid_session_identity())
         );
 
         let mut forged_session = sanitized.clone();
         forged_session.session_id = Some(agent_domain::SessionId::new("voice-session-2"));
         assert_eq!(
-            sanitize_client_session_config(forged_session, &binding),
+            sanitize_fixture_config(forged_session, &binding),
             Err(ClientFrameError::invalid_session_identity())
         );
 
         let mut forged_user = sanitized.clone();
         forged_user.user_id = Some("user-2".to_owned());
         assert_eq!(
-            sanitize_client_session_config(forged_user, &binding),
+            sanitize_fixture_config(forged_user, &binding),
             Err(ClientFrameError::invalid_session_identity())
         );
 
         let mut forged_study_set = sanitized.clone();
         forged_study_set.study_set_id = Some("chemistry-final".to_owned());
         assert_eq!(
-            sanitize_client_session_config(forged_study_set, &binding),
+            sanitize_fixture_config(forged_study_set, &binding),
             Err(ClientFrameError::invalid_session_identity())
         );
 
         let mut missing_study_set = sanitized;
         missing_study_set.study_set_id = None;
         assert_eq!(
-            sanitize_client_session_config(missing_study_set, &binding),
+            sanitize_fixture_config(missing_study_set, &binding),
             Err(ClientFrameError::invalid_session_identity())
         );
     }
@@ -6211,6 +6469,7 @@ mod tests {
                 sequence,
                 pcm_chunk(bytes),
             )
+            .map_err(ClientFrameError::from)
         }
 
         fn assert_sanitized_audio_error(error: ClientFrameError, frame: &AudioFrame) {
@@ -6279,6 +6538,7 @@ mod tests {
                     1,
                     pcm_chunk(960),
                 )
+                .map_err(ClientFrameError::from)
                 .expect_err("a second identity cannot join an active turn");
                 assert_eq!(error, ClientFrameError::invalid_audio_frame());
                 assert!(assembly.is_none());
@@ -6293,6 +6553,7 @@ mod tests {
                     0,
                     pcm_chunk(960),
                 )
+                .map_err(ClientFrameError::from)
                 .expect_err("empty identity fails closed");
                 assert_eq!(error, ClientFrameError::invalid_audio_frame());
                 assert!(assembly.is_none());
@@ -6318,6 +6579,7 @@ mod tests {
                     0,
                     frame.clone(),
                 )
+                .map_err(ClientFrameError::from)
                 .expect_err("invalid chunk sizes fail closed");
                 assert_eq!(error, expected);
                 assert!(assembly.is_none());
@@ -6378,6 +6640,7 @@ mod tests {
                 push_chunk(&mut mismatched, sequence, 960).expect("chunk accepted");
             }
             let error = accept_audio_end(&mut mismatched, TEST_GENERATION, TEST_TURN, 3)
+                .map_err(ClientFrameError::from)
                 .expect_err("audio_end must name the last accepted sequence");
             assert_eq!(error, ClientFrameError::invalid_audio_frame());
             assert!(mismatched.is_none());
@@ -6409,6 +6672,7 @@ mod tests {
 
             let mut empty = None;
             let error = accept_audio_end(&mut empty, TEST_GENERATION, TEST_TURN, 0)
+                .map_err(ClientFrameError::from)
                 .expect_err("audio_end without an assembled turn fails closed");
             assert_eq!(error, ClientFrameError::invalid_audio_frame());
         }
@@ -6434,16 +6698,265 @@ mod tests {
             )
             .expect("chunk accepted");
             let error = accept_audio_cancel(&mut other, TEST_GENERATION, TEST_TURN)
+                .map_err(ClientFrameError::from)
                 .expect_err("a mismatched cancel is a protocol error");
             assert_eq!(error, ClientFrameError::invalid_audio_frame());
             assert!(other.is_none());
 
             let mut empty = None;
             let error = accept_audio_cancel(&mut empty, TEST_GENERATION, TEST_TURN)
+                .map_err(ClientFrameError::from)
                 .expect_err("a scoped cancel without an assembly is a protocol error");
             assert_eq!(error, ClientFrameError::invalid_audio_frame());
         }
     }
+
+    /// `SERVICE-007`: Plan 05's `audio-turn-lifecycle.json` validates only its own
+    /// schema, case-id set, and per-frame parses. Executing the stateful outcome of
+    /// every case against Plan 03's real `ws.rs` assembler is exclusively this
+    /// plan's obligation, and the fixture is read-only here.
+    mod audio_turn_lifecycle {
+        use super::*;
+
+        const AUDIO_TURN_LIFECYCLE_JSON: &str =
+            include_str!("../../../fixtures/voice-protocol/v5/audio-turn-lifecycle.json");
+
+        #[derive(Deserialize)]
+        struct LifecycleFile {
+            schema: String,
+            protocol_version: u32,
+            cases: Vec<LifecycleCase>,
+        }
+
+        #[derive(Deserialize)]
+        struct LifecycleCase {
+            id: String,
+            wire_sequence_json: Vec<String>,
+            valid: bool,
+            diagnostic_code: Option<String>,
+            path: Option<String>,
+        }
+
+        /// The outcome of replaying one fixture case through the real assembler.
+        struct LifecycleOutcome {
+            completed: Option<AcceptedAudioTurn>,
+            rejection: Option<VoiceProtocolDiagnostic>,
+            /// Which layer refused, so Plan 05's per-frame parse can be told apart
+            /// from the stateful assembler outcome this plan owns.
+            rejected_by: Option<RejectionSource>,
+            assembly_retained: bool,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum RejectionSource {
+            Parser,
+            Assembler,
+        }
+
+        /// Replays one fixture case exactly as the socket does: every wire entry goes
+        /// through Plan 05's strict parser first, and only a parsed `audio_chunk` /
+        /// `audio_end` reaches the connection-local assembler.
+        fn replay(case: &LifecycleCase) -> LifecycleOutcome {
+            let mut assembly: Option<IncomingAudioTurn> = None;
+            let mut completed = None;
+            let mut rejection = None;
+            let mut rejected_by = None;
+
+            for wire_json in &case.wire_sequence_json {
+                if rejection.is_some() {
+                    continue;
+                }
+                let frame = match parse_client_frame_json(wire_json) {
+                    Ok(frame) => frame,
+                    Err(diagnostic) => {
+                        rejection = Some(diagnostic);
+                        rejected_by = Some(RejectionSource::Parser);
+                        continue;
+                    }
+                };
+                let outcome = match frame {
+                    ClientFrame::AudioChunk {
+                        client_generation_id,
+                        turn_id,
+                        sequence,
+                        frame,
+                        ..
+                    } => accept_audio_chunk(
+                        &mut assembly,
+                        client_generation_id,
+                        turn_id,
+                        sequence,
+                        frame,
+                    ),
+                    ClientFrame::AudioEnd {
+                        client_generation_id,
+                        turn_id,
+                        final_sequence,
+                        ..
+                    } => accept_audio_end(
+                        &mut assembly,
+                        &client_generation_id,
+                        &turn_id,
+                        final_sequence,
+                    ),
+                    other => panic!("{} carries a non-audio frame: {other:?}", case.id),
+                };
+                match outcome {
+                    Ok(AudioAssemblyAction::Pending) => {}
+                    Ok(AudioAssemblyAction::Complete {
+                        client_generation_id,
+                        turn_id,
+                        final_sequence,
+                        ..
+                    }) => {
+                        completed = Some(AcceptedAudioTurn {
+                            client_generation_id,
+                            turn_id,
+                            final_sequence,
+                        });
+                    }
+                    Ok(AudioAssemblyAction::Cancelled) => {
+                        panic!("{} produced a cancellation", case.id)
+                    }
+                    Err(reject) => {
+                        rejection = Some(reject);
+                        rejected_by = Some(RejectionSource::Assembler);
+                    }
+                }
+            }
+
+            LifecycleOutcome {
+                completed,
+                rejection,
+                rejected_by,
+                assembly_retained: assembly.is_some(),
+            }
+        }
+
+        #[test]
+        fn audio_turn_lifecycle_fixture_cases_execute_against_the_assembler() {
+            let file: LifecycleFile = serde_json::from_str(AUDIO_TURN_LIFECYCLE_JSON)
+                .expect("audio lifecycle fixture parses");
+            assert_eq!(file.schema, "viva.voice-audio-sequence-cases.v1");
+            assert_eq!(file.protocol_version, VIVA_VOICE_PROTOCOL_VERSION);
+            assert_eq!(file.cases.len(), 8, "every published case must be executed");
+
+            for case in &file.cases {
+                let outcome = replay(case);
+                if case.valid {
+                    assert!(
+                        outcome.rejection.is_none(),
+                        "{} must assemble without a diagnostic",
+                        case.id
+                    );
+                    let accepted = outcome
+                        .completed
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{} must complete one turn", case.id));
+                    assert_eq!(accepted.turn_id, "turn-fixture-audio", "{}", case.id);
+                    assert_eq!(
+                        accepted.client_generation_id, "generation-fixture-audio",
+                        "{}",
+                        case.id
+                    );
+                    let expected_final = case.wire_sequence_json.len() as u32 - 2;
+                    assert_eq!(accepted.final_sequence, expected_final, "{}", case.id);
+                    assert!(
+                        !outcome.assembly_retained,
+                        "{} must leave no retained assembly",
+                        case.id
+                    );
+                    continue;
+                }
+
+                let diagnostic = outcome
+                    .rejection
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{} must be rejected", case.id));
+                assert_eq!(
+                    Some(diagnostic.code.as_str().to_owned()),
+                    case.diagnostic_code,
+                    "{} diagnostic code",
+                    case.id
+                );
+                assert_eq!(
+                    Some(diagnostic.path.clone()),
+                    case.path,
+                    "{} diagnostic path",
+                    case.id
+                );
+                assert!(
+                    outcome.completed.is_none(),
+                    "{} must never produce a provider turn",
+                    case.id
+                );
+                assert!(
+                    !outcome.assembly_retained,
+                    "{} must clear the assembly on rejection",
+                    case.id
+                );
+                // A `VOICE_PROTOCOL_FRAME_TOO_LARGE` case is Plan 05's per-frame
+                // refusal; every other published rejection is a stateful outcome only
+                // this plan's assembler can decide.
+                let expected_source =
+                    if case.diagnostic_code.as_deref() == Some("VOICE_PROTOCOL_FRAME_TOO_LARGE") {
+                        RejectionSource::Parser
+                    } else {
+                        RejectionSource::Assembler
+                    };
+                assert_eq!(
+                    outcome.rejected_by,
+                    Some(expected_source),
+                    "{} was refused by the wrong layer",
+                    case.id
+                );
+            }
+        }
+
+        /// The three stateful rejections this plan owns are exactly the codes the
+        /// fixture publishes; the per-frame ceiling stays Plan 05's parser diagnostic.
+        #[test]
+        fn audio_turn_lifecycle_rejections_carry_no_payload_material() {
+            for rejection in [
+                AudioAssemblyRejection::InvalidIdentity,
+                AudioAssemblyRejection::InvalidPayload,
+                AudioAssemblyRejection::ChunkTooLarge,
+                AudioAssemblyRejection::TurnTooLarge,
+                AudioAssemblyRejection::Sequence,
+                AudioAssemblyRejection::FinalSequence,
+            ] {
+                let diagnostic = rejection.diagnostic();
+                let rendered = format!("{diagnostic:?} {diagnostic}");
+                assert!(!rendered.contains("AAA"), "{rejection:?} leaked a payload");
+                assert!(diagnostic.path.starts_with('$'), "{rejection:?}");
+                let error = ClientFrameError::from(rejection.diagnostic());
+                assert!(!error.message.contains("pcm16_base64"));
+            }
+
+            assert_eq!(
+                AudioAssemblyRejection::Sequence.diagnostic(),
+                VoiceProtocolDiagnostic::new(
+                    VoiceProtocolDiagnosticCode::AudioSequence,
+                    "$.sequence"
+                )
+            );
+            assert_eq!(
+                AudioAssemblyRejection::FinalSequence.diagnostic(),
+                VoiceProtocolDiagnostic::new(
+                    VoiceProtocolDiagnosticCode::AudioSequence,
+                    "$.final_sequence"
+                )
+            );
+            assert_eq!(
+                AudioAssemblyRejection::TurnTooLarge.diagnostic(),
+                VoiceProtocolDiagnostic::new(
+                    VoiceProtocolDiagnosticCode::TurnTooLarge,
+                    "$.frame.pcm16_base64"
+                )
+            );
+        }
+    }
+
     fn client_ip_test_peer(address: &str) -> SocketAddr {
         SocketAddr::new(address.parse().expect("test peer address"), 44_321)
     }
