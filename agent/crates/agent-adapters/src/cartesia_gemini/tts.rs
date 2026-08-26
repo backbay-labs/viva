@@ -14,7 +14,11 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 
-use agent_domain::{AudioFrame, BrainError};
+use agent_domain::{
+    AudioFrame, BrainError, BrainFailureClass, BrainFailureStage, BrainProviderFailureParts,
+};
+
+use super::brain_failure;
 
 use super::constants::{
     CARTESIA_SAMPLE_RATE, DEFAULT_CARTESIA_VERSION, DEFAULT_SONIC_MODEL, DEFAULT_SONIC_VOICE_ID,
@@ -23,6 +27,54 @@ use super::constants::{
 
 const CARTESIA_VERSION_HEADER: &str = "cartesia-version";
 const SONIC_TRANSCRIPT_CHUNK_TARGET: usize = 96;
+
+/// `ADAPTER-01` / `A-13.2`: every Sonic failure is classified where it is
+/// observed, and only a closed `error_kind` token travels. Assistant text, a
+/// provider message, a close reason, a URL, or a credential never reaches the
+/// metadata.
+fn sonic_failure(
+    failure_class: BrainFailureClass,
+    stage: BrainFailureStage,
+    retry_eligible: bool,
+    error_kind: &'static str,
+) -> BrainError {
+    brain_failure(BrainProviderFailureParts {
+        failure_class,
+        stage,
+        retry_eligible,
+        latency_ms: 0,
+        provider: "cartesia".to_owned(),
+        model: "cartesia-sonic".to_owned(),
+        metadata: format!("stage=cartesia_sonic error_kind={error_kind}"),
+    })
+}
+
+fn sonic_transport_failure(error_kind: &'static str) -> BrainError {
+    sonic_failure(
+        BrainFailureClass::NetworkDisconnect,
+        BrainFailureStage::Transport,
+        true,
+        error_kind,
+    )
+}
+
+fn sonic_protocol_failure(error_kind: &'static str) -> BrainError {
+    sonic_failure(
+        BrainFailureClass::MalformedStream,
+        BrainFailureStage::Provider,
+        true,
+        error_kind,
+    )
+}
+
+fn sonic_auth_failure(error_kind: &'static str) -> BrainError {
+    sonic_failure(
+        BrainFailureClass::ProviderAuthFailure,
+        BrainFailureStage::ProviderAuth,
+        false,
+        error_kind,
+    )
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SonicConfig {
@@ -62,21 +114,17 @@ impl SonicConfig {
     pub fn websocket_request(&self, api_key: &str) -> Result<Request<()>, BrainError> {
         let api_key = api_key.trim();
         if api_key.is_empty() {
-            return Err(BrainError::MissingApiKey);
+            return Err(sonic_auth_failure("missing_api_key"));
         }
 
         let mut request = self
             .websocket_endpoint()
             .into_client_request()
-            .map_err(|error| {
-                BrainError::Protocol(format!("invalid Cartesia Sonic WebSocket URL: {error}"))
-            })?;
-        let authorization = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| {
-            BrainError::Protocol("invalid Cartesia Sonic authorization header".to_owned())
-        })?;
-        let version = HeaderValue::from_str(self.cartesia_version.trim()).map_err(|_| {
-            BrainError::Protocol("invalid Cartesia-Version header value".to_owned())
-        })?;
+            .map_err(|_| sonic_protocol_failure("invalid_endpoint"))?;
+        let authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|_| sonic_auth_failure("invalid_authorization_header"))?;
+        let version = HeaderValue::from_str(self.cartesia_version.trim())
+            .map_err(|_| sonic_protocol_failure("invalid_version_header"))?;
         request.headers_mut().insert(AUTHORIZATION, authorization);
         request
             .headers_mut()
@@ -173,7 +221,14 @@ where
         synthesize_sonic_context(&mut socket, config, context_id, transcript).await
     })
     .await
-    .map_err(|_| BrainError::Connection("Cartesia Sonic stage timeout".to_owned()))?
+    .map_err(|_| {
+        sonic_failure(
+            BrainFailureClass::Timeout,
+            BrainFailureStage::Provider,
+            true,
+            "deadline_elapsed",
+        )
+    })?
 }
 
 pub(crate) async fn synthesize_sonic_context<S>(
@@ -189,7 +244,7 @@ where
         socket
             .send_json(request)
             .await
-            .map_err(|_| BrainError::Connection("Cartesia Sonic send failed".to_owned()))?;
+            .map_err(|_| sonic_transport_failure("send_failed"))?;
     }
 
     let mut frames = Vec::new();
@@ -197,12 +252,10 @@ where
         let Some(text) = socket
             .next_text()
             .await
-            .map_err(|_| BrainError::Connection("Cartesia Sonic receive failed".to_owned()))?
+            .map_err(|_| sonic_transport_failure("receive_failed"))?
         else {
             close_quietly(socket).await;
-            return Err(BrainError::Protocol(
-                "Cartesia Sonic socket closed before done".to_owned(),
-            ));
+            return Err(sonic_protocol_failure("closed_before_done"));
         };
 
         let Some(event) = parse_sonic_event(&text) else {
@@ -213,21 +266,19 @@ where
                 context_id: event_context_id,
                 pcm16_base64,
             } if event_context_id == context_id => {
-                let frame = AudioFrame::from_base64(pcm16_base64).map_err(|_| {
-                    BrainError::Protocol("Cartesia Sonic invalid audio chunk".to_owned())
-                })?;
+                let frame = AudioFrame::from_base64(pcm16_base64)
+                    .map_err(|_| sonic_protocol_failure("invalid_audio_chunk"))?;
                 frames.push(frame);
             }
             SonicEvent::Done {
                 context_id: event_context_id,
             } if event_context_id == context_id => {
-                socket.close().await.map_err(|_| {
-                    BrainError::Connection("Cartesia Sonic close failed".to_owned())
-                })?;
+                socket
+                    .close()
+                    .await
+                    .map_err(|_| sonic_transport_failure("close_failed"))?;
                 if frames.is_empty() {
-                    return Err(BrainError::Protocol(
-                        "Cartesia Sonic returned no audio chunks".to_owned(),
-                    ));
+                    return Err(sonic_protocol_failure("no_audio_chunks"));
                 }
                 return Ok(frames);
             }
@@ -236,18 +287,14 @@ where
                 context_id: None, ..
             } => {
                 close_quietly(socket).await;
-                return Err(BrainError::Protocol(
-                    "Cartesia Sonic provider error".to_owned(),
-                ));
+                return Err(sonic_protocol_failure("provider_error"));
             }
             SonicEvent::Error {
                 context_id: Some(event_context_id),
                 ..
             } if event_context_id == context_id => {
                 close_quietly(socket).await;
-                return Err(BrainError::Protocol(
-                    "Cartesia Sonic provider error".to_owned(),
-                ));
+                return Err(sonic_protocol_failure("provider_error"));
             }
             _ => {}
         }
@@ -262,7 +309,7 @@ where
     socket
         .send_json(sonic_cancel_request(context_id))
         .await
-        .map_err(|_| BrainError::Connection("Cartesia Sonic cancel failed".to_owned()))
+        .map_err(|_| sonic_transport_failure("cancel_failed"))
 }
 
 #[async_trait]
@@ -328,9 +375,9 @@ impl SonicConnector for WebSocketSonicConnector {
     type Socket = TungsteniteSonicSocket;
 
     async fn connect(&self, request: Request<()>) -> Result<Self::Socket, BrainError> {
-        let (socket, _) = connect_async(request).await.map_err(|_| {
-            BrainError::Connection("Cartesia Sonic WebSocket connect failed".to_owned())
-        })?;
+        let (socket, _) = connect_async(request)
+            .await
+            .map_err(|_| sonic_transport_failure("connect_failed"))?;
         Ok(TungsteniteSonicSocket { socket })
     }
 }
@@ -345,7 +392,7 @@ impl SonicSocket for TungsteniteSonicSocket {
         self.socket
             .send(Message::Text(value.to_string().into()))
             .await
-            .map_err(|_| BrainError::Connection("Cartesia Sonic send failed".to_owned()))
+            .map_err(|_| sonic_transport_failure("send_failed"))
     }
 
     async fn next_text(&mut self) -> Result<Option<String>, BrainError> {
@@ -359,14 +406,10 @@ impl SonicSocket for TungsteniteSonicSocket {
                     .socket
                     .send(Message::Pong(payload))
                     .await
-                    .map_err(|_| BrainError::Connection("Cartesia Sonic pong failed".to_owned()))?,
+                    .map_err(|_| sonic_transport_failure("pong_failed"))?,
                 Ok(Message::Close(_)) => return Ok(None),
                 Ok(Message::Binary(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
-                Err(_) => {
-                    return Err(BrainError::Connection(
-                        "Cartesia Sonic receive failed".to_owned(),
-                    ))
-                }
+                Err(_) => return Err(sonic_transport_failure("receive_failed")),
             }
         }
     }
@@ -375,7 +418,7 @@ impl SonicSocket for TungsteniteSonicSocket {
         self.socket
             .close(None)
             .await
-            .map_err(|_| BrainError::Connection("Cartesia Sonic close failed".to_owned()))
+            .map_err(|_| sonic_transport_failure("close_failed"))
     }
 }
 
@@ -557,12 +600,17 @@ mod tests {
             transcript,
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
-        assert!(error.contains("Cartesia Sonic stage timeout"));
-        assert!(!error.contains("sk_car_timeout_secret"));
-        assert!(!error.contains(transcript));
+        assert_eq!(failure.failure_class(), BrainFailureClass::Timeout);
+        assert_eq!(
+            failure.metadata(),
+            "stage=cartesia_sonic error_kind=deadline_elapsed"
+        );
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains("sk_car_timeout_secret"));
+        assert!(!rendered.contains(transcript));
     }
 
     #[tokio::test]
@@ -592,12 +640,17 @@ mod tests {
             "assistant text must not appear in errors",
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
-        assert!(error.contains("Cartesia Sonic provider error"));
-        assert!(!error.contains("provider leaked assistant text"));
-        assert!(!error.contains("assistant text must not appear"));
+        assert_eq!(failure.failure_class(), BrainFailureClass::MalformedStream);
+        assert_eq!(
+            failure.metadata(),
+            "stage=cartesia_sonic error_kind=provider_error"
+        );
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains("provider leaked assistant text"));
+        assert!(!rendered.contains("assistant text must not appear"));
 
         let mut send_error = FakeSonicSocket::with_send_error("writer leaked transcript");
         let error = synthesize_sonic_context(
@@ -607,12 +660,20 @@ mod tests {
             "another assistant payload",
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
-        assert!(error.contains("Cartesia Sonic send failed"));
-        assert!(!error.contains("writer leaked transcript"));
-        assert!(!error.contains("another assistant payload"));
+        assert_eq!(
+            failure.failure_class(),
+            BrainFailureClass::NetworkDisconnect
+        );
+        assert_eq!(
+            failure.metadata(),
+            "stage=cartesia_sonic error_kind=send_failed"
+        );
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains("writer leaked transcript"));
+        assert!(!rendered.contains("another assistant payload"));
     }
 
     #[tokio::test]
@@ -628,11 +689,13 @@ mod tests {
             "partial assistant text",
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
 
-        assert!(error.contains("closed before done"));
-        assert!(!error.contains("partial assistant text"));
+        assert_eq!(
+            error.failure().metadata(),
+            "stage=cartesia_sonic error_kind=closed_before_done"
+        );
+        assert!(!format!("{error} {:?}", error.failure()).contains("partial assistant text"));
         assert!(socket.closed);
     }
 
@@ -752,8 +815,8 @@ mod tests {
             &mut self,
             value: serde_json::Value,
         ) -> Result<(), agent_domain::BrainError> {
-            if let Some(message) = self.send_error {
-                return Err(agent_domain::BrainError::Connection(message.to_owned()));
+            if self.send_error.is_some() {
+                return Err(sonic_transport_failure("send_failed"));
             }
             self.sent_json.push(value);
             Ok(())

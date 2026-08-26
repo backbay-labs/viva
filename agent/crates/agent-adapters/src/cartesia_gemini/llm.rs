@@ -1,5 +1,7 @@
 use std::{
+    collections::BTreeSet,
     fmt,
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -10,9 +12,12 @@ use serde_json::{json, Value};
 use tokio::time::timeout;
 
 use agent_domain::{
-    BrainError, BrainProviderFailure, BrainProviderFailureParts, TerminalSessionReason, ToolResult,
+    AnswerEvaluator, BrainError, BrainFailureClass, BrainFailureStage, BrainProviderFailure,
+    BrainProviderFailureParts, CriterionAssessment, EvaluationDecision, EvaluationError,
+    EvaluationRequest, ToolResult,
 };
 
+use super::brain_failure;
 use super::constants::{
     DEFAULT_GEMINI_BASE_URL, DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_THINKING_LEVEL,
 };
@@ -188,7 +193,7 @@ pub enum GeminiStreamEvent {
         args: Value,
         part: Value,
     },
-    Error(String),
+    Error(#[allow(dead_code)] String),
     Usage {
         input_tokens: u64,
         output_tokens: u64,
@@ -217,7 +222,14 @@ impl GeminiStreamRequest {
     fn new(config: &GeminiConfig, body: Value) -> Result<Self, BrainError> {
         let api_key = config.api_key.trim();
         if api_key.is_empty() {
-            return Err(BrainError::MissingApiKey);
+            return Err(gemini_stage_failure(
+                config,
+                BrainFailureClass::ProviderAuthFailure,
+                BrainFailureStage::ProviderAuth,
+                false,
+                Duration::ZERO,
+                "error_kind=missing_api_key",
+            ));
         }
 
         Ok(Self {
@@ -291,7 +303,7 @@ where
             None => {
                 return Err(gemini_attempt_failure(
                     &attempt_events,
-                    gemini_generation_stage_timeout(),
+                    gemini_generation_stage_timeout(attempt_config),
                 ));
             }
         };
@@ -324,7 +336,7 @@ where
             Err(_) => {
                 return Err(gemini_attempt_failure(
                     &attempt_events,
-                    gemini_generation_stage_timeout(),
+                    gemini_generation_stage_timeout(attempt_config),
                 ))
             }
         };
@@ -357,7 +369,7 @@ where
             }
             return Err(gemini_attempt_failure(
                 &attempt_events,
-                sanitized_gemini_http_status_error(response.status),
+                sanitized_gemini_http_status_error(attempt_config, response.status),
             ));
         }
         if response.body.trim().is_empty() {
@@ -369,7 +381,7 @@ where
             }
             return Err(gemini_attempt_failure(
                 &attempt_events,
-                BrainError::Protocol("Gemini stream returned no events".to_owned()),
+                gemini_empty_stream_stage_failure(attempt_config, started.elapsed()),
             ));
         }
         let mut events = parse_gemini_sse_stream(&response.body);
@@ -382,7 +394,7 @@ where
             }
             return Err(gemini_attempt_failure(
                 &attempt_events,
-                BrainError::Protocol("Gemini stream returned no events".to_owned()),
+                gemini_empty_stream_stage_failure(attempt_config, started.elapsed()),
             ));
         }
         if !attempt_events.is_empty() {
@@ -394,7 +406,14 @@ where
     Err(gemini_attempt_failure(
         &attempt_events,
         last_rate_limit.unwrap_or_else(|| {
-            BrainError::Protocol("Gemini stream had no configured model attempts".to_owned())
+            gemini_stage_failure(
+                config,
+                BrainFailureClass::MalformedStream,
+                BrainFailureStage::Gemini,
+                false,
+                Duration::ZERO,
+                "error_kind=no_configured_model_attempts",
+            )
         }),
     ))
 }
@@ -410,14 +429,18 @@ fn gemini_attempt_failure(
 }
 
 fn brain_provider_failure(error: &BrainError) -> Option<BrainProviderFailure> {
-    match error {
-        BrainError::StageFailure(failure) => Some((**failure).clone()),
-        _ => None,
-    }
+    Some(error.failure().clone())
 }
 
-fn gemini_generation_stage_timeout() -> BrainError {
-    BrainError::Connection("Gemini generation stage timeout".to_owned())
+fn gemini_generation_stage_timeout(config: &GeminiConfig) -> BrainError {
+    gemini_stage_failure(
+        config,
+        BrainFailureClass::Timeout,
+        BrainFailureStage::Gemini,
+        true,
+        Duration::ZERO,
+        "error_kind=generation_stage_timeout",
+    )
 }
 
 fn gemini_attempt_request(config: &GeminiConfig, request: &Value) -> Value {
@@ -479,44 +502,24 @@ fn gemini_stream_attempts(config: &GeminiConfig) -> Vec<GeminiConfig> {
     attempts
 }
 
+/// The transport already classified what it observed, so the primary attempt
+/// keeps that classification instead of re-deriving one from a message. Plan 06
+/// removed the untyped variants this used to parse.
 fn sanitize_gemini_stream_error(error: BrainError) -> BrainError {
-    match error {
-        BrainError::Connection(message) | BrainError::Protocol(message) => {
-            if let Some(status) = sanitized_gemini_http_status(&message) {
-                return BrainError::Protocol(format!(
-                    "Gemini stream request failed with status {status}"
-                ));
-            }
-            BrainError::Connection("Gemini stream request failed".to_owned())
-        }
-        BrainError::MissingApiKey => BrainError::MissingApiKey,
-        BrainError::StageFailure(failure) => BrainError::StageFailure(failure),
-    }
+    error
 }
 
-fn sanitized_gemini_http_status(message: &str) -> Option<u16> {
-    let normalized = message.to_ascii_lowercase();
-    (400_u16..500_u16).find(|status| {
-        if !preserved_gemini_protocol_status(*status) {
-            return false;
-        }
-        let status = status.to_string();
-        normalized.contains(&format!("status {status}"))
-            || normalized.contains(&format!("status: {status}"))
-            || normalized.contains(&format!("status={status}"))
-    })
-}
-
-fn preserved_gemini_protocol_status(status: u16) -> bool {
-    (400..500).contains(&status) && status != 408
-}
-
-fn sanitized_gemini_http_status_error(status: u16) -> BrainError {
-    if preserved_gemini_protocol_status(status) {
-        BrainError::Protocol(format!("Gemini stream request failed with status {status}"))
-    } else {
-        BrainError::Connection("Gemini stream request failed".to_owned())
-    }
+fn sanitized_gemini_http_status_error(config: &GeminiConfig, status: u16) -> BrainError {
+    gemini_status_stage_failure(
+        config,
+        &GeminiSseResponse {
+            status,
+            body: String::new(),
+            retry_after: None,
+            reset_after: None,
+        },
+        Duration::ZERO,
+    )
 }
 
 pub(crate) async fn stream_gemini_http_with_attempt_events(
@@ -535,8 +538,19 @@ struct ReqwestGeminiSseClient {
 #[async_trait]
 impl GeminiSseClient for ReqwestGeminiSseClient {
     async fn stream(&self, request: GeminiStreamRequest) -> Result<GeminiSseResponse, BrainError> {
-        let api_key = HeaderValue::from_str(&request.api_key)
-            .map_err(|_| BrainError::Protocol("invalid Gemini API key header value".to_owned()))?;
+        // An unusable credential is a provider-auth failure at the auth stage:
+        // it is never retried as a transport blip, and no key byte travels.
+        let api_key = HeaderValue::from_str(&request.api_key).map_err(|_| {
+            brain_failure(BrainProviderFailureParts {
+                failure_class: BrainFailureClass::ProviderAuthFailure,
+                stage: BrainFailureStage::ProviderAuth,
+                retry_eligible: false,
+                latency_ms: 0,
+                provider: "gemini".to_owned(),
+                model: "gemini".to_owned(),
+                metadata: "error_kind=invalid_api_key_header".to_owned(),
+            })
+        })?;
         let response = self
             .client
             .post(&request.url)
@@ -545,13 +559,25 @@ impl GeminiSseClient for ReqwestGeminiSseClient {
             .json(&request.body)
             .send()
             .await
-            .map_err(|_| BrainError::Connection("Gemini stream request failed".to_owned()))?;
+            .map_err(|_| gemini_client_failure("error_kind=request_failed"))?;
         let status = response.status().as_u16();
         let retry_after = header_value(response.headers(), RETRY_AFTER.as_str());
         let reset_after = reset_header_value(response.headers());
         let body = response_text(status, response).await;
         gemini_sse_response_from_http_parts(status, retry_after, reset_after, body)
     }
+}
+
+fn gemini_client_failure(metadata: &'static str) -> BrainError {
+    brain_failure(BrainProviderFailureParts {
+        failure_class: BrainFailureClass::NetworkDisconnect,
+        stage: BrainFailureStage::Transport,
+        retry_eligible: true,
+        latency_ms: 0,
+        provider: "gemini".to_owned(),
+        model: "gemini".to_owned(),
+        metadata: metadata.to_owned(),
+    })
 }
 
 async fn response_text(status: u16, response: reqwest::Response) -> Result<String, ()> {
@@ -586,11 +612,7 @@ fn gemini_sse_response_from_http_parts(
     let body = match body {
         Ok(body) => body,
         Err(()) if !(200..300).contains(&status) => String::new(),
-        Err(()) => {
-            return Err(BrainError::Connection(
-                "Gemini stream response read failed".to_owned(),
-            ));
-        }
+        Err(()) => return Err(gemini_client_failure("error_kind=response_read_failed")),
     };
     Ok(GeminiSseResponse {
         status,
@@ -625,61 +647,47 @@ fn gemini_rate_limit_stage_failure(
     response: &GeminiSseResponse,
     latency: Duration,
 ) -> BrainError {
-    BrainError::StageFailure(Box::new(BrainProviderFailure::new(
-        BrainProviderFailureParts {
-            failure_class: "quota_rate_failure".to_owned(),
-            stage: "gemini".to_owned(),
-            terminal_reason: TerminalSessionReason::ProviderRateLimited,
-            retry_eligible: true,
-            latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
-            provider: "gemini".to_owned(),
-            model: config.model_id.clone(),
-            metadata: gemini_rate_limit_metadata(response),
-        },
-    )))
+    brain_failure(BrainProviderFailureParts {
+        failure_class: BrainFailureClass::QuotaRateFailure,
+        stage: BrainFailureStage::Gemini,
+        retry_eligible: true,
+        latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
+        provider: "gemini".to_owned(),
+        model: config.model_id.clone(),
+        metadata: gemini_rate_limit_metadata(response),
+    })
 }
 
+/// The HTTP status is the classifier. `401`/`403` are provider-auth failures and
+/// are never retried; the rest follow the typed policy the status itself implies.
 fn gemini_status_stage_failure(
     config: &GeminiConfig,
     response: &GeminiSseResponse,
     latency: Duration,
 ) -> BrainError {
-    let terminal_reason = match response.status {
-        401 | 403 => TerminalSessionReason::ProviderAuthFailed,
-        408 | 504 => TerminalSessionReason::ProviderTimeout,
-        500..=599 => TerminalSessionReason::ProviderNetworkDisconnect,
-        _ => TerminalSessionReason::ProviderMalformedStream,
+    let failure_class = match response.status {
+        401 | 403 => BrainFailureClass::ProviderAuthFailure,
+        429 => BrainFailureClass::QuotaRateFailure,
+        408 | 504 => BrainFailureClass::Timeout,
+        500..=599 => BrainFailureClass::NetworkDisconnect,
+        _ => BrainFailureClass::MalformedStream,
     };
-    BrainError::StageFailure(Box::new(BrainProviderFailure::new(
-        BrainProviderFailureParts {
-            failure_class: gemini_status_failure_class(terminal_reason).to_owned(),
-            stage: "gemini".to_owned(),
-            terminal_reason,
-            retry_eligible: response.status == 408
-                || response.status == 429
-                || response.status >= 500,
-            latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
-            provider: "gemini".to_owned(),
-            model: config.model_id.clone(),
-            metadata: gemini_status_metadata(response),
-        },
-    )))
-}
-
-fn gemini_status_failure_class(reason: TerminalSessionReason) -> &'static str {
-    match reason {
-        TerminalSessionReason::ProviderAuthFailed => "provider_auth_failure",
-        TerminalSessionReason::ProviderTimeout => "timeout",
-        TerminalSessionReason::ProviderNetworkDisconnect => "network_disconnect",
-        _ => "malformed_stream",
-    }
+    brain_failure(BrainProviderFailureParts {
+        failure_class,
+        stage: BrainFailureStage::Gemini,
+        retry_eligible: response.status == 408 || response.status == 429 || response.status >= 500,
+        latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
+        provider: "gemini".to_owned(),
+        model: config.model_id.clone(),
+        metadata: gemini_status_metadata(response),
+    })
 }
 
 fn gemini_timeout_stage_failure(config: &GeminiConfig, latency: Duration) -> BrainError {
     gemini_stage_failure(
         config,
-        "timeout",
-        TerminalSessionReason::ProviderTimeout,
+        BrainFailureClass::Timeout,
+        BrainFailureStage::Gemini,
         true,
         latency,
         "error_kind=deadline_elapsed",
@@ -689,135 +697,50 @@ fn gemini_timeout_stage_failure(config: &GeminiConfig, latency: Duration) -> Bra
 fn gemini_empty_stream_stage_failure(config: &GeminiConfig, latency: Duration) -> BrainError {
     gemini_stage_failure(
         config,
-        "malformed_stream",
-        TerminalSessionReason::ProviderMalformedStream,
+        BrainFailureClass::MalformedStream,
+        BrainFailureStage::Gemini,
         true,
         latency,
         "error_kind=empty_stream",
     )
 }
 
+/// A fallback attempt keeps the classification the transport chose and adopts
+/// the fallback model plus the elapsed latency. Nothing re-reads a message.
 fn gemini_transport_stage_failure(
     config: &GeminiConfig,
     error: &BrainError,
     latency: Duration,
 ) -> BrainError {
-    let (failure_class, terminal_reason, retry_eligible, metadata) =
-        gemini_transport_failure_classification(error);
-    gemini_stage_failure(
-        config,
-        failure_class,
-        terminal_reason,
-        retry_eligible,
-        latency,
-        metadata,
-    )
+    let failure = error.failure();
+    brain_failure(BrainProviderFailureParts {
+        failure_class: failure.failure_class(),
+        stage: failure.stage(),
+        retry_eligible: failure.retry_eligible(),
+        latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
+        provider: "gemini".to_owned(),
+        model: config.model_id.clone(),
+        metadata: failure.metadata().to_owned(),
+    })
 }
 
 fn gemini_stage_failure(
     config: &GeminiConfig,
-    failure_class: &'static str,
-    terminal_reason: TerminalSessionReason,
+    failure_class: BrainFailureClass,
+    stage: BrainFailureStage,
     retry_eligible: bool,
     latency: Duration,
     metadata: &'static str,
 ) -> BrainError {
-    BrainError::StageFailure(Box::new(BrainProviderFailure::new(
-        BrainProviderFailureParts {
-            failure_class: failure_class.to_owned(),
-            stage: "gemini".to_owned(),
-            terminal_reason,
-            retry_eligible,
-            latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
-            provider: "gemini".to_owned(),
-            model: config.model_id.clone(),
-            metadata: metadata.to_owned(),
-        },
-    )))
-}
-
-fn gemini_transport_failure_classification(
-    error: &BrainError,
-) -> (&'static str, TerminalSessionReason, bool, &'static str) {
-    match error {
-        BrainError::MissingApiKey => (
-            "provider_auth_failure",
-            TerminalSessionReason::ProviderAuthFailed,
-            false,
-            "error_kind=missing_api_key",
-        ),
-        BrainError::Connection(message) | BrainError::Protocol(message) => {
-            let normalized = message.to_ascii_lowercase();
-            if normalized.contains("auth")
-                || normalized.contains("api key")
-                || normalized.contains("_api_key")
-                || normalized.contains("unauthorized")
-                || normalized.contains("forbidden")
-                || normalized.contains("permission")
-            {
-                return (
-                    "provider_auth_failure",
-                    TerminalSessionReason::ProviderAuthFailed,
-                    false,
-                    "error_kind=provider_auth",
-                );
-            }
-            if normalized.contains("rate")
-                || normalized.contains("quota")
-                || normalized.contains("budget")
-                || normalized.contains("429")
-            {
-                return (
-                    "quota_rate_failure",
-                    TerminalSessionReason::ProviderRateLimited,
-                    true,
-                    "error_kind=provider_rate_limited",
-                );
-            }
-            if normalized.contains("timeout") || normalized.contains("timed out") {
-                return (
-                    "timeout",
-                    TerminalSessionReason::ProviderTimeout,
-                    true,
-                    "error_kind=deadline_elapsed",
-                );
-            }
-            if normalized.contains("cancel") || normalized.contains("abort") {
-                return (
-                    "cancellation",
-                    TerminalSessionReason::ProviderCancelled,
-                    true,
-                    "error_kind=provider_cancelled",
-                );
-            }
-            if matches!(error, BrainError::Protocol(_))
-                || normalized.contains("protocol")
-                || normalized.contains("invalid")
-                || normalized.contains("malformed")
-                || normalized.contains("parse")
-                || normalized.contains("schema")
-            {
-                return (
-                    "malformed_stream",
-                    TerminalSessionReason::ProviderMalformedStream,
-                    true,
-                    "error_kind=malformed_stream",
-                );
-            }
-            (
-                "network_disconnect",
-                TerminalSessionReason::ProviderNetworkDisconnect,
-                true,
-                "error_kind=network_disconnect",
-            )
-        }
-        BrainError::StageFailure(_) => (
-            "stage_failure",
-            TerminalSessionReason::ProviderMalformedStream,
-            true,
-            "error_kind=stage_failure",
-        ),
-    }
+    brain_failure(BrainProviderFailureParts {
+        failure_class,
+        stage,
+        retry_eligible,
+        latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
+        provider: "gemini".to_owned(),
+        model: config.model_id.clone(),
+        metadata: metadata.to_owned(),
+    })
 }
 
 fn gemini_status_metadata(response: &GeminiSseResponse) -> String {
@@ -1451,6 +1374,22 @@ fn viva_system_instruction() -> String {
 
 #[cfg(test)]
 mod tests {
+    use agent_domain::TerminalSessionReason;
+
+    /// A scripted transport fault carrying the classification a real transport
+    /// would have chosen. The hostile marker stays out of it by construction.
+    fn fixture_transport_failure() -> BrainError {
+        brain_failure(BrainProviderFailureParts {
+            failure_class: BrainFailureClass::NetworkDisconnect,
+            stage: BrainFailureStage::Transport,
+            retry_eligible: true,
+            latency_ms: 0,
+            provider: "gemini".to_owned(),
+            model: "gemini".to_owned(),
+            metadata: "error_kind=request_failed".to_owned(),
+        })
+    }
+
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1484,15 +1423,15 @@ mod tests {
         let failure = failure
             .as_ref()
             .expect("fallback activation carries originating provider failure");
-        assert_eq!(failure.failure_class, "quota_rate_failure");
+        assert_eq!(failure.failure_class(), BrainFailureClass::QuotaRateFailure);
         assert_eq!(
-            failure.terminal_reason,
+            failure.terminal_reason(),
             TerminalSessionReason::ProviderRateLimited
         );
-        assert_eq!(failure.provider, "gemini");
-        assert_eq!(failure.model, from_model.replace('.', ""));
+        assert_eq!(failure.provider(), "gemini");
+        assert_eq!(failure.model(), from_model.replace('.', ""));
         assert!(failure
-            .metadata
+            .metadata()
             .contains(&format!("retry_after_ms={retry_after_ms}")));
     }
 
@@ -1686,23 +1625,40 @@ data: [DONE]
             json!({ "contents": [] }),
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
-        assert!(error.contains("Gemini stream request failed"));
-        assert!(!error.contains(unsafe_marker));
-        assert!(!error.contains("local-fixture"));
+        // The transport classified what it observed; nothing downstream re-reads
+        // a message, so the provider's own words never enter the failure.
+        assert_eq!(
+            failure.failure_class(),
+            BrainFailureClass::NetworkDisconnect
+        );
+        assert_eq!(failure.stage(), BrainFailureStage::Transport);
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains(unsafe_marker));
+        assert!(!rendered.contains("local-fixture"));
     }
 
+    /// The status is the classifier, and only its integer survives. The body a
+    /// provider sent with it is dropped whole.
     #[tokio::test]
     async fn streaming_transport_preserves_safe_http_status_failures() {
         let unsafe_marker = "UNSAFE_STATUS_MARKER";
-        for status in [401_u16, 403, 404, 429] {
+        for (status, expected) in [
+            (401_u16, BrainFailureClass::ProviderAuthFailure),
+            (403, BrainFailureClass::ProviderAuthFailure),
+            (404, BrainFailureClass::MalformedStream),
+            (429, BrainFailureClass::QuotaRateFailure),
+        ] {
             let client = RecordingGeminiSseClient {
                 capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-                response: RecordingGeminiResponse::Error(format!(
-                    "Gemini stream request failed with status {status} after {unsafe_marker}"
-                )),
+                response: RecordingGeminiResponse::Response(GeminiSseResponse {
+                    status,
+                    body: format!(r#"{{"error":{{"message":"{unsafe_marker}"}}}}"#),
+                    retry_after: None,
+                    reset_after: None,
+                }),
             };
 
             let error = stream_gemini_with_client(
@@ -1714,14 +1670,22 @@ data: [DONE]
                 json!({ "contents": [] }),
             )
             .await
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
+            let failure = error.failure();
 
-            assert!(error.contains(&format!(
-                "Gemini stream request failed with status {status}"
-            )));
-            assert!(!error.contains(unsafe_marker));
-            assert!(!error.contains("local-fixture"));
+            assert_eq!(failure.failure_class(), expected, "status {status}");
+            assert_eq!(failure.stage(), BrainFailureStage::Gemini);
+            assert!(failure
+                .metadata()
+                .contains(&format!("http_status={status}")));
+            assert_eq!(
+                failure.retry_eligible(),
+                status == 429,
+                "status {status} retry policy"
+            );
+            let rendered = format!("{error} {failure:?}");
+            assert!(!rendered.contains(unsafe_marker));
+            assert!(!rendered.contains("local-fixture"));
         }
     }
 
@@ -1730,9 +1694,12 @@ data: [DONE]
         let unsafe_marker = "UNSAFE_STATUS_MARKER";
         let client = RecordingGeminiSseClient {
             capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-            response: RecordingGeminiResponse::Error(format!(
-                "Gemini stream request failed with status 503 after {unsafe_marker}"
-            )),
+            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+                status: 503,
+                body: format!(r#"{{"error":{{"message":"{unsafe_marker}"}}}}"#),
+                retry_after: None,
+                reset_after: None,
+            }),
         };
 
         let error = stream_gemini_with_client(
@@ -1744,16 +1711,17 @@ data: [DONE]
             json!({ "contents": [] }),
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
         assert_eq!(
-            error,
-            "brain connection failed: Gemini stream request failed"
+            failure.failure_class(),
+            BrainFailureClass::NetworkDisconnect
         );
-        assert!(!error.contains("503"));
-        assert!(!error.contains(unsafe_marker));
-        assert!(!error.contains("local-fixture"));
+        assert!(failure.metadata().contains("http_status=503"));
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains(unsafe_marker));
+        assert!(!rendered.contains("local-fixture"));
     }
 
     #[tokio::test]
@@ -1772,12 +1740,15 @@ data: [DONE]
             json!({ "contents": [{ "parts": [{ "text": unsafe_marker }] }] }),
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
-        assert!(error.contains("Gemini generation stage timeout"));
-        assert!(!error.contains(unsafe_marker));
-        assert!(!error.contains("local-fixture"));
+        assert_eq!(failure.failure_class(), BrainFailureClass::Timeout);
+        assert_eq!(failure.stage(), BrainFailureStage::Gemini);
+        assert_eq!(failure.metadata(), "error_kind=generation_stage_timeout");
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains(unsafe_marker));
+        assert!(!rendered.contains("local-fixture"));
     }
 
     #[tokio::test]
@@ -1805,25 +1776,27 @@ data: [DONE]
         .await
         .unwrap_err();
 
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected Gemini 429 stage failure");
-        };
-        assert_eq!(failure.failure_class, "quota_rate_failure");
+        let failure = error.failure();
+        assert_eq!(failure.failure_class(), BrainFailureClass::QuotaRateFailure);
         assert_eq!(
-            failure.terminal_reason,
+            failure.terminal_reason(),
             agent_domain::TerminalSessionReason::ProviderRateLimited
         );
-        assert_eq!(failure.provider, "gemini");
-        assert_eq!(failure.model, "gemini-35-flash");
-        assert!(failure.metadata.contains("http_status=429"));
-        assert!(failure.metadata.contains("retry_after_ms=7000"));
+        assert_eq!(failure.provider(), "gemini");
+        assert_eq!(failure.model(), "gemini-35-flash");
+        assert!(failure.metadata().contains("http_status=429"));
+        assert!(failure.metadata().contains("retry_after_ms=7000"));
         assert!(failure
-            .metadata
+            .metadata()
             .contains("retry_after_source=retry_after_delta"));
-        assert!(failure.metadata.contains("reset_hint=2030-01-01T00:00:00Z"));
-        assert!(failure.metadata.contains("body_status=resource_exhausted"));
-        assert!(failure.metadata.contains("budget_state=unknown"));
-        assert!(!failure.metadata.contains("UNSAFE_429_BODY_MARKER"));
+        assert!(failure
+            .metadata()
+            .contains("reset_hint=2030-01-01T00:00:00Z"));
+        assert!(failure
+            .metadata()
+            .contains("body_status=resource_exhausted"));
+        assert!(failure.metadata().contains("budget_state=unknown"));
+        assert!(!failure.metadata().contains("UNSAFE_429_BODY_MARKER"));
         assert!(!failure.to_string().contains("UNSAFE_429_BODY_MARKER"));
     }
 
@@ -1852,14 +1825,12 @@ data: [DONE]
         .await
         .unwrap_err();
 
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected Gemini 429 stage failure");
-        };
-        assert_eq!(failure.failure_class, "quota_rate_failure");
-        assert!(failure.metadata.contains("retry_after_ms=1000"));
-        assert!(failure.metadata.contains("retry_after_source=default"));
-        assert!(!failure.metadata.contains("UNSAFE_DEFAULT_BODY_MARKER"));
-        assert!(!failure.metadata.contains("not a retry hint"));
+        let failure = error.failure();
+        assert_eq!(failure.failure_class(), BrainFailureClass::QuotaRateFailure);
+        assert!(failure.metadata().contains("retry_after_ms=1000"));
+        assert!(failure.metadata().contains("retry_after_source=default"));
+        assert!(!failure.metadata().contains("UNSAFE_DEFAULT_BODY_MARKER"));
+        assert!(!failure.metadata().contains("not a retry hint"));
     }
 
     #[tokio::test]
@@ -1886,16 +1857,16 @@ data: [DONE]
         .await
         .unwrap_err();
 
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected Gemini 429 stage failure");
-        };
-        assert!(failure.metadata.contains("retry_after_ms=30000"));
+        let failure = error.failure();
+        assert!(failure.metadata().contains("retry_after_ms=30000"));
         assert!(failure
-            .metadata
+            .metadata()
             .contains("retry_after_source=body_retry_info"));
-        assert!(failure.metadata.contains("body_status=resource_exhausted"));
-        assert!(!failure.metadata.contains("RetryInfo"));
-        assert!(!failure.metadata.contains("retryDelay"));
+        assert!(failure
+            .metadata()
+            .contains("body_status=resource_exhausted"));
+        assert!(!failure.metadata().contains("RetryInfo"));
+        assert!(!failure.metadata().contains("retryDelay"));
     }
 
     #[tokio::test]
@@ -1932,16 +1903,18 @@ data: [DONE]
         .error;
         server.abort();
 
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected Gemini 429 stage failure");
-        };
-        assert!(failure.metadata.contains("http_status=429"));
-        assert!(failure.metadata.contains("retry_after_ms=30000"));
+        let failure = error.failure();
+        assert!(failure.metadata().contains("http_status=429"));
+        assert!(failure.metadata().contains("retry_after_ms=30000"));
         assert!(failure
-            .metadata
+            .metadata()
             .contains("retry_after_source=body_retry_info"));
-        assert!(failure.metadata.contains("body_status=resource_exhausted"));
-        assert!(!failure.metadata.contains("UNSAFE_REQWEST_429_BODY_MARKER"));
+        assert!(failure
+            .metadata()
+            .contains("body_status=resource_exhausted"));
+        assert!(!failure
+            .metadata()
+            .contains("UNSAFE_REQWEST_429_BODY_MARKER"));
         assert!(!failure
             .to_string()
             .contains("UNSAFE_REQWEST_429_BODY_MARKER"));
@@ -1986,18 +1959,16 @@ data: [DONE]
         .error;
         server.abort();
 
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected Gemini 429 stage failure");
-        };
-        assert!(failure.metadata.contains("http_status=429"));
-        assert!(failure.metadata.contains("retry_after_ms=5000"));
+        let failure = error.failure();
+        assert!(failure.metadata().contains("http_status=429"));
+        assert!(failure.metadata().contains("retry_after_ms=5000"));
         assert!(failure
-            .metadata
+            .metadata()
             .contains("retry_after_source=retry_after_delta"));
-        assert!(failure.metadata.contains("reset_hint=relative_ms=30000"));
-        assert!(failure.metadata.contains("body_status=unknown"));
+        assert!(failure.metadata().contains("reset_hint=relative_ms=30000"));
+        assert!(failure.metadata().contains("body_status=unknown"));
         assert!(!failure
-            .metadata
+            .metadata()
             .contains("UNSAFE_OVERSIZED_429_BODY_MARKER"));
         assert!(!failure
             .to_string()
@@ -2028,12 +1999,10 @@ data: [DONE]
         .await
         .unwrap_err();
 
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected Gemini 429 stage failure");
-        };
-        assert!(failure.metadata.contains("retry_after_ms=1500"));
+        let failure = error.failure();
+        assert!(failure.metadata().contains("retry_after_ms=1500"));
         assert!(failure
-            .metadata
+            .metadata()
             .contains("retry_after_source=body_retry_info"));
     }
 
@@ -2081,14 +2050,12 @@ data: [DONE]
         .await
         .unwrap_err();
 
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected Gemini 429 stage failure");
-        };
-        assert!(failure.metadata.contains("retry_after_ms=120000"));
+        let failure = error.failure();
+        assert!(failure.metadata().contains("retry_after_ms=120000"));
         assert!(failure
-            .metadata
+            .metadata()
             .contains("retry_after_source=body_retry_text"));
-        assert!(!failure.metadata.contains("fixture retry"));
+        assert!(!failure.metadata().contains("fixture retry"));
     }
 
     #[test]
@@ -2125,11 +2092,9 @@ data: [DONE]
         .await
         .unwrap_err();
 
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected Gemini 429 stage failure");
-        };
-        assert!(failure.metadata.contains("reset_hint=none"));
-        assert!(!failure.metadata.contains("quota-account-abc123"));
+        let failure = error.failure();
+        assert!(failure.metadata().contains("reset_hint=none"));
+        assert!(!failure.metadata().contains("quota-account-abc123"));
     }
 
     #[tokio::test]
@@ -2155,10 +2120,8 @@ data: [DONE]
         .await
         .unwrap_err();
 
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected Gemini 429 stage failure");
-        };
-        assert!(failure.metadata.contains("reset_hint=relative_ms=30000"));
+        let failure = error.failure();
+        assert!(failure.metadata().contains("reset_hint=relative_ms=30000"));
     }
 
     #[test]
@@ -2180,18 +2143,18 @@ data: [DONE]
             Duration::from_millis(42),
         );
 
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected Gemini 429 stage failure");
-        };
-        assert_eq!(failure.failure_class, "quota_rate_failure");
+        let failure = error.failure();
+        assert_eq!(failure.failure_class(), BrainFailureClass::QuotaRateFailure);
         assert_eq!(
-            failure.terminal_reason,
+            failure.terminal_reason(),
             agent_domain::TerminalSessionReason::ProviderRateLimited
         );
-        assert_eq!(failure.latency_ms, 42);
-        assert!(failure.metadata.contains("retry_after_ms=5000"));
-        assert!(failure.metadata.contains("reset_hint=2030-01-01T00:00:00Z"));
-        assert!(failure.metadata.contains("body_status=unknown"));
+        assert_eq!(failure.latency_ms(), 42);
+        assert!(failure.metadata().contains("retry_after_ms=5000"));
+        assert!(failure
+            .metadata()
+            .contains("reset_hint=2030-01-01T00:00:00Z"));
+        assert!(failure.metadata().contains("body_status=unknown"));
     }
 
     #[test]
@@ -2216,10 +2179,16 @@ data: [DONE]
     }
 
     #[test]
-    fn success_body_read_failure_remains_connection_failure() {
+    fn success_body_read_failure_remains_a_typed_transport_failure() {
         let error = gemini_sse_response_from_http_parts(200, None, None, Err(())).unwrap_err();
+        let failure = error.failure();
 
-        assert!(matches!(error, BrainError::Connection(_)));
+        assert_eq!(
+            failure.failure_class(),
+            BrainFailureClass::NetworkDisconnect
+        );
+        assert_eq!(failure.stage(), BrainFailureStage::Transport);
+        assert_eq!(failure.metadata(), "error_kind=response_read_failed");
     }
 
     #[tokio::test]
@@ -2432,16 +2401,14 @@ data: [DONE]
         .unwrap_err();
 
         assert!(started.elapsed() < Duration::from_millis(120));
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected fallback timeout stage failure");
-        };
-        assert_eq!(failure.failure_class, "timeout");
+        let failure = error.failure();
+        assert_eq!(failure.failure_class(), BrainFailureClass::Timeout);
         assert_eq!(
-            failure.terminal_reason,
+            failure.terminal_reason(),
             agent_domain::TerminalSessionReason::ProviderTimeout
         );
-        assert_eq!(failure.provider, "gemini");
-        assert_eq!(failure.model, "gemini-35-flash");
+        assert_eq!(failure.provider(), "gemini");
+        assert_eq!(failure.model(), "gemini-35-flash");
         assert_eq!(
             client.captures.lock().expect("capture lock poisoned").len(),
             2
@@ -2481,18 +2448,19 @@ data: [DONE]
         .await
         .unwrap_err();
 
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected Gemini fallback stage failure");
-        };
-        assert_eq!(failure.failure_class, "network_disconnect");
+        let failure = error.failure();
         assert_eq!(
-            failure.terminal_reason,
+            failure.failure_class(),
+            BrainFailureClass::NetworkDisconnect
+        );
+        assert_eq!(
+            failure.terminal_reason(),
             TerminalSessionReason::ProviderNetworkDisconnect
         );
-        assert_eq!(failure.provider, "gemini");
-        assert_eq!(failure.model, "gemini-25-flash");
-        assert!(failure.metadata.contains("http_status=503"));
-        assert!(failure.metadata.contains("body_status=unavailable"));
+        assert_eq!(failure.provider(), "gemini");
+        assert_eq!(failure.model(), "gemini-25-flash");
+        assert!(failure.metadata().contains("http_status=503"));
+        assert!(failure.metadata().contains("body_status=unavailable"));
         assert!(!failure.to_string().contains("fixture-redacted-input"));
     }
 
@@ -2537,15 +2505,16 @@ data: [DONE]
             "primary_429",
             1_000,
         );
-        let BrainError::StageFailure(stage_failure) = failure.error else {
-            panic!("expected Gemini fallback stage failure");
-        };
-        assert_eq!(stage_failure.failure_class, "network_disconnect");
+        let stage_failure = failure.error.failure();
         assert_eq!(
-            stage_failure.terminal_reason,
+            stage_failure.failure_class(),
+            BrainFailureClass::NetworkDisconnect
+        );
+        assert_eq!(
+            stage_failure.terminal_reason(),
             TerminalSessionReason::ProviderNetworkDisconnect
         );
-        assert_eq!(stage_failure.model, "gemini-25-flash");
+        assert_eq!(stage_failure.model(), "gemini-25-flash");
         assert!(!stage_failure.to_string().contains("fixture-redacted-input"));
     }
 
@@ -2585,13 +2554,14 @@ data: [DONE]
             "primary_429",
             1_000,
         );
-        let BrainError::StageFailure(stage_failure) = failure.error else {
-            panic!("expected Gemini fallback empty response stage failure");
-        };
-        assert_eq!(stage_failure.failure_class, "malformed_stream");
-        assert_eq!(stage_failure.provider, "gemini");
-        assert_eq!(stage_failure.model, "gemini-25-flash");
-        assert!(stage_failure.metadata.contains("error_kind=empty_stream"));
+        let stage_failure = failure.error.failure();
+        assert_eq!(
+            stage_failure.failure_class(),
+            BrainFailureClass::MalformedStream
+        );
+        assert_eq!(stage_failure.provider(), "gemini");
+        assert_eq!(stage_failure.model(), "gemini-25-flash");
+        assert!(stage_failure.metadata().contains("error_kind=empty_stream"));
         assert!(!stage_failure.to_string().contains("fixture-redacted-input"));
     }
 
@@ -2631,13 +2601,14 @@ data: [DONE]
             "primary_429",
             1_000,
         );
-        let BrainError::StageFailure(stage_failure) = failure.error else {
-            panic!("expected no-parsed-events fallback stream to fail");
-        };
-        assert_eq!(stage_failure.failure_class, "malformed_stream");
-        assert_eq!(stage_failure.provider, "gemini");
-        assert_eq!(stage_failure.model, "gemini-25-flash");
-        assert!(stage_failure.metadata.contains("error_kind=empty_stream"));
+        let stage_failure = failure.error.failure();
+        assert_eq!(
+            stage_failure.failure_class(),
+            BrainFailureClass::MalformedStream
+        );
+        assert_eq!(stage_failure.provider(), "gemini");
+        assert_eq!(stage_failure.model(), "gemini-25-flash");
+        assert!(stage_failure.metadata().contains("error_kind=empty_stream"));
     }
 
     #[tokio::test]
@@ -2678,17 +2649,15 @@ data: [DONE]
         .await
         .unwrap_err();
 
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected Gemini fallback timeout stage failure");
-        };
-        assert_eq!(failure.failure_class, "timeout");
+        let failure = error.failure();
+        assert_eq!(failure.failure_class(), BrainFailureClass::Timeout);
         assert_eq!(
-            failure.terminal_reason,
+            failure.terminal_reason(),
             agent_domain::TerminalSessionReason::ProviderTimeout
         );
-        assert_eq!(failure.provider, "gemini");
-        assert_eq!(failure.model, "gemini-35-flash");
-        assert!(failure.retry_eligible);
+        assert_eq!(failure.provider(), "gemini");
+        assert_eq!(failure.model(), "gemini-35-flash");
+        assert!(failure.retry_eligible());
         assert!(!failure.to_string().contains("fixture-redacted-input"));
     }
 
@@ -2726,13 +2695,11 @@ data: [DONE]
             1,
             "fallback request should not be sent after the shared deadline expires"
         );
-        let BrainError::StageFailure(failure) = failure.error else {
-            panic!("expected expired fallback deadline to remain a provider stage failure");
-        };
-        assert_eq!(failure.failure_class, "timeout");
-        assert_eq!(failure.provider, "gemini");
-        assert_eq!(failure.model, "gemini-35-flash");
-        assert!(failure.retry_eligible);
+        let failure = failure.error.failure();
+        assert_eq!(failure.failure_class(), BrainFailureClass::Timeout);
+        assert_eq!(failure.provider(), "gemini");
+        assert_eq!(failure.model(), "gemini-35-flash");
+        assert!(failure.retry_eligible());
         assert!(!failure.to_string().contains("fixture-redacted-input"));
     }
 
@@ -2747,9 +2714,7 @@ data: [DONE]
                     retry_after: Some("1".to_owned()),
                     reset_after: None,
                 }),
-                Err(BrainError::Connection(
-                    "fallback socket closed after fixture-redacted-input".to_owned(),
-                )),
+                Err(fixture_transport_failure()),
             ])),
         };
 
@@ -2766,13 +2731,14 @@ data: [DONE]
         .await
         .unwrap_err();
 
-        let BrainError::StageFailure(failure) = error else {
-            panic!("expected Gemini fallback client stage failure");
-        };
-        assert_eq!(failure.failure_class, "network_disconnect");
-        assert_eq!(failure.provider, "gemini");
-        assert_eq!(failure.model, "gemini-25-flash");
-        assert!(failure.retry_eligible);
+        let failure = error.failure();
+        assert_eq!(
+            failure.failure_class(),
+            BrainFailureClass::NetworkDisconnect
+        );
+        assert_eq!(failure.provider(), "gemini");
+        assert_eq!(failure.model(), "gemini-25-flash");
+        assert!(failure.retry_eligible());
         assert!(!failure.to_string().contains("fixture-redacted-input"));
     }
 
@@ -2797,16 +2763,17 @@ data: [DONE]
             json!({ "contents": [] }),
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
         assert_eq!(
-            error,
-            "brain connection failed: Gemini stream request failed"
+            failure.failure_class(),
+            BrainFailureClass::NetworkDisconnect
         );
-        assert!(!error.contains("503"));
-        assert!(!error.contains("UNSAFE_503_BODY_MARKER"));
-        assert!(!error.contains("local-fixture"));
+        assert!(failure.metadata().contains("http_status=503"));
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains("UNSAFE_503_BODY_MARKER"));
+        assert!(!rendered.contains("local-fixture"));
     }
 
     #[tokio::test]
@@ -2830,15 +2797,15 @@ data: [DONE]
             json!({ "contents": [] }),
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
-        assert_eq!(
-            error,
-            "brain protocol error: Gemini stream request failed with status 404"
-        );
-        assert!(!error.contains("UNSAFE_404_BODY_MARKER"));
-        assert!(!error.contains("local-fixture"));
+        assert_eq!(failure.failure_class(), BrainFailureClass::MalformedStream);
+        assert!(failure.metadata().contains("http_status=404"));
+        assert!(!failure.retry_eligible());
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains("UNSAFE_404_BODY_MARKER"));
+        assert!(!rendered.contains("local-fixture"));
     }
 
     #[test]
@@ -2898,7 +2865,7 @@ data: [DONE]
     enum RecordingGeminiResponse {
         Body(String),
         Response(GeminiSseResponse),
-        Error(String),
+        Error(#[allow(dead_code)] String),
     }
 
     #[async_trait]
@@ -2915,9 +2882,7 @@ data: [DONE]
             match &self.response {
                 RecordingGeminiResponse::Body(body) => Ok(GeminiSseResponse::ok(body.clone())),
                 RecordingGeminiResponse::Response(response) => Ok(response.clone()),
-                RecordingGeminiResponse::Error(message) => {
-                    Err(BrainError::Connection(message.clone()))
-                }
+                RecordingGeminiResponse::Error(_) => Err(fixture_transport_failure()),
             }
         }
     }
@@ -3023,6 +2988,471 @@ data: [DONE]
             Ok(GeminiSseResponse::ok(
                 r#"data: {"candidates":[{"content":{"parts":[{"text":"too late"}]}}]}"#.to_owned(),
             ))
+        }
+    }
+}
+
+/// The instruction the provider-backed evaluator is bound by.
+///
+/// It asks for criterion-level verdicts and nothing else. There is deliberately
+/// no place in the schema for a label, a score, a status, a concept, a due date,
+/// or a recap: `LEARN-002` derives every one of those on the server from the
+/// verdicts below, and a payload that volunteers one is refused rather than
+/// mapped or ignored.
+const VIVA_EVALUATION_INSTRUCTION: &str = concat!(
+    "You are a criterion checker. The user message is one JSON EvaluationRequest. ",
+    "Reply with one JSON object and no prose. Either ",
+    r#"{"kind":"evaluated","assessments":[{"criterion_id":<id from the rubric>,"#,
+    r#""assessment":"satisfied"|"contradicted"|"not_demonstrated","confidence":<0..1>}],"#,
+    r#""concise_feedback":<one short sentence>,"retry_prompt":<one short sentence or null>} "#,
+    "with exactly one assessment per rubric criterion, or ",
+    r#"{"kind":"deferred","reason":"insufficient_semantic_evidence"|"contradictory_evidence","#,
+    r#""can_retry_same_question":true}. "#,
+    "Never include a label, grade, score, status, concept, review date, or any other field.",
+);
+
+/// The live [`AnswerEvaluator`] (`ADAPTER-01`).
+///
+/// It moves the model's criterion verdicts across the wire and stops there. It
+/// derives no `EvaluationLabel`, no confidence aggregate, no concept status, no
+/// schedule, and no recap; the Plan 04 executor owns every one of those, binds
+/// the verdicts to the authorized rubric, and decides what is persisted. Every
+/// unusable provider answer becomes a typed [`EvaluationError`], which the
+/// executor turns into a persisted deferral.
+pub(crate) struct GeminiAnswerEvaluator {
+    client: Arc<dyn GeminiSseClient>,
+    config: GeminiConfig,
+}
+
+impl GeminiAnswerEvaluator {
+    /// The live composition. Task 4 later moves this onto the shared connection
+    /// pool without changing evaluator semantics.
+    pub(crate) fn live(config: &GeminiConfig) -> Self {
+        Self {
+            client: Arc::new(ReqwestGeminiSseClient::default()),
+            config: config.clone(),
+        }
+    }
+
+    /// The injectable seam this lane already owned. Task 4 moves the live
+    /// composition onto it without changing evaluator semantics.
+    #[cfg(test)]
+    pub(crate) fn with_client(client: Arc<dyn GeminiSseClient>, config: GeminiConfig) -> Self {
+        Self { client, config }
+    }
+}
+
+#[async_trait]
+impl AnswerEvaluator for GeminiAnswerEvaluator {
+    async fn evaluate(
+        &self,
+        request: &EvaluationRequest,
+    ) -> Result<EvaluationDecision, EvaluationError> {
+        let stream_request =
+            GeminiStreamRequest::new(&self.config, gemini_evaluation_request_body(request))
+                .map_err(|_| EvaluationError::Unavailable)?;
+        let response = timeout(
+            self.config.stage_timeout,
+            self.client.stream(stream_request),
+        )
+        .await
+        .map_err(|_| EvaluationError::Timeout)?
+        .map_err(|_| EvaluationError::Unavailable)?;
+        if !(200..300).contains(&response.status) {
+            return Err(EvaluationError::Unavailable);
+        }
+        parse_gemini_evaluation_decision(
+            &gemini_stream_model_text(&response.body),
+            &request.question.rubric,
+        )
+    }
+}
+
+/// Only Plan 04's server-bound `EvaluationRequest` crosses the wire.
+fn gemini_evaluation_request_body(request: &EvaluationRequest) -> Value {
+    let payload = serde_json::to_value(request).unwrap_or(Value::Null);
+    json!({
+        "systemInstruction": { "parts": [{ "text": VIVA_EVALUATION_INSTRUCTION }] },
+        "contents": [{ "role": "user", "parts": [{ "text": payload.to_string() }] }],
+        "generationConfig": { "responseMimeType": "application/json" },
+    })
+}
+
+fn gemini_stream_model_text(body: &str) -> String {
+    parse_gemini_sse_stream(body)
+        .into_iter()
+        .filter_map(|event| match event {
+            GeminiStreamEvent::ModelPart { text, .. } => text,
+            _ => None,
+        })
+        .collect()
+}
+
+fn parse_gemini_evaluation_decision(
+    text: &str,
+    rubric: &agent_domain::EvaluationRubricV1,
+) -> Result<EvaluationDecision, EvaluationError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(EvaluationError::MalformedResponse);
+    }
+    let value: Value =
+        serde_json::from_str(trimmed).map_err(|_| EvaluationError::MalformedResponse)?;
+    // A provider-supplied label is refused outright. Being overruled in silence
+    // would teach the caller nothing, and mapping it would hand the model the
+    // one derivation `viva.semantic-rubric.v1` reserves for the server.
+    if value.get("label").is_some() {
+        return Err(EvaluationError::ContractViolation);
+    }
+    let decision: EvaluationDecision =
+        serde_json::from_value(value).map_err(|_| EvaluationError::MalformedResponse)?;
+    if let EvaluationDecision::Evaluated {
+        assessments,
+        concise_feedback,
+        ..
+    } = &decision
+    {
+        validate_gemini_assessments(assessments, rubric)?;
+        if concise_feedback.trim().is_empty() {
+            return Err(EvaluationError::ContractViolation);
+        }
+    }
+    Ok(decision)
+}
+
+/// Exactly one finite in-range verdict per authorized criterion. Equal
+/// cardinality plus equal id sets is precisely "assessed once each", so a
+/// duplicate, an unknown id, and a missing criterion are all caught here rather
+/// than becoming a partial grade downstream.
+fn validate_gemini_assessments(
+    assessments: &[CriterionAssessment],
+    rubric: &agent_domain::EvaluationRubricV1,
+) -> Result<(), EvaluationError> {
+    let rubric_ids = rubric
+        .criteria
+        .iter()
+        .map(|criterion| criterion.criterion_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let assessed_ids = assessments
+        .iter()
+        .map(|assessment| assessment.criterion_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if assessments.is_empty()
+        || assessments.len() != rubric.criteria.len()
+        || assessed_ids != rubric_ids
+    {
+        return Err(EvaluationError::ContractViolation);
+    }
+    if assessments.iter().any(|assessment| {
+        !assessment.confidence.is_finite() || !(0.0..=1.0).contains(&assessment.confidence)
+    }) {
+        return Err(EvaluationError::ContractViolation);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Task 1 (`ADAPTER-01`): the live provider-backed `AnswerEvaluator`. It carries
+// the model's criterion verdicts across the wire and nothing else — no label,
+// no grade, no status, no concept, no schedule, no recap.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod live_evaluator_tests {
+    use std::sync::{Arc, Mutex};
+
+    use agent_domain::{
+        AnswerEvaluator, CriterionAssessmentKind, EvaluationDecision, EvaluationDeferralReason,
+        EvaluationError, EvaluationRequest, EvaluationRubricV1, RubricCriterionV1,
+        SourceConfidence, StudyQuestion, StudySourceReference,
+    };
+    use serde_json::json;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct RecordingEvaluatorClient {
+        requests: Arc<Mutex<Vec<Value>>>,
+        responses: Arc<Mutex<Vec<Result<String, ()>>>>,
+    }
+
+    impl RecordingEvaluatorClient {
+        fn scripted(body: &str) -> Self {
+            let client = Self::default();
+            client
+                .responses
+                .lock()
+                .expect("response lock poisoned")
+                .push(Ok(body.to_owned()));
+            client
+        }
+
+        fn requests(&self) -> Vec<Value> {
+            self.requests.lock().expect("request lock poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl GeminiSseClient for RecordingEvaluatorClient {
+        async fn stream(
+            &self,
+            request: GeminiStreamRequest,
+        ) -> Result<GeminiSseResponse, BrainError> {
+            self.requests
+                .lock()
+                .expect("request lock poisoned")
+                .push(request.body.clone());
+            let next = self
+                .responses
+                .lock()
+                .expect("response lock poisoned")
+                .pop()
+                .unwrap_or(Ok(String::new()));
+            match next {
+                Ok(body) => Ok(GeminiSseResponse::ok(body)),
+                Err(()) => Err(BrainError::from_failure(BrainProviderFailure::new(
+                    BrainProviderFailureParts {
+                        failure_class: agent_domain::BrainFailureClass::NetworkDisconnect,
+                        stage: agent_domain::BrainFailureStage::Gemini,
+                        retry_eligible: true,
+                        latency_ms: 1,
+                        provider: "gemini".to_owned(),
+                        model: "gemini-test-model".to_owned(),
+                        metadata: "error_kind=network_disconnect".to_owned(),
+                    },
+                ))),
+            }
+        }
+    }
+
+    fn evaluator_rubric() -> EvaluationRubricV1 {
+        EvaluationRubricV1 {
+            policy_version: agent_domain::learning_outcome::VIVA_SEMANTIC_RUBRIC_POLICY_VERSION
+                .to_owned(),
+            criteria: vec![
+                RubricCriterionV1 {
+                    criterion_id: "crit-one".to_owned(),
+                    concept_id: "concept-one".to_owned(),
+                    claim: "The first claim.".to_owned(),
+                    source_id: "src-one".to_owned(),
+                    required: true,
+                },
+                RubricCriterionV1 {
+                    criterion_id: "crit-two".to_owned(),
+                    concept_id: "concept-one".to_owned(),
+                    claim: "The second claim.".to_owned(),
+                    source_id: "src-one".to_owned(),
+                    required: false,
+                },
+            ],
+        }
+    }
+
+    fn evaluation_request() -> EvaluationRequest {
+        EvaluationRequest {
+            response_id: "response-1".to_owned(),
+            question: StudyQuestion {
+                question_id: "q-1".to_owned(),
+                concept_id: "concept-one".to_owned(),
+                prompt: "State the two claims.".to_owned(),
+                expected_terms: Vec::new(),
+                follow_up: "Say the second claim.".to_owned(),
+                rubric: evaluator_rubric(),
+                source: StudySourceReference {
+                    source_id: "src-one".to_owned(),
+                    document_id: "doc-1".to_owned(),
+                    span: "page:1".to_owned(),
+                    excerpt: "the bound claim".to_owned(),
+                    confidence: SourceConfidence::High,
+                    retrieval_reason: "server-bound rubric source".to_owned(),
+                },
+            },
+            answer_text: "the learner answer".to_owned(),
+            transcript_confidence: Some(0.88),
+        }
+    }
+
+    fn sse_body(payload: Value) -> String {
+        let text = payload.to_string();
+        format!(
+            "data: {}\n\n",
+            json!({ "candidates": [{ "content": { "parts": [{ "text": text }] } }] })
+        )
+    }
+
+    fn evaluator(client: RecordingEvaluatorClient) -> GeminiAnswerEvaluator {
+        GeminiAnswerEvaluator::with_client(
+            Arc::new(client),
+            GeminiConfig {
+                api_key: "gemini-test-key".to_owned(),
+                ..GeminiConfig::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn live_gemini_evaluator_returns_typed_model_decisions_without_grading() {
+        let request = evaluation_request();
+
+        let evaluated_client = RecordingEvaluatorClient::scripted(&sse_body(json!({
+            "kind": "evaluated",
+            "assessments": [
+                { "criterion_id": "crit-one", "assessment": "satisfied", "confidence": 0.91 },
+                { "criterion_id": "crit-two", "assessment": "not_demonstrated", "confidence": 0.72 },
+            ],
+            "concise_feedback": "The first claim held; the second was not shown.",
+            "retry_prompt": null,
+        })));
+        let decision = evaluator(evaluated_client.clone())
+            .evaluate(&request)
+            .await
+            .expect("an evaluated decision deserializes");
+        let EvaluationDecision::Evaluated {
+            assessments,
+            concise_feedback,
+            retry_prompt,
+        } = decision
+        else {
+            panic!("expected an evaluated decision");
+        };
+        assert_eq!(assessments.len(), 2);
+        assert_eq!(assessments[0].criterion_id, "crit-one");
+        assert_eq!(
+            assessments[0].assessment,
+            CriterionAssessmentKind::Satisfied
+        );
+        assert_eq!(assessments[1].criterion_id, "crit-two");
+        assert_eq!(
+            assessments[1].assessment,
+            CriterionAssessmentKind::NotDemonstrated
+        );
+        assert_eq!(
+            concise_feedback,
+            "The first claim held; the second was not shown."
+        );
+        assert_eq!(retry_prompt, None);
+
+        // Only Plan 04's server-bound `EvaluationRequest` crosses the wire.
+        let requests = evaluated_client.requests();
+        assert_eq!(requests.len(), 1);
+        let serialized = requests[0].to_string();
+        let bound: EvaluationRequest =
+            serde_json::from_str(&serde_json::to_string(&request).expect("request serializes"))
+                .expect("round trip");
+        assert_eq!(bound.response_id, request.response_id);
+        assert!(serialized.contains("crit-one"));
+        assert!(serialized.contains(&request.answer_text));
+
+        let deferred_client = RecordingEvaluatorClient::scripted(&sse_body(json!({
+            "kind": "deferred",
+            "reason": "insufficient_semantic_evidence",
+            "can_retry_same_question": true,
+        })));
+        let decision = evaluator(deferred_client)
+            .evaluate(&request)
+            .await
+            .expect("a deferred decision deserializes");
+        assert_eq!(
+            decision,
+            EvaluationDecision::Deferred {
+                reason: EvaluationDeferralReason::InsufficientSemanticEvidence,
+                can_retry_same_question: true,
+            }
+        );
+
+        // Malformed, empty, incomplete-criteria and non-finite payloads are all
+        // typed evaluator errors; none of them becomes a grade here.
+        for (body, expected) in [
+            (
+                "data: not json\n\n".to_owned(),
+                EvaluationError::MalformedResponse,
+            ),
+            (String::new(), EvaluationError::MalformedResponse),
+            (
+                sse_body(json!({
+                    "kind": "evaluated",
+                    "assessments": [
+                        { "criterion_id": "crit-one", "assessment": "satisfied", "confidence": 0.91 },
+                    ],
+                    "concise_feedback": "only one criterion",
+                    "retry_prompt": null,
+                })),
+                EvaluationError::ContractViolation,
+            ),
+            (
+                sse_body(json!({
+                    "kind": "evaluated",
+                    "assessments": [
+                        { "criterion_id": "crit-one", "assessment": "satisfied", "confidence": 0.91 },
+                        { "criterion_id": "crit-one", "assessment": "satisfied", "confidence": 0.91 },
+                    ],
+                    "concise_feedback": "duplicate criterion",
+                    "retry_prompt": null,
+                })),
+                EvaluationError::ContractViolation,
+            ),
+            (
+                sse_body(json!({
+                    "kind": "evaluated",
+                    "assessments": [
+                        { "criterion_id": "crit-one", "assessment": "satisfied", "confidence": 2.5 },
+                        { "criterion_id": "crit-two", "assessment": "satisfied", "confidence": 0.7 },
+                    ],
+                    "concise_feedback": "non-finite range",
+                    "retry_prompt": null,
+                })),
+                EvaluationError::ContractViolation,
+            ),
+            (
+                sse_body(json!({
+                    "kind": "evaluated",
+                    "assessments": [
+                        { "criterion_id": "crit-unknown", "assessment": "satisfied", "confidence": 0.9 },
+                        { "criterion_id": "crit-two", "assessment": "satisfied", "confidence": 0.9 },
+                    ],
+                    "concise_feedback": "unknown criterion",
+                    "retry_prompt": null,
+                })),
+                EvaluationError::ContractViolation,
+            ),
+        ] {
+            let error = evaluator(RecordingEvaluatorClient::scripted(&body))
+                .evaluate(&request)
+                .await
+                .expect_err("invalid provider output is a typed evaluator error");
+            assert_eq!(error, expected, "body: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn live_gemini_evaluator_rejects_provider_supplied_label() {
+        let request = evaluation_request();
+        for label in [
+            "strong",
+            "mostly_correct",
+            "partially_correct",
+            "vague",
+            "wrong",
+            "insufficient_evidence",
+        ] {
+            let body = sse_body(json!({
+                "kind": "evaluated",
+                "label": label,
+                "assessments": [
+                    { "criterion_id": "crit-one", "assessment": "satisfied", "confidence": 0.91 },
+                    { "criterion_id": "crit-two", "assessment": "satisfied", "confidence": 0.9 },
+                ],
+                "concise_feedback": "an otherwise valid payload",
+                "retry_prompt": null,
+            }));
+            let error = evaluator(RecordingEvaluatorClient::scripted(&body))
+                .evaluate(&request)
+                .await
+                .expect_err("a provider-supplied label is rejected, never mapped or ignored");
+            assert_eq!(
+                error,
+                EvaluationError::ContractViolation,
+                "label `{label}` must be refused"
+            );
         }
     }
 }

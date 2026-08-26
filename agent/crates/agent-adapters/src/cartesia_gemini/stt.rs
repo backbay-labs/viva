@@ -15,7 +15,11 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 
-use agent_domain::{AudioFrame, BrainError};
+use agent_domain::{
+    AudioFrame, BrainError, BrainFailureClass, BrainFailureStage, BrainProviderFailureParts,
+};
+
+use super::brain_failure;
 
 use super::constants::{
     CARTESIA_SAMPLE_RATE, DEFAULT_CARTESIA_VERSION, DEFAULT_INK_MODEL,
@@ -24,6 +28,54 @@ use super::constants::{
 
 const CARTESIA_VERSION_HEADER: &str = "cartesia-version";
 const INK_CLOSE_COMMAND: &str = r#"{"type":"close"}"#;
+
+/// `ADAPTER-01` / `A-13.2`: Plan 06 collapsed `BrainError` to one classified
+/// variant, so every Ink failure is classified where it is observed. Only a
+/// closed `error_kind` token travels; a provider message, close reason, URL,
+/// credential, or transcript never reaches the metadata.
+fn ink_failure(
+    failure_class: BrainFailureClass,
+    stage: BrainFailureStage,
+    retry_eligible: bool,
+    error_kind: &'static str,
+) -> BrainError {
+    brain_failure(BrainProviderFailureParts {
+        failure_class,
+        stage,
+        retry_eligible,
+        latency_ms: 0,
+        provider: "cartesia".to_owned(),
+        model: "cartesia-ink".to_owned(),
+        metadata: format!("stage=cartesia_ink error_kind={error_kind}"),
+    })
+}
+
+fn ink_transport_failure(error_kind: &'static str) -> BrainError {
+    ink_failure(
+        BrainFailureClass::NetworkDisconnect,
+        BrainFailureStage::Transport,
+        true,
+        error_kind,
+    )
+}
+
+fn ink_protocol_failure(error_kind: &'static str) -> BrainError {
+    ink_failure(
+        BrainFailureClass::MalformedStream,
+        BrainFailureStage::Provider,
+        true,
+        error_kind,
+    )
+}
+
+fn ink_auth_failure(error_kind: &'static str) -> BrainError {
+    ink_failure(
+        BrainFailureClass::ProviderAuthFailure,
+        BrainFailureStage::ProviderAuth,
+        false,
+        error_kind,
+    )
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InkConfig {
@@ -72,21 +124,17 @@ impl InkConfig {
     pub fn websocket_request(&self, api_key: &str) -> Result<Request<()>, BrainError> {
         let api_key = api_key.trim();
         if api_key.is_empty() {
-            return Err(BrainError::MissingApiKey);
+            return Err(ink_auth_failure("missing_api_key"));
         }
 
         let mut request = self
             .websocket_endpoint()
             .into_client_request()
-            .map_err(|error| {
-                BrainError::Protocol(format!("invalid Cartesia Ink WebSocket URL: {error}"))
-            })?;
-        let authorization = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| {
-            BrainError::Protocol("invalid Cartesia Ink authorization header".to_owned())
-        })?;
-        let version = HeaderValue::from_str(self.cartesia_version.trim()).map_err(|_| {
-            BrainError::Protocol("invalid Cartesia-Version header value".to_owned())
-        })?;
+            .map_err(|_| ink_protocol_failure("invalid_endpoint"))?;
+        let authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|_| ink_auth_failure("invalid_authorization_header"))?;
+        let version = HeaderValue::from_str(self.cartesia_version.trim())
+            .map_err(|_| ink_protocol_failure("invalid_version_header"))?;
         request.headers_mut().insert(AUTHORIZATION, authorization);
         request
             .headers_mut()
@@ -146,7 +194,14 @@ where
         transcribe_ink_turn(&mut socket, frame).await
     })
     .await
-    .map_err(|_| BrainError::Connection("Cartesia Ink stage timeout".to_owned()))?
+    .map_err(|_| {
+        ink_failure(
+            BrainFailureClass::Timeout,
+            BrainFailureStage::Provider,
+            true,
+            "deadline_elapsed",
+        )
+    })?
 }
 
 pub(crate) async fn transcribe_ink_websocket(
@@ -167,23 +222,21 @@ where
     socket
         .send_binary(audio_frame_bytes(frame))
         .await
-        .map_err(|_| BrainError::Connection("Cartesia Ink send failed".to_owned()))?;
+        .map_err(|_| ink_transport_failure("send_failed"))?;
     socket
         .send_text(INK_CLOSE_COMMAND)
         .await
-        .map_err(|_| BrainError::Connection("Cartesia Ink close command failed".to_owned()))?;
+        .map_err(|_| ink_transport_failure("close_command_failed"))?;
 
     let mut accumulator = InkTranscriptAccumulator::default();
     loop {
         let Some(text) = socket
             .next_text()
             .await
-            .map_err(|_| BrainError::Connection("Cartesia Ink receive failed".to_owned()))?
+            .map_err(|_| ink_transport_failure("receive_failed"))?
         else {
             close_quietly(socket).await;
-            return Err(BrainError::Protocol(
-                "Cartesia Ink socket closed before final transcript".to_owned(),
-            ));
+            return Err(ink_protocol_failure("closed_before_final_transcript"));
         };
         let Some(event) = parse_ink_event(&text) else {
             continue;
@@ -202,14 +255,12 @@ where
                 socket
                     .close()
                     .await
-                    .map_err(|_| BrainError::Connection("Cartesia Ink close failed".to_owned()))?;
+                    .map_err(|_| ink_transport_failure("close_failed"))?;
                 return Ok(transcript);
             }
             InkEvent::Error { .. } => {
                 close_quietly(socket).await;
-                return Err(BrainError::Protocol(
-                    "Cartesia Ink provider error".to_owned(),
-                ));
+                return Err(ink_protocol_failure("provider_error"));
             }
         }
     }
@@ -223,9 +274,9 @@ struct InkTranscriptAccumulator {
 
 impl InkTranscriptAccumulator {
     fn finish(self) -> Result<InkTranscript, BrainError> {
-        let final_text = self.final_text.ok_or_else(|| {
-            BrainError::Protocol("Cartesia Ink missing final transcript".to_owned())
-        })?;
+        let final_text = self
+            .final_text
+            .ok_or_else(|| ink_protocol_failure("missing_final_transcript"))?;
         Ok(InkTranscript {
             interim_text: self.interim_text,
             final_text,
@@ -249,9 +300,9 @@ impl InkConnector for WebSocketInkConnector {
     type Socket = TungsteniteInkSocket;
 
     async fn connect(&self, request: Request<()>) -> Result<Self::Socket, BrainError> {
-        let (socket, _) = connect_async(request).await.map_err(|_| {
-            BrainError::Connection("Cartesia Ink WebSocket connect failed".to_owned())
-        })?;
+        let (socket, _) = connect_async(request)
+            .await
+            .map_err(|_| ink_transport_failure("connect_failed"))?;
         Ok(TungsteniteInkSocket { socket })
     }
 }
@@ -266,14 +317,14 @@ impl InkSocket for TungsteniteInkSocket {
         self.socket
             .send(Message::Binary(bytes))
             .await
-            .map_err(|_| BrainError::Connection("Cartesia Ink send failed".to_owned()))
+            .map_err(|_| ink_transport_failure("send_failed"))
     }
 
     async fn send_text(&mut self, text: &'static str) -> Result<(), BrainError> {
         self.socket
             .send(Message::Text(text.into()))
             .await
-            .map_err(|_| BrainError::Connection("Cartesia Ink close command failed".to_owned()))
+            .map_err(|_| ink_transport_failure("close_command_failed"))
     }
 
     async fn next_text(&mut self) -> Result<Option<String>, BrainError> {
@@ -287,14 +338,10 @@ impl InkSocket for TungsteniteInkSocket {
                     .socket
                     .send(Message::Pong(payload))
                     .await
-                    .map_err(|_| BrainError::Connection("Cartesia Ink pong failed".to_owned()))?,
+                    .map_err(|_| ink_transport_failure("pong_failed"))?,
                 Ok(Message::Close(_)) => return Ok(None),
                 Ok(Message::Binary(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
-                Err(_) => {
-                    return Err(BrainError::Connection(
-                        "Cartesia Ink receive failed".to_owned(),
-                    ))
-                }
+                Err(_) => return Err(ink_transport_failure("receive_failed")),
             }
         }
     }
@@ -303,7 +350,7 @@ impl InkSocket for TungsteniteInkSocket {
         self.socket
             .close(None)
             .await
-            .map_err(|_| BrainError::Connection("Cartesia Ink close failed".to_owned()))
+            .map_err(|_| ink_transport_failure("close_failed"))
     }
 }
 
@@ -465,12 +512,18 @@ mod tests {
             &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
-        assert!(error.contains("Cartesia Ink provider error"));
-        assert!(!error.contains("do not leak this transcript"));
-        assert!(!error.contains("9, 8, 7, 6"));
+        assert_eq!(failure.failure_class(), BrainFailureClass::MalformedStream);
+        assert_eq!(failure.stage(), BrainFailureStage::Provider);
+        assert_eq!(
+            failure.metadata(),
+            "stage=cartesia_ink error_kind=provider_error"
+        );
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains("do not leak this transcript"));
+        assert!(!rendered.contains("9, 8, 7, 6"));
 
         let mut backpressure = FakeInkSocket::with_send_error("writer closed after PCM [9,8]");
         let error = transcribe_ink_turn(
@@ -478,11 +531,19 @@ mod tests {
             &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
-        assert!(error.contains("Cartesia Ink send failed"));
-        assert!(!error.contains("[9,8]"));
+        assert_eq!(
+            failure.failure_class(),
+            BrainFailureClass::NetworkDisconnect
+        );
+        assert_eq!(failure.stage(), BrainFailureStage::Transport);
+        assert_eq!(
+            failure.metadata(),
+            "stage=cartesia_ink error_kind=send_failed"
+        );
+        assert!(!format!("{error} {failure:?}").contains("[9,8]"));
     }
 
     #[tokio::test]
@@ -492,11 +553,13 @@ mod tests {
 
         let error = transcribe_ink_turn(&mut socket, &AudioFrame::from_pcm16_bytes(vec![1, 2]))
             .await
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
 
-        assert!(error.contains("closed before final transcript"));
-        assert!(!error.contains("partial"));
+        assert_eq!(
+            error.failure().metadata(),
+            "stage=cartesia_ink error_kind=closed_before_final_transcript"
+        );
+        assert!(!format!("{error} {:?}", error.failure()).contains("partial"));
     }
 
     #[tokio::test]
@@ -546,12 +609,17 @@ mod tests {
             &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
-        assert!(error.contains("Cartesia Ink stage timeout"));
-        assert!(!error.contains("sk_car_timeout_secret"));
-        assert!(!error.contains("9, 8, 7, 6"));
+        assert_eq!(failure.failure_class(), BrainFailureClass::Timeout);
+        assert_eq!(
+            failure.metadata(),
+            "stage=cartesia_ink error_kind=deadline_elapsed"
+        );
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains("sk_car_timeout_secret"));
+        assert!(!rendered.contains("9, 8, 7, 6"));
     }
 
     struct FakeInkSocket {
@@ -675,9 +743,7 @@ mod tests {
     impl InkSocket for FakeInkSocket {
         async fn send_binary(&mut self, bytes: Bytes) -> Result<(), agent_domain::BrainError> {
             if self.send_error.is_some() {
-                return Err(agent_domain::BrainError::Connection(
-                    "fake socket send failure".to_owned(),
-                ));
+                return Err(ink_transport_failure("send_failed"));
             }
             self.sent_binary.push(bytes);
             Ok(())

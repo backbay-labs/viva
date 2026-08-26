@@ -1,67 +1,194 @@
+//! The synthetic (offline, keyless) study runtime and the fixture evaluator both
+//! it and the fake Cartesia/Gemini runtime inject.
+//!
+//! `ADAPTER-01`: nothing in this file decides a learner fact. The verdict pattern
+//! and the examiner's copy come from the immutable Plan 04 learning-core corpus,
+//! the label/status/schedule/recap come from the persisted `TurnOutcome` the Plan
+//! 04 executor returned, and a runtime with no store emits no learner fact at all
+//! rather than inventing one.
+
 use async_trait::async_trait;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use std::time::Duration;
 
+use serde_json::Value;
 use tokio::{sync::mpsc, task::AbortHandle, time::sleep};
 
 use agent_domain::{
-    decide_review_schedule, fixture_question, AnswerAttemptEnvelope, AnswerCaptureMode,
-    AnswerCaptureStatus, AnswerContentPolicy, AnswerEvaluation, BrainError, BrainEvent, BrainInput,
-    BrainProviderError, BrainUsage, Clock, ConceptStatus, ManuscriptEmphasis, ManuscriptEntityKind,
-    ManuscriptIntent, ManuscriptRegister, RealtimeBrain, RealtimeBrainCapabilities,
-    RealtimeSession, RealtimeSessionTaskGuard, RecapSourceMoment, ReviewOutcomeV1, SessionConfig,
-    StudyMemoryStore, StudyQuestion, StudySessionPhase, StudySessionRecap, SystemClock,
+    fixture_question, learning_outcome::VIVA_SEMANTIC_RUBRIC_POLICY_VERSION, AnswerAttemptEnvelope,
+    AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy, AnswerEvaluator,
+    AuthorizedStudySession, BrainError, BrainEvent, BrainFailureClass, BrainFailureStage,
+    BrainInput, BrainProviderError, BrainProviderFailureParts, BrainUsage, Clock,
+    CriterionAssessment, EvaluationDecision, EvaluationDeferralReason, EvaluationError,
+    EvaluationRequest, ManuscriptEmphasis, ManuscriptEntityKind, ManuscriptIntent,
+    ManuscriptRegister, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession,
+    RealtimeSessionTaskGuard, SessionConfig, StudyMemoryStore, StudyQuestion, StudySessionPhase,
+    SystemClock, ToolProposal, TurnOutcome, TurnResolution, VivaToolExecutor,
 };
 
-/// One step in the synthetic evaluation rotation. Deterministic, offline, no
-/// keys — but VARIED, so the manuscript shows real branching (shaky vs strong vs
-/// confident-wrong vs unverifiable) instead of one hardcoded mood.
-struct SyntheticAnswerSpec {
-    label: &'static str,
-    status: ConceptStatus,
-    transcript_confidence: f32,
-    eval_confidence: f32,
-    feedback: &'static str,
-    concept_id: &'static str,
+use crate::cartesia_gemini::{
+    answer_evaluation_from_outcome, brain_failure, learning_event_projection,
+    parse_persisted_turn_outcome, recap_from_tool_result, select_session_question,
+    SessionPhaseTracker,
+};
+
+/// The immutable Plan 04 turn-outcome corpus. It is read-only input: this crate
+/// never writes it, and every synthetic verdict below is derived from it.
+pub(crate) const LEARNING_CORE_TURN_OUTCOMES_V1: &str =
+    include_str!("../../../fixtures/learning-core/turn-outcomes-v1.json");
+
+/// The corpus's evaluated cases, in the order the synthetic rotation walks them.
+/// Naming them explicitly keeps the rotation deterministic even if the fixture
+/// gains cases later, and keeps a deferral in the rotation so the deferred branch
+/// is exercised by the fixture runtimes rather than only by focused tests.
+pub(crate) const SYNTHETIC_FIXTURE_CASE_IDS: [&str; 4] = [
+    "evaluated_mostly_correct",
+    "evaluated_strong",
+    "evaluated_required_contradiction_is_wrong",
+    "deferred_insufficient_semantic_evidence",
+];
+
+fn learning_core_document() -> Option<&'static Value> {
+    static DOCUMENT: OnceLock<Option<Value>> = OnceLock::new();
+    DOCUMENT
+        .get_or_init(|| serde_json::from_str(LEARNING_CORE_TURN_OUTCOMES_V1).ok())
+        .as_ref()
 }
 
-const ANSWER_SPECS: [SyntheticAnswerSpec; 4] = [
-    SyntheticAnswerSpec {
-        label: "partially correct",
-        status: ConceptStatus::Shaky,
-        transcript_confidence: 0.78,
-        eval_confidence: 0.55,
-        feedback: "You named ATP, but skipped the proton-gradient mechanism that drives ATP synthase.",
-        concept_id: "nadh",
-    },
-    SyntheticAnswerSpec {
-        label: "mostly correct",
-        status: ConceptStatus::Strong,
-        transcript_confidence: 0.92,
-        eval_confidence: 0.88,
-        feedback: "Strong mechanism. Now make the link from the proton gradient to ATP synthase explicit.",
-        concept_id: "oxidative-phosphorylation",
-    },
-    SyntheticAnswerSpec {
-        label: "wrong",
-        status: ConceptStatus::Missed,
-        transcript_confidence: 0.95,
-        eval_confidence: 0.86,
-        feedback: "Not quite — NADH donates electrons to the transport chain; it does not make ATP directly.",
-        concept_id: "atp-synthase",
-    },
-    SyntheticAnswerSpec {
-        label: "insufficient evidence",
-        status: ConceptStatus::Missed,
-        transcript_confidence: 0.6,
-        eval_confidence: 0.4,
-        feedback: "I can't confirm that from your notes — Lecture 5 doesn't support that claim.",
-        concept_id: "cellular-respiration",
-    },
-];
+/// One complete persisted outcome from the immutable corpus.
+pub(crate) fn learning_core_turn_outcome(case_id: &str) -> Option<TurnOutcome> {
+    let case = learning_core_document()?.get("outcomes")?.get(case_id)?;
+    serde_json::from_value(case.clone()).ok()
+}
+
+/// The corpus's server-owned rubric.
+#[cfg(test)]
+pub(crate) fn learning_core_rubric() -> Option<agent_domain::EvaluationRubricV1> {
+    let rubric = learning_core_document()?.get("rubric")?;
+    serde_json::from_value(rubric.clone()).ok()
+}
+
+/// The fixture-derived [`AnswerEvaluator`] the fake and synthetic runtimes
+/// inject.
+///
+/// It is deliberately not a general evaluator and never sees a live session: it
+/// reads one corpus case and replays that case's criterion verdicts, so a fixture
+/// runtime's grade is a property of a checked-in file rather than of the answer
+/// text. `A-13.3` places it here; the only way to obtain one is
+/// [`synthetic_fixture_answer_evaluator`], so no live composition can reach it by
+/// default or through the environment.
+pub(crate) struct SyntheticFixtureAnswerEvaluator {
+    case_ids: Vec<String>,
+}
+
+impl SyntheticFixtureAnswerEvaluator {
+    /// Private on purpose: see the type documentation.
+    fn new() -> Self {
+        Self {
+            case_ids: SYNTHETIC_FIXTURE_CASE_IDS
+                .iter()
+                .map(|case_id| (*case_id).to_owned())
+                .collect(),
+        }
+    }
+
+    /// Which corpus case grades this response. Deterministic in the response
+    /// identity, so a replay of one response replays one case.
+    fn case_for(&self, response_id: &str) -> Option<TurnOutcome> {
+        if self.case_ids.is_empty() {
+            return None;
+        }
+        let index = response_id
+            .bytes()
+            .fold(0_usize, |total, byte| total.wrapping_add(byte as usize))
+            % self.case_ids.len();
+        learning_core_turn_outcome(&self.case_ids[index])
+    }
+}
+
+#[async_trait]
+impl AnswerEvaluator for SyntheticFixtureAnswerEvaluator {
+    async fn evaluate(
+        &self,
+        request: &EvaluationRequest,
+    ) -> Result<EvaluationDecision, EvaluationError> {
+        let case = self
+            .case_for(&request.response_id)
+            .ok_or(EvaluationError::Unavailable)?;
+        match case.resolution {
+            // The corpus case's criterion verdicts are replayed positionally onto
+            // the rubric this session actually authorizes: the pattern is fixture
+            // data, and the criterion identities stay server-owned.
+            TurnResolution::Evaluated {
+                assessments,
+                concise_feedback,
+                retry_prompt,
+                ..
+            } => {
+                if assessments.is_empty() {
+                    return Err(EvaluationError::Unavailable);
+                }
+                Ok(EvaluationDecision::Evaluated {
+                    assessments: request
+                        .question
+                        .rubric
+                        .criteria
+                        .iter()
+                        .enumerate()
+                        .map(|(index, criterion)| {
+                            let pattern = &assessments[index % assessments.len()];
+                            CriterionAssessment {
+                                criterion_id: criterion.criterion_id.clone(),
+                                assessment: pattern.assessment,
+                                confidence: pattern.confidence,
+                            }
+                        })
+                        .collect(),
+                    concise_feedback,
+                    retry_prompt,
+                })
+            }
+            TurnResolution::Deferred { reason, .. } => Ok(EvaluationDecision::Deferred {
+                // Only the two verdicts an evaluator may honestly report about its
+                // own evidence; the rest are server facts it must never claim.
+                reason: match reason {
+                    EvaluationDeferralReason::InsufficientSemanticEvidence
+                    | EvaluationDeferralReason::ContradictoryEvidence => reason,
+                    _ => EvaluationDeferralReason::InsufficientSemanticEvidence,
+                },
+                can_retry_same_question: true,
+            }),
+        }
+    }
+}
+
+/// The one named builder for the fixture evaluator.
+pub(crate) fn synthetic_fixture_answer_evaluator() -> Arc<dyn AnswerEvaluator> {
+    Arc::new(SyntheticFixtureAnswerEvaluator::new())
+}
+
+/// The fixture runtimes' spoken response text.
+///
+/// It is the persisted outcome's own feedback plus, when the server left the
+/// question open, its retry prompt — never a shared runner fallback sentence and
+/// never copy about a topic this session did not grade. A deferred outcome has
+/// no response to speak, so it yields nothing at all.
+pub(crate) fn fixture_response_text(outcome: &TurnOutcome) -> Option<String> {
+    match &outcome.resolution {
+        TurnResolution::Evaluated {
+            concise_feedback,
+            retry_prompt,
+            ..
+        } => Some(match retry_prompt {
+            Some(prompt) => format!("{concise_feedback} {prompt}"),
+            None => concise_feedback.clone(),
+        }),
+        TurnResolution::Deferred { .. } => None,
+    }
+}
 
 #[derive(Clone)]
 pub struct SyntheticBrain {
@@ -96,39 +223,6 @@ impl SyntheticBrain {
             clock,
         }
     }
-
-    async fn question_for_spec(
-        &self,
-        spec: &SyntheticStudySessionSpec,
-    ) -> Result<StudyQuestion, BrainError> {
-        let mut question = fixture_question();
-        let Some(study_store) = &self.study_store else {
-            return Ok(question);
-        };
-        if let Some(active_question) = study_store
-            .active_question(&spec.user_id, &spec.study_set_id)
-            .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?
-        {
-            return Ok(active_question);
-        }
-        let source = study_store
-            .source_reference(
-                &spec.user_id,
-                &spec.study_set_id,
-                &question.source.source_id,
-            )
-            .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?
-            .ok_or_else(|| {
-                BrainError::Connection(format!(
-                    "missing deterministic source {} for study set {}",
-                    question.source.source_id, spec.study_set_id
-                ))
-            })?;
-        question.source = source;
-        Ok(question)
-    }
 }
 
 #[async_trait]
@@ -146,15 +240,38 @@ impl RealtimeBrain for SyntheticBrain {
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(32);
         let (event_tx, events) = mpsc::channel::<BrainEvent>(32);
         let spec = SyntheticStudySessionSpec::from_config(&config)?;
-        let question = self.question_for_spec(&spec).await?;
         let study_store = self.study_store.clone();
         let clock = Arc::clone(&self.clock);
-        if let Some(store) = &study_store {
-            store
-                .record_voice_session(&config)
-                .await
-                .map_err(|error| BrainError::Connection(error.to_string()))?;
-        }
+        let executor = match &study_store {
+            Some(store) => {
+                let _ = store.record_voice_session(&config).await.map_err(|error| {
+                    store_failure(&error, BrainFailureClass::DurabilityDegraded)
+                })?;
+                Some(VivaToolExecutor::with_clock(
+                    Arc::clone(store),
+                    AuthorizedStudySession::from_config(&config).map_err(|error| {
+                        tool_failure(BrainFailureClass::ToolExecutorFailure, &error.to_string())
+                    })?,
+                    synthetic_fixture_answer_evaluator(),
+                    Arc::clone(&clock),
+                ))
+            }
+            None => None,
+        };
+        let first_response_id = spec.response_id(1);
+        let question = match &executor {
+            Some(executor) => {
+                select_session_question(
+                    executor,
+                    &spec.study_set_id,
+                    &spec.voice_session_id,
+                    &first_response_id,
+                )
+                .await?
+            }
+            None => fixture_question(),
+        };
+        let phases = SessionPhaseTracker::ready();
         let task = tokio::spawn(async move {
             let _ = event_tx
                 .send(BrainEvent::SessionPhase {
@@ -163,7 +280,7 @@ impl RealtimeBrain for SyntheticBrain {
                 .await;
             let _ = event_tx
                 .send(BrainEvent::QuestionStarted {
-                    response_id: spec.response_id(1),
+                    response_id: first_response_id,
                     question: question.clone(),
                 })
                 .await;
@@ -171,87 +288,17 @@ impl RealtimeBrain for SyntheticBrain {
             let mut turn = 1_usize;
             let mut active_response: Option<ActiveResponse> = None;
             while let Some(input) = input_rx.recv().await {
-                match input {
-                    BrainInput::Audio(frame) => {
-                        cancel_active_response(&mut active_response);
-                        let response_id = spec.response_id(turn);
-                        let answer_turn = turn;
-                        turn += 1;
-                        active_response = Some(spawn_study_answer_sequence(
-                            event_tx.clone(),
-                            spec.clone(),
-                            question.clone(),
-                            &response_id,
-                            SyntheticAnswerInput::audio(frame, None),
-                            answer_turn,
-                            SyntheticStudyContext {
-                                study_store: study_store.clone(),
-                                clock: Arc::clone(&clock),
-                            },
-                        ));
-                    }
+                let answer_input = match input {
+                    BrainInput::Audio(frame) => SyntheticAnswerInput::audio(frame, None),
                     BrainInput::AudioWithMetadata {
                         frame,
                         client_generation_id,
-                    } => {
-                        cancel_active_response(&mut active_response);
-                        let response_id =
-                            spec.response_id_for_generation(turn, client_generation_id.as_deref());
-                        let answer_turn = turn;
-                        turn += 1;
-                        active_response = Some(spawn_study_answer_sequence(
-                            event_tx.clone(),
-                            spec.clone(),
-                            question.clone(),
-                            &response_id,
-                            SyntheticAnswerInput::audio(frame, client_generation_id),
-                            answer_turn,
-                            SyntheticStudyContext {
-                                study_store: study_store.clone(),
-                                clock: Arc::clone(&clock),
-                            },
-                        ));
-                    }
-                    BrainInput::Text(text) => {
-                        cancel_active_response(&mut active_response);
-                        let response_id = spec.response_id(turn);
-                        let answer_turn = turn;
-                        turn += 1;
-                        active_response = Some(spawn_study_answer_sequence(
-                            event_tx.clone(),
-                            spec.clone(),
-                            question.clone(),
-                            &response_id,
-                            SyntheticAnswerInput::text(text, None),
-                            answer_turn,
-                            SyntheticStudyContext {
-                                study_store: study_store.clone(),
-                                clock: Arc::clone(&clock),
-                            },
-                        ));
-                    }
+                    } => SyntheticAnswerInput::audio(frame, client_generation_id),
+                    BrainInput::Text(text) => SyntheticAnswerInput::text(text, None),
                     BrainInput::TextWithMetadata {
                         text,
                         client_generation_id,
-                    } => {
-                        cancel_active_response(&mut active_response);
-                        let response_id =
-                            spec.response_id_for_generation(turn, client_generation_id.as_deref());
-                        let answer_turn = turn;
-                        turn += 1;
-                        active_response = Some(spawn_study_answer_sequence(
-                            event_tx.clone(),
-                            spec.clone(),
-                            question.clone(),
-                            &response_id,
-                            SyntheticAnswerInput::text(text, client_generation_id),
-                            answer_turn,
-                            SyntheticStudyContext {
-                                study_store: study_store.clone(),
-                                clock: Arc::clone(&clock),
-                            },
-                        ));
-                    }
+                    } => SyntheticAnswerInput::text(text, client_generation_id),
                     BrainInput::CancelResponse => {
                         let response_id = active_response
                             .as_ref()
@@ -269,17 +316,33 @@ impl RealtimeBrain for SyntheticBrain {
                         let _ = event_tx
                             .send(BrainEvent::ResponseCancelledFor { response_id })
                             .await;
+                        continue;
                     }
                     BrainInput::Stop => {
                         cancel_active_response(&mut active_response);
-                        emit_session_recap(&event_tx, &spec, &question, study_store.as_ref()).await;
+                        emit_session_recap(&event_tx, &spec, executor.as_ref(), &phases).await;
                         break;
                     }
                     BrainInput::ToolResult(_)
                     | BrainInput::SessionContextRefresh(_)
-                    | BrainInput::ProactiveTurn { .. } => {}
-                    _ => {}
-                }
+                    | BrainInput::ProactiveTurn { .. } => continue,
+                    _ => continue,
+                };
+                cancel_active_response(&mut active_response);
+                let response_id = spec
+                    .response_id_for_generation(turn, answer_input.client_generation_id.as_deref());
+                let answer_turn = turn;
+                turn += 1;
+                active_response = Some(spawn_study_answer_sequence(
+                    event_tx.clone(),
+                    spec.clone(),
+                    question.clone(),
+                    &response_id,
+                    answer_input,
+                    answer_turn,
+                    executor.clone(),
+                    phases.clone(),
+                ));
             }
         });
         Ok(RealtimeSession {
@@ -290,26 +353,50 @@ impl RealtimeBrain for SyntheticBrain {
     }
 }
 
+fn store_failure(error: &agent_domain::PortError, class: BrainFailureClass) -> BrainError {
+    let _ = error;
+    brain_failure(BrainProviderFailureParts {
+        failure_class: class,
+        stage: BrainFailureStage::Store,
+        retry_eligible: true,
+        latency_ms: 0,
+        provider: "server".to_owned(),
+        model: "synthetic".to_owned(),
+        metadata: "error_kind=store_write_failed".to_owned(),
+    })
+}
+
+fn tool_failure(class: BrainFailureClass, reason: &str) -> BrainError {
+    let _ = reason;
+    brain_failure(BrainProviderFailureParts {
+        failure_class: class,
+        stage: BrainFailureStage::Tools,
+        retry_eligible: true,
+        latency_ms: 0,
+        provider: "server".to_owned(),
+        model: "synthetic".to_owned(),
+        metadata: "error_kind=tool_executor_failure".to_owned(),
+    })
+}
+
 #[derive(Clone, Debug)]
 struct SyntheticStudySessionSpec {
     client_generation_id: Option<String>,
-    user_id: String,
     voice_session_id: String,
     study_set_id: String,
-    active_concepts: Vec<String>,
 }
 
 impl SyntheticStudySessionSpec {
     fn from_config(config: &SessionConfig) -> Result<Self, BrainError> {
-        let user_id = required(config.user_id.as_deref(), "user_id")?;
+        // Identity is validated here and owned by the executor's authorized
+        // session; this spec keeps only what event correlation needs.
+        let _ = required(config.user_id.as_deref(), "user_id")?;
         let voice_session_id = required(config.session_id.as_deref(), "session_id")?;
         let study_set_id = required(config.study_set_id.as_deref(), "study_set_id")?;
         Ok(Self {
             client_generation_id: config.client_generation_id.clone(),
-            user_id: user_id.to_owned(),
             voice_session_id: voice_session_id.to_owned(),
             study_set_id: study_set_id.to_owned(),
-            active_concepts: config.active_concepts.clone(),
         })
     }
 
@@ -334,20 +421,6 @@ impl SyntheticStudySessionSpec {
             format!("{base}-generation-{generation_id}")
         }
     }
-
-    fn concept_id_for_turn<'a>(&'a self, turn: usize, fixture_concept_id: &'a str) -> &'a str {
-        if self.active_concepts.is_empty() {
-            return fixture_concept_id;
-        }
-        if self
-            .active_concepts
-            .iter()
-            .any(|concept_id| concept_id == fixture_concept_id)
-        {
-            return fixture_concept_id;
-        }
-        self.active_concepts[turn.saturating_sub(1) % self.active_concepts.len()].as_str()
-    }
 }
 
 fn sanitized_response_generation_id(value: &str) -> String {
@@ -362,11 +435,21 @@ fn sanitized_response_generation_id(value: &str) -> String {
 }
 
 fn required<'a>(value: Option<&'a str>, label: &str) -> Result<&'a str, BrainError> {
-    let value = value
+    let _ = label;
+    value
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| BrainError::Protocol(format!("{label} is required")))?;
-    Ok(value)
+        .ok_or_else(|| {
+            brain_failure(BrainProviderFailureParts {
+                failure_class: BrainFailureClass::ToolExecutorFailure,
+                stage: BrainFailureStage::Session,
+                retry_eligible: false,
+                latency_ms: 0,
+                provider: "server".to_owned(),
+                model: "synthetic".to_owned(),
+                metadata: "error_kind=missing_session_identity".to_owned(),
+            })
+        })
 }
 
 struct ActiveResponse {
@@ -393,13 +476,7 @@ fn cancel_active_response(active_response: &mut Option<ActiveResponse>) {
     }
 }
 
-/// The store and injected clock a graded synthetic turn writes through.
-#[derive(Clone)]
-struct SyntheticStudyContext {
-    study_store: Option<Arc<dyn StudyMemoryStore>>,
-    clock: Arc<dyn Clock>,
-}
-
+#[allow(clippy::too_many_arguments)]
 fn spawn_study_answer_sequence(
     event_tx: mpsc::Sender<BrainEvent>,
     spec: SyntheticStudySessionSpec,
@@ -407,9 +484,9 @@ fn spawn_study_answer_sequence(
     response_id: &str,
     answer_input: SyntheticAnswerInput,
     turn: usize,
-    study: SyntheticStudyContext,
+    executor: Option<VivaToolExecutor>,
+    phases: SessionPhaseTracker,
 ) -> ActiveResponse {
-    let SyntheticStudyContext { study_store, clock } = study;
     let response_id = response_id.to_owned();
     let cancelled = Arc::new(AtomicBool::new(false));
     let completed = Arc::new(AtomicBool::new(false));
@@ -425,8 +502,8 @@ fn spawn_study_answer_sequence(
                 response_id: task_response_id,
                 answer_input,
                 turn,
-                study_store,
-                clock,
+                executor,
+                phases,
                 cancelled: task_cancelled,
                 completed: task_completed,
             },
@@ -448,8 +525,8 @@ struct StudyAnswerJob {
     response_id: String,
     answer_input: SyntheticAnswerInput,
     turn: usize,
-    study_store: Option<Arc<dyn StudyMemoryStore>>,
-    clock: Arc<dyn Clock>,
+    executor: Option<VivaToolExecutor>,
+    phases: SessionPhaseTracker,
     cancelled: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
 }
@@ -510,8 +587,6 @@ fn synthetic_answer_attempt_envelope(job: &StudyAnswerJob) -> AnswerAttemptEnvel
 }
 
 async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: StudyAnswerJob) {
-    let answer_spec = &ANSWER_SPECS[(job.turn - 1) % ANSWER_SPECS.len()];
-
     // Re-ask on a fresh attempt so the client's active-response correlation
     // resets and the new evaluation is applied rather than dropped as stale.
     if job.turn > 1
@@ -529,54 +604,54 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
     }
 
     sleep(Duration::from_millis(280)).await;
-    if !send_unless_cancelled(
-        event_tx,
-        BrainEvent::SessionPhase {
-            phase: StudySessionPhase::Listening,
-        },
-        &job.cancelled,
-    )
-    .await
-    {
-        return;
-    }
-    sleep(Duration::from_millis(240)).await;
-    if !send_unless_cancelled(
-        event_tx,
-        BrainEvent::TranscriptDelta {
-            response_id: job.response_id.clone(),
-            text: job.answer_input.text.clone(),
-        },
-        &job.cancelled,
-    )
-    .await
-    {
-        return;
-    }
-    if !send_unless_cancelled(
-        event_tx,
-        BrainEvent::TranscriptFinal {
-            response_id: job.response_id.clone(),
-            text: job.answer_input.text.clone(),
-            confidence: Some(answer_spec.transcript_confidence),
-        },
-        &job.cancelled,
-    )
-    .await
-    {
-        return;
-    }
-    sleep(Duration::from_millis(260)).await;
-    if !send_unless_cancelled(
-        event_tx,
-        BrainEvent::SessionPhase {
-            phase: StudySessionPhase::Thinking,
-        },
-        &job.cancelled,
-    )
-    .await
-    {
-        return;
+    for phase in [StudySessionPhase::Listening, StudySessionPhase::Thinking] {
+        let transition = if phase == StudySessionPhase::Listening {
+            job.phases.begin_turn()
+        } else {
+            job.phases.phase_event(phase)
+        };
+        match transition {
+            Ok(event) => {
+                if !send_unless_cancelled(event_tx, event, &job.cancelled).await {
+                    return;
+                }
+            }
+            Err(error) => {
+                emit_provider_failure(event_tx, error).await;
+                return;
+            }
+        }
+        if phase == StudySessionPhase::Listening {
+            sleep(Duration::from_millis(240)).await;
+            if !send_unless_cancelled(
+                event_tx,
+                BrainEvent::TranscriptDelta {
+                    response_id: job.response_id.clone(),
+                    text: job.answer_input.text.clone(),
+                },
+                &job.cancelled,
+            )
+            .await
+            {
+                return;
+            }
+            // The synthetic runtime runs no speech recognizer, so there is no
+            // transcription confidence to report and none is invented.
+            if !send_unless_cancelled(
+                event_tx,
+                BrainEvent::TranscriptFinal {
+                    response_id: job.response_id.clone(),
+                    text: job.answer_input.text.clone(),
+                    confidence: None,
+                },
+                &job.cancelled,
+            )
+            .await
+            {
+                return;
+            }
+            sleep(Duration::from_millis(260)).await;
+        }
     }
     if !send_unless_cancelled(
         event_tx,
@@ -595,187 +670,112 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
     }
     // The examiner takes a beat to cross-reference the sources.
     sleep(Duration::from_millis(850)).await;
-    let source = job.question.source.clone();
-    let evaluation = AnswerEvaluation {
-        question_id: job.question.question_id.clone(),
-        answer_text: job.answer_input.text.clone(),
-        label: answer_spec.label.to_owned(),
-        concise_feedback: answer_spec.feedback.to_owned(),
-        retry_prompt: job.question.follow_up.clone(),
-        source: source.clone(),
-        concept_status: answer_spec.status.clone(),
-        confidence_score: answer_spec.eval_confidence,
-    };
     if job.cancelled.load(Ordering::SeqCst) {
         return;
     }
-    if let Some(store) = &job.study_store {
-        if job.answer_input.client_generation_id.is_some() {
-            if let Err(error) = store
-                .record_answer_attempt_envelope(
-                    &job.spec.user_id,
+
+    // Without a store there is no persisted outcome, so this runtime states no
+    // learner fact at all. Fabricating one here is exactly the defect ADAPTER-01
+    // closes.
+    if let Some(executor) = job.executor.clone() {
+        if let Err(error) = executor
+            .record_answer_attempt_envelope(synthetic_answer_attempt_envelope(&job))
+            .await
+        {
+            emit_provider_failure(
+                event_tx,
+                tool_failure(BrainFailureClass::DurabilityDegraded, &error.to_string()),
+            )
+            .await;
+            return;
+        }
+        let outcome = match executor
+            .execute(
+                &job.response_id,
+                ToolProposal::evaluate_spoken_answer(
                     &job.spec.study_set_id,
                     &job.spec.voice_session_id,
-                    synthetic_answer_attempt_envelope(&job),
+                    &job.question.question_id,
+                    &job.answer_input.text,
+                ),
+            )
+            .await
+            .map_err(|error| {
+                tool_failure(BrainFailureClass::ToolExecutorFailure, &error.to_string())
+            })
+            .and_then(|result| parse_persisted_turn_outcome(&result.result, &job.response_id))
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                emit_provider_failure(event_tx, error).await;
+                return;
+            }
+        };
+
+        let source = match executor
+            .execute(
+                &job.response_id,
+                ToolProposal::retrieve_source_reference(
+                    &job.spec.study_set_id,
+                    &job.spec.voice_session_id,
+                    outcome
+                        .source_ids
+                        .first()
+                        .map_or(job.question.source.source_id.as_str(), String::as_str),
+                ),
+            )
+            .await
+            .map_err(|error| {
+                tool_failure(BrainFailureClass::ToolExecutorFailure, &error.to_string())
+            })
+            .and_then(|result| {
+                serde_json::from_value(result.result["source"].clone()).map_err(|_| {
+                    tool_failure(BrainFailureClass::ToolExecutorFailure, "source payload")
+                })
+            }) {
+            Ok(source) => source,
+            Err(error) => {
+                emit_provider_failure(event_tx, error).await;
+                return;
+            }
+        };
+
+        let evaluation = answer_evaluation_from_outcome(
+            &outcome,
+            &job.answer_input.text,
+            &source,
+            &job.question,
+        );
+        for event in learning_event_projection(&outcome, &job.response_id, &source, evaluation) {
+            let concept_intent = match &event {
+                BrainEvent::ConceptStatus { concept_id, .. } => Some(concept_id.clone()),
+                _ => None,
+            };
+            if !send_unless_cancelled(event_tx, event, &job.cancelled).await {
+                return;
+            }
+            if let Some(concept_id) = concept_intent {
+                if !send_unless_cancelled(
+                    event_tx,
+                    BrainEvent::ManuscriptIntent {
+                        response_id: job.response_id.clone(),
+                        intent: ManuscriptIntent::Entity {
+                            entity_id: concept_id,
+                            entity_kind: ManuscriptEntityKind::Concept,
+                            register: ManuscriptRegister::Correcting,
+                            emphasis: ManuscriptEmphasis::Marked,
+                        },
+                    },
+                    &job.cancelled,
                 )
                 .await
-            {
-                emit_store_error(event_tx, error.to_string()).await;
-                return;
+                {
+                    return;
+                }
             }
         }
-        if let Err(error) = store
-            .record_answer_evaluation(
-                &job.spec.user_id,
-                &job.spec.study_set_id,
-                &job.spec.voice_session_id,
-                &job.response_id,
-                evaluation.clone(),
-            )
-            .await
-        {
-            emit_store_error(event_tx, error.to_string()).await;
-            return;
-        }
     }
-    if !send_unless_cancelled(
-        event_tx,
-        BrainEvent::AnswerEvaluated {
-            response_id: job.response_id.clone(),
-            evaluation,
-        },
-        &job.cancelled,
-    )
-    .await
-    {
-        return;
-    }
-    if !send_unless_cancelled(
-        event_tx,
-        BrainEvent::SourceReference {
-            response_id: job.response_id.clone(),
-            source: source.clone(),
-        },
-        &job.cancelled,
-    )
-    .await
-    {
-        return;
-    }
-    if !send_unless_cancelled(
-        event_tx,
-        BrainEvent::ManuscriptIntent {
-            response_id: job.response_id.clone(),
-            intent: ManuscriptIntent::Marginalia {
-                marginalia_id: "source-folio".to_owned(),
-                anchor_entity_id: source.source_id.clone(),
-                register: ManuscriptRegister::Sourcing,
-                emphasis: ManuscriptEmphasis::Measured,
-            },
-        },
-        &job.cancelled,
-    )
-    .await
-    {
-        return;
-    }
-    if job.cancelled.load(Ordering::SeqCst) {
-        return;
-    }
-    let concept_id = job
-        .spec
-        .concept_id_for_turn(job.turn, answer_spec.concept_id);
-    if let Some(store) = &job.study_store {
-        if let Err(error) = store
-            .record_concept_status(
-                &job.spec.user_id,
-                &job.spec.study_set_id,
-                &job.spec.voice_session_id,
-                &job.response_id,
-                concept_id,
-                answer_spec.status.clone(),
-            )
-            .await
-        {
-            emit_store_error(event_tx, error.to_string()).await;
-            return;
-        }
-    }
-    if !send_unless_cancelled(
-        event_tx,
-        BrainEvent::ConceptStatus {
-            response_id: job.response_id.clone(),
-            concept_id: concept_id.to_owned(),
-            status: answer_spec.status.clone(),
-        },
-        &job.cancelled,
-    )
-    .await
-    {
-        return;
-    }
-    if !send_unless_cancelled(
-        event_tx,
-        BrainEvent::ManuscriptIntent {
-            response_id: job.response_id.clone(),
-            intent: ManuscriptIntent::Entity {
-                entity_id: concept_id.to_owned(),
-                entity_kind: ManuscriptEntityKind::Concept,
-                register: ManuscriptRegister::Correcting,
-                emphasis: ManuscriptEmphasis::Marked,
-            },
-        },
-        &job.cancelled,
-    )
-    .await
-    {
-        return;
-    }
-    if job.cancelled.load(Ordering::SeqCst) {
-        return;
-    }
-    if let Some(store) = &job.study_store {
-        // D-01 SERVER_PERSISTED_FSRS: the review schedule is authoritative. A silently
-        // missing or incorrect schedule is a critical failure, so a store rejection
-        // aborts this outcome exactly the way a concept-status rejection already does.
-        let now = job.clock.now();
-        let context = match store
-            .review_scheduling_context(&job.spec.user_id, &job.spec.study_set_id, concept_id)
-            .await
-        {
-            Ok(context) => context,
-            Err(error) => {
-                emit_store_error(event_tx, error.to_string()).await;
-                return;
-            }
-        };
-        let outcome = ReviewOutcomeV1 {
-            status: answer_spec.status.clone(),
-            hint_count: None,
-            miss_count: None,
-        };
-        let decision = match decide_review_schedule(now, &outcome, &context) {
-            Ok(decision) => decision,
-            Err(error) => {
-                emit_store_error(event_tx, error.to_string()).await;
-                return;
-            }
-        };
-        if let Err(error) = store
-            .persist_review_schedule_decision(
-                &job.spec.user_id,
-                &job.spec.study_set_id,
-                &job.spec.voice_session_id,
-                &job.response_id,
-                concept_id,
-                decision,
-            )
-            .await
-        {
-            emit_store_error(event_tx, error.to_string()).await;
-            return;
-        }
-    }
+
     if !send_unless_cancelled(
         event_tx,
         BrainEvent::Usage(BrainUsage {
@@ -790,27 +790,21 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
     {
         return;
     }
-    if !send_unless_cancelled(
-        event_tx,
-        BrainEvent::SessionPhase {
-            phase: StudySessionPhase::Feedback,
-        },
-        &job.cancelled,
-    )
-    .await
-    {
-        return;
-    }
     // Terminal state for the attempt: the page dwells in correction. There is no
     // auto-recap — recap is emitted on Stop. The student answers again or ends.
-    let _ = send_unless_cancelled(
-        event_tx,
-        BrainEvent::SessionPhase {
-            phase: StudySessionPhase::Correction,
-        },
-        &job.cancelled,
-    )
-    .await;
+    for phase in [StudySessionPhase::Feedback, StudySessionPhase::Correction] {
+        match job.phases.phase_event(phase) {
+            Ok(event) => {
+                if !send_unless_cancelled(event_tx, event, &job.cancelled).await {
+                    return;
+                }
+            }
+            Err(error) => {
+                emit_provider_failure(event_tx, error).await;
+                return;
+            }
+        }
+    }
     job.completed.store(true, Ordering::SeqCst);
     let _ = send_unless_cancelled(
         event_tx,
@@ -825,34 +819,34 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
 async fn emit_session_recap(
     event_tx: &mpsc::Sender<BrainEvent>,
     spec: &SyntheticStudySessionSpec,
-    question: &StudyQuestion,
-    study_store: Option<&Arc<dyn StudyMemoryStore>>,
+    executor: Option<&VivaToolExecutor>,
+    phases: &SessionPhaseTracker,
 ) {
+    let Some(executor) = executor else {
+        return;
+    };
     let response_id = spec.response_id(0);
-    let recap = study_session_recap(spec, question.source.clone());
-    if let Some(store) = study_store {
-        if let Err(error) = store
-            .record_recap(
-                &spec.user_id,
-                &spec.study_set_id,
-                &spec.voice_session_id,
-                &response_id,
-                recap.clone(),
-            )
-            .await
-        {
-            emit_store_error(event_tx, error.to_string()).await;
+    let recap = match executor
+        .execute(
+            &response_id,
+            ToolProposal::build_session_recap(&spec.study_set_id, &spec.voice_session_id),
+        )
+        .await
+        .map_err(|error| tool_failure(BrainFailureClass::ToolExecutorFailure, &error.to_string()))
+        .and_then(|result| recap_from_tool_result(&result.result))
+    {
+        Ok(recap) => recap,
+        Err(error) => {
+            emit_provider_failure(event_tx, error).await;
             return;
         }
-    }
+    };
     let _ = event_tx
         .send(BrainEvent::RecapReady { response_id, recap })
         .await;
-    let _ = event_tx
-        .send(BrainEvent::SessionPhase {
-            phase: StudySessionPhase::Recap,
-        })
-        .await;
+    if let Some(event) = phases.phase_event_if_legal(StudySessionPhase::Recap) {
+        let _ = event_tx.send(event).await;
+    }
 }
 
 async fn send_unless_cancelled(
@@ -870,598 +864,103 @@ async fn send_unless_cancelled(
     !cancelled.load(Ordering::SeqCst)
 }
 
-async fn emit_store_error(event_tx: &mpsc::Sender<BrainEvent>, message: String) {
+async fn emit_provider_failure(event_tx: &mpsc::Sender<BrainEvent>, error: BrainError) {
     let _ = event_tx
-        .send(BrainEvent::Error(BrainProviderError {
-            source: "synthetic-memory".to_owned(),
-            message,
-            failure: None,
-        }))
+        .send(BrainEvent::Error(BrainProviderError::from_failure(
+            error.failure().clone(),
+        )))
         .await;
 }
 
-fn study_session_recap(
-    spec: &SyntheticStudySessionSpec,
-    source: agent_domain::StudySourceReference,
-) -> StudySessionRecap {
-    StudySessionRecap {
-        voice_session_id: spec.voice_session_id.clone(),
-        headline: "Oxidative phosphorylation is getting stronger.".to_owned(),
-        summary: format!(
-            "You named NADH as the electron donor in {study_set}. Next, make the proton-gradient-to-ATP-synthase link explicit.",
-            study_set = spec.study_set_id
-        ),
-        strong_concepts: vec!["NADH".to_owned(), "electron transport chain".to_owned()],
-        shaky_concepts: vec!["proton gradient".to_owned()],
-        missed_concepts: vec![],
-        review_later: vec!["ATP synthase".to_owned()],
-        next_action: "Schedule a short review of ATP synthase tomorrow.".to_owned(),
-        source_moments: vec![RecapSourceMoment {
-            text: "NADH donates high-energy electrons to the electron transport chain.".to_owned(),
-            source,
-            status: ConceptStatus::Strong,
-        }],
-    }
-}
+/// The rubric policy the corpus pins, asserted at compile time so a fixture that
+/// silently changed policy could not grade a session under the old name.
+const _: () = assert!(!VIVA_SEMANTIC_RUBRIC_POLICY_VERSION.is_empty());
 
 #[cfg(test)]
-mod tests {
-    use std::{sync::Arc, time::Duration};
-
-    use agent_domain::{RealtimeBrain, SessionId, SourceConfidence, SourceContext, StudyMode};
-    use tokio::time::timeout;
+mod fixture_evaluator_tests {
+    use agent_domain::CriterionAssessmentKind;
 
     use super::*;
 
-    async fn next_event(session: &mut RealtimeSession) -> BrainEvent {
-        timeout(Duration::from_secs(1), session.events.recv())
-            .await
-            .expect("event arrives")
-            .expect("event stream stays open")
-    }
-
-    async fn wait_for_transcript_final(session: &mut RealtimeSession) {
-        loop {
-            if matches!(
-                next_event(session).await,
-                BrainEvent::TranscriptFinal { .. }
-            ) {
-                return;
-            }
+    #[test]
+    fn every_named_rotation_case_exists_in_the_immutable_corpus() {
+        for case_id in SYNTHETIC_FIXTURE_CASE_IDS {
+            assert!(
+                learning_core_turn_outcome(case_id).is_some(),
+                "the corpus must publish `{case_id}`"
+            );
         }
-    }
-
-    #[tokio::test]
-    async fn emits_deterministic_product_study_flow_and_cancel_id() {
-        let brain = SyntheticBrain::default();
-        let mut session = brain
-            .open(SessionConfig {
-                session_id: Some(SessionId::new("voice-session-1")),
-                user_id: Some("user-1".to_owned()),
-                study_set_id: Some("biology-midterm".to_owned()),
-                mode: Some(StudyMode::Quiz),
-                ..SessionConfig::default()
-            })
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            next_event(&mut session).await,
-            BrainEvent::SessionPhase {
-                phase: StudySessionPhase::Ready
-            }
-        ));
-        match next_event(&mut session).await {
-            BrainEvent::QuestionStarted {
-                response_id,
-                question,
-            } => {
-                assert_eq!(response_id, "response-1");
-                assert_eq!(question.source.source_id, "src-lecture-5-slide-18");
-            }
-            other => panic!("expected question_started, got {other:?}"),
-        }
-
-        session
-            .input
-            .send(BrainInput::Text(
-                "NADH gives electrons to the electron transport chain.".to_owned(),
-            ))
-            .await
-            .unwrap();
-
-        let mut saw_evaluation = false;
-        let mut saw_source = false;
-        let mut saw_manuscript_intent = false;
-        let mut saw_usage = false;
-        loop {
-            match next_event(&mut session).await {
-                BrainEvent::AnswerEvaluated {
-                    response_id,
-                    evaluation,
-                } => {
-                    assert_eq!(response_id, "response-1");
-                    assert_eq!(evaluation.source.document_id, "lec-5");
-                    saw_evaluation = true;
-                }
-                BrainEvent::SourceReference {
-                    response_id,
-                    source,
-                } => {
-                    assert_eq!(response_id, "response-1");
-                    assert_eq!(source.span, "slide:18");
-                    saw_source = true;
-                }
-                BrainEvent::ManuscriptIntent { response_id, .. } => {
-                    assert_eq!(response_id, "response-1");
-                    saw_manuscript_intent = true;
-                }
-                BrainEvent::Usage(usage) => {
-                    assert_eq!(usage.text_input_tokens, 20);
-                    assert_eq!(usage.text_output_tokens, 10);
-                    saw_usage = true;
-                }
-                // The per-answer sequence now ends at Correction; recap is on Stop.
-                BrainEvent::SessionPhase {
-                    phase: StudySessionPhase::Correction,
-                } => break,
-                _ => {}
-            }
-        }
-        assert!(saw_evaluation);
-        assert!(saw_source);
-        assert!(saw_manuscript_intent);
-        assert!(saw_usage);
         assert_eq!(
-            next_event(&mut session).await,
-            BrainEvent::ResponseCompleted {
-                response_id: "response-1".to_owned()
-            }
+            learning_core_rubric()
+                .expect("corpus rubric parses")
+                .policy_version,
+            VIVA_SEMANTIC_RUBRIC_POLICY_VERSION
         );
-
-        session
-            .input
-            .send(BrainInput::CancelResponse)
-            .await
-            .unwrap();
-        assert_eq!(
-            next_event(&mut session).await,
-            BrainEvent::ResponseCancelledFor {
-                response_id: "response-2".to_owned()
-            }
-        );
-
-        // Recap is produced when the student ends the session.
-        session.input.send(BrainInput::Stop).await.unwrap();
-        let mut saw_recap = false;
-        for _ in 0..4 {
-            if let BrainEvent::RecapReady { recap, .. } = next_event(&mut session).await {
-                assert_eq!(recap.voice_session_id, "voice-session-1");
-                saw_recap = true;
-                break;
-            }
-        }
-        assert!(saw_recap);
     }
 
     #[tokio::test]
-    async fn ignores_browser_source_context_for_trusted_source_output() {
-        let brain = SyntheticBrain::default();
-        let mut session = brain
-            .open(SessionConfig {
-                session_id: Some(SessionId::new("voice-session-1")),
-                user_id: Some("user-1".to_owned()),
-                study_set_id: Some("biology-midterm".to_owned()),
-                mode: Some(StudyMode::Quiz),
-                source_context: vec![SourceContext {
-                    source_id: "src-lecture-5-slide-18".to_owned(),
-                    document_id: "browser-forged-doc".to_owned(),
-                    span: "browser:999".to_owned(),
-                    excerpt: "Browser forged excerpt".to_owned(),
-                    confidence: SourceConfidence::Low,
-                    retrieval_reason: "browser supplied injection".to_owned(),
-                }],
-                ..SessionConfig::default()
-            })
-            .await
-            .unwrap();
-
-        let _ = next_event(&mut session).await;
-        match next_event(&mut session).await {
-            BrainEvent::QuestionStarted { question, .. } => {
-                assert_eq!(question.source.document_id, "lec-5");
-                assert_eq!(question.source.span, "slide:18");
-                assert_eq!(
-                    question.source.retrieval_reason,
-                    "server fixture source for oxidative phosphorylation"
-                );
-            }
-            other => panic!("expected question_started, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn uses_server_active_concepts_for_authorized_concept_events() {
-        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
-        let brain = SyntheticBrain::with_study_store(store.clone());
-        let mut session = brain
-            .open(SessionConfig {
-                session_id: Some(SessionId::new("voice-session-1")),
-                user_id: Some("user-1".to_owned()),
-                study_set_id: Some("biology-midterm".to_owned()),
-                mode: Some(StudyMode::Quiz),
-                active_concepts: vec!["atp-synthase".to_owned()],
-                ..SessionConfig::default()
-            })
-            .await
-            .unwrap();
-
-        let _ = next_event(&mut session).await;
-        let _ = next_event(&mut session).await;
-        session
-            .input
-            .send(BrainInput::Text(
-                "NADH gives electrons to the electron transport chain.".to_owned(),
-            ))
-            .await
-            .unwrap();
-
-        let mut saw_concept_status = false;
-        loop {
-            match next_event(&mut session).await {
-                BrainEvent::ConceptStatus {
-                    response_id,
-                    concept_id,
-                    status,
-                } => {
-                    assert_eq!(response_id, "response-1");
-                    assert_eq!(concept_id, "atp-synthase");
-                    assert_eq!(status, ConceptStatus::Shaky);
-                    saw_concept_status = true;
-                }
-                BrainEvent::Error(error) => panic!("store rejected synthetic concept: {error:?}"),
-                BrainEvent::SessionPhase {
-                    phase: StudySessionPhase::Correction,
-                } => break,
-                _ => {}
-            }
-        }
-        assert!(saw_concept_status);
-
-        let snapshot = store.snapshot();
-        assert_eq!(snapshot.concept_statuses.len(), 1);
-        assert_eq!(snapshot.concept_statuses[0].concept_id, "atp-synthase");
-        assert_eq!(snapshot.review_items.len(), 1);
-        assert_eq!(snapshot.review_items[0].concept_id, "atp-synthase");
-    }
-
-    #[tokio::test]
-    async fn persists_client_generation_id_on_synthetic_answer_attempts() {
-        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
-        let brain = SyntheticBrain::with_study_store(store.clone());
-        let mut config = SessionConfig {
-            session_id: Some(SessionId::new("voice-session-1")),
-            user_id: Some("user-1".to_owned()),
-            study_set_id: Some("biology-midterm".to_owned()),
-            mode: Some(StudyMode::Quiz),
-            ..SessionConfig::default()
+    async fn fixture_evaluator_replays_corpus_verdicts_and_never_reads_the_answer() {
+        let evaluator = synthetic_fixture_answer_evaluator();
+        let rubric = learning_core_rubric().expect("corpus rubric parses");
+        let question = StudyQuestion {
+            question_id: "q-etc-electron-flow".to_owned(),
+            concept_id: rubric.criteria[0].concept_id.clone(),
+            prompt: "Trace the electrons.".to_owned(),
+            expected_terms: Vec::new(),
+            follow_up: "Say the next step.".to_owned(),
+            source: agent_domain::StudySourceReference {
+                source_id: rubric.criteria[0].source_id.clone(),
+                document_id: "lec5".to_owned(),
+                span: "slide:18".to_owned(),
+                excerpt: "bound claim".to_owned(),
+                confidence: agent_domain::SourceConfidence::High,
+                retrieval_reason: "server-bound rubric source".to_owned(),
+            },
+            rubric: rubric.clone(),
         };
-        config.client_generation_id = Some("bfcache_restore-3".to_owned());
-        let mut session = brain.open(config).await.unwrap();
+        let request = |answer: &str| EvaluationRequest {
+            response_id: "response-1".to_owned(),
+            question: question.clone(),
+            answer_text: answer.to_owned(),
+            transcript_confidence: Some(0.88),
+        };
 
-        let response_id = "response-1-generation-bfcache_restore-3";
-        let _ = next_event(&mut session).await;
-        match next_event(&mut session).await {
-            BrainEvent::QuestionStarted {
-                response_id: question_response_id,
-                ..
-            } => assert_eq!(question_response_id, response_id),
-            event => panic!("expected generated question response id, got {event:?}"),
+        let first = evaluator
+            .evaluate(&request("a perfect answer"))
+            .await
+            .expect("fixture decision");
+        let second = evaluator
+            .evaluate(&request("a completely different answer"))
+            .await
+            .expect("fixture decision");
+        assert_eq!(
+            first, second,
+            "the fixture evaluator must not read the answer text"
+        );
+
+        if let EvaluationDecision::Evaluated { assessments, .. } = first {
+            let criterion_ids = assessments
+                .iter()
+                .map(|assessment| assessment.criterion_id.clone())
+                .collect::<Vec<_>>();
+            let rubric_ids = rubric
+                .criteria
+                .iter()
+                .map(|criterion| criterion.criterion_id.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                criterion_ids, rubric_ids,
+                "criterion identity stays server-owned"
+            );
+            assert!(assessments
+                .iter()
+                .all(|assessment| assessment.confidence.is_finite()));
+            assert!(assessments.iter().any(|assessment| matches!(
+                assessment.assessment,
+                CriterionAssessmentKind::Satisfied
+                    | CriterionAssessmentKind::Contradicted
+                    | CriterionAssessmentKind::NotDemonstrated
+            )));
         }
-        session
-            .input
-            .send(BrainInput::TextWithMetadata {
-                text: "NADH gives electrons to the electron transport chain.".to_owned(),
-                client_generation_id: Some("bfcache_restore-3".to_owned()),
-            })
-            .await
-            .unwrap();
-
-        loop {
-            match next_event(&mut session).await {
-                BrainEvent::SessionPhase {
-                    phase: StudySessionPhase::Correction,
-                } => break,
-                BrainEvent::Error(error) => panic!("store rejected synthetic answer: {error:?}"),
-                _ => {}
-            }
-        }
-
-        let snapshot = store.snapshot();
-        assert_eq!(snapshot.answer_attempts.len(), 1);
-        assert_eq!(snapshot.answer_attempts[0].response_id, response_id);
-        assert_eq!(
-            snapshot.answer_attempts[0].envelope.response_id,
-            response_id
-        );
-        assert_eq!(
-            snapshot.answer_attempts[0]
-                .envelope
-                .client_generation_id
-                .as_deref(),
-            Some("bfcache_restore-3"),
-        );
-    }
-
-    #[tokio::test]
-    async fn dropping_session_aborts_active_synthetic_response_before_store_writes() {
-        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
-        let brain = SyntheticBrain::with_study_store(store.clone());
-        let mut session = brain
-            .open(SessionConfig {
-                session_id: Some(SessionId::new("voice-session-1")),
-                user_id: Some("user-1".to_owned()),
-                study_set_id: Some("biology-midterm".to_owned()),
-                mode: Some(StudyMode::Quiz),
-                ..SessionConfig::default()
-            })
-            .await
-            .unwrap();
-
-        let _ = next_event(&mut session).await;
-        let _ = next_event(&mut session).await;
-        session
-            .input
-            .send(BrainInput::Text(
-                "NADH gives electrons to the electron transport chain.".to_owned(),
-            ))
-            .await
-            .unwrap();
-        wait_for_transcript_final(&mut session).await;
-
-        drop(session);
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-
-        let snapshot = store.snapshot();
-        assert_eq!(snapshot.sessions.len(), 1);
-        assert_eq!(snapshot.answer_attempts.len(), 0);
-        assert_eq!(snapshot.concept_statuses.len(), 0);
-        assert_eq!(snapshot.review_items.len(), 0);
-        assert_eq!(snapshot.recaps.len(), 0);
-    }
-
-    /// The WebSocket assembler admits one `BrainInput` per completed browser turn,
-    /// so thousands of bounded chunks still produce exactly one evaluated turn.
-    #[tokio::test]
-    async fn one_assembled_forty_five_second_turn_produces_one_evaluated_turn() {
-        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
-        let brain = SyntheticBrain::with_study_store(store.clone());
-        let mut session = brain
-            .open(SessionConfig {
-                session_id: Some(SessionId::new("voice-session-1")),
-                user_id: Some("user-1".to_owned()),
-                study_set_id: Some("biology-midterm".to_owned()),
-                mode: Some(StudyMode::Quiz),
-                ..SessionConfig::default()
-            })
-            .await
-            .unwrap();
-        let _ = next_event(&mut session).await;
-        let _ = next_event(&mut session).await;
-
-        // 45 seconds of mono pcm_s16le at 24 kHz: 2,250 bounded 20 ms chunks.
-        session
-            .input
-            .send(BrainInput::AudioWithMetadata {
-                frame: agent_domain::AudioFrame::from_pcm16_bytes(vec![0_u8; 2_160_000]),
-                client_generation_id: Some("generation-1".to_owned()),
-            })
-            .await
-            .unwrap();
-
-        // Read past the first evaluation to the turn's terminal event, so a
-        // second evaluation would be counted rather than hidden by an early
-        // break.
-        let mut transcripts = Vec::new();
-        let mut evaluations = 0_u32;
-        let mut completed = false;
-        for _ in 0..64 {
-            match timeout(Duration::from_secs(5), session.events.recv()).await {
-                Ok(Some(BrainEvent::TranscriptFinal { text, .. })) => transcripts.push(text),
-                Ok(Some(BrainEvent::AnswerEvaluated { .. })) => evaluations += 1,
-                Ok(Some(BrainEvent::ResponseCompleted { .. })) => {
-                    completed = true;
-                    break;
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => panic!("the assembled turn never reached its terminal event"),
-            }
-        }
-        assert!(completed, "the assembled turn completed exactly once");
-
-        // Close the input side and drain the remainder of the stream: any
-        // second provider turn for the same assembled frame surfaces here.
-        let RealtimeSession {
-            input,
-            mut events,
-            task_guard: _task_guard,
-        } = session;
-        drop(input);
-        while let Ok(Some(event)) = timeout(Duration::from_secs(5), events.recv()).await {
-            match event {
-                BrainEvent::TranscriptFinal { text, .. } => transcripts.push(text),
-                BrainEvent::AnswerEvaluated { .. } => evaluations += 1,
-                _ => {}
-            }
-        }
-
-        assert_eq!(transcripts, vec!["received 2160000 PCM16 bytes".to_owned()]);
-        assert_eq!(evaluations, 1);
-        assert_eq!(store.snapshot().answer_attempts.len(), 1);
-    }
-}
-
-#[cfg(test)]
-mod synthetic_review_schedule_tests {
-    use std::sync::Arc;
-
-    use agent_domain::{
-        parse_utc_instant, BrainEvent, BrainInput, ConceptStatus, FixedClock, RealtimeBrain,
-        RealtimeSession, ReviewScheduleCapReasonV1, SessionConfig, SessionId, StudyMode,
-        StudySessionPhase, VIVA_REVIEW_SCHEDULE_POLICY_ID,
-    };
-    use tokio::time::{timeout, Duration};
-
-    use super::SyntheticBrain;
-
-    /// Literals copied from `packages/core/src/review-scheduling-conformance-v1.json`
-    /// (`new-shaky-hinted-one-miss-no-exam`, `exam-closer-than-margin`, and
-    /// `exam-already-past-fail-closed`). The synthetic rotation grades the first turn
-    /// `shaky`, so the fixture's shaky rows are the expected authoritative outcomes.
-    const GRADED_AT: &str = "2031-04-05T12:00:00.000Z";
-    const SHAKY_DUE_AT: &str = "2031-04-07T12:00:00.000Z";
-    const EXAM_AT: &str = "2031-04-05T18:30:00.000Z";
-    const EXAM_CAPPED_DUE_AT: &str = "2031-04-04T18:30:00.000Z";
-
-    async fn next_event(session: &mut RealtimeSession) -> BrainEvent {
-        timeout(Duration::from_secs(5), session.events.recv())
-            .await
-            .expect("synthetic event within deterministic timeout")
-            .expect("synthetic event stream stays open")
-    }
-
-    async fn run_first_graded_turn(
-        store: Arc<data::InMemoryStudyStore>,
-        graded_at: &str,
-    ) -> Vec<String> {
-        let clock = Arc::new(FixedClock::new(
-            parse_utc_instant(graded_at).expect("graded instant parses"),
-        ));
-        let brain = SyntheticBrain::with_study_store_and_clock(store, clock);
-        let mut session = brain
-            .open(SessionConfig {
-                session_id: Some(SessionId::new("voice-session-1")),
-                user_id: Some("user-1".to_owned()),
-                study_set_id: Some("biology-midterm".to_owned()),
-                mode: Some(StudyMode::Quiz),
-                active_concepts: vec!["nadh".to_owned()],
-                ..SessionConfig::default()
-            })
-            .await
-            .expect("synthetic session opens");
-        let _ = next_event(&mut session).await;
-        let _ = next_event(&mut session).await;
-        session
-            .input
-            .send(BrainInput::Text(
-                "NADH gives electrons to the electron transport chain.".to_owned(),
-            ))
-            .await
-            .expect("text input accepted");
-
-        let mut errors = Vec::new();
-        loop {
-            match next_event(&mut session).await {
-                // A surfaced store error aborts the outcome: nothing follows it.
-                BrainEvent::Error(error) => {
-                    errors.push(error.message);
-                    break;
-                }
-                BrainEvent::SessionPhase {
-                    phase: StudySessionPhase::Correction,
-                } => break,
-                _ => {}
-            }
-        }
-        errors
-    }
-
-    #[tokio::test]
-    async fn synthetic_review_schedule_persists_the_authoritative_decision() {
-        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
-        let errors = run_first_graded_turn(Arc::clone(&store), GRADED_AT).await;
-        assert!(errors.is_empty(), "synthetic store errors: {errors:?}");
-
-        let snapshot = store.snapshot();
-        assert_eq!(snapshot.review_schedule_decisions.len(), 1);
-        let record = &snapshot.review_schedule_decisions[0];
-        assert_eq!(record.concept_id, "nadh");
-        assert_eq!(record.decision.status, ConceptStatus::Shaky);
-        assert_eq!(record.decision.rating, 3);
-        assert_eq!(record.decision.policy_id, VIVA_REVIEW_SCHEDULE_POLICY_ID);
-        assert_eq!(
-            agent_domain::format_rfc3339_millis(record.decision.generated_at),
-            GRADED_AT
-        );
-        assert_eq!(
-            agent_domain::format_rfc3339_millis(record.decision.due_at),
-            SHAKY_DUE_AT
-        );
-        assert_eq!(record.decision.cap_reason, None);
-        assert_eq!(record.decision.card.reps, 1);
-
-        // The paired review item carries the same authoritative date, never a fixed one.
-        assert_eq!(snapshot.review_items.len(), 1);
-        assert_eq!(snapshot.review_items[0].due_at, SHAKY_DUE_AT);
-        let encoded = serde_json::to_string(&snapshot.review_items).expect("snapshot serializes");
-        assert!(!encoded.contains("2026-06-"), "{encoded}");
-    }
-
-    #[tokio::test]
-    async fn synthetic_review_schedule_honours_the_recorded_exam_margin() {
-        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
-        store.set_study_set_exam_date("biology-midterm", Some(EXAM_AT.to_owned()));
-        let errors = run_first_graded_turn(Arc::clone(&store), GRADED_AT).await;
-        assert!(errors.is_empty(), "synthetic store errors: {errors:?}");
-
-        let snapshot = store.snapshot();
-        let record = &snapshot.review_schedule_decisions[0];
-        assert_eq!(
-            agent_domain::format_rfc3339_millis(record.decision.due_at),
-            EXAM_CAPPED_DUE_AT
-        );
-        assert_eq!(
-            record.decision.cap_reason,
-            Some(ReviewScheduleCapReasonV1::ExamMargin)
-        );
-        assert!(record.decision.due_at <= record.decision.exam_at.expect("exam instant"));
-    }
-
-    #[tokio::test]
-    async fn synthetic_review_schedule_fails_closed_for_an_already_past_exam() {
-        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
-        store.set_study_set_exam_date(
-            "biology-midterm",
-            Some("2031-03-30T09:15:00.000Z".to_owned()),
-        );
-        let errors = run_first_graded_turn(Arc::clone(&store), GRADED_AT).await;
-        assert!(errors.is_empty(), "synthetic store errors: {errors:?}");
-
-        let snapshot = store.snapshot();
-        let record = &snapshot.review_schedule_decisions[0];
-        assert_eq!(
-            agent_domain::format_rfc3339_millis(record.decision.due_at),
-            "2031-03-30T09:15:00.000Z"
-        );
-        assert_eq!(
-            record.decision.cap_reason,
-            Some(ReviewScheduleCapReasonV1::PastExam)
-        );
-    }
-
-    #[tokio::test]
-    async fn synthetic_review_schedule_surfaces_a_store_rejection_instead_of_skipping_it() {
-        // An unparseable exam instant makes the authoritative context unavailable. The
-        // old best-effort path swallowed this; a missing authoritative schedule is a
-        // critical failure and must surface.
-        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
-        store.set_study_set_exam_date("biology-midterm", Some("not-a-date".to_owned()));
-        let errors = run_first_graded_turn(Arc::clone(&store), GRADED_AT).await;
-        assert_eq!(errors.len(), 1, "expected exactly one surfaced store error");
-        assert!(store.snapshot().review_schedule_decisions.is_empty());
-        assert!(store.snapshot().review_items.is_empty());
     }
 }
