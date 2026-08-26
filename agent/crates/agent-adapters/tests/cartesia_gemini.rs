@@ -451,6 +451,15 @@ async fn fake_runtime_is_selectable_realtime_brain_without_live_keys() {
     // that one outcome is also what records the session-scoped status write its
     // `concept_status` browser event is authorized against — still one write, made
     // by the outcome authority rather than by this adapter.
+    //
+    // CROSS-LANE FALLOUT — AWAITING COORDINATOR SANCTION (A-07/A-08/A-17 category).
+    // This file is Plan 07's; the `A-22` store change that forces the
+    // `concept_statuses` value below was made in Plan 09's `data` crate. The
+    // original sentence above is untouched and still true; only the store-shape
+    // count moved, arbitrated by the untouched `store_snapshot` block of both
+    // frozen v5 evidence packs. Revert recipe if the sanction is refused: restore
+    // `assert!(snapshot.concept_statuses.is_empty())` here and in
+    // `fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn`.
     let snapshot = store.snapshot();
     assert_eq!(snapshot.sessions.len(), 1);
     assert_eq!(snapshot.answer_attempts.len(), 1);
@@ -884,7 +893,9 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
     assert_eq!(snapshot.turn_outcomes[0].response_id, "response-2");
     // `A-22`: the surviving outcome records the status write its own
     // `concept_status` event is authorized against; the cancelled turn recorded
-    // none, which is what keeps this exactly one.
+    // none, which is what keeps this exactly one. CROSS-LANE FALLOUT — AWAITING
+    // COORDINATOR SANCTION, the same one recorded in full on
+    // `fake_runtime_is_selectable_realtime_brain_without_live_keys` above.
     assert_eq!(snapshot.concept_statuses.len(), 1);
     assert_eq!(snapshot.review_items.len(), 1);
     assert_eq!(snapshot.recaps.len(), 1);
