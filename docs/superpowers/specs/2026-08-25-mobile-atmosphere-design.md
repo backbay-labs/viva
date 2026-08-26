@@ -289,11 +289,39 @@ consequence of the drift; it was already failing on the flat `#F7F0E7` ground.
 > 0.0017. The corrected value is `#693F23` (4.5648:1). The unit test in §11.3
 > catches this class of error because it parses the shipped hex.
 
-**Move 2 — accents may not carry body-size text.** Ornament values stay exactly as they are for
-hairlines, keylines, sparks, gauge fills and rules; purely decorative marks are outside WCAG 1.4.11,
-and meaningful UI graphics need 3:1, which the ornament values meet at the brightest but not the
-darkest — so any accent mark that *conveys state* (the gauge fill, the selected keyline) uses the
-`*Ink` value too.
+**Move 2 — three tiers, and a component picks a role rather than a hex.** WCAG sets two different
+bars here, and collapsing them to one costs the palette all of its chroma for no accessibility gain.
+So each accent hue exists at up to three tones, and which one a component reaches for is decided by
+what the mark *is*, not by how it looks:
+
+| tier | bar at the darkest excursion | what belongs in it |
+| --- | --- | --- |
+| ornament — the base value, unchanged | none; WCAG 1.4.11 exempts it | hairlines, keylines, rules, sparks, gradient stops, decorative dots — anything a user loses no information by not seeing |
+| `*Mark` | **3:1** (WCAG 1.4.11 non-text contrast) | a graphic that *conveys state*, and text at **≥24 dp** (or ≥18.7 dp bold), where 3:1 is the text bar too |
+| `*Ink` | **4.5:1** | body-size text, full stop |
+
+Ornament values are therefore kept exactly as they are, and are still wrong for anything that carries
+meaning: they clear 3:1 at the brightest but not at the darkest. A state-bearing mark uses the `*Mark`
+value; body copy uses `*Ink`.
+
+> **This supersedes an earlier ruling.** The first version of this section said a state-conveying
+> accent "uses the `*Ink` value too" — one bar for everything. That is stricter than WCAG requires and
+> it flattens exactly the hues the states depend on to stay apart. The recap ledger is the case that
+> settled it: the strong / shaky / due dot is a non-text graphic and its numeral is 36 dp display type,
+> so 3:1 is the correct bar for both, and pushing them to `*Ink` would have made the three states read
+> as three shades of the same brown. The shipped palette implements the table above.
+
+The full classification is not prose — it is `TEXT_TOKENS` / `MARK_TOKENS` / `ORNAMENT_TOKENS` /
+`SURFACE_TOKENS` in `apps/mobile/src/theme/tokens.ts`, and `contrast.test.ts` asserts that every
+hex-valued token appears in exactly one of the four. That assertion, not this table, is what makes the
+tier system binding: adding a colour to `packages/tokens` fails the suite until someone says which
+tier it is. Note that `packages/tokens` contributes about half of `colors` through a spread, so a
+token being absent from this section is not evidence it is safe — check the sets.
+
+`plumMark` is deliberately byte-identical to `plumVivid`: plum already clears 3:1, so its mark tier is
+an alias rather than a new tone. `goldMark` and `copperMark` have no consumer yet and stay anyway —
+the point of a tier is that a component picks a role, and deleting the role means the next component
+invents a hex.
 
 ### 11.2 This invalidates part of a locked decision
 
