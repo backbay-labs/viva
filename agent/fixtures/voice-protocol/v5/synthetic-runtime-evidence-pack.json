@@ -1,8 +1,8 @@
 {
-  "client_fixture": "fake-cartesia-gemini-study-session.json#client",
-  "server_fixture": "fake-cartesia-gemini-study-session.json#server",
-  "client_frame_count": 5,
-  "server_frame_count": 18,
+  "client_fixture": "v5/synthetic-runtime-session.json#client",
+  "server_fixture": "v5/synthetic-runtime-session.json#server",
+  "client_frame_count": 4,
+  "server_frame_count": 17,
   "store_snapshot": {
     "sessions": 1,
     "answer_attempts": 1,
@@ -13,14 +13,14 @@
   },
   "usage": {
     "events": 1,
-    "provider": "fake_cartesia_gemini",
-    "model": "fake_cartesia_gemini-viva",
+    "provider": "synthetic",
+    "model": "synthetic-viva",
     "duration_seconds_min": 1,
     "text_input_tokens": 20,
     "text_output_tokens": 10,
     "audio_input_tokens": 0,
     "audio_output_tokens": 0,
-    "cost_estimate_usd": 0.00002,
+    "cost_estimate_usd": 2e-05,
     "answer_eval_latency_ms_present": true,
     "source_grounded_correction_count": 1
   },
@@ -48,7 +48,7 @@
     {
       "kind": "question_emitted",
       "voice_session_id": "voice-session-1",
-      "detail": "response-1-generation-1"
+      "detail": "response-1"
     },
     {
       "kind": "provider_admission",
@@ -58,17 +58,17 @@
     {
       "kind": "answer_received",
       "voice_session_id": "voice-session-1",
-      "detail": "audio frame received"
+      "detail": "text answer received"
     },
     {
       "kind": "evaluation_emitted",
       "voice_session_id": "voice-session-1",
-      "detail": "response-1-generation-1"
+      "detail": "response-1"
     },
     {
       "kind": "source_emitted",
       "voice_session_id": "voice-session-1",
-      "detail": "response-1-generation-1"
+      "detail": "response-1"
     },
     {
       "kind": "cancel_received",
@@ -78,7 +78,7 @@
     {
       "kind": "cancel_received",
       "voice_session_id": "voice-session-1",
-      "detail": "response-2-generation-1"
+      "detail": "response-2"
     },
     {
       "kind": "stop_received",

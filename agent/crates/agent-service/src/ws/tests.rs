@@ -1751,7 +1751,8 @@ impl futures_util::Sink<Message> for RecordingSink {
 #[tokio::test]
 async fn maps_versioned_audio_text_and_cancel_frames_to_brain_inputs() {
     let (input, mut received) = mpsc::channel(8);
-    let audio_chunk = include_str!("../../../../fixtures/voice-protocol/client-audio.json");
+    let audio_chunk =
+        include_str!("../../../../fixtures/voice-protocol/v5/client-audio-chunk.json");
     let binding = fixture_binding();
     let mut audio_assembly = AudioTurnAssembly::default();
 
@@ -1957,7 +1958,7 @@ async fn maps_client_generation_ids_to_brain_inputs() {
 
 #[test]
 fn requires_session_config_as_bootstrap_frame() {
-    let session = include_str!("../../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../../fixtures/voice-protocol/v5/seeded-session-config.json");
     let message = Message::Text(
             format!(
                 r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"1","session_token":"placeholder-session-material","session":{session}}}"#
@@ -1997,7 +1998,7 @@ fn sanitize_fixture_config(
 
 #[test]
 fn sanitizes_session_config_identity_and_strips_browser_source_context() {
-    let session = include_str!("../../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../../fixtures/voice-protocol/v5/seeded-session-config.json");
     let message = Message::Text(
             format!(
                 r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"1","session_token":"placeholder-session-material","session":{session}}}"#
@@ -3804,7 +3805,7 @@ async fn bounded_sender_slow_client_aborts_the_provider_and_releases_every_lease
 }
 
 fn slow_client_session_config_json() -> String {
-    let session = include_str!("../../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../../fixtures/voice-protocol/v5/seeded-session-config.json");
     format!(
         r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"slow-client-1","session_token":"placeholder-session-material","session":{session}}}"#
     )

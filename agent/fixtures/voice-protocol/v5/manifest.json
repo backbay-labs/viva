@@ -1,7 +1,9 @@
 {
   "schema": "viva.voice-fixtures.manifest.v1",
   "protocol_version": 5,
-  "supported_versions": [5],
+  "supported_versions": [
+    5
+  ],
   "legacy_v4_disposition": "reject",
   "fixtures": [
     {
@@ -25,6 +27,16 @@
       "kind": "client_frame"
     },
     {
+      "id": "VOICE-SEEDED-SESSION-CONFIG",
+      "path": "agent/fixtures/voice-protocol/v5/seeded-session-config.json",
+      "kind": "session_payload"
+    },
+    {
+      "id": "VOICE-CLIENT-AUDIO-CHUNK",
+      "path": "agent/fixtures/voice-protocol/v5/client-audio-chunk.json",
+      "kind": "client_frame"
+    },
+    {
       "id": "VOICE-AUDIO-TURN-LIFECYCLE",
       "path": "agent/fixtures/voice-protocol/v5/audio-turn-lifecycle.json",
       "kind": "frame_sequence"
@@ -42,6 +54,11 @@
     {
       "id": "VOICE-SERVER-READY",
       "path": "agent/fixtures/voice-protocol/v5/server-ready.json",
+      "kind": "server_frame"
+    },
+    {
+      "id": "VOICE-SERVER-EVENT-MANUSCRIPT-INTENT",
+      "path": "agent/fixtures/voice-protocol/v5/server-event-manuscript-intent.json",
       "kind": "server_frame"
     },
     {
@@ -63,6 +80,26 @@
       "id": "VOICE-FAKE-CARTESIA-GEMINI-TWO-TURN-SESSION",
       "path": "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-two-turn-session.json",
       "kind": "session_sequence"
+    },
+    {
+      "id": "VOICE-SYNTHETIC-RUNTIME-SESSION",
+      "path": "agent/fixtures/voice-protocol/v5/synthetic-runtime-session.json",
+      "kind": "runtime_session"
+    },
+    {
+      "id": "VOICE-FAKE-CARTESIA-GEMINI-RUNTIME-SESSION",
+      "path": "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-session.json",
+      "kind": "runtime_session"
+    },
+    {
+      "id": "VOICE-SYNTHETIC-RUNTIME-EVIDENCE-PACK",
+      "path": "agent/fixtures/voice-protocol/v5/synthetic-runtime-evidence-pack.json",
+      "kind": "evidence_pack"
+    },
+    {
+      "id": "VOICE-FAKE-CARTESIA-GEMINI-RUNTIME-EVIDENCE-PACK",
+      "path": "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-evidence-pack.json",
+      "kind": "evidence_pack"
     },
     {
       "id": "VOICE-CLIENT-DIFFERENTIAL-CASES",

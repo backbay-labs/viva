@@ -9,10 +9,10 @@ import {
   VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
   VIVA_VOICE_PROTOCOL_VERSION,
 } from "@viva/core";
-import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/fake-cartesia-gemini-study-session.json";
 import readyFixture from "../../../agent/fixtures/voice-protocol/server-ready.json";
-import sessionFixture from "../../../agent/fixtures/voice-protocol/session-config.json";
-import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
+import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-session.json";
+import sessionFixture from "../../../agent/fixtures/voice-protocol/v5/seeded-session-config.json";
+import fullSessionFixture from "../../../agent/fixtures/voice-protocol/v5/synthetic-runtime-session.json";
 import {
   agentProtocolVersion,
   createVivaAgentSessionController,
