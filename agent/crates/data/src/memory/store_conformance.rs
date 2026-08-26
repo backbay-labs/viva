@@ -29,8 +29,9 @@ use agent_domain::{
     AnswerEvaluation, AuthenticatedStudyProjectionV1, ChallengeResolution, ConceptStatus,
     CreateFileStudySet, CreatePasteStudySet, PortErrorKind, ProgressionPolicyId,
     QuestionDisposition, QuestionProgressionResult, SessionConfig, SessionId,
-    SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudyQuestion, StudySetIngestionRecord,
-    StudySetIngestionStatus, StudyStoreWriteCounts, StudyStoreWriteOutcome, VoiceUsageRecord,
+    SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudyQuestion, StudySessionDurableCounts,
+    StudySetIngestionRecord, StudySetIngestionStatus, StudyStoreWriteCounts,
+    StudyStoreWriteOutcome, VoiceUsageRecord,
 };
 
 use crate::{
@@ -1127,21 +1128,52 @@ async fn authorize_evaluation(
         .await
 }
 
-/// How many session-scoped concept-status writes this session has published.
+/// Every durable row count this session publishes.
 ///
 /// Read through the port both backends already publish counts on, so the two are
-/// compared on the number each one *tells a caller* it wrote — the memory
-/// snapshot's row count and Postgres's `concept_status_events` count — rather than
-/// on a backend-specific query the test invents.
-async fn durable_concept_statuses(
+/// compared on the numbers each one *tells a caller* it wrote — the memory
+/// snapshot's row counts and Postgres's own table counts — rather than on a
+/// backend-specific query the test invents.
+async fn session_durable_counts(
     store: &dyn StudyMemoryStore,
     fixture: &CanonicalStoreFixture,
-) -> usize {
+) -> StudySessionDurableCounts {
     store
         .study_session_durable_counts(LEARNING_USER_ID, LEARNING_SET_ID, fixture.voice_session_id)
         .await
         .expect("the session's durable counts read")
+}
+
+/// How many session-scoped concept-status writes this session has published.
+async fn durable_concept_statuses(
+    store: &dyn StudyMemoryStore,
+    fixture: &CanonicalStoreFixture,
+) -> usize {
+    session_durable_counts(store, fixture)
+        .await
         .concept_statuses
+}
+
+/// The two learning-evidence facts a refused turn must not have moved: the
+/// progression cursor, and the list of questions the session has answered.
+///
+/// Compared as this derived pair rather than as the whole
+/// [`SessionLearningEvidence`] so a mismatch names the fact that moved.
+async fn evidence_cursor_and_answers(
+    store: &dyn StudyMemoryStore,
+    fixture: &CanonicalStoreFixture,
+) -> (Option<String>, Vec<String>) {
+    let evidence = store
+        .session_learning_evidence(LEARNING_USER_ID, LEARNING_SET_ID, fixture.voice_session_id)
+        .await
+        .expect("session learning evidence reads");
+    (
+        evidence
+            .current_question
+            .as_ref()
+            .map(|question| question.question_id.clone()),
+        answered_question_ids(&evidence),
+    )
 }
 
 /// `A-22`: an evaluated turn's browser events are authoritative, and only the
@@ -1499,6 +1531,178 @@ pub(crate) async fn exercise_turn_outcome_browser_authority(
                 )
             });
     }
+
+    // --- Turn F: a refused turn writes nothing and authorizes nothing --------
+    //
+    // `record_turn_outcome` refuses an outcome whose question is not the one its
+    // response's answer attempt captured. That refusal is a *security* refusal on
+    // memory: A-22 made this authority the writer of both the `concept_status`
+    // rows and the `event_authorizations` digests that memory's
+    // `authorize_concept_status` reads, and memory has no rollback, so a refusal
+    // decided after those writes hands a browser live authority for a turn the
+    // store refused. Postgres decides the same refusal inside its transaction and
+    // rolls back, so an unpinned ordering difference here is exactly the
+    // "authoritative on exactly one deployment" split `DATA-005` and this shared
+    // suite exist to prevent.
+    //
+    // Pinned as an observable contract, not as an implementation detail: a refused
+    // turn moves no published count, no progression cursor, no answered-question
+    // list, and no browser authority — on both backends.
+    let mut mismatched = mostly_correct.clone();
+    mismatched.response_id = "resp-a22-attempt-question-mismatch".to_owned();
+    let TurnResolution::Evaluated {
+        concept_transitions: refused_transitions,
+        ..
+    } = mismatched.resolution.clone()
+    else {
+        panic!("the re-bound template must be an evaluated outcome")
+    };
+    assert!(
+        !refused_transitions.is_empty(),
+        "this turn only discriminates while the refused outcome would have moved a concept"
+    );
+    let captured_question = seeded_active_question(fixture, 1);
+    assert_ne!(
+        captured_question.question_id, mismatched.question_id,
+        "this turn only discriminates while the captured question is not the graded one"
+    );
+
+    store
+        .record_answer_attempt_envelope(
+            LEARNING_USER_ID,
+            LEARNING_SET_ID,
+            fixture.voice_session_id,
+            conformance_envelope(&mismatched.response_id, &captured_question),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{label}: the capture envelope records: {error:?}"));
+
+    // Measured after the capture, so every difference below belongs to the
+    // refused outcome alone.
+    let before_counts = session_durable_counts(store, fixture).await;
+    let before_cursor = evidence_cursor_and_answers(store, fixture).await;
+
+    let error = store
+        .record_turn_outcome(
+            LEARNING_USER_ID,
+            LEARNING_SET_ID,
+            fixture.voice_session_id,
+            mismatched.clone(),
+        )
+        .await
+        .expect_err(&format!(
+            "{label}: an outcome grading a different question than its capture is refused"
+        ));
+    assert_eq!(
+        error.kind(),
+        PortErrorKind::Conflict,
+        "{label}: the capture mismatch is a typed conflict, got {error:?}"
+    );
+
+    assert_eq!(
+        session_durable_counts(store, fixture).await,
+        before_counts,
+        "{label}: a refused turn publishes no durable row — not a concept status, not a \
+         review item"
+    );
+    assert_eq!(
+        evidence_cursor_and_answers(store, fixture).await,
+        before_cursor,
+        "{label}: a refused turn moves no progression cursor and answers no question"
+    );
+    assert_eq!(
+        persisted_evaluation_row(backend, fixture, &mismatched.response_id).await,
+        Some(PersistedEvaluationRow {
+            question_id: captured_question.question_id.clone(),
+            label: None,
+            concept_status: None,
+            confidence_score: None,
+            source_id: None,
+        }),
+        "{label}: a refused turn leaves its capture row exactly as the capture wrote it"
+    );
+
+    // The point of the whole step: no browser event of a refused turn is
+    // authoritative, on either backend.
+    for transition in &refused_transitions {
+        store
+            .authorize_concept_status(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                fixture.voice_session_id,
+                &mismatched.response_id,
+                &transition.concept_id,
+                &transition.to_status,
+            )
+            .await
+            .expect_err(&format!(
+                "{label}: a refused turn authorizes no `{}` status event",
+                transition.concept_id
+            ));
+    }
+    authorize_evaluation(
+        store,
+        fixture,
+        &mismatched.response_id,
+        &mostly_correct_evaluation,
+    )
+    .await
+    .expect_err(&format!(
+        "{label}: a refused turn authorizes no evaluation event"
+    ));
+
+    // --- Turn G: an evaluated outcome with no capture row -------------------
+    //
+    // The retired `record_answer_evaluation` had an `evaluation_only_compat`
+    // branch that inserted an attempt row when none existed; the turn-outcome
+    // authority deliberately does not reproduce it (the attempt row is the
+    // learner's capture record, so this authority completes one and never invents
+    // one). That is a fail-closed choice, and this pins its authorization
+    // consequence rather than leaving it to be re-derived: the outcome itself
+    // persists — its mastery move is real and its `concept_status` event is
+    // authoritative — while the `answer_evaluation` event, which has no capture
+    // row behind it, is refused on both backends.
+    let mut uncaptured = mostly_correct.clone();
+    uncaptured.response_id = "resp-a22-no-capture-row".to_owned();
+    store
+        .record_turn_outcome(
+            LEARNING_USER_ID,
+            LEARNING_SET_ID,
+            fixture.voice_session_id,
+            uncaptured.clone(),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{label}: an outcome with no capture row still persists: {error:?}")
+        });
+    assert_eq!(
+        persisted_evaluation_row(backend, fixture, &uncaptured.response_id).await,
+        None,
+        "{label}: the turn-outcome authority completes a capture row and never invents one"
+    );
+    authorize_evaluation(
+        store,
+        fixture,
+        &uncaptured.response_id,
+        &mostly_correct_evaluation,
+    )
+    .await
+    .expect_err(&format!(
+        "{label}: an evaluation with no capture row behind it fails closed at the gate"
+    ));
+    store
+        .authorize_concept_status(
+            LEARNING_USER_ID,
+            LEARNING_SET_ID,
+            fixture.voice_session_id,
+            &uncaptured.response_id,
+            &refused_transitions[0].concept_id,
+            &refused_transitions[0].to_status,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{label}: the mastery move it did persist is still authoritative: {error:?}")
+        });
 }
 
 // ---------------------------------------------------------------------------

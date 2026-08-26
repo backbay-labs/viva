@@ -985,6 +985,45 @@ pub(super) fn record_turn_outcome(
             "turn outcome recorded_at is not an RFC3339 UTC instant",
         )
     })?;
+
+    // `A-22`: the last refusal this write can make, decided here — before the
+    // first mutation below — because on this backend a late refusal is not a
+    // refusal at all.
+    //
+    // An evaluated outcome completes the answer attempt its response identity
+    // captured, so it must be grading the question that capture recorded. Postgres
+    // decides the same thing at the write itself (`postgres/learning.rs`), which is
+    // safe there: the whole write is one transaction and a refusal rolls it back.
+    // This backend has no rollback. Refusing after the loop below would leave the
+    // refused turn's `concept_statuses` rows and `ConceptStatus` authorization
+    // digests behind, and `authorize_concept_status` reads exactly those two — so
+    // the browser would hold live authority for a turn this call refused, on memory
+    // and not on Postgres. `DATA-005` and the shared conformance suite exist to stop
+    // exactly that split; `Turn F` there pins it on both backends.
+    //
+    // Ordered after the replay and supersession decisions above so both backends
+    // still answer a replay with its receipt and rank the same conflicts the same
+    // way; the checks it joins are all reads.
+    if browser_evaluation.is_some() {
+        let captured = state
+            .answer_attempts
+            .iter()
+            .find(|record| {
+                record.user_id == user_id
+                    && record.study_set_id == study_set_id
+                    && record.voice_session_id == voice_session_id
+                    && record.response_id == outcome.response_id
+            })
+            .map(|record| record.envelope.question_id.clone());
+        if captured.is_some_and(|question_id| question_id != outcome.question_id) {
+            return Err(PortError::conflict(
+                "memory",
+                &outcome.response_id,
+                "turn outcome question does not match the recorded answer attempt",
+            ));
+        }
+    }
+
     for transition in turn_outcome_transitions(&outcome).to_vec() {
         if let Some(concept) = state
             .concepts
@@ -1092,19 +1131,16 @@ pub(super) fn record_turn_outcome(
             EventAuthorizationKind::AnswerEvaluation,
             &payload,
         )?;
+        // The captured question was matched against this outcome above, before the
+        // first mutation, and this call has held the write lock throughout — so
+        // this row is the one that check passed, and there is no second place a
+        // mismatch can be refused from.
         if let Some(existing) = state.answer_attempts.iter_mut().find(|record| {
             record.user_id == user_id
                 && record.study_set_id == study_set_id
                 && record.voice_session_id == voice_session_id
                 && record.response_id == outcome.response_id
         }) {
-            if existing.envelope.question_id != outcome.question_id {
-                return Err(PortError::conflict(
-                    "memory",
-                    &outcome.response_id,
-                    "turn outcome question does not match the recorded answer attempt",
-                ));
-            }
             existing.evaluation = Some(payload.persisted_evaluation());
             authorization::record_locked(&mut state, authorization);
         }
