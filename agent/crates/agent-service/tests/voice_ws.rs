@@ -7440,6 +7440,7 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
             ..VoiceLimitConfig::default()
         },
     );
+    let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
         return;
     };
@@ -7535,6 +7536,11 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
     )
     .await;
 
+    // The cancel and the first socket's close travel on two separate loopback
+    // connections, so "sent" is not "processed". The server's own CancelReceived
+    // evidence is the ordering the assertion below depends on: the queued
+    // admission must already be dropped when the provider slot opens.
+    wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::CancelReceived).await;
     first_socket.close(None).await.unwrap();
     let _ = read_server_frames_until_close(&mut first_socket).await;
     let forwarded_after_cancel = tokio::time::timeout(Duration::from_millis(250), async {
@@ -7572,7 +7578,11 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
     )
     .with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
-        idle: Duration::from_millis(40),
+        // `SERVICE-001`: the deadline a cancelled queued submission returns to is
+        // the between-turn one. The in-turn deadline stays long so the socket
+        // holding the only provider slot survives the probe.
+        idle: Duration::from_secs(5),
+        between_turn_idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
         ..WsTimeouts::default()
     });
@@ -8025,7 +8035,9 @@ async fn websocket_provider_active_audio_rejects_later_frame_without_second_leas
     .expect("active audio continuation without a second lease should be denied");
     assert_terminal_session_phase(terminal, TerminalSessionReason::SlowClient);
     assert_close_code(&mut socket, CloseCode::Policy).await;
-    assert_eq!(*audio_inputs.lock().unwrap(), vec![vec![1_u8]]);
+    // v5 PCM16 payloads are a whole number of samples, so the bounded assembler
+    // admits the even-length turn the helper actually sent.
+    assert_eq!(*audio_inputs.lock().unwrap(), vec![vec![1_u8, 2]]);
     assert!(evidence.snapshot().iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::ProviderAdmission
             && event.detail.contains("admission_decision=denied")
@@ -9002,7 +9014,7 @@ async fn websocket_brain_open_failure_with_missing_session_close_keeps_provider_
 }
 
 #[tokio::test]
-async fn websocket_brain_open_store_failure_emits_durability_degraded_terminal_phase() {
+async fn websocket_brain_open_store_failure_reports_the_brains_typed_terminal_reason() {
     let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let store = Arc::new(DurableStoreDegradingStore {
         inner: inner.clone(),
@@ -9028,16 +9040,28 @@ async fn websocket_brain_open_store_failure_emits_durability_degraded_terminal_p
     assert!(store.durable);
     send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
+    // `DOMAIN-009` / `SERVICE-006`: the service reports the typed terminal reason
+    // the brain handed it and derives nothing from the store's prose. The
+    // synthetic adapter classifies a failed durable progression read as a
+    // tool-executor failure at its own tool stage, so that is what the socket
+    // truthfully reports. Recovering the durability signal across that adapter
+    // boundary is Plan 07's `ADAPTER-06` row, not a service-side
+    // reclassification; the protocol-wrapped test below is the companion proof
+    // that a brain which *does* report durability degradation reaches the wire as
+    // `durability_degraded`.
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
-        TerminalSessionReason::DurabilityDegraded,
+        TerminalSessionReason::ToolExecutorFailure,
     );
     assert_close_code(&mut socket, CloseCode::Error).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::TerminalReason
-            && event.detail == "durability_degraded"
+            && event.detail == "tool_executor_failure"
     }));
+    assert!(events
+        .iter()
+        .all(|event| !event.detail.contains("durable store read failed")));
 }
 
 #[tokio::test]
@@ -9079,17 +9103,28 @@ async fn websocket_protocol_wrapped_open_store_failure_emits_durability_degraded
     }));
 }
 
+/// `DOMAIN-009`: the terminal reason comes from the typed failure the provider
+/// error carries. The diagnostic `message` beside it is never parsed and never
+/// reaches the wire, however suggestive its prose is.
 #[tokio::test]
 async fn websocket_provider_error_event_emits_terminal_phase_without_raw_message() {
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let mut provider_error =
+        BrainProviderError::from_failure(BrainProviderFailure::new(BrainProviderFailureParts {
+            failure_class: BrainFailureClass::ProviderAuthFailure,
+            stage: BrainFailureStage::ProviderAuth,
+            retry_eligible: false,
+            latency_ms: 0,
+            provider: "cartesia_gemini".to_owned(),
+            model: String::new(),
+            metadata: "error_kind=missing_api_key".to_owned(),
+        }));
+    provider_error.message =
+        "raw answer transcript with CARTESIA_API_KEY must not surface".to_owned();
     let state = AppState::with_study_store(
         Arc::new(EventProbeBrain {
             study_store: None,
-            events: vec![BrainEvent::Error(BrainProviderError {
-                source: "cartesia_gemini".to_owned(),
-                message: "raw answer transcript with CARTESIA_API_KEY must not surface".to_owned(),
-                failure: None,
-            })],
+            events: vec![BrainEvent::Error(provider_error)],
         }),
         "event_probe",
         VoiceWsAccess::default(),
@@ -9103,11 +9138,60 @@ async fn websocket_provider_error_event_emits_terminal_phase_without_raw_message
     assert_ready_provider(&mut socket, "event_probe").await;
     send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
-    assert_terminal_session_phase(
-        read_server_frame(&mut socket).await,
-        TerminalSessionReason::ProviderAuthFailed,
+    let terminal = read_server_frame(&mut socket).await;
+    assert!(
+        !serde_json::to_string(&terminal)
+            .unwrap()
+            .contains("CARTESIA_API_KEY"),
+        "the provider diagnostic must never reach the wire"
     );
+    assert_terminal_session_phase(terminal, TerminalSessionReason::ProviderAuthFailed);
     assert_close_code(&mut socket, CloseCode::Error).await;
+}
+
+/// `DOMAIN-009` misclassification control: a provider error that arrives without
+/// its typed failure is an invariant breach, not an invitation to read its
+/// prose. Its message names an auth failure and a durable-store failure at once;
+/// the service refuses to derive either and reports the explicit rollback.
+#[tokio::test]
+async fn websocket_untyped_provider_error_cannot_be_classified_from_its_message() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(EventProbeBrain {
+            study_store: None,
+            events: vec![BrainEvent::Error(BrainProviderError {
+                source: "cartesia_gemini".to_owned(),
+                message: "CARTESIA_API_KEY rejected; postgres adapter error: durable store write failed; rate limit"
+                    .to_owned(),
+                failure: None,
+            })],
+        }),
+        "event_probe",
+        VoiceWsAccess::default(),
+        4,
+        store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut socket, "event_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+
+    let terminal = read_server_frame(&mut socket).await;
+    let rendered = serde_json::to_string(&terminal).unwrap();
+    assert!(!rendered.contains("CARTESIA_API_KEY"), "{rendered}");
+    assert!(!rendered.contains("postgres"), "{rendered}");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::Rollback);
+    assert_close_code(&mut socket, CloseCode::Error).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason && event.detail == "rollback"
+    }));
+    assert!(events.iter().all(|event| {
+        !event.detail.contains("CARTESIA_API_KEY") && !event.detail.contains("postgres")
+    }));
 }
 
 #[tokio::test]
@@ -9122,11 +9206,19 @@ async fn websocket_runtime_store_error_event_emits_durability_degraded_terminal_
     let state = AppState::with_study_store(
         Arc::new(EventProbeBrain {
             study_store: Some(brain_store),
-            events: vec![BrainEvent::Error(BrainProviderError {
-                source: "synthetic-memory".to_owned(),
-                message: "postgres adapter error: durable store write failed".to_owned(),
-                failure: None,
-            })],
+            // `DOMAIN-009`: the durability classification is read from the typed
+            // failure, never from the adapter prose beside it.
+            events: vec![BrainEvent::Error(BrainProviderError::from_failure(
+                BrainProviderFailure::new(BrainProviderFailureParts {
+                    failure_class: BrainFailureClass::DurabilityDegraded,
+                    stage: BrainFailureStage::Store,
+                    retry_eligible: false,
+                    latency_ms: 0,
+                    provider: "synthetic-memory".to_owned(),
+                    model: String::new(),
+                    metadata: "error_kind=store_write_failed".to_owned(),
+                }),
+            ))],
         }),
         "event_probe",
         VoiceWsAccess::default(),
@@ -10819,9 +10911,13 @@ async fn websocket_turn_cap_waits_for_answer_frame() {
 
 #[tokio::test]
 async fn websocket_post_config_idle_timeout_closes_without_answer_frame() {
+    // `SERVICE-001`: a socket that never submits an answer is a sleeping client,
+    // so the deadline that ends it is the between-turn one, not the in-turn
+    // progress deadline.
     let state = test_state(1).with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
-        idle: Duration::from_millis(25),
+        idle: Duration::from_secs(5),
+        between_turn_idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
         ..WsTimeouts::default()
     });
@@ -11264,10 +11360,14 @@ async fn websocket_audio_continuation_requires_second_lease_when_limiter_enabled
         VoiceWsAccess::default(),
         1,
     )
+    // The subject here is the provider lease, not a deadline: the in-turn
+    // progress deadline stays well clear of the first turn's admission so the
+    // second audio turn is denied for the overlap it is, rather than racing the
+    // turn cap.
     .with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
-        idle: Duration::from_millis(40),
-        session: Duration::from_secs(5),
+        idle: Duration::from_secs(4),
+        session: Duration::from_secs(8),
         ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
@@ -14468,6 +14568,75 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
             .await
     }
 
+    async fn select_next_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        policy: agent_domain::ProgressionPolicyId,
+    ) -> Result<agent_domain::QuestionProgressionResult, PortError> {
+        // `LEARN-004B` moved question selection onto a per-session progression
+        // cursor, so this — not `active_question` — is the durable read a session
+        // open actually performs.
+        if self.failure == DurableStoreFailureMode::ActiveQuestion {
+            return Err(PortError::durability(
+                "postgres",
+                "durable-read",
+                "durable store read failed",
+            ));
+        }
+        self.inner
+            .select_next_question(user_id, study_set_id, voice_session_id, response_id, policy)
+            .await
+    }
+
+    async fn session_learning_evidence(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::SessionLearningEvidence, PortError> {
+        self.inner
+            .session_learning_evidence(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn authenticated_study_projection(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::AuthenticatedStudyProjectionV1, PortError> {
+        self.inner
+            .authenticated_study_projection(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn record_answer_attempt_envelope(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        envelope: AnswerAttemptEnvelope,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_attempt_envelope(user_id, study_set_id, voice_session_id, envelope)
+            .await
+    }
+
+    async fn record_turn_outcome(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        outcome: agent_domain::TurnOutcome,
+    ) -> Result<agent_domain::PersistedTurnOutcome, PortError> {
+        self.inner
+            .record_turn_outcome(user_id, study_set_id, voice_session_id, outcome)
+            .await
+    }
+
     async fn record_voice_usage(
         &self,
         event: VoiceUsageRecord,
@@ -14547,17 +14716,38 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                 })
                 .await;
             while let Some(input) = input_rx.recv().await {
-                let (char_count, client_generation_id) = match input {
-                    BrainInput::Text(text) => (Some(text.chars().count() as u64), None),
+                // `DOMAIN-003` emission boundary: a typed answer envelope carries
+                // both the byte count every capture mode records and the char
+                // count typed capture requires. Omitting either is what the
+                // upstream `validate_fail_closed` refuses, so this probe supplies
+                // the same pair the production runtimes do.
+                let (byte_count, char_count, client_generation_id) = match input {
+                    BrainInput::Text(text) => (
+                        Some(text.len() as u64),
+                        Some(text.chars().count() as u64),
+                        None,
+                    ),
                     BrainInput::TextWithMetadata {
                         text,
                         client_generation_id,
-                    } => (Some(text.chars().count() as u64), client_generation_id),
-                    BrainInput::Audio(frame) => (Some(frame.pcm16_bytes().len() as u64), None),
+                    } => (
+                        Some(text.len() as u64),
+                        Some(text.chars().count() as u64),
+                        client_generation_id,
+                    ),
+                    BrainInput::Audio(frame) => (
+                        Some(frame.pcm16_bytes().len() as u64),
+                        Some(frame.pcm16_bytes().len() as u64),
+                        None,
+                    ),
                     BrainInput::AudioWithMetadata {
                         frame,
                         client_generation_id,
-                    } => (Some(frame.pcm16_bytes().len() as u64), client_generation_id),
+                    } => (
+                        Some(frame.pcm16_bytes().len() as u64),
+                        Some(frame.pcm16_bytes().len() as u64),
+                        client_generation_id,
+                    ),
                     BrainInput::Stop => break,
                     _ => continue,
                 };
@@ -14576,7 +14766,7 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                                     question.question_id
                                 ),
                                 capture_mode: AnswerCaptureMode::Typed,
-                                byte_count: None,
+                                byte_count,
                                 char_count,
                                 duration_ms: None,
                                 client_generation_id: client_generation_id.clone(),
@@ -14606,7 +14796,7 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                                     question.question_id
                                 ),
                                 capture_mode: AnswerCaptureMode::Typed,
-                                byte_count: None,
+                                byte_count,
                                 char_count,
                                 duration_ms: None,
                                 client_generation_id,
@@ -15864,4 +16054,922 @@ impl RealtimeBrain for CancelledThenStaleResolutionProbeBrain {
             task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
         })
     }
+}
+
+// -------------------------------------------------------------------------
+// Task 8 (SERVICE-001, SERVICE-006, SERVICE-014): durable deferred turns and
+// the between-turn idle deadline, proved on a real socket.
+// -------------------------------------------------------------------------
+
+/// Every store call the synthetic (Plan 07) outcome path makes, in order, with a
+/// single injectable `record_turn_outcome` failure. Nothing is simulated: each
+/// call is delegated to the real in-memory store, so a durable read after a wire
+/// frame observes the same rows the runtime wrote.
+struct TurnOutcomeAuditStore {
+    inner: Arc<data::InMemoryStudyStore>,
+    fail_turn_outcome: bool,
+    calls: Mutex<Vec<&'static str>>,
+}
+
+impl TurnOutcomeAuditStore {
+    fn new(inner: Arc<data::InMemoryStudyStore>, fail_turn_outcome: bool) -> Self {
+        Self {
+            inner,
+            fail_turn_outcome,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn record(&self, call: &'static str) {
+        self.calls
+            .lock()
+            .expect("turn outcome audit lock poisoned")
+            .push(call);
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls
+            .lock()
+            .expect("turn outcome audit lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for TurnOutcomeAuditStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    async fn pending_answer_attempts_for_session(
+        &self,
+        voice_session_id: &str,
+    ) -> Result<usize, PortError> {
+        self.inner
+            .pending_answer_attempts_for_session(voice_session_id)
+            .await
+    }
+
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<agent_domain::StudyStoreWriteOutcome, PortError> {
+        self.inner.record_voice_session(config).await
+    }
+
+    async fn study_session_durable_counts(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::StudySessionDurableCounts, PortError> {
+        self.inner
+            .study_session_durable_counts(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn answer_attempt_was_recorded(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+    ) -> Result<bool, PortError> {
+        self.inner
+            .answer_attempt_was_recorded(user_id, study_set_id, voice_session_id, response_id)
+            .await
+    }
+
+    async fn claim_session_token_nonce(
+        &self,
+        claim: SessionTokenNonceClaim,
+    ) -> Result<(), PortError> {
+        self.inner.claim_session_token_nonce(claim).await
+    }
+
+    async fn close_voice_session(
+        &self,
+        voice_session_id: &str,
+        terminal_reason: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .close_voice_session(voice_session_id, terminal_reason)
+            .await
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn active_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<StudyQuestion>, PortError> {
+        self.inner.active_question(user_id, study_set_id).await
+    }
+
+    async fn authorize_question_started(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        question: &StudyQuestion,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_question_started(user_id, study_set_id, voice_session_id, question)
+            .await
+    }
+
+    async fn authorize_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: &AnswerEvaluation,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn authorize_source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        source: &StudySourceReference,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_source_reference(user_id, study_set_id, voice_session_id, source)
+            .await
+    }
+
+    async fn authorize_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: &ConceptStatus,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn authorize_manuscript_intent(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        intent: &agent_domain::ManuscriptIntent,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_manuscript_intent(user_id, study_set_id, voice_session_id, intent)
+            .await
+    }
+
+    async fn authorize_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: &StudySessionRecap,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+
+    async fn record_answer_attempt_envelope(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        envelope: AnswerAttemptEnvelope,
+    ) -> Result<serde_json::Value, PortError> {
+        self.record("record_answer_attempt_envelope");
+        self.inner
+            .record_answer_attempt_envelope(user_id, study_set_id, voice_session_id, envelope)
+            .await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.record("record_answer_evaluation");
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.record("record_concept_status");
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.record("schedule_review_item");
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn review_scheduling_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<ReviewSchedulingContextV1, PortError> {
+        self.inner
+            .review_scheduling_context(user_id, study_set_id, concept_id)
+            .await
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        decision: agent_domain::ReviewScheduleDecisionV1,
+    ) -> Result<serde_json::Value, PortError> {
+        self.record("persist_review_schedule_decision");
+        self.inner
+            .persist_review_schedule_decision(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                decision,
+            )
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.record("record_recap");
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+
+    async fn record_voice_usage(
+        &self,
+        event: VoiceUsageRecord,
+    ) -> Result<agent_domain::StudyStoreWriteOutcome, PortError> {
+        self.inner.record_voice_usage(event).await
+    }
+
+    async fn record_turn_outcome(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        outcome: agent_domain::TurnOutcome,
+    ) -> Result<agent_domain::PersistedTurnOutcome, PortError> {
+        self.record("record_turn_outcome");
+        if self.fail_turn_outcome {
+            return Err(PortError::durability(
+                "postgres",
+                voice_session_id,
+                "durable store write failed",
+            ));
+        }
+        self.inner
+            .record_turn_outcome(user_id, study_set_id, voice_session_id, outcome)
+            .await
+    }
+
+    async fn session_learning_evidence(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::SessionLearningEvidence, PortError> {
+        self.inner
+            .session_learning_evidence(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn select_next_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        policy: agent_domain::ProgressionPolicyId,
+    ) -> Result<agent_domain::QuestionProgressionResult, PortError> {
+        self.inner
+            .select_next_question(user_id, study_set_id, voice_session_id, response_id, policy)
+            .await
+    }
+
+    async fn record_challenge_resolution(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        resolution: agent_domain::ChallengeResolution,
+    ) -> Result<agent_domain::ChallengeResolution, PortError> {
+        self.inner
+            .record_challenge_resolution(user_id, study_set_id, voice_session_id, resolution)
+            .await
+    }
+
+    async fn authenticated_study_projection(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::AuthenticatedStudyProjectionV1, PortError> {
+        self.inner
+            .authenticated_study_projection(user_id, study_set_id, voice_session_id)
+            .await
+    }
+}
+
+/// `bac522-deferred-2` is chosen so the synthetic fixture evaluator's
+/// response-identity cursor lands on `deferred_insufficient_semantic_evidence`.
+/// The assertion on the wire reason keeps a drift in that cursor loud instead of
+/// silently turning this into an evaluated-turn test.
+const TURN_DEFERRED_GENERATION_ID: &str = "bac522-deferred-2";
+
+fn turn_deferred_session_config_json(generation_id: &str) -> String {
+    let session: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/session-config.json"
+    ))
+    .unwrap();
+    serde_json::json!({
+        "type": "session_config",
+        "version": VIVA_VOICE_PROTOCOL_VERSION,
+        "client_generation_id": generation_id,
+        "session": session,
+        "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
+    })
+    .to_string()
+}
+
+async fn run_turn_deferred_probe(
+    fail_turn_outcome: bool,
+) -> Option<(Vec<ServerFrame>, Arc<TurnOutcomeAuditStore>)> {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(TurnOutcomeAuditStore::new(inner, fail_turn_outcome));
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(brain_store)),
+        "synthetic",
+        VoiceWsAccess::default(),
+        2,
+        state_store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(10),
+        between_turn_idle: Duration::from_secs(10),
+        session: Duration::from_secs(20),
+        ..WsTimeouts::default()
+    });
+    let url = spawn_server(state).await?;
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut socket, "synthetic").await;
+    socket
+        .send(WsMessage::Text(
+            turn_deferred_session_config_json(TURN_DEFERRED_GENERATION_ID).into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut frames = Vec::new();
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        let saw_question = matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        );
+        frames.push(frame);
+        if saw_question {
+            break;
+        }
+    }
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: TURN_DEFERRED_GENERATION_ID.to_owned(),
+            turn_id: "turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "electrons move through the chain".to_owned(),
+            },
+        },
+    )
+    .await;
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        let frame = tokio::time::timeout(Duration::from_secs(4), socket.next()).await;
+        let Ok(Some(Ok(message))) = frame else {
+            break;
+        };
+        match message {
+            WsMessage::Text(text) => {
+                let frame: ServerFrame = serde_json::from_str(&text).unwrap();
+                let stop = matches!(
+                    &frame,
+                    ServerFrame::Event { event, .. }
+                        if matches!(event.as_ref(), VivaServerEvent::TurnDeferred { .. })
+                ) || terminal_session_reason(&frame).is_some();
+                frames.push(frame);
+                if stop {
+                    break;
+                }
+            }
+            WsMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+    Some((frames, store))
+}
+
+/// `SERVICE-014`: the deferral the learner sees is the one Plan 07 already
+/// persisted. The durable outcome is readable at the instant the nonterminal
+/// frame arrives, and the frame carries the persisted turn binding.
+#[tokio::test]
+async fn turn_deferred_frame_follows_the_persisted_outcome() {
+    let Some((frames, store)) = run_turn_deferred_probe(false).await else {
+        return;
+    };
+
+    let (turn_id, response_id, question_id, reason, can_retry_same_question) = frames
+        .iter()
+        .find_map(|frame| match frame {
+            ServerFrame::Event { event, .. } => match event.as_ref() {
+                VivaServerEvent::TurnDeferred {
+                    turn_id,
+                    response_id,
+                    question_id,
+                    reason,
+                    can_retry_same_question,
+                } => Some((
+                    turn_id.clone(),
+                    response_id.clone(),
+                    question_id.clone(),
+                    reason.clone(),
+                    *can_retry_same_question,
+                )),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("turn_deferred frame");
+
+    let question_turn_id = frames
+        .iter()
+        .find_map(|frame| match frame {
+            ServerFrame::Event { event, .. } => match event.as_ref() {
+                VivaServerEvent::QuestionStarted {
+                    turn_id,
+                    response_id: question_response_id,
+                    ..
+                } if *question_response_id == response_id => Some(turn_id.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("question_started that opened the deferred turn");
+    assert_eq!(
+        turn_id, question_turn_id,
+        "the deferral must name the turn its question opened"
+    );
+    assert_eq!(
+        reason,
+        agent_domain::EvaluationDeferralReason::InsufficientSemanticEvidence
+    );
+    assert!(can_retry_same_question);
+    assert!(!question_id.trim().is_empty());
+
+    // The deferral is nonterminal: no terminal phase precedes it.
+    let deferred_index = frames
+        .iter()
+        .position(|frame| {
+            matches!(
+                frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(event.as_ref(), VivaServerEvent::TurnDeferred { .. })
+            )
+        })
+        .expect("deferral index");
+    assert!(
+        frames[..deferred_index]
+            .iter()
+            .all(|frame| terminal_session_reason(frame).is_none()),
+        "a deferral is never preceded by a terminal phase"
+    );
+
+    let calls = store.calls();
+    assert!(
+        calls.contains(&"record_turn_outcome"),
+        "the persisted outcome is the only source of a deferral: {calls:?}"
+    );
+    // A deferred outcome states no mastery: no evaluation, status, schedule, or
+    // recap write is authorized by it.
+    let counts = store.write_counts();
+    assert_eq!(counts.concept_statuses, 0, "{calls:?}");
+    assert_eq!(counts.review_items, 0, "{calls:?}");
+    assert!(
+        !frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::AnswerEvaluated { .. } | VivaServerEvent::ConceptStatus { .. }
+                )
+        )),
+        "a deferral never carries a graded fact"
+    );
+}
+
+/// A store that cannot persist the outcome yields no learner fact at all: no
+/// deferral, no evaluation, no concept status, no review write, no graded recap.
+#[tokio::test]
+async fn turn_deferred_store_failure_emits_no_learner_fact() {
+    let Some((frames, store)) = run_turn_deferred_probe(true).await else {
+        return;
+    };
+
+    assert!(store.calls().contains(&"record_turn_outcome"));
+    assert!(
+        !frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::TurnDeferred { .. }
+                        | VivaServerEvent::AnswerEvaluated { .. }
+                        | VivaServerEvent::ConceptStatus { .. }
+                )
+        )),
+        "a failed outcome write must not reach the learner: {frames:?}"
+    );
+    assert!(
+        !frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::RecapReady { .. })
+        )),
+        "a failed outcome write must not produce a graded recap"
+    );
+    let counts = store.write_counts();
+    assert_eq!(counts.concept_statuses, 0);
+    assert_eq!(counts.review_items, 0);
+    assert_eq!(counts.recaps, 0);
+    let calls = store.calls();
+    assert!(!calls.contains(&"record_answer_evaluation"), "{calls:?}");
+    assert!(!calls.contains(&"record_concept_status"), "{calls:?}");
+    assert!(
+        !calls.contains(&"persist_review_schedule_decision"),
+        "{calls:?}"
+    );
+    assert!(!calls.contains(&"record_recap"), "{calls:?}");
+}
+
+/// A provider that finishes one turn and then says nothing. The socket must be
+/// returned to the between-turn deadline rather than left alive until the
+/// six-hour absolute session cap.
+struct BetweenTurnIdleProbeBrain {
+    study_store: Arc<dyn StudyMemoryStore>,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for BetweenTurnIdleProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "between_turn_idle_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(&self, config: SessionConfig) -> Result<RealtimeSession, BrainError> {
+        let _outcome = self
+            .study_store
+            .record_voice_session(&config)
+            .await
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = event_tx
+                .send(BrainEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                })
+                .await;
+            let _ = event_tx
+                .send(BrainEvent::QuestionStarted {
+                    response_id: "response-1".to_owned(),
+                    question: agent_domain::fixture_question(),
+                })
+                .await;
+            while let Some(input) = input_rx.recv().await {
+                if !matches!(
+                    input,
+                    BrainInput::Text(_)
+                        | BrainInput::TextWithMetadata { .. }
+                        | BrainInput::Audio(_)
+                        | BrainInput::AudioWithMetadata { .. }
+                ) {
+                    continue;
+                }
+                let _ = event_tx
+                    .send(BrainEvent::ResponseCompleted {
+                        response_id: "response-1".to_owned(),
+                    })
+                    .await;
+            }
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+/// `SERVICE-001`: a completed provider turn re-arms the between-turn deadline,
+/// and its expiry drops every server-owned lease.
+#[tokio::test]
+async fn between_turn_idle_expiry_releases_session_ip_and_provider_leases() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(BetweenTurnIdleProbeBrain {
+            study_store: store.clone(),
+        }),
+        "between_turn_idle_probe",
+        VoiceWsAccess::default(),
+        2,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(2),
+        max_user_sessions: Some(1),
+        provider_limiter_enabled: true,
+        max_provider_concurrent_turns: Some(1),
+        max_provider_queue_depth: Some(1),
+        ..VoiceLimitConfig::default()
+    })
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        // The in-turn deadline is deliberately long: only the between-turn
+        // deadline may end a socket whose turn already resolved.
+        idle: Duration::from_secs(4),
+        between_turn_idle: Duration::from_millis(250),
+        session: Duration::from_secs(8),
+        ..WsTimeouts::default()
+    });
+    let limits = state.limit_state.clone();
+    let slots = state.session_slots.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "between_turn_idle_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+    assert_eq!(limits.ip_lease_count(TEST_PEER_IP), Some(1));
+
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-between-turn-idle".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "an answer the provider completes".to_owned(),
+            },
+        },
+    )
+    .await;
+
+    let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = read_server_frame(&mut socket).await;
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("a completed provider turn must re-arm the between-turn deadline");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
+    assert_close_code(&mut socket, CloseCode::Policy).await;
+
+    wait_for_released_ip_lease(&limits, TEST_PEER_IP).await;
+    wait_until(Duration::from_secs(5), || slots.available_permits() == 2).await;
+
+    // The user, study-set, and provider leases are gone too: the same identity
+    // reconnects and is admitted a provider turn immediately.
+    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut second_socket, "between_turn_idle_probe").await;
+    send_client_frame(&mut second_socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut second_socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+    send_client_frame(
+        &mut second_socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-between-turn-idle-2".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "the provider slot was released".to_owned(),
+            },
+        },
+    )
+    .await;
+    let second_terminal = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = read_server_frame(&mut second_socket).await;
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("the reconnecting session was admitted and re-armed");
+    assert_terminal_session_phase(second_terminal, TerminalSessionReason::TurnCap);
+}
+
+/// Keepalives are not work: a Ping/Pong pair cannot postpone the between-turn
+/// deadline of a socket whose turn already resolved.
+#[tokio::test]
+async fn between_turn_idle_is_not_postponed_by_client_keepalives() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(BetweenTurnIdleProbeBrain {
+            study_store: store.clone(),
+        }),
+        "between_turn_idle_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(4),
+        between_turn_idle: Duration::from_millis(250),
+        session: Duration::from_secs(8),
+        ..WsTimeouts::default()
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "between_turn_idle_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-between-turn-keepalive".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "an answer the provider completes".to_owned(),
+            },
+        },
+    )
+    .await;
+
+    let started = Instant::now();
+    let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let _ = socket.send(WsMessage::Ping(Vec::new().into())).await;
+            let Some(Ok(message)) = socket.next().await else {
+                panic!("socket ended without a terminal phase");
+            };
+            let WsMessage::Text(text) = message else {
+                continue;
+            };
+            let frame: ServerFrame = serde_json::from_str(&text).unwrap();
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("client keepalives postponed the between-turn deadline");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the between-turn deadline moved with keepalives"
+    );
 }

@@ -1,7 +1,8 @@
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,7 +31,7 @@ use observe::{VoiceEvidenceEvent, VoiceEvidenceEventKind};
 use serde_json::json;
 use tokio::{
     sync::{mpsc, watch, OwnedSemaphorePermit},
-    time::{timeout, Instant},
+    time::{timeout, Instant, Sleep},
 };
 
 use crate::{
@@ -654,14 +655,16 @@ async fn handle_socket(
     let mut terminal_persisted = false;
     let mut cancelled_responses = CancelledResponseTracker::default();
     let mut session_limits = SessionLimitRuntime::new();
-    let mut wire_turns = WireTurnLedger::default();
+    let mut turn_bindings = TurnBindingTracker::default();
     // One bounded browser audio turn under assembly at a time, connection-local.
     let mut incoming_audio_turn: Option<IncomingAudioTurn> = None;
     let session_cap = tokio::time::sleep(state.ws_timeouts.session);
     tokio::pin!(session_cap);
     let turn_cap = tokio::time::sleep(state.ws_timeouts.idle);
     tokio::pin!(turn_cap);
-    let pre_answer_idle = tokio::time::sleep(state.ws_timeouts.idle);
+    // `SERVICE-001`: the sleeping-client deadline between turns, never the
+    // in-turn progress deadline. A client frame cannot extend it.
+    let pre_answer_idle = tokio::time::sleep(state.ws_timeouts.between_turn_idle);
     tokio::pin!(pre_answer_idle);
     let mut pre_answer_idle_armed = true;
     let mut turn_cap_deadline: Option<Instant> = None;
@@ -674,6 +677,7 @@ async fn handle_socket(
     let mut resolved_submitted_answer_response_ids = HashSet::<String>::new();
     let mut completed_provider_turn_response_ids = HashSet::<String>::new();
     let mut superseded_provider_turn_response_ids = HashSet::<String>::new();
+    let mut turn_work_outstanding = false;
     let mut drain_signal = state.drain_signal.subscribe();
     if *drain_signal.borrow_and_update() {
         terminal_reason = close_with_terminal_session_phase(
@@ -691,6 +695,25 @@ async fn handle_socket(
     }
 
     loop {
+        // `SERVICE-001`: the falling edge of outstanding turn work is the only
+        // thing that re-arms the between-turn deadline. A client frame, a
+        // keepalive, a context-only refresh, or a repeated resolution reaches
+        // this point with the counters unchanged, so none of them moves it.
+        let outstanding = pending_submitted_answers != 0 || active_provider_turns != 0;
+        if turn_work_outstanding
+            && !outstanding
+            && rearm_between_turn_idle(
+                pending_submitted_answers,
+                active_provider_turns,
+                pre_answer_idle.as_mut(),
+                Instant::now(),
+                state.ws_timeouts.between_turn_idle,
+            )
+        {
+            pre_answer_idle_armed = true;
+        }
+        turn_work_outstanding = outstanding;
+
         tokio::select! {
             biased;
 
@@ -773,6 +796,7 @@ async fn handle_socket(
                     break;
                 }
                 let accepted_audio_turn = client_input.accepted_audio_turn();
+                let submitted_turn_id = client_input.submitted_turn_id().map(ToOwned::to_owned);
                 let mut provider_admission_lease = admission.lease.take();
                 let turn_send_deadline = if client_input.action().arms_turn_cap() {
                     pre_answer_idle_armed = false;
@@ -798,6 +822,10 @@ async fn handle_socket(
                     Ok(action) => {
                         record_client_action(&state, voice_session_id.clone(), action);
                         if action.arms_turn_cap() {
+                            register_submitted_turn(
+                                &mut turn_bindings,
+                                submitted_turn_id.as_deref(),
+                            );
                             mark_completed_provider_turns_superseded(
                                 &completed_provider_turn_response_ids,
                                 &mut superseded_provider_turn_response_ids,
@@ -955,13 +983,10 @@ async fn handle_socket(
                         pending_provider_admission_reserved_submission = false;
                         if pending_submitted_answers == 0 {
                             turn_cap_deadline = None;
-                            if active_provider_turns == 0 {
-                                pre_answer_idle_armed = true;
-                                pre_answer_idle
-                                    .as_mut()
-                                    .reset(Instant::now() + state.ws_timeouts.idle);
-                            }
                         }
+                        // The `continue` below returns to the loop head, whose
+                        // falling-edge check is the one place the between-turn
+                        // deadline is re-armed.
                     }
                     match send_client_input_action_with_drain(
                         &session.input,
@@ -1024,6 +1049,7 @@ async fn handle_socket(
                     continue;
                 }
                 let accepted_audio_turn = client_input.accepted_audio_turn();
+                let submitted_turn_id = client_input.submitted_turn_id().map(ToOwned::to_owned);
                 let mut provider_admission_lease = None;
                 let requires_provider_admission =
                     client_input_requires_provider_admission(&client_input);
@@ -1035,7 +1061,7 @@ async fn handle_socket(
                             session_binding: &session_binding,
                             limits: &state.voice_limits,
                             session_limits: &mut session_limits,
-                            wire_turns: &mut wire_turns,
+                            turn_bindings: &mut turn_bindings,
                         };
                         let mut provider_runtime = ProviderTurnRuntime {
                             pending_submitted_answers: &mut pending_submitted_answers,
@@ -1214,6 +1240,10 @@ async fn handle_socket(
                     Ok(action) => {
                         record_client_action(&state, voice_session_id.clone(), action);
                         if action.arms_turn_cap() {
+                            register_submitted_turn(
+                                &mut turn_bindings,
+                                submitted_turn_id.as_deref(),
+                            );
                             if requires_provider_admission {
                                 mark_completed_provider_turns_superseded(
                                     &completed_provider_turn_response_ids,
@@ -1249,7 +1279,7 @@ async fn handle_socket(
                                     session_binding: &session_binding,
                                     limits: &state.voice_limits,
                                     session_limits: &mut session_limits,
-                                    wire_turns: &mut wire_turns,
+                                    turn_bindings: &mut turn_bindings,
                                 };
                                 match drain_terminal_events(
                                     &mut forward_context,
@@ -1416,7 +1446,7 @@ async fn handle_socket(
                     session_binding: &session_binding,
                     limits: &state.voice_limits,
                     session_limits: &mut session_limits,
-                    wire_turns: &mut wire_turns,
+                    turn_bindings: &mut turn_bindings,
                 };
                 let mut provider_runtime = ProviderTurnRuntime {
                     pending_submitted_answers: &mut pending_submitted_answers,
@@ -1522,54 +1552,72 @@ fn abort_realtime_session_tasks(session: &mut agent_domain::RealtimeSession) {
     drop(session.task_guard.take());
 }
 
+/// `SERVICE-006`: how one provider event resolves outstanding turn work. There is
+/// exactly one mapping and both the submitted-answer counter and the
+/// active-provider-turn counter consume the same returned value, so the two can
+/// never disagree about whether a turn ended.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum SubmittedAnswerResolution {
+enum ProviderTurnResolution {
     One { response_id: Option<String> },
     All,
 }
 
-fn brain_event_submitted_answer_resolution(
-    event: &agent_domain::BrainEvent,
-) -> Option<SubmittedAnswerResolution> {
+/// The single classification of a provider event.
+///
+/// `BrainEvent` is `#[non_exhaustive]` in another crate, so the final arm safely
+/// ignores a future event until its contract owner classifies it; every current
+/// variant is named explicitly above it and pinned by the lane's table test.
+fn classify_provider_turn_event(event: &BrainEvent) -> Option<ProviderTurnResolution> {
     match event {
-        agent_domain::BrainEvent::TerminalSessionPhase { .. } => {
-            Some(SubmittedAnswerResolution::All)
-        }
-        agent_domain::BrainEvent::RecapReady { .. }
-        | agent_domain::BrainEvent::AnswerEvaluated { .. }
-        | agent_domain::BrainEvent::ResponseCompleted { .. }
-        | agent_domain::BrainEvent::ResponseCancelledFor { .. } => {
-            Some(SubmittedAnswerResolution::One {
-                response_id: event.response_id().map(ToOwned::to_owned),
-            })
-        }
-        agent_domain::BrainEvent::ResponseCancelled => {
-            Some(SubmittedAnswerResolution::One { response_id: None })
-        }
+        BrainEvent::TerminalSessionPhase { .. } => Some(ProviderTurnResolution::All),
+        BrainEvent::AnswerEvaluated { response_id, .. }
+        | BrainEvent::RecapReady { response_id, .. }
+        | BrainEvent::ResponseCompleted { response_id }
+        | BrainEvent::TurnDeferred { response_id, .. }
+        | BrainEvent::ResponseCancelledFor { response_id } => Some(ProviderTurnResolution::One {
+            response_id: Some(response_id.clone()),
+        }),
+        BrainEvent::ResponseCancelled => Some(ProviderTurnResolution::One { response_id: None }),
+        BrainEvent::SessionPhase { .. }
+        | BrainEvent::QuestionStarted { .. }
+        | BrainEvent::TranscriptDelta { .. }
+        | BrainEvent::SourceReference { .. }
+        | BrainEvent::ConceptStatus { .. }
+        | BrainEvent::ManuscriptIntent { .. }
+        | BrainEvent::AudioDelta { .. }
+        | BrainEvent::ResponseStarted { .. }
+        | BrainEvent::ResponseAudio { .. }
+        | BrainEvent::Transcript(_)
+        | BrainEvent::ResponseToolProposal { .. }
+        | BrainEvent::Usage(_)
+        | BrainEvent::ProviderFallbackActivated { .. }
+        | BrainEvent::Error(_)
+        | BrainEvent::SpeechIntent(_)
+        | BrainEvent::InputSpeechStarted
+        | BrainEvent::InputSpeechStopped
+        | BrainEvent::ResponseTranscriptDelta { .. }
+        | BrainEvent::ResponseTextStarted { .. }
+        | BrainEvent::TranscriptFinal { .. } => None,
         _ => None,
     }
 }
 
-fn brain_event_provider_turn_completion(
-    event: &agent_domain::BrainEvent,
-) -> Option<SubmittedAnswerResolution> {
-    match event {
-        agent_domain::BrainEvent::TerminalSessionPhase { .. } => {
-            Some(SubmittedAnswerResolution::All)
-        }
-        agent_domain::BrainEvent::AnswerEvaluated { .. }
-        | agent_domain::BrainEvent::RecapReady { .. }
-        | agent_domain::BrainEvent::ResponseCompleted { .. }
-        | agent_domain::BrainEvent::ResponseCancelledFor { .. } => {
-            Some(SubmittedAnswerResolution::One {
-                response_id: event.response_id().map(ToOwned::to_owned),
-            })
-        }
-        agent_domain::BrainEvent::ResponseCancelled => {
-            Some(SubmittedAnswerResolution::One { response_id: None })
-        }
-        _ => None,
+/// `SERVICE-001`: return a socket with no outstanding work to the between-turn
+/// sleeping-client deadline. Returns `false` — leaving the deadline exactly where
+/// it was — while any submitted answer or provider turn is still outstanding, so
+/// a mid-turn event can never postpone it.
+fn rearm_between_turn_idle(
+    pending_submitted_answers: u32,
+    active_provider_turns: u32,
+    mut sleeper: Pin<&mut Sleep>,
+    now: Instant,
+    timeout: Duration,
+) -> bool {
+    if pending_submitted_answers != 0 || active_provider_turns != 0 {
+        return false;
     }
+    sleeper.as_mut().reset(now + timeout);
+    true
 }
 
 async fn close_with_terminal_session_phase<S>(
@@ -1917,28 +1965,131 @@ fn deterministic_provider_failure_partial_recap(
 
 /// `VOICE-TURN-001` / `VOICE-TURN-002`: the socket's wire-turn accounting.
 ///
-/// A domain `question_started` carries no turn identity, and Plan 05's contract
-/// refuses to attach one on its behalf, so the socket names the turn. Ids are a
-/// per-socket monotonic sequence: the Nth question this socket asks is `turn-N`,
-/// and the turn stays active until the next question starts, which is what a
-/// deferral or a later turn-bound event binds to.
-#[derive(Debug, Default)]
-struct WireTurnLedger {
-    asked: u32,
-    active_turn_id: Option<String>,
+/// Why a turn binding was refused. Every variant is a fail-closed refusal; none
+/// of them is an invitation to invent a replacement identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+enum TurnBindingError {
+    #[error("turn id is already registered on this socket")]
+    DuplicateTurn,
+    #[error("response id is already bound to a turn")]
+    DuplicateResponse,
+    #[error("no registered turn is waiting for a question")]
+    MissingTurn,
+    #[error("response id has no turn binding")]
+    MissingResponse,
 }
 
-impl WireTurnLedger {
-    fn start_turn(&mut self) -> String {
-        self.asked = self.asked.saturating_add(1);
-        let turn_id = format!("turn-{}", self.asked);
-        self.active_turn_id = Some(turn_id.clone());
-        turn_id
+/// `SERVICE-014`: the socket's own record of which wire turn each provider
+/// response belongs to.
+///
+/// The active v5 turn binding is tracked separately from provider response
+/// identity: a turn is registered when its input is admitted (or minted by the
+/// server before a proactive provider question), bound to a response when that
+/// response's `question_started` arrives, and released only after that response's
+/// single resolution has been forwarded. A released turn id is spent, never
+/// recycled.
+#[derive(Debug, Default)]
+struct TurnBindingTracker {
+    pending_turn_ids: VecDeque<String>,
+    response_to_turn: HashMap<String, String>,
+    spent_turn_ids: HashSet<String>,
+    minted: u32,
+}
+
+impl TurnBindingTracker {
+    fn register_submission(&mut self, turn_id: String) -> Result<(), TurnBindingError> {
+        if self.knows_turn(&turn_id) {
+            return Err(TurnBindingError::DuplicateTurn);
+        }
+        self.pending_turn_ids.push_back(turn_id);
+        Ok(())
     }
 
-    fn active_turn_id(&self) -> Option<&str> {
-        self.active_turn_id.as_deref()
+    /// Whether this socket has ever used `turn_id`: pending, bound, or spent.
+    fn knows_turn(&self, turn_id: &str) -> bool {
+        self.pending_turn_ids.iter().any(|known| known == turn_id)
+            || self.response_to_turn.values().any(|known| known == turn_id)
+            || self.spent_turn_ids.contains(turn_id)
     }
+
+    /// A provider that asks proactively names no client turn, so the server mints
+    /// the canonical id itself *before* the question can be bound. This is the
+    /// only place an identifier is created; a deferral never mints one.
+    fn register_server_turn(&mut self) -> Result<String, TurnBindingError> {
+        self.minted = self.minted.saturating_add(1);
+        let turn_id = format!("turn-{}", self.minted);
+        self.register_submission(turn_id.clone())?;
+        Ok(turn_id)
+    }
+
+    fn bind_question(&mut self, response_id: &str) -> Result<&str, TurnBindingError> {
+        if self.response_to_turn.contains_key(response_id) {
+            return Err(TurnBindingError::DuplicateResponse);
+        }
+        let turn_id = self
+            .pending_turn_ids
+            .pop_front()
+            .ok_or(TurnBindingError::MissingTurn)?;
+        self.response_to_turn
+            .insert(response_id.to_owned(), turn_id);
+        self.response_to_turn
+            .get(response_id)
+            .map(String::as_str)
+            .ok_or(TurnBindingError::MissingTurn)
+    }
+
+    fn turn_for_response(&self, response_id: &str) -> Result<&str, TurnBindingError> {
+        self.response_to_turn
+            .get(response_id)
+            .map(String::as_str)
+            .ok_or(TurnBindingError::MissingResponse)
+    }
+
+    /// Drop a response binding after its single resolution was forwarded.
+    fn release_response(&mut self, response_id: &str) {
+        if let Some(turn_id) = self.response_to_turn.remove(response_id) {
+            self.spent_turn_ids.insert(turn_id);
+        }
+    }
+}
+
+/// `SERVICE-014`: register a client-named turn once its bounded input is admitted.
+///
+/// A client that answers a turn the server already named is not opening a new
+/// one, so an id this socket already knows is left exactly as it is. Only a turn
+/// identity the socket has never seen becomes a pending client submission.
+fn register_submitted_turn(bindings: &mut TurnBindingTracker, turn_id: Option<&str>) {
+    let Some(turn_id) = turn_id else {
+        return;
+    };
+    if bindings.knows_turn(turn_id) {
+        return;
+    }
+    let _ = bindings.register_submission(turn_id.to_owned());
+}
+
+/// Plan 05 publishes no `VoiceProtocolDiagnostic::invariant` constructor and
+/// `protocol.rs` is its file, so the lane names the invariant code here rather
+/// than editing an upstream contract.
+fn invariant_diagnostic(path: &'static str) -> VoiceProtocolDiagnostic {
+    VoiceProtocolDiagnostic::new(VoiceProtocolDiagnosticCode::Invariant, path)
+}
+
+/// `VOICE-TURN-002`: look up the wire turn a persisted deferral belongs to and
+/// hand both to Plan 05's constructor. Nothing about the frame is redeclared
+/// here: the destructuring exists only to read `response_id` for the lookup, and
+/// the constructor's own `Result` is returned unchanged.
+fn map_turn_deferred(
+    event: &BrainEvent,
+    bindings: &TurnBindingTracker,
+) -> Result<ServerFrame, VoiceProtocolDiagnostic> {
+    let BrainEvent::TurnDeferred { response_id, .. } = event else {
+        return Err(invariant_diagnostic("$.event.type"));
+    };
+    let turn_id = bindings
+        .turn_for_response(response_id)
+        .map_err(|_| invariant_diagnostic("$.event.turn_id"))?;
+    ServerFrame::turn_deferred(turn_id, event)
 }
 
 struct BrainForwardContext<'a> {
@@ -1947,7 +2098,7 @@ struct BrainForwardContext<'a> {
     session_binding: &'a AuthorizedClientSession,
     limits: &'a VoiceLimitConfig,
     session_limits: &'a mut SessionLimitRuntime,
-    wire_turns: &'a mut WireTurnLedger,
+    turn_bindings: &'a mut TurnBindingTracker,
 }
 
 async fn drain_terminal_events<S>(
@@ -2046,8 +2197,15 @@ where
     if should_suppress_superseded_recap(&event, runtime.superseded_provider_turn_response_ids) {
         return Ok(ForwardBrainEvent::Suppressed);
     }
-    let submitted_answer_resolution = brain_event_submitted_answer_resolution(&event);
-    let provider_turn_completion = brain_event_provider_turn_completion(&event);
+    // `SERVICE-006`: classified once, before forwarding, and consumed by both
+    // counters. There is deliberately no second call site.
+    let resolution = classify_provider_turn_event(&event);
+    let resolved_response_id = match &resolution {
+        Some(ProviderTurnResolution::One {
+            response_id: Some(response_id),
+        }) => Some(response_id.clone()),
+        _ => None,
+    };
     let result = forward_brain_event(
         context,
         event,
@@ -2057,73 +2215,66 @@ where
     )
     .await?;
     if matches!(result, ForwardBrainEvent::Continue) {
-        apply_provider_turn_accounting(
-            submitted_answer_resolution,
-            provider_turn_completion,
-            runtime,
-        );
+        apply_provider_turn_accounting(resolution, runtime);
+        // The binding is released only after its single resolution reached the
+        // wire, so a deferral that failed to send keeps its turn identity.
+        if let Some(response_id) = &resolved_response_id {
+            context.turn_bindings.release_response(response_id);
+        }
     }
     Ok(result)
 }
 
 fn apply_provider_turn_accounting(
-    submitted_answer_resolution: Option<SubmittedAnswerResolution>,
-    provider_turn_completion: Option<SubmittedAnswerResolution>,
+    resolution: Option<ProviderTurnResolution>,
     runtime: &mut ProviderTurnRuntime<'_>,
 ) {
-    if let Some(resolution) = submitted_answer_resolution {
-        match resolution {
-            SubmittedAnswerResolution::One { response_id } => {
-                let count_resolution = match response_id {
-                    Some(response_id) => runtime
-                        .resolved_submitted_answer_response_ids
-                        .insert(response_id),
-                    None => true,
-                };
-                if count_resolution {
-                    *runtime.pending_submitted_answers =
-                        runtime.pending_submitted_answers.saturating_sub(1);
-                }
+    let Some(resolution) = resolution else {
+        return;
+    };
+    match resolution {
+        ProviderTurnResolution::One { response_id } => {
+            let count_resolution = match &response_id {
+                Some(response_id) => runtime
+                    .resolved_submitted_answer_response_ids
+                    .insert(response_id.clone()),
+                None => true,
+            };
+            if count_resolution {
+                *runtime.pending_submitted_answers =
+                    runtime.pending_submitted_answers.saturating_sub(1);
             }
-            SubmittedAnswerResolution::All => {
-                *runtime.pending_submitted_answers = 0;
-                runtime.resolved_submitted_answer_response_ids.clear();
+            if *runtime.pending_submitted_answers == 0 {
+                *runtime.turn_cap_deadline = None;
             }
-        }
-        if *runtime.pending_submitted_answers == 0 {
-            *runtime.turn_cap_deadline = None;
-        }
-    }
-    if let Some(completion) = provider_turn_completion {
-        match completion {
-            SubmittedAnswerResolution::One { response_id } => {
-                let count_completion = match response_id {
-                    Some(response_id) => {
-                        let superseded_by_active_turn = *runtime.active_provider_turns > 1;
-                        let count_completion = runtime
-                            .completed_provider_turn_response_ids
-                            .insert(response_id.clone());
-                        if superseded_by_active_turn {
-                            runtime
-                                .superseded_provider_turn_response_ids
-                                .insert(response_id);
-                        }
-                        count_completion
+            let count_completion = match response_id {
+                Some(response_id) => {
+                    let superseded_by_active_turn = *runtime.active_provider_turns > 1;
+                    let count_completion = runtime
+                        .completed_provider_turn_response_ids
+                        .insert(response_id.clone());
+                    if superseded_by_active_turn {
+                        runtime
+                            .superseded_provider_turn_response_ids
+                            .insert(response_id);
                     }
-                    None => true,
-                };
-                if count_completion {
-                    *runtime.active_provider_turns =
-                        runtime.active_provider_turns.saturating_sub(1);
-                    let _ = runtime.pending_provider_admissions.pop();
+                    count_completion
                 }
+                None => true,
+            };
+            if count_completion {
+                *runtime.active_provider_turns = runtime.active_provider_turns.saturating_sub(1);
+                let _ = runtime.pending_provider_admissions.pop();
             }
-            SubmittedAnswerResolution::All => {
-                *runtime.active_provider_turns = 0;
-                runtime.completed_provider_turn_response_ids.clear();
-                runtime.superseded_provider_turn_response_ids.clear();
-                runtime.pending_provider_admissions.clear();
-            }
+        }
+        ProviderTurnResolution::All => {
+            *runtime.pending_submitted_answers = 0;
+            runtime.resolved_submitted_answer_response_ids.clear();
+            *runtime.turn_cap_deadline = None;
+            *runtime.active_provider_turns = 0;
+            runtime.completed_provider_turn_response_ids.clear();
+            runtime.superseded_provider_turn_response_ids.clear();
+            runtime.pending_provider_admissions.clear();
         }
     }
 }
@@ -2246,8 +2397,24 @@ where
     // one. The socket supplies it from its own ledger through the explicit
     // constructors; everything else takes the blanket path unchanged.
     let frame = match &event {
-        agent_domain::BrainEvent::QuestionStarted { .. } => {
-            let turn_id = context.wire_turns.start_turn();
+        agent_domain::BrainEvent::QuestionStarted { response_id, .. } => {
+            // A question with no admitted client turn is a proactive provider
+            // turn, so the server mints its canonical id before binding. A
+            // duplicate response id is an invariant breach and fails closed.
+            if context.turn_bindings.pending_turn_ids.is_empty() {
+                context.turn_bindings.register_server_turn().map_err(|_| {
+                    axum::Error::new(std::io::Error::other("server turn id is not registrable"))
+                })?;
+            }
+            let turn_id = context
+                .turn_bindings
+                .bind_question(response_id)
+                .map_err(|_| {
+                    axum::Error::new(std::io::Error::other(
+                        "question_started is not turn-bindable",
+                    ))
+                })?
+                .to_owned();
             Some(
                 ServerFrame::question_started(&turn_id, &event).map_err(|_| {
                     axum::Error::new(std::io::Error::other(
@@ -2256,20 +2423,23 @@ where
                 })?,
             )
         }
-        agent_domain::BrainEvent::TurnDeferred { .. } => {
-            // A deferral names the turn it defers. Without an active turn there is
-            // nothing truthful to name, so the event is dropped rather than bound to
-            // a fabricated id.
-            match context.wire_turns.active_turn_id() {
-                Some(turn_id) => {
-                    Some(ServerFrame::turn_deferred(turn_id, &event).map_err(|_| {
-                        axum::Error::new(std::io::Error::other(
-                            "turn_deferred is not turn-bindable",
-                        ))
-                    })?)
-                }
-                None => None,
+        agent_domain::BrainEvent::TurnDeferred { response_id, .. } => {
+            // A provider may resolve a turn it never announced: the runner re-keys
+            // a first turn's response identity by the client generation of the
+            // answer it is resolving, without a second `question_started`. That
+            // turn is still one this socket admitted, so the oldest admitted turn
+            // id is bound here under the same oldest-first rule `bind_question`
+            // uses. Nothing is minted: with no admitted turn left to bind, the
+            // mapping below produces `VOICE_PROTOCOL_INVARIANT` and no frame at
+            // all rather than a fabricated or borrowed id.
+            if context
+                .turn_bindings
+                .turn_for_response(response_id)
+                .is_err()
+            {
+                let _ = context.turn_bindings.bind_question(response_id);
             }
+            map_turn_deferred(&event, context.turn_bindings).ok()
         }
         _ => ServerFrame::browser_event(event),
     };
@@ -3050,6 +3220,7 @@ async fn handle_client_message(
         ClientInputAction::Send {
             brain_input,
             action,
+            ..
         } => input
             .send(brain_input)
             .await
@@ -3111,6 +3282,7 @@ async fn send_client_input_action_with_drain(
         ClientInputAction::Send {
             brain_input,
             action,
+            ..
         } => send_brain_input_with_deadline(input, brain_input, drain_signal, turn_deadline)
             .await
             .map(|_| action),
@@ -3388,6 +3560,7 @@ fn client_input_action(
                                 .map_err(|_| ClientFrameError::invalid())?,
                         ),
                         action: ClientAction::ConfigRefresh,
+                        turn_id: None,
                     })
                 }
                 ClientFrame::AudioChunk {
@@ -3445,6 +3618,7 @@ fn client_input_action(
                 }
                 ClientFrame::TurnIntent {
                     client_generation_id,
+                    turn_id,
                     intent,
                     ..
                 } => {
@@ -3460,6 +3634,7 @@ fn client_input_action(
                                 None => BrainInput::Text(text),
                             },
                             action: ClientAction::AnswerText,
+                            turn_id: Some(turn_id),
                         }),
                         // A citation challenge is not an answer and must never be
                         // graded as one. No typed provider input carries a challenge
@@ -3515,6 +3690,7 @@ fn client_input_action(
                     None => Ok(ClientInputAction::Send {
                         brain_input: BrainInput::CancelResponse,
                         action: ClientAction::Cancel,
+                        turn_id: None,
                     }),
                 },
                 ClientFrame::Stop { .. } => Ok(ClientInputAction::TrySend {
@@ -3952,6 +4128,10 @@ enum ClientInputAction {
     Send {
         brain_input: BrainInput,
         action: ClientAction,
+        /// The v5 turn identity this submission names, when it names one. It is
+        /// registered with the socket's turn bindings only once the input is
+        /// actually admitted.
+        turn_id: Option<String>,
     },
     /// One complete bounded audio turn, admitted exactly once at explicit end.
     SendAudioTurn {
@@ -3987,6 +4167,21 @@ impl ClientInputAction {
         match self {
             Self::SendAudioTurn { accepted, .. } => Some(accepted.clone()),
             _ => None,
+        }
+    }
+
+    /// `SERVICE-014`: the v5 turn identity a submission names, for the socket's
+    /// turn bindings. A keepalive, a buffered chunk, a discarded assembly, and a
+    /// refused context change all name none.
+    fn submitted_turn_id(&self) -> Option<&str> {
+        match self {
+            Self::Send { turn_id, .. } => turn_id.as_deref(),
+            Self::SendAudioTurn { accepted, .. } => Some(accepted.turn_id.as_str()),
+            Self::TrySend { .. }
+            | Self::Keepalive
+            | Self::AudioTurnBuffered
+            | Self::AudioTurnDiscarded
+            | Self::RecoverableDenial(_) => None,
         }
     }
 
@@ -5119,14 +5314,14 @@ mod tests {
         let binding = fixture_binding();
         let limits = VoiceLimitConfig::default();
         let mut session_limits = SessionLimitRuntime::new();
-        let mut wire_turns = WireTurnLedger::default();
+        let mut turn_bindings = TurnBindingTracker::default();
         let mut context = BrainForwardContext {
             state: &state,
             voice_session_id: Some("voice-session-1".to_owned()),
             session_binding: &binding,
             limits: &limits,
             session_limits: &mut session_limits,
-            wire_turns: &mut wire_turns,
+            turn_bindings: &mut turn_bindings,
         };
         let mut cancelled_responses = CancelledResponseTracker::default();
         let mut sender = RecordingSink::new();
@@ -5282,14 +5477,8 @@ mod tests {
             evaluation,
         };
         assert_eq!(
-            brain_event_submitted_answer_resolution(&answer_evaluated),
-            Some(SubmittedAnswerResolution::One {
-                response_id: Some("response-1".to_owned())
-            })
-        );
-        assert_eq!(
-            brain_event_provider_turn_completion(&answer_evaluated),
-            Some(SubmittedAnswerResolution::One {
+            classify_provider_turn_event(&answer_evaluated),
+            Some(ProviderTurnResolution::One {
                 response_id: Some("response-1".to_owned())
             })
         );
@@ -5298,8 +5487,8 @@ mod tests {
             response_id: "response-1".to_owned(),
         };
         assert_eq!(
-            brain_event_provider_turn_completion(&response_completed),
-            Some(SubmittedAnswerResolution::One {
+            classify_provider_turn_event(&response_completed),
+            Some(ProviderTurnResolution::One {
                 response_id: Some("response-1".to_owned())
             })
         );
@@ -5309,8 +5498,8 @@ mod tests {
             terminal_reason: TerminalSessionReason::ProviderCancelled,
         };
         assert_eq!(
-            brain_event_provider_turn_completion(&terminal_phase),
-            Some(SubmittedAnswerResolution::All)
+            classify_provider_turn_event(&terminal_phase),
+            Some(ProviderTurnResolution::All)
         );
     }
 
@@ -5346,6 +5535,773 @@ mod tests {
             &current_recap,
             &superseded
         ));
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 8 (SERVICE-001, SERVICE-006, SERVICE-014): one classifier, durable
+    // deferred-turn mapping, and between-turn idle rearm.
+    // ---------------------------------------------------------------------
+
+    fn classifier_fixture_recap() -> StudySessionRecap {
+        StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+            voice_session_id: "voice-session-1".to_owned(),
+            headline: "Session recap".to_owned(),
+            summary: "Review oxidative phosphorylation.".to_owned(),
+            concepts: vec![],
+            review_schedule: vec![],
+            next_action: "Review the source moment.".to_owned(),
+            source_moments: vec![],
+            deferred_turns: 0,
+        }
+    }
+
+    fn classifier_fixture_evaluation() -> agent_domain::AnswerEvaluation {
+        agent_domain::AnswerEvaluation {
+            question_id: fixture_question().question_id,
+            answer_text: "omitted".to_owned(),
+            label: "mostly correct".to_owned(),
+            concise_feedback: "omitted".to_owned(),
+            retry_prompt: "omitted".to_owned(),
+            source: agent_domain::fixture_source_reference(),
+            concept_status: agent_domain::ConceptStatus::Strong,
+            confidence_score: 0.84,
+        }
+    }
+
+    fn classifier_fixture_failure() -> BrainProviderFailure {
+        BrainProviderFailure::new(BrainProviderFailureParts {
+            failure_class: BrainFailureClass::Timeout,
+            stage: BrainFailureStage::Gemini,
+            retry_eligible: true,
+            latency_ms: 7,
+            provider: "gemini".to_owned(),
+            model: "gemini-35-flash".to_owned(),
+            metadata: "http_status=504".to_owned(),
+        })
+    }
+
+    fn resolved_one(response_id: &str) -> Option<ProviderTurnResolution> {
+        Some(ProviderTurnResolution::One {
+            response_id: Some(response_id.to_owned()),
+        })
+    }
+
+    /// One constructed event for every currently named `BrainEvent` variant plus
+    /// its exact expected resolution. `BrainEvent` is `#[non_exhaustive]`, so this
+    /// table is the lane's record of what "every current variant" means; a new
+    /// upstream variant is classified `None` by the final arm until its owner
+    /// names it here.
+    fn every_named_brain_event() -> Vec<(&'static str, BrainEvent, Option<ProviderTurnResolution>)>
+    {
+        vec![
+            (
+                "SessionPhase",
+                BrainEvent::SessionPhase {
+                    phase: StudySessionPhase::Listening,
+                },
+                None,
+            ),
+            (
+                "TerminalSessionPhase",
+                BrainEvent::TerminalSessionPhase {
+                    phase: StudySessionPhase::Recap,
+                    terminal_reason: TerminalSessionReason::ProviderCancelled,
+                },
+                Some(ProviderTurnResolution::All),
+            ),
+            (
+                "QuestionStarted",
+                BrainEvent::QuestionStarted {
+                    response_id: "response-1".to_owned(),
+                    question: fixture_question(),
+                },
+                None,
+            ),
+            (
+                "TranscriptDelta",
+                BrainEvent::TranscriptDelta {
+                    response_id: "response-1".to_owned(),
+                    text: "omitted".to_owned(),
+                },
+                None,
+            ),
+            (
+                "AnswerEvaluated",
+                BrainEvent::AnswerEvaluated {
+                    response_id: "response-1".to_owned(),
+                    evaluation: classifier_fixture_evaluation(),
+                },
+                resolved_one("response-1"),
+            ),
+            (
+                "TurnDeferred",
+                BrainEvent::TurnDeferred {
+                    response_id: "response-1".to_owned(),
+                    question_id: "question-1".to_owned(),
+                    reason: agent_domain::EvaluationDeferralReason::EmptyAnswer,
+                    can_retry_same_question: true,
+                },
+                resolved_one("response-1"),
+            ),
+            (
+                "SourceReference",
+                BrainEvent::SourceReference {
+                    response_id: "response-1".to_owned(),
+                    source: agent_domain::fixture_source_reference(),
+                },
+                None,
+            ),
+            (
+                "ConceptStatus",
+                BrainEvent::ConceptStatus {
+                    response_id: "response-1".to_owned(),
+                    concept_id: "oxidative-phosphorylation".to_owned(),
+                    status: agent_domain::ConceptStatus::Review,
+                },
+                None,
+            ),
+            (
+                "ManuscriptIntent",
+                BrainEvent::ManuscriptIntent {
+                    response_id: "response-1".to_owned(),
+                    intent: agent_domain::ManuscriptIntent::Scene {
+                        register: agent_domain::ManuscriptRegister::Examining,
+                        emphasis: agent_domain::ManuscriptEmphasis::Measured,
+                    },
+                },
+                None,
+            ),
+            (
+                "RecapReady",
+                BrainEvent::RecapReady {
+                    response_id: "response-1".to_owned(),
+                    recap: classifier_fixture_recap(),
+                },
+                resolved_one("response-1"),
+            ),
+            (
+                "AudioDelta",
+                BrainEvent::AudioDelta {
+                    response_id: "response-1".to_owned(),
+                    frame: AudioFrame::from_pcm16_bytes(vec![0, 0]),
+                },
+                None,
+            ),
+            (
+                "ResponseStarted",
+                BrainEvent::ResponseStarted {
+                    response_id: "response-1".to_owned(),
+                },
+                None,
+            ),
+            (
+                "ResponseCompleted",
+                BrainEvent::ResponseCompleted {
+                    response_id: "response-1".to_owned(),
+                },
+                resolved_one("response-1"),
+            ),
+            (
+                "ResponseAudio",
+                BrainEvent::ResponseAudio {
+                    response_id: "response-1".to_owned(),
+                    frame: AudioFrame::from_pcm16_bytes(vec![0, 0]),
+                },
+                None,
+            ),
+            (
+                "Transcript",
+                BrainEvent::Transcript("omitted".to_owned()),
+                None,
+            ),
+            (
+                "ResponseToolProposal",
+                BrainEvent::ResponseToolProposal {
+                    response_id: "response-1".to_owned(),
+                    proposal: agent_domain::ToolProposal::new("select_next_question", json!({})),
+                },
+                None,
+            ),
+            (
+                "Usage",
+                BrainEvent::Usage(agent_domain::BrainUsage::default()),
+                None,
+            ),
+            (
+                "ProviderFallbackActivated",
+                BrainEvent::ProviderFallbackActivated {
+                    response_id: "response-1".to_owned(),
+                    provider: "gemini".to_owned(),
+                    from_model: "gemini-35-flash".to_owned(),
+                    to_model: "gemini-35-flash-lite".to_owned(),
+                    reason: "quota_rate_failure".to_owned(),
+                    failure: Some(classifier_fixture_failure()),
+                },
+                None,
+            ),
+            (
+                "Error",
+                BrainEvent::Error(BrainProviderError::from_failure(
+                    classifier_fixture_failure(),
+                )),
+                None,
+            ),
+            (
+                "SpeechIntent",
+                BrainEvent::SpeechIntent(agent_domain::SpeechIntent {
+                    text: "omitted".to_owned(),
+                }),
+                None,
+            ),
+            ("InputSpeechStarted", BrainEvent::InputSpeechStarted, None),
+            ("InputSpeechStopped", BrainEvent::InputSpeechStopped, None),
+            (
+                "ResponseCancelled",
+                BrainEvent::ResponseCancelled,
+                Some(ProviderTurnResolution::One { response_id: None }),
+            ),
+            (
+                "ResponseCancelledFor",
+                BrainEvent::ResponseCancelledFor {
+                    response_id: "response-1".to_owned(),
+                },
+                resolved_one("response-1"),
+            ),
+            (
+                "ResponseTranscriptDelta",
+                BrainEvent::ResponseTranscriptDelta {
+                    response_id: "response-1".to_owned(),
+                    text: "omitted".to_owned(),
+                },
+                None,
+            ),
+            (
+                "ResponseTextStarted",
+                BrainEvent::ResponseTextStarted {
+                    response_id: "response-1".to_owned(),
+                },
+                None,
+            ),
+            (
+                "TranscriptFinal",
+                BrainEvent::TranscriptFinal {
+                    response_id: "response-1".to_owned(),
+                    text: "omitted".to_owned(),
+                    confidence: Some(0.9),
+                },
+                None,
+            ),
+        ]
+    }
+
+    struct ProviderTurnAccounting {
+        pending_submitted_answers: u32,
+        active_provider_turns: u32,
+        pending_provider_admissions: Vec<VoiceLimitLease>,
+        resolved_submitted_answer_response_ids: HashSet<String>,
+        completed_provider_turn_response_ids: HashSet<String>,
+        superseded_provider_turn_response_ids: HashSet<String>,
+        turn_cap_deadline: Option<Instant>,
+    }
+
+    impl ProviderTurnAccounting {
+        fn with_one_open_turn() -> Self {
+            Self {
+                pending_submitted_answers: 1,
+                active_provider_turns: 1,
+                pending_provider_admissions: Vec::new(),
+                resolved_submitted_answer_response_ids: HashSet::new(),
+                completed_provider_turn_response_ids: HashSet::new(),
+                superseded_provider_turn_response_ids: HashSet::new(),
+                turn_cap_deadline: Some(Instant::now() + Duration::from_secs(45)),
+            }
+        }
+
+        fn apply(&mut self, event: &BrainEvent) {
+            let resolution = classify_provider_turn_event(event);
+            let mut runtime = ProviderTurnRuntime {
+                pending_submitted_answers: &mut self.pending_submitted_answers,
+                active_provider_turns: &mut self.active_provider_turns,
+                pending_provider_admissions: &mut self.pending_provider_admissions,
+                resolved_submitted_answer_response_ids: &mut self
+                    .resolved_submitted_answer_response_ids,
+                completed_provider_turn_response_ids: &mut self
+                    .completed_provider_turn_response_ids,
+                superseded_provider_turn_response_ids: &mut self
+                    .superseded_provider_turn_response_ids,
+                turn_cap_deadline: &mut self.turn_cap_deadline,
+            };
+            apply_provider_turn_accounting(resolution, &mut runtime);
+        }
+    }
+
+    #[test]
+    fn provider_turn_classifier_maps_every_named_brain_event_exactly_once() {
+        for (name, event, expected) in every_named_brain_event() {
+            assert_eq!(
+                classify_provider_turn_event(&event),
+                expected,
+                "{name} classified differently than the single mapping declares"
+            );
+        }
+    }
+
+    /// `SERVICE-006`: both counters consume the same returned value. `TurnDeferred`
+    /// is the discriminating case — the two pre-remediation classifiers each
+    /// ignored it, so a surviving second classifier leaves one counter behind.
+    #[test]
+    fn provider_turn_classifier_feeds_both_counters_from_one_value() {
+        for (name, event, expected) in every_named_brain_event() {
+            let mut accounting = ProviderTurnAccounting::with_one_open_turn();
+            accounting.apply(&event);
+            let (expected_pending, expected_active) = match &expected {
+                None => (1, 1),
+                Some(_) => (0, 0),
+            };
+            assert_eq!(
+                accounting.pending_submitted_answers, expected_pending,
+                "{name} left the submitted-answer counter behind"
+            );
+            assert_eq!(
+                accounting.active_provider_turns, expected_active,
+                "{name} left the active-provider-turn counter behind"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_turn_classifier_resolves_a_duplicate_delivery_once() {
+        let mut accounting = ProviderTurnAccounting::with_one_open_turn();
+        accounting.pending_submitted_answers = 2;
+        accounting.active_provider_turns = 2;
+        let completed = BrainEvent::ResponseCompleted {
+            response_id: "response-1".to_owned(),
+        };
+
+        accounting.apply(&completed);
+        accounting.apply(&completed);
+
+        assert_eq!(accounting.pending_submitted_answers, 1);
+        assert_eq!(accounting.active_provider_turns, 1);
+    }
+
+    #[test]
+    fn provider_turn_classifier_terminal_phase_clears_every_open_turn() {
+        let mut accounting = ProviderTurnAccounting::with_one_open_turn();
+        accounting.pending_submitted_answers = 3;
+        accounting.active_provider_turns = 3;
+
+        accounting.apply(&BrainEvent::TerminalSessionPhase {
+            phase: StudySessionPhase::Recap,
+            terminal_reason: TerminalSessionReason::Drained,
+        });
+
+        assert_eq!(accounting.pending_submitted_answers, 0);
+        assert_eq!(accounting.active_provider_turns, 0);
+        assert_eq!(accounting.turn_cap_deadline, None);
+    }
+
+    fn deferred_event(
+        response_id: &str,
+        question_id: &str,
+        reason: agent_domain::EvaluationDeferralReason,
+        can_retry_same_question: bool,
+    ) -> BrainEvent {
+        BrainEvent::TurnDeferred {
+            response_id: response_id.to_owned(),
+            question_id: question_id.to_owned(),
+            reason,
+            can_retry_same_question,
+        }
+    }
+
+    fn bound_tracker(pairs: &[(&str, &str)]) -> TurnBindingTracker {
+        let mut tracker = TurnBindingTracker::default();
+        for (turn_id, response_id) in pairs {
+            tracker
+                .register_submission((*turn_id).to_owned())
+                .expect("submission registers");
+            tracker.bind_question(response_id).expect("question binds");
+        }
+        tracker
+    }
+
+    #[test]
+    fn turn_deferred_binding_maps_sequential_and_overlapping_submissions() {
+        let mut tracker = TurnBindingTracker::default();
+        tracker.register_submission("turn-1".to_owned()).unwrap();
+        tracker.register_submission("turn-2".to_owned()).unwrap();
+
+        assert_eq!(tracker.bind_question("response-1").unwrap(), "turn-1");
+        assert_eq!(tracker.bind_question("response-2").unwrap(), "turn-2");
+        assert_eq!(tracker.turn_for_response("response-1").unwrap(), "turn-1");
+        assert_eq!(tracker.turn_for_response("response-2").unwrap(), "turn-2");
+    }
+
+    #[test]
+    fn turn_deferred_binding_rejects_duplicate_turn_and_response_ids() {
+        let mut tracker = TurnBindingTracker::default();
+        tracker.register_submission("turn-1".to_owned()).unwrap();
+        assert_eq!(
+            tracker.register_submission("turn-1".to_owned()),
+            Err(TurnBindingError::DuplicateTurn)
+        );
+
+        tracker.bind_question("response-1").unwrap();
+        assert_eq!(
+            tracker.register_submission("turn-1".to_owned()),
+            Err(TurnBindingError::DuplicateTurn)
+        );
+
+        tracker.register_submission("turn-2".to_owned()).unwrap();
+        assert_eq!(
+            tracker.bind_question("response-1").map(ToOwned::to_owned),
+            Err(TurnBindingError::DuplicateResponse)
+        );
+    }
+
+    #[test]
+    fn turn_deferred_binding_requires_a_registered_turn_before_a_question() {
+        let mut tracker = TurnBindingTracker::default();
+        assert_eq!(
+            tracker.bind_question("response-1").map(ToOwned::to_owned),
+            Err(TurnBindingError::MissingTurn)
+        );
+        assert_eq!(
+            tracker.turn_for_response("response-1"),
+            Err(TurnBindingError::MissingResponse)
+        );
+    }
+
+    #[test]
+    fn turn_deferred_binding_mints_a_canonical_server_turn_for_a_proactive_question() {
+        let mut tracker = TurnBindingTracker::default();
+
+        let first = tracker.register_server_turn().expect("first server turn");
+        assert_eq!(first, "turn-1");
+        assert_eq!(tracker.bind_question("response-1").unwrap(), "turn-1");
+
+        let second = tracker.register_server_turn().expect("second server turn");
+        assert_eq!(second, "turn-2");
+        assert_eq!(tracker.bind_question("response-2").unwrap(), "turn-2");
+    }
+
+    #[test]
+    fn turn_deferred_binding_releases_a_response_only_after_its_resolution() {
+        let mut tracker = bound_tracker(&[("turn-1", "response-1")]);
+        assert_eq!(tracker.turn_for_response("response-1").unwrap(), "turn-1");
+
+        tracker.release_response("response-1");
+
+        assert_eq!(
+            tracker.turn_for_response("response-1"),
+            Err(TurnBindingError::MissingResponse)
+        );
+        // The released turn id is spent, not recycled.
+        assert_eq!(
+            tracker.register_submission("turn-1".to_owned()),
+            Err(TurnBindingError::DuplicateTurn)
+        );
+    }
+
+    #[test]
+    fn turn_deferred_maps_an_unknown_response_to_a_protocol_invariant() {
+        let bindings = bound_tracker(&[("turn-1", "response-1")]);
+        let event = deferred_event(
+            "response-unknown",
+            "question-1",
+            agent_domain::EvaluationDeferralReason::EmptyAnswer,
+            true,
+        );
+
+        let diagnostic = map_turn_deferred(&event, &bindings).expect_err("unknown response");
+
+        assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::Invariant);
+        assert_eq!(diagnostic.code.as_str(), "VOICE_PROTOCOL_INVARIANT");
+        assert_eq!(diagnostic.path, "$.event.turn_id");
+    }
+
+    #[test]
+    fn turn_deferred_refuses_to_map_any_other_event() {
+        let bindings = bound_tracker(&[("turn-1", "response-1")]);
+        let event = BrainEvent::ResponseCompleted {
+            response_id: "response-1".to_owned(),
+        };
+
+        let diagnostic = map_turn_deferred(&event, &bindings).expect_err("wrong event type");
+
+        assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::Invariant);
+        assert_eq!(diagnostic.path, "$.event.type");
+    }
+
+    #[derive(Deserialize)]
+    struct TurnOutcomeFixtureCase {
+        id: String,
+        wire_json: String,
+        valid: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct TurnOutcomeFixture {
+        schema: String,
+        protocol_version: u32,
+        cases: Vec<TurnOutcomeFixtureCase>,
+    }
+
+    /// Plan 05's frozen deferred cases, byte-for-byte. Every one of the six exact
+    /// reasons and both retry booleans is mapped through the owner-provided
+    /// constructor and re-serialized; the fixture bytes are the assertion.
+    #[test]
+    fn turn_deferred_fixture_cases_map_byte_for_byte() {
+        let fixture: TurnOutcomeFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/voice-protocol/v5/turn-outcomes.json"
+        ))
+        .expect("turn-outcomes fixture parses");
+        assert_eq!(fixture.schema, "viva.voice-server-event-cases.v1");
+        assert_eq!(fixture.protocol_version, VIVA_VOICE_PROTOCOL_VERSION);
+
+        let mut seen_reasons = HashSet::new();
+        let mut seen_retry = HashSet::new();
+        let mut mapped = 0_usize;
+        for case in &fixture.cases {
+            if !case.valid {
+                continue;
+            }
+            let wire: serde_json::Value =
+                serde_json::from_str(&case.wire_json).expect("case wire json parses");
+            if wire["event"]["type"] != "turn_deferred" {
+                continue;
+            }
+            let turn_id = wire["event"]["turn_id"].as_str().expect("fixture turn_id");
+            let response_id = wire["event"]["response_id"]
+                .as_str()
+                .expect("fixture response_id");
+            let question_id = wire["event"]["question_id"]
+                .as_str()
+                .expect("fixture question_id");
+            let reason: agent_domain::EvaluationDeferralReason =
+                serde_json::from_value(wire["event"]["reason"].clone())
+                    .expect("fixture reason is a typed deferral reason");
+            let can_retry_same_question = wire["event"]["can_retry_same_question"]
+                .as_bool()
+                .expect("fixture can_retry_same_question");
+
+            // Nothing beyond the five typed members may appear on the wire.
+            let members = wire["event"]
+                .as_object()
+                .expect("event object")
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                members,
+                [
+                    "type",
+                    "turn_id",
+                    "response_id",
+                    "question_id",
+                    "reason",
+                    "can_retry_same_question",
+                ]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<HashSet<_>>(),
+                "{} carries a member outside the deferral contract",
+                case.id
+            );
+            for forbidden in [
+                "retryable",
+                "terminal_reason",
+                "message",
+                "provider_message",
+                "feedback",
+                "concise_feedback",
+                "confidence",
+                "confidence_score",
+                "concept_status",
+                "review_schedule",
+                "schedule",
+                "mastery",
+                "recap",
+            ] {
+                assert!(
+                    !case.wire_json.contains(forbidden),
+                    "{} leaks {forbidden}",
+                    case.id
+                );
+            }
+
+            let event = deferred_event(
+                response_id,
+                question_id,
+                reason.clone(),
+                can_retry_same_question,
+            );
+            let mut bindings = TurnBindingTracker::default();
+            bindings
+                .register_submission(turn_id.to_owned())
+                .expect("fixture turn registers");
+            bindings
+                .bind_question(response_id)
+                .expect("fixture question binds");
+
+            let frame = map_turn_deferred(&event, &bindings).expect("fixture case maps");
+            let rendered = serde_json::to_string(&frame).expect("frame serializes");
+            assert_eq!(
+                rendered, case.wire_json,
+                "{} did not map byte-exactly",
+                case.id
+            );
+
+            seen_reasons.insert(format!("{reason:?}"));
+            seen_retry.insert(can_retry_same_question);
+            mapped += 1;
+        }
+
+        assert_eq!(
+            seen_reasons.len(),
+            6,
+            "every deferral reason must be covered"
+        );
+        assert_eq!(seen_retry.len(), 2, "both retry booleans must be covered");
+        assert_eq!(mapped, 12, "six reasons times two retry booleans");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn between_turn_idle_rearms_only_when_no_turn_is_outstanding() {
+        for (pending, active, expected) in [
+            (0_u32, 0_u32, true),
+            (1, 0, false),
+            (0, 1, false),
+            (2, 3, false),
+        ] {
+            let sleeper = tokio::time::sleep(Duration::from_secs(1));
+            tokio::pin!(sleeper);
+            assert_eq!(
+                rearm_between_turn_idle(
+                    pending,
+                    active,
+                    sleeper.as_mut(),
+                    Instant::now(),
+                    Duration::from_secs(600),
+                ),
+                expected,
+                "pending={pending} active={active}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn between_turn_idle_rearms_after_provider_completion() {
+        let start = Instant::now();
+        let between_turn_idle = Duration::from_secs(600);
+        let sleeper = tokio::time::sleep(between_turn_idle);
+        tokio::pin!(sleeper);
+        assert_eq!(sleeper.deadline(), start + between_turn_idle);
+
+        // A submitted answer disarms the between-turn deadline.
+        let mut accounting = ProviderTurnAccounting::with_one_open_turn();
+        assert!(!rearm_between_turn_idle(
+            accounting.pending_submitted_answers,
+            accounting.active_provider_turns,
+            sleeper.as_mut(),
+            Instant::now(),
+            between_turn_idle,
+        ));
+        assert_eq!(sleeper.deadline(), start + between_turn_idle);
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        accounting.apply(&BrainEvent::ResponseCompleted {
+            response_id: "response-1".to_owned(),
+        });
+        assert_eq!(accounting.pending_submitted_answers, 0);
+        assert_eq!(accounting.active_provider_turns, 0);
+        assert!(rearm_between_turn_idle(
+            accounting.pending_submitted_answers,
+            accounting.active_provider_turns,
+            sleeper.as_mut(),
+            Instant::now(),
+            between_turn_idle,
+        ));
+        assert_eq!(sleeper.deadline(), start + Duration::from_secs(630));
+
+        tokio::time::advance(Duration::from_secs(599)).await;
+        assert!(!sleeper.is_elapsed(), "t=629 is still inside the deadline");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        sleeper.as_mut().await;
+        assert!(sleeper.is_elapsed(), "t=630 expires the between-turn idle");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn between_turn_idle_is_not_extended_by_keepalives_or_repeated_completion() {
+        let start = Instant::now();
+        let between_turn_idle = Duration::from_secs(600);
+        let sleeper = tokio::time::sleep(between_turn_idle);
+        tokio::pin!(sleeper);
+
+        let mut accounting = ProviderTurnAccounting::with_one_open_turn();
+        accounting.apply(&BrainEvent::ResponseCompleted {
+            response_id: "response-1".to_owned(),
+        });
+        assert!(rearm_between_turn_idle(
+            accounting.pending_submitted_answers,
+            accounting.active_provider_turns,
+            sleeper.as_mut(),
+            Instant::now(),
+            between_turn_idle,
+        ));
+        let armed_deadline = sleeper.deadline();
+        assert_eq!(armed_deadline, start + between_turn_idle);
+
+        tokio::time::advance(Duration::from_secs(100)).await;
+
+        // A repeated completion for the same response resolves nothing, so the
+        // deadline is not moved. Ping/Pong and a context-only refresh never reach
+        // the classifier at all.
+        accounting.apply(&BrainEvent::ResponseCompleted {
+            response_id: "response-1".to_owned(),
+        });
+        assert_eq!(
+            classify_provider_turn_event(&BrainEvent::SessionPhase {
+                phase: StudySessionPhase::Listening,
+            }),
+            None
+        );
+        assert_eq!(sleeper.deadline(), armed_deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn between_turn_idle_rearms_after_cancel_and_after_all_turns_complete() {
+        let between_turn_idle = Duration::from_secs(600);
+        for event in [
+            BrainEvent::ResponseCancelled,
+            BrainEvent::ResponseCancelledFor {
+                response_id: "response-1".to_owned(),
+            },
+            BrainEvent::TerminalSessionPhase {
+                phase: StudySessionPhase::Recap,
+                terminal_reason: TerminalSessionReason::ProviderCancelled,
+            },
+        ] {
+            let sleeper = tokio::time::sleep(Duration::from_secs(1));
+            tokio::pin!(sleeper);
+            let mut accounting = ProviderTurnAccounting::with_one_open_turn();
+            accounting.apply(&event);
+            let now = Instant::now();
+            assert!(
+                rearm_between_turn_idle(
+                    accounting.pending_submitted_answers,
+                    accounting.active_provider_turns,
+                    sleeper.as_mut(),
+                    now,
+                    between_turn_idle,
+                ),
+                "{event:?} must return the socket to the between-turn deadline"
+            );
+            assert_eq!(sleeper.deadline(), now + between_turn_idle);
+        }
     }
 
     #[tokio::test]
@@ -5447,6 +6403,7 @@ mod tests {
                 client_generation_id: Some("queued-input".to_owned()),
             },
             action: ClientAction::AnswerText,
+            turn_id: Some("queued-turn".to_owned()),
         };
         let mut queued = start_provider_admission(
             limit_state.clone(),
@@ -6238,7 +7195,7 @@ mod tests {
         let mut sender = RecordingSink::new();
         let limits = VoiceLimitConfig::default();
         let mut session_limits = SessionLimitRuntime::new();
-        let mut wire_turns = WireTurnLedger::default();
+        let mut turn_bindings = TurnBindingTracker::default();
         let binding = fixture_binding();
         let mut context = BrainForwardContext {
             state: &state,
@@ -6246,7 +7203,7 @@ mod tests {
             session_binding: &binding,
             limits: &limits,
             session_limits: &mut session_limits,
-            wire_turns: &mut wire_turns,
+            turn_bindings: &mut turn_bindings,
         };
         let started_at = Instant::now();
 
