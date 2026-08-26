@@ -327,7 +327,7 @@ export async function handleVivaSessionStart(request: NextRequest) {
   }
   const access = guardAllowedIdentity(userId, studySetId, logContext);
   if (access) return access;
-  const bootstrap = guardSessionBootstrapCapability(request, {
+  const bootstrap = guardSessionBootstrapCapability({
     ...logContext,
     sessionId: sessionId ?? null,
     studySetId,
@@ -578,17 +578,14 @@ function guardAllowedIdentity(
   return null;
 }
 
-function guardSessionBootstrapCapability(
-  request: NextRequest,
-  input: {
-    action?: VivaSessionRouteAction | null;
-    route: VivaSessionRouteName;
-    sessionId: string | null;
-    studySetId: string;
-    token: string | null;
-    userId: string;
-  },
-): NextResponse | null {
+function guardSessionBootstrapCapability(input: {
+  action?: VivaSessionRouteAction | null;
+  route: VivaSessionRouteName;
+  sessionId: string | null;
+  studySetId: string;
+  token: string | null;
+  userId: string;
+}): NextResponse | null {
   const requirement = sessionBootstrapRequirement();
   if (!requirement.required) return null;
   if (!requirement.secret) {
@@ -1973,10 +1970,6 @@ function requiredString(value: unknown): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function numberClaim(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function positiveInteger(value: string | undefined, fallback: number): number {
