@@ -300,9 +300,12 @@ what the mark *is*, not by how it looks:
 | `*Mark` | **3:1** (WCAG 1.4.11 non-text contrast) | a graphic that *conveys state*, and text at **≥24 dp** (or ≥18.7 dp bold), where 3:1 is the text bar too |
 | `*Ink` | **4.5:1** | body-size text, full stop |
 
-Ornament values are therefore kept exactly as they are, and are still wrong for anything that carries
-meaning: they clear 3:1 at the brightest but not at the darkest. A state-bearing mark uses the `*Mark`
-value; body copy uses `*Ink`.
+Ornament values are therefore kept exactly as they are, and most of them are wrong for anything that
+carries meaning: `gold` (1.35), `ochre` (1.86), `copper` (2.15) and `sageDeep` (2.31) all miss 3:1 at
+the darkest excursion. The exception is `prussian`, which measures 3.64 there and would qualify as a
+mark — it is classified ornament because nothing in the app uses it and ornament is the more
+restrictive tier, not because it fails the bar. A state-bearing mark uses the `*Mark` value; body copy
+uses `*Ink`.
 
 > **This supersedes an earlier ruling.** The first version of this section said a state-conveying
 > accent "uses the `*Ink` value too" — one bar for everything. That is stricter than WCAG requires and

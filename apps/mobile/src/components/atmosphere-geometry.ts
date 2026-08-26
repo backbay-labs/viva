@@ -28,12 +28,16 @@ export const WELL = {
  * A cool sink at the extreme edge, so the page reads as embedded.
  *
  * **The known limit.** Inside this band the ground darkens toward
- * `VELLUM_VIGNETTED` (#AA9E99), where only `colors.inkStrong` still clears
- * 4.5:1. Every other text token drops to roughly 3.4-3.5:1 there. This is an
- * **accepted limit for Act 1, not an enforceable rule**: all four screens are
- * `ScrollView`s, so muted text passes through the band transiently no matter
- * where it is authored — a user's thumb can break the rule that a review could
- * not. Worst measured case is a single token at 3.84:1 in a ~97 dp strip. Act 2
+ * `VELLUM_VIGNETTED` (#AA9E99), where only the three darkest TEXT tokens still
+ * clear 4.5:1 — `ink`, `inkStrong` and `pressedInk`; the suite asserts that
+ * exact list. Every other text token lands near 3.4-3.5:1 at the corner clamp,
+ * which still clears 3:1. This is an **accepted limit for Act 1, not an
+ * enforceable rule**: all four screens are `ScrollView`s, so body text passes
+ * through the band transiently no matter where it is authored — a user's thumb
+ * can break a rule that a review cannot catch. Two different numbers are quoted
+ * here on purpose: 3.4-3.5:1 is the corner clamp, the theoretical floor, while
+ * 3.84:1 is the worst ratio measured at a position text actually occupies (a
+ * ~97 dp top strip). Act 2
  * can resolve it by lowering `edgeOpacity`; until then, prefer `inkStrong` for
  * anything that sits permanently in the top or bottom strip.
  *

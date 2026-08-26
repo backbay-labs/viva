@@ -28,10 +28,16 @@ export const VELLUM_DARKEST = "#C2B7AC";
  * at the corners: a corner sits at objectBoundingBox distance 0.707, past the
  * last gradient stop, so `r`/`rx`/`ry` cannot lighten it on either platform.
  *
- * Derived, not sampled — it is VELLUM_DARKEST composited at edgeOpacity 0.16,
- * and ./contrast.test.ts pins that arithmetic so the constant cannot go stale.
- * Only inkStrong clears 4.5:1 against it; everything else needs to stay out of
- * the band or be large text.
+ * Derived, not sampled — it is VELLUM_DARKEST composited at VIGNETTE.color and
+ * VIGNETTE.edgeOpacity, and ./contrast.test.ts pins that arithmetic so the
+ * constant cannot go stale.
+ *
+ * Three TEXT tokens still clear 4.5:1 against it — `ink`, `inkStrong` and
+ * `pressedInk` — and the suite asserts exactly that list, so it stays true.
+ * Every other TEXT token lands near 3.4-3.5:1 here, which still clears 3:1, so
+ * large text is fine anywhere. This is an accepted limit rather than a rule:
+ * all four screens scroll, so body text passes through the band transiently no
+ * matter where it is authored. See VIGNETTE in components/atmosphere-geometry.
  */
 export const VELLUM_VIGNETTED = "#AA9E99";
 
