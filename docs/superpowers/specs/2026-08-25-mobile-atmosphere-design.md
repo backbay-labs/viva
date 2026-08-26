@@ -212,8 +212,11 @@ not a locked decision.** The underlying claim is what matters and it is separabl
 responds to it the surface reads as wallpaper behind the app rather than something the app rests on.
 Glass is one answer; letterpress, tinted paper, cut-paper shadow, and inked stamp are others.
 
-Native equivalent is not `backdrop-filter`; it is `expo-blur`'s `BlurView` or a Skia backdrop-blur
-layer. **Resolved by the component-system design**, which this is the natural bridge into.
+**Resolved 2026-08-25 — glass was not chosen.** See
+`docs/superpowers/specs/2026-08-25-mobile-component-system-design.md`. The chrome does acknowledge the
+light, but by being *cut into* the page rather than frosted over it: surfaces are signed-distance
+fields in the vellum's height map, lit by the page's own sun. This also retires the `expo-blur` /
+Skia-backdrop-blur question — there is no blur pass to pay for.
 
 ## 9. Craft rules
 
