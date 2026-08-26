@@ -490,7 +490,31 @@ fn outbound_write_terminal_label(error: &OutboundWriteError) -> &'static str {
 
 /// Whether a recorded terminal label came from a failed outbound write.
 fn is_outbound_write_failure_label(label: &str) -> bool {
-    label == "send_failed" || label == TerminalSessionReason::SlowClient.as_str()
+    label == "send_failed"
+        || label == TerminalSessionReason::SlowClient.as_str()
+        || label == HEARTBEAT_TIMEOUT_TERMINAL_LABEL
+}
+
+/// `SERVICE-001`: the sanitized terminal label a heartbeat expiry records.
+///
+/// A peer that stopped answering Pings is half-open; a peer whose outbound write
+/// missed its deadline is a slow reader. Both end on Plan 05's published
+/// `slow_client` wire contract — this plan adds no wire reason and browsers keep
+/// one terminal vocabulary — so the distinction lives in the recorded evidence,
+/// which is the only place a half-open socket can be detected after the fact.
+/// There is no `TerminalSessionReason` variant for it, exactly as `send_failed`
+/// has none.
+const HEARTBEAT_TIMEOUT_TERMINAL_LABEL: &str = "heartbeat_timeout";
+
+/// Relabel a completed slow-client close as a heartbeat timeout. A close that
+/// degraded under its own store write, or that failed outright, keeps the label
+/// it produced: only the ordinary slow-client close is a heartbeat expiry.
+fn heartbeat_expiry_terminal_label(close_terminal_label: &'static str) -> &'static str {
+    if close_terminal_label == TerminalSessionReason::SlowClient.as_str() {
+        HEARTBEAT_TIMEOUT_TERMINAL_LABEL
+    } else {
+        close_terminal_label
+    }
 }
 
 /// A client that stopped reading is not worth another provider turn's work, so a
@@ -953,20 +977,22 @@ async fn run_voice_session<S, R>(
                         heartbeat_timer.as_mut().reset(heartbeat.next_wake());
                     }
                     HeartbeatAction::Expired => {
-                        // A peer that stopped answering is indistinguishable from a
-                        // peer that stopped reading, and Plan 05 already publishes
-                        // that terminal contract.
+                        // The wire contract is Plan 05's published slow-client
+                        // termination; the recorded label is `heartbeat_timeout`,
+                        // so a half-open peer is never read back as a slow reader.
                         abort_realtime_session_tasks(&mut session);
-                        terminal_reason = close_with_terminal_session_phase(
-                            &mut sender,
-                            &session.input,
-                            &state,
-                            voice_session_id.clone(),
-                            &mut terminal_persisted,
-                            TerminalSessionReason::SlowClient,
-                            close_code::POLICY,
-                        )
-                        .await;
+                        terminal_reason = heartbeat_expiry_terminal_label(
+                            close_with_terminal_session_phase(
+                                &mut sender,
+                                &session.input,
+                                &state,
+                                voice_session_id.clone(),
+                                &mut terminal_persisted,
+                                TerminalSessionReason::SlowClient,
+                                close_code::POLICY,
+                            )
+                            .await,
+                        );
                         break;
                     }
                 }
@@ -2871,6 +2897,14 @@ fn terminal_observability_classification(
             failure_class: "slow_client",
             stage: "session",
             signal: "slow_client",
+        },
+        // `SERVICE-001`: the half-open detection signal. Its own class, so the
+        // operator log separates a peer that stopped answering Pings from a peer
+        // whose outbound write missed its deadline.
+        HEARTBEAT_TIMEOUT_TERMINAL_LABEL => TerminalObservabilityClassification {
+            failure_class: "heartbeat_timeout",
+            stage: "session",
+            signal: "heartbeat_timeout",
         },
         "drained" => TerminalObservabilityClassification {
             failure_class: "deploy_drain",
@@ -9180,5 +9214,231 @@ mod tests {
 
         assert_eq!(pings, 20);
         assert_eq!(sleeper.deadline(), armed_deadline);
+    }
+
+    /// A sink that survives `run_voice_session` taking its sender by value, so a
+    /// terminated session's wire frames can still be read back afterwards.
+    #[derive(Clone)]
+    struct SharedRecordingSink {
+        sent: Arc<std::sync::Mutex<Vec<Message>>>,
+    }
+
+    impl SharedRecordingSink {
+        fn new() -> Self {
+            Self {
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn sent(&self) -> Vec<Message> {
+            self.sent.lock().expect("recording sink lock").clone()
+        }
+    }
+
+    impl futures_util::Sink<Message> for SharedRecordingSink {
+        type Error = axum::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.sent.lock().expect("recording sink lock").push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// `SERVICE-001`: a peer that stopped answering Pings is a half-open socket,
+    /// and the operator evidence must say so. The wire keeps Plan 05's published
+    /// slow-client terminal contract — browsers have one terminal vocabulary and
+    /// this plan adds no wire reason — but the recorded terminal label is the
+    /// service-local `heartbeat_timeout`, so a half-open socket is never read
+    /// back as a slow reader whose outbound write missed its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_expiry_records_heartbeat_timeout_on_the_slow_client_wire_contract() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let probe_task = Arc::new(std::sync::Mutex::new(None));
+        let state = AppState::with_study_store(
+            Arc::new(SlowClientProbeBrain {
+                study_store: store.clone(),
+                task: probe_task.clone(),
+            }),
+            "slow_client_probe",
+            crate::config::VoiceWsAccess::default(),
+            2,
+            store,
+        )
+        .with_ws_timeouts(crate::app::WsTimeouts {
+            // Every other deadline is far away: only the heartbeat can end this
+            // socket, and the outbound sink never stalls.
+            first_frame: Duration::from_secs(600),
+            idle: Duration::from_secs(3_600),
+            between_turn_idle: Duration::from_secs(3_600),
+            session: Duration::from_secs(6 * 60 * 60),
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            pong_timeout: PONG_TIMEOUT,
+            outbound_write: Duration::from_secs(5),
+            ..crate::app::WsTimeouts::default()
+        });
+        let evidence = state.evidence.clone();
+        let limit_state = state.limit_state.clone();
+        let session_slots = state.session_slots.clone();
+
+        let permit = session_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("session slot");
+        let ip_lease = limit_state
+            .try_acquire_ip("198.51.100.9", 2)
+            .expect("ip lease");
+        let admission = VoiceAdmission {
+            _permit: permit,
+            _ip_lease: Some(ip_lease),
+            principal: crate::config::UpgradePrincipal::ServiceBearer,
+        };
+
+        // The client bootstraps, then reads nothing and writes nothing ever
+        // again — including no Pong.
+        let client_frames = futures_util::stream::iter(vec![Ok(Message::Text(
+            slow_client_session_config_json().into(),
+        ))])
+        .chain(futures_util::stream::pending());
+
+        let sink = SharedRecordingSink::new();
+        let start = Instant::now();
+        run_voice_session(
+            BoundedSender::new(sink.clone(), Duration::from_secs(5)),
+            client_frames,
+            state,
+            admission,
+            "http://localhost:3000".to_owned(),
+        )
+        .await;
+
+        assert_eq!(
+            Instant::now().duration_since(start),
+            HEARTBEAT_INTERVAL + PONG_TIMEOUT,
+            "the socket ends one ping interval plus one pong timeout after acceptance"
+        );
+
+        let sent = sink.sent();
+        assert!(
+            sent.iter().any(|message| matches!(
+                message,
+                Message::Ping(payload) if payload.is_empty()
+            )),
+            "the server must have pinged before it expired the peer: {sent:?}"
+        );
+        // The wire contract is unchanged: Plan 05's `slow_client` terminal phase
+        // and its close reason.
+        let terminal_wire_reason = sent
+            .iter()
+            .find_map(|message| match message {
+                Message::Text(text) => {
+                    let frame: serde_json::Value = serde_json::from_str(text).ok()?;
+                    let event = frame.get("event")?;
+                    if event.get("type")?.as_str()? != "session_phase" {
+                        return None;
+                    }
+                    Some(event.get("terminal_reason")?.as_str()?.to_owned())
+                }
+                _ => None,
+            })
+            .expect("a terminal session_phase frame");
+        assert_eq!(
+            terminal_wire_reason,
+            TerminalSessionReason::SlowClient.as_str(),
+            "the wire keeps Plan 05's published terminal vocabulary: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|message| matches!(
+                message,
+                Message::Close(Some(frame))
+                    if frame.reason == TerminalSessionReason::SlowClient.close_reason()
+            )),
+            "the close frame keeps the slow-client reason: {sent:?}"
+        );
+
+        // The evidence is where the half-open socket is named.
+        let recorded = evidence.snapshot();
+        assert!(
+            recorded.iter().any(|event| {
+                event.kind == VoiceEvidenceEventKind::TerminalReason
+                    && event.detail == HEARTBEAT_TIMEOUT_TERMINAL_LABEL
+            }),
+            "a missing Pong records `heartbeat_timeout`: {recorded:?}"
+        );
+        assert!(
+            !recorded.iter().any(|event| {
+                event.kind == VoiceEvidenceEventKind::TerminalReason
+                    && event.detail == TerminalSessionReason::SlowClient.as_str()
+            }),
+            "a half-open socket is not reported as a slow reader: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|event| {
+                event.kind == VoiceEvidenceEventKind::Close
+                    && event.detail == HEARTBEAT_TIMEOUT_TERMINAL_LABEL
+            }),
+            "the close evidence carries the same label: {recorded:?}"
+        );
+
+        assert_eq!(limit_state.ip_lease_count("198.51.100.9"), None);
+        assert_eq!(session_slots.available_permits(), 2);
+    }
+
+    /// The two outbound-write labels and the heartbeat label stay distinct: a
+    /// missed write deadline is a slow reader, a broken sink is a failed send,
+    /// and only an unanswered Ping is a heartbeat timeout.
+    #[test]
+    fn heartbeat_timeout_is_distinct_from_every_outbound_write_label() {
+        assert_eq!(
+            heartbeat_expiry_terminal_label(TerminalSessionReason::SlowClient.as_str()),
+            HEARTBEAT_TIMEOUT_TERMINAL_LABEL
+        );
+        assert_ne!(
+            HEARTBEAT_TIMEOUT_TERMINAL_LABEL,
+            outbound_write_terminal_label(&OutboundWriteError::Timeout)
+        );
+        assert_ne!(
+            HEARTBEAT_TIMEOUT_TERMINAL_LABEL,
+            outbound_write_terminal_label(&OutboundWriteError::Sink(axum::Error::new(
+                std::io::Error::other("sink broke")
+            )))
+        );
+        assert!(
+            !TerminalSessionReason::ALL
+                .iter()
+                .any(|reason| reason.as_str() == HEARTBEAT_TIMEOUT_TERMINAL_LABEL),
+            "`heartbeat_timeout` is a service-local evidence label, not a wire reason"
+        );
+        // A close that degraded under its own store write, or that failed
+        // outright, keeps the label it produced rather than being relabelled.
+        assert_eq!(
+            heartbeat_expiry_terminal_label(TerminalSessionReason::DurabilityDegraded.as_str()),
+            TerminalSessionReason::DurabilityDegraded.as_str()
+        );
+        assert_eq!(
+            heartbeat_expiry_terminal_label("send_failed"),
+            "send_failed"
+        );
     }
 }

@@ -17119,13 +17119,25 @@ async fn half_open_socket_expires_and_releases_every_server_owned_lease() {
         "the half-open socket must release its IP lease"
     );
     assert_eq!(slots.available_permits(), 2);
+    // The half-open detection signal this row exists to add: the recorded label
+    // is `heartbeat_timeout`, never the slow-reader label a missed outbound
+    // write records. The wire still closes on Plan 05's published slow-client
+    // contract — `ws::tests::heartbeat_expiry_records_heartbeat_timeout_on_the_slow_client_wire_contract`
+    // pins both halves against a recording sink.
     let recorded = evidence.snapshot();
     assert!(
         recorded.iter().any(|event| {
             event.kind == VoiceEvidenceEventKind::TerminalReason
-                && event.detail == TerminalSessionReason::SlowClient.as_str()
+                && event.detail == "heartbeat_timeout"
         }),
         "{recorded:?}"
+    );
+    assert!(
+        !recorded.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::TerminalReason
+                && event.detail == TerminalSessionReason::SlowClient.as_str()
+        }),
+        "a half-open socket must not be recorded as a slow reader: {recorded:?}"
     );
     drop(half_open);
 
