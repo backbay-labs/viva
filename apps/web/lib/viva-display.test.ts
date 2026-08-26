@@ -7,8 +7,8 @@ import {
   type SessionRecap,
   seedStudySets,
 } from "@viva/core";
-import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/fake-cartesia-gemini-study-session.json";
-import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
+import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-session.json";
+import fullSessionFixture from "../../../agent/fixtures/voice-protocol/v5/synthetic-runtime-session.json";
 import {
   correctionQuote,
   recapPlanFromSessionEvents,

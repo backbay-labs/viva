@@ -91,7 +91,10 @@ try {
   );
 
   const session = JSON.parse(
-    await readFile(path.join(root, "agent/fixtures/voice-protocol/session-config.json"), "utf8"),
+    await readFile(
+      path.join(root, "agent/fixtures/voice-protocol/v5/seeded-session-config.json"),
+      "utf8",
+    ),
   );
 
   bundleDir = await mkdtemp(path.join(os.tmpdir(), "viva-e2e-browser-audio-"));

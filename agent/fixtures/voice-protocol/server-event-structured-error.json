@@ -1,9 +1,0 @@
-{
-  "type": "event",
-  "version": 5,
-  "event": {
-    "type": "structured_error",
-    "source": "agent-service",
-    "message": "telemetry event suppressed"
-  }
-}

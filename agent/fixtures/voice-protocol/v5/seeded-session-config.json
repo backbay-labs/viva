@@ -3,7 +3,6 @@
   "user_id": "user-1",
   "study_set_id": "biology-midterm",
   "mode": "quiz",
-  "initial_goal": "Review oxidative phosphorylation from Lecture 5.",
   "source_context": [
     {
       "source_id": "src-lecture-5-slide-18",
@@ -14,5 +13,9 @@
       "retrieval_reason": "seeded next-question context"
     }
   ],
-  "active_concepts": ["oxidative-phosphorylation", "nadh", "atp-synthase"]
+  "active_concepts": [
+    "oxidative-phosphorylation",
+    "nadh",
+    "atp-synthase"
+  ]
 }

@@ -1,24 +1,21 @@
 import { describe, expect, test } from "bun:test";
 import sessionTokenVectorFixture from "../../../agent/fixtures/session-token/v1/vectors.json";
-import audioFixture from "../../../agent/fixtures/voice-protocol/client-audio.json";
-import fakeEvidencePackFixture from "../../../agent/fixtures/voice-protocol/fake-cartesia-gemini-evidence-pack.json";
-import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/fake-cartesia-gemini-study-session.json";
-import manuscriptIntentFixture from "../../../agent/fixtures/voice-protocol/server-event-manuscript-intent.json";
-import eventFixture from "../../../agent/fixtures/voice-protocol/server-event-question-started.json";
-import structuredErrorFixture from "../../../agent/fixtures/voice-protocol/server-event-structured-error.json";
-import readyFixture from "../../../agent/fixtures/voice-protocol/server-ready.json";
-import sessionFixture from "../../../agent/fixtures/voice-protocol/session-config.json";
-import evidencePackFixture from "../../../agent/fixtures/voice-protocol/synthetic-evidence-pack.json";
-import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
 import audioLifecycleFixture from "../../../agent/fixtures/voice-protocol/v5/audio-turn-lifecycle.json";
 import authDecisionFixture from "../../../agent/fixtures/voice-protocol/v5/auth-decision.json";
+import audioFixture from "../../../agent/fixtures/voice-protocol/v5/client-audio-chunk.json";
 import clientDifferentialFixture from "../../../agent/fixtures/voice-protocol/v5/client-differential-cases.json";
 import signedSessionConfigFixture from "../../../agent/fixtures/voice-protocol/v5/client-session-config-signed.json";
 import sessionRefreshFixture from "../../../agent/fixtures/voice-protocol/v5/client-session-refresh.json";
+import fakeEvidencePackFixture from "../../../agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-evidence-pack.json";
+import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-session.json";
 import fakeTwoTurnFixture from "../../../agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-two-turn-session.json";
 import manifestFixture from "../../../agent/fixtures/voice-protocol/v5/manifest.json";
+import sessionFixture from "../../../agent/fixtures/voice-protocol/v5/seeded-session-config.json";
 import serverDifferentialFixture from "../../../agent/fixtures/voice-protocol/v5/server-differential-cases.json";
+import manuscriptIntentFixture from "../../../agent/fixtures/voice-protocol/v5/server-event-manuscript-intent.json";
 import readyV5Fixture from "../../../agent/fixtures/voice-protocol/v5/server-ready.json";
+import evidencePackFixture from "../../../agent/fixtures/voice-protocol/v5/synthetic-runtime-evidence-pack.json";
+import fullSessionFixture from "../../../agent/fixtures/voice-protocol/v5/synthetic-runtime-session.json";
 import syntheticTwoTurnFixture from "../../../agent/fixtures/voice-protocol/v5/synthetic-two-turn-session.json";
 import terminalSequenceFixture from "../../../agent/fixtures/voice-protocol/v5/terminal-sequences.json";
 import transportOutcomeFixture from "../../../agent/fixtures/voice-protocol/v5/transport-outcomes.json";
@@ -249,23 +246,13 @@ describe("Viva voice agent contract", () => {
     ).toThrow("Missing client_generation_id");
   });
 
-  test("rejects the retiring unversioned ready fixture as pre-v5", () => {
-    // `VOICE-READY-001` makes the protocol advertisement a required ready field. The
-    // frozen root corpus predates it, so strict v5 parsing rejects it instead of
-    // inventing an advertisement. Task 9 Step 6 deletes the corpus outright.
-    const rejection = captureVoiceProtocolError(() => parseVivaServerFrame(readyFixture));
-    expect(rejection.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
-    expect(rejection.path).toBe("$.protocol");
-  });
-
-  test("rejects the retiring unversioned question fixture as pre-v5", () => {
-    // `VOICE-TURN-001` binds `question_started` to the active wire turn, and the merged
-    // Plan 06 `StudyQuestion` carries `concept_id` and `rubric`. The frozen root event
-    // corpus predates all three, so strict v5 parsing rejects it at the first one.
-    const rejection = captureVoiceProtocolError(() => parseVivaServerFrame(eventFixture));
-    expect(rejection.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
-    expect(rejection.path).toBe("$.event.turn_id");
-  });
+  // Task 9 Step 6 retired the frozen unversioned corpus, so the three "reject the
+  // retiring fixture" tests that read those files are gone. Their proofs are not: the
+  // pre-v5 `question_started` (no wire `turn_id`) and `structured_error` (no `code`)
+  // shapes are executed from the versioned differential corpus as
+  // `VOICE-SERVER-REJECT-QUESTION-STARTED-WITHOUT-TURN` and
+  // `VOICE-SERVER-REJECT-STRUCTURED-ERROR-MISSING-CODE`, and the advertisement-less
+  // ready shape is reproduced below from the v5 ready fixture that superseded it.
 
   test("parses terminal session phases with sanitized enum reasons", () => {
     const frame = parseVivaServerFrame({
@@ -375,15 +362,6 @@ describe("Viva voice agent contract", () => {
         },
       }),
     ).toThrow("Invalid enumerated value");
-  });
-
-  test("rejects the retiring unversioned structured error fixture as pre-v5", () => {
-    // `VOICE-TERMINAL-002` requires an explicit `code` and `terminality`; the frozen
-    // root fixture predates both. Positive coverage lives in the v5 corpora, and Task 9
-    // Step 6 deletes this fixture.
-    const rejection = captureVoiceProtocolError(() => parseVivaServerFrame(structuredErrorFixture));
-    expect(rejection.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
-    expect(rejection.path).toBe("$.event.code");
   });
 
   test("parses shared manuscript intent fixture from Rust service", () => {
@@ -574,42 +552,39 @@ describe("Viva voice agent contract", () => {
     expect(forgedToolResult.path).toBe("$.type");
   });
 
-  test("rejects the frozen unversioned synthetic session corpus in both directions", () => {
-    // `VOICE-VERSION-001`: the frozen corpus is v4 wire shape — token-less
-    // `session_config`, plain `text`, ready frames without the advertisement, and
-    // questions without `concept_id`/`rubric`. v5 rejects it rather than silently
-    // upgrading it, and Task 9 Step 6 deletes it outright.
-    for (const frame of fullSessionFixture.client) {
-      expect(VIVA_VOICE_DIAGNOSTIC_CODES).toContain(
-        captureVoiceProtocolError(() => parseVivaClientFrame(frame)).code,
-      );
-    }
-    const readyRejection = captureVoiceProtocolError(() =>
-      parseVivaServerFrame(fullSessionFixture.server[0]),
-    );
-    expect(readyRejection.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
-    expect(readyRejection.path).toBe("$.protocol");
+  test("parses the v5 synthetic runtime session corpus in both directions", () => {
+    // `VOICE-VERSION-001` / `VOICE-SESSION-001`: Task 9 Step 6 retired the frozen
+    // unversioned corpus these two tests used to prove *rejected*. Its v5 successor is
+    // the merged runtime's own recorded output, so the proof inverts: the TypeScript
+    // parser must accept every frame the Rust service actually emits, in both
+    // directions, or the two languages have drifted.
+    expect(fullSessionFixture.client.map((frame) => parseVivaClientFrame(frame).type)).toEqual([
+      "session_config",
+      "turn_intent",
+      "cancel",
+      "stop",
+    ]);
+    const ready = parseVivaServerFrame(fullSessionFixture.server[0]);
+    expect(ready.type).toBe("ready");
+    if (ready.type !== "ready") throw new Error("Expected ready frame");
+    expect(ready.protocol.preferred_version).toBe(VIVA_VOICE_PROTOCOL_VERSION);
 
-    // The corpus still records the shapes the v5 corpus must eventually cover.
     const eventTypes = fullSessionFixture.server.flatMap((frame) =>
       frame.type === "event" ? [(frame as { event: { type: string } }).event.type] : [],
     );
+    expect(eventTypes).toContain("question_started");
     expect(eventTypes).toContain("answer_evaluated");
     expect(eventTypes).toContain("recap_ready");
+    for (const frame of fullSessionFixture.server) {
+      parseVivaServerFrame(frame);
+    }
   });
 
-  test("rejects the frozen unversioned fake-provider corpus but keeps its audio shape", () => {
-    // The v4 `session_config` carries no signed credential and the ready frame carries
-    // no advertisement, so both reject; the bounded audio frames Plan 03 introduced are
-    // already v5 shaped and still parse.
-    expect(
-      captureVoiceProtocolError(() => parseVivaClientFrame(fakeSessionFixture.client[0])).code,
-    ).toBe("VOICE_PROTOCOL_MISSING_FIELD");
+  test("parses the v5 fake-provider runtime session corpus including its audio turn", () => {
+    expect(parseVivaClientFrame(fakeSessionFixture.client[0]).type).toBe("session_config");
     expect(parseVivaClientFrame(fakeSessionFixture.client[1]).type).toBe("audio_chunk");
     expect(parseVivaClientFrame(fakeSessionFixture.client[2]).type).toBe("audio_end");
-    expect(
-      captureVoiceProtocolError(() => parseVivaServerFrame(fakeSessionFixture.server[0])).path,
-    ).toBe("$.protocol");
+    expect(parseVivaServerFrame(fakeSessionFixture.server[0]).type).toBe("ready");
     expect(parseVivaServerFrame(fakeSessionFixture.server[3]).type).toBe("audio_turn_accepted");
 
     const eventTypes = fakeSessionFixture.server.flatMap((frame) =>
@@ -619,23 +594,25 @@ describe("Viva voice agent contract", () => {
       "session_phase",
       "question_started",
       "session_phase",
+      "session_phase",
       "transcript_delta",
       "transcript_final",
       "session_phase",
-      "answer_evaluated",
+      "session_phase",
       "manuscript_intent",
       "source_reference",
+      "answer_evaluated",
       "concept_status",
       "audio_delta",
       "session_phase",
       "session_phase",
+      "cancellation",
       "recap_ready",
       "session_phase",
-      "cancellation",
     ]);
-    const browserEvents = fakeSessionFixture.server.filter((frame) => frame.type === "event");
-    expect(JSON.stringify(browserEvents)).not.toContain("usage");
-    expect(JSON.stringify(browserEvents)).not.toContain("fake_cartesia_gemini");
+    for (const frame of fakeSessionFixture.server) {
+      parseVivaServerFrame(frame);
+    }
   });
 
   test("keeps synthetic evidence pack sanitized and tied to release contract", () => {
@@ -890,8 +867,13 @@ describe("Viva voice v5 protocol negotiation and the single ready representation
 
   test("rejects a ready frame that omits the protocol advertisement", () => {
     // `VOICE-READY-001` publishes exactly one ready representation and the strict v5
-    // parser requires its advertisement; a frame without one is not v5.
-    const rejection = captureVoiceProtocolError(() => parseVivaServerFrame(readyFixture));
+    // parser requires its advertisement; a frame without one is not v5. This is the
+    // exact shape the retired unversioned ready fixture carried, derived from the v5
+    // fixture that replaced it rather than from a file that no longer exists.
+    const { protocol: _advertisement, ...readyWithoutAdvertisement } = readyV5Fixture;
+    const rejection = captureVoiceProtocolError(() =>
+      parseVivaServerFrame(readyWithoutAdvertisement),
+    );
     expect(rejection.code).toBe("VOICE_PROTOCOL_MISSING_FIELD");
     expect(rejection.path).toBe("$.protocol");
   });
@@ -2829,6 +2811,16 @@ const EXPECTED_MANIFEST_ROWS: ReadonlyArray<readonly [string, string, string]> =
     "client_frame",
   ],
   [
+    "VOICE-SEEDED-SESSION-CONFIG",
+    "agent/fixtures/voice-protocol/v5/seeded-session-config.json",
+    "session_payload",
+  ],
+  [
+    "VOICE-CLIENT-AUDIO-CHUNK",
+    "agent/fixtures/voice-protocol/v5/client-audio-chunk.json",
+    "client_frame",
+  ],
+  [
     "VOICE-AUDIO-TURN-LIFECYCLE",
     "agent/fixtures/voice-protocol/v5/audio-turn-lifecycle.json",
     "frame_sequence",
@@ -2844,6 +2836,11 @@ const EXPECTED_MANIFEST_ROWS: ReadonlyArray<readonly [string, string, string]> =
     "server_event_cases",
   ],
   ["VOICE-SERVER-READY", "agent/fixtures/voice-protocol/v5/server-ready.json", "server_frame"],
+  [
+    "VOICE-SERVER-EVENT-MANUSCRIPT-INTENT",
+    "agent/fixtures/voice-protocol/v5/server-event-manuscript-intent.json",
+    "server_frame",
+  ],
   [
     "VOICE-TERMINAL-SEQUENCES",
     "agent/fixtures/voice-protocol/v5/terminal-sequences.json",
@@ -2863,6 +2860,26 @@ const EXPECTED_MANIFEST_ROWS: ReadonlyArray<readonly [string, string, string]> =
     "VOICE-FAKE-CARTESIA-GEMINI-TWO-TURN-SESSION",
     "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-two-turn-session.json",
     "session_sequence",
+  ],
+  [
+    "VOICE-SYNTHETIC-RUNTIME-SESSION",
+    "agent/fixtures/voice-protocol/v5/synthetic-runtime-session.json",
+    "runtime_session",
+  ],
+  [
+    "VOICE-FAKE-CARTESIA-GEMINI-RUNTIME-SESSION",
+    "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-session.json",
+    "runtime_session",
+  ],
+  [
+    "VOICE-SYNTHETIC-RUNTIME-EVIDENCE-PACK",
+    "agent/fixtures/voice-protocol/v5/synthetic-runtime-evidence-pack.json",
+    "evidence_pack",
+  ],
+  [
+    "VOICE-FAKE-CARTESIA-GEMINI-RUNTIME-EVIDENCE-PACK",
+    "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-evidence-pack.json",
+    "evidence_pack",
   ],
   [
     "VOICE-CLIENT-DIFFERENTIAL-CASES",
