@@ -452,6 +452,31 @@ atmosphere frame is committed, not merely until fonts load (`_layout.tsx` curren
   user's actual study set. The FSRS coupling in §6 implies at least partly the latter.
 - **O-11 — Night-state contrast.** §11's table covers the daylight range only. The clock-bound night
   state has its own luminance range and must be measured before it ships.
+- **O-13 — Nothing ties `VELLUM_DARKEST` to the shipped plate.** Six of the eight text tokens clear
+  the floor by under 2% (`prussianInk` 4.52, `inkMuted` 4.54, `ochreInk` 4.54, `sageInk`/`copperInk`/
+  `goldInk` 4.56). A re-bake at a different phase or quality could push several under while the whole
+  suite stays green, because the constant is a literal and nothing reads the artifact. Fix: have
+  `bake-vellum.mjs` write the plate's 4×4-averaged luminance floor to a JSON sidecar and assert
+  against it in `vellum-asset.test.ts`. Deferred from Act 1 only because decoding WebP inside
+  `bun:test` would need a dependency the constraints forbid; the bake script can compute it.
+- **O-14 — Native transition ghosting, unverified.** With transparent `contentStyle` and
+  `animation: "fade_from_bottom"`, the outgoing native-stack screen stays mounted beneath the incoming
+  one, so two text layers can superimpose during the fade. Inherent to the ground showing through, and
+  **not exercisable on web** — it needs a device. Remedy if it reads badly: `animation: "fade"`.
+- **O-15 — The classification declares capability, not usage.** `TEXT/MARK/ORNAMENT/SURFACE_TOKENS`
+  guarantee every token has a declared ceiling; nothing statically ties a `color:` prop to
+  `TEXT_TOKENS`, so `color: colors.inkFaint` would compile and pass the suite. `SURFACE_TOKENS` is
+  also the one tier with no contrast assertion, so a dark value can hide there. Two tokens already sit
+  slightly awkwardly: `inkSecondary` (MARK) and `sheet` (SURFACE) are both *text that never sits on
+  the ground*, which no tier name expresses — a reader could take MARK to mean "safe anywhere at 3:1"
+  and put `inkSecondary` back on the vellum, which is the exact defect the final review caught. Fix:
+  extend the MARK docstring, or add an `ON_SURFACE_TOKENS` tier.
+- **O-16 — Opaque cards read as slabs on the living ground.** `colors.sheet` cards now sit on a
+  textured, light-varying surface and read close to the "tipped-in" treatment the owner rejected.
+  The impression-system plan resolves it by cutting cards *into* the ground. The interim alternative
+  (lowering card alpha) is not a tweak: it makes every card's text background a composite of the
+  drifting ground, so the contrast certification would have to be rebuilt against a two-dimensional
+  range instead of a one-dimensional one.
 - **O-12 — Orb rendering.** SVG orb with shader-drawn bloom (§17) is the decision for now; whether the
   orb eventually moves into Skia for one lighting model is deferred.
 
