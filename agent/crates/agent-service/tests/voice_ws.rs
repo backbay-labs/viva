@@ -17697,6 +17697,158 @@ async fn bounded_writes_deliver_the_terminal_frame_and_close_with_client_bytes_i
     );
 }
 
+/// `A-20.2`: a `slow_client` terminal REASON is not a failed write SIDE.
+///
+/// `slow_client` is Plan 05's published wire reason for "this socket is not
+/// keeping up", and the overlapping-provider-turn policy denial closes with it
+/// while every server write is succeeding instantly. Inferring "the write side
+/// failed" from that sanitized label skipped the closing handshake, so the
+/// socket was dropped on top of the client's still-unread pipelined bytes and
+/// the connection reset — discarding the terminal frame and the Close frame the
+/// server had already written. The learner is told nothing; the browser sees a
+/// transport error.
+///
+/// This is the same property as the test above, taken on the other branch of the
+/// guard: the client is reading perfectly well, it simply has bytes in flight
+/// behind the frame the server refused.
+#[tokio::test]
+async fn bounded_writes_deliver_the_terminal_frame_and_close_after_a_denied_overlapping_turn() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let state = AppState::new(
+        Arc::new(BlockingProviderProbeBrain {
+            text_inputs: text_inputs.clone(),
+        }),
+        "cartesia_gemini",
+        VoiceWsAccess::default(),
+        4,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_provider_concurrent_turns: Some(1),
+        max_provider_queue_depth: Some(1),
+        ..VoiceLimitConfig::default()
+    })
+    // The subject is the closing handshake, not a deadline: every deadline stays
+    // far clear of the denial so nothing else can end this socket.
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(30),
+        between_turn_idle: Duration::from_secs(30),
+        session: Duration::from_secs(30),
+        ..WsTimeouts::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "cartesia_gemini").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Event { event, .. }
+            if matches!(
+                event.as_ref(),
+                VivaServerEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                    terminal_reason: None,
+                }
+            )
+    ));
+
+    // One answer the provider never resolves, so it keeps the only provider slot.
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "a20-handshake-first".to_owned(),
+            turn_id: "turn-a20-first".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
+        },
+    )
+    .await;
+    wait_until(Duration::from_secs(2), || {
+        text_inputs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    // The overlapping answers, written as one burst without reading anything
+    // back. The server refuses the first one it cannot queue and stops reading
+    // there, so the rest of the burst is still unread when the socket unwinds.
+    // Each frame stays under the protocol's text-frame ceiling, and the whole
+    // burst stays well under a socket send buffer so the client never blocks.
+    const INFLIGHT_FILLER_FRAMES: usize = 6;
+    const INFLIGHT_FILLER_BYTES: usize = 32 * 1024;
+    for index in 1..=INFLIGHT_FILLER_FRAMES {
+        socket
+            .feed(WsMessage::Text(
+                serde_json::to_string(&ClientFrame::TurnIntent {
+                    version: VIVA_VOICE_PROTOCOL_VERSION,
+                    client_generation_id: format!("a20-handshake-inflight-{index}"),
+                    turn_id: format!("turn-a20-inflight-{index}"),
+                    intent: ClientTurnIntent::AnswerText {
+                        text: "x".repeat(INFLIGHT_FILLER_BYTES),
+                    },
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    }
+    socket.flush().await.unwrap();
+
+    // Both writes must reach the client rather than dying with the connection.
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = match socket.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    serde_json::from_str::<ServerFrame>(&text).unwrap()
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(error)) => panic!(
+                    "the denied overlap must deliver its terminal frame, not reset the \
+                     connection: {error:?}"
+                ),
+                None => panic!("the socket ended before its terminal frame"),
+            };
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::SlowClient) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("the denied overlap must deliver its terminal frame");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::SlowClient);
+    match tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("the close frame must arrive rather than the connection resetting")
+        .expect("the socket must not end before its close frame")
+        .expect("the socket must not fail before its close frame")
+    {
+        WsMessage::Close(Some(frame)) => assert_eq!(frame.code, CloseCode::Policy),
+        other => panic!("expected a close frame, got {other:?}"),
+    }
+    match tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("the socket must reach a clean end of stream")
+    {
+        None => {}
+        Some(Ok(other)) => panic!("expected end of stream, got {other:?}"),
+        Some(Err(error)) => panic!(
+            "the closing handshake must complete rather than resetting the connection: {error:?}"
+        ),
+    }
+    assert_eq!(text_inputs.load(Ordering::SeqCst), 1);
+    assert!(evidence.snapshot().iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::ProviderAdmission
+            && event.detail.contains("admission_decision=denied")
+            && event.detail.contains("reason=overlapping_provider_turn")
+            && event.detail.contains("terminal_reason=slow_client")
+    }));
+}
+
 /// Independent-review CRITICAL (cancel-after-submit): a scoped cancel that names
 /// a turn the client has already ended must not end the session.
 ///

@@ -488,11 +488,45 @@ fn outbound_write_terminal_label(error: &OutboundWriteError) -> &'static str {
     }
 }
 
-/// Whether a recorded terminal label came from a failed outbound write.
+/// Whether a label produced *by a failed outbound write* names that failure.
+///
+/// `A-20.2`: this answers "which label won", never "did the write side fail".
+/// Only `terminal_label_after_terminal_phase_close` may ask it, because only
+/// there is the argument already known to have come from a write failure.
+/// `slow_client` is also an ordinary policy-denial wire reason, so the same
+/// string arriving from anywhere else says nothing about the socket.
 fn is_outbound_write_failure_label(label: &str) -> bool {
-    label == "send_failed"
-        || label == TerminalSessionReason::SlowClient.as_str()
-        || label == HEARTBEAT_TIMEOUT_TERMINAL_LABEL
+    label == "send_failed" || label == TerminalSessionReason::SlowClient.as_str()
+}
+
+/// What the session recorded about how its terminal close went.
+///
+/// `persisted` is whether the terminal reason reached durable storage.
+/// `write_failed` is `A-20.2`'s explicit write-side fact: it is set only where
+/// an outbound write actually failed, and it is the only evidence the
+/// closing-handshake guard reads. It is never derived from a terminal label,
+/// because `slow_client` is both an outbound-write label and an ordinary
+/// policy-denial wire reason.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TerminalCloseState {
+    persisted: bool,
+    write_failed: bool,
+}
+
+/// `A-20.2`: whether this socket still has a closing handshake to finish.
+///
+/// Two independent facts skip it, and neither may be inferred from the
+/// sanitized terminal label: this socket's own write side failed, so there is
+/// no way to deliver anything more, or the peer is already gone, so there is
+/// nobody left to answer. Reading `slow_client` as write-side evidence stranded
+/// clients that were reading perfectly well and had simply pipelined frames
+/// behind the one the server refused — the socket was dropped on top of their
+/// unread bytes and the reset discarded the terminal frame and the Close frame
+/// already written to them.
+fn should_finish_closing_handshake(outbound_write_failed: bool, terminal_reason: &str) -> bool {
+    !outbound_write_failed
+        && terminal_reason != "client_disconnect"
+        && terminal_reason != HEARTBEAT_TIMEOUT_TERMINAL_LABEL
 }
 
 /// `SERVICE-001`: the sanitized terminal label a heartbeat expiry records.
@@ -520,10 +554,15 @@ fn heartbeat_expiry_terminal_label(close_terminal_label: &'static str) -> &'stat
 /// A client that stopped reading is not worth another provider turn's work, so a
 /// missed write deadline aborts the provider tasks before the socket unwinds. A
 /// broken sink leaves them to the ordinary teardown.
+///
+/// `A-20.2`: this is one of the two places that record the write side failing,
+/// and the flag it sets is the only evidence the closing-handshake guard reads.
 fn handle_outbound_write_failure(
     error: &OutboundWriteError,
     session: &mut agent_domain::RealtimeSession,
+    terminal: &mut TerminalCloseState,
 ) -> &'static str {
+    terminal.write_failed = true;
     if matches!(error, OutboundWriteError::Timeout) {
         abort_realtime_session_tasks(session);
     }
@@ -834,7 +873,7 @@ async fn run_voice_session<S, R>(
         "session opened",
     ));
     let mut terminal_reason = "event_stream_closed";
-    let mut terminal_persisted = false;
+    let mut terminal_close = TerminalCloseState::default();
     let mut cancelled_responses = CancelledResponseTracker::default();
     let mut session_limits = SessionLimitRuntime::new();
     let mut turn_bindings = TurnBindingTracker::default();
@@ -872,7 +911,7 @@ async fn run_voice_session<S, R>(
             &session.input,
             &state,
             voice_session_id.clone(),
-            &mut terminal_persisted,
+            &mut terminal_close,
             TerminalSessionReason::Drained,
             close_code::NORMAL,
         )
@@ -911,7 +950,7 @@ async fn run_voice_session<S, R>(
                         &session.input,
                         &state,
                         voice_session_id.clone(),
-                        &mut terminal_persisted,
+                        &mut terminal_close,
                         TerminalSessionReason::Drained,
                         close_code::NORMAL,
                     )
@@ -925,7 +964,7 @@ async fn run_voice_session<S, R>(
                     &session.input,
                     &state,
                     voice_session_id.clone(),
-                    &mut terminal_persisted,
+                    &mut terminal_close,
                     TerminalSessionReason::SessionCap,
                     close_code::POLICY,
                 )
@@ -939,7 +978,7 @@ async fn run_voice_session<S, R>(
                     &session.input,
                     &state,
                     voice_session_id.clone(),
-                    &mut terminal_persisted,
+                    &mut terminal_close,
                     TerminalSessionReason::TurnCap,
                     close_code::POLICY,
                 )
@@ -953,7 +992,7 @@ async fn run_voice_session<S, R>(
                     &session.input,
                     &state,
                     voice_session_id.clone(),
-                    &mut terminal_persisted,
+                    &mut terminal_close,
                     TerminalSessionReason::TurnCap,
                     close_code::POLICY,
                 )
@@ -971,7 +1010,7 @@ async fn run_voice_session<S, R>(
                     }
                     HeartbeatAction::SendPing => {
                         if let Err(error) = sender.send(Message::Ping(Vec::new().into())).await {
-                            terminal_reason = handle_outbound_write_failure(&error, &mut session);
+                            terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
                             break;
                         }
                         heartbeat_timer.as_mut().reset(heartbeat.next_wake());
@@ -987,7 +1026,7 @@ async fn run_voice_session<S, R>(
                                 &session.input,
                                 &state,
                                 voice_session_id.clone(),
-                                &mut terminal_persisted,
+                                &mut terminal_close,
                                 TerminalSessionReason::SlowClient,
                                 close_code::POLICY,
                             )
@@ -1012,7 +1051,7 @@ async fn run_voice_session<S, R>(
                         &session.input,
                         &state,
                         voice_session_id.clone(),
-                        &mut terminal_persisted,
+                        &mut terminal_close,
                         denial.terminal_reason,
                         close_code::POLICY,
                     )
@@ -1070,7 +1109,7 @@ async fn run_voice_session<S, R>(
                             )
                             .await
                             {
-                                terminal_reason = handle_outbound_write_failure(&error, &mut session);
+                                terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
                                 break;
                             }
                         }
@@ -1081,7 +1120,7 @@ async fn run_voice_session<S, R>(
                             &session.input,
                             &state,
                             voice_session_id.clone(),
-                            &mut terminal_persisted,
+                            &mut terminal_close,
                             TerminalSessionReason::Drained,
                             close_code::NORMAL,
                         )
@@ -1094,7 +1133,7 @@ async fn run_voice_session<S, R>(
                             &session.input,
                             &state,
                             voice_session_id.clone(),
-                            &mut terminal_persisted,
+                            &mut terminal_close,
                             TerminalSessionReason::RateLimit,
                             close_code::POLICY,
                         )
@@ -1114,7 +1153,7 @@ async fn run_voice_session<S, R>(
                             &session.input,
                             &state,
                             voice_session_id.clone(),
-                            &mut terminal_persisted,
+                            &mut terminal_close,
                             TerminalSessionReason::TurnCap,
                             close_code::POLICY,
                         )
@@ -1141,7 +1180,7 @@ async fn run_voice_session<S, R>(
                     Message::Ping(payload) => {
                         let payload = payload.clone();
                         if let Err(error) = sender.send(Message::Pong(payload)).await {
-                            terminal_reason = handle_outbound_write_failure(&error, &mut session);
+                            terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
                             break;
                         }
                         continue;
@@ -1170,7 +1209,7 @@ async fn run_voice_session<S, R>(
                             &session.input,
                             &state,
                             voice_session_id.clone(),
-                            &mut terminal_persisted,
+                            &mut terminal_close,
                             TerminalSessionReason::Drained,
                             close_code::NORMAL,
                         )
@@ -1183,7 +1222,7 @@ async fn run_voice_session<S, R>(
                             &session.input,
                             &state,
                             voice_session_id.clone(),
-                            &mut terminal_persisted,
+                            &mut terminal_close,
                             TerminalSessionReason::RateLimit,
                             close_code::POLICY,
                         )
@@ -1213,7 +1252,7 @@ async fn run_voice_session<S, R>(
                     )
                     .await
                     {
-                        terminal_reason = handle_outbound_write_failure(&error, &mut session);
+                        terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
                         break;
                     }
                     continue;
@@ -1249,7 +1288,7 @@ async fn run_voice_session<S, R>(
                                 &session.input,
                                 &state,
                                 voice_session_id.clone(),
-                                &mut terminal_persisted,
+                                &mut terminal_close,
                                 TerminalSessionReason::Drained,
                                 close_code::NORMAL,
                             )
@@ -1262,7 +1301,7 @@ async fn run_voice_session<S, R>(
                                 &session.input,
                                 &state,
                                 voice_session_id.clone(),
-                                &mut terminal_persisted,
+                                &mut terminal_close,
                                 TerminalSessionReason::RateLimit,
                                 close_code::POLICY,
                             )
@@ -1282,7 +1321,7 @@ async fn run_voice_session<S, R>(
                                 &session.input,
                                 &state,
                                 voice_session_id.clone(),
-                                &mut terminal_persisted,
+                                &mut terminal_close,
                                 TerminalSessionReason::TurnCap,
                                 close_code::POLICY,
                             )
@@ -1343,7 +1382,7 @@ async fn run_voice_session<S, R>(
                                     &session.input,
                                     &state,
                                     voice_session_id.clone(),
-                                    &mut terminal_persisted,
+                                    &mut terminal_close,
                                     TerminalSessionReason::DurabilityDegraded,
                                     close_code::ERROR,
                                 )
@@ -1356,7 +1395,7 @@ async fn run_voice_session<S, R>(
                                     &session.input,
                                     &state,
                                     voice_session_id.clone(),
-                                    &mut terminal_persisted,
+                                    &mut terminal_close,
                                     TerminalSessionReason::CostBudget,
                                     close_code::POLICY,
                                 )
@@ -1375,7 +1414,7 @@ async fn run_voice_session<S, R>(
                                 )
                                 .await
                                 {
-                                    terminal_reason = handle_outbound_write_failure(&error, &mut session);
+                                    terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
                                     break;
                                 }
                                 terminal_reason = close_with_terminal_session_phase(
@@ -1383,7 +1422,7 @@ async fn run_voice_session<S, R>(
                                     &session.input,
                                     &state,
                                     voice_session_id.clone(),
-                                    &mut terminal_persisted,
+                                    &mut terminal_close,
                                     reason,
                                     close_code::ERROR,
                                 )
@@ -1391,7 +1430,7 @@ async fn run_voice_session<S, R>(
                                 break;
                             }
                             Err(error) => {
-                                terminal_reason = handle_outbound_write_failure(&error, &mut session);
+                                terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
                                 break;
                             }
                         }
@@ -1448,7 +1487,7 @@ async fn run_voice_session<S, R>(
                             &session.input,
                             &state,
                             voice_session_id.clone(),
-                            &mut terminal_persisted,
+                            &mut terminal_close,
                             denial.terminal_reason,
                             close_code::POLICY,
                         )
@@ -1509,7 +1548,7 @@ async fn run_voice_session<S, R>(
                             )
                             .await
                             {
-                                terminal_reason = handle_outbound_write_failure(&error, &mut session);
+                                terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
                                 break;
                             }
                         }
@@ -1549,7 +1588,7 @@ async fn run_voice_session<S, R>(
                                             &session.input,
                                             &state,
                                             voice_session_id.clone(),
-                                            &mut terminal_persisted,
+                                            &mut terminal_close,
                                             TerminalSessionReason::DurabilityDegraded,
                                             close_code::ERROR,
                                         )
@@ -1562,7 +1601,7 @@ async fn run_voice_session<S, R>(
                                             &session.input,
                                             &state,
                                             voice_session_id.clone(),
-                                            &mut terminal_persisted,
+                                            &mut terminal_close,
                                             TerminalSessionReason::CostBudget,
                                             close_code::POLICY,
                                         )
@@ -1581,7 +1620,7 @@ async fn run_voice_session<S, R>(
                                         )
                                         .await
                                         {
-                                            terminal_reason = handle_outbound_write_failure(&error, &mut session);
+                                            terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
                                             break;
                                         }
                                         terminal_reason = close_with_terminal_session_phase(
@@ -1589,7 +1628,7 @@ async fn run_voice_session<S, R>(
                                             &session.input,
                                             &state,
                                             voice_session_id.clone(),
-                                            &mut terminal_persisted,
+                                            &mut terminal_close,
                                             reason,
                                             close_code::ERROR,
                                         )
@@ -1597,7 +1636,7 @@ async fn run_voice_session<S, R>(
                                         break;
                                     }
                                     Err(error) => {
-                                        terminal_reason = handle_outbound_write_failure(&error, &mut session);
+                                        terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
                                         let _ = close_with(
                                             &mut sender,
                                             close_code::NORMAL,
@@ -1611,7 +1650,7 @@ async fn run_voice_session<S, R>(
                                     &mut sender,
                                     &state,
                                     voice_session_id.clone(),
-                                    &mut terminal_persisted,
+                                    &mut terminal_close,
                                 )
                                 .await;
                                 break;
@@ -1621,7 +1660,7 @@ async fn run_voice_session<S, R>(
                                     &mut sender,
                                     &state,
                                     voice_session_id.clone(),
-                                    &mut terminal_persisted,
+                                    &mut terminal_close,
                                 )
                                 .await;
                                 break;
@@ -1635,7 +1674,7 @@ async fn run_voice_session<S, R>(
                             &session.input,
                             &state,
                             voice_session_id.clone(),
-                            &mut terminal_persisted,
+                            &mut terminal_close,
                             TerminalSessionReason::Drained,
                             close_code::NORMAL,
                         )
@@ -1648,7 +1687,7 @@ async fn run_voice_session<S, R>(
                             &session.input,
                             &state,
                             voice_session_id.clone(),
-                            &mut terminal_persisted,
+                            &mut terminal_close,
                             TerminalSessionReason::RateLimit,
                             close_code::POLICY,
                         )
@@ -1668,7 +1707,7 @@ async fn run_voice_session<S, R>(
                             &session.input,
                             &state,
                             voice_session_id.clone(),
-                            &mut terminal_persisted,
+                            &mut terminal_close,
                             TerminalSessionReason::TurnCap,
                             close_code::POLICY,
                         )
@@ -1726,7 +1765,7 @@ async fn run_voice_session<S, R>(
                             &session.input,
                             &state,
                             voice_session_id.clone(),
-                            &mut terminal_persisted,
+                            &mut terminal_close,
                             TerminalSessionReason::DurabilityDegraded,
                             close_code::ERROR,
                         )
@@ -1739,7 +1778,7 @@ async fn run_voice_session<S, R>(
                             &session.input,
                             &state,
                             voice_session_id.clone(),
-                            &mut terminal_persisted,
+                            &mut terminal_close,
                             TerminalSessionReason::CostBudget,
                             close_code::POLICY,
                         )
@@ -1758,7 +1797,7 @@ async fn run_voice_session<S, R>(
                         )
                         .await
                         {
-                            terminal_reason = handle_outbound_write_failure(&error, &mut session);
+                            terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
                             break;
                         }
                         terminal_reason = close_with_terminal_session_phase(
@@ -1766,7 +1805,7 @@ async fn run_voice_session<S, R>(
                             &session.input,
                             &state,
                             voice_session_id.clone(),
-                            &mut terminal_persisted,
+                            &mut terminal_close,
                             reason,
                             close_code::ERROR,
                         )
@@ -1774,14 +1813,14 @@ async fn run_voice_session<S, R>(
                         break;
                     }
                     Err(error) => {
-                        terminal_reason = handle_outbound_write_failure(&error, &mut session);
+                        terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
                         break;
                     }
                 }
             }
         }
     }
-    if terminal_persisted {
+    if terminal_close.persisted {
         record_terminal_evidence(&state, voice_session_id, terminal_reason).await;
     } else {
         record_terminal(&state, voice_session_id, terminal_reason).await;
@@ -1797,7 +1836,7 @@ async fn run_voice_session<S, R>(
     drop(admission);
     // A socket whose own write side already failed, or whose client is already
     // gone, has no handshake left to finish and must not wait for one.
-    if !is_outbound_write_failure_label(terminal_reason) && terminal_reason != "client_disconnect" {
+    if should_finish_closing_handshake(terminal_close.write_failed, terminal_reason) {
         finish_closing_handshake(&mut receiver, CLOSING_HANDSHAKE_GRACE).await;
     }
 }
@@ -1900,7 +1939,7 @@ async fn close_with_terminal_session_phase<S>(
     input: &mpsc::Sender<BrainInput>,
     state: &AppState,
     voice_session_id: Option<String>,
-    terminal_persisted: &mut bool,
+    terminal: &mut TerminalCloseState,
     terminal_reason: TerminalSessionReason,
     close_code: u16,
 ) -> &'static str
@@ -1910,8 +1949,11 @@ where
     let _ = input.try_send(BrainInput::Stop);
     let terminal_reason =
         persist_terminal_session_reason(state, voice_session_id, terminal_reason).await;
-    *terminal_persisted = true;
+    terminal.persisted = true;
     if let Err(error) = send_terminal_session_phase(sender, terminal_reason).await {
+        // `A-20.2`: the write side failed here whatever label wins below, and a
+        // label that loses the precedence contest must not hide that fact.
+        terminal.write_failed = true;
         return terminal_label_after_terminal_phase_close(
             terminal_reason,
             outbound_write_terminal_label(&error),
@@ -1976,14 +2018,14 @@ async fn close_with_client_stop<S>(
     sender: &mut BoundedSender<S>,
     state: &AppState,
     voice_session_id: Option<String>,
-    terminal_persisted: &mut bool,
+    terminal: &mut TerminalCloseState,
 ) -> &'static str
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
     let terminal_label =
         persist_terminal_label_or_durability_degraded(state, voice_session_id, "client_stop").await;
-    *terminal_persisted = true;
+    terminal.persisted = true;
     if terminal_label == TerminalSessionReason::DurabilityDegraded.as_str() {
         let _ =
             send_terminal_session_phase(sender, TerminalSessionReason::DurabilityDegraded).await;
@@ -7599,21 +7641,23 @@ mod tests {
             crate::VoiceWsAccess::default(),
             1,
         );
-        let mut terminal_persisted = false;
+        let mut terminal_close = TerminalCloseState::default();
 
         let reason = close_with_terminal_session_phase(
             &mut sender,
             &input,
             &state,
             None,
-            &mut terminal_persisted,
+            &mut terminal_close,
             TerminalSessionReason::Drained,
             close_code::NORMAL,
         )
         .await;
 
         assert_eq!(reason, "drained");
-        assert!(terminal_persisted);
+        assert!(terminal_close.persisted);
+        // `A-20.2`: whichever label wins, the write side failing is recorded.
+        assert!(terminal_close.write_failed);
         assert!(matches!(received.recv().await.unwrap(), BrainInput::Stop));
     }
 
@@ -7627,21 +7671,23 @@ mod tests {
             crate::VoiceWsAccess::default(),
             1,
         );
-        let mut terminal_persisted = false;
+        let mut terminal_close = TerminalCloseState::default();
 
         let reason = close_with_terminal_session_phase(
             &mut sender,
             &input,
             &state,
             None,
-            &mut terminal_persisted,
+            &mut terminal_close,
             TerminalSessionReason::ProviderRateLimited,
             close_code::ERROR,
         )
         .await;
 
         assert_eq!(reason, "provider_rate_limited");
-        assert!(terminal_persisted);
+        assert!(terminal_close.persisted);
+        // `A-20.2`: the overriding wire reason does not hide the failed write.
+        assert!(terminal_close.write_failed);
         assert!(matches!(received.recv().await.unwrap(), BrainInput::Stop));
     }
 
@@ -7718,7 +7764,7 @@ mod tests {
             crate::VoiceWsAccess::default(),
             1,
         );
-        let mut terminal_persisted = false;
+        let mut terminal_close = TerminalCloseState::default();
 
         let reason = timeout(
             Duration::from_millis(100),
@@ -7727,7 +7773,7 @@ mod tests {
                 &input,
                 &state,
                 None,
-                &mut terminal_persisted,
+                &mut terminal_close,
                 TerminalSessionReason::Drained,
                 close_code::NORMAL,
             ),
@@ -7736,7 +7782,7 @@ mod tests {
         .expect("terminal close must not block behind provider input backpressure");
 
         assert_eq!(reason, "drained");
-        assert!(terminal_persisted);
+        assert!(terminal_close.persisted);
         assert_eq!(sender.inner.sent.len(), 2);
         let Message::Text(text) = &sender.inner.sent[0] else {
             panic!("expected terminal session phase text frame");
@@ -9179,14 +9225,155 @@ mod tests {
     }
 
     fn slow_client_answer_json() -> String {
+        slow_client_answer_json_for("turn-1")
+    }
+
+    fn slow_client_answer_json_for(turn_id: &str) -> String {
         json!({
             "type": "turn_intent",
             "version": VIVA_VOICE_PROTOCOL_VERSION,
             "client_generation_id": "slow-client-1",
-            "turn_id": "turn-1",
+            "turn_id": turn_id,
             "intent": { "kind": "answer_text", "text": "an answer the client never reads back" },
         })
         .to_string()
+    }
+
+    /// Counts every item the session actually pulls out of its peer.
+    struct CountingStream<S> {
+        inner: S,
+        yielded: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S> futures_util::Stream for CountingStream<S>
+    where
+        S: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
+    {
+        type Item = Result<Message, axum::Error>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let polled = Pin::new(&mut self.inner).poll_next(cx);
+            if matches!(polled, Poll::Ready(Some(_))) {
+                self.yielded
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            polled
+        }
+    }
+
+    /// `A-20.2`: a `slow_client` terminal REASON is not a failed write SIDE, so
+    /// the socket still owes its peer a closing handshake.
+    ///
+    /// The overlapping-provider-turn policy denial closes with
+    /// `TerminalSessionReason::SlowClient` while every write succeeds. Reading
+    /// that sanitized label as write-side evidence skipped the handshake, so the
+    /// socket was dropped on top of the client's pipelined bytes and the reset
+    /// discarded the terminal frame and the Close frame already written to it.
+    /// This is the deterministic half of that property: after the denial the
+    /// session must read its peer out, and doing so may cost no more than the
+    /// server-owned grace.
+    #[tokio::test(start_paused = true)]
+    async fn closing_handshake_drains_the_peer_after_a_denied_overlapping_turn() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let probe_task = Arc::new(std::sync::Mutex::new(None));
+        let state = AppState::with_study_store(
+            Arc::new(SlowClientProbeBrain {
+                study_store: store.clone(),
+                task: probe_task.clone(),
+            }),
+            "slow_client_probe",
+            crate::config::VoiceWsAccess::default(),
+            2,
+            store,
+        )
+        .with_voice_limits(VoiceLimitConfig {
+            max_ip_sessions: Some(2),
+            max_user_sessions: Some(2),
+            provider_limiter_enabled: true,
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        })
+        .with_ws_timeouts(crate::app::WsTimeouts {
+            first_frame: Duration::from_secs(60),
+            idle: Duration::from_secs(600),
+            between_turn_idle: Duration::from_secs(600),
+            session: Duration::from_secs(6 * 60 * 60),
+            outbound_write: Duration::from_secs(5),
+            ..crate::app::WsTimeouts::default()
+        });
+        let evidence = state.evidence.clone();
+        let limit_state = state.limit_state.clone();
+        let session_slots = state.session_slots.clone();
+        let permit = session_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("session slot");
+        let ip_lease = limit_state
+            .try_acquire_ip("198.51.100.9", 2)
+            .expect("ip lease");
+        let admission = VoiceAdmission {
+            _permit: permit,
+            _ip_lease: Some(ip_lease),
+            principal: crate::config::UpgradePrincipal::ServiceBearer,
+        };
+
+        // Bootstrap, one answer the provider never resolves, the overlapping
+        // answer the server refuses, and three frames pipelined behind it.
+        const PIPELINED_FRAMES: usize = 5;
+        let yielded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client_frames = CountingStream {
+            inner: futures_util::stream::iter(vec![
+                Ok(Message::Text(slow_client_session_config_json().into())),
+                Ok(Message::Text(slow_client_answer_json_for("turn-1").into())),
+                Ok(Message::Text(slow_client_answer_json_for("turn-2").into())),
+                Ok(Message::Text(slow_client_answer_json_for("turn-3").into())),
+                Ok(Message::Text(slow_client_answer_json_for("turn-4").into())),
+            ])
+            .chain(futures_util::stream::pending()),
+            yielded: yielded.clone(),
+        };
+
+        let start = Instant::now();
+        run_voice_session(
+            BoundedSender::new(RecordingSink::new(), Duration::from_secs(5)),
+            client_frames,
+            state,
+            admission,
+            "http://localhost:3000".to_owned(),
+        )
+        .await;
+
+        let recorded = evidence.snapshot();
+        assert!(
+            recorded.iter().any(|event| {
+                event.kind == VoiceEvidenceEventKind::ProviderAdmission
+                    && event.detail.contains("reason=overlapping_provider_turn")
+                    && event.detail.contains("terminal_reason=slow_client")
+            }),
+            "the denial under test must be the overlapping-turn policy denial: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|event| {
+                event.kind == VoiceEvidenceEventKind::TerminalReason
+                    && event.detail == TerminalSessionReason::SlowClient.as_str()
+            }),
+            "{recorded:?}"
+        );
+        assert_eq!(
+            yielded.load(std::sync::atomic::Ordering::SeqCst),
+            PIPELINED_FRAMES,
+            "every pipelined frame must be read out of the peer before the socket is dropped"
+        );
+        assert_eq!(
+            Instant::now().duration_since(start),
+            CLOSING_HANDSHAKE_GRACE,
+            "reading the peer out costs exactly the server-owned closing grace"
+        );
+        // The wait holds nothing: every lease is released before it starts.
+        assert_eq!(limit_state.ip_lease_count("198.51.100.9"), None);
+        assert_eq!(session_slots.available_permits(), 2);
     }
 
     // ---------------------------------------------------------------------
@@ -9560,5 +9747,55 @@ mod tests {
             heartbeat_expiry_terminal_label("send_failed"),
             "send_failed"
         );
+    }
+
+    /// `A-20.2`: the closing handshake is skipped only for an explicitly
+    /// recorded write failure or a peer that is already gone — never because a
+    /// sanitized terminal label happens to read like one.
+    ///
+    /// `slow_client` is the case that broke: it is Plan 05's wire reason for
+    /// "this socket is not keeping up", and an ordinary overlapping-turn policy
+    /// denial closes with it while every server write succeeds. Reading the
+    /// label as write-side evidence dropped the socket on top of the client's
+    /// unread bytes and reset the connection, discarding the terminal frame and
+    /// the Close frame already written to it.
+    #[test]
+    fn closing_handshake_is_skipped_only_for_a_failed_write_or_a_departed_peer() {
+        // The defect: a wire reason is not evidence about the write side, so no
+        // terminal reason on its own may cancel the handshake.
+        assert!(
+            TerminalSessionReason::ALL
+                .iter()
+                .all(|reason| should_finish_closing_handshake(false, reason.as_str())),
+            "a wire terminal reason is not evidence that this socket's write side failed"
+        );
+        // Including the two labels that name a write failure. Only the flag decides.
+        assert!(should_finish_closing_handshake(
+            false,
+            TerminalSessionReason::SlowClient.as_str()
+        ));
+        assert!(should_finish_closing_handshake(false, "send_failed"));
+
+        // A recorded write failure has nothing left to deliver, whatever the label says.
+        assert!(!should_finish_closing_handshake(
+            true,
+            TerminalSessionReason::SlowClient.as_str()
+        ));
+        assert!(!should_finish_closing_handshake(true, "send_failed"));
+        assert!(!should_finish_closing_handshake(
+            true,
+            TerminalSessionReason::CostBudget.as_str()
+        ));
+        assert!(!should_finish_closing_handshake(
+            true,
+            "oversized_text_frame"
+        ));
+
+        // A peer that is already gone has nobody left to answer the Close.
+        assert!(!should_finish_closing_handshake(false, "client_disconnect"));
+        assert!(!should_finish_closing_handshake(
+            false,
+            HEARTBEAT_TIMEOUT_TERMINAL_LABEL
+        ));
     }
 }
