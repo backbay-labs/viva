@@ -1247,6 +1247,18 @@ export function validateVivaWebSecret(
   return { ok: true, value: raw };
 }
 
+/**
+ * Web-owned credential validation. Task 2 Step 3 names four families for this validator: the
+ * active and previous HMAC keys, the three scoped agent bearers, and the shared security-store
+ * credential `VIVA_SESSION_SECURITY_STORE_REST_TOKEN`.
+ *
+ * The first three are validated here today. The fourth is DEFERRED TO TASK 4, which introduces
+ * the shared `SessionSecurityStore` adapter that is its only reader: validating it before that
+ * reader exists would be inert configuration that no route can act on. Task 4 must call this
+ * function for it with `maxBytes: WEB_OPAQUE_CREDENTIAL_MAX_BYTES`, exactly as the scoped
+ * bearers do. Recorded here rather than only in the lane report so the obligation cannot be
+ * silently dropped when Task 4 dispatches.
+ */
 function validatedSecret(name: string, options: { maxBytes?: number } = {}): string | null {
   const validation = validateVivaWebSecret(process.env[name], options);
   return validation.ok ? validation.value : null;

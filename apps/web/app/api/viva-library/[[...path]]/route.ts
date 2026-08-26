@@ -441,6 +441,18 @@ function guardAllowedLibraryControlRoute(
 /**
  * Destructive routes must be exactly same-origin. A missing or foreign `Origin`, or a
  * cross-site fetch, returns the same coarse capability error as a forged capability.
+ *
+ * SCOPE — an open question this lane routed to the coordinator rather than deciding alone.
+ * Task 3 Step 3 words the rule as "mutating routes require an exact `Origin` match", but this
+ * guard runs only on destructive DELETE. Paste/file/retry POST is deliberately excluded: Task 3
+ * Step 4 makes it "separately authorized by its ingestion contract", the plan's public error
+ * table defines a 403 shape only for start/refresh and destructive DELETE, and this lane may not
+ * invent new public error vocabulary. Those POSTs are also handed no read, mint, or delete
+ * authority by serverBearerForBrowserLibraryRequest, so nothing is silently widened.
+ *
+ * The POST path is therefore an OWNED follow-up, not an unowned gap. Task 5 is the next task in
+ * this plan that reworks these routes, and it must either apply the same same-origin primitive
+ * there or record why the ingestion contract already closes it.
  */
 function guardDestructiveRequestOrigin(
   request: NextRequest,
