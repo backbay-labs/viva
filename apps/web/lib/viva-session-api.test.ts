@@ -2611,7 +2611,7 @@ function applySharedSecurityStoreTestEnv() {
 
 /**
  * Independent restatement of the plan's admission key formula. These hashes are computed here
- * from the documented recipe, never imported from the module under test, so a production drift
+ * from the documented formula, never imported from the module under test, so a production drift
  * in either key breaks the shared-bucket assertions.
  */
 function mintAdmissionKeys(
