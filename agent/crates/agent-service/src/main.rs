@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use agent_service::{
     build_brain, build_router, build_study_store, validate_runtime_store_preflight, AppState,
-    ServiceConfig, VoiceDrainSignal,
+    ProjectionReadAccess, ServiceConfig, VoiceDrainSignal,
 };
 
 const VOICE_DRAIN_GRACE_PERIOD: Duration = Duration::from_secs(2);
@@ -24,6 +24,20 @@ async fn main() -> anyhow::Result<()> {
     let study_store = build_study_store(&config).await?;
     validate_runtime_store_preflight(&config, &study_store.capabilities())?;
     let brain = build_brain(&config, Arc::clone(&study_store));
+    // `SERVICE-011`: the projection route exists only where both scoped credentials
+    // are configured. A deployment missing either one serves no projection at all
+    // rather than accepting a broader credential in their place.
+    let projection_read_access = config
+        .library_read_bearer
+        .clone()
+        .zip(config.ws_access.session_token_secret.clone())
+        .map(|(library_read_bearer, session_token_secret)| {
+            ProjectionReadAccess::new(
+                library_read_bearer,
+                session_token_secret,
+                config.ws_access.allowed_origins.clone(),
+            )
+        });
     let state = AppState::with_study_store(
         brain,
         config.provider.as_str(),
@@ -42,6 +56,10 @@ async fn main() -> anyhow::Result<()> {
     .with_voice_limits(config.voice_limits)
     .with_failure_control(config.failure_control)
     .with_unauthenticated_paste_allowed(config.bind_addr.ip().is_loopback());
+    let state = match projection_read_access {
+        Some(access) => state.with_projection_read_access(access),
+        None => state,
+    };
     let drain_signal = state.drain_signal.clone();
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;

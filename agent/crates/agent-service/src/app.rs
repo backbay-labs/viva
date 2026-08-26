@@ -14,7 +14,7 @@ use agent_domain::{
     StudySetIngestionStatus, TerminalSessionReason, VoiceUsageRecord,
 };
 use axum::{
-    extract::{Path, Query},
+    extract::{rejection::QueryRejection, Path, Query},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     routing::{delete, get, post},
     Json, Router,
@@ -29,8 +29,9 @@ use uuid::Uuid;
 use crate::{
     config::{
         bac_510_max_turn_duration, FailureControlClaim, FailureControlClaimRequest,
-        FailureControlConfig, OperatorAccess, RecorderLimits, RedactedSecret, SessionTokenClaims,
-        TrustedProxyConfig, VoiceLimitConfig, VoiceWsAccess,
+        FailureControlConfig, OperatorAccess, ProjectionReadAccess, ProjectionRejection,
+        RecorderLimits, RedactedSecret, SessionTokenClaims, TrustedProxyConfig, VoiceLimitConfig,
+        VoiceWsAccess,
     },
     ws::voice_ws,
 };
@@ -46,6 +47,10 @@ pub struct AppState {
     pub trusted_session_sequence: Arc<AtomicU64>,
     pub ws_access: VoiceWsAccess,
     pub operator_access: OperatorAccess,
+    /// `SERVICE-011`: present only where the Plan 11 scoped read credential and a
+    /// session-token secret are both configured. Absent means the route refuses
+    /// every request rather than falling back to a broader credential.
+    pub projection_read_access: Option<ProjectionReadAccess>,
     pub trusted_proxies: TrustedProxyConfig,
     pub session_slots: Arc<Semaphore>,
     pub ws_timeouts: WsTimeouts,
@@ -92,6 +97,7 @@ impl AppState {
             trusted_session_sequence: Arc::new(AtomicU64::new(0)),
             ws_access,
             operator_access: OperatorAccess::default(),
+            projection_read_access: None,
             trusted_proxies: TrustedProxyConfig::default(),
             session_slots: Arc::new(Semaphore::new(max_sessions)),
             ws_timeouts: WsTimeouts::default(),
@@ -132,6 +138,14 @@ impl AppState {
     pub fn with_ws_timeouts(mut self, ws_timeouts: WsTimeouts) -> Self {
         self.turn_cap_override = ws_timeouts.idle != WsTimeouts::default().idle;
         self.ws_timeouts = ws_timeouts;
+        self
+    }
+
+    pub fn with_projection_read_access(
+        mut self,
+        projection_read_access: ProjectionReadAccess,
+    ) -> Self {
+        self.projection_read_access = Some(projection_read_access);
         self
     }
 
@@ -956,6 +970,10 @@ pub fn build_router(state: AppState) -> Router {
             get(library_export).options(paste_options),
         )
         .route("/study-sets/library", get(library_snapshot))
+        .route(
+            "/v1/study-sets/{study_set_id}/projection",
+            get(authenticated_study_projection),
+        )
         .route(
             "/study-sets/{study_set_id}",
             delete(delete_study_set).options(paste_options),
@@ -1848,6 +1866,115 @@ async fn library_export(
             }),
         ),
     )
+}
+
+/// `SERVICE-011`: the only selector the projection route accepts. `deny_unknown_fields`
+/// makes an extra or duplicate query key a contract violation rather than a silently
+/// ignored one.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectionQuery {
+    voice_session_id: String,
+}
+
+fn projection_error(
+    response_headers: HeaderMap,
+    rejection: ProjectionRejection,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let status = match rejection {
+        ProjectionRejection::Unauthorized => StatusCode::UNAUTHORIZED,
+        ProjectionRejection::Forbidden => StatusCode::FORBIDDEN,
+        ProjectionRejection::Invalid => StatusCode::BAD_REQUEST,
+    };
+    (
+        status,
+        response_headers,
+        Json(json!({
+            "error": rejection.error_code(),
+            "message": rejection.message(),
+        })),
+    )
+}
+
+/// Headers every projection response carries, success or failure. The learner state
+/// this route returns is never cached and never content-sniffed.
+fn projection_response_headers(
+    access: Option<&ProjectionReadAccess>,
+    request_headers: &HeaderMap,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    if let Some(origin) = access.and_then(|access| access.allowed_origin_header(request_headers)) {
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    }
+    headers
+}
+
+/// `SERVICE-011`: the claim-bound study projection Plans 04, 09, 10, and 11 consume.
+///
+/// The Plan 11 scoped read credential authorizes the caller; the signed access
+/// credential supplies identity. `user_id`, `study_set_id`, and `voice_session_id` are
+/// read from the verified claims and the request's path/query selectors are compared
+/// with them in constant time, so a request can never name an identity it did not
+/// prove. Plan 09's port answers, and Plan 04's exact type is returned unchanged.
+async fn authenticated_study_projection(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Path(study_set_id): Path<String>,
+    query: Result<Query<ProjectionQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let response_headers =
+        projection_response_headers(state.projection_read_access.as_ref(), &headers);
+    let Some(access) = state.projection_read_access.as_ref() else {
+        return projection_error(response_headers, ProjectionRejection::Unauthorized);
+    };
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(elapsed) => elapsed.as_secs(),
+        Err(_) => {
+            return projection_error(response_headers, ProjectionRejection::Unauthorized);
+        }
+    };
+    let claims = match access.authorize(&headers, now) {
+        Ok(claims) => claims,
+        Err(rejection) => return projection_error(response_headers, rejection),
+    };
+    // Extractor diagnostics are never returned: an invalid selector shape is one
+    // fixed public body.
+    let Ok(Query(query)) = query else {
+        return projection_error(response_headers, ProjectionRejection::Invalid);
+    };
+    if let Err(rejection) =
+        ProjectionReadAccess::bind_selectors(&claims, &study_set_id, &query.voice_session_id)
+    {
+        return projection_error(response_headers, rejection);
+    }
+
+    match state
+        .study_store
+        .authenticated_study_projection(&claims.user_id, &claims.study_set_id, &claims.session_id)
+        .await
+    {
+        Ok(projection) => match serde_json::to_value(&projection) {
+            Ok(value) => (StatusCode::OK, response_headers, Json(value)),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                response_headers,
+                Json(json!({
+                    "error": "projection_failed",
+                    "message": "study projection is unavailable",
+                })),
+            ),
+        },
+        Err(error) => store_json_error(response_headers, error, "projection_failed"),
+    }
 }
 
 async fn delete_study_set(

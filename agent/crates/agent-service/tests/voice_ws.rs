@@ -23,9 +23,9 @@ use agent_domain::{
 use agent_service::{
     build_router, verify_session_token_at, AppState, ClientFrame, ClientTurnIntent,
     ExpectedSessionBinding, FailureControlConfig, FailureControlScenario, OperatorAccess,
-    RecorderLimits, RedactedSecret, ServerFrame, VivaServerEvent, VoiceDrainSignal,
-    VoiceEvidenceRecorder, VoiceLimitConfig, VoiceServerErrorCode, VoiceUsageRecorder,
-    VoiceWsAccess, WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
+    ProjectionReadAccess, RecorderLimits, RedactedSecret, ServerFrame, VivaServerEvent,
+    VoiceDrainSignal, VoiceEvidenceRecorder, VoiceLimitConfig, VoiceServerErrorCode,
+    VoiceUsageRecorder, VoiceWsAccess, WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
 };
 use axum::{
     body::Body,
@@ -2887,10 +2887,30 @@ async fn delete_study_set_tombstones_sources_hides_history_and_is_idempotent() {
     assert_eq!(first.status(), axum::http::StatusCode::OK);
     let first_body = first.into_body().collect().await.unwrap().to_bytes();
     let first_payload: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    // `D-05 HARD_PURGE_TEXT`: Plan 09's receipt is content-free and derivable from
+    // the tombstone alone, so it carries no per-request counts. The pre-D-05
+    // `deleted_documents` / `hidden_sessions` counters are gone, and a replay must
+    // return byte-identical bytes rather than a second set of zeroed counters.
+    assert_eq!(
+        first_payload
+            .as_object()
+            .expect("deletion receipt is an object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            "deleted_at".to_owned(),
+            "policy".to_owned(),
+            "status".to_owned(),
+            "study_set_id".to_owned(),
+        ]
+    );
     assert_eq!(first_payload["study_set_id"], "biology-midterm");
     assert_eq!(first_payload["status"], "deleted");
-    assert_eq!(first_payload["deleted_documents"], 1);
-    assert_eq!(first_payload["hidden_sessions"], 1);
+    assert_eq!(first_payload["policy"], "hard_purge_text");
+    assert!(first_payload["deleted_at"].as_str().is_some_and(|value| {
+        value.ends_with('Z') && agent_domain::parse_utc_instant(value).is_some()
+    }));
 
     let second = app
         .clone()
@@ -2908,8 +2928,10 @@ async fn delete_study_set_tombstones_sources_hides_history_and_is_idempotent() {
     assert_eq!(second.status(), axum::http::StatusCode::OK);
     let second_body = second.into_body().collect().await.unwrap().to_bytes();
     let second_payload: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
-    assert_eq!(second_payload["deleted_documents"], 0);
-    assert_eq!(second_payload["hidden_sessions"], 0);
+    assert_eq!(
+        second_payload, first_payload,
+        "an idempotent delete replays the original receipt byte for byte"
+    );
 
     let library = app
         .clone()
@@ -2927,20 +2949,17 @@ async fn delete_study_set_tombstones_sources_hides_history_and_is_idempotent() {
     assert_eq!(library.status(), axum::http::StatusCode::OK);
     let library_body = library.into_body().collect().await.unwrap().to_bytes();
     let library_payload: serde_json::Value = serde_json::from_slice(&library_body).unwrap();
-    let biology = library_payload["study_sets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|set| set["id"] == "biology-midterm")
-        .expect("biology study set");
-    assert_eq!(biology["documents"][0]["deleted"], true);
-    assert_eq!(biology["question_count"], 0);
-    assert_eq!(biology["actions"]["start"]["available"], false);
-    assert_eq!(
-        biology["actions"]["start"]["unavailable_reason"],
-        "source_deleted"
+    // `D-05 HARD_PURGE_TEXT`: the tombstone is the one place a read path asks
+    // "is this deleted?", and every projection excludes it. There is no residual
+    // soft-deleted row carrying document flags, counts, or disabled actions.
+    assert!(
+        !library_payload["study_sets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|set| set["id"] == "biology-midterm"),
+        "a hard-purged set is not projected back to the library"
     );
-    assert_eq!(biology["actions"]["delete"]["available"], false);
     assert!(library_payload["sessions"].as_array().unwrap().is_empty());
 
     let cross_user = app
@@ -2956,6 +2975,589 @@ async fn delete_study_set_tombstones_sources_hides_history_and_is_idempotent() {
         .await
         .unwrap();
     assert_eq!(cross_user.status(), axum::http::StatusCode::NOT_FOUND);
+}
+
+// --- `SERVICE-011` authenticated study projection --------------------------------
+
+const PROJECTION_SESSION_SECRET: &str = "viva-fixture-projection-signing-secret";
+const PROJECTION_ORIGIN: &str = "http://localhost:3000";
+
+/// Counts every projection read and the exact tuple it was asked for, so a
+/// confused-deputy request can be proven never to reach the store.
+type PortErrorFactory = Box<dyn Fn() -> PortError + Send + Sync>;
+
+struct ProjectionAuditStore {
+    inner: Arc<data::InMemoryStudyStore>,
+    reads: Mutex<Vec<(String, String, String)>>,
+    fail: Option<PortErrorFactory>,
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for ProjectionAuditStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+
+    async fn delete_study_set(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner.delete_study_set(user_id, study_set_id).await
+    }
+
+    async fn authenticated_study_projection(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::AuthenticatedStudyProjectionV1, PortError> {
+        self.reads.lock().expect("read log").push((
+            user_id.to_owned(),
+            study_set_id.to_owned(),
+            voice_session_id.to_owned(),
+        ));
+        if let Some(fail) = &self.fail {
+            return Err(fail());
+        }
+        self.inner
+            .authenticated_study_projection(user_id, study_set_id, voice_session_id)
+            .await
+    }
+}
+
+async fn projection_app(
+    fail: Option<PortErrorFactory>,
+) -> (
+    axum::Router,
+    Arc<ProjectionAuditStore>,
+    Arc<data::InMemoryStudyStore>,
+) {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    seed_completed_library_session(&inner).await;
+    let store = Arc::new(ProjectionAuditStore {
+        inner: inner.clone(),
+        reads: Mutex::new(Vec::new()),
+        fail,
+    });
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(inner.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some(PROJECTION_SESSION_SECRET.into()),
+            allowed_origins: vec![PROJECTION_ORIGIN.to_owned()],
+        },
+        4,
+        store.clone(),
+    )
+    .with_operator_access(OperatorAccess::new(Some(
+        FIXTURE_OPERATOR_CREDENTIAL.into(),
+    )))
+    .with_projection_read_access(ProjectionReadAccess::new(
+        FIXTURE_LIBRARY_READ_CREDENTIAL.into(),
+        PROJECTION_SESSION_SECRET.into(),
+        vec![PROJECTION_ORIGIN.to_owned()],
+    ));
+    (build_router(state), store, inner)
+}
+
+fn projection_token(user_id: &str, study_set_id: &str, session_id: &str, nonce: &str) -> String {
+    signed_session_token(
+        PROJECTION_SESSION_SECRET,
+        user_id,
+        study_set_id,
+        session_id,
+        unix_timestamp_now() + 60,
+        nonce,
+    )
+}
+
+struct ProjectionRequest<'a> {
+    uri: &'a str,
+    bearer: Option<&'a str>,
+    session_token: Option<&'a str>,
+    origin: Option<&'a str>,
+}
+
+fn projection_request(request: ProjectionRequest<'_>) -> Request<Body> {
+    let mut builder = Request::builder().method("GET").uri(request.uri);
+    if let Some(bearer) = request.bearer {
+        builder = builder.header("authorization", format!("Bearer {bearer}"));
+    }
+    if let Some(token) = request.session_token {
+        builder = builder.header("x-viva-session-token", token);
+    }
+    if let Some(origin) = request.origin {
+        builder = builder.header("origin", origin);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+const VALID_PROJECTION_URI: &str =
+    "/v1/study-sets/biology-midterm/projection?voice_session_id=voice-session-1";
+
+/// `SERVICE-011`: the projection route is authorized by the Plan 11 scoped read
+/// credential plus a signed access credential, and its identity comes only from the
+/// verified claims. Every rejection is coarse and echoes no credential.
+#[tokio::test]
+async fn authenticated_projection_requires_both_scoped_credentials() {
+    let (app, store, _inner) = projection_app(None).await;
+    let token = projection_token("user-1", "biology-midterm", "voice-session-1", "proj-1");
+
+    let cases: Vec<(&str, ProjectionRequest<'_>, StatusCode)> = vec![
+        (
+            "no scoped bearer",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: None,
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "wrong scoped bearer",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some("viva-fixture-not-the-read-credential-1"),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "operator bearer must not authorize a projection read",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_OPERATOR_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "session token alone must not authorize",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: None,
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "scoped bearer alone must not authorize",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: None,
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "malformed session token",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some("viva1.not-a-token"),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "missing origin",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: None,
+            },
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "wrong origin",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some("https://evil.example"),
+            },
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "duplicate query key",
+            ProjectionRequest {
+                uri: "/v1/study-sets/biology-midterm/projection?voice_session_id=voice-session-1&voice_session_id=voice-session-1",
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "extra query key",
+            ProjectionRequest {
+                uri: "/v1/study-sets/biology-midterm/projection?voice_session_id=voice-session-1&user_id=user-1",
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "missing query key",
+            ProjectionRequest {
+                uri: "/v1/study-sets/biology-midterm/projection",
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "path study set does not match the claim",
+            ProjectionRequest {
+                uri: "/v1/study-sets/chemistry-final/projection?voice_session_id=voice-session-1",
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "query session does not match the claim",
+            ProjectionRequest {
+                uri: "/v1/study-sets/biology-midterm/projection?voice_session_id=voice-session-9",
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+
+    for (label, request, expected) in cases {
+        let response = app
+            .clone()
+            .oneshot(projection_request(request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{label}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        for forbidden in [
+            FIXTURE_LIBRARY_READ_CREDENTIAL,
+            FIXTURE_OPERATOR_CREDENTIAL,
+            PROJECTION_SESSION_SECRET,
+            token.as_str(),
+            "user-1",
+            "proj-1",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{label} leaked credential or subject material: {text}"
+            );
+        }
+        // Every denial body is one of exactly three fixed public shapes. Serde and
+        // extractor diagnostics never reach the caller.
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let (code, message) = match expected {
+            StatusCode::UNAUTHORIZED => (
+                "projection_unauthorized",
+                "projection access is not authorized",
+            ),
+            StatusCode::FORBIDDEN => ("projection_forbidden", "projection access is forbidden"),
+            StatusCode::BAD_REQUEST => ("projection_invalid", "projection request is invalid"),
+            other => panic!("{label} produced an unclassified status {other}"),
+        };
+        assert_eq!(payload["error"], code, "{label}");
+        assert_eq!(payload["message"], message, "{label}");
+    }
+
+    assert!(
+        store.reads.lock().expect("read log").is_empty(),
+        "no rejected request may reach the store"
+    );
+}
+
+/// `SERVICE-011`: an expired or wrongly signed access credential is refused with the
+/// same coarse status, and neither reaches the store.
+#[tokio::test]
+async fn authenticated_projection_rejects_expired_and_forged_tokens() {
+    let (app, store, _inner) = projection_app(None).await;
+    let expired = signed_session_token(
+        PROJECTION_SESSION_SECRET,
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() - 1,
+        "proj-expired",
+    );
+    let forged = signed_session_token(
+        "viva-fixture-not-the-projection-secret",
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() + 60,
+        "proj-forged",
+    );
+
+    for token in [expired, forged] {
+        let response = app
+            .clone()
+            .oneshot(projection_request(ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    assert!(store.reads.lock().expect("read log").is_empty());
+}
+
+/// `SERVICE-011`: a credential for user A plus a path and query naming user B's live
+/// study set and session is refused before any store read for B.
+#[tokio::test]
+async fn authenticated_projection_refuses_the_confused_deputy() {
+    let (app, store, inner) = projection_app(None).await;
+    inner.upsert_study_set(data::StudySetRecord {
+        study_set_id: "victim-set".to_owned(),
+        user_id: "user-2".to_owned(),
+        title: "Victim Set".to_owned(),
+        course: None,
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    let attacker = projection_token("user-1", "biology-midterm", "voice-session-1", "proj-cd");
+
+    let response = app
+        .oneshot(projection_request(ProjectionRequest {
+            uri: "/v1/study-sets/victim-set/projection?voice_session_id=voice-session-2",
+            bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+            session_token: Some(&attacker),
+            origin: Some(PROJECTION_ORIGIN),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(!text.contains("victim-set") && !text.contains("user-2"));
+    assert!(
+        store.reads.lock().expect("read log").is_empty(),
+        "the store is never asked about another user's set"
+    );
+}
+
+/// `SERVICE-011`: the authorized read returns Plan 04's exact type, keyed only by the
+/// verified claims, with no-store caching and nosniff.
+#[tokio::test]
+async fn authenticated_projection_returns_the_claim_bound_projection() {
+    let (app, store, inner) = projection_app(None).await;
+    let token = projection_token("user-1", "biology-midterm", "voice-session-1", "proj-ok");
+
+    let response = app
+        .clone()
+        .oneshot(projection_request(ProjectionRequest {
+            uri: VALID_PROJECTION_URI,
+            bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+            session_token: Some(&token),
+            origin: Some(PROJECTION_ORIGIN),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let returned: agent_domain::AuthenticatedStudyProjectionV1 =
+        serde_json::from_slice(&body).expect("the route returns Plan 04's exact type");
+    let expected = inner
+        .authenticated_study_projection("user-1", "biology-midterm", "voice-session-1")
+        .await
+        .expect("store projection");
+    assert_eq!(returned, expected, "the route must not reshape the type");
+    assert_eq!(
+        store.reads.lock().expect("read log").as_slice(),
+        [(
+            "user-1".to_owned(),
+            "biology-midterm".to_owned(),
+            "voice-session-1".to_owned(),
+        )],
+        "identity comes only from the verified claims"
+    );
+}
+
+/// `SERVICE-011`: a store failure is reported through the shared coarse taxonomy
+/// mapping under this route's own error code, and never leaks the scoped credential.
+///
+/// The exact `PortErrorKind` to status matrix and the removal of store prose from the
+/// public message are `SERVICE-016`'s remediation of `store_json_error` (Task 7); this
+/// test pins the route code and the credential boundary that hold either way.
+#[tokio::test]
+async fn authenticated_projection_sanitizes_store_failures() {
+    let hostile = format!(
+        "Bearer {FIXTURE_LIBRARY_READ_CREDENTIAL} user-1 voice-session-1 {HOSTILE_TRANSCRIPT_TEXT}"
+    );
+    let unavailable = hostile.clone();
+    let durability = hostile.clone();
+    let factories: Vec<PortErrorFactory> = vec![
+        Box::new(move || PortError::unavailable("memory", "projection-read", unavailable.clone())),
+        Box::new(move || PortError::durability("postgres", "durable-read", durability.clone())),
+    ];
+    for error in factories {
+        let (app, _store, _inner) = projection_app(Some(error)).await;
+        let token = projection_token("user-1", "biology-midterm", "voice-session-1", "proj-fail");
+        let response = app
+            .oneshot(projection_request(ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error() || response.status().is_server_error(),
+            "a failed store read is never a success"
+        );
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["error"], "projection_failed",
+            "the caller learns only this route's coarse code"
+        );
+    }
+}
+
+/// `D-04 CONFIRM_DELETE`: no restore route exists. This characterization is the guard
+/// that a later half-implementation cannot land silently.
+#[tokio::test]
+async fn restore_route_absent_when_confirm_delete_selected() {
+    let (app, _store, _inner) = projection_app(None).await;
+    for method in ["POST", "GET"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/v1/study-sets/biology-midterm/restore")
+                    .header("origin", PROJECTION_ORIGIN)
+                    .header(
+                        "authorization",
+                        format!("Bearer {FIXTURE_LIBRARY_READ_CREDENTIAL}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{method} /v1/study-sets/{{id}}/restore must not exist under CONFIRM_DELETE"
+        );
+    }
 }
 
 #[tokio::test]

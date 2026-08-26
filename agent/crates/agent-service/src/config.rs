@@ -14,7 +14,7 @@ use agent_adapters::{
 use agent_domain::{
     viva_max_submitted_answer_resolution, RealtimeBrain, StudyMemoryStore, StudyStoreCapabilities,
 };
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -90,6 +90,133 @@ impl OperatorAccess {
             return Ok(());
         }
         Err(AccessError::InvalidBearer)
+    }
+}
+
+/// The header the browser access credential rides in on the projection route. It is
+/// never `Authorization`: that position belongs to the Plan 11 service credential.
+pub const VIVA_SESSION_TOKEN_HEADER: &str = "x-viva-session-token";
+
+/// `SERVICE-011`: the two credentials the authenticated projection route requires,
+/// plus the canonical origins it answers. Both values stay redacted.
+#[derive(Clone, Debug)]
+pub struct ProjectionReadAccess {
+    library_read_bearer: RedactedSecret,
+    session_token_secret: RedactedSecret,
+    allowed_origins: Arc<[String]>,
+}
+
+/// Why a projection read was refused. Every variant is coarse: it names no
+/// credential, subject, selector, or store reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectionRejection {
+    /// A missing or wrong credential in either position.
+    Unauthorized,
+    /// A denied origin, or selectors that do not match the verified claims.
+    Forbidden,
+    /// A request whose shape does not match the contract.
+    Invalid,
+}
+
+impl ProjectionRejection {
+    pub fn error_code(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "projection_unauthorized",
+            Self::Forbidden => "projection_forbidden",
+            Self::Invalid => "projection_invalid",
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "projection access is not authorized",
+            Self::Forbidden => "projection access is forbidden",
+            Self::Invalid => "projection request is invalid",
+        }
+    }
+}
+
+impl ProjectionReadAccess {
+    pub fn new(
+        library_read_bearer: RedactedSecret,
+        session_token_secret: RedactedSecret,
+        allowed_origins: Vec<String>,
+    ) -> Self {
+        Self {
+            library_read_bearer,
+            session_token_secret,
+            allowed_origins: allowed_origins.into(),
+        }
+    }
+
+    /// A configured canonical origin is required; an empty allow-list denies every
+    /// request rather than answering `*`, because this route returns learner state.
+    fn origin_allowed(&self, headers: &HeaderMap) -> bool {
+        let Some(origin) = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return false;
+        };
+        self.allowed_origins
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(origin))
+    }
+
+    /// Verifies origin, the scoped service bearer, and the signed access credential
+    /// in that order, and returns the credential's verified claims. The nonce store
+    /// is never consulted: this is a read, and a read never consumes a nonce.
+    pub fn authorize(
+        &self,
+        headers: &HeaderMap,
+        now_unix_seconds: u64,
+    ) -> Result<SessionTokenClaims, ProjectionRejection> {
+        if !self.origin_allowed(headers) {
+            return Err(ProjectionRejection::Forbidden);
+        }
+        let Some(provided) = authorization_bearer_from_headers(headers) else {
+            return Err(ProjectionRejection::Unauthorized);
+        };
+        if !constant_time_eq(
+            self.library_read_bearer.as_str().as_bytes(),
+            provided.as_bytes(),
+        ) {
+            return Err(ProjectionRejection::Unauthorized);
+        }
+        let mut tokens = headers.get_all(VIVA_SESSION_TOKEN_HEADER).iter();
+        let (Some(token), None) = (tokens.next(), tokens.next()) else {
+            return Err(ProjectionRejection::Unauthorized);
+        };
+        let token = token
+            .to_str()
+            .map_err(|_| ProjectionRejection::Unauthorized)?;
+        verify_session_token_at(token, &self.session_token_secret, now_unix_seconds, None)
+            .map_err(|_| ProjectionRejection::Unauthorized)
+    }
+
+    /// The request supplies selectors, never identity authority: each is compared in
+    /// constant time with the value the verified credential already carries.
+    pub fn bind_selectors(
+        claims: &SessionTokenClaims,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<(), ProjectionRejection> {
+        let study_matches =
+            constant_time_eq(claims.study_set_id.as_bytes(), study_set_id.as_bytes());
+        let session_matches =
+            constant_time_eq(claims.session_id.as_bytes(), voice_session_id.as_bytes());
+        if study_matches && session_matches {
+            Ok(())
+        } else {
+            Err(ProjectionRejection::Forbidden)
+        }
+    }
+
+    pub fn allowed_origin_header(&self, headers: &HeaderMap) -> Option<HeaderValue> {
+        headers
+            .get(axum::http::header::ORIGIN)
+            .filter(|_| self.origin_allowed(headers))
+            .cloned()
     }
 }
 
