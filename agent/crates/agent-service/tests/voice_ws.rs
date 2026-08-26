@@ -2250,7 +2250,7 @@ async fn optional_postgres_replays_synthetic_fixture_when_database_url_is_set() 
     .unwrap();
 
     let mut actual = vec![read_server_frame(&mut socket).await];
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
     for _ in 0..2 {
         actual.push(read_server_frame(&mut socket).await);
     }
@@ -2598,11 +2598,7 @@ async fn websocket_strips_browser_source_context_before_trusted_output() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-    let mut session_frame = fixture.client[0].clone();
+    let mut session_frame = fixture_session_config_frame();
     let ClientFrame::SessionConfig { session, .. } = &mut session_frame else {
         panic!("expected session config");
     };
@@ -5192,17 +5188,12 @@ async fn websocket_study_context_store_failure_emits_durability_degraded_before_
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -5497,14 +5488,9 @@ async fn websocket_brain_open_auth_failure_emits_terminal_phase_without_raw_erro
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let _ = read_server_frame(&mut socket).await;
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -5537,17 +5523,12 @@ async fn websocket_brain_open_failure_with_missing_session_close_keeps_provider_
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -5585,17 +5566,12 @@ async fn websocket_brain_open_store_failure_emits_durability_degraded_terminal_p
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -5628,18 +5604,13 @@ async fn websocket_protocol_wrapped_open_store_failure_emits_durability_degraded
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert_eq!(brain.provider, "open_protocol_store_failure");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -5673,14 +5644,9 @@ async fn websocket_provider_error_event_emits_terminal_phase_without_raw_message
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     assert_ready_provider(&mut socket, "event_probe").await;
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -5716,18 +5682,13 @@ async fn websocket_runtime_store_error_event_emits_durability_degraded_terminal_
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert_eq!(brain.provider, "event_probe");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     let frames = read_server_frames_until_terminal_reason(
         &mut socket,
@@ -5777,18 +5738,13 @@ async fn websocket_durable_store_failure_mid_turn_emits_durability_degraded_term
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert_eq!(brain.provider, "event_probe");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     let frames = read_server_frames_until_terminal_reason(
         &mut socket,
@@ -5832,17 +5788,12 @@ async fn websocket_durable_semantic_authority_miss_remains_provider_source_rejec
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     let frames = read_server_frames_until_close(&mut socket).await;
 
@@ -5883,18 +5834,13 @@ async fn websocket_durable_terminal_close_failure_emits_durability_degraded_term
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert_eq!(brain.provider, "idle_probe");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
     assert!(matches!(
         read_server_frame(&mut socket).await,
         ServerFrame::Event {
@@ -5957,7 +5903,7 @@ async fn websocket_client_stop_close_failure_emits_durability_degraded_terminal_
     };
     assert_eq!(brain.provider, "idle_probe");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
     assert!(matches!(
         read_server_frame(&mut socket).await,
         ServerFrame::Event {
@@ -6006,18 +5952,13 @@ async fn websocket_peer_close_failure_records_durability_degraded_terminal_reaso
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert_eq!(brain.provider, "idle_probe");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
     assert!(matches!(
         read_server_frame(&mut socket).await,
         ServerFrame::Event {
@@ -6061,18 +6002,13 @@ async fn websocket_durable_store_write_failure_mid_turn_emits_durability_degrade
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert_eq!(brain.provider, "event_probe");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     let frames = read_server_frames_until_terminal_reason(
         &mut socket,
@@ -6099,13 +6035,8 @@ async fn websocket_rejects_browser_tool_result_as_untrusted() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
     let _ = read_server_frame(&mut socket).await;
     let _ = read_server_frame(&mut socket).await;
     socket
@@ -6132,15 +6063,19 @@ async fn websocket_rejects_browser_tool_result_as_untrusted() {
         .await
         .unwrap();
 
+    // `VOICE-AUTHORITY-001`: `tool_result` is not a member of the v5 browser-sendable
+    // union, so the forged frame cannot parse into anything the server could act on.
+    // The tool authority is unreachable from the wire rather than refused by a policy
+    // branch a refactor could delete.
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { error, .. } if error.message == "browser tool_result frames are not trusted"
+        ServerFrame::Error { error, .. } if error.message == "invalid client frame"
     ));
-    assert_close_code(&mut socket, CloseCode::Policy).await;
+    assert_close_code(&mut socket, CloseCode::Protocol).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::TerminalReason
-            && event.detail == "untrusted_tool_result"
+            && event.detail == "invalid_client_frame"
     }));
 }
 
@@ -9340,8 +9275,25 @@ async fn assert_streamed_audio_turn_admits_one_provider_turn(seconds: u32) {
         )),
         "the synthetic provider must transcribe exactly one assembled {seconds}s turn"
     );
-    assert_eq!(count_events(&frames, BrowserEventKind::AnswerEvaluated), 1);
-    assert_eq!(count_events(&frames, BrowserEventKind::ConceptStatus), 1);
+    // The assembled turn produces exactly one durable outcome. The synthetic
+    // transcript is a byte-count placeholder carrying none of the question's rubric
+    // evidence, so the honest outcome is a retryable deferral rather than a grade,
+    // and a deferred turn writes no mastery at all.
+    assert_eq!(count_events(&frames, BrowserEventKind::AnswerEvaluated), 0);
+    assert_eq!(count_events(&frames, BrowserEventKind::TurnDeferred), 1);
+    assert_eq!(count_events(&frames, BrowserEventKind::ConceptStatus), 0);
+    assert!(frames.iter().any(|frame| matches!(
+        frame,
+        ServerFrame::Event { event, .. }
+            if matches!(
+                event.as_ref(),
+                agent_service::VivaServerEvent::TurnDeferred {
+                    reason: agent_domain::learning_outcome::EvaluationDeferralReason::InsufficientSemanticEvidence,
+                    can_retry_same_question: true,
+                    ..
+                }
+            )
+    )));
     assert_eq!(
         frames
             .iter()
@@ -9542,7 +9494,10 @@ async fn streamed_audio_turns_cancel_halfway_creates_no_provider_work() {
         agent_domain::StudySessionPhase::Correction,
     )
     .await;
-    assert_eq!(count_events(&frames, BrowserEventKind::AnswerEvaluated), 1);
+    // As above: the placeholder transcript defers rather than grading, and the point
+    // of this case is that the post-cancel turn still produces exactly one outcome.
+    assert_eq!(count_events(&frames, BrowserEventKind::AnswerEvaluated), 0);
+    assert_eq!(count_events(&frames, BrowserEventKind::TurnDeferred), 1);
     assert!(frames.iter().any(|frame| matches!(
         frame,
         ServerFrame::Event { event, .. }
@@ -9558,6 +9513,7 @@ async fn streamed_audio_turns_cancel_halfway_creates_no_provider_work() {
 enum BrowserEventKind {
     QuestionStarted,
     AnswerEvaluated,
+    TurnDeferred,
     SourceReference,
     ConceptStatus,
     ManuscriptIntent,
@@ -9575,6 +9531,9 @@ impl BrowserEventKind {
                 event,
                 agent_service::VivaServerEvent::AnswerEvaluated { .. }
             ),
+            Self::TurnDeferred => {
+                matches!(event, agent_service::VivaServerEvent::TurnDeferred { .. })
+            }
             Self::SourceReference => matches!(
                 event,
                 agent_service::VivaServerEvent::SourceReference { .. }
