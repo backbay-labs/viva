@@ -9,17 +9,16 @@ import {
   HankenGrotesk_600SemiBold,
   HankenGrotesk_700Bold,
 } from "@expo-google-fonts/hanken-grotesk";
-import { Asset } from "expo-asset";
 import { useFonts } from "expo-font";
 import { DefaultTheme, Stack, ThemeProvider } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
 import * as SystemUI from "expo-system-ui";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { StyleSheet, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 
-import { VELLUM_PLATE, VivaAtmosphere } from "@/components/atmosphere";
+import { useAtmosphereReady, VivaAtmosphere } from "@/components/atmosphere";
 import { colors } from "@/theme/tokens";
 
 void SplashScreen.preventAutoHideAsync();
@@ -36,11 +35,6 @@ const TRANSPARENT_NAV_THEME = {
   colors: { ...DefaultTheme.colors, background: "transparent" },
 };
 
-// How long the splash will wait on the plate before opening anyway. Also caps
-// web cold start, where there is no native splash behind us and first paint is
-// blocked on a 318 KB webp.
-const PLATE_DECODE_DEADLINE_MS = 3000;
-
 export default function RootLayout() {
   const [fontsLoaded, fontError] = useFonts({
     Cormorant_500Medium_Italic,
@@ -50,43 +44,12 @@ export default function RootLayout() {
     HankenGrotesk_600SemiBold,
     HankenGrotesk_700Bold,
   });
-  const [plateReady, setPlateReady] = useState(false);
-
   // The splash background is already the vellum's base colour, so holding it
-  // until the plate is decoded makes the handoff seamless. Hiding on fonts
-  // alone flashes flat canvas first, which is the exact impression this work
-  // exists to remove.
-  //
-  // The gate has to be total. A rejected download, a synchronous throw out of
-  // Asset.fromModule, and a promise that simply never settles all end the same
-  // way: the app opens on flat canvas, which is far better than an app that
-  // never opens at all. Hence the deadline as well as the catch.
-  useEffect(() => {
-    let active = true;
-    let deadline: ReturnType<typeof setTimeout>;
+  // until the atmosphere can paint makes the handoff seamless. What that costs
+  // — and which tier is doing the waiting — belongs to the atmosphere, not here.
+  const atmosphereReady = useAtmosphereReady();
 
-    // Promise.resolve().then(...) so a synchronous throw from fromModule
-    // becomes a rejection this chain can catch, rather than escaping the effect.
-    const decoded = Promise.resolve()
-      .then(() => Asset.fromModule(VELLUM_PLATE).downloadAsync())
-      .catch((error: unknown) => {
-        console.warn("[viva] the vellum plate failed to load; opening on flat canvas.", error);
-      });
-    const timedOut = new Promise<void>((resolve) => {
-      deadline = setTimeout(resolve, PLATE_DECODE_DEADLINE_MS);
-    });
-
-    void Promise.race([decoded, timedOut]).finally(() => {
-      if (active) setPlateReady(true);
-    });
-
-    return () => {
-      active = false;
-      clearTimeout(deadline);
-    };
-  }, []);
-
-  const ready = (fontsLoaded || fontError) && plateReady;
+  const ready = (fontsLoaded || fontError) && atmosphereReady;
 
   useEffect(() => {
     if (ready) {
@@ -94,12 +57,16 @@ export default function RootLayout() {
     }
   }, [ready]);
 
+  // Not `null`: native has the splash over us, but web does not, so bare null
+  // is a blank white page for up to the full readiness deadline — white being
+  // the one colour this whole branch exists to avoid. Painting the base colour
+  // instead lets the vellum fade in over the ground it is made of.
   if (!ready) {
-    return null;
+    return <View style={styles.root} />;
   }
 
   return (
-    <GestureHandlerRootView style={styles.root}>
+    <GestureHandlerRootView style={styles.fill}>
       <View style={styles.root}>
         <VivaAtmosphere />
         <StatusBar style="dark" />
@@ -124,6 +91,12 @@ export default function RootLayout() {
 }
 
 const styles = StyleSheet.create({
+  // The root view below already paints the base colour, and a second opaque
+  // full-screen fill behind it is pure overdraw on exactly the low-end devices
+  // this tier targets.
+  fill: {
+    flex: 1,
+  },
   root: {
     backgroundColor: colors.canvas,
     flex: 1,

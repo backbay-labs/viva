@@ -1,4 +1,5 @@
-import { useId } from "react";
+import { Asset } from "expo-asset";
+import { useEffect, useId, useState } from "react";
 import { Image, StyleSheet, View } from "react-native";
 import Svg, { Defs, RadialGradient, Rect, Stop } from "react-native-svg";
 
@@ -12,11 +13,61 @@ import {
 
 // Relative, not "@/assets/...": the tsconfig maps @/assets/* but nothing in the
 // app imports through it yet, so Metro's resolution of that branch is unproven.
-// A relative asset path is guaranteed. Exported so _layout.tsx preloads the same
-// module reference rather than duplicating the path.
-export const VELLUM_PLATE = require("../../assets/images/vellum-plate.webp");
+// A relative asset path is guaranteed. Private to this module: what the current
+// tier needs in order to paint is the tier's own business, and Act 2 changes it.
+const VELLUM_PLATE = require("../../assets/images/vellum-plate.webp");
 
 const WELL_STOPS = gaussianStops(WELL.peakOpacity, 5);
+
+// How long a caller will wait on the atmosphere before opening anyway. Also
+// caps web cold start, where there is no native splash behind us and first
+// paint is blocked on a 318 KB webp.
+const READY_DEADLINE_MS = 3000;
+
+/**
+ * Whether the atmosphere has everything it needs to paint its first frame.
+ *
+ * The root layout holds the splash on this so the handoff is seamless: opening
+ * on fonts alone flashes flat canvas first, which is the exact impression this
+ * work exists to remove. It deliberately says nothing about *what* is being
+ * waited on — Act 1 decodes a baked plate, Act 2 will warm a shader, and the
+ * caller should not have to change when that happens.
+ *
+ * The gate has to be total. A rejected download, a synchronous throw out of
+ * Asset.fromModule, and a promise that simply never settles all end the same
+ * way: the app opens on flat canvas, which is far better than an app that never
+ * opens at all. Hence the deadline as well as the catch.
+ */
+export function useAtmosphereReady(): boolean {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    let deadline: ReturnType<typeof setTimeout>;
+
+    // Promise.resolve().then(...) so a synchronous throw from fromModule
+    // becomes a rejection this chain can catch, rather than escaping the effect.
+    const decoded = Promise.resolve()
+      .then(() => Asset.fromModule(VELLUM_PLATE).downloadAsync())
+      .catch((error: unknown) => {
+        console.warn("[viva] the vellum plate failed to load; opening on flat canvas.", error);
+      });
+    const timedOut = new Promise<void>((resolve) => {
+      deadline = setTimeout(resolve, READY_DEADLINE_MS);
+    });
+
+    void Promise.race([decoded, timedOut]).finally(() => {
+      if (active) setReady(true);
+    });
+
+    return () => {
+      active = false;
+      clearTimeout(deadline);
+    };
+  }, []);
+
+  return ready;
+}
 
 /**
  * The ground every screen sits on.
