@@ -38,7 +38,7 @@ export function VivaAtmosphere() {
       pointerEvents="none"
       style={StyleSheet.absoluteFill}
     >
-      <Image resizeMode="cover" source={VELLUM_PLATE} style={StyleSheet.absoluteFill} />
+      <Image resizeMode="cover" source={VELLUM_PLATE} style={styles.plate} />
       <Svg height="100%" style={StyleSheet.absoluteFill} width="100%">
         <Defs>
           <RadialGradient
@@ -68,3 +68,17 @@ export function VivaAtmosphere() {
     </View>
   );
 }
+
+const styles = StyleSheet.create({
+  plate: {
+    // The insets alone are not enough: react-native-web writes the source's
+    // intrinsic size (1242x2688) as an inline style whenever the passed style
+    // omits width/height, and that beats the insets — the plate then renders at
+    // its natural size and `cover` crops a magnified corner. Native sizes from
+    // the insets alone, so the plate must state both. Do not "simplify" this
+    // back to a bare StyleSheet.absoluteFill.
+    ...StyleSheet.absoluteFill,
+    height: "100%",
+    width: "100%",
+  },
+});
