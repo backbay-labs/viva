@@ -1,9 +1,10 @@
 import * as bunTest from "bun:test";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { NextRequest } from "next/server";
 import { POST as refreshSession } from "../app/api/viva-session/refresh/route";
 import {
+  guardVivaSessionProjectionAdmission,
   resetVivaSessionMintRateLimitsForTests,
   type SessionTokenClaims,
   signVivaLibraryControlToken,
@@ -14,6 +15,8 @@ import {
   validateVivaWebSecret,
   verifyVivaSessionAccessToken,
   vivaSessionRouteFailureLogPayload,
+  vivaSessionSecurityStore,
+  vivaSessionSecurityStoreMemoryRecordCountForTests,
 } from "../app/api/viva-session/shared";
 import { POST as startSession } from "../app/api/viva-session/start/route";
 
@@ -26,6 +29,7 @@ const originalFetch = globalThis.fetch;
 const originalConsoleWarn = console.warn;
 const originalEnv = {
   NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL,
+  NODE_ENV: process.env.NODE_ENV,
   VERCEL_GIT_COMMIT_SHA: process.env.VERCEL_GIT_COMMIT_SHA,
   VIVA_AGENT_HTTP_URL: process.env.VIVA_AGENT_HTTP_URL,
   VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN: process.env.VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN,
@@ -40,10 +44,16 @@ const originalEnv = {
   VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS: process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS,
   VIVA_SESSION_ALLOWED_USER_IDS: process.env.VIVA_SESSION_ALLOWED_USER_IDS,
   VIVA_SESSION_MINT_MAX_PER_MINUTE: process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE,
+  VIVA_SESSION_PROJECTION_MAX_PER_MINUTE: process.env.VIVA_SESSION_PROJECTION_MAX_PER_MINUTE,
+  VIVA_SESSION_SECURITY_STORE_MODE: process.env.VIVA_SESSION_SECURITY_STORE_MODE,
+  VIVA_SESSION_SECURITY_STORE_REST_TOKEN: process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN,
+  VIVA_SESSION_SECURITY_STORE_REST_URL: process.env.VIVA_SESSION_SECURITY_STORE_REST_URL,
+  VIVA_SESSION_TRUSTED_PROXY_HOPS: process.env.VIVA_SESSION_TRUSTED_PROXY_HOPS,
   VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET: process.env.VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET,
   VIVA_VOICE_SESSION_TOKEN_SECRET: process.env.VIVA_VOICE_SESSION_TOKEN_SECRET,
   VIVA_VOICE_WS_BEARER_TOKEN: process.env.VIVA_VOICE_WS_BEARER_TOKEN,
   VIVA_WEB_CANONICAL_ORIGIN: process.env.VIVA_WEB_CANONICAL_ORIGIN,
+  VIVA_WEB_SINGLE_INSTANCE: process.env.VIVA_WEB_SINGLE_INSTANCE,
 };
 
 // Fixture credentials: long enough to satisfy the recorded strength floor and
@@ -57,6 +67,8 @@ const CANONICAL_WEB_ORIGIN = "https://web.example";
 const SCOPED_SESSION_MINT_BEARER = "viva-fixture-agent-session-mint-bearer";
 const SCOPED_LIBRARY_READ_BEARER = "viva-fixture-agent-library-read-bearer";
 const SCOPED_LIBRARY_DELETE_BEARER = "viva-fixture-agent-library-delete-bearer";
+const SESSION_SECURITY_STORE_ORIGIN = "https://session-store.example";
+const SESSION_SECURITY_STORE_CREDENTIAL = "viva-fixture-session-security-store-cred";
 
 describe("Viva same-origin session API", () => {
   beforeEach(() => {
@@ -76,6 +88,7 @@ describe("Viva same-origin session API", () => {
     process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
     process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS = "10000";
     process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "20";
+    process.env.VIVA_SESSION_TRUSTED_PROXY_HOPS = "1";
     delete process.env.VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET;
     process.env.VIVA_VOICE_SESSION_TOKEN_SECRET = STRONG_SESSION_SECRET;
   });
@@ -1599,6 +1612,833 @@ describe("Viva scoped service credential selection", () => {
   });
 });
 
+describe("Viva trusted proxy and atomic shared rate admission", () => {
+  beforeEach(() => {
+    console.warn = () => {};
+    resetVivaSessionMintRateLimitsForTests();
+    applyCanonicalOriginTestEnv();
+    applySharedSecurityStoreTestEnv();
+  });
+
+  afterEach(() => {
+    console.warn = originalConsoleWarn;
+    globalThis.fetch = originalFetch;
+    resetVivaSessionMintRateLimitsForTests();
+    for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
+  });
+
+  test("trusted proxy admission with one hop buckets on the right-most forwarded entry only", async () => {
+    process.env.VIVA_SESSION_TRUSTED_PROXY_HOPS = "1";
+    process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "1";
+    process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user,alternate-user";
+    globalThis.fetch = (async () =>
+      jsonResponse(
+        200,
+        librarySnapshot({ startToken: "viva1.redacted-start-token" }),
+      )) as typeof fetch;
+
+    // Same trusted hop, attacker-rotated left prefixes AND attacker-supplied platform headers.
+    // None of them may mint a fresh admission bucket.
+    const first = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload(), {
+        "x-forwarded-for": "198.51.100.1, 203.0.113.10",
+      }),
+    );
+    const rotatedPrefix = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload({ userId: "alternate-user" }), {
+        "x-forwarded-for": "198.51.100.99, 203.0.113.10",
+      }),
+    );
+    const spoofedPlatformHeaders = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload({ userId: "alternate-user" }), {
+        "cf-connecting-ip": "198.51.100.51",
+        "true-client-ip": "198.51.100.52",
+        "x-forwarded-for": "198.51.100.98, 203.0.113.10",
+        "x-real-ip": "198.51.100.50",
+        "x-vercel-forwarded-for": "198.51.100.53",
+      }),
+    );
+
+    expect(first.status).toBe(200);
+    expect([rotatedPrefix.status, spoofedPlatformHeaders.status]).toEqual([429, 429]);
+    expect(await rotatedPrefix.json()).toEqual({
+      error: "session_mint_rate_limited",
+      failure_class: "rate_limit",
+      token_refresh_outcome: "blocked",
+    });
+    expect(isBoundedRetryAfter(rotatedPrefix.headers.get("retry-after"))).toBe(true);
+  });
+
+  test("trusted proxy admission with two hops buckets on the second entry from the right", async () => {
+    process.env.VIVA_SESSION_TRUSTED_PROXY_HOPS = "2";
+    process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "1";
+    process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user,alternate-user";
+    globalThis.fetch = (async (input: RequestInfo | URL) =>
+      jsonResponse(
+        200,
+        librarySnapshot({
+          startToken: "viva1.redacted-start-token",
+          userId: new URL(String(input)).searchParams.get("user_id") ?? "synthetic-user",
+        }),
+      )) as typeof fetch;
+
+    const first = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload(), {
+        "x-forwarded-for": "198.51.100.1, 203.0.113.10, 192.0.2.5",
+      }),
+    );
+    const sameSecondFromRight = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload({ userId: "alternate-user" }), {
+        "x-forwarded-for": "198.51.100.77, 203.0.113.10, 192.0.2.9",
+      }),
+    );
+    const differentSecondFromRight = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload({ userId: "alternate-user" }), {
+        "x-forwarded-for": "198.51.100.77, 203.0.113.44, 192.0.2.9",
+      }),
+    );
+
+    expect(first.status).toBe(200);
+    expect(sameSecondFromRight.status).toBe(429);
+    expect(differentSecondFromRight.status).toBe(200);
+  });
+
+  test("trusted proxy admission fails closed on unset, invalid, zero, and short forwarded chains", async () => {
+    // A fully working public shared store is configured here on purpose: the only thing that can
+    // refuse these requests is the trusted client identity, and the store must never be reached.
+    const calls: string[] = [];
+    restoreEnv("NODE_ENV", "production");
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_URL = SESSION_SECURITY_STORE_ORIGIN;
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN = SESSION_SECURITY_STORE_CREDENTIAL;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const target = String(input);
+      calls.push(target);
+      if (target.startsWith(SESSION_SECURITY_STORE_ORIGIN)) {
+        const sent = JSON.parse(String(init?.body)) as { request_id: string };
+        return jsonResponse(200, {
+          operation: "increment_rate_limit",
+          request_id: sent.request_id,
+          result: { ok: true, remaining: 11, resetAtMs: Date.now() + 60_000 },
+          schema_version: 1,
+        });
+      }
+      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+    }) as typeof fetch;
+
+    const cases: Array<{
+      headers?: Record<string, string>;
+      hops?: string;
+      omitHeaders?: readonly string[];
+    }> = [
+      { hops: undefined },
+      { hops: "0" },
+      { hops: "abc" },
+      { hops: "6" },
+      // Declared two hops, one supplied: the request did not traverse the declared topology.
+      { hops: "2" },
+      { hops: "1", omitHeaders: ["x-forwarded-for"] },
+      { headers: { "x-forwarded-for": "" }, hops: "1" },
+      { headers: { "x-forwarded-for": "203.0.113.10, , 192.0.2.5" }, hops: "1" },
+      { headers: { "x-forwarded-for": "203.0.113.10, not-an-ip" }, hops: "1" },
+      { headers: { "x-forwarded-for": "203.0.113.10, 999.1.1.1" }, hops: "1" },
+    ];
+
+    const observed: Array<{ error: string; status: number }> = [];
+    for (const testCase of cases) {
+      resetVivaSessionMintRateLimitsForTests();
+      restoreEnv("VIVA_SESSION_TRUSTED_PROXY_HOPS", testCase.hops);
+      const response = await startSession(
+        sessionRequest("/api/viva-session/start", sessionStartPayload(), testCase.headers ?? {}, {
+          omitHeaders: testCase.omitHeaders,
+        }),
+      );
+      const body = (await response.json()) as VivaSessionRouteFailureClass;
+      observed.push({ error: body.error, status: response.status });
+    }
+
+    // Positive control on the identical fixture: a declared chain admits and does reach the store.
+    resetVivaSessionMintRateLimitsForTests();
+    process.env.VIVA_SESSION_TRUSTED_PROXY_HOPS = "1";
+    const admitted = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload(), {
+        "x-forwarded-for": "198.51.100.4, 203.0.113.10",
+      }),
+    );
+
+    expect(observed).toEqual(
+      cases.map(() => ({ error: "viva_session_security_store_unavailable", status: 503 })),
+    );
+    expect(admitted.status).toBe(200);
+    expect(calls).toEqual([
+      "https://session-store.example/v1/session-security",
+      "https://agent.example/study-sets/library?user_id=synthetic-user",
+    ]);
+  });
+
+  test("atomic shared rate admission rejects out-of-range mint and projection limits", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+    }) as typeof fetch;
+
+    const rejected = ["0", "121", "-1", "12.5", "twelve", "1e2", "+12", "0x0c"];
+    const observed: Array<{ error: string; status: number }> = [];
+    for (const value of rejected) {
+      resetVivaSessionMintRateLimitsForTests();
+      process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = value;
+      const response = await startSession(
+        sessionRequest("/api/viva-session/start", sessionStartPayload()),
+      );
+      const body = (await response.json()) as VivaSessionRouteFailureClass;
+      observed.push({ error: body.error, status: response.status });
+    }
+
+    // A blank value is treated as unset, not as an invalid value: deployment tooling routinely
+    // renders an unset variable as the empty string, and every other env read here agrees.
+    const blankDefaults: number[] = [];
+    for (const blank of ["", "   "]) {
+      resetVivaSessionMintRateLimitsForTests();
+      process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = blank;
+      const response = await startSession(
+        sessionRequest("/api/viva-session/start", sessionStartPayload()),
+      );
+      blankDefaults.push(response.status);
+    }
+
+    resetVivaSessionMintRateLimitsForTests();
+    delete process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE;
+    const defaulted = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+
+    expect(observed).toEqual(
+      rejected.map(() => ({ error: "viva_session_agent_unavailable", status: 503 })),
+    );
+    expect(blankDefaults).toEqual([200, 200]);
+    expect(defaulted.status).toBe(200);
+    expect(calls).toHaveLength(3);
+  });
+
+  test("shared security store is mandatory for public start and refresh before any agent fetch", async () => {
+    const calls: string[] = [];
+    restoreEnv("NODE_ENV", "production");
+    delete process.env.VIVA_SESSION_SECURITY_STORE_REST_URL;
+    delete process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+    }) as typeof fetch;
+
+    const start = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const startBody = (await start.json()) as VivaSessionRouteFailureClass;
+    const refresh = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", {
+        session_id: "server-session",
+        session_token: signedSessionToken(sessionTokenClaims()),
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      }),
+    );
+    const refreshBody = (await refresh.json()) as VivaSessionRouteFailureClass;
+
+    expect(start.status).toBe(503);
+    expect(startBody).toEqual({
+      error: "viva_session_security_store_unavailable",
+      failure_class: "session_bootstrap_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_session_unavailable",
+      token_refresh_outcome: "failed",
+    });
+    expect(refresh.status).toBe(503);
+    expect(refreshBody).toEqual(startBody);
+    expect(calls).toEqual([]);
+    expect(JSON.stringify([startBody, refreshBody])).not.toContain("VIVA_SESSION_SECURITY_STORE");
+  });
+
+  test("shared security store rest url alone cannot admit public traffic without its credential", async () => {
+    const calls: string[] = [];
+    restoreEnv("NODE_ENV", "production");
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_URL = SESSION_SECURITY_STORE_ORIGIN;
+    delete process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+    }) as typeof fetch;
+
+    const response = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const body = (await response.json()) as VivaSessionRouteFailureClass;
+
+    expect(response.status).toBe(503);
+    expect(body.error).toBe("viva_session_security_store_unavailable");
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("Viva shared security store adapters", () => {
+  beforeEach(() => {
+    console.warn = () => {};
+    resetVivaSessionMintRateLimitsForTests();
+    applyCanonicalOriginTestEnv();
+    applySharedSecurityStoreTestEnv();
+  });
+
+  afterEach(() => {
+    console.warn = originalConsoleWarn;
+    globalThis.fetch = originalFetch;
+    resetVivaSessionMintRateLimitsForTests();
+    for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
+  });
+
+  test("shared security store refuses memory mode and unconfigured stores on public deployments", () => {
+    restoreEnv("NODE_ENV", "production");
+
+    process.env.VIVA_SESSION_SECURITY_STORE_MODE = "memory";
+    const publicMemoryRequest = vivaSessionSecurityStore();
+
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_URL = SESSION_SECURITY_STORE_ORIGIN;
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN = SESSION_SECURITY_STORE_CREDENTIAL;
+    const memoryRequestedWithRestAvailable = vivaSessionSecurityStore();
+
+    process.env.VIVA_SESSION_SECURITY_STORE_MODE = "redis";
+    const unknownMode = vivaSessionSecurityStore();
+
+    delete process.env.VIVA_SESSION_SECURITY_STORE_MODE;
+    const restSelected = vivaSessionSecurityStore();
+
+    delete process.env.VIVA_SESSION_SECURITY_STORE_REST_URL;
+    const restUnconfigured = vivaSessionSecurityStore();
+
+    expect(publicMemoryRequest).toEqual({ ok: false, reason: "unavailable" });
+    expect(memoryRequestedWithRestAvailable).toEqual({ ok: false, reason: "unavailable" });
+    expect(unknownMode).toEqual({ ok: false, reason: "unavailable" });
+    expect(restSelected.ok).toBe(true);
+    expect(restUnconfigured).toEqual({ ok: false, reason: "unavailable" });
+  });
+
+  test("shared security store memory mode requires an explicit single-instance assertion", () => {
+    restoreEnv("NODE_ENV", "production");
+    process.env.VIVA_WEB_CANONICAL_ORIGIN = "http://localhost:3000";
+    process.env.VIVA_AGENT_HTTP_URL = "http://127.0.0.1:4318";
+
+    const rejectedAssertions = [undefined, "", "0", "false", "true", "yes", "01"];
+    const rejected = rejectedAssertions.map((value) => {
+      restoreEnv("VIVA_WEB_SINGLE_INSTANCE", value);
+      return vivaSessionSecurityStore().ok;
+    });
+
+    process.env.VIVA_WEB_SINGLE_INSTANCE = "1";
+    const loopbackSingleInstance = vivaSessionSecurityStore();
+
+    process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
+    const publicAgentUrl = vivaSessionSecurityStore();
+
+    process.env.VIVA_AGENT_HTTP_URL = "http://127.0.0.1:4318";
+    process.env.VIVA_WEB_CANONICAL_ORIGIN = "https://web.example";
+    const publicWebOrigin = vivaSessionSecurityStore();
+
+    expect(rejected).toEqual(rejectedAssertions.map(() => false));
+    expect(loopbackSingleInstance.ok).toBe(true);
+    expect(publicAgentUrl).toEqual({ ok: false, reason: "unavailable" });
+    expect(publicWebOrigin).toEqual({ ok: false, reason: "unavailable" });
+  });
+
+  test("shared security store rejects rest urls with credentials, path, query, fragment, or insecure public http", () => {
+    restoreEnv("NODE_ENV", "production");
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN = SESSION_SECURITY_STORE_CREDENTIAL;
+
+    const rejectedUrls = [
+      "https://operator:secret@session-store.example",
+      "https://session-store.example/v1",
+      "https://session-store.example/",
+      "https://session-store.example?tenant=1",
+      "https://session-store.example#fragment",
+      "http://session-store.example",
+      "session-store.example",
+      "ftp://session-store.example",
+    ];
+    const rejected = rejectedUrls.map((value) => {
+      process.env.VIVA_SESSION_SECURITY_STORE_REST_URL = value;
+      return vivaSessionSecurityStore().ok;
+    });
+
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_URL = "https://session-store.example";
+    const publicHttps = vivaSessionSecurityStore();
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_URL = "http://127.0.0.1:9410";
+    const loopbackHttp = vivaSessionSecurityStore();
+
+    expect(rejected).toEqual(rejectedUrls.map(() => false));
+    expect(publicHttps.ok).toBe(true);
+    expect(loopbackHttp.ok).toBe(true);
+  });
+
+  test("shared security store validates its rest credential through the web secret gate", () => {
+    restoreEnv("NODE_ENV", "production");
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_URL = SESSION_SECURITY_STORE_ORIGIN;
+
+    const weakCredentials = [
+      undefined,
+      "",
+      "short-store-token",
+      "changeme",
+      "<replace-with-store-token>",
+      "z".repeat(64),
+      "s".repeat(513).replace(/^s/, "v"),
+    ];
+    const rejected = weakCredentials.map((value) => {
+      restoreEnv("VIVA_SESSION_SECURITY_STORE_REST_TOKEN", value);
+      return vivaSessionSecurityStore().ok;
+    });
+
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN = SESSION_SECURITY_STORE_CREDENTIAL;
+    const accepted = vivaSessionSecurityStore();
+
+    expect(rejected).toEqual(weakCredentials.map(() => false));
+    expect(accepted.ok).toBe(true);
+  });
+
+  test("shared security store speaks the exact rest envelope and requires an exact request id echo", async () => {
+    restoreEnv("NODE_ENV", "production");
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_URL = SESSION_SECURITY_STORE_ORIGIN;
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN = SESSION_SECURITY_STORE_CREDENTIAL;
+    const calls: Array<{ init?: RequestInit; input: string }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init, input: String(input) });
+      const sent = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return jsonResponse(200, {
+        operation: "increment_rate_limit",
+        request_id: sent.request_id,
+        result: { ok: true, remaining: 5, resetAtMs: 1_700_000_060_000 },
+        schema_version: 1,
+      });
+    }) as typeof fetch;
+
+    const selection = vivaSessionSecurityStore();
+    if (!selection.ok) throw new Error("rest adapter must be selected for this fixture");
+    const result = await selection.store.incrementRateLimit({
+      keys: ["hashed-ip-key", "hashed-identity-key"],
+      limit: 6,
+      nowMs: 1_700_000_000_000,
+      windowMs: 60_000,
+    });
+    const sent = JSON.parse(String(calls[0]?.init?.body)) as Record<string, unknown>;
+    const headers = new Headers(calls[0]?.init?.headers);
+
+    expect(result).toEqual({ ok: true, remaining: 5, resetAtMs: 1_700_000_060_000 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.input).toBe("https://session-store.example/v1/session-security");
+    expect(calls[0]?.init?.method).toBe("POST");
+    expect(calls[0]?.init?.cache).toBe("no-store");
+    expect(calls[0]?.init?.redirect).toBe("error");
+    expect(calls[0]?.init?.signal instanceof AbortSignal).toBe(true);
+    expect(headers.get("authorization")).toBe(`Bearer ${SESSION_SECURITY_STORE_CREDENTIAL}`);
+    expect(headers.get("content-type")).toBe("application/json");
+    expect(headers.get("accept")).toBe("application/json");
+    expect(Object.keys(sent).sort()).toEqual([
+      "input",
+      "operation",
+      "request_id",
+      "schema_version",
+    ]);
+    expect(sent.schema_version).toBe(1);
+    expect(sent.operation).toBe("increment_rate_limit");
+    expect(isCanonicalUuidV4(String(sent.request_id))).toBe(true);
+    expect(sent.input).toEqual({
+      keys: ["hashed-ip-key", "hashed-identity-key"],
+      limit: 6,
+      nowMs: 1_700_000_000_000,
+      windowMs: 60_000,
+    });
+  });
+
+  test("shared security store fails closed on hostile rest responses and never falls back to memory", async () => {
+    restoreEnv("NODE_ENV", "production");
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_URL = SESSION_SECURITY_STORE_ORIGIN;
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN = SESSION_SECURITY_STORE_CREDENTIAL;
+    const admitted = { ok: true, remaining: 5, resetAtMs: 1_700_000_060_000 };
+    const hostile: Array<(requestId: string) => Response> = [
+      () => jsonResponse(500, { error: "upstream" }),
+      () => new Response("{not-json", { headers: { "content-type": "application/json" } }),
+      (requestId) =>
+        jsonResponse(200, {
+          operation: "increment_rate_limit",
+          padding: "x".repeat(17 * 1024),
+          request_id: requestId,
+          result: admitted,
+          schema_version: 1,
+        }),
+      () =>
+        jsonResponse(200, {
+          operation: "increment_rate_limit",
+          request_id: "00000000-0000-4000-8000-000000000000",
+          result: admitted,
+          schema_version: 1,
+        }),
+      (requestId) =>
+        jsonResponse(200, {
+          operation: "consume_refresh",
+          request_id: requestId,
+          result: admitted,
+          schema_version: 1,
+        }),
+      (requestId) =>
+        jsonResponse(200, {
+          operation: "increment_rate_limit",
+          request_id: requestId,
+          result: admitted,
+          schema_version: 2,
+        }),
+      (requestId) =>
+        jsonResponse(200, {
+          extra: true,
+          operation: "increment_rate_limit",
+          request_id: requestId,
+          result: admitted,
+          schema_version: 1,
+        }),
+      (requestId) =>
+        jsonResponse(200, {
+          operation: "increment_rate_limit",
+          request_id: requestId,
+          result: { ok: false, reason: "teapot" },
+          schema_version: 1,
+        }),
+      (requestId) =>
+        jsonResponse(200, {
+          operation: "increment_rate_limit",
+          request_id: requestId,
+          result: { ok: true, extra: 1, remaining: 5, resetAtMs: 1 },
+          schema_version: 1,
+        }),
+    ];
+
+    const observed: Array<unknown> = [];
+    for (const respond of hostile) {
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const sent = JSON.parse(String(init?.body)) as { request_id: string };
+        return respond(sent.request_id);
+      }) as typeof fetch;
+      const selection = vivaSessionSecurityStore();
+      if (!selection.ok) throw new Error("rest adapter must be selected for this fixture");
+      observed.push(
+        await selection.store.incrementRateLimit({
+          keys: ["hashed-ip-key", "hashed-identity-key"],
+          limit: 6,
+          nowMs: 1_700_000_000_000,
+          windowMs: 60_000,
+        }),
+      );
+    }
+
+    expect(observed).toEqual(hostile.map(() => ({ ok: false, reason: "unavailable" })));
+    // A failed HTTP adapter never quietly becomes the bounded in-memory adapter.
+    expect(vivaSessionSecurityStoreMemoryRecordCountForTests()).toBe(0);
+  });
+
+  test("shared security store abandons a hung rest call at its two-second deadline", async () => {
+    restoreEnv("NODE_ENV", "production");
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_URL = SESSION_SECURITY_STORE_ORIGIN;
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN = SESSION_SECURITY_STORE_CREDENTIAL;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+          once: true,
+        });
+      })) as typeof fetch;
+
+    const selection = vivaSessionSecurityStore();
+    if (!selection.ok) throw new Error("rest adapter must be selected for this fixture");
+    const startedAt = Date.now();
+    const result = await selection.store.incrementRateLimit({
+      keys: ["hashed-ip-key", "hashed-identity-key"],
+      limit: 6,
+      nowMs: 1_700_000_000_000,
+      windowMs: 60_000,
+    });
+    const elapsed = Date.now() - startedAt;
+
+    expect(result).toEqual({ ok: false, reason: "unavailable" });
+    expect(elapsed).toBeGreaterThanOrEqual(1_800);
+    expect(elapsed).toBeLessThan(4_000);
+  });
+
+  test("atomic shared rate admission is one bucket across independently constructed adapters", async () => {
+    const first = vivaSessionSecurityStore();
+    const second = vivaSessionSecurityStore();
+    if (!first.ok || !second.ok) throw new Error("memory adapter must be selected in test mode");
+    const keys = mintAdmissionKeys("203.0.113.10");
+    const nowMs = 1_700_000_000_000;
+
+    const results = [
+      await first.store.incrementRateLimit({ keys, limit: 3, nowMs, windowMs: 60_000 }),
+      await second.store.incrementRateLimit({ keys, limit: 3, nowMs, windowMs: 60_000 }),
+      await first.store.incrementRateLimit({ keys, limit: 3, nowMs, windowMs: 60_000 }),
+      await second.store.incrementRateLimit({ keys, limit: 3, nowMs, windowMs: 60_000 }),
+    ];
+
+    expect(first.store).not.toBe(second.store);
+    expect(results.map((result) => result.ok)).toEqual([true, true, true, false]);
+    expect(results[3]).toEqual({ ok: false, reason: "limited", resetAtMs: 1_700_000_040_000 });
+  });
+
+  test("atomic shared rate admission shares one mint bucket with the start route", async () => {
+    process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "2";
+    globalThis.fetch = (async () =>
+      jsonResponse(
+        200,
+        librarySnapshot({ startToken: "viva1.redacted-start-token" }),
+      )) as typeof fetch;
+    const selection = vivaSessionSecurityStore();
+    if (!selection.ok) throw new Error("memory adapter must be selected in test mode");
+
+    // One slot is consumed outside the route, through the documented key formula only.
+    const seeded = await selection.store.incrementRateLimit({
+      keys: mintAdmissionKeys("203.0.113.10"),
+      limit: 2,
+      nowMs: Date.now(),
+      windowMs: 60_000,
+    });
+    const admitted = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const rejected = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const rejectedBody = (await rejected.json()) as VivaSessionRouteFailureClass;
+
+    expect(seeded.ok).toBe(true);
+    expect(admitted.status).toBe(200);
+    expect(rejected.status).toBe(429);
+    expect(rejectedBody).toEqual({
+      error: "session_mint_rate_limited",
+      failure_class: "rate_limit",
+      token_refresh_outcome: "blocked",
+    });
+    expect(isBoundedRetryAfter(rejected.headers.get("retry-after"))).toBe(true);
+  });
+
+  test("atomic shared rate admission admits exactly one concurrent request for the final slot", async () => {
+    const selection = vivaSessionSecurityStore();
+    if (!selection.ok) throw new Error("memory adapter must be selected in test mode");
+    const keys = mintAdmissionKeys("198.51.100.200");
+    const nowMs = 1_700_000_000_000;
+
+    const settled = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        selection.store.incrementRateLimit({ keys, limit: 1, nowMs, windowMs: 60_000 }),
+      ),
+    );
+
+    expect(settled.filter((result) => result.ok)).toHaveLength(1);
+    expect(settled.filter((result) => !result.ok)).toHaveLength(7);
+  });
+
+  test("atomic shared rate admission never consumes one key of a pair when the other is limited", async () => {
+    const selection = vivaSessionSecurityStore();
+    if (!selection.ok) throw new Error("memory adapter must be selected in test mode");
+    const nowMs = 1_700_000_000_000;
+    const shared = "atomic-pair-shared";
+    const fresh = "atomic-pair-fresh";
+    const partner = "atomic-pair-partner";
+
+    const seeded = await selection.store.incrementRateLimit({
+      keys: ["atomic-pair-seed", shared],
+      limit: 1,
+      nowMs,
+      windowMs: 60_000,
+    });
+    const limited = await selection.store.incrementRateLimit({
+      keys: [fresh, shared],
+      limit: 1,
+      nowMs,
+      windowMs: 60_000,
+    });
+    // If the limited call had already consumed `fresh`, this pair would be limited too.
+    const freshStillWhole = await selection.store.incrementRateLimit({
+      keys: [fresh, partner],
+      limit: 1,
+      nowMs,
+      windowMs: 60_000,
+    });
+
+    expect(seeded.ok).toBe(true);
+    expect(limited).toEqual({ ok: false, reason: "limited", resetAtMs: 1_700_000_040_000 });
+    expect(freshStillWhole).toEqual({
+      ok: true,
+      remaining: 0,
+      resetAtMs: 1_700_000_040_000,
+    });
+  });
+
+  test("atomic shared rate admission passes the 100k-key clocked test with a bounded record map", async () => {
+    const selection = vivaSessionSecurityStore();
+    if (!selection.ok) throw new Error("memory adapter must be selected in test mode");
+    const windowMs = 60_000;
+    const batches = 10;
+    const callsPerBatch = 5_000;
+    let nowMs = 1_700_000_000_000;
+    let observedMaxRecords = 0;
+    let admitted = 0;
+
+    for (let batch = 0; batch < batches; batch += 1) {
+      if (batch > 0) nowMs += windowMs;
+      for (let index = 0; index < callsPerBatch; index += 1) {
+        const key = batch * callsPerBatch + index;
+        const result = await selection.store.incrementRateLimit({
+          keys: [`clocked-ip-${key}`, `clocked-identity-${key}`],
+          limit: 2,
+          nowMs,
+          windowMs,
+        });
+        if (result.ok) admitted += 1;
+        observedMaxRecords = Math.max(
+          observedMaxRecords,
+          vivaSessionSecurityStoreMemoryRecordCountForTests(),
+        );
+      }
+    }
+
+    // 10,000 records are active at this instant; a brand-new key must be refused, not grown into.
+    const overflow = await selection.store.incrementRateLimit({
+      keys: ["clocked-overflow-ip", "clocked-overflow-identity"],
+      limit: 2,
+      nowMs,
+      windowMs,
+    });
+    // Surviving buckets still enforce their own atomic limits.
+    const lastKey = batches * callsPerBatch - 1;
+    const survivorKeys = [`clocked-ip-${lastKey}`, `clocked-identity-${lastKey}`] as const;
+    const survivorSecond = await selection.store.incrementRateLimit({
+      keys: survivorKeys,
+      limit: 2,
+      nowMs,
+      windowMs,
+    });
+    const survivorThird = await selection.store.incrementRateLimit({
+      keys: survivorKeys,
+      limit: 2,
+      nowMs,
+      windowMs,
+    });
+
+    expect(admitted).toBe(batches * callsPerBatch);
+    expect(observedMaxRecords).toBe(10_000);
+    expect(overflow).toEqual({ ok: false, reason: "unavailable" });
+    expect(vivaSessionSecurityStoreMemoryRecordCountForTests()).toBe(10_000);
+    expect(survivorSecond.ok).toBe(true);
+    expect(survivorThird).toEqual({
+      ok: false,
+      reason: "limited",
+      resetAtMs: Math.floor(nowMs / windowMs) * windowMs + windowMs,
+    });
+  });
+
+  test("shared security store memory adapter prunes expired records instead of evicting active ones", async () => {
+    const selection = vivaSessionSecurityStore();
+    if (!selection.ok) throw new Error("memory adapter must be selected in test mode");
+    const windowMs = 60_000;
+    const nowMs = 1_700_000_000_000;
+
+    await selection.store.incrementRateLimit({
+      keys: ["prune-ip", "prune-identity"],
+      limit: 2,
+      nowMs,
+      windowMs,
+    });
+    const beforeExpiry = vivaSessionSecurityStoreMemoryRecordCountForTests();
+    await selection.store.incrementRateLimit({
+      keys: ["prune-next-ip", "prune-next-identity"],
+      limit: 2,
+      nowMs: nowMs + windowMs,
+      windowMs,
+    });
+    const afterExpiry = vivaSessionSecurityStoreMemoryRecordCountForTests();
+
+    expect(beforeExpiry).toBe(2);
+    expect(afterExpiry).toBe(2);
+  });
+
+  test("shared security store bounds projection admission separately from mint capacity", async () => {
+    process.env.VIVA_SESSION_PROJECTION_MAX_PER_MINUTE = "2";
+    process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "12";
+    const identity = {
+      sessionId: "server-session",
+      studySetId: "biology-midterm",
+      userId: "synthetic-user",
+    };
+
+    const admitted = [
+      await guardVivaSessionProjectionAdmission(projectionRequest(), identity),
+      await guardVivaSessionProjectionAdmission(projectionRequest(), identity),
+    ];
+    const limited = await guardVivaSessionProjectionAdmission(projectionRequest(), identity);
+    const limitedBody = (await limited?.json()) as Record<string, unknown>;
+    const selection = vivaSessionSecurityStore();
+    if (!selection.ok) throw new Error("memory adapter must be selected in test mode");
+    const mintStillOpen = await selection.store.incrementRateLimit({
+      keys: mintAdmissionKeys("203.0.113.10"),
+      limit: 12,
+      nowMs: Date.now(),
+      windowMs: 60_000,
+    });
+
+    expect(admitted).toEqual([null, null]);
+    expect(limited?.status).toBe(429);
+    expect(limitedBody).toEqual({
+      error: "session_projection_rate_limited",
+      failure_class: "rate_limit",
+      stage: "pre_loop",
+    });
+    expect(isBoundedRetryAfter(limited?.headers.get("retry-after"))).toBe(true);
+    expect(limited?.headers.get("cache-control")).toBe("no-store");
+    expect(mintStillOpen.ok).toBe(true);
+  });
+
+  test("shared security store rejects out-of-range projection limits and unavailable stores", async () => {
+    const identity = {
+      sessionId: "server-session",
+      studySetId: "biology-midterm",
+      userId: "synthetic-user",
+    };
+    const rejectedLimits = ["0", "601", "-3", "60.5", "sixty"];
+    const observed: Array<{ body: unknown; status: number | undefined }> = [];
+    for (const value of rejectedLimits) {
+      resetVivaSessionMintRateLimitsForTests();
+      process.env.VIVA_SESSION_PROJECTION_MAX_PER_MINUTE = value;
+      const response = await guardVivaSessionProjectionAdmission(projectionRequest(), identity);
+      observed.push({ body: await response?.json(), status: response?.status });
+    }
+
+    resetVivaSessionMintRateLimitsForTests();
+    delete process.env.VIVA_SESSION_PROJECTION_MAX_PER_MINUTE;
+    const defaulted = await guardVivaSessionProjectionAdmission(projectionRequest(), identity);
+
+    restoreEnv("NODE_ENV", "production");
+    const storeUnavailable = await guardVivaSessionProjectionAdmission(
+      projectionRequest(),
+      identity,
+    );
+    const storeUnavailableBody = (await storeUnavailable?.json()) as Record<string, unknown>;
+
+    const expectedFailure = {
+      body: {
+        error: "viva_session_projection_unavailable",
+        failure_class: "projection_unavailable",
+        stage: "pre_loop",
+      },
+      status: 503,
+    };
+    expect(observed).toEqual(rejectedLimits.map(() => expectedFailure));
+    expect(defaulted).toBe(null);
+    expect(storeUnavailable?.status).toBe(503);
+    expect(storeUnavailableBody).toEqual(expectedFailure.body);
+  });
+});
+
 function applyCanonicalOriginTestEnv() {
   process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
   process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
@@ -1616,6 +2456,61 @@ function applyCanonicalOriginTestEnv() {
   process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "20";
   delete process.env.VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET;
   process.env.VIVA_VOICE_SESSION_TOKEN_SECRET = STRONG_SESSION_SECRET;
+  process.env.VIVA_SESSION_TRUSTED_PROXY_HOPS = "1";
+}
+
+/**
+ * Baseline shared-store env for the admission suites. `NODE_ENV` stays `test` here so the
+ * bounded in-memory adapter is the selected one; individual cases raise it to `production` to
+ * exercise the public HTTP-adapter path.
+ */
+function applySharedSecurityStoreTestEnv() {
+  delete process.env.VIVA_SESSION_SECURITY_STORE_MODE;
+  delete process.env.VIVA_SESSION_SECURITY_STORE_REST_URL;
+  delete process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN;
+  delete process.env.VIVA_SESSION_PROJECTION_MAX_PER_MINUTE;
+  delete process.env.VIVA_WEB_SINGLE_INSTANCE;
+  restoreEnv("NODE_ENV", "test");
+}
+
+/**
+ * Independent restatement of the plan's admission key formula. These hashes are computed here
+ * from the documented recipe, never imported from the module under test, so a production drift
+ * in either key breaks the shared-bucket assertions.
+ */
+function mintAdmissionKeys(
+  ip: string,
+  userId = "synthetic-user",
+  studySetId = "biology-midterm",
+): readonly [string, string] {
+  const sep = String.fromCharCode(0);
+  return [
+    createHash("sha256").update(["mint", "ip", ip].join(sep), "utf8").digest("hex"),
+    createHash("sha256")
+      .update(["mint", "identity", userId, studySetId].join(sep), "utf8")
+      .digest("hex"),
+  ] as const;
+}
+
+/** A `retry-after` must be whole seconds inside the one-minute admission window, never a raw key. */
+function isBoundedRetryAfter(value: string | null | undefined): boolean {
+  if (typeof value !== "string" || !/^[0-9]+$/.test(value)) return false;
+  const seconds = Number.parseInt(value, 10);
+  return seconds >= 1 && seconds <= 60;
+}
+
+function isCanonicalUuidV4(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+}
+
+function projectionRequest(headers: Record<string, string> = {}): NextRequest {
+  return {
+    headers: new Headers({ "x-forwarded-for": "203.0.113.10", ...headers }),
+    method: "GET",
+    nextUrl: new URL(
+      "https://web.example/api/viva-session/projection?study_set_id=biology-midterm&voice_session_id=server-session",
+    ),
+  } as unknown as NextRequest;
 }
 
 function decodedCapabilityClaims(token: string | null): Record<string, unknown> {
@@ -1654,16 +2549,19 @@ function sessionRequest(
   path: string,
   body: Record<string, unknown>,
   headers: Record<string, string> = {},
+  options: { omitHeaders?: readonly string[] } = {},
 ): NextRequest {
+  const requestHeaders = new Headers({
+    "content-type": "application/json",
+    host: "web.example",
+    origin: "https://web.example",
+    "x-forwarded-for": "203.0.113.10",
+    ...headers,
+  });
+  for (const name of options.omitHeaders ?? []) requestHeaders.delete(name);
   const request = new Request(`https://web.example${path}`, {
     body: JSON.stringify(body),
-    headers: {
-      "content-type": "application/json",
-      host: "web.example",
-      origin: "https://web.example",
-      "x-forwarded-for": "203.0.113.10",
-      ...headers,
-    },
+    headers: requestHeaders,
     method: "POST",
   }) as unknown as NextRequest;
   Object.defineProperty(request, "nextUrl", {
@@ -1750,6 +2648,7 @@ function librarySnapshot({
   startAvailable = true,
   startToken,
   unavailableReason,
+  userId = "synthetic-user",
 }: {
   conceptCount?: number;
   ingestionStatus?: "pending" | "processing" | "ready" | "failed" | "retry";
@@ -1758,6 +2657,7 @@ function librarySnapshot({
   startAvailable?: boolean;
   startToken?: string;
   unavailableReason?: string;
+  userId?: string;
 }) {
   return {
     privacy: {
@@ -1799,10 +2699,10 @@ function librarySnapshot({
         question_count: questionCount,
         server_owned: true,
         title: "Biology Midterm",
-        user_id: "synthetic-user",
+        user_id: userId,
       },
     ],
-    user_id: "synthetic-user",
+    user_id: userId,
   };
 }
 

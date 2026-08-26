@@ -1,4 +1,4 @@
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { type NextRequest, NextResponse } from "next/server";
 
 export type VivaSessionRouteFailureClass = {
@@ -221,9 +221,124 @@ type VivaLibrarySnapshot = {
   study_sets?: VivaLibraryStudySet[];
 };
 
-type RateLimitBucket = {
+export type VivaSessionProjectionFailureClass = {
+  error: string;
+  failure_class: string;
+  stage: "pre_loop";
+};
+
+type SessionIdentity = {
+  userId: string;
+  studySetId: string;
+  sessionId: string;
+};
+
+/**
+ * The web-owned shared security-state contract. Every browser-facing security decision that must
+ * survive a horizontally scaled deployment goes through exactly these four methods: refresh
+ * reservation, refresh rotation, the single destructive-capability transaction primitive, and
+ * bounded admission. No method is optional and there is no fifth method — a process-local map
+ * beside this interface would silently reintroduce the per-instance gap it exists to close.
+ */
+export interface SessionSecurityStore {
+  consumeRefresh(input: {
+    credentialHash: string;
+    identity: SessionIdentity;
+    nowSeconds: number;
+    reservationTtlSeconds: 10;
+  }): Promise<
+    | { ok: true; absoluteExpiresAt: number; rotationId: string }
+    | {
+        ok: false;
+        reason: "expired" | "identity_mismatch" | "replayed" | "revoked" | "unavailable";
+      }
+  >;
+
+  rotateRefresh(
+    input:
+      | {
+          mode: "issue";
+          identity: SessionIdentity;
+          credentialHash: string;
+          refreshExpiresAt: number;
+          absoluteExpiresAt: number;
+        }
+      | {
+          mode: "rotate";
+          identity: SessionIdentity;
+          rotationId: string;
+          credentialHash: string;
+          refreshExpiresAt: number;
+          absoluteExpiresAt: number;
+        },
+  ): Promise<{ ok: true } | { ok: false; reason: "conflict" | "unavailable" }>;
+
+  revokeSession(
+    input:
+      | {
+          operation: "consume_delete_and_revoke";
+          capabilityHash: string;
+          capabilityExpiresAt: number;
+          nowSeconds: number;
+          purpose: "session_history_delete" | "study_set_delete";
+          scope:
+            | { kind: "session"; identity: SessionIdentity }
+            | { kind: "study_set"; userId: string; studySetId: string };
+        }
+      | {
+          operation: "register_restore";
+          capabilityHash: string;
+          capabilityExpiresAt: number;
+          nowSeconds: number;
+          purpose: "library_restore";
+          scope: { kind: "restore"; userId: string; studySetId: string; deletionId: string };
+        }
+      | {
+          operation: "consume_restore";
+          capabilityHash: string;
+          capabilityExpiresAt: number;
+          nowSeconds: number;
+          purpose: "library_restore";
+          scope: { kind: "restore"; userId: string; studySetId: string; deletionId: string };
+        },
+  ): Promise<
+    | { ok: true }
+    | { ok: false; reason: "conflict" | "expired" | "replayed" | "scope_mismatch" | "unavailable" }
+  >;
+
+  incrementRateLimit(input: {
+    keys: readonly [string, string];
+    limit: number;
+    nowMs: number;
+    windowMs: 60_000;
+  }): Promise<
+    | { ok: true; remaining: number; resetAtMs: number }
+    | { ok: false; reason: "limited" | "unavailable"; resetAtMs?: number }
+  >;
+}
+
+export type SessionSecurityStoreSelection =
+  | { ok: true; store: SessionSecurityStore }
+  | { ok: false; reason: "unavailable" };
+
+type SessionSecurityStoreOperation =
+  | "consume_refresh"
+  | "rotate_refresh"
+  | "revoke_session"
+  | "increment_rate_limit";
+
+type MemoryRateLimitRecord = {
   count: number;
-  resetAt: number;
+  resetAtMs: number;
+};
+
+type TrustedClientAdmission = { ok: true; value: string } | { ok: false; reason: "untrusted" };
+
+type AdmissionLimitRange = {
+  fallback: number;
+  max: number;
+  min: number;
+  name: string;
 };
 
 type SessionAccessTokenRouteVerification =
@@ -317,7 +432,41 @@ export const VIVA_SESSION_AUTH_FAILURE_PROFILES = {
   malformed: sessionAuthFailureProfile("malformed", "terminal", false),
   replayed: sessionAuthFailureProfile("replayed", "terminal", false),
 } as const satisfies Record<VivaSessionAuthFailureCode, VivaSessionAuthFailureProfile>;
-const mintRateLimits = new Map<string, RateLimitBucket>();
+
+const SESSION_SECURITY_STORE_PATH = "/v1/session-security";
+const SESSION_SECURITY_STORE_TIMEOUT_MS = 2_000;
+const SESSION_SECURITY_STORE_RESPONSE_MAX_BYTES = 16 * 1024;
+const SESSION_SECURITY_STORE_UNAVAILABLE = { ok: false, reason: "unavailable" } as const;
+const SESSION_SECURITY_STORE_RESPONSE_KEYS: ReadonlySet<string> = new Set([
+  "operation",
+  "request_id",
+  "result",
+  "schema_version",
+]);
+/**
+ * Bounded in-memory record capacity. Expired records are pruned in insertion order (which is
+ * expiry order for a fixed window), and a full map returns unavailable rather than evicting an
+ * active record: dropping a live bucket would hand an attacker a free admission slot.
+ */
+const MEMORY_SECURITY_STORE_MAX_RECORDS = 10_000;
+/** NUL, so no identifier value can span two fields of an admission key. */
+const ADMISSION_KEY_SEPARATOR = String.fromCharCode(0);
+const LOOPBACK_ADMISSION_BUCKET = "loopback";
+const TRUSTED_PROXY_MAX_HOPS = 5;
+const MINT_ADMISSION_LIMIT: AdmissionLimitRange = {
+  fallback: 12,
+  max: 120,
+  min: 1,
+  name: "VIVA_SESSION_MINT_MAX_PER_MINUTE",
+};
+const PROJECTION_ADMISSION_LIMIT: AdmissionLimitRange = {
+  fallback: 60,
+  max: 600,
+  min: 1,
+  name: "VIVA_SESSION_PROJECTION_MAX_PER_MINUTE",
+};
+/** One process-wide map, shared by every adapter this module hands out. */
+const memorySecurityStoreRateLimits = new Map<string, MemoryRateLimitRecord>();
 
 export async function handleVivaSessionStart(request: NextRequest) {
   const routeContext = { route: "start" } as const;
@@ -345,7 +494,7 @@ export async function handleVivaSessionStart(request: NextRequest) {
     userId,
   });
   if (bootstrap) return bootstrap;
-  const limit = guardMintRateLimit(request, userId, studySetId, logContext);
+  const limit = await guardSessionMintAdmission(request, userId, studySetId, logContext);
   if (limit) return limit;
 
   const minted = await mintSessionFromLibrary({
@@ -404,7 +553,7 @@ export async function handleVivaSessionRefresh(request: NextRequest) {
     return sessionAuthTerminalJsonError(authFailureCodeForTokenReason(reason), logContext);
   }
 
-  const limit = guardMintRateLimit(request, userId, studySetId, logContext);
+  const limit = await guardSessionMintAdmission(request, userId, studySetId, logContext);
   if (limit) return limit;
 
   const minted = await mintSessionFromLibrary({
@@ -428,7 +577,7 @@ export async function handleVivaSessionRefresh(request: NextRequest) {
 }
 
 export function resetVivaSessionMintRateLimitsForTests() {
-  mintRateLimits.clear();
+  memorySecurityStoreRateLimits.clear();
 }
 
 export function signVivaSessionBootstrapToken(input: {
@@ -627,36 +776,564 @@ function guardSessionBootstrapCapability(input: {
   return null;
 }
 
-function guardMintRateLimit(
+/**
+ * Bounded shared mint admission.
+ *
+ * Two distinct 503 shapes, and the difference is deliberate:
+ *
+ * - A configured admission limit that is present but outside its recorded range is a rejected
+ *   *configuration* value, so it takes the route's generic configuration-unavailable error.
+ * - A missing shared store, an unusable store, or an underivable trusted client identity all mean
+ *   the same thing — no bounded admission decision can be reached for this request at all — so
+ *   they take the shared-admission-unavailable error.
+ *
+ * Neither shape names an environment variable, a bucket key, or an upstream URL.
+ */
+async function guardSessionMintAdmission(
   request: NextRequest,
   userId: string,
   studySetId: string,
   logContext: VivaSessionRouteLogContext,
-): NextResponse | null {
-  const max = positiveInteger(process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE, 12);
-  const now = Date.now();
-  const ipKey = `ip\u0000${clientIp(request)}`;
-  const identityKey = `identity\u0000${userId}\u0000${studySetId}`;
-  const ipBucket = currentRateLimitBucket(ipKey, now);
-  const identityBucket = currentRateLimitBucket(identityKey, now);
-  if (ipBucket.count >= max || identityBucket.count >= max) {
-    return sessionJsonError(429, "session_mint_rate_limited", "blocked", {
-      ...logContext,
-      failure_class: "rate_limit",
-    });
-  }
-  ipBucket.count += 1;
-  identityBucket.count += 1;
-  mintRateLimits.set(ipKey, ipBucket);
-  mintRateLimits.set(identityKey, identityBucket);
-  return null;
+): Promise<NextResponse<VivaSessionRouteFailureClass> | null> {
+  const limit = validatedAdmissionLimit(MINT_ADMISSION_LIMIT);
+  if (limit === null) return sessionConfigUnavailableResponse(logContext);
+  const client = trustedClientAdmissionBucket(request);
+  if (!client.ok) return sessionAdmissionUnavailableResponse(logContext);
+  const selection = vivaSessionSecurityStore();
+  if (!selection.ok) return sessionAdmissionUnavailableResponse(logContext);
+
+  const nowMs = Date.now();
+  const outcome = await selection.store.incrementRateLimit({
+    keys: [
+      admissionKeyHash(["mint", "ip", client.value]),
+      admissionKeyHash(["mint", "identity", userId, studySetId]),
+    ],
+    limit,
+    nowMs,
+    windowMs: RATE_LIMIT_WINDOW_MS,
+  });
+  if (outcome.ok) return null;
+  if (outcome.reason === "unavailable") return sessionAdmissionUnavailableResponse(logContext);
+  return sessionJsonError(429, "session_mint_rate_limited", "blocked", {
+    ...logContext,
+    failure_class: "rate_limit",
+    retryAfterSeconds: admissionRetryAfterSeconds(outcome.resetAtMs, nowMs),
+  });
 }
 
-function currentRateLimitBucket(key: string, now: number): RateLimitBucket {
-  const current = mintRateLimits.get(key);
-  return current && current.resetAt > now
-    ? current
-    : { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+/**
+ * Bounded shared projection admission, keyed by voice session rather than by study set so a
+ * projection flood can never consume mint capacity (or the reverse). Task 9's route calls this
+ * after it has verified the browser session credential and derived identity from the claims.
+ */
+export async function guardVivaSessionProjectionAdmission(
+  request: NextRequest,
+  identity: SessionIdentity,
+): Promise<NextResponse<VivaSessionProjectionFailureClass> | null> {
+  const limit = validatedAdmissionLimit(PROJECTION_ADMISSION_LIMIT);
+  if (limit === null) return projectionAdmissionUnavailableResponse();
+  const client = trustedClientAdmissionBucket(request);
+  if (!client.ok) return projectionAdmissionUnavailableResponse();
+  const selection = vivaSessionSecurityStore();
+  if (!selection.ok) return projectionAdmissionUnavailableResponse();
+
+  const nowMs = Date.now();
+  const outcome = await selection.store.incrementRateLimit({
+    keys: [
+      admissionKeyHash(["projection", "ip", client.value]),
+      admissionKeyHash([
+        "projection",
+        "session",
+        identity.userId,
+        identity.studySetId,
+        identity.sessionId,
+      ]),
+    ],
+    limit,
+    nowMs,
+    windowMs: RATE_LIMIT_WINDOW_MS,
+  });
+  if (outcome.ok) return null;
+  if (outcome.reason === "unavailable") return projectionAdmissionUnavailableResponse();
+  return projectionAdmissionJson(429, "session_projection_rate_limited", "rate_limit", {
+    retryAfterSeconds: admissionRetryAfterSeconds(outcome.resetAtMs, nowMs),
+  });
+}
+
+function projectionAdmissionUnavailableResponse(): NextResponse<VivaSessionProjectionFailureClass> {
+  return projectionAdmissionJson(
+    503,
+    "viva_session_projection_unavailable",
+    "projection_unavailable",
+  );
+}
+
+function projectionAdmissionJson(
+  status: number,
+  error: string,
+  failureClass: string,
+  options: { retryAfterSeconds?: number } = {},
+): NextResponse<VivaSessionProjectionFailureClass> {
+  const headers = new Headers({ "cache-control": "no-store" });
+  if (options.retryAfterSeconds !== undefined) {
+    headers.set("retry-after", String(options.retryAfterSeconds));
+  }
+  return NextResponse.json(
+    { error, failure_class: failureClass, stage: "pre_loop" as const },
+    { headers, status },
+  );
+}
+
+/** Whole seconds only, never below one, and never derived from a raw bucket key. */
+function admissionRetryAfterSeconds(resetAtMs: number | undefined, nowMs: number): number {
+  const reset =
+    resetAtMs !== undefined && Number.isSafeInteger(resetAtMs)
+      ? resetAtMs
+      : nowMs + RATE_LIMIT_WINDOW_MS;
+  return Math.max(1, Math.ceil((reset - nowMs) / 1_000));
+}
+
+/**
+ * `sha256(part0 SEP part1 SEP ...)` over the NUL separator, so no caller-supplied identifier can
+ * impersonate another bucket by embedding the separator. PII-bearing parts never leave this
+ * function unhashed, which is what lets an identity key travel to the shared store.
+ */
+function admissionKeyHash(parts: readonly string[]): string {
+  return createHash("sha256").update(parts.join(ADMISSION_KEY_SEPARATOR), "utf8").digest("hex");
+}
+
+/**
+ * A present-but-out-of-range admission limit fails configuration instead of silently falling back
+ * to the default: a deployment that meant to raise its ceiling must not be quietly narrowed.
+ */
+function validatedAdmissionLimit(range: AdmissionLimitRange): number | null {
+  const raw = process.env[range.name]?.trim();
+  if (raw === undefined || raw === "") return range.fallback;
+  if (!/^[0-9]+$/.test(raw)) return null;
+  const value = Number.parseInt(raw, 10);
+  return value >= range.min && value <= range.max ? value : null;
+}
+
+/**
+ * Trusted client identity for admission bucketing.
+ *
+ * Next's App Router hands a route handler no trusted peer socket address, so public direct-origin
+ * mode is unsupported: a public deployment must declare its hop count and terminate every request
+ * through that topology. No platform header (`x-real-ip`, `true-client-ip`, Cloudflare, Vercel) is
+ * ever auto-trusted, because any of them is caller-settable without the declared topology.
+ */
+function trustedClientAdmissionBucket(request: NextRequest): TrustedClientAdmission {
+  const raw = process.env.VIVA_SESSION_TRUSTED_PROXY_HOPS?.trim();
+  const loopbackOnlyDeployment = inMemorySessionSecurityStoreAllowed();
+  if (raw === undefined || raw === "" || raw === "0") {
+    return loopbackOnlyDeployment
+      ? { ok: true, value: LOOPBACK_ADMISSION_BUCKET }
+      : { ok: false, reason: "untrusted" };
+  }
+  if (!/^[0-9]+$/.test(raw)) return { ok: false, reason: "untrusted" };
+  const hops = Number.parseInt(raw, 10);
+  if (hops < 1 || hops > TRUSTED_PROXY_MAX_HOPS) return { ok: false, reason: "untrusted" };
+
+  const forwarded = request.headers.get("x-forwarded-for");
+  if (forwarded === null) return { ok: false, reason: "untrusted" };
+  const entries = forwarded.split(",").map((entry) => entry.trim());
+  if (entries.length < hops) return { ok: false, reason: "untrusted" };
+  const normalized: string[] = [];
+  for (const entry of entries) {
+    const literal = normalizedIpLiteral(entry);
+    if (!literal) return { ok: false, reason: "untrusted" };
+    normalized.push(literal);
+  }
+  const selected = normalized.at(-hops);
+  return selected ? { ok: true, value: selected } : { ok: false, reason: "untrusted" };
+}
+
+/** Accepts an IPv4 dotted quad or a bracketed/plain IPv6 literal, with an optional port. */
+function normalizedIpLiteral(entry: string): string | null {
+  const unquoted = entry.replace(/^"(.*)"$/, "$1").trim();
+  if (!unquoted) return null;
+  const bracketed = /^\[([0-9A-Fa-f:.]+)\](?::\d{1,5})?$/.exec(unquoted);
+  if (bracketed?.[1]) return isIpv6Literal(bracketed[1]) ? bracketed[1].toLowerCase() : null;
+  const ipv4WithPort = /^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/.exec(unquoted);
+  const candidate = ipv4WithPort?.[1] ?? unquoted;
+  if (isIpv4Literal(candidate)) return candidate;
+  return isIpv6Literal(candidate) ? candidate.toLowerCase() : null;
+}
+
+function isIpv4Literal(value: string): boolean {
+  const octets = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value);
+  if (!octets) return false;
+  return octets.slice(1).every((octet) => Number.parseInt(octet, 10) <= 255);
+}
+
+function isIpv6Literal(value: string): boolean {
+  if (!value.includes(":") || !/^[0-9A-Fa-f:.]+$/.test(value)) return false;
+  if (value.split("::").length > 2) return false;
+  const groups = value.split(":");
+  return groups.length >= 3 && groups.length <= 8;
+}
+
+/**
+ * Adapter selection. The bounded in-memory adapter is legal only under `NODE_ENV=test`, or when
+ * the canonical web origin and the agent URL are both loopback AND the deployment explicitly
+ * asserts a single web instance. Anything else selects the HTTP adapter and fails closed when its
+ * two required values are absent; the in-memory adapter is never a fallback after HTTP failure.
+ */
+export function vivaSessionSecurityStore(): SessionSecurityStoreSelection {
+  const memoryAllowed = inMemorySessionSecurityStoreAllowed();
+  const mode = process.env.VIVA_SESSION_SECURITY_STORE_MODE?.trim();
+  if (mode !== undefined && mode !== "" && mode !== "memory") {
+    return SESSION_SECURITY_STORE_UNAVAILABLE;
+  }
+  if (mode === "memory") {
+    return memoryAllowed
+      ? { ok: true, store: createMemorySessionSecurityStore() }
+      : SESSION_SECURITY_STORE_UNAVAILABLE;
+  }
+  if (memoryAllowed) return { ok: true, store: createMemorySessionSecurityStore() };
+  const rest = createRestSessionSecurityStore();
+  return rest ? { ok: true, store: rest } : SESSION_SECURITY_STORE_UNAVAILABLE;
+}
+
+/** Test-only inspector for the bounded in-memory record map. */
+export function vivaSessionSecurityStoreMemoryRecordCountForTests(): number {
+  return memorySecurityStoreRateLimits.size;
+}
+
+function inMemorySessionSecurityStoreAllowed(): boolean {
+  if (process.env.NODE_ENV === "test") return true;
+  if (process.env.VIVA_WEB_SINGLE_INSTANCE?.trim() !== "1") return false;
+  const canonical = canonicalWebOrigin();
+  if (!canonical.ok) return false;
+  let originHostname: string;
+  try {
+    originHostname = new URL(canonical.value.origin).hostname;
+  } catch {
+    return false;
+  }
+  return isLoopbackHostname(originHostname) && isLoopbackAgentUrl(serverAgentBaseUrl());
+}
+
+/** Bounded process-local adapter. Every call returns a fresh facade over the one shared map. */
+function createMemorySessionSecurityStore(): SessionSecurityStore {
+  return {
+    consumeRefresh: async () => memorySecurityStoreTransactionDeferred(),
+    incrementRateLimit: async (input) => memoryIncrementRateLimit(input),
+    revokeSession: async () => memorySecurityStoreTransactionDeferred(),
+    rotateRefresh: async () => memorySecurityStoreTransactionDeferred(),
+  };
+}
+
+/**
+ * The refresh and destructive halves of the in-memory adapter are OWNED BY Tasks 7 and 8A of this
+ * plan, which carry their own RED tests for the reservation, rotation, tombstone, and
+ * capability-consumption state machines. Until those land this adapter reports the fail-closed
+ * direction rather than inventing untested transaction semantics here; no route in the tree calls
+ * these three methods yet, so nothing regresses. The HTTP adapter below implements all four.
+ */
+function memorySecurityStoreTransactionDeferred() {
+  return SESSION_SECURITY_STORE_UNAVAILABLE;
+}
+
+function memoryIncrementRateLimit(input: {
+  keys: readonly [string, string];
+  limit: number;
+  nowMs: number;
+  windowMs: 60_000;
+}):
+  | { ok: true; remaining: number; resetAtMs: number }
+  | { ok: false; reason: "limited" | "unavailable"; resetAtMs?: number } {
+  pruneExpiredMemoryRateLimitRecords(input.nowMs);
+  const resetAtMs = Math.floor(input.nowMs / input.windowMs) * input.windowMs + input.windowMs;
+  const keys = [...new Set(input.keys)];
+
+  let newRecords = 0;
+  const counts: number[] = [];
+  for (const key of keys) {
+    const record = memorySecurityStoreRateLimits.get(key);
+    const active = record && record.resetAtMs > input.nowMs ? record : null;
+    if (!active) newRecords += 1;
+    counts.push(active?.count ?? 0);
+  }
+  if (memorySecurityStoreRateLimits.size + newRecords > MEMORY_SECURITY_STORE_MAX_RECORDS) {
+    return SESSION_SECURITY_STORE_UNAVAILABLE;
+  }
+  if (counts.some((count) => count >= input.limit)) {
+    return { ok: false, reason: "limited", resetAtMs };
+  }
+  // Commit every key or none: one key of a pair is never spent on a rejected admission.
+  for (const key of keys) {
+    const record = memorySecurityStoreRateLimits.get(key);
+    if (record && record.resetAtMs > input.nowMs) {
+      record.count += 1;
+      continue;
+    }
+    memorySecurityStoreRateLimits.delete(key);
+    memorySecurityStoreRateLimits.set(key, { count: 1, resetAtMs });
+  }
+  return { ok: true, remaining: Math.max(0, input.limit - Math.max(...counts) - 1), resetAtMs };
+}
+
+/**
+ * Insertion order is expiry order for a fixed window, so the expired prefix can be dropped without
+ * scanning the whole map. A clock that steps backwards only ends the sweep early; it never evicts
+ * a live record.
+ */
+function pruneExpiredMemoryRateLimitRecords(nowMs: number): void {
+  for (const [key, record] of memorySecurityStoreRateLimits) {
+    if (record.resetAtMs > nowMs) return;
+    memorySecurityStoreRateLimits.delete(key);
+  }
+}
+
+function createRestSessionSecurityStore(): SessionSecurityStore | null {
+  const origin = parseCanonicalOrigin(process.env.VIVA_SESSION_SECURITY_STORE_REST_URL);
+  if (!origin.ok) return null;
+  const credential = validatedSecret("VIVA_SESSION_SECURITY_STORE_REST_TOKEN", {
+    maxBytes: WEB_OPAQUE_CREDENTIAL_MAX_BYTES,
+  });
+  if (!credential) return null;
+  const endpoint = `${origin.value.origin}${SESSION_SECURITY_STORE_PATH}`;
+  return {
+    consumeRefresh: (input) =>
+      sessionSecurityStoreCommand(
+        endpoint,
+        credential,
+        "consume_refresh",
+        input,
+        isConsumeRefreshResult,
+      ),
+    incrementRateLimit: (input) =>
+      sessionSecurityStoreCommand(
+        endpoint,
+        credential,
+        "increment_rate_limit",
+        input,
+        isIncrementRateLimitResult,
+      ),
+    revokeSession: (input) =>
+      sessionSecurityStoreCommand(
+        endpoint,
+        credential,
+        "revoke_session",
+        input,
+        isRevokeSessionResult,
+      ),
+    rotateRefresh: (input) =>
+      sessionSecurityStoreCommand(
+        endpoint,
+        credential,
+        "rotate_refresh",
+        input,
+        isRotateRefreshResult,
+      ),
+  };
+}
+
+/**
+ * One state-changing command, never automatically retried. A timeout is an ambiguous commit and
+ * fails closed: the caller sees `unavailable` and must obtain fresh authority rather than replay.
+ */
+async function sessionSecurityStoreCommand<T extends { ok: boolean }>(
+  endpoint: string,
+  credential: string,
+  operation: SessionSecurityStoreOperation,
+  input: unknown,
+  isResult: (value: unknown) => value is T,
+): Promise<T | { ok: false; reason: "unavailable" }> {
+  const requestId = randomUUID();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), SESSION_SECURITY_STORE_TIMEOUT_MS);
+  try {
+    const response = await fetch(endpoint, {
+      body: JSON.stringify({ input, operation, request_id: requestId, schema_version: 1 }),
+      cache: "no-store",
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${credential}`,
+        "content-type": "application/json",
+      },
+      method: "POST",
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      await cancelStreamQuietly(response.body);
+      return SESSION_SECURITY_STORE_UNAVAILABLE;
+    }
+    const bytes = await readBoundedStoreResponse(response, controller.signal);
+    if (!bytes) return SESSION_SECURITY_STORE_UNAVAILABLE;
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      return SESSION_SECURITY_STORE_UNAVAILABLE;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text) as unknown;
+    } catch {
+      return SESSION_SECURITY_STORE_UNAVAILABLE;
+    }
+    if (!isRecord(parsed)) return SESSION_SECURITY_STORE_UNAVAILABLE;
+    const keys = Object.keys(parsed);
+    if (
+      keys.length !== SESSION_SECURITY_STORE_RESPONSE_KEYS.size ||
+      keys.some((key) => !SESSION_SECURITY_STORE_RESPONSE_KEYS.has(key)) ||
+      parsed.schema_version !== 1 ||
+      parsed.request_id !== requestId ||
+      parsed.operation !== operation ||
+      !isResult(parsed.result)
+    ) {
+      return SESSION_SECURITY_STORE_UNAVAILABLE;
+    }
+    return parsed.result;
+  } catch {
+    return SESSION_SECURITY_STORE_UNAVAILABLE;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function readBoundedStoreResponse(
+  response: Response,
+  signal: AbortSignal,
+): Promise<Uint8Array | null> {
+  const declared = response.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number.parseInt(declared, 10);
+    if (
+      !Number.isSafeInteger(length) ||
+      length < 0 ||
+      length > SESSION_SECURITY_STORE_RESPONSE_MAX_BYTES
+    ) {
+      await cancelStreamQuietly(response.body);
+      return null;
+    }
+  }
+  const body = response.body;
+  if (!body) return new Uint8Array();
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let bounded = true;
+  try {
+    while (true) {
+      if (signal.aborted) {
+        bounded = false;
+        break;
+      }
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      if (!chunk.value) continue;
+      total += chunk.value.byteLength;
+      if (total > SESSION_SECURITY_STORE_RESPONSE_MAX_BYTES) {
+        bounded = false;
+        break;
+      }
+      chunks.push(chunk.value);
+    }
+  } catch {
+    bounded = false;
+  } finally {
+    await cancelReaderQuietly(reader);
+  }
+  if (!bounded) return null;
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged;
+}
+
+async function cancelReaderQuietly(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+  try {
+    await reader.cancel();
+  } catch {
+    // The reader is already closed or errored; nothing else to release.
+  }
+}
+
+async function cancelStreamQuietly(body: ReadableStream<Uint8Array> | null): Promise<void> {
+  try {
+    await body?.cancel();
+  } catch {
+    // Best effort only; the caller is already returning the fail-closed outcome.
+  }
+}
+
+function hasExactKeys(value: unknown, expected: readonly string[]): boolean {
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => keys.includes(key));
+}
+
+function isIncrementRateLimitResult(
+  value: unknown,
+): value is Awaited<ReturnType<SessionSecurityStore["incrementRateLimit"]>> {
+  if (!isRecord(value)) return false;
+  if (value.ok === true) {
+    return (
+      hasExactKeys(value, ["ok", "remaining", "resetAtMs"]) &&
+      Number.isSafeInteger(value.remaining) &&
+      (value.remaining as number) >= 0 &&
+      Number.isSafeInteger(value.resetAtMs)
+    );
+  }
+  if (value.ok !== false) return false;
+  if (value.reason !== "limited" && value.reason !== "unavailable") return false;
+  if (hasExactKeys(value, ["ok", "reason"])) return true;
+  return (
+    hasExactKeys(value, ["ok", "reason", "resetAtMs"]) && Number.isSafeInteger(value.resetAtMs)
+  );
+}
+
+function isConsumeRefreshResult(
+  value: unknown,
+): value is Awaited<ReturnType<SessionSecurityStore["consumeRefresh"]>> {
+  if (!isRecord(value)) return false;
+  if (value.ok === true) {
+    return (
+      hasExactKeys(value, ["ok", "absoluteExpiresAt", "rotationId"]) &&
+      Number.isSafeInteger(value.absoluteExpiresAt) &&
+      nonEmptyClaimString(value.rotationId) !== null
+    );
+  }
+  return (
+    value.ok === false &&
+    hasExactKeys(value, ["ok", "reason"]) &&
+    ["expired", "identity_mismatch", "replayed", "revoked", "unavailable"].includes(
+      String(value.reason),
+    )
+  );
+}
+
+function isRotateRefreshResult(
+  value: unknown,
+): value is Awaited<ReturnType<SessionSecurityStore["rotateRefresh"]>> {
+  if (!isRecord(value)) return false;
+  if (value.ok === true) return hasExactKeys(value, ["ok"]);
+  return (
+    value.ok === false &&
+    hasExactKeys(value, ["ok", "reason"]) &&
+    ["conflict", "unavailable"].includes(String(value.reason))
+  );
+}
+
+function isRevokeSessionResult(
+  value: unknown,
+): value is Awaited<ReturnType<SessionSecurityStore["revokeSession"]>> {
+  if (!isRecord(value)) return false;
+  if (value.ok === true) return hasExactKeys(value, ["ok"]);
+  return (
+    value.ok === false &&
+    hasExactKeys(value, ["ok", "reason"]) &&
+    ["conflict", "expired", "replayed", "scope_mismatch", "unavailable"].includes(
+      String(value.reason),
+    )
+  );
 }
 
 async function readSessionPayload(
@@ -1255,12 +1932,10 @@ export function validateVivaWebSecret(
  * active and previous HMAC keys, the three scoped agent bearers, and the shared security-store
  * credential `VIVA_SESSION_SECURITY_STORE_REST_TOKEN`.
  *
- * The first three are validated here today. The fourth is DEFERRED TO TASK 4, which introduces
- * the shared `SessionSecurityStore` adapter that is its only reader: validating it before that
- * reader exists would be inert configuration that no route can act on. Task 4 must call this
- * function for it with `maxBytes: WEB_OPAQUE_CREDENTIAL_MAX_BYTES`, exactly as the scoped
- * bearers do. Recorded here rather than only in the lane report so the obligation cannot be
- * silently dropped when Task 4 dispatches.
+ * All four are validated here now. The fourth was deferred to Task 4, which introduced the shared
+ * `SessionSecurityStore` HTTP adapter that is its only reader; `createRestSessionSecurityStore`
+ * calls this function for it with `maxBytes: WEB_OPAQUE_CREDENTIAL_MAX_BYTES`, exactly as the
+ * scoped bearers do, and a weak value makes the store unselectable rather than unauthenticated.
  */
 function validatedSecret(name: string, options: { maxBytes?: number } = {}): string | null {
   const validation = validateVivaWebSecret(process.env[name], options);
@@ -1275,7 +1950,20 @@ function validatedSecret(name: string, options: { maxBytes?: number } = {}): str
 function canonicalWebOrigin():
   | { ok: true; value: CanonicalWebOrigin }
   | { ok: false; reason: "missing" | "invalid" | "insecure_public" } {
-  const raw = process.env.VIVA_WEB_CANONICAL_ORIGIN?.trim();
+  return parseCanonicalOrigin(process.env.VIVA_WEB_CANONICAL_ORIGIN);
+}
+
+/**
+ * One canonical-origin grammar, shared by the web origin and the shared security-store URL: the
+ * configured value must equal its own parsed origin, carry no credentials/path/query/fragment,
+ * and use `https:` unless its host is loopback.
+ */
+function parseCanonicalOrigin(
+  value: string | undefined,
+):
+  | { ok: true; value: CanonicalWebOrigin }
+  | { ok: false; reason: "missing" | "invalid" | "insecure_public" } {
+  const raw = value?.trim();
   if (!raw) return { ok: false, reason: "missing" };
   let url: URL;
   try {
@@ -1492,6 +2180,24 @@ function sessionConfigUnavailableResponse(
   );
 }
 
+/**
+ * No bounded admission decision could be reached for this request — no shared store, an unusable
+ * store, or no trusted client identity. Identical on start and refresh so the shape never tells a
+ * caller which half of the admission path refused them.
+ */
+function sessionAdmissionUnavailableResponse(
+  logContext: VivaSessionRouteLogContext,
+): NextResponse<VivaSessionRouteFailureClass> {
+  return sessionPreLoopJsonError(
+    503,
+    "viva_session_security_store_unavailable",
+    "failed",
+    "session_bootstrap_unavailable",
+    PRE_LOOP_SESSION_TERMINAL_REASON,
+    logContext,
+  );
+}
+
 function sessionPreLoopJsonError(
   status: number,
   error: string,
@@ -1528,6 +2234,7 @@ function sessionJsonError(
     logError?: string;
     logFailureClass?: string;
     logTokenRefreshOutcome?: string;
+    retryAfterSeconds?: number;
     route?: VivaSessionRouteName;
     stage?: "pre_loop" | "session";
     terminal_reason?: string;
@@ -1549,10 +2256,11 @@ function sessionJsonError(
     status,
     options,
   );
-  return NextResponse.json(body, {
-    headers: { "cache-control": "no-store" },
-    status,
-  });
+  const headers = new Headers({ "cache-control": "no-store" });
+  if (options.retryAfterSeconds !== undefined) {
+    headers.set("retry-after", String(options.retryAfterSeconds));
+  }
+  return NextResponse.json(body, { headers, status });
 }
 
 export function vivaSessionRouteFailureLogPayload(
@@ -1630,24 +2338,6 @@ function deploymentSha(): string | null {
     if (value) return value.slice(0, 64);
   }
   return null;
-}
-
-function clientIp(request: NextRequest): string {
-  const metadataIp = (request as { ip?: unknown }).ip;
-  if (typeof metadataIp === "string" && metadataIp.trim()) return metadataIp.trim();
-  const trustedPlatformIp =
-    request.headers.get("x-vercel-forwarded-for")?.split(",").at(-1)?.trim() ||
-    request.headers.get("cf-connecting-ip")?.trim() ||
-    request.headers.get("true-client-ip")?.trim() ||
-    request.headers.get("x-real-ip")?.trim();
-  if (trustedPlatformIp) return trustedPlatformIp;
-  const forwarded = request.headers
-    .get("x-forwarded-for")
-    ?.split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-    .at(-1);
-  return forwarded || "unknown";
 }
 
 function serverAgentBaseUrl(): string | null {
