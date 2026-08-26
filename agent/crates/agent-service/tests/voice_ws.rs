@@ -9637,6 +9637,18 @@ async fn send_client_frame(socket: &mut TestWebSocket, frame: &ClientFrame) {
         .unwrap();
 }
 
+/// The v5 initial `session_config` frame, built from Plan 05's session fixture.
+///
+/// The frozen unversioned full-session fixtures still carry v4 client frames, so a
+/// test that only needs to open a session builds the frame here instead of reading
+/// `fixture.client[0]`; the session payload itself is still the shared fixture.
+fn fixture_session_config_frame() -> ClientFrame {
+    serde_json::from_str(&session_config_json_with_token(
+        "placeholder-session-material",
+    ))
+    .expect("v5 session config frame parses")
+}
+
 fn session_config_json_with_token(token: &str) -> String {
     let session: serde_json::Value = serde_json::from_str(include_str!(
         "../../../fixtures/voice-protocol/session-config.json"
