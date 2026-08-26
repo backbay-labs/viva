@@ -9,7 +9,6 @@ dependencies = [
  "agent-domain",
  "async-trait",
  "axum",
- "base64",
  "bytes",
  "data",
  "futures-util",
@@ -17,12 +16,9 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "thiserror",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
- "tracing",
- "uuid",
 ]
 
 [[package]]

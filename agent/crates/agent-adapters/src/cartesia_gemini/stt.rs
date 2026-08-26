@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use reqwest::Url;
 use serde_json::Value;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::{
@@ -14,8 +15,17 @@ use tokio_tungstenite::{
     },
     MaybeTlsStream, WebSocketStream,
 };
+use tokio_util::sync::CancellationToken;
 
-use agent_domain::{AudioFrame, BrainError};
+use agent_domain::{
+    AudioFrame, BrainError, BrainFailureClass, BrainFailureStage, BrainProviderFailureParts,
+};
+
+use super::{
+    brain_failure, cartesia_handshake_classification, provider_diagnostic_failure,
+    websocket_close_code, websocket_handshake_status, ProviderDiagnostic, ProviderDiagnosticCode,
+    ProviderStageLabel,
+};
 
 use super::constants::{
     CARTESIA_SAMPLE_RATE, DEFAULT_CARTESIA_VERSION, DEFAULT_INK_MODEL,
@@ -25,17 +35,122 @@ use super::constants::{
 const CARTESIA_VERSION_HEADER: &str = "cartesia-version";
 const INK_CLOSE_COMMAND: &str = r#"{"type":"close"}"#;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// `ADAPTER-01` / `A-13.2`: Plan 06 collapsed `BrainError` to one classified
+/// variant, so every Ink failure is classified where it is observed. Only a
+/// closed `error_kind` token travels; a provider message, close reason, URL,
+/// credential, or transcript never reaches the metadata.
+fn ink_failure(
+    failure_class: BrainFailureClass,
+    stage: BrainFailureStage,
+    retry_eligible: bool,
+    error_kind: &'static str,
+) -> BrainError {
+    brain_failure(BrainProviderFailureParts {
+        failure_class,
+        stage,
+        retry_eligible,
+        latency_ms: 0,
+        provider: "cartesia".to_owned(),
+        model: "cartesia-ink".to_owned(),
+        metadata: format!("stage=cartesia_ink error_kind={error_kind}"),
+    })
+}
+
+fn ink_transport_failure(error_kind: &'static str) -> BrainError {
+    ink_failure(
+        BrainFailureClass::NetworkDisconnect,
+        BrainFailureStage::Transport,
+        true,
+        error_kind,
+    )
+}
+
+fn ink_protocol_failure(error_kind: &'static str) -> BrainError {
+    ink_failure(
+        BrainFailureClass::MalformedStream,
+        BrainFailureStage::Provider,
+        true,
+        error_kind,
+    )
+}
+
+fn ink_auth_failure(error_kind: &'static str) -> BrainError {
+    ink_failure(
+        BrainFailureClass::ProviderAuthFailure,
+        BrainFailureStage::ProviderAuth,
+        false,
+        error_kind,
+    )
+}
+
+/// `ADAPTER-06`: a refused Ink upgrade keeps only its numeric HTTP status and
+/// one allowlisted diagnostic code. The refusal body, the request URL, and the
+/// query are discarded whole.
+fn ink_handshake_failure(status: u16) -> BrainError {
+    let (diagnostic, failure_class, stage) =
+        cartesia_handshake_classification(ProviderStageLabel::CartesiaInk, status);
+    provider_diagnostic_failure(
+        diagnostic,
+        failure_class,
+        stage,
+        "cartesia-ink",
+        Duration::ZERO,
+    )
+}
+
+/// A connected Ink socket the provider closed. Only the numeric close code
+/// survives; the close reason never leaves the transport.
+fn ink_close_failure(close_code: Option<u16>) -> BrainError {
+    provider_diagnostic_failure(
+        ProviderDiagnostic::new(ProviderDiagnosticCode::CartesiaInkWsClosed, true)
+            .with_close_code(close_code),
+        BrainFailureClass::MalformedStream,
+        BrainFailureStage::Provider,
+        "cartesia-ink",
+        Duration::ZERO,
+    )
+}
+
+/// A provider `error` frame. Its message and provider-authored code collapse
+/// into the stage's one provider-error diagnostic.
+fn ink_provider_error_failure() -> BrainError {
+    provider_diagnostic_failure(
+        ProviderDiagnostic::new(ProviderDiagnosticCode::CartesiaInkProviderError, true),
+        BrainFailureClass::MalformedStream,
+        BrainFailureStage::Provider,
+        "cartesia-ink",
+        Duration::ZERO,
+    )
+}
+
+/// `ADAPTER-07`: the operator-supplied Ink numerics are finite bounded values,
+/// not free-form strings. A volume threshold is a fraction; a silence window is
+/// a positive number of seconds this adapter is willing to wait inside its own
+/// stage deadline.
+pub const INK_MIN_VOLUME_RANGE: std::ops::RangeInclusive<f32> = 0.0..=1.0;
+pub const INK_MAX_SILENCE_SECS_RANGE: std::ops::RangeInclusive<f32> = 0.01..=60.0;
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct InkConfig {
     pub websocket_url: String,
     pub model: String,
     pub language: String,
     pub encoding: String,
     pub sample_rate: u32,
-    pub min_volume: String,
-    pub max_silence_duration_secs: String,
+    pub min_volume: f32,
+    pub max_silence_duration_secs: f32,
     pub cartesia_version: String,
     pub stage_timeout: Duration,
+}
+
+/// Parse one operator-supplied Ink numeric, or refuse it.
+///
+/// `NaN`, an infinity, a value outside the documented range, and anything
+/// carrying query syntax are all rejected the same way: the caller keeps its
+/// documented safe default. Operator-controlled query syntax is never accepted.
+pub fn parse_ink_numeric(value: &str, range: &std::ops::RangeInclusive<f32>) -> Option<f32> {
+    let parsed = value.trim().parse::<f32>().ok()?;
+    (parsed.is_finite() && range.contains(&parsed)).then_some(parsed)
 }
 
 impl Default for InkConfig {
@@ -46,8 +161,8 @@ impl Default for InkConfig {
             language: "en".to_owned(),
             encoding: "pcm_s16le".to_owned(),
             sample_rate: CARTESIA_SAMPLE_RATE,
-            min_volume: "0.05".to_owned(),
-            max_silence_duration_secs: "0.7".to_owned(),
+            min_volume: 0.05,
+            max_silence_duration_secs: 0.7,
             cartesia_version: DEFAULT_CARTESIA_VERSION.to_owned(),
             stage_timeout: Duration::from_secs(4),
         }
@@ -55,38 +170,49 @@ impl Default for InkConfig {
 }
 
 impl InkConfig {
+    /// `ADAPTER-07`: the endpoint is assembled through URL query-pair APIs, so
+    /// every operator-supplied value is percent-encoded data. A `&`, `#`, or `?`
+    /// in a value can no longer inject a second pair or truncate the query.
     pub fn websocket_endpoint(&self) -> String {
-        format!(
-            "{}?model={}&language={}&encoding={}&sample_rate={}&min_volume={}&max_silence_duration_secs={}&cartesia_version={}",
-            self.websocket_url,
-            self.model,
-            self.language,
-            self.encoding,
-            self.sample_rate,
-            self.min_volume,
-            self.max_silence_duration_secs,
-            self.cartesia_version
-        )
+        self.websocket_url_result()
+            .map_or_else(|| self.websocket_url.clone(), String::from)
+    }
+
+    fn websocket_url_result(&self) -> Option<Url> {
+        let mut url = Url::parse(&self.websocket_url).ok()?;
+        url.set_fragment(None);
+        url.query_pairs_mut()
+            .clear()
+            .append_pair("model", &self.model)
+            .append_pair("language", &self.language)
+            .append_pair("encoding", &self.encoding)
+            .append_pair("sample_rate", &self.sample_rate.to_string())
+            .append_pair("min_volume", &self.min_volume.to_string())
+            .append_pair(
+                "max_silence_duration_secs",
+                &self.max_silence_duration_secs.to_string(),
+            )
+            .append_pair("cartesia_version", &self.cartesia_version);
+        Some(url)
     }
 
     pub fn websocket_request(&self, api_key: &str) -> Result<Request<()>, BrainError> {
         let api_key = api_key.trim();
         if api_key.is_empty() {
-            return Err(BrainError::MissingApiKey);
+            return Err(ink_auth_failure("missing_api_key"));
         }
 
-        let mut request = self
-            .websocket_endpoint()
+        let endpoint = self
+            .websocket_url_result()
+            .ok_or_else(|| ink_protocol_failure("invalid_endpoint"))?;
+        let mut request = endpoint
+            .as_str()
             .into_client_request()
-            .map_err(|error| {
-                BrainError::Protocol(format!("invalid Cartesia Ink WebSocket URL: {error}"))
-            })?;
-        let authorization = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| {
-            BrainError::Protocol("invalid Cartesia Ink authorization header".to_owned())
-        })?;
-        let version = HeaderValue::from_str(self.cartesia_version.trim()).map_err(|_| {
-            BrainError::Protocol("invalid Cartesia-Version header value".to_owned())
-        })?;
+            .map_err(|_| ink_protocol_failure("invalid_endpoint"))?;
+        let authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|_| ink_auth_failure("invalid_authorization_header"))?;
+        let version = HeaderValue::from_str(self.cartesia_version.trim())
+            .map_err(|_| ink_protocol_failure("invalid_version_header"))?;
         request.headers_mut().insert(AUTHORIZATION, authorization);
         request
             .headers_mut()
@@ -95,14 +221,26 @@ impl InkConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum InkEvent {
     TurnStart,
-    TurnUpdate { text: String },
-    TurnEagerEnd { text: String },
+    TurnUpdate {
+        text: String,
+    },
+    TurnEagerEnd {
+        text: String,
+    },
     TurnResume,
-    TurnEnd { text: String },
-    Error { message: String },
+    TurnEnd {
+        text: String,
+        /// `ADAPTER-07`: the provider's own score, present only when the event
+        /// schema supplied a finite value in `[0, 1]`. The adapter never
+        /// substitutes one.
+        confidence: Option<f32>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub fn audio_frame_bytes(frame: &AudioFrame) -> Bytes {
@@ -122,6 +260,12 @@ pub(crate) trait InkSocket: Send {
     async fn send_text(&mut self, text: &'static str) -> Result<(), BrainError>;
     async fn next_text(&mut self) -> Result<Option<String>, BrainError>;
     async fn close(&mut self) -> Result<(), BrainError>;
+
+    /// The numeric close code the provider sent, once it has closed. The close
+    /// reason is dropped at the transport and is never available here.
+    fn last_close_code(&self) -> Option<u16> {
+        None
+    }
 }
 
 #[async_trait]
@@ -131,35 +275,71 @@ pub(crate) trait InkConnector: Send + Sync {
     async fn connect(&self, request: Request<()>) -> Result<Self::Socket, BrainError>;
 }
 
+/// One turn's transcription, bounded by the stage deadline and cancellable.
+///
+/// `ADAPTER-03`: only the handshake runs outside the scope that owns the
+/// socket. A deadline that fires after the connection exists closes it; a
+/// deadline that fires before it has nothing to close.
 pub(crate) async fn transcribe_ink_with_connector<C>(
     connector: &C,
     config: &InkConfig,
     api_key: &str,
     frame: &AudioFrame,
+    cancel: &CancellationToken,
 ) -> Result<InkTranscript, BrainError>
 where
     C: InkConnector,
 {
     let request = config.websocket_request(api_key)?;
-    timeout(config.stage_timeout, async {
-        let mut socket = connector.connect(request).await?;
-        transcribe_ink_turn(&mut socket, frame).await
-    })
-    .await
-    .map_err(|_| BrainError::Connection("Cartesia Ink stage timeout".to_owned()))?
+    let deadline = Instant::now() + config.stage_timeout;
+    let mut socket = match timeout(config.stage_timeout, connector.connect(request)).await {
+        Ok(socket) => socket?,
+        Err(_) => return Err(ink_deadline_failure()),
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match timeout(remaining, transcribe_ink_turn(&mut socket, frame, cancel)).await {
+        Ok(transcript) => transcript,
+        Err(_) => {
+            // Cleanup is best-effort and never replaces the sanitized terminal
+            // classification the deadline produced.
+            close_quietly(&mut socket).await;
+            Err(ink_deadline_failure())
+        }
+    }
+}
+
+fn ink_deadline_failure() -> BrainError {
+    ink_failure(
+        BrainFailureClass::Timeout,
+        BrainFailureStage::Provider,
+        true,
+        "deadline_elapsed",
+    )
+}
+
+/// A cancelled turn is the learner's own decision, not a provider incident.
+fn ink_cancelled_failure() -> BrainError {
+    ink_failure(
+        BrainFailureClass::Cancellation,
+        BrainFailureStage::Provider,
+        false,
+        "cancelled",
+    )
 }
 
 pub(crate) async fn transcribe_ink_websocket(
     config: &InkConfig,
     api_key: &str,
     frame: &AudioFrame,
+    cancel: &CancellationToken,
 ) -> Result<InkTranscript, BrainError> {
-    transcribe_ink_with_connector(&WebSocketInkConnector, config, api_key, frame).await
+    transcribe_ink_with_connector(&WebSocketInkConnector, config, api_key, frame, cancel).await
 }
 
 pub(crate) async fn transcribe_ink_turn<S>(
     socket: &mut S,
     frame: &AudioFrame,
+    cancel: &CancellationToken,
 ) -> Result<InkTranscript, BrainError>
 where
     S: InkSocket + ?Sized,
@@ -167,23 +347,31 @@ where
     socket
         .send_binary(audio_frame_bytes(frame))
         .await
-        .map_err(|_| BrainError::Connection("Cartesia Ink send failed".to_owned()))?;
+        .map_err(|_| ink_transport_failure("send_failed"))?;
     socket
         .send_text(INK_CLOSE_COMMAND)
         .await
-        .map_err(|_| BrainError::Connection("Cartesia Ink close command failed".to_owned()))?;
+        .map_err(|_| ink_transport_failure("close_command_failed"))?;
 
     let mut accumulator = InkTranscriptAccumulator::default();
     loop {
-        let Some(text) = socket
-            .next_text()
-            .await
-            .map_err(|_| BrainError::Connection("Cartesia Ink receive failed".to_owned()))?
-        else {
+        if cancel.is_cancelled() {
             close_quietly(socket).await;
-            return Err(BrainError::Protocol(
-                "Cartesia Ink socket closed before final transcript".to_owned(),
-            ));
+            return Err(ink_cancelled_failure());
+        }
+        let received = tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            received = socket.next_text() => Some(received),
+        };
+        let Some(received) = received else {
+            close_quietly(socket).await;
+            return Err(ink_cancelled_failure());
+        };
+        let Some(text) = received.map_err(|_| ink_transport_failure("receive_failed"))? else {
+            let close_code = socket.last_close_code();
+            close_quietly(socket).await;
+            return Err(ink_close_failure(close_code));
         };
         let Some(event) = parse_ink_event(&text) else {
             continue;
@@ -196,20 +384,19 @@ where
             InkEvent::TurnResume => {
                 accumulator.interim_text.clear();
             }
-            InkEvent::TurnEnd { text } => {
+            InkEvent::TurnEnd { text, confidence } => {
                 accumulator.final_text = Some(text);
+                accumulator.confidence = confidence;
                 let transcript = accumulator.finish()?;
-                socket
-                    .close()
-                    .await
-                    .map_err(|_| BrainError::Connection("Cartesia Ink close failed".to_owned()))?;
+                // The Ink turn endpoint is short-lived by design: the socket is
+                // closed with the turn rather than kept idle against Cartesia's
+                // documented STT concurrency limits.
+                close_quietly(socket).await;
                 return Ok(transcript);
             }
             InkEvent::Error { .. } => {
                 close_quietly(socket).await;
-                return Err(BrainError::Protocol(
-                    "Cartesia Ink provider error".to_owned(),
-                ));
+                return Err(ink_provider_error_failure());
             }
         }
     }
@@ -219,17 +406,18 @@ where
 struct InkTranscriptAccumulator {
     interim_text: String,
     final_text: Option<String>,
+    confidence: Option<f32>,
 }
 
 impl InkTranscriptAccumulator {
     fn finish(self) -> Result<InkTranscript, BrainError> {
-        let final_text = self.final_text.ok_or_else(|| {
-            BrainError::Protocol("Cartesia Ink missing final transcript".to_owned())
-        })?;
+        let final_text = self
+            .final_text
+            .ok_or_else(|| ink_protocol_failure("missing_final_transcript"))?;
         Ok(InkTranscript {
             interim_text: self.interim_text,
             final_text,
-            confidence: None,
+            confidence: self.confidence,
         })
     }
 }
@@ -249,15 +437,23 @@ impl InkConnector for WebSocketInkConnector {
     type Socket = TungsteniteInkSocket;
 
     async fn connect(&self, request: Request<()>) -> Result<Self::Socket, BrainError> {
-        let (socket, _) = connect_async(request).await.map_err(|_| {
-            BrainError::Connection("Cartesia Ink WebSocket connect failed".to_owned())
+        let (socket, _) = connect_async(request).await.map_err(|error| {
+            // A refused upgrade is an HTTP fact; only its status survives.
+            websocket_handshake_status(&error).map_or_else(
+                || ink_transport_failure("connect_failed"),
+                ink_handshake_failure,
+            )
         })?;
-        Ok(TungsteniteInkSocket { socket })
+        Ok(TungsteniteInkSocket {
+            socket,
+            close_code: None,
+        })
     }
 }
 
 struct TungsteniteInkSocket {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    close_code: Option<u16>,
 }
 
 #[async_trait]
@@ -266,14 +462,14 @@ impl InkSocket for TungsteniteInkSocket {
         self.socket
             .send(Message::Binary(bytes))
             .await
-            .map_err(|_| BrainError::Connection("Cartesia Ink send failed".to_owned()))
+            .map_err(|_| ink_transport_failure("send_failed"))
     }
 
     async fn send_text(&mut self, text: &'static str) -> Result<(), BrainError> {
         self.socket
             .send(Message::Text(text.into()))
             .await
-            .map_err(|_| BrainError::Connection("Cartesia Ink close command failed".to_owned()))
+            .map_err(|_| ink_transport_failure("close_command_failed"))
     }
 
     async fn next_text(&mut self) -> Result<Option<String>, BrainError> {
@@ -287,14 +483,13 @@ impl InkSocket for TungsteniteInkSocket {
                     .socket
                     .send(Message::Pong(payload))
                     .await
-                    .map_err(|_| BrainError::Connection("Cartesia Ink pong failed".to_owned()))?,
-                Ok(Message::Close(_)) => return Ok(None),
-                Ok(Message::Binary(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
-                Err(_) => {
-                    return Err(BrainError::Connection(
-                        "Cartesia Ink receive failed".to_owned(),
-                    ))
+                    .map_err(|_| ink_transport_failure("pong_failed"))?,
+                Ok(Message::Close(frame)) => {
+                    self.close_code = websocket_close_code(frame.as_ref());
+                    return Ok(None);
                 }
+                Ok(Message::Binary(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
+                Err(_) => return Err(ink_transport_failure("receive_failed")),
             }
         }
     }
@@ -303,7 +498,11 @@ impl InkSocket for TungsteniteInkSocket {
         self.socket
             .close(None)
             .await
-            .map_err(|_| BrainError::Connection("Cartesia Ink close failed".to_owned()))
+            .map_err(|_| ink_transport_failure("close_failed"))
+    }
+
+    fn last_close_code(&self) -> Option<u16> {
+        self.close_code
     }
 }
 
@@ -319,14 +518,20 @@ pub fn parse_ink_value(value: &Value) -> Option<InkEvent> {
         "turn.update" => transcript_text(value).map(|text| InkEvent::TurnUpdate { text }),
         "turn.eager_end" => transcript_text(value).map(|text| InkEvent::TurnEagerEnd { text }),
         "turn.resume" => Some(InkEvent::TurnResume),
-        "turn.end" => transcript_text(value).map(|text| InkEvent::TurnEnd { text }),
+        "turn.end" => transcript_text(value).map(|text| InkEvent::TurnEnd {
+            text,
+            confidence: transcript_confidence(value),
+        }),
         "transcript" => transcript_text(value).map(|text| {
             if value
                 .get("is_final")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             {
-                InkEvent::TurnEnd { text }
+                InkEvent::TurnEnd {
+                    text,
+                    confidence: transcript_confidence(value),
+                }
             } else {
                 InkEvent::TurnUpdate { text }
             }
@@ -341,6 +546,16 @@ pub fn parse_ink_value(value: &Value) -> Option<InkEvent> {
         }),
         _ => None,
     }
+}
+
+/// The provider's confidence, or nothing.
+///
+/// `ADAPTER-07`: only a JSON number that is finite and inside `[0, 1]` is a
+/// score. A string, a null, a `NaN`, and an out-of-range value are all absences
+/// — never clamped, never defaulted.
+fn transcript_confidence(value: &Value) -> Option<f32> {
+    let confidence = value.get("confidence")?.as_f64()? as f32;
+    (confidence.is_finite() && (0.0..=1.0).contains(&confidence)).then_some(confidence)
 }
 
 fn transcript_text(value: &Value) -> Option<String> {
@@ -361,6 +576,7 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::json;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
 
@@ -381,7 +597,8 @@ mod tests {
                 &json!({ "type": "transcript", "is_final": true, "text": "ATP synthase" })
             ),
             Some(InkEvent::TurnEnd {
-                text: "ATP synthase".to_owned()
+                text: "ATP synthase".to_owned(),
+                confidence: None,
             })
         );
     }
@@ -418,13 +635,99 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Task 7 (`ADAPTER-07`): the Ink endpoint is built through URL query pairs,
+    // so an operator-supplied value is data and can never become structure.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ink_endpoint_percent_encodes_every_query_value_without_parameter_injection() {
+        // Hostile values in every operator-controlled *string* field. The two
+        // numeric fields cannot hold `0.05&language=de` / `0.7?model=forged` at
+        // all — `from_env` refuses them, which the companion config test pins —
+        // so this asserts the pairs they were meant to inject never appear.
+        let config = InkConfig {
+            model: "ink-2&language=de".to_owned(),
+            language: "en US#fragment".to_owned(),
+            encoding: "pcm_s16le?model=forged".to_owned(),
+            cartesia_version: "2026-03-01 #x".to_owned(),
+            ..InkConfig::default()
+        };
+
+        let endpoint = config.websocket_endpoint();
+        let url = reqwest::Url::parse(&endpoint).expect("the endpoint is a parseable URL");
+        assert_eq!(url.fragment(), None, "{endpoint}");
+
+        let pairs = url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        let count = |key: &str| pairs.iter().filter(|(name, _)| name == key).count();
+        let value = |key: &str| {
+            pairs
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| panic!("{key} is missing from {endpoint}"))
+        };
+
+        for key in [
+            "model",
+            "language",
+            "encoding",
+            "sample_rate",
+            "min_volume",
+            "max_silence_duration_secs",
+            "cartesia_version",
+        ] {
+            assert_eq!(count(key), 1, "{key} appears more than once in {endpoint}");
+        }
+        assert_eq!(pairs.len(), 7, "{endpoint}");
+
+        // Every hostile value survives verbatim as *data*.
+        assert_eq!(value("model"), "ink-2&language=de");
+        assert_eq!(value("language"), "en US#fragment");
+        assert_eq!(value("encoding"), "pcm_s16le?model=forged");
+        assert_eq!(value("cartesia_version"), "2026-03-01 #x");
+        assert_eq!(value("sample_rate"), CARTESIA_SAMPLE_RATE.to_string());
+        assert_eq!(value("min_volume"), "0.05");
+        assert_eq!(value("max_silence_duration_secs"), "0.7");
+
+        // …and none of it became structure.
+        assert!(
+            !pairs
+                .iter()
+                .any(|(key, value)| key == "language" && value == "de"),
+            "{endpoint}"
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|(key, value)| key == "model" && value == "forged"),
+            "{endpoint}"
+        );
+
+        // The authenticated request carries the same single-valued query and
+        // keeps the credential in a header, never in the URL.
+        let request = config
+            .websocket_request("sk_car_url_probe")
+            .expect("a usable credential builds a request");
+        let request_url =
+            reqwest::Url::parse(&request.uri().to_string()).expect("the request URI is a URL");
+        assert_eq!(request_url.query_pairs().count(), 7, "{}", request.uri());
+        assert!(!request.uri().to_string().contains("sk_car_url_probe"));
+    }
+
     #[tokio::test]
     async fn turn_runner_forwards_binary_audio_and_closes_session() {
         let mut socket = FakeInkSocket::new(vec![r#"{"type":"turn.end","transcript":"ATP"}"#]);
-        let transcript =
-            transcribe_ink_turn(&mut socket, &AudioFrame::from_pcm16_bytes(vec![1, 2, 3, 4]))
-                .await
-                .unwrap();
+        let transcript = transcribe_ink_turn(
+            &mut socket,
+            &AudioFrame::from_pcm16_bytes(vec![1, 2, 3, 4]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(transcript.final_text, "ATP");
         assert_eq!(socket.sent_binary, vec![Bytes::from_static(&[1, 2, 3, 4])]);
@@ -443,10 +746,13 @@ mod tests {
             r#"{"type":"turn.end","transcript":"NADH donates electrons"}"#,
         ]);
 
-        let transcript =
-            transcribe_ink_turn(&mut socket, &AudioFrame::from_pcm16_bytes(vec![1, 2]))
-                .await
-                .unwrap();
+        let transcript = transcribe_ink_turn(
+            &mut socket,
+            &AudioFrame::from_pcm16_bytes(vec![1, 2]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(transcript.interim_text, "NADH");
         assert_eq!(transcript.final_text, "NADH donates electrons");
@@ -463,26 +769,42 @@ mod tests {
         let error = transcribe_ink_turn(
             &mut provider_error,
             &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
+            &CancellationToken::new(),
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
-        assert!(error.contains("Cartesia Ink provider error"));
-        assert!(!error.contains("do not leak this transcript"));
-        assert!(!error.contains("9, 8, 7, 6"));
+        assert_eq!(failure.failure_class(), BrainFailureClass::MalformedStream);
+        assert_eq!(failure.stage(), BrainFailureStage::Provider);
+        assert_eq!(
+            failure.metadata(),
+            "stage=cartesia_ink error_kind=cartesia_ink_provider_error retry_eligible=true"
+        );
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains("do not leak this transcript"));
+        assert!(!rendered.contains("9, 8, 7, 6"));
 
         let mut backpressure = FakeInkSocket::with_send_error("writer closed after PCM [9,8]");
         let error = transcribe_ink_turn(
             &mut backpressure,
             &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
+            &CancellationToken::new(),
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
-        assert!(error.contains("Cartesia Ink send failed"));
-        assert!(!error.contains("[9,8]"));
+        assert_eq!(
+            failure.failure_class(),
+            BrainFailureClass::NetworkDisconnect
+        );
+        assert_eq!(failure.stage(), BrainFailureStage::Transport);
+        assert_eq!(
+            failure.metadata(),
+            "stage=cartesia_ink error_kind=send_failed"
+        );
+        assert!(!format!("{error} {failure:?}").contains("[9,8]"));
     }
 
     #[tokio::test]
@@ -490,13 +812,19 @@ mod tests {
         let mut socket =
             FakeInkSocket::new(vec![r#"{"type":"turn.update","transcript":"partial"}"#]);
 
-        let error = transcribe_ink_turn(&mut socket, &AudioFrame::from_pcm16_bytes(vec![1, 2]))
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = transcribe_ink_turn(
+            &mut socket,
+            &AudioFrame::from_pcm16_bytes(vec![1, 2]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
 
-        assert!(error.contains("closed before final transcript"));
-        assert!(!error.contains("partial"));
+        assert_eq!(
+            error.failure().metadata(),
+            "stage=cartesia_ink error_kind=cartesia_ink_ws_closed retry_eligible=true"
+        );
+        assert!(!format!("{error} {:?}", error.failure()).contains("partial"));
     }
 
     #[tokio::test]
@@ -511,6 +839,7 @@ mod tests {
             &InkConfig::default(),
             "sk_car_connector_secret",
             &AudioFrame::from_pcm16_bytes(vec![3, 2, 1]),
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -544,14 +873,20 @@ mod tests {
             &config,
             "sk_car_timeout_secret",
             &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
+            &CancellationToken::new(),
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let failure = error.failure();
 
-        assert!(error.contains("Cartesia Ink stage timeout"));
-        assert!(!error.contains("sk_car_timeout_secret"));
-        assert!(!error.contains("9, 8, 7, 6"));
+        assert_eq!(failure.failure_class(), BrainFailureClass::Timeout);
+        assert_eq!(
+            failure.metadata(),
+            "stage=cartesia_ink error_kind=deadline_elapsed"
+        );
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains("sk_car_timeout_secret"));
+        assert!(!rendered.contains("9, 8, 7, 6"));
     }
 
     struct FakeInkSocket {
@@ -566,6 +901,8 @@ mod tests {
     struct SocketRecord {
         request_uri: Option<String>,
         authorization: Option<String>,
+        handshake_attempts: u32,
+        connected: bool,
         sent_binary: Vec<Bytes>,
         sent_text: Vec<&'static str>,
         closed: bool,
@@ -592,6 +929,7 @@ mod tests {
                 .get("Authorization")
                 .and_then(|value| value.to_str().ok())
                 .map(ToOwned::to_owned);
+            record.connected = true;
             drop(record);
             Ok(RecordingInkSocket {
                 record: self.record.clone(),
@@ -671,13 +1009,154 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Task 3 (`ADAPTER-03`): the Ink stage deadline lives inside the scope that
+    // owns the connected socket, so a timeout can close it. A timeout before
+    // connect has no socket to close and must not claim one.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ink_timeout_after_connect_closes_the_socket() {
+        let record = Arc::new(Mutex::new(SocketRecord::default()));
+        let connector = StallingInkConnector {
+            record: record.clone(),
+        };
+        let config = InkConfig {
+            stage_timeout: Duration::from_millis(30),
+            ..InkConfig::default()
+        };
+
+        let error = transcribe_ink_with_connector(
+            &connector,
+            &config,
+            "sk_car_cleanup_secret",
+            &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        let failure = error.failure();
+
+        assert_eq!(failure.failure_class(), BrainFailureClass::Timeout);
+        assert_eq!(
+            failure.metadata(),
+            "stage=cartesia_ink error_kind=deadline_elapsed"
+        );
+        {
+            let after_connect = record.lock().expect("record lock poisoned");
+            assert!(after_connect.connected);
+            assert!(
+                after_connect.closed,
+                "a stage timeout after connect must close the provider socket"
+            );
+        }
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains("sk_car_cleanup_secret"));
+        assert!(!rendered.contains("9, 8, 7, 6"));
+
+        // Control: the deadline can also fire before the handshake completes.
+        // There is no socket then, and cleanup must not pretend otherwise.
+        let before_connect = Arc::new(Mutex::new(SocketRecord::default()));
+        let error = transcribe_ink_with_connector(
+            &SlowHandshakeInkConnector {
+                record: before_connect.clone(),
+            },
+            &config,
+            "sk_car_cleanup_secret",
+            &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.failure().failure_class(), BrainFailureClass::Timeout);
+        let before_connect = before_connect.lock().expect("record lock poisoned");
+        assert_eq!(
+            before_connect.handshake_attempts, 1,
+            "the handshake was attempted and the deadline fired inside it"
+        );
+        assert!(!before_connect.connected);
+        assert!(!before_connect.closed);
+    }
+
+    /// Connects immediately, then never transcribes. Only the deadline ends it.
+    struct StallingInkConnector {
+        record: Arc<Mutex<SocketRecord>>,
+    }
+
+    #[async_trait]
+    impl InkConnector for StallingInkConnector {
+        type Socket = StallingInkSocket;
+
+        async fn connect(&self, _request: Request<()>) -> Result<Self::Socket, BrainError> {
+            let mut record = self.record.lock().expect("record lock poisoned");
+            record.handshake_attempts += 1;
+            record.connected = true;
+            drop(record);
+            Ok(StallingInkSocket {
+                record: self.record.clone(),
+            })
+        }
+    }
+
+    struct StallingInkSocket {
+        record: Arc<Mutex<SocketRecord>>,
+    }
+
+    #[async_trait]
+    impl InkSocket for StallingInkSocket {
+        async fn send_binary(&mut self, bytes: Bytes) -> Result<(), agent_domain::BrainError> {
+            self.record
+                .lock()
+                .expect("record lock poisoned")
+                .sent_binary
+                .push(bytes);
+            Ok(())
+        }
+
+        async fn send_text(&mut self, text: &'static str) -> Result<(), agent_domain::BrainError> {
+            self.record
+                .lock()
+                .expect("record lock poisoned")
+                .sent_text
+                .push(text);
+            Ok(())
+        }
+
+        async fn next_text(&mut self) -> Result<Option<String>, agent_domain::BrainError> {
+            std::future::pending().await
+        }
+
+        async fn close(&mut self) -> Result<(), agent_domain::BrainError> {
+            self.record.lock().expect("record lock poisoned").closed = true;
+            Ok(())
+        }
+    }
+
+    /// The handshake itself outlives the stage deadline.
+    struct SlowHandshakeInkConnector {
+        record: Arc<Mutex<SocketRecord>>,
+    }
+
+    #[async_trait]
+    impl InkConnector for SlowHandshakeInkConnector {
+        type Socket = StallingInkSocket;
+
+        async fn connect(&self, _request: Request<()>) -> Result<Self::Socket, BrainError> {
+            self.record
+                .lock()
+                .expect("record lock poisoned")
+                .handshake_attempts += 1;
+            std::future::pending::<()>().await;
+            unreachable!("the stage deadline fires before the handshake completes")
+        }
+    }
+
     #[async_trait]
     impl InkSocket for FakeInkSocket {
         async fn send_binary(&mut self, bytes: Bytes) -> Result<(), agent_domain::BrainError> {
             if self.send_error.is_some() {
-                return Err(agent_domain::BrainError::Connection(
-                    "fake socket send failure".to_owned(),
-                ));
+                return Err(ink_transport_failure("send_failed"));
             }
             self.sent_binary.push(bytes);
             Ok(())
