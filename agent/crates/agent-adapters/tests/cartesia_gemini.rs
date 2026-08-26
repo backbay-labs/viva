@@ -1555,12 +1555,63 @@ struct BlockingAnswerStore {
     release_answer: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
+/// The store call an `A-20.1` audit case refuses.
+///
+/// Each one is a distinct adapter seam that maps an executor or port error into
+/// a `BrainFailureClass`, so each is a place the kind could be lost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefusedStoreCall {
+    /// Session open, before the progression cursor is read.
+    VoiceSessionWrite,
+    /// The progression cursor read every turn takes.
+    QuestionProgression,
+    /// The durable answer-attempt envelope, written before any provider I/O.
+    AnswerAttemptEnvelope,
+    /// The session-evidence read `evaluate_spoken_answer` binds a turn from.
+    SessionEvidence,
+}
+
+/// The `PortErrorKind` a refusal is raised with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefusedKind {
+    /// Plan 06 publishes a class for this kind, so it must survive.
+    Durability,
+    /// Plan 06 publishes no distinct class, so no class may be invented for it.
+    Unclassified,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StoreRefusal {
+    call: RefusedStoreCall,
+    kind: RefusedKind,
+}
+
+impl StoreRefusal {
+    fn refuses(&self, call: RefusedStoreCall) -> bool {
+        self.call == call
+    }
+
+    /// The port error this refusal raises, carrying hostile prose so a seam
+    /// cannot buy its classification by leaking the store's diagnostics.
+    fn port_error(&self, id: &str) -> PortError {
+        let reason = format!(
+            "refused by {PROGRESSION_STORE_DSN_MARKER} while handling \
+             {PROGRESSION_QUESTION_MARKER}"
+        );
+        match self.kind {
+            RefusedKind::Durability => PortError::durability("study_memory_store", id, reason),
+            RefusedKind::Unclassified => PortError::internal("study_memory_store", id, reason),
+        }
+    }
+}
+
 struct FailStudyToolStore {
     inner: Arc<data::InMemoryStudyStore>,
     source_reference_calls: Mutex<usize>,
     fail_source_after_question: bool,
     fail_recap: bool,
     fail_envelope: bool,
+    refusal: Option<StoreRefusal>,
 }
 
 impl FailStudyToolStore {
@@ -1571,6 +1622,7 @@ impl FailStudyToolStore {
             fail_source_after_question: true,
             fail_recap: false,
             fail_envelope: false,
+            refusal: None,
         }
     }
 
@@ -1581,6 +1633,7 @@ impl FailStudyToolStore {
             fail_source_after_question: false,
             fail_recap: true,
             fail_envelope: false,
+            refusal: None,
         }
     }
 
@@ -1592,7 +1645,30 @@ impl FailStudyToolStore {
             fail_source_after_question: false,
             fail_recap: false,
             fail_envelope: true,
+            refusal: None,
         }
+    }
+
+    /// `A-20.1`: refuse exactly one store call with exactly one port kind.
+    fn refusing(
+        inner: Arc<data::InMemoryStudyStore>,
+        call: RefusedStoreCall,
+        kind: RefusedKind,
+    ) -> Self {
+        Self {
+            inner,
+            source_reference_calls: Mutex::new(0),
+            fail_source_after_question: false,
+            fail_recap: false,
+            fail_envelope: false,
+            refusal: Some(StoreRefusal { call, kind }),
+        }
+    }
+
+    fn refuses(&self, call: RefusedStoreCall) -> Option<PortError> {
+        self.refusal
+            .filter(|refusal| refusal.refuses(call))
+            .map(|refusal| refusal.port_error("voice-session-1"))
     }
 }
 
@@ -1610,6 +1686,9 @@ impl StudyMemoryStore for FailStudyToolStore {
         &self,
         config: &SessionConfig,
     ) -> Result<StudyStoreWriteOutcome, PortError> {
+        if let Some(refusal) = self.refuses(RefusedStoreCall::VoiceSessionWrite) {
+            return Err(refusal);
+        }
         self.inner.record_voice_session(config).await
     }
 
@@ -1636,6 +1715,9 @@ impl StudyMemoryStore for FailStudyToolStore {
         voice_session_id: &str,
         envelope: AnswerAttemptEnvelope,
     ) -> Result<serde_json::Value, PortError> {
+        if let Some(refusal) = self.refuses(RefusedStoreCall::AnswerAttemptEnvelope) {
+            return Err(refusal);
+        }
         if self.fail_envelope {
             return Err(PortError::durability(
                 "answer_attempt_envelope",
@@ -1810,6 +1892,9 @@ impl StudyMemoryStore for FailStudyToolStore {
         study_set_id: &str,
         voice_session_id: &str,
     ) -> Result<SessionLearningEvidence, PortError> {
+        if let Some(refusal) = self.refuses(RefusedStoreCall::SessionEvidence) {
+            return Err(refusal);
+        }
         self.inner
             .session_learning_evidence(user_id, study_set_id, voice_session_id)
             .await
@@ -1823,6 +1908,9 @@ impl StudyMemoryStore for FailStudyToolStore {
         response_id: &str,
         policy: ProgressionPolicyId,
     ) -> Result<QuestionProgressionResult, PortError> {
+        if let Some(refusal) = self.refuses(RefusedStoreCall::QuestionProgression) {
+            return Err(refusal);
+        }
         self.inner
             .select_next_question(user_id, study_set_id, voice_session_id, response_id, policy)
             .await
@@ -3928,186 +4016,157 @@ async fn live_envelope_store_failure_is_typed_durability_degraded() {
 const PROGRESSION_STORE_DSN_MARKER: &str = "postgres://viva:marker-dsn-b17@db.internal/viva";
 const PROGRESSION_QUESTION_MARKER: &str = "marker-authorized-question-b18";
 
-#[derive(Clone, Copy, Debug)]
-enum ProgressionStoreFailure {
-    /// The store could not durably answer. Plan 06 publishes a class for this.
-    Durability,
-    /// An invariant inside the store adapter broke. Plan 06 publishes no
-    /// distinct class, so the adapter may not invent one.
-    Internal,
+/// Every adapter seam that turns an executor or port failure into a
+/// `BrainFailureClass`. Each is a separate place the store's typed kind could
+/// be dropped, so each is driven end to end rather than asserted on a helper.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutorSeam {
+    /// `runner.rs` `open`: the durable voice-session write.
+    RunnerOpenVoiceSessionWrite,
+    /// `synthetic.rs` `open`: the same write in the synthetic runtime.
+    SyntheticOpenVoiceSessionWrite,
+    /// `mod.rs` `select_session_question`, reached from the runner's `open`.
+    RunnerOpenQuestionProgression,
+    /// The same seam, reached from the synthetic runtime's `open`.
+    SyntheticOpenQuestionProgression,
+    /// `runner.rs` `replay_audio_turn`: the answer-attempt envelope.
+    RunnerReplayEnvelope,
+    /// `mod.rs` `open_scripted_session`: the same envelope.
+    ScriptedSessionEnvelope,
+    /// `synthetic.rs` answer sequence: the same envelope.
+    SyntheticTurnEnvelope,
+    /// `synthetic.rs` answer sequence: the `evaluate_spoken_answer` tool stage.
+    SyntheticTurnEvaluate,
 }
 
-/// A store that refuses exactly the question-progression read.
-///
-/// Every other call delegates, so the only failure in the session is the one
-/// under test and the class it produces cannot be borrowed from another stage.
-struct FailProgressionStore {
-    inner: Arc<data::InMemoryStudyStore>,
-    failure: ProgressionStoreFailure,
-}
+impl ExecutorSeam {
+    const ALL: [Self; 8] = [
+        Self::RunnerOpenVoiceSessionWrite,
+        Self::SyntheticOpenVoiceSessionWrite,
+        Self::RunnerOpenQuestionProgression,
+        Self::SyntheticOpenQuestionProgression,
+        Self::RunnerReplayEnvelope,
+        Self::ScriptedSessionEnvelope,
+        Self::SyntheticTurnEnvelope,
+        Self::SyntheticTurnEvaluate,
+    ];
 
-#[async_trait::async_trait]
-impl StudyMemoryStore for FailProgressionStore {
-    fn capabilities(&self) -> StudyStoreCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn write_counts(&self) -> StudyStoreWriteCounts {
-        self.inner.write_counts()
-    }
-
-    async fn record_voice_session(
-        &self,
-        config: &SessionConfig,
-    ) -> Result<StudyStoreWriteOutcome, PortError> {
-        self.inner.record_voice_session(config).await
-    }
-
-    async fn select_next_question(
-        &self,
-        _user_id: &str,
-        _study_set_id: &str,
-        voice_session_id: &str,
-        _response_id: &str,
-        _policy: ProgressionPolicyId,
-    ) -> Result<QuestionProgressionResult, PortError> {
-        let reason = format!(
-            "progression cursor refused by {PROGRESSION_STORE_DSN_MARKER} while reading \
-             {PROGRESSION_QUESTION_MARKER}"
-        );
-        Err(match self.failure {
-            ProgressionStoreFailure::Durability => {
-                PortError::durability("study_memory_store", voice_session_id, reason)
+    fn refused_call(self) -> RefusedStoreCall {
+        match self {
+            Self::RunnerOpenVoiceSessionWrite | Self::SyntheticOpenVoiceSessionWrite => {
+                RefusedStoreCall::VoiceSessionWrite
             }
-            ProgressionStoreFailure::Internal => {
-                PortError::internal("study_memory_store", voice_session_id, reason)
+            Self::RunnerOpenQuestionProgression | Self::SyntheticOpenQuestionProgression => {
+                RefusedStoreCall::QuestionProgression
             }
-        })
-    }
-
-    async fn study_context(
-        &self,
-        user_id: &str,
-        study_set_id: &str,
-    ) -> Result<Option<serde_json::Value>, PortError> {
-        self.inner.study_context(user_id, study_set_id).await
-    }
-
-    async fn record_answer_evaluation(
-        &self,
-        user_id: &str,
-        study_set_id: &str,
-        voice_session_id: &str,
-        response_id: &str,
-        evaluation: AnswerEvaluation,
-    ) -> Result<serde_json::Value, PortError> {
-        self.inner
-            .record_answer_evaluation(
-                user_id,
-                study_set_id,
-                voice_session_id,
-                response_id,
-                evaluation,
-            )
-            .await
-    }
-
-    async fn source_reference(
-        &self,
-        user_id: &str,
-        study_set_id: &str,
-        source_id: &str,
-    ) -> Result<Option<StudySourceReference>, PortError> {
-        self.inner
-            .source_reference(user_id, study_set_id, source_id)
-            .await
-    }
-
-    async fn record_concept_status(
-        &self,
-        user_id: &str,
-        study_set_id: &str,
-        voice_session_id: &str,
-        response_id: &str,
-        concept_id: &str,
-        status: ConceptStatus,
-    ) -> Result<ConceptStatus, PortError> {
-        self.inner
-            .record_concept_status(
-                user_id,
-                study_set_id,
-                voice_session_id,
-                response_id,
-                concept_id,
-                status,
-            )
-            .await
-    }
-
-    async fn schedule_review_item(
-        &self,
-        user_id: &str,
-        study_set_id: &str,
-        voice_session_id: &str,
-        concept_id: &str,
-        due_at: &str,
-    ) -> Result<serde_json::Value, PortError> {
-        self.inner
-            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
-            .await
-    }
-
-    async fn record_recap(
-        &self,
-        user_id: &str,
-        study_set_id: &str,
-        voice_session_id: &str,
-        response_id: &str,
-        recap: StudySessionRecap,
-    ) -> Result<serde_json::Value, PortError> {
-        self.inner
-            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
-            .await
+            Self::RunnerReplayEnvelope
+            | Self::ScriptedSessionEnvelope
+            | Self::SyntheticTurnEnvelope => RefusedStoreCall::AnswerAttemptEnvelope,
+            Self::SyntheticTurnEvaluate => RefusedStoreCall::SessionEvidence,
+        }
     }
 }
 
-/// Open both adapter runtimes against a progression store that fails the given
-/// way, and return the typed failure each one refused with.
-async fn progression_open_failures(
-    failure: ProgressionStoreFailure,
-) -> Vec<agent_domain::BrainProviderFailure> {
-    let mut failures = Vec::new();
-    for runtime in ["fake_cartesia_gemini", "synthetic"] {
-        let inner = learning_ready_store();
-        let session = fixture_session_config();
-        let _ = inner.record_voice_session(&session).await.unwrap();
-        let store = Arc::new(FailProgressionStore { inner, failure });
-        let brain: Box<dyn RealtimeBrain> = match runtime {
-            "synthetic" => Box::new(agent_adapters::SyntheticBrain::with_study_store(store)),
-            _ => Box::new(FakeCartesiaGeminiRuntime::new(store)),
-        };
-        let error =
-            brain.open(session).await.err().unwrap_or_else(|| {
-                panic!("{runtime}: a refused progression read must fail the open")
-            });
-        failures.push(error.failure().clone());
+/// Drive one seam with one refused port kind and return the typed failure the
+/// adapter actually produced.
+async fn executor_seam_failure(
+    seam: ExecutorSeam,
+    kind: RefusedKind,
+) -> agent_domain::BrainProviderFailure {
+    let inner = learning_ready_store();
+    let session = fixture_session_config();
+    let _ = inner.record_voice_session(&session).await.unwrap();
+    let store = Arc::new(FailStudyToolStore::refusing(
+        inner,
+        seam.refused_call(),
+        kind,
+    ));
+    let frame = || AudioFrame::from_pcm16_bytes(vec![1_u8, 2, 3, 4]);
+
+    match seam {
+        ExecutorSeam::RunnerOpenVoiceSessionWrite | ExecutorSeam::RunnerOpenQuestionProgression => {
+            FakeCartesiaGeminiRuntime::new(store)
+                .open(session)
+                .await
+                .err()
+                .expect("a refused store call must fail the runner open")
+                .failure()
+                .clone()
+        }
+        ExecutorSeam::SyntheticOpenVoiceSessionWrite
+        | ExecutorSeam::SyntheticOpenQuestionProgression => {
+            agent_adapters::SyntheticBrain::with_study_store(store)
+                .open(session)
+                .await
+                .err()
+                .expect("a refused store call must fail the synthetic open")
+                .failure()
+                .clone()
+        }
+        ExecutorSeam::RunnerReplayEnvelope => FakeCartesiaGeminiRuntime::new(store)
+            .replay_audio_turn(session, frame())
+            .await
+            .expect_err("a refused envelope write must fail the replayed turn")
+            .failure()
+            .clone(),
+        ExecutorSeam::ScriptedSessionEnvelope => {
+            let mut realtime = FakeCartesiaGeminiRuntime::new(store)
+                .open_scripted_session(session, FakeSessionScenario::BargeInDuringSonicAudio)
+                .expect("the scripted session opens");
+            realtime
+                .input
+                .send(BrainInput::Audio(frame()))
+                .await
+                .unwrap();
+            drain_to_typed_failure(&mut realtime).await
+        }
+        ExecutorSeam::SyntheticTurnEnvelope | ExecutorSeam::SyntheticTurnEvaluate => {
+            let mut realtime = agent_adapters::SyntheticBrain::with_study_store(store)
+                .open(session)
+                .await
+                .expect("the synthetic session opens");
+            realtime
+                .input
+                .send(BrainInput::Audio(frame()))
+                .await
+                .unwrap();
+            drain_to_typed_failure(&mut realtime).await
+        }
     }
-    failures
+}
+
+/// Consume events until the session reports its provider error, and return the
+/// typed failure that error must carry.
+async fn drain_to_typed_failure(
+    realtime: &mut RealtimeSession,
+) -> agent_domain::BrainProviderFailure {
+    loop {
+        if let BrainEvent::Error(error) = next_event(realtime).await {
+            return error
+                .failure
+                .clone()
+                .expect("a provider error must carry a typed failure");
+        }
+    }
 }
 
 #[tokio::test]
 async fn question_progression_store_failure_keeps_its_port_error_kind() {
-    for failure in progression_open_failures(ProgressionStoreFailure::Durability).await {
+    for seam in [
+        ExecutorSeam::RunnerOpenQuestionProgression,
+        ExecutorSeam::SyntheticOpenQuestionProgression,
+    ] {
+        let failure = executor_seam_failure(seam, RefusedKind::Durability).await;
         assert_eq!(
             failure.failure_class(),
             BrainFailureClass::DurabilityDegraded,
-            "a durability-kind progression refusal is a durability failure: {failure:?}"
+            "{seam:?}: a durability-kind progression refusal is a durability failure: {failure:?}"
         );
         assert_eq!(failure.stage(), BrainFailureStage::Store, "{failure:?}");
         assert_eq!(
             failure.terminal_reason(),
             TerminalSessionReason::DurabilityDegraded,
-            "the operator-visible terminal reason names the store, not the tools: {failure:?}"
+            "{seam:?}: the terminal reason names the store, not the tools: {failure:?}"
         );
         assert!(failure.retry_eligible(), "{failure:?}");
 
@@ -4128,11 +4187,15 @@ async fn question_progression_store_failure_keeps_its_port_error_kind() {
     // The control: `PortErrorKind::Internal` has no class of its own in Plan
     // 06's vocabulary, so it stays a tool-executor failure. A fix that simply
     // hardcoded durability at this seam would fail here.
-    for failure in progression_open_failures(ProgressionStoreFailure::Internal).await {
+    for seam in [
+        ExecutorSeam::RunnerOpenQuestionProgression,
+        ExecutorSeam::SyntheticOpenQuestionProgression,
+    ] {
+        let failure = executor_seam_failure(seam, RefusedKind::Unclassified).await;
         assert_eq!(
             failure.failure_class(),
             BrainFailureClass::ToolExecutorFailure,
-            "an unclassified port kind must not be promoted to a durability claim: {failure:?}"
+            "{seam:?}: an unclassified kind must not be promoted to durability: {failure:?}"
         );
         assert_eq!(
             failure.terminal_reason(),
@@ -4140,6 +4203,84 @@ async fn question_progression_store_failure_keeps_its_port_error_kind() {
             "{failure:?}"
         );
     }
+}
+
+/// `A-20.1` audit: the rule holds at every seam, not just the reported one.
+///
+/// Both halves are load-bearing. A seam that drops the kind reports a database
+/// outage as a tool defect; a seam that hardcodes durability reports a tool
+/// defect as a database outage. Each seam is asserted under both kinds, so
+/// neither shortcut passes.
+#[tokio::test]
+async fn every_executor_seam_keeps_its_port_error_kind() {
+    let mut violations = Vec::new();
+    for seam in ExecutorSeam::ALL {
+        for (kind, expected) in [
+            (
+                RefusedKind::Durability,
+                BrainFailureClass::DurabilityDegraded,
+            ),
+            (
+                RefusedKind::Unclassified,
+                BrainFailureClass::ToolExecutorFailure,
+            ),
+        ] {
+            let failure = executor_seam_failure(seam, kind).await;
+            if failure.failure_class() != expected
+                || failure.terminal_reason() != expected.terminal_reason()
+            {
+                violations.push(format!(
+                    "{seam:?} under {kind:?}: expected {expected} but got {} / {}",
+                    failure.failure_class(),
+                    failure.terminal_reason()
+                ));
+            }
+            if kind == RefusedKind::Durability && failure.stage() != BrainFailureStage::Store {
+                violations.push(format!(
+                    "{seam:?} under {kind:?}: a durability failure belongs to the store stage, \
+                     not {}",
+                    failure.stage()
+                ));
+            }
+
+            // Classification is never bought with a leak.
+            let rendered = format!("{failure:?} {}", serde_json::to_string(&failure).unwrap());
+            assert!(
+                !rendered.contains(PROGRESSION_STORE_DSN_MARKER),
+                "{rendered}"
+            );
+            assert!(
+                !rendered.contains(PROGRESSION_QUESTION_MARKER),
+                "{rendered}"
+            );
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "seams that do not classify from the store's own kind:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// One rule, one reader. A second file that reads a `PortErrorKind` is a second
+/// place the mapping can drift, which is exactly how `A-20.1` was introduced.
+#[test]
+fn one_adapter_module_reads_the_port_error_kind() {
+    let readers = adapter_source_files()
+        .into_iter()
+        .filter(|(_, body)| body.contains("PortErrorKind::") || body.contains("is_durability()"))
+        .map(|(path, _)| path)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        readers.len(),
+        1,
+        "exactly one adapter source may read a port error kind: {readers:?}"
+    );
+    assert!(
+        readers[0].ends_with("cartesia_gemini/mod.rs"),
+        "{readers:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

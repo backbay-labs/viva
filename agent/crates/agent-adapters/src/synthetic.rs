@@ -30,9 +30,9 @@ use agent_domain::{
 };
 
 use crate::cartesia_gemini::{
-    answer_evaluation_from_outcome, brain_failure, learning_event_projection,
-    parse_persisted_turn_outcome, recap_from_tool_result, select_session_question,
-    SessionPhaseTracker,
+    answer_evaluation_from_outcome, brain_failure, classified_failure, learning_event_projection,
+    parse_persisted_turn_outcome, port_error_classification, recap_from_tool_result,
+    select_session_question, tool_execution_classification, SessionPhaseTracker,
 };
 
 /// The immutable Plan 04 turn-outcome corpus. It is read-only input: this crate
@@ -244,9 +244,10 @@ impl RealtimeBrain for SyntheticBrain {
         let clock = Arc::clone(&self.clock);
         let executor = match &study_store {
             Some(store) => {
-                let _ = store.record_voice_session(&config).await.map_err(|error| {
-                    store_failure(&error, BrainFailureClass::DurabilityDegraded)
-                })?;
+                let _ = store
+                    .record_voice_session(&config)
+                    .await
+                    .map_err(|error| store_failure(&error))?;
                 Some(VivaToolExecutor::with_clock(
                     Arc::clone(store),
                     AuthorizedStudySession::from_config(&config).map_err(|error| {
@@ -382,30 +383,60 @@ impl RealtimeBrain for SyntheticBrain {
     }
 }
 
-fn store_failure(error: &agent_domain::PortError, class: BrainFailureClass) -> BrainError {
-    let _ = error;
-    brain_failure(BrainProviderFailureParts {
-        failure_class: class,
-        stage: BrainFailureStage::Store,
+fn synthetic_failure_parts(
+    failure_class: BrainFailureClass,
+    stage: BrainFailureStage,
+    error_kind: &'static str,
+) -> BrainProviderFailureParts {
+    BrainProviderFailureParts {
+        failure_class,
+        stage,
         retry_eligible: true,
         latency_ms: 0,
         provider: "server".to_owned(),
         model: "synthetic".to_owned(),
-        metadata: "error_kind=store_write_failed".to_owned(),
-    })
+        metadata: format!("error_kind={error_kind}"),
+    }
 }
 
+/// `A-20.1`: a direct store failure, classified by its own `PortErrorKind`.
+///
+/// A kind Plan 06 publishes a class for keeps it; every other kind stays an
+/// unclassified tool-executor failure rather than being promoted into a
+/// durability claim the store never made.
+fn store_failure(error: &agent_domain::PortError) -> BrainError {
+    classified_failure(
+        port_error_classification(error),
+        synthetic_failure_parts(
+            BrainFailureClass::ToolExecutorFailure,
+            BrainFailureStage::Store,
+            "store_write_failed",
+        ),
+    )
+}
+
+/// The same rule for a failure the Plan 04 executor returned.
+fn executor_failure(
+    error: &agent_domain::ToolExecutionError,
+    stage: BrainFailureStage,
+    error_kind: &'static str,
+) -> BrainError {
+    classified_failure(
+        tool_execution_classification(error),
+        synthetic_failure_parts(BrainFailureClass::ToolExecutorFailure, stage, error_kind),
+    )
+}
+
+/// A failure with no typed store kind behind it at all — a rejected session
+/// config, a malformed tool payload. There is nothing to preserve here, so the
+/// caller's class stands.
 fn tool_failure(class: BrainFailureClass, reason: &str) -> BrainError {
     let _ = reason;
-    brain_failure(BrainProviderFailureParts {
-        failure_class: class,
-        stage: BrainFailureStage::Tools,
-        retry_eligible: true,
-        latency_ms: 0,
-        provider: "server".to_owned(),
-        model: "synthetic".to_owned(),
-        metadata: "error_kind=tool_executor_failure".to_owned(),
-    })
+    brain_failure(synthetic_failure_parts(
+        class,
+        BrainFailureStage::Tools,
+        "tool_executor_failure",
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -713,7 +744,11 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
         {
             emit_provider_failure(
                 event_tx,
-                tool_failure(BrainFailureClass::DurabilityDegraded, &error.to_string()),
+                executor_failure(
+                    &error,
+                    BrainFailureStage::Store,
+                    "answer_attempt_envelope_failed",
+                ),
             )
             .await;
             return;
@@ -730,7 +765,11 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
             )
             .await
             .map_err(|error| {
-                tool_failure(BrainFailureClass::ToolExecutorFailure, &error.to_string())
+                executor_failure(
+                    &error,
+                    BrainFailureStage::Tools,
+                    "evaluate_spoken_answer_failed",
+                )
             })
             .and_then(|result| parse_persisted_turn_outcome(&result.result, &job.response_id))
         {
@@ -755,7 +794,11 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
             )
             .await
             .map_err(|error| {
-                tool_failure(BrainFailureClass::ToolExecutorFailure, &error.to_string())
+                executor_failure(
+                    &error,
+                    BrainFailureStage::Tools,
+                    "retrieve_source_reference_failed",
+                )
             })
             .and_then(|result| {
                 serde_json::from_value(result.result["source"].clone()).map_err(|_| {
@@ -867,7 +910,13 @@ async fn emit_session_recap(
             ToolProposal::build_session_recap(&spec.study_set_id, &spec.voice_session_id),
         )
         .await
-        .map_err(|error| tool_failure(BrainFailureClass::ToolExecutorFailure, &error.to_string()))
+        .map_err(|error| {
+            executor_failure(
+                &error,
+                BrainFailureStage::Recap,
+                "build_session_recap_failed",
+            )
+        })
         .and_then(|result| recap_from_tool_result(&result.result))
     {
         Ok(recap) => recap,

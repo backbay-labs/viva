@@ -39,8 +39,8 @@ pub use tts::{parse_sonic_event, sonic_generation_request, SonicConfig, SonicEve
 
 pub(crate) use projection::{
     answer_evaluation_from_outcome, emit_provider_failure, learning_event_projection,
-    outcome_contract_failure, parse_persisted_turn_outcome, recap_from_tool_result,
-    send_fake_unless_cancelled, SessionPhaseTracker,
+    outcome_contract_failure, outcome_contract_parts, parse_persisted_turn_outcome,
+    recap_from_tool_result, send_fake_unless_cancelled, SessionPhaseTracker,
 };
 
 use crate::synthetic::fixture_response_text;
@@ -156,26 +156,37 @@ pub(crate) fn tool_execution_classification(
     }
 }
 
-/// One executor failure at a server-owned adapter seam.
+/// Fold a store failure's own classification into the parts a seam prepared.
 ///
-/// A classified kind carries its own class, stage, and retry policy; anything
-/// else stays exactly the tool-contract failure this seam already reported.
-pub(crate) fn executor_stage_failure(
-    error: &agent_domain::ToolExecutionError,
-    error_kind: &'static str,
+/// A classified kind replaces the class, stage, and retry policy the seam would
+/// otherwise have chosen; an unclassified kind leaves the seam's own choice
+/// untouched. Every adapter seam that maps an executor or port error goes
+/// through here, so no seam can claim a durable-store outage the store never
+/// reported — or hide one it did.
+pub(crate) fn classified_failure(
+    classification: Option<PortFailureClassification>,
+    parts: BrainProviderFailureParts,
 ) -> BrainError {
-    let Some(classification) = tool_execution_classification(error) else {
-        return outcome_contract_failure(error_kind);
+    let Some(classification) = classification else {
+        return brain_failure(parts);
     };
     brain_failure(BrainProviderFailureParts {
         failure_class: classification.failure_class,
         stage: classification.stage,
         retry_eligible: classification.retry_eligible,
-        latency_ms: 0,
-        provider: "server".to_owned(),
-        model: "viva-tools".to_owned(),
-        metadata: format!("error_kind={error_kind}"),
+        ..parts
     })
+}
+
+/// One executor failure at the shared tool-contract seam.
+pub(crate) fn executor_stage_failure(
+    error: &agent_domain::ToolExecutionError,
+    error_kind: &'static str,
+) -> BrainError {
+    classified_failure(
+        tool_execution_classification(error),
+        outcome_contract_parts(error_kind),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -926,7 +937,7 @@ impl FakeCartesiaGeminiRuntime {
                         break;
                     }
                 };
-                if executor
+                if let Err(error) = executor
                     .record_answer_attempt_envelope(answer_attempt_envelope(
                         &session,
                         &question,
@@ -935,11 +946,10 @@ impl FakeCartesiaGeminiRuntime {
                         &runner_input,
                     ))
                     .await
-                    .is_err()
                 {
                     emit_provider_failure(
                         &event_tx,
-                        outcome_contract_failure("answer_attempt_envelope_failed"),
+                        executor_stage_failure(&error, "answer_attempt_envelope_failed"),
                     )
                     .await;
                     break;
