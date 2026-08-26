@@ -122,7 +122,9 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
           return libraryPreLoopJsonError(502, "viva_library_pre_loop_unavailable", terminalReason);
         }
         // Every other upstream 400/422 is preserved, but only after bounded reading and stripping.
-        const preserved = await browserSafeLibraryResponse(response, path, controller.signal, {});
+        const preserved = await browserSafeLibraryResponse(response, path, controller.signal, {
+          terminalReason,
+        });
         if (timedOut) {
           return libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason);
         }
@@ -136,7 +138,10 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
         ? libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason)
         : libraryProxyJsonError(504, "viva_library_proxy_timeout");
     }
-    return await browserSafeLibraryResponse(response, path, controller.signal, { snapshotFilter });
+    return await browserSafeLibraryResponse(response, path, controller.signal, {
+      snapshotFilter,
+      terminalReason,
+    });
   } catch (error) {
     if (vivaBoundedBodyRejection(error) === "too_large") {
       return libraryUpstreamTooLargeResponse(terminalReason);
@@ -623,11 +628,14 @@ function trimTrailingSlash(value: string): string {
 /**
  * The ONE bounded response builder every upstream response goes through.
  *
- * Order matters and is fixed: bounded read -> parse -> (Task 6 stripping) -> snapshot allowlist
- * filtering -> BFF capability minting. Headers are rebuilt from a route-owned allowlist — the
- * upstream content type plus this route's own cache/security headers — so no upstream cookie,
- * auth, or cache header is ever cloned onto a browser-facing response. An overage cancels the
- * upstream stream and raises, and the caller maps it to the recorded 502.
+ * Order matters and is fixed: bounded read -> parse -> recursive credential strip -> snapshot
+ * allowlist filtering -> BFF capability minting. The strip pass never runs after minting, because
+ * the BFF's own freshly minted capabilities are the intended browser-safe outputs.
+ *
+ * Headers are rebuilt from a route-owned allowlist — the upstream content type plus this route's
+ * own cache/security headers — so no upstream cookie, auth, or cache header is ever cloned onto a
+ * browser-facing response. An overage cancels the upstream stream and raises, and the caller maps
+ * it to the recorded 502.
  */
 async function browserSafeLibraryResponse(
   response: Response,
@@ -635,6 +643,7 @@ async function browserSafeLibraryResponse(
   signal: AbortSignal,
   options: {
     snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
+    terminalReason?: string | null;
   },
 ): Promise<NextResponse> {
   const contentType = response.headers.get("content-type");
@@ -643,12 +652,18 @@ async function browserSafeLibraryResponse(
     limit: WEB_API_BODY_LIMITS.libraryResponse,
     signal,
   });
+  const built = browserSafeLibraryResponseBody(bytes, path, contentType, options);
+  if (!built.ok) {
+    // A JSON-expected route never relays ambiguous bytes; it returns the route's sanitized 502.
+    return options.terminalReason
+      ? libraryPreLoopJsonError(502, "viva_library_pre_loop_unavailable", options.terminalReason)
+      : libraryProxyJsonError(502, "viva_library_proxy_unavailable");
+  }
   const responseHeaders = noStoreHeaders(contentType ? { "content-type": contentType } : {});
-  const body = browserSafeLibraryResponseBody(bytes, path, contentType, options);
-  return new NextResponse(typeof body === "string" ? body : new Uint8Array(body), {
-    headers: responseHeaders,
-    status: response.status,
-  });
+  return new NextResponse(
+    typeof built.body === "string" ? built.body : new Uint8Array(built.body),
+    { headers: responseHeaders, status: response.status },
+  );
 }
 
 function browserSafeLibraryResponseBody(
@@ -658,31 +673,92 @@ function browserSafeLibraryResponseBody(
   options: {
     snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
   },
-): Uint8Array | string {
-  if (
-    path.join("/") !== "study-sets/library" ||
-    !contentType?.toLowerCase().includes("application/json")
-  ) {
-    return bytes;
-  }
+): { ok: true; body: Uint8Array | string } | { ok: false } {
+  // An explicitly binary/export route keeps bounded byte pass-through.
+  if (isLibraryBytePassThroughRoute(path)) return { ok: true, body: bytes };
+  // A bodiless response (204, or a bare 4xx with no payload) has nothing to sanitize.
+  if (bytes.byteLength === 0) return { ok: true, body: bytes };
+  if (!contentType?.toLowerCase().includes("application/json")) return { ok: false };
+
   const parsed = parseBoundedJson(bytes);
-  if (!parsed.ok) return "{}";
-  const filtered = options.snapshotFilter
-    ? filterBearerBackedLibrarySnapshot(parsed.value, options.snapshotFilter)
-    : parsed.value;
-  const withBootstrapTokens = options.snapshotFilter
-    ? attachVivaSessionBootstrapTokensToLibrarySnapshot(filtered, {
-        allowedStudySetIds: options.snapshotFilter.allowedStudySetIds,
-        userId: options.snapshotFilter.userId,
-      })
-    : filtered;
-  const withControlTokens = options.snapshotFilter
-    ? attachVivaLibraryControlTokensToLibrarySnapshot(withBootstrapTokens, {
-        allowedStudySetIds: options.snapshotFilter.allowedStudySetIds,
-        userId: options.snapshotFilter.userId,
-      })
-    : withBootstrapTokens;
-  return JSON.stringify(stripBrowserLibraryCapabilityTokens(withControlTokens));
+  if (!parsed.ok) return { ok: false };
+  const stripped = stripAgentOriginatedCredentials(parsed.value);
+  if (path.join("/") !== "study-sets/library" || !options.snapshotFilter) {
+    return { ok: true, body: JSON.stringify(stripped) };
+  }
+
+  const filter = options.snapshotFilter;
+  const filtered = filterBearerBackedLibrarySnapshot(stripped, filter);
+  const withBootstrapTokens = attachVivaSessionBootstrapTokensToLibrarySnapshot(filtered, {
+    allowedStudySetIds: filter.allowedStudySetIds,
+    userId: filter.userId,
+  });
+  const withControlTokens = attachVivaLibraryControlTokensToLibrarySnapshot(withBootstrapTokens, {
+    allowedStudySetIds: filter.allowedStudySetIds,
+    userId: filter.userId,
+  });
+  return { ok: true, body: JSON.stringify(withControlTokens) };
+}
+
+/** Only an explicitly binary/export route relays upstream bytes unparsed. */
+function isLibraryBytePassThroughRoute(path: string[]): boolean {
+  return path.join("/") === "study-sets/export";
+}
+
+/**
+ * Recursive, order-sensitive credential removal for every proxied JSON body.
+ *
+ * Keys are compared case-insensitively against the closed credential set plus any `_token`
+ * suffix, so an upstream `session_bootstrap_token`, `same_origin_control_token`, or `Access_Token`
+ * is removed no matter how it is cased or nested. String VALUES are inspected one leaf at a time —
+ * never with a token-shaped regex over serialized JSON — and any string carrying a bearer
+ * credential or a Viva credential prefix is replaced whole.
+ */
+const AGENT_CREDENTIAL_KEYS: ReadonlySet<string> = new Set([
+  "api_key",
+  "authorization",
+  "credential",
+  "password",
+  "private_key",
+  "secret",
+  "token",
+]);
+/**
+ * Value markers, lowercase, matched against a lowercased string LEAF — never as a token-shaped
+ * regex over serialized JSON. These are the only credential shapes the agent can hand back:
+ * the HTTP authorization scheme below, and Viva's four credential prefixes.
+ */
+const AGENT_CREDENTIAL_VALUE_MARKERS = [
+  "bearer ",
+  "viva1.",
+  "viva-bootstrap1.",
+  "viva-control1.",
+  "viva-refresh1.",
+] as const;
+const AGENT_CREDENTIAL_REDACTION = "[redacted]";
+
+function stripAgentOriginatedCredentials(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripAgentOriginatedCredentials);
+  if (typeof value === "string") return redactedAgentCredentialString(value);
+  if (!value || typeof value !== "object") return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (isAgentCredentialKey(key)) continue;
+    output[key] = stripAgentOriginatedCredentials(child);
+  }
+  return output;
+}
+
+function isAgentCredentialKey(key: string): boolean {
+  const normalized = key.toLowerCase();
+  return AGENT_CREDENTIAL_KEYS.has(normalized) || normalized.endsWith("_token");
+}
+
+function redactedAgentCredentialString(value: string): string {
+  const normalized = value.toLowerCase();
+  return AGENT_CREDENTIAL_VALUE_MARKERS.some((marker) => normalized.includes(marker))
+    ? AGENT_CREDENTIAL_REDACTION
+    : value;
 }
 
 function filterBearerBackedLibrarySnapshot(
@@ -739,15 +815,4 @@ function librarySessionAllowed(
     typeof session.study_set_id === "string" &&
     filter.allowedStudySetIds.has(session.study_set_id)
   );
-}
-
-function stripBrowserLibraryCapabilityTokens(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripBrowserLibraryCapabilityTokens);
-  if (!value || typeof value !== "object") return value;
-  const output: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(value)) {
-    if (key === "control_token" || key === "session_token") continue;
-    output[key] = stripBrowserLibraryCapabilityTokens(child);
-  }
-  return output;
 }

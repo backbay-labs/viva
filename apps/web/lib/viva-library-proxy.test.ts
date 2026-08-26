@@ -2310,6 +2310,282 @@ describe("Viva library body byte cap and ingestion request shapes", () => {
   }
 });
 
+describe("Viva library proxy credential stripping", () => {
+  const CANONICAL = "http://localhost:3000";
+  const trackedEnv = [
+    "VIVA_AGENT_HTTP_URL",
+    "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+    "VIVA_SESSION_ALLOWED_STUDY_SET_IDS",
+    "VIVA_SESSION_ALLOWED_USER_IDS",
+    "VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET",
+    "VIVA_WEB_CANONICAL_ORIGIN",
+  ] as const;
+  const savedEnv = new Map<string, string | undefined>();
+
+  beforeEach(() => {
+    for (const name of trackedEnv) savedEnv.set(name, process.env[name]);
+    process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+    process.env.VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN = LIBRARY_READ_BEARER;
+    process.env.VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN = LIBRARY_DELETE_BEARER;
+    process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+    process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+    process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = LIBRARY_BOOTSTRAP_SECRET;
+    process.env.VIVA_WEB_CANONICAL_ORIGIN = CANONICAL;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    for (const [name, value] of savedEnv) restoreEnv(name, value);
+    savedEnv.clear();
+  });
+
+  test("strips agent credentials from every proxied JSON response", async () => {
+    const relaying: Array<{ label: string; status: number; run: () => Promise<Response> }> = [];
+    for (const status of [200, 201, 400, 401, 403, 409, 422, 500]) {
+      relaying.push({
+        label: `delete ${status}`,
+        run: () => destructiveDelete(),
+        status,
+      });
+    }
+    for (const status of [200, 201, 400, 422]) {
+      relaying.push({ label: `paste ${status}`, run: () => ingestionPost("paste"), status });
+      relaying.push({ label: `files ${status}`, run: () => ingestionPost("files"), status });
+      relaying.push({ label: `retry ${status}`, run: () => ingestionPost("retry"), status });
+    }
+    relaying.push({ label: "snapshot 200", run: () => librarySnapshot(), status: 200 });
+
+    const leaked: string[] = [];
+    const preserved: string[] = [];
+    for (const entry of relaying) {
+      globalThis.fetch = hostileUpstream(entry.status);
+      const response = await entry.run();
+      const text = await response.text();
+      for (const credential of HOSTILE_CREDENTIAL_STRINGS) {
+        if (text.includes(credential)) leaked.push(`${entry.label}: value ${credential}`);
+      }
+      for (const key of HOSTILE_CREDENTIAL_KEYS) {
+        if (text.includes(`"${key}"`)) leaked.push(`${entry.label}: key ${key}`);
+      }
+      if (text.includes('"safe":"preserved"')) preserved.push(entry.label);
+    }
+
+    expect(leaked).toEqual([]);
+    // Every relaying case keeps the innocuous field, so the matrix is not passing by returning
+    // an empty or sanitized body everywhere.
+    expect(preserved).toHaveLength(relaying.length);
+  });
+
+  test("strips agent credentials from every proxied JSON response header set", async () => {
+    globalThis.fetch = hostileUpstream(200, {
+      authorization: `Bearer ${LIBRARY_READ_BEARER}`,
+      "cache-control": "public, max-age=31536000",
+      "content-type": "application/json",
+      "set-cookie": "session=upstream; Path=/",
+      "www-authenticate": 'Bearer realm="agent"',
+      "x-api-key": "upstream-api-key",
+    });
+
+    const response = await destructiveDelete();
+    const names = [...response.headers.keys()].sort();
+
+    expect(response.headers.get("authorization")).toBe(null);
+    expect(response.headers.get("set-cookie")).toBe(null);
+    expect(response.headers.get("www-authenticate")).toBe(null);
+    expect(response.headers.get("x-api-key")).toBe(null);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("pragma")).toBe("no-cache");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(names).toEqual(["cache-control", "content-type", "pragma", "x-content-type-options"]);
+  });
+
+  test("strips agent credentials from every proxied JSON response before minting BFF capabilities", async () => {
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          study_sets: [
+            {
+              actions: {
+                delete: { available: true },
+                start: {
+                  available: true,
+                  session_bootstrap_token: "viva-bootstrap1.upstream-forged",
+                  session_id: "server-session",
+                  session_token: "viva1.raw-upstream",
+                },
+              },
+              id: "biology-midterm",
+              same_origin_control_token: "viva-control1.upstream-forged",
+              user_id: "user-1",
+            },
+          ],
+          user_id: "user-1",
+        }),
+        { headers: { "content-type": "application/json" }, status: 200 },
+      )) as typeof fetch;
+
+    const response = await librarySnapshot();
+    const body = (await response.json()) as {
+      study_sets: Array<{
+        actions: {
+          delete?: { same_origin_control_token?: string };
+          start?: { session_bootstrap_token?: string; session_token?: string };
+        };
+        same_origin_control_token?: string;
+      }>;
+    };
+    const studySet = body.study_sets[0];
+
+    // Upstream-forged capability values never survive...
+    expect(JSON.stringify(body)).not.toContain("upstream-forged");
+    expect(JSON.stringify(body)).not.toContain("viva1.raw-upstream");
+    expect(studySet?.same_origin_control_token).toBeUndefined();
+    // ...while the BFF's own freshly minted ones do, because minting runs after the strip pass.
+    expect(studySet?.actions.start?.session_bootstrap_token).toContain("viva-bootstrap1.");
+    expect(studySet?.actions.delete?.same_origin_control_token).toContain("viva-control1.");
+    expect(studySet?.actions.start?.session_token).toBeUndefined();
+  });
+
+  test("strips agent credentials from every proxied JSON response and refuses ambiguous non-JSON bytes", async () => {
+    const calls: number[] = [];
+    globalThis.fetch = (async () => {
+      calls.push(1);
+      return new Response(`raw bytes with Bearer ${LIBRARY_READ_BEARER} inside`, {
+        headers: { "content-type": "text/plain" },
+        status: 200,
+      });
+    }) as typeof fetch;
+
+    const removal = await destructiveDelete();
+    const removalBody = await removal.json();
+    const snapshot = await librarySnapshot();
+    const snapshotBody = await snapshot.json();
+
+    expect(removal.status).toBe(502);
+    expect(removalBody).toEqual({ error: "viva_library_proxy_unavailable" });
+    expect(snapshot.status).toBe(502);
+    expect(snapshotBody).toEqual({
+      error: "viva_library_pre_loop_unavailable",
+      failure_class: "pre_loop_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_ingestion_unavailable",
+    });
+    expect(JSON.stringify([removalBody, snapshotBody])).not.toContain(LIBRARY_READ_BEARER);
+    expect(calls).toHaveLength(2);
+  });
+
+  function hostileUpstream(status: number, headers?: Record<string, string>): typeof fetch {
+    return (async () =>
+      new Response(JSON.stringify(hostileUpstreamBody()), {
+        headers: headers ?? { "content-type": "application/json" },
+        status,
+      })) as typeof fetch;
+  }
+
+  async function destructiveDelete(): Promise<Response> {
+    const token = signVivaLibraryControlToken({
+      scope: "study_set_delete",
+      studySetId: "biology-midterm",
+      userId: "user-1",
+    });
+    if (!token) throw new Error("fixture must sign a study-set delete control capability");
+    const request = {
+      headers: new Headers({
+        origin: CANONICAL,
+        "sec-fetch-site": "same-origin",
+        "x-viva-library-control-token": token,
+      }),
+      method: "DELETE",
+      nextUrl: new URL(`${CANONICAL}/api/viva-library/study-sets/biology-midterm?user_id=user-1`),
+    } as unknown as NextRequest;
+    return DELETE(request, {
+      params: Promise.resolve({ path: ["study-sets", "biology-midterm"] }),
+    });
+  }
+
+  async function ingestionPost(kind: "files" | "paste" | "retry"): Promise<Response> {
+    if (kind === "paste") {
+      return POST(ingestionRequest("study-sets/paste", validPasteBody()), {
+        params: Promise.resolve({ path: ["study-sets", "paste"] }),
+      });
+    }
+    if (kind === "files") {
+      return POST(
+        ingestionRequest("study-sets/files", {
+          file_base64: "JVBERi0xLjc=",
+          file_name: "Lecture 9.pdf",
+          title: "Bio PDF",
+        }),
+        { params: Promise.resolve({ path: ["study-sets", "files"] }) },
+      );
+    }
+    return POST(
+      ingestionRequest("study-sets/biology-midterm/files/retry", {
+        file_base64: "JVBERi0xLjc=",
+        file_name: "Lecture 9.pdf",
+      }),
+      { params: Promise.resolve({ path: ["study-sets", "biology-midterm", "files", "retry"] }) },
+    );
+  }
+
+  async function librarySnapshot(): Promise<Response> {
+    const request = {
+      headers: new Headers(),
+      method: "GET",
+      nextUrl: new URL(`${CANONICAL}/api/viva-library/study-sets/library?user_id=user-1`),
+    } as unknown as NextRequest;
+    return GET(request, { params: Promise.resolve({ path: ["study-sets", "library"] }) });
+  }
+});
+
+const HOSTILE_CREDENTIAL_KEYS = [
+  "session_token",
+  "control_token",
+  "refresh_token",
+  "authorization",
+  "Access_Token",
+  "api_key",
+  "secret",
+  "password",
+  "private_key",
+  "credential",
+  "token",
+] as const;
+
+const HOSTILE_CREDENTIAL_STRINGS = [
+  "viva1.raw",
+  "raw-control",
+  "viva-refresh1.raw",
+  "viva1.raw-nested",
+  "Bearer raw-in-text",
+  "viva-control1.raw",
+  "viva-bootstrap1.raw",
+] as const;
+
+function hostileUpstreamBody(): Record<string, unknown> {
+  return {
+    api_key: "raw-api-key",
+    authorization: "Bearer raw",
+    control_token: "raw-control",
+    credential: "raw-credential",
+    nested: [
+      { Access_Token: "viva1.raw-nested" },
+      { message: "upstream reflected Bearer raw-in-text" },
+      { deeper: { same_origin_control_token: "viva-control1.raw", token: "raw-token" } },
+    ],
+    password: "raw-password",
+    private_key: "raw-private-key",
+    refresh_token: "viva-refresh1.raw",
+    safe: "preserved",
+    secret: "raw-secret",
+    session_bootstrap_token: "viva-bootstrap1.raw",
+    session_token: "viva1.raw",
+    study_sets: [],
+    user_id: "user-1",
+  };
+}
+
 function validPasteBody(): Record<string, string> {
   return {
     course: "Biology 201",
