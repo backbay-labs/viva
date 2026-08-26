@@ -2,7 +2,13 @@ import { useId } from "react";
 import { Image, StyleSheet, View } from "react-native";
 import Svg, { Defs, RadialGradient, Rect, Stop } from "react-native-svg";
 
-import { gaussianStops, VIGNETTE, WELL } from "@/components/atmosphere-geometry";
+import {
+  gaussianStops,
+  VIGNETTE,
+  VIGNETTE_RADIUS,
+  WELL,
+  WELL_RADIUS,
+} from "@/components/atmosphere-geometry";
 
 // Relative, not "@/assets/...": the tsconfig maps @/assets/* but nothing in the
 // app imports through it yet, so Metro's resolution of that branch is unproven.
@@ -41,10 +47,19 @@ export function VivaAtmosphere() {
       <Image resizeMode="cover" source={VELLUM_PLATE} style={styles.plate} />
       <Svg height="100%" style={StyleSheet.absoluteFill} width="100%">
         <Defs>
+          {/*
+            Both radii are supplied on purpose. rx/ry are a react-native-svg
+            native extension and a DOM <radialGradient> has none, so the browser
+            drops them and falls back to the SVG default r = 50%; r is what web
+            actually paints with. Native ignores r whenever rx is present
+            (`rx: rx || r`), so native output is unchanged. Removing either one
+            silently breaks one of the two tiers.
+          */}
           <RadialGradient
             cx={`${WELL.cx * 100}%`}
             cy={`${WELL.cy * 100}%`}
             id={`${gradientId}Well`}
+            r={`${WELL_RADIUS * 100}%`}
             rx={`${WELL.rx * 100}%`}
             ry={`${WELL.ry * 100}%`}
           >
@@ -57,7 +72,14 @@ export function VivaAtmosphere() {
               />
             ))}
           </RadialGradient>
-          <RadialGradient cx="50%" cy="50%" id={`${gradientId}Vignette`} rx="74%" ry="64%">
+          <RadialGradient
+            cx={`${VIGNETTE.cx * 100}%`}
+            cy={`${VIGNETTE.cy * 100}%`}
+            id={`${gradientId}Vignette`}
+            r={`${VIGNETTE_RADIUS * 100}%`}
+            rx={`${VIGNETTE.rx * 100}%`}
+            ry={`${VIGNETTE.ry * 100}%`}
+          >
             <Stop offset={VIGNETTE.innerStop} stopColor="#2B1D34" stopOpacity={0} />
             <Stop offset={1} stopColor="#2B1D34" stopOpacity={VIGNETTE.edgeOpacity} />
           </RadialGradient>
@@ -76,7 +98,12 @@ const styles = StyleSheet.create({
     // omits width/height, and that beats the insets — the plate then renders at
     // its natural size and `cover` crops a magnified corner. Native sizes from
     // the insets alone, so the plate must state both. Do not "simplify" this
-    // back to a bare StyleSheet.absoluteFill.
+    // back to style={StyleSheet.absoluteFill} on the <Image>.
+    //
+    // Spreading absoluteFill rather than absoluteFillObject is also deliberate:
+    // React Native 0.86 removed absoluteFillObject from core, so spreading it
+    // would be `...undefined` and would drop position:absolute on iOS and
+    // Android while looking fine on web.
     ...StyleSheet.absoluteFill,
     height: "100%",
     width: "100%",

@@ -20,9 +20,39 @@ export const WELL = {
 
 /** A cool sink at the extreme edge, so the page reads as embedded. */
 export const VIGNETTE = {
+  cx: 0.5,
+  cy: 0.5,
+  rx: 0.74,
+  ry: 0.64,
   innerStop: 0.52,
   edgeOpacity: 0.16,
 } as const;
+
+/**
+ * The scalar radius that approximates an `rx` x `ry` ellipse.
+ *
+ * The geometric mean, not the arithmetic one: it preserves the ellipse's area,
+ * so the circle web draws covers the same ground as the ellipse native draws
+ * rather than the wider pool an averaged radius would give.
+ */
+export function meanRadius(rx: number, ry: number): number {
+  return Math.sqrt(rx * ry);
+}
+
+/**
+ * `rx`/`ry` on a `RadialGradient` are a react-native-svg *native extension*, not
+ * DOM attributes: the web element is a bare pass-through, so the browser drops
+ * them and falls back to the SVG default `r = 50%`. That shrinks the well to a
+ * 0.50 pool and starts the vignette darkening at 0.26 of the box, which measured
+ * about 15% below the luminance Task 1's contrast suite certifies against — and
+ * took seven of the eight text tokens under 4.5:1 on the web tier.
+ *
+ * Supplying `r` alongside `rx`/`ry` fixes web and leaves native untouched, since
+ * native maps `rx: rx || r`. Derived here rather than written at the call site
+ * so the scalar cannot drift from the ellipse it summarises.
+ */
+export const WELL_RADIUS = meanRadius(WELL.rx, WELL.ry);
+export const VIGNETTE_RADIUS = meanRadius(VIGNETTE.rx, VIGNETTE.ry);
 
 /**
  * Discretises the shader's `exp(-(distance * 1.15)^2)` falloff into SVG stops.

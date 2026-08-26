@@ -36,6 +36,11 @@ const TRANSPARENT_NAV_THEME = {
   colors: { ...DefaultTheme.colors, background: "transparent" },
 };
 
+// How long the splash will wait on the plate before opening anyway. Also caps
+// web cold start, where there is no native splash behind us and first paint is
+// blocked on a 318 KB webp.
+const PLATE_DECODE_DEADLINE_MS = 3000;
+
 export default function RootLayout() {
   const [fontsLoaded, fontError] = useFonts({
     Cormorant_500Medium_Italic,
@@ -50,17 +55,34 @@ export default function RootLayout() {
   // The splash background is already the vellum's base colour, so holding it
   // until the plate is decoded makes the handoff seamless. Hiding on fonts
   // alone flashes flat canvas first, which is the exact impression this work
-  // exists to remove. A failed decode must not wedge the splash.
+  // exists to remove.
+  //
+  // The gate has to be total. A rejected download, a synchronous throw out of
+  // Asset.fromModule, and a promise that simply never settles all end the same
+  // way: the app opens on flat canvas, which is far better than an app that
+  // never opens at all. Hence the deadline as well as the catch.
   useEffect(() => {
     let active = true;
-    Asset.fromModule(VELLUM_PLATE)
-      .downloadAsync()
-      .catch(() => undefined)
-      .finally(() => {
-        if (active) setPlateReady(true);
+    let deadline: ReturnType<typeof setTimeout>;
+
+    // Promise.resolve().then(...) so a synchronous throw from fromModule
+    // becomes a rejection this chain can catch, rather than escaping the effect.
+    const decoded = Promise.resolve()
+      .then(() => Asset.fromModule(VELLUM_PLATE).downloadAsync())
+      .catch((error: unknown) => {
+        console.warn("[viva] the vellum plate failed to load; opening on flat canvas.", error);
       });
+    const timedOut = new Promise<void>((resolve) => {
+      deadline = setTimeout(resolve, PLATE_DECODE_DEADLINE_MS);
+    });
+
+    void Promise.race([decoded, timedOut]).finally(() => {
+      if (active) setPlateReady(true);
+    });
+
     return () => {
       active = false;
+      clearTimeout(deadline);
     };
   }, []);
 
