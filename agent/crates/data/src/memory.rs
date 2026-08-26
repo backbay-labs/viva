@@ -5,16 +5,33 @@ use std::{
 };
 
 use agent_domain::{
-    format_rfc3339_millis, parse_utc_instant, AnswerAttemptEnvelope, AnswerCaptureMode,
-    AnswerCaptureStatus, AnswerContentPolicy, AnswerEvaluation, ConceptStatus, CreateFileStudySet,
-    CreatePasteStudySet, LibraryNextReviewSummary, LibrarySessionRecapSummary,
-    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
+    format_rfc3339_millis,
+    learning_outcome::{
+        VIVA_CHALLENGE_RESOLUTION_SCHEMA, VIVA_TURN_OUTCOME_RECORD_SCHEMA, VIVA_TURN_OUTCOME_SCHEMA,
+    },
+    learning_recap::{
+        ConceptLabel, ReviewScheduleAuthority, ReviewScheduleSummary, SessionLearningEvidence,
+    },
+    parse_utc_instant,
+    study_projection::{
+        StudyProjectionActiveQuestionV1, StudyProjectionConceptV1,
+        StudyProjectionQuestionProgressV1, StudyProjectionReviewItemV1, StudyProjectionSessionV1,
+        StudyProjectionSourceCitationV1, StudyProjectionStudySetV1, StudyProjectionVersionV1,
+    },
+    AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
+    AnswerEvaluation, AuthenticatedStudyProjectionV1, ChallengeDisposition, ChallengeResolution,
+    ConceptStatus, ConceptStatusTransition, CreateFileStudySet, CreatePasteStudySet,
+    LibraryNextReviewSummary, LibrarySessionRecapSummary, LibrarySessionSummary,
+    LibraryStudyDocumentSummary, LibraryStudySetSummary, PersistedTurnOutcome, PortError,
+    ProgressionPolicyId, QuestionDisposition, QuestionProgressionCursor, QuestionProgressionResult,
     ReviewScheduleCapReasonV1, ReviewScheduleDecisionV1, ReviewSchedulingContextV1, SessionConfig,
     SessionStore, SessionTokenNonceClaim, SourceConfidence, StudyConceptSummary,
     StudyDocumentSummary, StudyLibrarySnapshot, StudyMemoryStore, StudyMode, StudyQuestion,
     StudySessionDurableCounts, StudySessionRecap, StudySetIngestionRecord, StudySetIngestionStatus,
     StudySetSummary, StudySourceReference, StudySourceSpanSummary, StudyStoreBackend,
-    StudyStoreCapabilities, StudyStoreWriteCounts, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+    StudyStoreCapabilities, StudyStoreWriteCounts, StudyStoreWriteOutcome, TurnOutcome,
+    TurnOutcomeRecordReceipt, TurnResolution, VoiceUsageRecord,
+    VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -23,8 +40,50 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const MAX_PASTE_SOURCE_EXCERPT_CHARS: usize = 360;
-const MAX_PASTE_SOURCE_SPANS: usize = 4;
+/// `DATA-015`: the one shared memory/Postgres characterization suite.
+///
+/// It is declared here, not in `lib.rs`, so the crate's public surface is
+/// untouched; it is not memory-specific and imports both backends.
+#[cfg(test)]
+pub(crate) mod store_conformance;
+
+/// `DATA-015`: ingestion — classification, decoding, and generation, owned in one
+/// place. The port methods below delegate their whole body to it.
+mod ingestion;
+
+/// `DATA-015`: learning — canonical outcomes, challenges, progression, the
+/// selected D-01 schedule, and both canonical reads built from them.
+mod learning;
+
+/// `DATA-015`: authorization — the canonical browser-event digest and the nonce
+/// replay ledger's bounded retention.
+mod authorization;
+
+/// `DATA-015`: privacy — the tombstone-aware ownership guard, usage/delete
+/// serialization, and the selected D-05 finalizer.
+mod privacy;
+
+pub(crate) use authorization::{
+    current_epoch_seconds, event_authorization_record, payload_sha256, ConceptStatusEventPayload,
+    EventAuthorizationKind, EventAuthorizationRecord, ReviewScheduleEventPayload,
+    SESSION_TOKEN_NONCE_SKEW_SECONDS,
+};
+#[cfg(test)]
+use ingestion::MAX_PASTE_SOURCE_EXCERPT_CHARS;
+pub(crate) use ingestion::{generate_file_study_set, generate_paste_study_set};
+pub(crate) use learning::{
+    cursor_current_question, last_reviewed_at, projection_active_question,
+    require_selected_progression_policy, review_schedule_summaries, session_answered_questions,
+    turn_outcome_disposition, turn_outcome_transitions, validate_challenge_resolution,
+    validate_turn_outcome,
+};
+/// The raw-payload inventory is a schema gate, exercised only by the migration
+/// suite that enforces it.
+#[cfg(test)]
+pub(crate) use learning::{raw_learner_payload_field, FORBIDDEN_RAW_LEARNER_PAYLOAD_FIELDS};
+pub(crate) use privacy::{
+    deletion_receipt, DATA_RETENTION_POLICY, DELETED_ROW_CONSTANT, DELETED_STUDY_SET_TITLE,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StudySetRecord {
@@ -147,43 +206,20 @@ fn required_study_set_id(config: &SessionConfig) -> Result<&str, PortError> {
     Ok(study_set_id)
 }
 
-fn event_authorization_record<T: Serialize>(
-    user_id: &str,
-    study_set_id: &str,
-    voice_session_id: &str,
-    response_id: &str,
-    kind: EventAuthorizationKind,
-    payload: &T,
-) -> Result<EventAuthorizationRecord, PortError> {
-    Ok(EventAuthorizationRecord {
-        user_id: user_id.to_owned(),
-        study_set_id: study_set_id.to_owned(),
-        voice_session_id: voice_session_id.to_owned(),
-        response_id: response_id.to_owned(),
-        kind,
-        payload_sha256: payload_sha256(kind, response_id, payload)?,
-    })
+/// A poisoned state lock is a broken adapter invariant, not a caller error and
+/// not a storage failure.
+fn state_lock_poisoned() -> PortError {
+    PortError::internal(
+        "memory",
+        "study_state",
+        "in-memory study state lock poisoned",
+    )
 }
 
-fn payload_sha256<T: Serialize>(
-    kind: EventAuthorizationKind,
-    response_id: &str,
-    payload: &T,
-) -> Result<String, PortError> {
-    let payload = serde_json::to_vec(payload)
-        .map_err(|error| PortError::adapter("memory", error.to_string()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(kind.as_str().as_bytes());
-    hasher.update([0]);
-    hasher.update(response_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(payload);
-    let digest = hasher.finalize();
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(&mut encoded, "{byte:02x}");
-    }
-    Ok(encoded)
+/// Encoding an already-typed record this store itself holds cannot fail for a
+/// caller reason; a failure here means the adapter's own invariant broke.
+fn json_invariant(id: &'static str, error: &serde_json::Error) -> PortError {
+    PortError::internal("memory", id, error.to_string())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -332,10 +368,13 @@ impl ReviewScheduleDecisionRecord {
     }
 }
 
+/// The stored half of a v2 recap source moment. Plan 04's recap carries only the
+/// response and source identity — no excerpt, no status label — so this record
+/// holds exactly that and nothing learner-authored.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PersistedRecapSourceMoment {
-    pub source: PersistedSourceReference,
-    pub status: ConceptStatus,
+    pub response_id: String,
+    pub source_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -350,18 +389,19 @@ pub struct PersistedSessionRecap {
 
 impl From<&StudySessionRecap> for PersistedSessionRecap {
     fn from(recap: &StudySessionRecap) -> Self {
+        let buckets = crate::recap_label_buckets(recap);
         Self {
             voice_session_id: recap.voice_session_id.clone(),
-            strong_concepts: recap.strong_concepts.clone(),
-            shaky_concepts: recap.shaky_concepts.clone(),
-            missed_concepts: recap.missed_concepts.clone(),
-            review_later: recap.review_later.clone(),
+            strong_concepts: buckets.strong,
+            shaky_concepts: buckets.shaky,
+            missed_concepts: buckets.missed,
+            review_later: buckets.review_later,
             source_moments: recap
                 .source_moments
                 .iter()
                 .map(|moment| PersistedRecapSourceMoment {
-                    source: PersistedSourceReference::from(&moment.source),
-                    status: moment.status.clone(),
+                    response_id: moment.response_id.clone(),
+                    source_id: moment.source_id.clone(),
                 })
                 .collect(),
         }
@@ -376,66 +416,87 @@ pub struct RecapRecord {
     pub recap: PersistedSessionRecap,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EventAuthorizationKind {
-    AnswerEvaluation,
-    ConceptStatus,
-    ReviewSchedule,
-    StudySessionRecap,
+/// One accepted Plan 06 [`agent_domain::VoiceUsageRecord`].
+///
+/// The port type is not serializable, so this is the same
+/// `Persisted*`-from-port-type projection the rest of this module uses. Usage has
+/// no stable event identity, so every accepted write appends exactly one record
+/// and the collection's length is the published `voice_usage` count.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PersistedVoiceUsage {
+    pub voice_session_id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub duration_seconds: u64,
+    pub text_input_tokens: u64,
+    pub text_output_tokens: u64,
+    pub audio_input_tokens: u64,
+    pub audio_output_tokens: u64,
+    pub cost_estimate_usd: f64,
+    pub first_audio_latency_ms: Option<u64>,
+    pub answer_eval_latency_ms: Option<u64>,
+    pub source_retrieval_latency_ms: Option<u64>,
+    pub source_grounded_correction_count: u64,
 }
 
-impl EventAuthorizationKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AnswerEvaluation => "answer_evaluation",
-            Self::ConceptStatus => "concept_status",
-            Self::ReviewSchedule => "review_schedule",
-            Self::StudySessionRecap => "study_session_recap",
+impl From<&VoiceUsageRecord> for PersistedVoiceUsage {
+    fn from(event: &VoiceUsageRecord) -> Self {
+        Self {
+            voice_session_id: event.voice_session_id.clone(),
+            provider: event.provider.clone(),
+            model: event.model.clone(),
+            duration_seconds: event.duration_seconds,
+            text_input_tokens: event.text_input_tokens,
+            text_output_tokens: event.text_output_tokens,
+            audio_input_tokens: event.audio_input_tokens,
+            audio_output_tokens: event.audio_output_tokens,
+            cost_estimate_usd: event.cost_estimate_usd,
+            first_audio_latency_ms: event.first_audio_latency_ms,
+            answer_eval_latency_ms: event.answer_eval_latency_ms,
+            source_retrieval_latency_ms: event.source_retrieval_latency_ms,
+            source_grounded_correction_count: event.source_grounded_correction_count,
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct EventAuthorizationRecord {
+/// One persisted Plan 04 [`TurnOutcome`], stored as the canonical typed object.
+///
+/// `payload_sha256` is the same canonical digest the durable backend stores, so
+/// insert-versus-replay truth and divergence detection are decided identically on
+/// both backends.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TurnOutcomeRecord {
     pub user_id: String,
     pub study_set_id: String,
     pub voice_session_id: String,
     pub response_id: String,
-    pub kind: EventAuthorizationKind,
     pub payload_sha256: String,
+    pub outcome: TurnOutcome,
 }
 
-#[derive(Serialize)]
-struct ConceptStatusEventPayload<'a> {
-    concept_id: &'a str,
-    status: &'a ConceptStatus,
+/// One persisted Plan 04 [`ChallengeResolution`], keyed by its correction id.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChallengeResolutionRecord {
+    pub user_id: String,
+    pub study_set_id: String,
+    pub voice_session_id: String,
+    pub payload_sha256: String,
+    pub resolution: ChallengeResolution,
 }
 
-/// The replay-stable half of a scheduling outcome: the graded inputs, never the
-/// clock-derived schedule they produce. Two calls that differ only because the wall
-/// clock moved hash identically here, which is what makes a replay detectable.
-#[derive(Serialize)]
-struct ReviewScheduleEventPayload<'a> {
-    concept_id: &'a str,
-    policy_id: &'a str,
-    status: &'a ConceptStatus,
-    rating: u8,
-    hint_count: Option<u32>,
-    miss_count: Option<u32>,
-}
-
-impl<'a> ReviewScheduleEventPayload<'a> {
-    fn new(concept_id: &'a str, decision: &'a ReviewScheduleDecisionV1) -> Self {
-        Self {
-            concept_id,
-            policy_id: &decision.policy_id,
-            status: &decision.status,
-            rating: decision.rating,
-            hint_count: decision.hint_count,
-            miss_count: decision.miss_count,
-        }
-    }
+/// The one session-scoped progression cursor, plus the responses already applied
+/// to it.
+///
+/// `applied_response_ids` is what makes a replay a replay: selecting again under
+/// an already-authorized response returns the stored selection and does not
+/// advance `cursor.revision`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuestionProgressionRecord {
+    pub user_id: String,
+    pub study_set_id: String,
+    pub voice_session_id: String,
+    pub cursor: QuestionProgressionCursor,
+    pub applied_response_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -457,8 +518,32 @@ pub struct InMemoryStudyState {
     #[serde(default)]
     pub review_schedule_decisions: Vec<ReviewScheduleDecisionRecord>,
     pub recaps: Vec<RecapRecord>,
-    pub event_authorizations: Vec<EventAuthorizationRecord>,
+    /// Plan 06's usage collection (Task 7). Usage carries no stable event
+    /// identity, so this is an append-only log and its length is the published
+    /// `voice_usage` count.
+    #[serde(default)]
+    pub voice_usage_events: Vec<PersistedVoiceUsage>,
+    /// Plan 04's canonical learning persistence (Task 6).
+    #[serde(default)]
+    pub turn_outcomes: Vec<TurnOutcomeRecord>,
+    #[serde(default)]
+    pub challenge_resolutions: Vec<ChallengeResolutionRecord>,
+    #[serde(default)]
+    pub question_progressions: Vec<QuestionProgressionRecord>,
+    /// `DATA-005`: a set, not a log. Authorization is only ever consulted by
+    /// membership, so an identical replay carries no new information and must
+    /// not cost another entry; the bound is structural rather than a cap.
+    pub event_authorizations: HashSet<EventAuthorizationRecord>,
     pub session_token_nonces: Vec<SessionTokenNonceClaim>,
+    /// `DATA-004`: this backend's `study_sets.deleted_at`, keyed by study set id
+    /// and holding the RFC3339 UTC instant the deletion committed.
+    ///
+    /// It is a separate map rather than a `StudySetRecord` field because that
+    /// record is public API of this crate and other lanes build it with exhaustive
+    /// struct literals. The authority is the same either way: every ordinary read
+    /// goes through `study_set_locked`, which refuses a set named here.
+    #[serde(default)]
+    pub deleted_study_sets: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -467,14 +552,153 @@ pub struct FixtureIdTranslation {
     pub storage_uuid: Uuid,
 }
 
+/// Fixture logical id to durable storage UUID, in both directions.
+///
+/// Every id below names a checked-in fixture, never learner data: the seeded
+/// development study set, and Plan 04's canonical learning-core study set,
+/// documents, source spans, and voice sessions. The durable schema keys those
+/// entities by UUID, so without this table the Postgres backend could not return
+/// a canonical fixture under the same identifier the in-memory backend uses and
+/// no cross-backend fixture comparison would be possible at all.
+const FIXTURE_ID_TRANSLATIONS: &[(&str, &str)] = &[
+    // Seeded development fixture.
+    ("biology-midterm", "11111111-1111-4111-8111-111111111111"),
+    ("lec-5", "22222222-2222-4222-8222-222222222222"),
+    (
+        "src-lecture-5-slide-18",
+        "33333333-3333-4333-8333-333333333333",
+    ),
+    ("voice-session-1", "44444444-4444-4444-8444-444444444444"),
+    // Plan 04 learning-core fixtures (`agent/fixtures/learning-core/*.json`).
+    (
+        "set-cellular-respiration",
+        "5e700001-0000-4000-8000-000000000001",
+    ),
+    ("lec5", "5e700001-0000-4000-8000-000000000002"),
+    ("lec3", "5e700001-0000-4000-8000-000000000003"),
+    ("src-lec5-slide-18", "5e700001-0000-4000-8000-000000000004"),
+    ("src-lec5-slide-19", "5e700001-0000-4000-8000-000000000005"),
+    ("src-lec5-slide-20", "5e700001-0000-4000-8000-000000000006"),
+    ("src-lec3-slide-04", "5e700001-0000-4000-8000-000000000007"),
+    ("lec4", "5e700001-0000-4000-8000-000000000008"),
+    ("src-lec4-slide-11", "5e700001-0000-4000-8000-000000000009"),
+    ("src-lec5-slide-22", "5e700001-0000-4000-8000-00000000000a"),
+    ("vs-0001", "5e700001-0000-4000-8000-000000000011"),
+    ("vs-0002", "5e700001-0000-4000-8000-000000000012"),
+    ("vs-0003", "5e700001-0000-4000-8000-000000000013"),
+    ("vs-0004", "5e700001-0000-4000-8000-000000000014"),
+    ("vs-0005", "5e700001-0000-4000-8000-000000000015"),
+    ("vs-0006", "5e700001-0000-4000-8000-000000000016"),
+    ("vs-0007", "5e700001-0000-4000-8000-000000000017"),
+    ("vs-0008", "5e700001-0000-4000-8000-000000000018"),
+    ("vs-0009", "5e700001-0000-4000-8000-000000000019"),
+    ("vs-1001", "5e700001-0000-4000-8000-000000000021"),
+];
+
+/// `DATA-012`: the one deterministic interleaving point this crate's tests can
+/// stop an in-memory mutation at.
+///
+/// The hook sits between a method's validation and its mutation. A test arms one
+/// site, waits until the writer has validated and is about to write, runs the
+/// racing operation, and only then releases the writer. Under a method that holds
+/// one state write lock across validation and mutation the racer cannot even
+/// begin until the paused writer commits; under a validate-then-mutate method it
+/// runs to completion inside the gap, which is exactly the state the RED tests
+/// witness.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MutationSite {
+    VoiceSession,
+    AnswerEvaluation,
+    TurnOutcome,
+    VoiceUsage,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct MutationPause {
+    site: MutationSite,
+    entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+/// The test side of one armed pause.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct MutationPauseHandle {
+    entered: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+impl MutationPauseHandle {
+    /// Blocks the calling thread until the armed mutation has validated and is
+    /// about to mutate. A site that is never reached fails the test rather than
+    /// hanging the suite.
+    pub(crate) fn wait_until_paused(&self) {
+        self.entered
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the armed mutation reaches its pause point");
+    }
+
+    pub(crate) fn release(&self) {
+        let _ = self.release.send(());
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStudyStore {
     inner: Arc<RwLock<InMemoryStudyState>>,
+    #[cfg(test)]
+    pause: Arc<RwLock<Option<MutationPause>>>,
 }
 
 impl InMemoryStudyStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Arms a one-shot pause at `site`.
+    #[cfg(test)]
+    pub(crate) fn pause_at(&self, site: MutationSite) -> MutationPauseHandle {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.pause.write().expect("pause lock poisoned") = Some(MutationPause {
+            site,
+            entered: std::sync::Mutex::new(entered_tx),
+            release: std::sync::Mutex::new(release_rx),
+        });
+        MutationPauseHandle {
+            entered: entered_rx,
+            release: release_tx,
+        }
+    }
+
+    /// The pause itself. Disarms before blocking, so a site is stopped at most
+    /// once per arming and a second caller never waits on a released channel.
+    #[cfg(test)]
+    fn pause_hook(&self, site: MutationSite) {
+        let armed = {
+            let mut guard = self.pause.write().expect("pause lock poisoned");
+            if guard.as_ref().is_some_and(|pause| pause.site == site) {
+                guard.take()
+            } else {
+                None
+            }
+        };
+        let Some(pause) = armed else {
+            return;
+        };
+        let _ = pause
+            .entered
+            .lock()
+            .expect("pause sender lock poisoned")
+            .send(());
+        let _ = pause
+            .release
+            .lock()
+            .expect("pause receiver lock poisoned")
+            .recv_timeout(std::time::Duration::from_secs(10));
     }
 
     pub fn seeded_fixture() -> Self {
@@ -545,26 +769,43 @@ impl InMemoryStudyStore {
     }
 
     pub fn fixture_id_translation(logical_id: &str) -> Result<FixtureIdTranslation, PortError> {
-        let storage_uuid = match logical_id {
-            "biology-midterm" => "11111111-1111-4111-8111-111111111111",
-            "lec-5" => "22222222-2222-4222-8222-222222222222",
-            "src-lecture-5-slide-18" => "33333333-3333-4333-8333-333333333333",
-            "voice-session-1" => "44444444-4444-4444-8444-444444444444",
-            _ => {
-                return Err(PortError::unavailable(
+        let storage_uuid = FIXTURE_ID_TRANSLATIONS
+            .iter()
+            .find_map(|(fixture_id, uuid)| (*fixture_id == logical_id).then_some(*uuid))
+            .ok_or_else(|| {
+                PortError::unavailable(
                     "memory",
                     logical_id,
                     "fixture logical id has no UUID storage mapping",
-                ));
-            }
-        }
-        .parse()
-        .map_err(|error| PortError::adapter("memory", format!("invalid fixture UUID: {error}")))?;
+                )
+            })?
+            .parse()
+            .map_err(|error| {
+                PortError::internal(
+                    "memory",
+                    logical_id,
+                    format!("invalid fixture UUID: {error}"),
+                )
+            })?;
 
         Ok(FixtureIdTranslation {
             logical_id: logical_id.to_owned(),
             storage_uuid,
         })
+    }
+
+    /// The reverse of [`Self::fixture_id_translation`].
+    ///
+    /// The durable backend stores UUIDs, so this is how it hands a fixture id back
+    /// under the same name the in-memory backend uses. One table drives both
+    /// directions: a mapping that existed in only one of them would make the two
+    /// backends disagree about an id, which is exactly the class of drift
+    /// `DATA-011` exists to prevent.
+    pub fn fixture_logical_id_for_uuid(storage_uuid: Uuid) -> Option<&'static str> {
+        let rendered = storage_uuid.to_string();
+        FIXTURE_ID_TRANSLATIONS
+            .iter()
+            .find_map(|(fixture_id, uuid)| (*uuid == rendered).then_some(*fixture_id))
     }
 
     pub fn upsert_study_set(&self, record: StudySetRecord) {
@@ -628,119 +869,6 @@ impl InMemoryStudyStore {
             );
     }
 
-    /// Capture the study set's exam instant at ingestion so D-01's exam cap has the
-    /// same authoritative input on this backend as `study_sets.exam_at` gives the
-    /// Postgres backend. It is store context, never a tool argument.
-    ///
-    /// An absent exam date leaves the recorded instant untouched. A retry re-ingests
-    /// the file without re-asking the learner for the exam date — the production
-    /// retry route sends none every time — so writing that absence verbatim would
-    /// erase the only authoritative input the cap has. Title and course already
-    /// follow the same rule; clearing a recorded exam date is a separate, explicit
-    /// operation (`set_study_set_exam_date`).
-    fn capture_exam_instant_locked(
-        state: &mut InMemoryStudyState,
-        study_set_id: &str,
-        exam_at: Option<DateTime<Utc>>,
-    ) {
-        if let Some(instant) = exam_at {
-            state
-                .study_set_exam_dates
-                .insert(study_set_id.to_owned(), format_rfc3339_millis(instant));
-        }
-    }
-
-    fn persist_ingestion_record_locked(
-        state: &mut InMemoryStudyState,
-        generated: &StudySetIngestionRecord,
-        replace_existing: bool,
-    ) {
-        let study_set_id = generated.study_set.id.clone();
-        if replace_existing {
-            state
-                .documents
-                .retain(|_, document| document.study_set_id != study_set_id);
-            state
-                .source_spans
-                .retain(|_, source| source.study_set_id != study_set_id);
-            state
-                .concepts
-                .retain(|_, concept| concept.study_set_id != study_set_id);
-            state
-                .questions
-                .retain(|_, question| question.study_set_id != study_set_id);
-            state
-                .event_authorizations
-                .retain(|authorization| authorization.study_set_id != study_set_id);
-        }
-        state.study_sets.insert(
-            study_set_id.clone(),
-            StudySetRecord {
-                study_set_id: study_set_id.clone(),
-                user_id: generated.study_set.user_id.clone(),
-                title: generated.study_set.title.clone(),
-                course: generated.study_set.course.clone(),
-                ingestion_status: generated.study_set.ingestion_status.clone(),
-                ingestion_error: generated.study_set.ingestion_error.clone(),
-                concept_ids: generated
-                    .concepts
-                    .iter()
-                    .map(|concept| concept.public_id.clone())
-                    .collect(),
-                question_ids: generated
-                    .questions
-                    .iter()
-                    .map(|question| question.question_id.clone())
-                    .collect(),
-            },
-        );
-        for document in &generated.documents {
-            state.documents.insert(
-                document.id.clone(),
-                StudyDocumentRecord {
-                    study_set_id: study_set_id.clone(),
-                    document_id: document.id.clone(),
-                    title: document.display_name.clone(),
-                    source_kind: document.source_kind.clone(),
-                    processing_status: document.processing_status.clone(),
-                    tombstoned: false,
-                },
-            );
-        }
-        for source in &generated.source_spans {
-            state.source_spans.insert(
-                source.id.clone(),
-                SourceSpanRecord {
-                    study_set_id: study_set_id.clone(),
-                    source: source_summary_to_reference(source),
-                    tombstoned: false,
-                },
-            );
-        }
-        for concept in &generated.concepts {
-            state.concepts.insert(
-                concept_key(&study_set_id, &concept.public_id),
-                ConceptRecord {
-                    study_set_id: study_set_id.clone(),
-                    concept_id: concept.public_id.clone(),
-                    label: concept.label.clone(),
-                    status: concept.status.clone(),
-                    source_span_id: concept.source_span_id.clone(),
-                },
-            );
-        }
-        for question in &generated.questions {
-            state.questions.insert(
-                question_key(&study_set_id, &question.question_id),
-                StudyQuestionRecord {
-                    study_set_id: study_set_id.clone(),
-                    question: question.clone(),
-                    active: true,
-                },
-            );
-        }
-    }
-
     pub fn save_recap(&self, record: RecapRecord) {
         let mut state = self.inner.write().expect("memory store lock poisoned");
         state.recaps.retain(|existing| {
@@ -770,45 +898,6 @@ impl InMemoryStudyStore {
             return None;
         }
         Some(span.source.clone())
-    }
-
-    fn study_set_locked<'a>(
-        state: &'a InMemoryStudyState,
-        user_id: &str,
-        study_set_id: &str,
-    ) -> Result<&'a StudySetRecord, PortError> {
-        let study_set = state.study_sets.get(study_set_id).ok_or_else(|| {
-            PortError::unavailable("memory", study_set_id, "study set does not exist")
-        })?;
-        if study_set.user_id != user_id {
-            return Err(PortError::unavailable(
-                "memory",
-                study_set_id,
-                "study set is not available for this user",
-            ));
-        }
-        Ok(study_set)
-    }
-
-    fn ensure_session_locked(
-        state: &InMemoryStudyState,
-        user_id: &str,
-        study_set_id: &str,
-        voice_session_id: &str,
-    ) -> Result<(), PortError> {
-        if state.sessions.iter().any(|session| {
-            session.user_id == user_id
-                && session.study_set_id == study_set_id
-                && session.voice_session_id == voice_session_id
-                && session.status == "open"
-        }) {
-            return Ok(());
-        }
-        Err(PortError::unavailable(
-            "memory",
-            voice_session_id,
-            "voice session is not available for this user and study set",
-        ))
     }
 
     fn active_question_source_locked(
@@ -843,8 +932,9 @@ impl InMemoryStudyStore {
             )
         })?;
         if source != record.question.source {
-            return Err(PortError::adapter(
+            return Err(PortError::internal(
                 "memory",
+                &record.question.question_id,
                 "active question source tuple does not match deterministic retrieval",
             ));
         }
@@ -873,78 +963,18 @@ impl InMemoryStudyStore {
         ))
     }
 
-    fn ensure_question_locked(
-        study_set: &StudySetRecord,
+    /// The set's active questions in committed ingestion order.
+    ///
+    /// `StudySetRecord::question_ids` is the in-memory ingestion ordinal; the
+    /// durable backend orders by the `ingestion_ordinal` column migration `0018`
+    /// allocates. Both are the order the questions were committed in.
+    fn active_questions_locked(
         state: &InMemoryStudyState,
-        question_id: &str,
-    ) -> Result<(), PortError> {
-        if study_set
-            .question_ids
-            .iter()
-            .any(|known| known == question_id)
-            && state
-                .questions
-                .get(&question_key(&study_set.study_set_id, question_id))
-                .is_some_and(|record| record.active)
-        {
-            return Ok(());
-        }
-        Err(PortError::unavailable(
-            "memory",
-            question_id,
-            "question is not active for this study set",
-        ))
-    }
-
-    fn active_question_locked(
-        state: &InMemoryStudyState,
-        user_id: &str,
         study_set_id: &str,
-    ) -> Result<Option<StudyQuestion>, PortError> {
-        let study_set = Self::study_set_locked(state, user_id, study_set_id)?;
-        if study_set.ingestion_status != StudySetIngestionStatus::Ready {
-            return Ok(None);
-        }
-        for question_id in &study_set.question_ids {
-            let Some(record) = state
-                .questions
-                .get(&question_key(study_set_id, question_id))
-                .filter(|record| record.active)
-            else {
-                continue;
-            };
-            let Some(source) = Self::source_reference_locked(
-                state,
-                user_id,
-                study_set_id,
-                &record.question.source.source_id,
-            ) else {
-                continue;
-            };
-            if source != record.question.source {
-                return Err(PortError::adapter(
-                    "memory",
-                    "active question source tuple does not match deterministic retrieval",
-                ));
-            }
-            return Ok(Some(record.question.clone()));
-        }
-        Ok(None)
-    }
-
-    fn retrievable_question_count_locked(
-        state: &InMemoryStudyState,
-        user_id: &str,
-        study_set_id: &str,
-    ) -> usize {
+    ) -> Vec<StudyQuestion> {
         let Some(study_set) = state.study_sets.get(study_set_id) else {
-            return 0;
+            return Vec::new();
         };
-        if study_set.user_id != user_id
-            || study_set.ingestion_status != StudySetIngestionStatus::Ready
-        {
-            return 0;
-        }
         study_set
             .question_ids
             .iter()
@@ -955,15 +985,39 @@ impl InMemoryStudyStore {
             })
             .filter(|record| record.active)
             .filter(|record| {
-                Self::source_reference_locked(
+                Self::source_span_available_locked(
                     state,
-                    user_id,
                     study_set_id,
                     &record.question.source.source_id,
                 )
-                .is_some_and(|source| source == record.question.source)
             })
-            .count()
+            .map(|record| record.question.clone())
+            .collect()
+    }
+
+    /// Whether a source span is still retrievable for this study set.
+    ///
+    /// `DATA-011`: this is the in-memory form of the durable
+    /// `ACTIVE_QUESTION_SELECT` join, which requires the span and its document to
+    /// belong to the set and to be un-tombstoned. Without it a tombstoned document
+    /// left its questions active on one backend and removed them on the other, so
+    /// the two projections disagreed about the very thing deletion is supposed to
+    /// hide.
+    fn source_span_available_locked(
+        state: &InMemoryStudyState,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> bool {
+        let Some(span) = state.source_spans.get(source_id) else {
+            return false;
+        };
+        if span.study_set_id != study_set_id || span.tombstoned {
+            return false;
+        }
+        state
+            .documents
+            .get(&span.source.document_id)
+            .is_some_and(|document| document.study_set_id == study_set_id && !document.tombstoned)
     }
 }
 
@@ -973,50 +1027,6 @@ fn concept_key(study_set_id: &str, concept_id: &str) -> String {
 
 fn question_key(study_set_id: &str, question_id: &str) -> String {
     format!("{study_set_id}::{question_id}")
-}
-
-fn remove_session_artifacts(
-    state: &mut InMemoryStudyState,
-    user_id: &str,
-    study_set_id: &str,
-    voice_session_ids: &HashSet<String>,
-) {
-    if voice_session_ids.is_empty() {
-        return;
-    }
-    state.recaps.retain(|record| {
-        record.user_id != user_id
-            || record.study_set_id != study_set_id
-            || !voice_session_ids.contains(&record.voice_session_id)
-    });
-    state.review_items.retain(|record| {
-        record.user_id != user_id
-            || record.study_set_id != study_set_id
-            || !voice_session_ids.contains(&record.voice_session_id)
-    });
-    state.review_schedule_decisions.retain(|record| {
-        record.user_id != user_id
-            || record.study_set_id != study_set_id
-            || !voice_session_ids.contains(&record.voice_session_id)
-    });
-    state.concept_statuses.retain(|record| {
-        record.user_id != user_id
-            || record.study_set_id != study_set_id
-            || !voice_session_ids.contains(&record.voice_session_id)
-    });
-    state
-        .answer_attempts
-        .retain(|record| !voice_session_ids.contains(&record.voice_session_id));
-    state.event_authorizations.retain(|record| {
-        record.user_id != user_id
-            || record.study_set_id != study_set_id
-            || !voice_session_ids.contains(&record.voice_session_id)
-    });
-    state.session_token_nonces.retain(|record| {
-        record.user_id != user_id
-            || record.study_set_id != study_set_id
-            || !voice_session_ids.contains(&record.voice_session_id)
-    });
 }
 
 pub(crate) fn source_reference_to_summary(source: &StudySourceReference) -> StudySourceSpanSummary {
@@ -1046,928 +1056,6 @@ pub(crate) fn source_summary_to_reference(source: &StudySourceSpanSummary) -> St
     }
 }
 
-pub(crate) fn generate_paste_study_set(
-    input: CreatePasteStudySet,
-) -> Result<StudySetIngestionRecord, PortError> {
-    let user_id = required_text(&input.user_id, "user_id")?.to_owned();
-    let title = required_text(&input.title, "title")?.to_owned();
-    let pasted_text = required_text(&input.pasted_text, "pasted_text")?.to_owned();
-    let course = input.course.and_then(non_empty_owned);
-    let study_set_id = Uuid::new_v4().to_string();
-    let document_id = Uuid::new_v4().to_string();
-    let session_id = input
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let normalized = normalize_whitespace(&pasted_text);
-    let source_candidates = derive_paste_source_spans(&normalized);
-    if source_candidates.is_empty() {
-        return Ok(failed_paste_study_set(
-            study_set_id,
-            user_id,
-            title,
-            course,
-            document_id,
-            session_id,
-        ));
-    }
-    let source_text = source_candidates
-        .iter()
-        .map(|candidate| candidate.excerpt.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let concepts = extract_concepts(&source_text);
-    if concepts.is_empty() {
-        return Ok(failed_paste_study_set(
-            study_set_id,
-            user_id,
-            title,
-            course,
-            document_id,
-            session_id,
-        ));
-    }
-
-    let source_quality = classify_paste_source_quality(&normalized);
-    let sources = source_candidates
-        .into_iter()
-        .map(|candidate| StudySourceReference {
-            source_id: Uuid::new_v4().to_string(),
-            document_id: document_id.clone(),
-            span: format!("chars:{}-{}", candidate.start_char, candidate.end_char),
-            excerpt: candidate.excerpt,
-            confidence: source_quality.confidence.clone(),
-            retrieval_reason: source_quality.retrieval_reason.clone(),
-        })
-        .collect::<Vec<_>>();
-    let questions = questions_for_concepts(&concepts, &sources, &title);
-    let concepts = concepts
-        .into_iter()
-        .map(|concept| StudyConceptSummary {
-            source_span_id: source_id_for_concept(&concept, &sources),
-            public_id: concept.public_id,
-            label: concept.label,
-            status: ConceptStatus::Review,
-        })
-        .collect::<Vec<_>>();
-
-    Ok(StudySetIngestionRecord {
-        study_set: StudySetSummary {
-            id: study_set_id,
-            user_id,
-            title,
-            course,
-            ingestion_status: StudySetIngestionStatus::Ready,
-            ingestion_error: None,
-        },
-        documents: vec![StudyDocumentSummary {
-            id: document_id,
-            display_name: "Pasted notes".to_owned(),
-            source_kind: "pasted_text".to_owned(),
-            processing_status: StudySetIngestionStatus::Ready,
-        }],
-        source_spans: sources.iter().map(source_reference_to_summary).collect(),
-        concepts,
-        questions,
-        session_id,
-        session_token: None,
-    })
-}
-
-pub(crate) fn generate_file_study_set(
-    input: CreateFileStudySet,
-) -> Result<StudySetIngestionRecord, PortError> {
-    let user_id = required_text(&input.user_id, "user_id")?.to_owned();
-    let title = required_text(&input.title, "title")?.to_owned();
-    let file_name = required_text(&input.file_name, "file_name")?.to_owned();
-    let course = input.course.and_then(non_empty_owned);
-    let failure_status = if input
-        .study_set_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some()
-    {
-        StudySetIngestionStatus::Retry
-    } else {
-        StudySetIngestionStatus::Failed
-    };
-    let study_set_id = input
-        .study_set_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let document_id = Uuid::new_v4().to_string();
-    let session_id = input
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let source_kind = file_source_kind(&file_name, input.content_type.as_deref());
-    let normalized = normalize_file_bytes(&input.file_bytes);
-    let source_candidates = derive_paste_source_spans(&normalized);
-    if source_candidates.is_empty() {
-        return Ok(failed_file_study_set(
-            FailedFileStudySetInput {
-                study_set_id,
-                user_id,
-                title,
-                course,
-                document_id,
-                file_name,
-                source_kind,
-                session_id,
-                status: failure_status.clone(),
-            },
-            "no usable source span could be derived from uploaded file",
-        ));
-    }
-    let source_text = source_candidates
-        .iter()
-        .map(|candidate| candidate.excerpt.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let concepts = extract_concepts(&source_text);
-    if concepts.is_empty() {
-        return Ok(failed_file_study_set(
-            FailedFileStudySetInput {
-                study_set_id,
-                user_id,
-                title,
-                course,
-                document_id,
-                file_name,
-                source_kind,
-                session_id,
-                status: failure_status,
-            },
-            "no source-grounded concepts could be derived from uploaded file",
-        ));
-    }
-
-    let source_quality = classify_file_source_quality(&normalized);
-    let sources = source_candidates
-        .into_iter()
-        .map(|candidate| StudySourceReference {
-            source_id: Uuid::new_v4().to_string(),
-            document_id: document_id.clone(),
-            span: format!(
-                "document:chars:{}-{}",
-                candidate.start_char, candidate.end_char
-            ),
-            excerpt: candidate.excerpt,
-            confidence: source_quality.confidence.clone(),
-            retrieval_reason: source_quality.retrieval_reason.clone(),
-        })
-        .collect::<Vec<_>>();
-    let questions = questions_for_concepts(&concepts, &sources, &title);
-    let concepts = concepts
-        .into_iter()
-        .map(|concept| StudyConceptSummary {
-            source_span_id: source_id_for_concept(&concept, &sources),
-            public_id: concept.public_id,
-            label: concept.label,
-            status: ConceptStatus::Review,
-        })
-        .collect::<Vec<_>>();
-
-    Ok(StudySetIngestionRecord {
-        study_set: StudySetSummary {
-            id: study_set_id,
-            user_id,
-            title,
-            course,
-            ingestion_status: StudySetIngestionStatus::Ready,
-            ingestion_error: None,
-        },
-        documents: vec![StudyDocumentSummary {
-            id: document_id,
-            display_name: file_name,
-            source_kind,
-            processing_status: StudySetIngestionStatus::Ready,
-        }],
-        source_spans: sources.iter().map(source_reference_to_summary).collect(),
-        concepts,
-        questions,
-        session_id,
-        session_token: None,
-    })
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ExtractedConcept {
-    public_id: String,
-    label: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PasteSourceSpanCandidate {
-    start_char: usize,
-    end_char: usize,
-    excerpt: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PasteSourceQuality {
-    confidence: SourceConfidence,
-    retrieval_reason: String,
-}
-
-fn required_text<'a>(value: &'a str, label: &str) -> Result<&'a str, PortError> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err(PortError::unavailable(
-            "memory",
-            label,
-            format!("{label} is required"),
-        ));
-    }
-    Ok(value)
-}
-
-fn non_empty_owned(value: String) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_owned())
-    }
-}
-
-fn normalize_whitespace(value: &str) -> String {
-    strip_markup_tags(value)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn normalize_file_bytes(bytes: &[u8]) -> String {
-    let lossy = String::from_utf8_lossy(bytes);
-    let printable = lossy
-        .chars()
-        .map(|ch| {
-            if ch.is_control() && !ch.is_whitespace() {
-                ' '
-            } else {
-                ch
-            }
-        })
-        .collect::<String>();
-    normalize_whitespace(&printable)
-}
-
-fn file_source_kind(file_name: &str, content_type: Option<&str>) -> String {
-    let lower_name = file_name.to_ascii_lowercase();
-    let lower_content_type = content_type.unwrap_or_default().to_ascii_lowercase();
-    if lower_name.ends_with(".pdf") || lower_content_type.contains("pdf") {
-        "pdf".to_owned()
-    } else {
-        "file".to_owned()
-    }
-}
-
-fn strip_markup_tags(value: &str) -> String {
-    let chars = value.chars().collect::<Vec<_>>();
-    let mut stripped = String::with_capacity(value.len());
-    let mut index = 0;
-    while index < chars.len() {
-        if chars[index] == '<' {
-            if let Some(close_index) = chars[index + 1..]
-                .iter()
-                .take(128)
-                .position(|ch| *ch == '>')
-                .map(|offset| index + 1 + offset)
-            {
-                let content = chars[index + 1..close_index].iter().collect::<String>();
-                if is_plausible_markup_tag(&content) {
-                    stripped.push(' ');
-                    index = close_index + 1;
-                    continue;
-                }
-            }
-        }
-        stripped.push(chars[index]);
-        index += 1;
-    }
-    stripped
-}
-
-fn is_plausible_markup_tag(content: &str) -> bool {
-    if content.is_empty() || content.chars().next().is_some_and(char::is_whitespace) {
-        return false;
-    }
-    let trimmed = content.trim_end();
-    let name = trimmed
-        .strip_prefix('/')
-        .or_else(|| trimmed.strip_prefix('!'))
-        .unwrap_or(trimmed);
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_alphabetic() {
-        return false;
-    }
-    let tag_name_len = std::iter::once(first)
-        .chain(chars)
-        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-        .count();
-    tag_name_len > 0 && !trimmed.chars().any(|ch| matches!(ch, '<' | '\n' | '\r'))
-}
-
-fn failed_paste_study_set(
-    study_set_id: String,
-    user_id: String,
-    title: String,
-    course: Option<String>,
-    document_id: String,
-    session_id: String,
-) -> StudySetIngestionRecord {
-    StudySetIngestionRecord {
-        study_set: StudySetSummary {
-            id: study_set_id,
-            user_id,
-            title,
-            course,
-            ingestion_status: StudySetIngestionStatus::Failed,
-            ingestion_error: Some(
-                "no usable source span could be derived from pasted text".to_owned(),
-            ),
-        },
-        documents: vec![StudyDocumentSummary {
-            id: document_id,
-            display_name: "Pasted notes".to_owned(),
-            source_kind: "pasted_text".to_owned(),
-            processing_status: StudySetIngestionStatus::Failed,
-        }],
-        source_spans: vec![],
-        concepts: vec![],
-        questions: vec![],
-        session_id,
-        session_token: None,
-    }
-}
-
-struct FailedFileStudySetInput {
-    study_set_id: String,
-    user_id: String,
-    title: String,
-    course: Option<String>,
-    document_id: String,
-    file_name: String,
-    source_kind: String,
-    session_id: String,
-    status: StudySetIngestionStatus,
-}
-
-fn failed_file_study_set(
-    input: FailedFileStudySetInput,
-    reason: &'static str,
-) -> StudySetIngestionRecord {
-    StudySetIngestionRecord {
-        study_set: StudySetSummary {
-            id: input.study_set_id,
-            user_id: input.user_id,
-            title: input.title,
-            course: input.course,
-            ingestion_status: input.status.clone(),
-            ingestion_error: Some(reason.to_owned()),
-        },
-        documents: vec![StudyDocumentSummary {
-            id: input.document_id,
-            display_name: input.file_name,
-            source_kind: input.source_kind,
-            processing_status: input.status,
-        }],
-        source_spans: vec![],
-        concepts: vec![],
-        questions: vec![],
-        session_id: input.session_id,
-        session_token: None,
-    }
-}
-
-fn derive_paste_source_spans(text: &str) -> Vec<PasteSourceSpanCandidate> {
-    let chars = text.chars().collect::<Vec<_>>();
-    if !has_usable_source_text(&chars) {
-        return vec![];
-    }
-
-    let mut raw_ranges = Vec::new();
-    let mut start = 0;
-    for (index, ch) in chars.iter().enumerate() {
-        if is_source_sentence_boundary(&chars, index, *ch) {
-            raw_ranges.push((start, index + 1));
-            start = index + 1;
-        }
-    }
-    if start < chars.len() {
-        raw_ranges.push((start, chars.len()));
-    }
-    if raw_ranges.is_empty() {
-        raw_ranges.push((0, chars.len()));
-    }
-
-    let bounded_ranges = select_source_ranges(&chars, &raw_ranges, text);
-
-    let mut seen = std::collections::HashSet::new();
-    bounded_ranges
-        .into_iter()
-        .filter_map(|(start, end)| {
-            let (start, end) = trim_char_range(&chars, start, end)?;
-            let excerpt = collect_chars(&chars, start, end);
-            let key = excerpt.to_ascii_lowercase();
-            if !seen.insert(key) {
-                return None;
-            }
-            Some(PasteSourceSpanCandidate {
-                start_char: start,
-                end_char: end,
-                excerpt,
-            })
-        })
-        .take(MAX_PASTE_SOURCE_SPANS)
-        .collect()
-}
-
-fn is_source_sentence_boundary(chars: &[char], index: usize, ch: char) -> bool {
-    if ch == '.' {
-        let previous_is_digit = index
-            .checked_sub(1)
-            .and_then(|previous| chars.get(previous))
-            .is_some_and(|previous| previous.is_ascii_digit());
-        let next_is_digit = chars
-            .get(index + 1)
-            .is_some_and(|next| next.is_ascii_digit());
-        return !(previous_is_digit && next_is_digit);
-    }
-    matches!(ch, '?' | '!' | ';')
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ScoredSourceRange {
-    index: usize,
-    start: usize,
-    end: usize,
-    score: usize,
-}
-
-fn select_source_ranges(
-    chars: &[char],
-    raw_ranges: &[(usize, usize)],
-    text: &str,
-) -> Vec<(usize, usize)> {
-    let mut bounded_ranges = Vec::new();
-    if raw_ranges.len() == 1 {
-        let (start, end) = raw_ranges[0];
-        append_non_full_single_source_range(chars, start, end, &mut bounded_ranges);
-        return bounded_ranges;
-    }
-
-    let compact_ambiguous = chars.len() <= MAX_PASTE_SOURCE_EXCERPT_CHARS
-        && has_ambiguous_source_markers(&text.to_ascii_lowercase());
-    if compact_ambiguous {
-        let (start, end) = raw_ranges[0];
-        append_bounded_source_ranges(chars, start, end, &mut bounded_ranges);
-        return bounded_ranges;
-    }
-
-    let limit = MAX_PASTE_SOURCE_SPANS.min(raw_ranges.len());
-    let mut selected = raw_ranges
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (start, end))| {
-            let (start, end) = trim_char_range(chars, *start, *end)?;
-            Some(ScoredSourceRange {
-                index,
-                start,
-                end,
-                score: source_range_score(chars, start, end),
-            })
-        })
-        .collect::<Vec<_>>();
-    selected.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.index.cmp(&right.index))
-    });
-    selected.truncate(limit);
-    selected.sort_by_key(|range| range.index);
-    let truncate_last_selected_range = selected.len() == raw_ranges.len();
-    let last_selected_index = selected.last().map(|range| range.index);
-    for range in selected {
-        if truncate_last_selected_range && Some(range.index) == last_selected_index {
-            append_non_full_single_source_range(chars, range.start, range.end, &mut bounded_ranges);
-        } else {
-            append_bounded_source_ranges(chars, range.start, range.end, &mut bounded_ranges);
-        }
-    }
-    bounded_ranges
-}
-
-fn source_range_score(chars: &[char], start: usize, end: usize) -> usize {
-    let text = collect_chars(chars, start, end);
-    extract_concepts(&text).len()
-}
-
-fn append_non_full_single_source_range(
-    chars: &[char],
-    start: usize,
-    end: usize,
-    bounded_ranges: &mut Vec<(usize, usize)>,
-) {
-    let Some((start, end)) = trim_char_range(chars, start, end) else {
-        return;
-    };
-    let token_ranges = token_char_ranges(chars, start, end);
-    if token_ranges.len() < 2 {
-        return;
-    }
-    let mut candidate_end = token_ranges[token_ranges.len() - 2].1;
-    while candidate_end > start && chars[candidate_end - 1].is_whitespace() {
-        candidate_end -= 1;
-    }
-    if candidate_end <= start {
-        return;
-    }
-    if candidate_end - start > MAX_PASTE_SOURCE_EXCERPT_CHARS {
-        append_bounded_source_ranges(chars, start, candidate_end, bounded_ranges);
-    } else {
-        bounded_ranges.push((start, candidate_end));
-    }
-}
-
-fn append_bounded_source_ranges(
-    chars: &[char],
-    start: usize,
-    end: usize,
-    bounded_ranges: &mut Vec<(usize, usize)>,
-) {
-    let Some((mut cursor, end)) = trim_char_range(chars, start, end) else {
-        return;
-    };
-    while cursor < end {
-        let remaining = end - cursor;
-        if remaining <= MAX_PASTE_SOURCE_EXCERPT_CHARS {
-            bounded_ranges.push((cursor, end));
-            break;
-        }
-
-        let hard_end = cursor + MAX_PASTE_SOURCE_EXCERPT_CHARS;
-        let split_end = preferred_source_break(chars, cursor, hard_end).unwrap_or(hard_end);
-        bounded_ranges.push((cursor, split_end));
-        cursor = split_end;
-        while cursor < end && chars[cursor].is_whitespace() {
-            cursor += 1;
-        }
-    }
-}
-
-fn token_char_ranges(chars: &[char], start: usize, end: usize) -> Vec<(usize, usize)> {
-    let mut tokens = Vec::new();
-    let mut token_start = None;
-    for (index, ch) in chars.iter().enumerate().take(end).skip(start) {
-        if ch.is_alphanumeric() {
-            token_start.get_or_insert(index);
-        } else if let Some(start) = token_start.take() {
-            tokens.push((start, index));
-        }
-    }
-    if let Some(start) = token_start {
-        tokens.push((start, end));
-    }
-    tokens
-}
-
-fn preferred_source_break(chars: &[char], start: usize, hard_end: usize) -> Option<usize> {
-    let minimum = start + (MAX_PASTE_SOURCE_EXCERPT_CHARS / 2);
-    for index in (minimum..hard_end).rev() {
-        if chars[index].is_whitespace() || matches!(chars[index], ',' | ':' | ';' | '.') {
-            return Some((index + 1).min(hard_end));
-        }
-    }
-    None
-}
-
-fn trim_char_range(chars: &[char], start: usize, end: usize) -> Option<(usize, usize)> {
-    let mut start = start.min(chars.len());
-    let mut end = end.min(chars.len());
-    while start < end && chars[start].is_whitespace() {
-        start += 1;
-    }
-    while end > start && chars[end - 1].is_whitespace() {
-        end -= 1;
-    }
-    if start >= end || !has_usable_source_text(&chars[start..end]) {
-        None
-    } else {
-        Some((start, end))
-    }
-}
-
-fn collect_chars(chars: &[char], start: usize, end: usize) -> String {
-    chars[start..end].iter().collect()
-}
-
-fn has_usable_source_text(chars: &[char]) -> bool {
-    let mut alpha_count = 0;
-    let mut current_token_alpha = 0;
-    let mut has_word_token = false;
-    for ch in chars {
-        if ch.is_alphabetic() {
-            alpha_count += 1;
-            current_token_alpha += 1;
-        } else if ch.is_alphanumeric() {
-            current_token_alpha += 1;
-        } else {
-            if current_token_alpha >= 3 {
-                has_word_token = true;
-            }
-            current_token_alpha = 0;
-        }
-    }
-    if current_token_alpha >= 3 {
-        has_word_token = true;
-    }
-    alpha_count >= 3 && has_word_token
-}
-
-fn classify_paste_source_quality(text: &str) -> PasteSourceQuality {
-    let lower = text.to_ascii_lowercase();
-    if has_ambiguous_source_markers(&lower) {
-        return PasteSourceQuality {
-            confidence: SourceConfidence::Low,
-            retrieval_reason:
-                "ambiguous paste; bounded server-owned source span selected for review".to_owned(),
-        };
-    }
-    if text.chars().count() <= 80 {
-        return PasteSourceQuality {
-            confidence: SourceConfidence::Medium,
-            retrieval_reason:
-                "short paste; bounded server-owned source span selected for source reference"
-                    .to_owned(),
-        };
-    }
-    PasteSourceQuality {
-        confidence: SourceConfidence::High,
-        retrieval_reason: "server-owned paste ingestion bounded source-specific excerpt".to_owned(),
-    }
-}
-
-fn classify_file_source_quality(text: &str) -> PasteSourceQuality {
-    let ambiguous = text.split_whitespace().any(|token| {
-        matches!(
-            token.to_ascii_lowercase().as_str(),
-            "maybe" | "unclear" | "todo"
-        )
-    });
-    if ambiguous {
-        return PasteSourceQuality {
-            confidence: SourceConfidence::Low,
-            retrieval_reason:
-                "server-owned file ingestion bounded document-level excerpt; ambiguous source text"
-                    .to_owned(),
-        };
-    }
-    PasteSourceQuality {
-        confidence: SourceConfidence::Medium,
-        retrieval_reason:
-            "server-owned file ingestion bounded document-level excerpt; exact page/bbox provenance unverified"
-                .to_owned(),
-    }
-}
-
-fn has_ambiguous_source_markers(lower: &str) -> bool {
-    lower.contains("maybe")
-        || lower.contains("not sure")
-        || lower.contains("unclear")
-        || lower.contains("ask professor")
-}
-
-fn source_id_for_concept(concept: &ExtractedConcept, sources: &[StudySourceReference]) -> String {
-    source_for_concept(concept, sources).source_id.clone()
-}
-
-fn questions_for_concepts(
-    concepts: &[ExtractedConcept],
-    sources: &[StudySourceReference],
-    title: &str,
-) -> Vec<StudyQuestion> {
-    concepts
-        .iter()
-        .map(|concept| {
-            let source = source_for_concept(concept, sources).clone();
-            let secondary = follow_up_concept_label(concepts, concept, &source)
-                .unwrap_or(title)
-                .to_owned();
-            StudyQuestion {
-                question_id: format!("q-{}", concept.public_id),
-                prompt: format!(
-                    "Explain {} in your own words using the pasted notes.",
-                    concept.label
-                ),
-                expected_terms: expected_terms_for_concept(concepts, concept, &source),
-                follow_up: format!(
-                    "Now connect {} to {secondary} in one precise sentence.",
-                    concept.label
-                ),
-                source,
-            }
-        })
-        .collect()
-}
-
-fn expected_terms_for_concept(
-    concepts: &[ExtractedConcept],
-    primary: &ExtractedConcept,
-    source: &StudySourceReference,
-) -> Vec<String> {
-    let mut terms = Vec::new();
-    push_expected_term(&mut terms, &primary.label);
-    let source_lower = source.excerpt.to_ascii_lowercase();
-    for concept in concepts {
-        if concept.public_id != primary.public_id
-            && source_lower.contains(&concept.label.to_ascii_lowercase())
-        {
-            push_expected_term(&mut terms, &concept.label);
-        }
-    }
-    for concept in concepts {
-        if concept.public_id != primary.public_id {
-            push_expected_term(&mut terms, &concept.label);
-        }
-        if terms.len() >= 4 {
-            break;
-        }
-    }
-    terms
-}
-
-fn push_expected_term(terms: &mut Vec<String>, term: &str) {
-    if !terms.iter().any(|known| known == term) {
-        terms.push(term.to_owned());
-    }
-}
-
-fn follow_up_concept_label<'a>(
-    concepts: &'a [ExtractedConcept],
-    primary: &ExtractedConcept,
-    source: &StudySourceReference,
-) -> Option<&'a str> {
-    let source_lower = source.excerpt.to_ascii_lowercase();
-    concepts
-        .iter()
-        .find(|concept| {
-            concept.public_id != primary.public_id
-                && source_lower.contains(&concept.label.to_ascii_lowercase())
-        })
-        .or_else(|| {
-            concepts
-                .iter()
-                .find(|concept| concept.public_id != primary.public_id)
-        })
-        .map(|concept| concept.label.as_str())
-}
-
-fn source_for_concept<'a>(
-    concept: &ExtractedConcept,
-    sources: &'a [StudySourceReference],
-) -> &'a StudySourceReference {
-    let label = concept.label.to_ascii_lowercase();
-    sources
-        .iter()
-        .find(|source| source.excerpt.to_ascii_lowercase().contains(&label))
-        .unwrap_or(&sources[0])
-}
-
-fn extract_concepts(text: &str) -> Vec<ExtractedConcept> {
-    let mut seen = std::collections::HashSet::new();
-    let mut concepts = Vec::new();
-    for raw in text.split(|ch: char| !ch.is_alphanumeric()) {
-        let trimmed = raw.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if !is_concept_token(trimmed, &lower) || is_stop_word(&lower) || !seen.insert(lower.clone())
-        {
-            continue;
-        }
-        concepts.push(ExtractedConcept {
-            public_id: slugify(&lower),
-            label: concept_label(trimmed, &lower),
-        });
-        if concepts.len() >= 4 {
-            break;
-        }
-    }
-    concepts
-}
-
-fn is_concept_token(raw: &str, lower: &str) -> bool {
-    if raw.is_empty() || !raw.chars().any(char::is_alphabetic) {
-        return false;
-    }
-    if is_stop_word(lower) {
-        return false;
-    }
-    if raw.chars().count() >= 5 {
-        return true;
-    }
-    let alphabetic_count = raw.chars().filter(|ch| ch.is_alphabetic()).count();
-    let acronym_like = alphabetic_count >= 3
-        && raw
-            .chars()
-            .filter(|ch| ch.is_alphabetic())
-            .all(|ch| ch.is_uppercase());
-    let code_like = raw.chars().count() >= 3 && raw.chars().any(|ch| ch.is_ascii_digit());
-    acronym_like || code_like
-}
-
-fn concept_label(raw: &str, lower: &str) -> String {
-    let alphabetic = raw
-        .chars()
-        .filter(|ch| ch.is_alphabetic())
-        .collect::<Vec<_>>();
-    if !alphabetic.is_empty() && alphabetic.iter().all(|ch| ch.is_uppercase()) {
-        return raw.to_owned();
-    }
-    if raw.chars().any(|ch| ch.is_ascii_digit()) {
-        return raw.to_ascii_uppercase();
-    }
-    title_case(lower)
-}
-
-fn is_stop_word(value: &str) -> bool {
-    matches!(
-        value,
-        "about"
-            | "after"
-            | "before"
-            | "course"
-            | "exam"
-            | "explain"
-            | "first"
-            | "later"
-            | "maybe"
-            | "notes"
-            | "professor"
-            | "their"
-            | "there"
-            | "these"
-            | "those"
-            | "unclear"
-            | "using"
-            | "where"
-            | "which"
-            | "while"
-    )
-}
-
-fn slugify(value: &str) -> String {
-    let mut slug = String::new();
-    let mut last_dash = false;
-    for ch in value.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            last_dash = false;
-        } else if !last_dash && !slug.is_empty() {
-            slug.push('-');
-            last_dash = true;
-        }
-    }
-    while slug.ends_with('-') {
-        slug.pop();
-    }
-    if slug.is_empty() {
-        "generated-question".to_owned()
-    } else {
-        slug
-    }
-}
-
-fn title_case(value: &str) -> String {
-    value
-        .split('-')
-        .flat_map(|part| part.split_whitespace())
-        .map(|part| {
-            let mut chars = part.chars();
-            match chars.next() {
-                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
-                None => String::new(),
-            }
-        })
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[async_trait]
 impl SessionStore<VoiceSessionRecord> for InMemoryStudyStore {
     async fn load_latest_for_user(
@@ -1977,7 +1065,7 @@ impl SessionStore<VoiceSessionRecord> for InMemoryStudyStore {
         Ok(self
             .inner
             .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?
+            .map_err(|_| state_lock_poisoned())?
             .sessions
             .iter()
             .rev()
@@ -1986,10 +1074,7 @@ impl SessionStore<VoiceSessionRecord> for InMemoryStudyStore {
     }
 
     async fn save(&self, session: &VoiceSessionRecord) -> Result<(), PortError> {
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
         state.sessions.retain(|existing| {
             existing.voice_session_id != session.voice_session_id
                 || existing.user_id != session.user_id
@@ -2022,6 +1107,10 @@ impl StudyMemoryStore for InMemoryStudyStore {
             concept_statuses: state.concept_statuses.len(),
             review_items: state.review_items.len(),
             recaps: state.recaps.len(),
+            // Every published count is derived from the committed collection it
+            // describes, so a count can never disagree with the state that
+            // produced it.
+            voice_usage: state.voice_usage_events.len(),
         }
     }
 
@@ -2029,10 +1118,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         &self,
         voice_session_id: &str,
     ) -> Result<usize, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         Ok(state
             .answer_attempts
             .iter()
@@ -2048,10 +1134,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         study_set_id: &str,
         voice_session_id: &str,
     ) -> Result<StudySessionDurableCounts, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         Ok(StudySessionDurableCounts {
             answer_attempts: state
                 .answer_attempts
@@ -2099,10 +1182,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         voice_session_id: &str,
         response_id: &str,
     ) -> Result<bool, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         Ok(state.answer_attempts.iter().any(|attempt| {
             attempt.user_id == user_id
                 && attempt.study_set_id == study_set_id
@@ -2111,65 +1191,66 @@ impl StudyMemoryStore for InMemoryStudyStore {
         }))
     }
 
-    async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
         let user_id = required_user_id(config)?;
         let study_set_id = required_study_set_id(config)?;
         let voice_session_id = required_session_id(config)?;
-        {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-            Self::study_set_locked(&state, user_id, study_set_id)?;
-            if let Some(existing) = state
-                .sessions
-                .iter()
-                .find(|session| session.voice_session_id == voice_session_id)
-            {
-                if existing.user_id != user_id || existing.study_set_id != study_set_id {
-                    return Err(PortError::adapter(
-                        "memory",
-                        "voice session ownership cannot be changed",
-                    ));
-                }
-                if existing.status != "open" {
-                    return Err(PortError::unavailable(
-                        "memory",
-                        voice_session_id,
-                        "closed voice session cannot be reopened",
-                    ));
-                }
+        let record = VoiceSessionRecord::from_config(config);
+
+        // `DATA-012`: one write lock spans the validation and the write. The
+        // previous read-lock-then-`SessionStore::save` shape let a `close` commit
+        // in the gap, and `save`'s remove-and-push then resurrected the session as
+        // `open`.
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        Self::study_set_locked(&state, user_id, study_set_id)?;
+        let existing = state
+            .sessions
+            .iter()
+            .position(|session| session.voice_session_id == voice_session_id);
+        if let Some(index) = existing {
+            let session = &state.sessions[index];
+            if session.user_id != user_id || session.study_set_id != study_set_id {
+                return Err(PortError::conflict(
+                    "memory",
+                    voice_session_id,
+                    "voice session ownership cannot be changed",
+                ));
+            }
+            if session.status != "open" {
+                return Err(PortError::conflict(
+                    "memory",
+                    voice_session_id,
+                    "closed voice session cannot be reopened",
+                ));
             }
         }
-        self.save(&VoiceSessionRecord::from_config(config)).await
+        #[cfg(test)]
+        self.pause_hook(MutationSite::VoiceSession);
+        // The outcome reports the physical truth this backend can see: the row
+        // already existed, or it did not.
+        match existing {
+            Some(index) => {
+                // In place, never remove-and-push: the committed insertion
+                // position is this backend's recency ordinal (`DATA-011`), exactly
+                // as Postgres preserves `started_at` across a replay.
+                state.sessions[index] = record;
+                Ok(StudyStoreWriteOutcome::IdempotentReplay)
+            }
+            None => {
+                state.sessions.push(record);
+                Ok(StudyStoreWriteOutcome::Inserted)
+            }
+        }
     }
 
     async fn claim_session_token_nonce(
         &self,
         claim: SessionTokenNonceClaim,
     ) -> Result<(), PortError> {
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-        Self::study_set_locked(&state, &claim.user_id, &claim.study_set_id)?;
-        if state.session_token_nonces.iter().any(|used| {
-            used.user_id == claim.user_id
-                && used.study_set_id == claim.study_set_id
-                && used.voice_session_id == claim.voice_session_id
-                && used.nonce == claim.nonce
-        }) {
-            return Err(PortError::unavailable(
-                "memory",
-                format!(
-                    "{}/{}/{}",
-                    claim.user_id, claim.study_set_id, claim.voice_session_id
-                ),
-                "session token nonce already used",
-            ));
-        }
-        state.session_token_nonces.push(claim);
-        Ok(())
+        self.claim_session_token_nonce_at(claim, current_epoch_seconds())
     }
 
     async fn close_voice_session(
@@ -2177,10 +1258,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         voice_session_id: &str,
         terminal_reason: &str,
     ) -> Result<Value, PortError> {
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
         let session = state
             .sessions
             .iter_mut()
@@ -2195,9 +1273,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         }
         let status = session.status.clone();
         let terminal_reason = session.terminal_reason.clone();
-        state
-            .event_authorizations
-            .retain(|record| record.voice_session_id != voice_session_id);
+        authorization::evict_session_locked(&mut state, voice_session_id);
         Ok(json!({
             "voice_session_id": voice_session_id,
             "status": status,
@@ -2209,78 +1285,21 @@ impl StudyMemoryStore for InMemoryStudyStore {
         &self,
         input: CreatePasteStudySet,
     ) -> Result<StudySetIngestionRecord, PortError> {
-        let exam_at = crate::ingestion_exam_instant("memory", input.exam_date.as_deref())?;
-        let generated = generate_paste_study_set(input)?;
-        {
-            let mut state = self
-                .inner
-                .write()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-            Self::persist_ingestion_record_locked(&mut state, &generated, false);
-            Self::capture_exam_instant_locked(&mut state, &generated.study_set.id, exam_at);
-        }
-        Ok(generated)
+        ingestion::create_paste_study_set(self, input)
     }
 
     async fn create_file_study_set(
         &self,
         input: CreateFileStudySet,
     ) -> Result<StudySetIngestionRecord, PortError> {
-        let exam_at = crate::ingestion_exam_instant("memory", input.exam_date.as_deref())?;
-        let generated = generate_file_study_set(input)?;
-        {
-            let mut state = self
-                .inner
-                .write()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-            Self::persist_ingestion_record_locked(&mut state, &generated, false);
-            Self::capture_exam_instant_locked(&mut state, &generated.study_set.id, exam_at);
-        }
-        Ok(generated)
+        ingestion::create_file_study_set(self, input)
     }
 
     async fn retry_file_study_set(
         &self,
         input: CreateFileStudySet,
     ) -> Result<StudySetIngestionRecord, PortError> {
-        let study_set_id = input
-            .study_set_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                PortError::unavailable("memory", "file_retry", "study_set_id is required")
-            })?
-            .to_owned();
-        let (title, course) = {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-            let existing = Self::study_set_locked(&state, &input.user_id, &study_set_id)?;
-            (existing.title.clone(), existing.course.clone())
-        };
-        let exam_at = crate::ingestion_exam_instant("memory", input.exam_date.as_deref())?;
-        let generated = generate_file_study_set(CreateFileStudySet {
-            user_id: input.user_id,
-            study_set_id: Some(study_set_id),
-            title,
-            course,
-            exam_date: input.exam_date,
-            file_name: input.file_name,
-            content_type: input.content_type,
-            file_bytes: input.file_bytes,
-            session_id: input.session_id,
-        })?;
-        {
-            let mut state = self
-                .inner
-                .write()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-            Self::persist_ingestion_record_locked(&mut state, &generated, true);
-            Self::capture_exam_instant_locked(&mut state, &generated.study_set.id, exam_at);
-        }
-        Ok(generated)
+        ingestion::retry_file_study_set(self, input)
     }
 
     async fn study_context(
@@ -2288,14 +1307,19 @@ impl StudyMemoryStore for InMemoryStudyStore {
         user_id: &str,
         study_set_id: &str,
     ) -> Result<Option<Value>, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         let Some(study_set) = state.study_sets.get(study_set_id) else {
             return Ok(None);
         };
         if study_set.user_id != user_id {
+            return Ok(None);
+        }
+        // `DATA-004`/D-05 `HARD_PURGE_TEXT`: a tombstoned set is not part of any
+        // ordinary read projection. Postgres already excludes it with
+        // `deleted_at IS NULL`; without this, one backend answered a deleted set's
+        // context with its scrubbed tombstone — content-free, but still an
+        // existence answer the other backend refuses to give.
+        if privacy::is_deleted_locked(&state, study_set_id) {
             return Ok(None);
         }
         let documents = state
@@ -2353,15 +1377,16 @@ impl StudyMemoryStore for InMemoryStudyStore {
     }
 
     async fn library_snapshot(&self, user_id: &str) -> Result<StudyLibrarySnapshot, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
 
         let mut study_sets = state
             .study_sets
             .values()
             .filter(|study_set| study_set.user_id == user_id)
+            // `DATA-004`: the library is an active read, so a tombstone is not in
+            // it. Under `HARD_PURGE_TEXT` the tombstone exists only to keep a
+            // repeated delete idempotent and to stop a seed recreating the set.
+            .filter(|study_set| !privacy::is_deleted_locked(&state, &study_set.study_set_id))
             .map(|study_set| {
                 let mut documents = state
                     .documents
@@ -2413,15 +1438,22 @@ impl StudyMemoryStore for InMemoryStudyStore {
             .collect::<Vec<_>>();
         study_sets.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.id.cmp(&b.id)));
 
+        // `DATA-011`: the committed insertion position *is* this backend's recency
+        // ordinal — Plan 06 deliberately adds no timestamp to `VoiceSessionRecord`,
+        // and `record_voice_session` replays in place so a replay never moves a
+        // session. Sorting by session id, as this list used to, is not recency at
+        // all: for two non-lexical UUIDs it can invert the order Postgres returns
+        // from `started_at DESC`.
         let mut sessions = state
             .sessions
             .iter()
-            .filter(|session| {
+            .enumerate()
+            .filter(|(_, session)| {
                 session.user_id == user_id
                     && session.status == "closed"
                     && session.terminal_reason.as_deref() == Some("completed")
             })
-            .map(|session| {
+            .map(|(insertion_ordinal, session)| {
                 let study_set_title = state
                     .study_sets
                     .get(&session.study_set_id)
@@ -2480,28 +1512,33 @@ impl StudyMemoryStore for InMemoryStudyStore {
                         }
                     });
 
-                LibrarySessionSummary {
-                    voice_session_id: session.voice_session_id.clone(),
-                    user_id: session.user_id.clone(),
-                    study_set_id: session.study_set_id.clone(),
-                    study_set_title,
-                    status: session.status.clone(),
-                    terminal_reason: session.terminal_reason.clone(),
-                    recap,
-                    next_review,
-                }
+                (
+                    insertion_ordinal,
+                    LibrarySessionSummary {
+                        voice_session_id: session.voice_session_id.clone(),
+                        user_id: session.user_id.clone(),
+                        study_set_id: session.study_set_id.clone(),
+                        study_set_title,
+                        status: session.status.clone(),
+                        terminal_reason: session.terminal_reason.clone(),
+                        recap,
+                        next_review,
+                    },
+                )
             })
             .collect::<Vec<_>>();
-        sessions.sort_by(|a, b| {
-            b.voice_session_id
-                .cmp(&a.voice_session_id)
-                .then_with(|| a.study_set_title.cmp(&b.study_set_title))
+        // Most recent first, with the session id as the documented tie-break —
+        // the same rule the durable backend states as `started_at DESC, id DESC`.
+        sessions.sort_by(|(left_ordinal, left), (right_ordinal, right)| {
+            right_ordinal
+                .cmp(left_ordinal)
+                .then_with(|| right.voice_session_id.cmp(&left.voice_session_id))
         });
 
         Ok(StudyLibrarySnapshot {
             user_id: user_id.to_owned(),
             study_sets,
-            sessions,
+            sessions: sessions.into_iter().map(|(_, session)| session).collect(),
         })
     }
 
@@ -2510,69 +1547,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         user_id: &str,
         study_set_id: &str,
     ) -> Result<Value, PortError> {
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-        Self::study_set_locked(&state, user_id, study_set_id)?;
-
-        let mut deleted_documents = 0usize;
-        for document in state
-            .documents
-            .values_mut()
-            .filter(|document| document.study_set_id == study_set_id && !document.tombstoned)
-        {
-            document.tombstoned = true;
-            deleted_documents += 1;
-        }
-
-        let mut deleted_source_spans = 0usize;
-        for span in state
-            .source_spans
-            .values_mut()
-            .filter(|span| span.study_set_id == study_set_id && !span.tombstoned)
-        {
-            span.tombstoned = true;
-            deleted_source_spans += 1;
-        }
-
-        let mut disabled_questions = 0usize;
-        for question in state
-            .questions
-            .values_mut()
-            .filter(|question| question.study_set_id == study_set_id && question.active)
-        {
-            question.active = false;
-            disabled_questions += 1;
-        }
-
-        let mut hidden_sessions = 0usize;
-        let mut affected_sessions = HashSet::new();
-        for session in state
-            .sessions
-            .iter_mut()
-            .filter(|session| session.user_id == user_id && session.study_set_id == study_set_id)
-        {
-            affected_sessions.insert(session.voice_session_id.clone());
-            if session.status == "deleted" {
-                continue;
-            }
-            session.status = "deleted".to_owned();
-            session.ended_at.get_or_insert_with(|| "deleted".to_owned());
-            session.terminal_reason = Some("deleted".to_owned());
-            hidden_sessions += 1;
-        }
-
-        remove_session_artifacts(&mut state, user_id, study_set_id, &affected_sessions);
-
-        Ok(json!({
-            "study_set_id": study_set_id,
-            "status": "deleted",
-            "deleted_documents": deleted_documents,
-            "deleted_source_spans": deleted_source_spans,
-            "disabled_questions": disabled_questions,
-            "hidden_sessions": hidden_sessions,
-        }))
+        privacy::delete_study_set(self, user_id, study_set_id)
     }
 
     async fn delete_session_history(
@@ -2581,41 +1556,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         study_set_id: &str,
         voice_session_id: &str,
     ) -> Result<Value, PortError> {
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-        Self::study_set_locked(&state, user_id, study_set_id)?;
-
-        let session = state
-            .sessions
-            .iter_mut()
-            .find(|session| session.voice_session_id == voice_session_id)
-            .ok_or_else(|| {
-                PortError::unavailable("memory", voice_session_id, "voice session does not exist")
-            })?;
-        if session.user_id != user_id || session.study_set_id != study_set_id {
-            return Err(PortError::unavailable(
-                "memory",
-                voice_session_id,
-                "voice session is not available for this user and study set",
-            ));
-        }
-
-        let already_deleted = session.status == "deleted";
-        session.status = "deleted".to_owned();
-        session.ended_at.get_or_insert_with(|| "deleted".to_owned());
-        session.terminal_reason = Some("deleted".to_owned());
-
-        let affected_sessions = HashSet::from([voice_session_id.to_owned()]);
-        remove_session_artifacts(&mut state, user_id, study_set_id, &affected_sessions);
-
-        Ok(json!({
-            "voice_session_id": voice_session_id,
-            "study_set_id": study_set_id,
-            "status": "deleted",
-            "already_deleted": already_deleted,
-        }))
+        privacy::delete_session_history(self, user_id, study_set_id, voice_session_id)
     }
 
     async fn active_question(
@@ -2623,10 +1564,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         user_id: &str,
         study_set_id: &str,
     ) -> Result<Option<StudyQuestion>, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         Self::active_question_locked(&state, user_id, study_set_id)
     }
 
@@ -2637,26 +1575,13 @@ impl StudyMemoryStore for InMemoryStudyStore {
         voice_session_id: &str,
         question: &StudyQuestion,
     ) -> Result<(), PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-        let canonical =
-            Self::active_question_locked(&state, user_id, study_set_id)?.ok_or_else(|| {
-                PortError::unavailable(
-                    "memory",
-                    &question.question_id,
-                    "question is not active for this study set",
-                )
-            })?;
-        if canonical != *question {
-            return Err(PortError::adapter(
-                "memory",
-                "question tuple does not match deterministic retrieval",
-            ));
-        }
-        Ok(())
+        authorization::authorize_question_started(
+            self,
+            user_id,
+            study_set_id,
+            voice_session_id,
+            question,
+        )
     }
 
     async fn authorize_answer_evaluation(
@@ -2667,55 +1592,14 @@ impl StudyMemoryStore for InMemoryStudyStore {
         response_id: &str,
         evaluation: &AnswerEvaluation,
     ) -> Result<(), PortError> {
-        evaluation
-            .validate_fail_closed()
-            .map_err(|reason| PortError::adapter("memory", reason))?;
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-        let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-        let canonical_source = Self::active_question_source_locked(
-            study_set,
-            &state,
-            user_id,
-            &evaluation.question_id,
-        )?;
-        if canonical_source != evaluation.source {
-            return Err(PortError::adapter(
-                "memory",
-                "answer evaluation source tuple does not match active question source",
-            ));
-        }
-        let persisted = PersistedAnswerEvaluation::from(evaluation);
-        if !state.answer_attempts.iter().any(|record| {
-            record.user_id == user_id
-                && record.study_set_id == study_set_id
-                && record.voice_session_id == voice_session_id
-                && record.response_id == response_id
-                && record.evaluation.as_ref() == Some(&persisted)
-        }) {
-            return Err(PortError::adapter(
-                "memory",
-                "answer evaluation event does not match persisted answer attempt",
-            ));
-        }
-        let authorization = event_authorization_record(
+        authorization::authorize_answer_evaluation(
+            self,
             user_id,
             study_set_id,
             voice_session_id,
             response_id,
-            EventAuthorizationKind::AnswerEvaluation,
             evaluation,
-        )?;
-        if !state.event_authorizations.contains(&authorization) {
-            return Err(PortError::adapter(
-                "memory",
-                "answer evaluation event does not match authorized browser payload",
-            ));
-        }
-        Ok(())
+        )
     }
 
     async fn authorize_source_reference(
@@ -2725,27 +1609,13 @@ impl StudyMemoryStore for InMemoryStudyStore {
         voice_session_id: &str,
         source: &StudySourceReference,
     ) -> Result<(), PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-        let canonical =
-            Self::source_reference_locked(&state, user_id, study_set_id, &source.source_id)
-                .ok_or_else(|| {
-                    PortError::unavailable(
-                        "memory",
-                        &source.source_id,
-                        "source reference is not available for this user and study set",
-                    )
-                })?;
-        if canonical != *source {
-            return Err(PortError::adapter(
-                "memory",
-                "source tuple does not match deterministic retrieval",
-            ));
-        }
-        Ok(())
+        authorization::authorize_source_reference(
+            self,
+            user_id,
+            study_set_id,
+            voice_session_id,
+            source,
+        )
     }
 
     async fn authorize_concept_status(
@@ -2757,41 +1627,15 @@ impl StudyMemoryStore for InMemoryStudyStore {
         concept_id: &str,
         status: &ConceptStatus,
     ) -> Result<(), PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-        let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-        Self::ensure_concept_locked(study_set, &state, concept_id)?;
-        if !state.concept_statuses.iter().any(|record| {
-            record.user_id == user_id
-                && record.study_set_id == study_set_id
-                && record.voice_session_id == voice_session_id
-                && record.concept_id == concept_id
-                && record.status == *status
-        }) {
-            return Err(PortError::adapter(
-                "memory",
-                "concept status event does not match persisted concept status write",
-            ));
-        }
-        let payload = ConceptStatusEventPayload { concept_id, status };
-        let authorization = event_authorization_record(
+        authorization::authorize_concept_status(
+            self,
             user_id,
             study_set_id,
             voice_session_id,
             response_id,
-            EventAuthorizationKind::ConceptStatus,
-            &payload,
-        )?;
-        if !state.event_authorizations.contains(&authorization) {
-            return Err(PortError::adapter(
-                "memory",
-                "concept status event does not match authorized browser payload",
-            ));
-        }
-        Ok(())
+            concept_id,
+            status,
+        )
     }
 
     async fn authorize_manuscript_intent(
@@ -2801,60 +1645,13 @@ impl StudyMemoryStore for InMemoryStudyStore {
         voice_session_id: &str,
         intent: &agent_domain::ManuscriptIntent,
     ) -> Result<(), PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-        let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-        match intent {
-            agent_domain::ManuscriptIntent::Scene { .. } => Ok(()),
-            agent_domain::ManuscriptIntent::Entity {
-                entity_id,
-                entity_kind,
-                ..
-            } => match entity_kind {
-                agent_domain::ManuscriptEntityKind::Concept => {
-                    Self::ensure_concept_locked(study_set, &state, entity_id)
-                }
-                agent_domain::ManuscriptEntityKind::Source => {
-                    Self::source_reference_locked(&state, user_id, study_set_id, entity_id)
-                        .map(|_| ())
-                        .ok_or_else(|| {
-                            PortError::unavailable(
-                                "memory",
-                                entity_id,
-                                "source entity is not available for this study set",
-                            )
-                        })
-                }
-                agent_domain::ManuscriptEntityKind::MarginalNote => Err(PortError::unavailable(
-                    "memory",
-                    entity_id,
-                    "marginal note entity is not server-owned",
-                )),
-            },
-            agent_domain::ManuscriptIntent::Marginalia {
-                anchor_entity_id, ..
-            } => {
-                if Self::ensure_concept_locked(study_set, &state, anchor_entity_id).is_ok()
-                    || Self::source_reference_locked(
-                        &state,
-                        user_id,
-                        study_set_id,
-                        anchor_entity_id,
-                    )
-                    .is_some()
-                {
-                    return Ok(());
-                }
-                Err(PortError::unavailable(
-                    "memory",
-                    anchor_entity_id,
-                    "marginalia anchor is not available for this study set",
-                ))
-            }
-        }
+        authorization::authorize_manuscript_intent(
+            self,
+            user_id,
+            study_set_id,
+            voice_session_id,
+            intent,
+        )
     }
 
     async fn authorize_recap(
@@ -2865,54 +1662,14 @@ impl StudyMemoryStore for InMemoryStudyStore {
         response_id: &str,
         recap: &StudySessionRecap,
     ) -> Result<(), PortError> {
-        if recap.voice_session_id != voice_session_id {
-            return Err(PortError::adapter(
-                "memory",
-                "recap session does not match authorized session",
-            ));
-        }
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-        let _study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-        for moment in &recap.source_moments {
-            let canonical = Self::source_reference_locked(
-                &state,
-                user_id,
-                study_set_id,
-                &moment.source.source_id,
-            )
-            .ok_or_else(|| {
-                PortError::unavailable(
-                    "memory",
-                    moment.source.source_id.clone(),
-                    "recap source reference unavailable",
-                )
-            })?;
-            if canonical != moment.source {
-                return Err(PortError::adapter(
-                    "memory",
-                    "recap source tuple does not match deterministic retrieval",
-                ));
-            }
-        }
-        let authorization = event_authorization_record(
+        authorization::authorize_recap(
+            self,
             user_id,
             study_set_id,
             voice_session_id,
             response_id,
-            EventAuthorizationKind::StudySessionRecap,
             recap,
-        )?;
-        if !state.event_authorizations.contains(&authorization) {
-            return Err(PortError::adapter(
-                "memory",
-                "recap event does not match authorized browser payload",
-            ));
-        }
-        Ok(())
+        )
     }
 
     async fn record_answer_attempt_envelope(
@@ -2924,16 +1681,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
     ) -> Result<Value, PortError> {
         envelope
             .validate_fail_closed()
-            .map_err(|reason| PortError::adapter("memory", reason))?;
-        {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-            Self::active_question_source_locked(study_set, &state, user_id, &envelope.question_id)?;
-        }
+            .map_err(|reason| PortError::invalid_input("memory", &envelope.response_id, reason))?;
         let persisted = PersistedAnswerAttemptEnvelope::from(&envelope);
         let record = AnswerAttemptRecord {
             user_id: user_id.to_owned(),
@@ -2944,11 +1692,14 @@ impl StudyMemoryStore for InMemoryStudyStore {
             evaluation: None,
         };
         let result = serde_json::to_value(&record)
-            .map_err(|error| PortError::adapter("memory", error.to_string()))?;
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            .map_err(|error| json_invariant("study_store_record", &error))?;
+        // `DATA-012`: validate against the same locked state the mutation writes.
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        {
+            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+            Self::active_question_source_locked(study_set, &state, user_id, &envelope.question_id)?;
+        }
         if let Some(existing) = state.answer_attempts.iter_mut().find(|existing| {
             existing.user_id == user_id
                 && existing.study_set_id == study_set_id
@@ -2956,13 +1707,14 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 && existing.response_id == envelope.response_id
         }) {
             if existing.envelope != record.envelope {
-                return Err(PortError::adapter(
+                return Err(PortError::conflict(
                     "memory",
+                    &envelope.response_id,
                     "answer attempt envelope cannot be changed",
                 ));
             }
             return serde_json::to_value(existing)
-                .map_err(|error| PortError::adapter("memory", error.to_string()));
+                .map_err(|error| json_invariant("answer_attempt_record", &error));
         }
         state.answer_attempts.push(record);
         Ok(result)
@@ -2976,26 +1728,12 @@ impl StudyMemoryStore for InMemoryStudyStore {
         response_id: &str,
         evaluation: AnswerEvaluation,
     ) -> Result<Value, PortError> {
-        evaluation
-            .validate_fail_closed()
-            .map_err(|reason| PortError::adapter("memory", reason))?;
-        let canonical_source = {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-            Self::active_question_source_locked(study_set, &state, user_id, &evaluation.question_id)
-        }?;
-        if canonical_source != evaluation.source {
-            return Err(PortError::adapter(
-                "memory",
-                "answer evaluation source tuple does not match active question source",
-            ));
-        }
+        evaluation.validate_fail_closed().map_err(|reason| {
+            PortError::invalid_input("memory", &evaluation.question_id, reason)
+        })?;
         let persisted_evaluation = PersistedAnswerEvaluation::from(&evaluation);
         let authorization = event_authorization_record(
+            "memory",
             user_id,
             study_set_id,
             voice_session_id,
@@ -3003,10 +1741,29 @@ impl StudyMemoryStore for InMemoryStudyStore {
             EventAuthorizationKind::AnswerEvaluation,
             &evaluation,
         )?;
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        // `DATA-012`: one write lock spans the validation and the write, so a
+        // deletion that commits first cannot be followed by a late attempt row or
+        // a late authorization digest.
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        let canonical_source = {
+            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+            Self::active_question_source_locked(
+                study_set,
+                &state,
+                user_id,
+                &evaluation.question_id,
+            )?
+        };
+        if canonical_source != evaluation.source {
+            return Err(PortError::invalid_input(
+                "memory",
+                &evaluation.question_id,
+                "answer evaluation source tuple does not match active question source",
+            ));
+        }
+        #[cfg(test)]
+        self.pause_hook(MutationSite::AnswerEvaluation);
         let result = if let Some(existing) = state.answer_attempts.iter_mut().find(|record| {
             record.user_id == user_id
                 && record.study_set_id == study_set_id
@@ -3014,14 +1771,15 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 && record.response_id == response_id
         }) {
             if existing.envelope.question_id != evaluation.question_id {
-                return Err(PortError::adapter(
+                return Err(PortError::conflict(
                     "memory",
+                    response_id,
                     "answer evaluation question does not match attempt envelope",
                 ));
             }
             existing.evaluation = Some(persisted_evaluation);
             serde_json::to_value(existing)
-                .map_err(|error| PortError::adapter("memory", error.to_string()))?
+                .map_err(|error| json_invariant("study_store_record", &error))?
         } else {
             let record = AnswerAttemptRecord {
                 user_id: user_id.to_owned(),
@@ -3052,11 +1810,11 @@ impl StudyMemoryStore for InMemoryStudyStore {
                 evaluation: Some(persisted_evaluation),
             };
             let result = serde_json::to_value(&record)
-                .map_err(|error| PortError::adapter("memory", error.to_string()))?;
+                .map_err(|error| json_invariant("study_store_record", &error))?;
             state.answer_attempts.push(record);
             result
         };
-        state.event_authorizations.push(authorization);
+        authorization::record_locked(&mut state, authorization);
         Ok(result)
     }
 
@@ -3066,10 +1824,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         study_set_id: &str,
         source_id: &str,
     ) -> Result<Option<StudySourceReference>, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+        let state = self.inner.read().map_err(|_| state_lock_poisoned())?;
         Ok(Self::source_reference_locked(
             &state,
             user_id,
@@ -3087,15 +1842,6 @@ impl StudyMemoryStore for InMemoryStudyStore {
         concept_id: &str,
         status: ConceptStatus,
     ) -> Result<ConceptStatus, PortError> {
-        {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-            Self::ensure_concept_locked(study_set, &state, concept_id)?;
-        }
         let record = ConceptStatusRecord {
             user_id: user_id.to_owned(),
             study_set_id: study_set_id.to_owned(),
@@ -3108,6 +1854,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             status: &status,
         };
         let authorization = event_authorization_record(
+            "memory",
             user_id,
             study_set_id,
             voice_session_id,
@@ -3115,11 +1862,14 @@ impl StudyMemoryStore for InMemoryStudyStore {
             EventAuthorizationKind::ConceptStatus,
             &payload,
         )?;
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-        if state.event_authorizations.contains(&authorization) {
+        // `DATA-012`: validate against the same locked state the mutation writes.
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        {
+            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+            Self::ensure_concept_locked(study_set, &state, concept_id)?;
+        }
+        if authorization::is_recorded_locked(&state, &authorization) {
             return Ok(status);
         }
         if let Some(concept) = state
@@ -3129,7 +1879,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             concept.status = status.clone();
         }
         state.concept_statuses.push(record);
-        state.event_authorizations.push(authorization);
+        authorization::record_locked(&mut state, authorization);
         Ok(status)
     }
 
@@ -3141,15 +1891,6 @@ impl StudyMemoryStore for InMemoryStudyStore {
         concept_id: &str,
         due_at: &str,
     ) -> Result<Value, PortError> {
-        {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-            Self::ensure_concept_locked(study_set, &state, concept_id)?;
-        }
         let record = ReviewItemRecord {
             user_id: user_id.to_owned(),
             study_set_id: study_set_id.to_owned(),
@@ -3158,11 +1899,14 @@ impl StudyMemoryStore for InMemoryStudyStore {
             due_at: due_at.to_owned(),
         };
         let result = serde_json::to_value(&record)
-            .map_err(|error| PortError::adapter("memory", error.to_string()))?;
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
+            .map_err(|error| json_invariant("study_store_record", &error))?;
+        // `DATA-012`: validate against the same locked state the mutation writes.
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        {
+            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
+            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+            Self::ensure_concept_locked(study_set, &state, concept_id)?;
+        }
         if !state.review_items.contains(&record) {
             state.review_items.push(record);
         }
@@ -3175,47 +1919,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
         study_set_id: &str,
         concept_id: &str,
     ) -> Result<ReviewSchedulingContextV1, PortError> {
-        let state = self
-            .inner
-            .read()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-        let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-        Self::ensure_concept_locked(study_set, &state, concept_id)?;
-
-        // D-01: the exam instant is authoritative store context, never a tool argument.
-        let exam_at = match state
-            .study_set_exam_dates
-            .get(study_set_id)
-            .map(String::as_str)
-        {
-            None => None,
-            Some(raw) => Some(parse_utc_instant(raw).ok_or_else(|| {
-                PortError::adapter(
-                    "memory",
-                    "study set exam date is not a parseable UTC instant",
-                )
-            })?),
-        };
-
-        // Only the latest valid v1 decision seeds the next review; a superseded or
-        // legacy review item never becomes FSRS input.
-        let card = state
-            .review_schedule_decisions
-            .iter()
-            .filter(|record| {
-                record.user_id == user_id
-                    && record.study_set_id == study_set_id
-                    && record.concept_id == concept_id
-                    && record.decision.validate().is_ok()
-            })
-            .max_by_key(|record| record.decision.generated_at)
-            .map(|record| record.decision.card.clone());
-
-        Ok(ReviewSchedulingContextV1 {
-            schema_version: VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
-            exam_at,
-            card,
-        })
+        learning::review_scheduling_context(self, user_id, study_set_id, concept_id)
     }
 
     async fn persist_review_schedule_decision(
@@ -3227,64 +1931,15 @@ impl StudyMemoryStore for InMemoryStudyStore {
         concept_id: &str,
         decision: ReviewScheduleDecisionV1,
     ) -> Result<Value, PortError> {
-        decision
-            .validate()
-            .map_err(|error| PortError::adapter("memory", error.to_string()))?;
-
-        let authorization = event_authorization_record(
+        learning::persist_review_schedule_decision(
+            self,
             user_id,
             study_set_id,
             voice_session_id,
             response_id,
-            EventAuthorizationKind::ReviewSchedule,
-            &ReviewScheduleEventPayload::new(concept_id, &decision),
-        )?;
-        let review_item = ReviewItemRecord {
-            user_id: user_id.to_owned(),
-            study_set_id: study_set_id.to_owned(),
-            voice_session_id: voice_session_id.to_owned(),
-            concept_id: concept_id.to_owned(),
-            due_at: format_rfc3339_millis(decision.due_at),
-        };
-        let decision_record = ReviewScheduleDecisionRecord {
-            user_id: user_id.to_owned(),
-            study_set_id: study_set_id.to_owned(),
-            voice_session_id: voice_session_id.to_owned(),
-            response_id: response_id.to_owned(),
-            concept_id: concept_id.to_owned(),
-            payload_sha256: authorization.payload_sha256.clone(),
+            concept_id,
             decision,
-        };
-
-        // One critical section: scoping, the due date and the v1 decision land
-        // together or not at all, and a replay writes neither a second time.
-        let mut state = self
-            .inner
-            .write()
-            .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-        {
-            let study_set = Self::study_set_locked(&state, user_id, study_set_id)?;
-            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-            Self::ensure_concept_locked(study_set, &state, concept_id)?;
-        }
-        // A replay is identified by the graded outcome, never by the schedule it
-        // produced: the wall clock has moved, so the recomputed `due_at` differs. The
-        // first decision stays authoritative and is what the caller reports back.
-        if let Some(persisted) = state
-            .review_schedule_decisions
-            .iter()
-            .find(|record| record.is_replay_of(&decision_record))
-        {
-            return Ok(persisted.decision.public_summary(concept_id));
-        }
-        if !state.review_items.contains(&review_item) {
-            state.review_items.push(review_item);
-        }
-        let result = decision_record.decision.public_summary(concept_id);
-        state.review_schedule_decisions.push(decision_record);
-        // The authorization ledger stays complete across every authorized write kind.
-        state.event_authorizations.push(authorization);
-        Ok(result)
+        )
     }
 
     async fn record_recap(
@@ -3296,45 +1951,11 @@ impl StudyMemoryStore for InMemoryStudyStore {
         recap: StudySessionRecap,
     ) -> Result<Value, PortError> {
         if recap.voice_session_id != voice_session_id {
-            return Err(PortError::adapter(
+            return Err(PortError::invalid_input(
                 "memory",
+                voice_session_id,
                 "recap session does not match authorized session",
             ));
-        }
-        {
-            let state = self
-                .inner
-                .read()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-            Self::study_set_locked(&state, user_id, study_set_id)?;
-            Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
-        }
-        for moment in &recap.source_moments {
-            let canonical_source = {
-                let state = self
-                    .inner
-                    .read()
-                    .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-                Self::source_reference_locked(
-                    &state,
-                    user_id,
-                    study_set_id,
-                    &moment.source.source_id,
-                )
-            }
-            .ok_or_else(|| {
-                PortError::unavailable(
-                    "memory",
-                    moment.source.source_id.clone(),
-                    "recap source reference is not available for this user and study set",
-                )
-            })?;
-            if canonical_source != moment.source {
-                return Err(PortError::adapter(
-                    "memory",
-                    "recap source tuple does not match deterministic retrieval",
-                ));
-            }
         }
         let record = RecapRecord {
             user_id: user_id.to_owned(),
@@ -3343,6 +1964,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             recap: PersistedSessionRecap::from(&recap),
         };
         let authorization = event_authorization_record(
+            "memory",
             user_id,
             study_set_id,
             voice_session_id,
@@ -3351,29 +1973,120 @@ impl StudyMemoryStore for InMemoryStudyStore {
             &recap,
         )?;
         let result = serde_json::to_value(&record)
-            .map_err(|error| PortError::adapter("memory", error.to_string()))?;
-        {
-            let mut state = self
-                .inner
-                .write()
-                .map_err(|_| PortError::adapter("memory", "lock poisoned"))?;
-            state.recaps.retain(|existing| {
-                existing.user_id != record.user_id
-                    || existing.study_set_id != record.study_set_id
-                    || existing.voice_session_id != record.voice_session_id
-            });
-            state.recaps.push(record);
-            state.event_authorizations.push(authorization);
+            .map_err(|error| json_invariant("study_store_record", &error))?;
+        // `DATA-012`: one write lock spans the set/session/source validation and
+        // the write. The previous shape took a fresh read lock per source moment,
+        // so a deletion could commit between two of them.
+        let mut state = self.inner.write().map_err(|_| state_lock_poisoned())?;
+        Self::study_set_locked(&state, user_id, study_set_id)?;
+        Self::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
+        for moment in &recap.source_moments {
+            Self::source_reference_locked(&state, user_id, study_set_id, &moment.source_id)
+                .ok_or_else(|| {
+                    PortError::unavailable(
+                        "memory",
+                        moment.source_id.clone(),
+                        "recap source reference is not available for this user and study set",
+                    )
+                })?;
         }
+        state.recaps.retain(|existing| {
+            existing.user_id != record.user_id
+                || existing.study_set_id != record.study_set_id
+                || existing.voice_session_id != record.voice_session_id
+        });
+        state.recaps.push(record);
+        authorization::record_locked(&mut state, authorization);
         Ok(result)
+    }
+
+    async fn record_voice_usage(
+        &self,
+        event: VoiceUsageRecord,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
+        privacy::record_voice_usage(self, event)
+    }
+
+    /// `LEARN-003`/Task 6: the canonical outcome, its concept transitions, its
+    /// progression effect, and its browser authorization digests, all under one
+    /// state write lock.
+    ///
+    /// Every validation reads the same locked state the mutation writes, so there
+    /// is no window in which a deletion or a close can slip between them. A
+    /// divergent payload under an already-recorded response identity is a
+    /// `Conflict` that changes nothing.
+    async fn record_turn_outcome(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        outcome: TurnOutcome,
+    ) -> Result<PersistedTurnOutcome, PortError> {
+        learning::record_turn_outcome(self, user_id, study_set_id, voice_session_id, outcome)
+    }
+
+    async fn session_learning_evidence(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<SessionLearningEvidence, PortError> {
+        learning::session_learning_evidence(self, user_id, study_set_id, voice_session_id)
+    }
+
+    async fn record_challenge_resolution(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        resolution: ChallengeResolution,
+    ) -> Result<ChallengeResolution, PortError> {
+        learning::record_challenge_resolution(
+            self,
+            user_id,
+            study_set_id,
+            voice_session_id,
+            resolution,
+        )
+    }
+
+    async fn select_next_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        policy: ProgressionPolicyId,
+    ) -> Result<QuestionProgressionResult, PortError> {
+        learning::select_next_question(
+            self,
+            user_id,
+            study_set_id,
+            voice_session_id,
+            response_id,
+            policy,
+        )
+    }
+
+    async fn authenticated_study_projection(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<AuthenticatedStudyProjectionV1, PortError> {
+        learning::authenticated_study_projection(self, user_id, study_set_id, voice_session_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use agent_domain::{
-        fixture_question, fixture_source_reference, AuthorizedStudySession, ConceptStatus,
-        RecapSourceMoment, SessionId, SourceConfidence, ToolProposal, VivaToolExecutor,
+        fixture_question, fixture_source_reference,
+        learning_recap::{
+            RecapConceptOutcome, RecapSourceMoment, ReviewScheduleAuthority, ReviewScheduleSummary,
+            VIVA_STUDY_SESSION_RECAP_SCHEMA,
+        },
+        ConceptStatus, PortErrorKind, SessionId, SourceConfidence,
     };
 
     use super::*;
@@ -3425,7 +2138,9 @@ mod tests {
     }
 
     async fn record_fixture_session(store: &InMemoryStudyStore) {
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new("voice-session-1")),
                 user_id: Some("user-1".to_owned()),
@@ -3435,6 +2150,53 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    /// One accepted evaluation for the store's own active question, so the source
+    /// tuple always matches deterministic retrieval.
+    fn fixture_evaluation(question: &StudyQuestion) -> AnswerEvaluation {
+        AnswerEvaluation {
+            question_id: question.question_id.clone(),
+            answer_text: "NADH donates electrons.".to_owned(),
+            label: "mostly correct".to_owned(),
+            concise_feedback: "Grounded in the seeded source.".to_owned(),
+            retry_prompt: question.follow_up.clone(),
+            source: question.source.clone(),
+            concept_status: ConceptStatus::Strong,
+            confidence_score: 0.84,
+        }
+    }
+
+    fn fixture_recap() -> StudySessionRecap {
+        StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+            voice_session_id: "voice-session-1".to_owned(),
+            headline: "Strong concepts: 1 of 2.".to_owned(),
+            summary: "Graded concepts: 2. Evaluated turns: 1. Deferred turns: 0.".to_owned(),
+            concepts: vec![
+                RecapConceptOutcome {
+                    concept_id: "oxidative-phosphorylation".to_owned(),
+                    label: "Oxidative phosphorylation".to_owned(),
+                    status: ConceptStatus::Strong,
+                },
+                RecapConceptOutcome {
+                    concept_id: "atp-synthase".to_owned(),
+                    label: "ATP synthase".to_owned(),
+                    status: ConceptStatus::Shaky,
+                },
+            ],
+            review_schedule: vec![ReviewScheduleSummary {
+                concept_id: "atp-synthase".to_owned(),
+                due_at: "2031-04-07T12:00:00.000Z".to_owned(),
+                authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+            }],
+            next_action: "Review the scheduled concepts on their due dates.".to_owned(),
+            source_moments: vec![RecapSourceMoment {
+                response_id: "response-1".to_owned(),
+                source_id: fixture_source_reference().source_id,
+            }],
+            deferred_turns: 0,
+        }
     }
 
     #[tokio::test]
@@ -3513,7 +2275,9 @@ mod tests {
     async fn study_session_durable_counts_are_scoped_to_authorized_session() {
         let store = seeded_store();
         record_fixture_session(&store).await;
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new("voice-session-2")),
                 user_id: Some("user-1".to_owned()),
@@ -3554,15 +2318,34 @@ mod tests {
                     session_id,
                     "response-1",
                     StudySessionRecap {
+                        schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA
+                            .to_owned(),
                         voice_session_id: session_id.to_owned(),
                         headline: "Durable recap".to_owned(),
                         summary: "Recorded from durable state.".to_owned(),
-                        strong_concepts: vec!["oxidative-phosphorylation".to_owned()],
-                        shaky_concepts: vec![],
-                        missed_concepts: vec![],
-                        review_later: vec!["atp-synthase".to_owned()],
+                        concepts: vec![
+                            agent_domain::learning_recap::RecapConceptOutcome {
+                                concept_id: "oxidative-phosphorylation".to_owned(),
+                                label: "Oxidative phosphorylation".to_owned(),
+                                status: ConceptStatus::Strong,
+                            },
+                            agent_domain::learning_recap::RecapConceptOutcome {
+                                concept_id: "atp-synthase".to_owned(),
+                                label: "ATP synthase".to_owned(),
+                                status: ConceptStatus::Shaky,
+                            },
+                        ],
+                        review_schedule: vec![
+                            agent_domain::learning_recap::ReviewScheduleSummary {
+                                concept_id: "atp-synthase".to_owned(),
+                                due_at: "2031-04-07T12:00:00.000Z".to_owned(),
+                                authority:
+                                    agent_domain::learning_recap::ReviewScheduleAuthority::ServerPersistedFsrs,
+                            },
+                        ],
                         next_action: "Continue".to_owned(),
                         source_moments: vec![],
+                        deferred_turns: 0,
                     },
                 )
                 .await
@@ -3608,7 +2391,9 @@ mod tests {
         assert!(session_deleted.answer_attempts.is_empty());
 
         let study_delete_session_id = "voice-session-study-delete";
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new(study_delete_session_id)),
                 user_id: Some("user-1".to_owned()),
@@ -3655,9 +2440,15 @@ mod tests {
         });
         let question = StudyQuestion {
             question_id: "q-fadh2-entry-point".to_owned(),
+            concept_id: crate::generated_question_concept_id("q-fadh2-entry-point"),
             prompt: "Where does FADH2 enter the electron transport chain?".to_owned(),
             expected_terms: vec!["complex ii".to_owned(), "fewer protons".to_owned()],
             follow_up: "Connect the entry point to ATP yield.".to_owned(),
+            rubric: crate::generated_question_rubric(
+                "q-fadh2-entry-point",
+                "Where does FADH2 enter the electron transport chain?",
+                &source.source_id,
+            ),
             source,
         };
         store.upsert_question(StudyQuestionRecord {
@@ -4153,10 +2944,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_ingestion_writes_pdf_artifacts_without_exact_region_provenance() {
+    async fn file_ingestion_writes_document_level_spans_without_exact_region_provenance() {
         let store = InMemoryStudyStore::new();
         let file_text = [
-            "%PDF-1.7",
             "Mitochondria electron transport builds a proton gradient across the inner membrane.",
             "NADH transfers electrons while oxygen accepts them at the end of the chain.",
             "ATP synthase uses chemiosmosis to make ATP from ADP.",
@@ -4167,11 +2957,11 @@ mod tests {
             .create_file_study_set(CreateFileStudySet {
                 user_id: "user-1".to_owned(),
                 study_set_id: None,
-                title: "Bio PDF".to_owned(),
+                title: "Bio notes".to_owned(),
                 course: Some("Biology 201".to_owned()),
                 exam_date: None,
-                file_name: "Lecture 9.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "Lecture 9.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: file_text.as_bytes().to_vec(),
                 session_id: Some("file-session-1".to_owned()),
             })
@@ -4182,8 +2972,8 @@ mod tests {
             record.study_set.ingestion_status,
             StudySetIngestionStatus::Ready
         );
-        assert_eq!(record.documents[0].display_name, "Lecture 9.pdf");
-        assert_eq!(record.documents[0].source_kind, "pdf");
+        assert_eq!(record.documents[0].display_name, "Lecture 9.txt");
+        assert_eq!(record.documents[0].source_kind, "file");
         assert!(!record.source_spans.is_empty());
         for source in &record.source_spans {
             assert!(locator_span(source).starts_with("document:chars:"));
@@ -4212,7 +3002,6 @@ mod tests {
     async fn file_ingested_study_set_flows_through_authorized_tools() {
         let store = Arc::new(InMemoryStudyStore::new());
         let file_text = [
-            "%PDF-1.7",
             "Electron transport in mitochondria transfers electrons from NADH to oxygen.",
             "The proton gradient powers ATP synthase during oxidative phosphorylation.",
         ]
@@ -4222,18 +3011,20 @@ mod tests {
             .create_file_study_set(CreateFileStudySet {
                 user_id: "user-1".to_owned(),
                 study_set_id: None,
-                title: "Tool Flow PDF".to_owned(),
+                title: "Tool Flow notes".to_owned(),
                 course: Some("Biology 201".to_owned()),
                 exam_date: None,
-                file_name: "tool-flow.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "notes.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: file_text.as_bytes().to_vec(),
                 session_id: Some("file-session-tool-flow".to_owned()),
             })
             .await
             .expect("file ingestion succeeds");
         let voice_session_id = "voice-session-file-flow";
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new(voice_session_id)),
                 user_id: Some("user-1".to_owned()),
@@ -4259,67 +3050,32 @@ mod tests {
             .expect("file-generated concept")
             .public_id
             .clone();
-        let executor = VivaToolExecutor::new(
-            store.clone(),
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: record.study_set.id.clone(),
-                voice_session_id: voice_session_id.to_owned(),
-                mode: StudyMode::Quiz,
-                active_concepts: vec![concept_id.clone()],
-            },
-        );
+        assert!(active_question.source.span.starts_with("document:chars:"));
 
-        let selected = executor
-            .execute(
-                "response-file-0",
-                ToolProposal::select_next_question(&record.study_set.id, voice_session_id, "quiz"),
+        let canonical_source = store
+            .source_reference(
+                "user-1",
+                &record.study_set.id,
+                &active_question.source.source_id,
             )
             .await
-            .unwrap();
-        assert_eq!(
-            selected.result["question"]["source"]["source_id"],
-            active_question.source.source_id
-        );
-        assert!(selected.result["question"]["source"]["span"]
-            .as_str()
             .unwrap()
-            .starts_with("document:chars:"));
+            .expect("file-generated source reference");
+        assert_eq!(canonical_source.document_id, record.documents[0].id);
+        assert!(canonical_source.span.starts_with("document:chars:"));
 
-        let source_result = executor
-            .execute(
-                "response-file-1",
-                ToolProposal::retrieve_source_reference(
-                    &record.study_set.id,
-                    voice_session_id,
-                    &active_question.source.source_id,
-                ),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            source_result.result["source"]["document_id"],
-            record.documents[0].id
-        );
-        assert!(source_result.result["source"]["span"]
-            .as_str()
-            .unwrap()
-            .starts_with("document:chars:"));
-
-        let concept_status = executor
-            .execute(
+        let concept_status = store
+            .record_concept_status(
+                "user-1",
+                &record.study_set.id,
+                voice_session_id,
                 "response-file-2",
-                ToolProposal::mark_concept_status(
-                    &record.study_set.id,
-                    voice_session_id,
-                    &concept_id,
-                    "shaky",
-                ),
+                &concept_id,
+                ConceptStatus::Shaky,
             )
             .await
             .unwrap();
-        assert_eq!(concept_status.result["concept_id"], concept_id);
-        assert_eq!(concept_status.result["status"], "shaky");
+        assert_eq!(concept_status, ConceptStatus::Shaky);
 
         let snapshot = store.snapshot();
         assert!(snapshot.concept_statuses.iter().any(|status| {
@@ -4337,11 +3093,11 @@ mod tests {
             .create_file_study_set(CreateFileStudySet {
                 user_id: "user-1".to_owned(),
                 study_set_id: None,
-                title: "Bad PDF".to_owned(),
+                title: "Bad upload".to_owned(),
                 course: None,
                 exam_date: None,
-                file_name: "empty.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "empty.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: b"!!! ??? ---".to_vec(),
                 session_id: Some("file-session-failed".to_owned()),
             })
@@ -4362,11 +3118,11 @@ mod tests {
             .retry_file_study_set(CreateFileStudySet {
                 user_id: "user-1".to_owned(),
                 study_set_id: Some(failed.study_set.id.clone()),
-                title: "Bad PDF".to_owned(),
+                title: "Bad upload".to_owned(),
                 course: None,
                 exam_date: None,
-                file_name: "still-empty.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "still-empty.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: b"??? --- !!!".to_vec(),
                 session_id: Some("file-session-retry-failed".to_owned()),
             })
@@ -4384,11 +3140,11 @@ mod tests {
             .retry_file_study_set(CreateFileStudySet {
                 user_id: "user-1".to_owned(),
                 study_set_id: Some(failed.study_set.id.clone()),
-                title: "Bad PDF".to_owned(),
+                title: "Bad upload".to_owned(),
                 course: None,
                 exam_date: None,
-                file_name: "replacement.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "replacement.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: retry_text.as_bytes().to_vec(),
                 session_id: Some("file-session-retry".to_owned()),
             })
@@ -4434,7 +3190,9 @@ mod tests {
             .await
             .expect("second paste ingests");
         for record in [&first, &second] {
-            store
+            // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+            // truth is asserted.
+            let _outcome = store
                 .record_voice_session(&SessionConfig {
                     session_id: Some(SessionId::new(record.session_id.clone())),
                     user_id: Some(record.study_set.user_id.clone()),
@@ -4446,90 +3204,67 @@ mod tests {
                 .expect("records paste voice session");
         }
 
-        let first_executor = VivaToolExecutor::new(
-            store.clone(),
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: first.study_set.id.clone(),
-                voice_session_id: first.session_id.clone(),
-                mode: StudyMode::Quiz,
-                active_concepts: first
-                    .concepts
-                    .iter()
-                    .map(|concept| concept.public_id.clone())
-                    .collect(),
-            },
-        );
-        let second_executor = VivaToolExecutor::new(
-            store.clone(),
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: second.study_set.id.clone(),
-                voice_session_id: second.session_id.clone(),
-                mode: StudyMode::Quiz,
-                active_concepts: second
-                    .concepts
-                    .iter()
-                    .map(|concept| concept.public_id.clone())
-                    .collect(),
-            },
-        );
-
-        let first_question = first_executor
-            .execute(
-                "response-0",
-                ToolProposal::select_next_question(&first.study_set.id, &first.session_id, "quiz"),
-            )
+        let first_question = store
+            .active_question("user-1", &first.study_set.id)
             .await
+            .expect("first active question read")
             .expect("selects first generated question");
-        let second_question = second_executor
-            .execute(
-                "response-0",
-                ToolProposal::select_next_question(
-                    &second.study_set.id,
-                    &second.session_id,
-                    "quiz",
-                ),
-            )
+        let second_question = store
+            .active_question("user-1", &second.study_set.id)
             .await
+            .expect("second active question read")
             .expect("selects second generated question");
-        let first_question_id = first_question.result["question"]["question_id"]
-            .as_str()
-            .expect("question id");
-        let second_question_id = second_question.result["question"]["question_id"]
-            .as_str()
-            .expect("question id");
 
-        assert_ne!(first_question_id, "q-oxidative-phosphorylation-nadh");
-        assert_ne!(second_question_id, "q-oxidative-phosphorylation-nadh");
-        assert_ne!(first_question_id, second_question_id);
         assert_ne!(
-            first_question.result["question"]["source"]["source_id"],
-            "src-lecture-5-slide-18"
+            first_question.question_id,
+            "q-oxidative-phosphorylation-nadh"
         );
+        assert_ne!(
+            second_question.question_id,
+            "q-oxidative-phosphorylation-nadh"
+        );
+        assert_ne!(first_question.question_id, second_question.question_id);
+        assert_ne!(first_question.source.source_id, "src-lecture-5-slide-18");
 
-        first_executor
-            .execute(
+        store
+            .record_answer_evaluation(
+                "user-1",
+                &first.study_set.id,
+                &first.session_id,
                 "response-1",
-                ToolProposal::evaluate_spoken_answer(
-                    &first.study_set.id,
-                    &first.session_id,
-                    first_question_id,
-                    "mitosis chromosome spindle",
-                ),
+                AnswerEvaluation {
+                    question_id: first_question.question_id.clone(),
+                    answer_text: "mitosis chromosome spindle".to_owned(),
+                    label: "mostly correct".to_owned(),
+                    concise_feedback: "Grounded in the first study set.".to_owned(),
+                    retry_prompt: first_question.follow_up.clone(),
+                    source: first_question.source.clone(),
+                    concept_status: ConceptStatus::Strong,
+                    confidence_score: 0.8,
+                },
             )
             .await
             .expect("first generated answer records");
+
+        // The second set's question and source belong to a different study set, so
+        // the first session may not evaluate against them and may not write.
         let baseline_writes = store.write_counts();
-        let wrong_set = first_executor
-            .execute(
-                "response-1",
-                ToolProposal::evaluate_spoken_answer(
-                    &first.study_set.id,
-                    &first.session_id,
-                    second_question_id,
-                    "photosynthesis chloroplast",
-                ),
+        let wrong_set = store
+            .record_answer_evaluation(
+                "user-1",
+                &first.study_set.id,
+                &first.session_id,
+                "response-2",
+                AnswerEvaluation {
+                    question_id: second_question.question_id.clone(),
+                    answer_text: "photosynthesis chloroplast".to_owned(),
+                    label: "mostly correct".to_owned(),
+                    concise_feedback: "Wrong study set.".to_owned(),
+                    retry_prompt: second_question.follow_up.clone(),
+                    source: second_question.source.clone(),
+                    concept_status: ConceptStatus::Strong,
+                    confidence_score: 0.8,
+                },
             )
             .await;
 
@@ -4714,19 +3449,22 @@ mod tests {
                 "voice-session-1",
                 "response-0",
                 StudySessionRecap {
+                    schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
                     voice_session_id: "voice-session-1".to_owned(),
                     headline: "Closed".to_owned(),
                     summary: "Closed session recap.".to_owned(),
-                    strong_concepts: vec!["NADH".to_owned()],
-                    shaky_concepts: vec![],
-                    missed_concepts: vec![],
-                    review_later: vec![],
-                    next_action: "Stop".to_owned(),
-                    source_moments: vec![RecapSourceMoment {
-                        text: "Closed recap source".to_owned(),
-                        source: fixture_source_reference(),
+                    concepts: vec![RecapConceptOutcome {
+                        concept_id: "nadh".to_owned(),
+                        label: "NADH".to_owned(),
                         status: ConceptStatus::Strong,
                     }],
+                    review_schedule: vec![],
+                    next_action: "Stop".to_owned(),
+                    source_moments: vec![RecapSourceMoment {
+                        response_id: "response-0".to_owned(),
+                        source_id: fixture_source_reference().source_id,
+                    }],
+                    deferred_turns: 0,
                 },
             )
             .await
@@ -4790,19 +3528,33 @@ mod tests {
             .is_err());
 
         let recap = StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
             voice_session_id: "voice-session-1".to_owned(),
             headline: "Done".to_owned(),
             summary: "Recap".to_owned(),
-            strong_concepts: vec!["NADH".to_owned()],
-            shaky_concepts: vec![],
-            missed_concepts: vec![],
-            review_later: vec!["ATP synthase".to_owned()],
+            concepts: vec![
+                RecapConceptOutcome {
+                    concept_id: "nadh".to_owned(),
+                    label: "NADH".to_owned(),
+                    status: ConceptStatus::Strong,
+                },
+                RecapConceptOutcome {
+                    concept_id: "atp-synthase".to_owned(),
+                    label: "ATP synthase".to_owned(),
+                    status: ConceptStatus::Shaky,
+                },
+            ],
+            review_schedule: vec![ReviewScheduleSummary {
+                concept_id: "atp-synthase".to_owned(),
+                due_at: "2031-04-07T12:00:00.000Z".to_owned(),
+                authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+            }],
             next_action: "Review tomorrow".to_owned(),
             source_moments: vec![RecapSourceMoment {
-                text: "NADH source".to_owned(),
-                source: fixture_source_reference(),
-                status: ConceptStatus::Strong,
+                response_id: "response-0".to_owned(),
+                source_id: fixture_source_reference().source_id,
             }],
+            deferred_turns: 0,
         };
         store
             .record_recap(
@@ -4852,34 +3604,58 @@ mod tests {
         record_fixture_session(&store).await;
 
         let first_recap = StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
             voice_session_id: "voice-session-1".to_owned(),
             headline: "First recap".to_owned(),
             summary: "Initial recap.".to_owned(),
-            strong_concepts: vec!["NADH".to_owned()],
-            shaky_concepts: vec![],
-            missed_concepts: vec![],
-            review_later: vec!["ATP synthase".to_owned()],
+            concepts: vec![
+                RecapConceptOutcome {
+                    concept_id: "nadh".to_owned(),
+                    label: "NADH".to_owned(),
+                    status: ConceptStatus::Strong,
+                },
+                RecapConceptOutcome {
+                    concept_id: "atp-synthase".to_owned(),
+                    label: "ATP synthase".to_owned(),
+                    status: ConceptStatus::Shaky,
+                },
+            ],
+            review_schedule: vec![ReviewScheduleSummary {
+                concept_id: "atp-synthase".to_owned(),
+                due_at: "2031-04-07T12:00:00.000Z".to_owned(),
+                authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+            }],
             next_action: "Review oxidative phosphorylation.".to_owned(),
             source_moments: vec![RecapSourceMoment {
-                text: "NADH source".to_owned(),
-                source: fixture_source_reference(),
-                status: ConceptStatus::Strong,
+                response_id: "response-a".to_owned(),
+                source_id: fixture_source_reference().source_id,
             }],
+            deferred_turns: 0,
         };
         let second_recap = StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
             voice_session_id: "voice-session-1".to_owned(),
             headline: "Second recap".to_owned(),
             summary: "Replacement recap.".to_owned(),
-            strong_concepts: vec!["ATP synthase".to_owned()],
-            shaky_concepts: vec!["NADH".to_owned()],
-            missed_concepts: vec![],
-            review_later: vec![],
+            concepts: vec![
+                RecapConceptOutcome {
+                    concept_id: "atp-synthase".to_owned(),
+                    label: "ATP synthase".to_owned(),
+                    status: ConceptStatus::Strong,
+                },
+                RecapConceptOutcome {
+                    concept_id: "nadh".to_owned(),
+                    label: "NADH".to_owned(),
+                    status: ConceptStatus::Shaky,
+                },
+            ],
+            review_schedule: vec![],
             next_action: "Compare electron transport steps.".to_owned(),
             source_moments: vec![RecapSourceMoment {
-                text: "ATP synthase source".to_owned(),
-                source: fixture_source_reference(),
-                status: ConceptStatus::Shaky,
+                response_id: "response-b".to_owned(),
+                source_id: fixture_source_reference().source_id,
             }],
+            deferred_turns: 0,
         };
 
         store
@@ -4987,6 +3763,110 @@ mod tests {
             .is_err());
     }
 
+    /// `DATA-005`: the in-memory authorization ledger is a set, not a log.
+    ///
+    /// Authorization is only ever consulted by membership, so an identical replay
+    /// carries no new information — but a `Vec` still grew by one entry per
+    /// replay, which is an unbounded process-local allocation driven by a remote
+    /// caller. The bound is structural: identical records deduplicate.
+    #[tokio::test]
+    async fn memory_authorization_replay_is_deduplicated_and_bounded() {
+        let store = seeded_store();
+        record_fixture_session(&store).await;
+        let question = store
+            .active_question("user-1", "biology-midterm")
+            .await
+            .expect("active question read")
+            .expect("seeded active question");
+        let evaluation = fixture_evaluation(&question);
+        let recap = fixture_recap();
+
+        for _ in 0..16 {
+            store
+                .record_answer_evaluation(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    "response-1",
+                    evaluation.clone(),
+                )
+                .await
+                .expect("evaluation replay is accepted");
+            store
+                .record_concept_status(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    "response-1",
+                    "nadh",
+                    ConceptStatus::Strong,
+                )
+                .await
+                .expect("concept status replay is accepted");
+            store
+                .record_recap(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    "response-1",
+                    recap.clone(),
+                )
+                .await
+                .expect("recap replay is accepted");
+        }
+
+        // Three distinct authorized events, sixteen replays each.
+        assert_eq!(store.snapshot().event_authorizations.len(), 3);
+
+        // Deduplication must not weaken live authorization.
+        store
+            .authorize_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                &evaluation,
+            )
+            .await
+            .expect("the deduplicated record still authorizes its own event");
+        store
+            .authorize_concept_status(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                "nadh",
+                &ConceptStatus::Strong,
+            )
+            .await
+            .expect("the deduplicated record still authorizes its own event");
+        store
+            .authorize_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                &recap,
+            )
+            .await
+            .expect("the deduplicated record still authorizes its own event");
+
+        // A one-field change is still refused.
+        let mut forged = evaluation.clone();
+        forged.label = "wrong".to_owned();
+        let error = store
+            .authorize_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "response-1",
+                &forged,
+            )
+            .await
+            .expect_err("a changed payload is not authorized");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+    }
+
     #[tokio::test]
     async fn close_voice_session_evicts_event_authorizations() {
         let store = seeded_store();
@@ -5041,19 +3921,22 @@ mod tests {
             .is_err());
 
         let mismatched_session_recap = StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
             voice_session_id: "voice-session-2".to_owned(),
             headline: "Done".to_owned(),
             summary: "Recap".to_owned(),
-            strong_concepts: vec!["NADH".to_owned()],
-            shaky_concepts: vec![],
-            missed_concepts: vec![],
-            review_later: vec!["ATP synthase".to_owned()],
-            next_action: "Review tomorrow".to_owned(),
-            source_moments: vec![RecapSourceMoment {
-                text: "Mismatched recap source".to_owned(),
-                source: fixture_source_reference(),
+            concepts: vec![RecapConceptOutcome {
+                concept_id: "nadh".to_owned(),
+                label: "NADH".to_owned(),
                 status: ConceptStatus::Strong,
             }],
+            review_schedule: vec![],
+            next_action: "Review tomorrow".to_owned(),
+            source_moments: vec![RecapSourceMoment {
+                response_id: "response-0".to_owned(),
+                source_id: fixture_source_reference().source_id,
+            }],
+            deferred_turns: 0,
         };
         assert!(store
             .record_recap(
@@ -5066,22 +3949,25 @@ mod tests {
             .await
             .is_err());
 
-        let mut forged_recap_source = fixture_source_reference();
-        forged_recap_source.document_id = "wrong-doc".to_owned();
+        // The v2 recap moment carries only a source id, so a forged moment is a
+        // source id this user and study set do not own.
         let recap = StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
             voice_session_id: "voice-session-1".to_owned(),
             headline: "Done".to_owned(),
             summary: "Recap".to_owned(),
-            strong_concepts: vec!["NADH".to_owned()],
-            shaky_concepts: vec![],
-            missed_concepts: vec![],
-            review_later: vec!["ATP synthase".to_owned()],
-            next_action: "Review tomorrow".to_owned(),
-            source_moments: vec![RecapSourceMoment {
-                text: "Forged recap source".to_owned(),
-                source: forged_recap_source,
+            concepts: vec![RecapConceptOutcome {
+                concept_id: "nadh".to_owned(),
+                label: "NADH".to_owned(),
                 status: ConceptStatus::Strong,
             }],
+            review_schedule: vec![],
+            next_action: "Review tomorrow".to_owned(),
+            source_moments: vec![RecapSourceMoment {
+                response_id: "response-0".to_owned(),
+                source_id: "src-not-owned-by-this-study-set".to_owned(),
+            }],
+            deferred_turns: 0,
         };
 
         assert!(store
@@ -5129,19 +4015,33 @@ mod tests {
                 "voice-session-1",
                 "response-0",
                 StudySessionRecap {
+                    schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
                     voice_session_id: "voice-session-1".to_owned(),
                     headline: "Done".to_owned(),
                     summary: "Recap".to_owned(),
-                    strong_concepts: vec!["NADH".to_owned()],
-                    shaky_concepts: vec![],
-                    missed_concepts: vec![],
-                    review_later: vec!["ATP synthase".to_owned()],
+                    concepts: vec![
+                        RecapConceptOutcome {
+                            concept_id: "nadh".to_owned(),
+                            label: "NADH".to_owned(),
+                            status: ConceptStatus::Strong,
+                        },
+                        RecapConceptOutcome {
+                            concept_id: "atp-synthase".to_owned(),
+                            label: "ATP synthase".to_owned(),
+                            status: ConceptStatus::Shaky,
+                        },
+                    ],
+                    review_schedule: vec![ReviewScheduleSummary {
+                        concept_id: "atp-synthase".to_owned(),
+                        due_at: "2031-04-07T12:00:00.000Z".to_owned(),
+                        authority: ReviewScheduleAuthority::ServerPersistedFsrs,
+                    }],
                     next_action: "Review tomorrow".to_owned(),
                     source_moments: vec![RecapSourceMoment {
-                        text: "NADH source".to_owned(),
-                        source: fixture_source_reference(),
-                        status: ConceptStatus::Strong,
+                        response_id: "response-0".to_owned(),
+                        source_id: fixture_source_reference().source_id,
                     }],
+                    deferred_turns: 0,
                 },
             )
             .await
@@ -5158,98 +4058,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_tool_executor_handles_all_viva_tools_with_authorized_session() {
+    async fn every_authorized_store_write_lands_exactly_once_for_one_session() {
         let store = Arc::new(seeded_store());
         record_fixture_session(&store).await;
-        let executor = VivaToolExecutor::new(
-            store.clone(),
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: "biology-midterm".to_owned(),
-                voice_session_id: "voice-session-1".to_owned(),
-                mode: StudyMode::Quiz,
-                active_concepts: vec![
-                    "oxidative-phosphorylation".to_owned(),
-                    "atp-synthase".to_owned(),
-                ],
-            },
-        );
-        let question = executor
-            .execute(
-                "response-0",
-                ToolProposal::select_next_question("biology-midterm", "voice-session-1", "quiz"),
-            )
+        let question = store
+            .active_question("user-1", "biology-midterm")
             .await
-            .unwrap();
-        assert_eq!(
-            question.result["question"]["source"]["source_id"],
-            "src-lecture-5-slide-18"
-        );
+            .unwrap()
+            .expect("seeded active question");
+        assert_eq!(question.source.source_id, "src-lecture-5-slide-18");
 
-        executor
-            .execute(
+        store
+            .record_answer_evaluation(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
                 "response-1",
-                ToolProposal::evaluate_spoken_answer(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "q-oxidative-phosphorylation-nadh",
-                    "NADH donates electrons.",
-                ),
+                fixture_evaluation(&question),
             )
             .await
             .unwrap();
-        executor
-            .execute(
+        assert!(store
+            .source_reference("user-1", "biology-midterm", "src-lecture-5-slide-18")
+            .await
+            .unwrap()
+            .is_some());
+        store
+            .record_concept_status(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
                 "response-1",
-                ToolProposal::retrieve_source_reference(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "src-lecture-5-slide-18",
-                ),
+                "oxidative-phosphorylation",
+                ConceptStatus::Strong,
             )
             .await
             .unwrap();
-        executor
-            .execute(
-                "response-1",
-                ToolProposal::mark_concept_status(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "oxidative-phosphorylation",
-                    "strong",
-                ),
+        store
+            .schedule_review_item(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                "atp-synthase",
+                "2031-04-07T12:00:00.000Z",
             )
             .await
             .unwrap();
-        executor
-            .execute(
-                "response-1",
-                ToolProposal::schedule_review_item(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "atp-synthase",
-                    "shaky",
-                ),
-            )
-            .await
-            .unwrap();
-        executor
-            .execute(
+        store
+            .record_recap(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
                 "response-0",
-                ToolProposal::build_session_recap("biology-midterm", "voice-session-1"),
-            )
-            .await
-            .unwrap();
-        executor
-            .execute(
-                "response-1",
-                ToolProposal::challenge_correction(
-                    "biology-midterm",
-                    "voice-session-1",
-                    &fixture_source_reference(),
-                    "correction-1",
-                    "Re-check this source.",
-                ),
+                fixture_recap(),
             )
             .await
             .unwrap();
@@ -5262,64 +4123,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_tool_executor_replay_keeps_store_counts_exact() {
+    async fn replaying_every_authorized_store_write_keeps_counts_exact() {
         let store = Arc::new(seeded_store());
         record_fixture_session(&store).await;
-        let executor = VivaToolExecutor::new(
-            store.clone(),
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: "biology-midterm".to_owned(),
-                voice_session_id: "voice-session-1".to_owned(),
-                mode: StudyMode::Quiz,
-                active_concepts: vec![
-                    "oxidative-phosphorylation".to_owned(),
-                    "atp-synthase".to_owned(),
-                ],
-            },
-        );
+        let question = store
+            .active_question("user-1", "biology-midterm")
+            .await
+            .unwrap()
+            .expect("seeded active question");
 
         for _ in 0..2 {
-            executor
-                .execute(
+            store
+                .record_answer_evaluation(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
                     "response-1",
-                    ToolProposal::evaluate_spoken_answer(
-                        "biology-midterm",
-                        "voice-session-1",
-                        "q-oxidative-phosphorylation-nadh",
-                        "NADH donates electrons.",
-                    ),
+                    fixture_evaluation(&question),
                 )
                 .await
                 .unwrap();
-            executor
-                .execute(
+            store
+                .record_concept_status(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
                     "response-1",
-                    ToolProposal::mark_concept_status(
-                        "biology-midterm",
-                        "voice-session-1",
-                        "oxidative-phosphorylation",
-                        "strong",
-                    ),
+                    "oxidative-phosphorylation",
+                    ConceptStatus::Strong,
                 )
                 .await
                 .unwrap();
-            executor
-                .execute(
-                    "response-1",
-                    ToolProposal::schedule_review_item(
-                        "biology-midterm",
-                        "voice-session-1",
-                        "atp-synthase",
-                        "shaky",
-                    ),
+            store
+                .schedule_review_item(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    "atp-synthase",
+                    "2031-04-07T12:00:00.000Z",
                 )
                 .await
                 .unwrap();
-            executor
-                .execute(
+            store
+                .record_recap(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
                     "response-0",
-                    ToolProposal::build_session_recap("biology-midterm", "voice-session-1"),
+                    fixture_recap(),
                 )
                 .await
                 .unwrap();
@@ -5333,55 +4184,467 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_tool_executor_rejects_session_and_source_forgery() {
+    async fn store_rejects_wrong_study_set_and_forged_source_tuple() {
         let store = Arc::new(seeded_store());
         record_fixture_session(&store).await;
-        let executor = VivaToolExecutor::new(
-            store,
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: "biology-midterm".to_owned(),
-                voice_session_id: "voice-session-1".to_owned(),
-                mode: StudyMode::Quiz,
-                active_concepts: vec![
-                    "oxidative-phosphorylation".to_owned(),
-                    "atp-synthase".to_owned(),
-                ],
-            },
-        );
-        assert!(executor
-            .execute(
-                "response-0",
-                ToolProposal::select_next_question("wrong-set", "voice-session-1", "quiz",),
-            )
-            .await
-            .is_err());
+
+        // A study set this session is not bound to yields no question at all: the
+        // store refuses rather than answering with someone else's question.
+        assert!(store.active_question("user-1", "wrong-set").await.is_err());
 
         let mut forged_source = fixture_source_reference();
         forged_source.excerpt = "forged excerpt".to_owned();
-        assert!(executor
-            .execute(
-                "response-1",
-                ToolProposal::challenge_correction(
-                    "biology-midterm",
-                    "voice-session-1",
-                    &forged_source,
-                    "correction-1",
-                    "Re-check this source.",
-                ),
+        assert!(store
+            .authorize_source_reference(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                &forged_source,
             )
             .await
             .is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Task 7 (`DATA-012`)
+    //
+    // Every in-memory check-and-mutate path has to hold one state write lock
+    // across its validation and its mutation. The tests below arm the
+    // deterministic pause between the two halves, run the racing operation, and
+    // assert the *final committed state* — a validate-then-mutate method lets
+    // the racer finish inside the gap and then writes on top of it.
+    // ------------------------------------------------------------------
+
+    /// Runs `wait_until_paused` off the async runtime: it blocks a thread, and the
+    /// mutation it waits for is blocking a worker thread of its own.
+    async fn await_pause(handle: MutationPauseHandle) -> MutationPauseHandle {
+        tokio::task::spawn_blocking(move || {
+            handle.wait_until_paused();
+            handle
+        })
+        .await
+        .expect("pause waiter joins")
+    }
+
+    fn fixture_usage_record(voice_session_id: Option<&str>) -> agent_domain::VoiceUsageRecord {
+        agent_domain::VoiceUsageRecord {
+            voice_session_id: voice_session_id.map(ToOwned::to_owned),
+            provider: "synthetic".to_owned(),
+            model: "synthetic-viva".to_owned(),
+            duration_seconds: 2,
+            text_input_tokens: 20,
+            text_output_tokens: 10,
+            audio_input_tokens: 0,
+            audio_output_tokens: 0,
+            cost_estimate_usd: 0.000_02,
+            first_audio_latency_ms: None,
+            answer_eval_latency_ms: Some(1),
+            source_retrieval_latency_ms: None,
+            source_grounded_correction_count: 1,
+        }
+    }
+
+    /// One evaluated turn for the seeded fixture's own question and concepts.
+    fn fixture_turn_outcome(response_id: &str) -> TurnOutcome {
+        let question = fixture_question();
+        let criterion_id = question.rubric.criteria[0].criterion_id.clone();
+        TurnOutcome {
+            schema: VIVA_TURN_OUTCOME_SCHEMA.to_owned(),
+            response_id: response_id.to_owned(),
+            question_id: question.question_id.clone(),
+            rubric_policy_version: question.rubric.policy_version.clone(),
+            recorded_at: "2031-04-05T12:00:00.000Z".to_owned(),
+            source_ids: vec![question.source.source_id.clone()],
+            supersedes_response_id: None,
+            resolution: TurnResolution::Evaluated {
+                label: agent_domain::EvaluationLabel::MostlyCorrect,
+                confidence: 0.84,
+                assessments: vec![agent_domain::CriterionAssessment {
+                    criterion_id: criterion_id.clone(),
+                    assessment: agent_domain::CriterionAssessmentKind::Satisfied,
+                    confidence: 0.84,
+                }],
+                concept_transitions: vec![ConceptStatusTransition {
+                    concept_id: "oxidative-phosphorylation".to_owned(),
+                    from_status: ConceptStatus::Shaky,
+                    to_status: ConceptStatus::Strong,
+                    criterion_ids: vec![criterion_id],
+                }],
+                concise_feedback: "Grounded in the seeded source.".to_owned(),
+                retry_prompt: None,
+                disposition: QuestionDisposition::Advance,
+            },
+        }
+    }
+
+    /// A session write that validated while the session was open must not resurrect
+    /// it after a close that committed in between.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_close_and_session_replay_cannot_reopen_closed_session() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+
+        let pause = store.pause_at(MutationSite::VoiceSession);
+        let replay_store = Arc::clone(&store);
+        let replay = tokio::spawn(async move {
+            replay_store
+                .record_voice_session(&fixture_session_config())
+                .await
+        });
+        let pause = await_pause(pause).await;
+
+        let close_store = Arc::clone(&store);
+        let close = tokio::spawn(async move {
+            close_store
+                .close_voice_session("voice-session-1", "completed")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        pause.release();
+
+        let replayed = replay
+            .await
+            .expect("session replay joins")
+            .expect("replaying an open session succeeds");
+        let closed = close
+            .await
+            .expect("close joins")
+            .expect("closing the session succeeds");
+
+        assert_eq!(replayed, StudyStoreWriteOutcome::IdempotentReplay);
+        assert_eq!(closed["status"], "closed");
+
+        let state = store.snapshot();
+        let session = state
+            .sessions
+            .iter()
+            .find(|session| session.voice_session_id == "voice-session-1")
+            .expect("the fixture session row still exists");
+        assert_eq!(
+            session.status, "closed",
+            "a replayed session write must never reopen a closed session"
+        );
+        assert_eq!(session.terminal_reason.as_deref(), Some("completed"));
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(store.write_counts().sessions, 1);
+    }
+
+    /// An evaluation that validated before a deletion must not append after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_delete_and_answer_evaluation_cannot_leave_late_artifact() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+
+        let pause = store.pause_at(MutationSite::AnswerEvaluation);
+        let evaluation_store = Arc::clone(&store);
+        let evaluation = fixture_evaluation(&fixture_question());
+        let write = tokio::spawn(async move {
+            evaluation_store
+                .record_answer_evaluation(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    "response-race",
+                    evaluation,
+                )
+                .await
+        });
+        let pause = await_pause(pause).await;
+
+        let delete_store = Arc::clone(&store);
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_study_set("user-1", "biology-midterm")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        pause.release();
+
+        let _ = write.await.expect("evaluation joins");
+        delete
+            .await
+            .expect("delete joins")
+            .expect("study set deletion succeeds");
+
+        let state = store.snapshot();
+        assert!(
+            state.answer_attempts.is_empty(),
+            "deletion must not be followed by a late answer attempt: {:?}",
+            state.answer_attempts
+        );
+        assert!(
+            state.event_authorizations.is_empty(),
+            "deletion must not be followed by a late authorization digest"
+        );
+        assert_eq!(store.write_counts().answer_attempts, 0);
+    }
+
+    /// The same race for Plan 04's canonical outcome, its transitions, its
+    /// progression cursor, its schedule, and its digests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_delete_and_turn_outcome_cannot_leave_late_artifact() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+
+        let pause = store.pause_at(MutationSite::TurnOutcome);
+        let outcome_store = Arc::clone(&store);
+        let write = tokio::spawn(async move {
+            outcome_store
+                .record_turn_outcome(
+                    "user-1",
+                    "biology-midterm",
+                    "voice-session-1",
+                    fixture_turn_outcome("response-race"),
+                )
+                .await
+        });
+        let pause = await_pause(pause).await;
+
+        let delete_store = Arc::clone(&store);
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_study_set("user-1", "biology-midterm")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        pause.release();
+
+        let _ = write.await.expect("turn outcome joins");
+        delete
+            .await
+            .expect("delete joins")
+            .expect("study set deletion succeeds");
+
+        let state = store.snapshot();
+        assert!(
+            state.turn_outcomes.is_empty(),
+            "deletion must not be followed by a late turn outcome"
+        );
+        assert!(
+            state.question_progressions.is_empty(),
+            "deletion must not be followed by a late progression cursor"
+        );
+        assert!(
+            state.review_schedule_decisions.is_empty(),
+            "deletion must not be followed by a late review schedule decision"
+        );
+        assert!(
+            state.event_authorizations.is_empty(),
+            "deletion must not be followed by a late authorization digest"
+        );
+    }
+
+    /// `DATA-010` for this backend: usage and session deletion serialize, and the
+    /// order that ends deleted ends with no usage record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_voice_usage_and_session_delete_serialize_to_no_usage_record() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+
+        let pause = store.pause_at(MutationSite::VoiceUsage);
+        let usage_store = Arc::clone(&store);
+        let usage = tokio::spawn(async move {
+            usage_store
+                .record_voice_usage(fixture_usage_record(Some("voice-session-1")))
+                .await
+        });
+        let pause = await_pause(pause).await;
+
+        let delete_store = Arc::clone(&store);
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_session_history("user-1", "biology-midterm", "voice-session-1")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        pause.release();
+
+        let _ = usage.await.expect("usage joins");
+        delete
+            .await
+            .expect("delete joins")
+            .expect("session history deletion succeeds");
+
+        assert_eq!(
+            store.write_counts().voice_usage,
+            0,
+            "a deleted session must end with no usage record"
+        );
+
+        // The other serial order: usage that arrives after the deletion is a
+        // typed conflict, not a silent success.
+        let late = store
+            .record_voice_usage(fixture_usage_record(Some("voice-session-1")))
+            .await
+            .expect_err("usage for a deleted session is refused");
+        assert_eq!(late.kind(), PortErrorKind::Conflict);
+        assert_eq!(store.write_counts().voice_usage, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_voice_usage_and_study_delete_serialize_to_no_usage_record() {
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+
+        let pause = store.pause_at(MutationSite::VoiceUsage);
+        let usage_store = Arc::clone(&store);
+        let usage = tokio::spawn(async move {
+            usage_store
+                .record_voice_usage(fixture_usage_record(Some("voice-session-1")))
+                .await
+        });
+        let pause = await_pause(pause).await;
+
+        let delete_store = Arc::clone(&store);
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_study_set("user-1", "biology-midterm")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        pause.release();
+
+        let _ = usage.await.expect("usage joins");
+        delete
+            .await
+            .expect("delete joins")
+            .expect("study set deletion succeeds");
+
+        assert_eq!(
+            store.write_counts().voice_usage,
+            0,
+            "a deleted study set must end with no usage record"
+        );
+
+        let late = store
+            .record_voice_usage(fixture_usage_record(Some("voice-session-1")))
+            .await
+            .expect_err("usage after study set deletion is refused");
+        assert_eq!(late.kind(), PortErrorKind::Conflict);
+        assert_eq!(store.write_counts().voice_usage, 0);
+    }
+
+    /// Eight racers replaying byte-identical writes leave exactly one of each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn memory_concurrent_identical_replays_keep_every_count_exact() {
+        const RACERS: usize = 8;
+
+        let store = Arc::new(seeded_store());
+        record_fixture_session(&store).await;
+        assert_eq!(
+            store
+                .record_voice_usage(fixture_usage_record(Some("voice-session-1")))
+                .await
+                .expect("usage is recorded by this backend"),
+            StudyStoreWriteOutcome::Inserted
+        );
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
+        let mut handles = Vec::with_capacity(RACERS);
+        for _ in 0..RACERS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                assert_eq!(
+                    store
+                        .record_voice_session(&fixture_session_config())
+                        .await
+                        .expect("session replay succeeds"),
+                    StudyStoreWriteOutcome::IdempotentReplay
+                );
+                store
+                    .record_answer_evaluation(
+                        "user-1",
+                        "biology-midterm",
+                        "voice-session-1",
+                        "response-replay",
+                        fixture_evaluation(&fixture_question()),
+                    )
+                    .await
+                    .expect("evaluation replay succeeds");
+                store
+                    .record_concept_status(
+                        "user-1",
+                        "biology-midterm",
+                        "voice-session-1",
+                        "response-replay",
+                        "nadh",
+                        ConceptStatus::Strong,
+                    )
+                    .await
+                    .expect("concept status replay succeeds");
+                store
+                    .schedule_review_item(
+                        "user-1",
+                        "biology-midterm",
+                        "voice-session-1",
+                        "atp-synthase",
+                        "2031-04-07T12:00:00.000Z",
+                    )
+                    .await
+                    .expect("review item replay succeeds");
+                store
+                    .record_recap(
+                        "user-1",
+                        "biology-midterm",
+                        "voice-session-1",
+                        "response-replay",
+                        fixture_recap(),
+                    )
+                    .await
+                    .expect("recap replay succeeds");
+                store
+                    .record_turn_outcome(
+                        "user-1",
+                        "biology-midterm",
+                        "voice-session-1",
+                        fixture_turn_outcome("response-replay-outcome"),
+                    )
+                    .await
+                    .expect("turn outcome replay succeeds");
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("racer joins");
+        }
+
+        let counts = store.write_counts();
+        assert_eq!(
+            counts,
+            StudyStoreWriteCounts {
+                sessions: 1,
+                answer_attempts: 1,
+                concept_statuses: 1,
+                // Two distinct concepts are scheduled exactly once each: the
+                // explicit `atp-synthase` call, and the graded transition on
+                // `oxidative-phosphorylation` that the turn outcome schedules
+                // under D-01 `SERVER_PERSISTED_FSRS`.
+                review_items: 2,
+                recaps: 1,
+                voice_usage: 1,
+            }
+        );
+
+        let state = store.snapshot();
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.answer_attempts.len(), 1);
+        assert_eq!(state.concept_statuses.len(), 1);
+        assert_eq!(state.review_items.len(), 2);
+        assert_eq!(state.review_schedule_decisions.len(), 1);
+        assert_eq!(state.recaps.len(), 1);
+        assert_eq!(state.turn_outcomes.len(), 1);
+        assert_eq!(state.question_progressions.len(), 1);
+        assert_eq!(state.voice_usage_events.len(), 1);
     }
 }
 
 #[cfg(test)]
 mod review_schedule_decision_tests {
     use agent_domain::{
-        decide_review_schedule, format_rfc3339_millis, parse_utc_instant, AuthorizedStudySession,
-        Clock, ConceptStatus, FsrsCardStateV1, ReviewOutcomeV1, ReviewScheduleCapReasonV1,
-        ReviewScheduleDecisionV1, ReviewSchedulingContextV1, SessionConfig, SessionId,
-        StudyMemoryStore, StudyMode, ToolProposal, VivaToolExecutor,
+        decide_review_schedule, format_rfc3339_millis, parse_utc_instant, Clock, ConceptStatus,
+        FsrsCardStateV1, ReviewOutcomeV1, ReviewScheduleCapReasonV1, ReviewScheduleDecisionV1,
+        ReviewSchedulingContextV1, SessionConfig, SessionId, StudyMemoryStore, StudyMode,
         VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
     };
     use chrono::{DateTime, Duration, Utc};
@@ -5403,7 +4666,9 @@ mod review_schedule_decision_tests {
 
     async fn seeded_session_store() -> InMemoryStudyStore {
         let store = InMemoryStudyStore::seeded_fixture();
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new("voice-session-1")),
                 user_id: Some("user-1".to_owned()),
@@ -5462,53 +4727,61 @@ mod review_schedule_decision_tests {
         }
     }
 
-    fn scheduling_executor(
-        store: Arc<InMemoryStudyStore>,
-        clock: Arc<dyn Clock>,
-    ) -> VivaToolExecutor {
-        VivaToolExecutor::with_clock(
-            store,
-            AuthorizedStudySession {
-                user_id: "user-1".to_owned(),
-                study_set_id: "biology-midterm".to_owned(),
-                voice_session_id: "voice-session-1".to_owned(),
-                mode: StudyMode::Quiz,
-                active_concepts: vec!["nadh".to_owned()],
+    /// Grade the same outcome again a moment later, exactly as a live replay does.
+    ///
+    /// `LEARN-009` removed the `schedule_review_item` tool, so the wall-clock replay
+    /// this test cares about is expressed directly: two decisions computed from one
+    /// graded outcome at two instants necessarily differ, and the store must still
+    /// keep the first one authoritative.
+    async fn schedule_shaky(
+        store: &InMemoryStudyStore,
+        clock: &AdvancingClock,
+        response_id: &str,
+    ) -> Value {
+        // Exactly what the live path does: the authoritative card and exam instant
+        // are read from the store, never supplied by the caller.
+        let context = store
+            .review_scheduling_context("user-1", "biology-midterm", "nadh")
+            .await
+            .expect("scheduling context");
+        let decision = decide_review_schedule(
+            clock.now(),
+            &ReviewOutcomeV1 {
+                status: ConceptStatus::Shaky,
+                hint_count: Some(2),
+                miss_count: Some(1),
             },
-            clock,
+            &context,
         )
+        .expect("authoritative decision");
+        store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
+                response_id,
+                "nadh",
+                decision,
+            )
+            .await
+            .expect("decision persists")
     }
 
-    fn shaky_proposal() -> ToolProposal {
-        ToolProposal::schedule_review_item("biology-midterm", "voice-session-1", "nadh", "shaky")
-    }
-
-    /// The replay property that matters: the same tool call, replayed through the live
-    /// executor while the wall clock moves, must not write a second scheduled review
-    /// and must not advance the persisted FSRS card. Replaying a decision object that
-    /// was built once cannot exercise this, because the second decision differs.
+    /// The replay property that matters: the same graded outcome, replayed while the
+    /// wall clock moves, must not write a second scheduled review and must not
+    /// advance the persisted FSRS card. Replaying a decision object that was built
+    /// once cannot exercise this, because the second decision differs.
     #[tokio::test]
-    async fn review_schedule_decision_replay_through_the_executor_never_writes_twice() {
+    async fn review_schedule_decision_replay_under_a_moving_clock_never_writes_twice() {
         let store = Arc::new(seeded_session_store().await);
-        let executor = scheduling_executor(
-            Arc::clone(&store),
-            Arc::new(AdvancingClock::new(
-                parse_utc_instant(GRADED_AT).expect("instant parses"),
-            )),
-        );
+        let clock = AdvancingClock::new(parse_utc_instant(GRADED_AT).expect("instant parses"));
 
-        let first = executor
-            .execute("response-7", shaky_proposal())
-            .await
-            .expect("first schedule");
-        let replay = executor
-            .execute("response-7", shaky_proposal())
-            .await
-            .expect("replayed schedule");
+        let first = schedule_shaky(&store, &clock, "response-7").await;
+        let replay = schedule_shaky(&store, &clock, "response-7").await;
 
         assert_eq!(
             replay, first,
-            "a replayed tool call must report the already-persisted decision"
+            "a replayed graded outcome must report the already-persisted decision"
         );
 
         let snapshot = store.snapshot();
@@ -5530,29 +4803,27 @@ mod review_schedule_decision_tests {
         assert_eq!(context.card.as_ref().map(|card| card.reps), Some(1));
     }
 
-    /// The same property under concurrency, still through the live executor: eight
-    /// racing replays each read a different instant from the clock and so each compute
-    /// a different schedule, and exactly one of them may be persisted.
+    /// The same property under concurrency: eight racing replays each read a
+    /// different instant from the clock and so each compute a different schedule,
+    /// and exactly one of them may be persisted.
     #[tokio::test]
-    async fn review_schedule_decision_concurrent_executor_replays_write_exactly_one_row() {
+    async fn review_schedule_decision_concurrent_replays_write_exactly_one_row() {
         let store = Arc::new(seeded_session_store().await);
-        let executor = Arc::new(scheduling_executor(
-            Arc::clone(&store),
-            Arc::new(AdvancingClock::new(
-                parse_utc_instant(GRADED_AT).expect("instant parses"),
-            )),
+        let clock = Arc::new(AdvancingClock::new(
+            parse_utc_instant(GRADED_AT).expect("instant parses"),
         ));
 
         let mut handles = Vec::new();
         for _ in 0..8 {
-            let executor = Arc::clone(&executor);
+            let store = Arc::clone(&store);
+            let clock = Arc::clone(&clock);
             handles.push(tokio::spawn(async move {
-                executor.execute("response-7", shaky_proposal()).await
+                schedule_shaky(&store, &clock, "response-7").await
             }));
         }
         let mut results = Vec::new();
         for handle in handles {
-            results.push(handle.await.expect("join").expect("replay succeeds"));
+            results.push(handle.await.expect("join"));
         }
         for result in &results {
             assert_eq!(result, &results[0], "every replay reports one schedule");
@@ -5569,21 +4840,10 @@ mod review_schedule_decision_tests {
     #[tokio::test]
     async fn review_schedule_decision_a_distinct_graded_outcome_still_advances_the_card() {
         let store = Arc::new(seeded_session_store().await);
-        let executor = scheduling_executor(
-            Arc::clone(&store),
-            Arc::new(AdvancingClock::new(
-                parse_utc_instant(GRADED_AT).expect("instant parses"),
-            )),
-        );
+        let clock = AdvancingClock::new(parse_utc_instant(GRADED_AT).expect("instant parses"));
 
-        executor
-            .execute("response-7", shaky_proposal())
-            .await
-            .expect("first schedule");
-        executor
-            .execute("response-8", shaky_proposal())
-            .await
-            .expect("second graded outcome");
+        schedule_shaky(&store, &clock, "response-7").await;
+        schedule_shaky(&store, &clock, "response-8").await;
 
         let snapshot = store.snapshot();
         assert_eq!(snapshot.review_schedule_decisions.len(), 2);
@@ -5600,26 +4860,17 @@ mod review_schedule_decision_tests {
     #[tokio::test]
     async fn review_schedule_decision_guard_separates_outcomes_within_one_response() {
         let store = Arc::new(seeded_session_store().await);
-        let executor = scheduling_executor(
-            Arc::clone(&store),
-            Arc::new(AdvancingClock::new(
-                parse_utc_instant(GRADED_AT).expect("instant parses"),
-            )),
-        );
+        let clock = AdvancingClock::new(parse_utc_instant(GRADED_AT).expect("instant parses"));
 
-        executor
-            .execute("response-7", shaky_proposal())
-            .await
-            .expect("shaky schedule");
-        executor
-            .execute(
+        schedule_shaky(&store, &clock, "response-7").await;
+        store
+            .persist_review_schedule_decision(
+                "user-1",
+                "biology-midterm",
+                "voice-session-1",
                 "response-7",
-                ToolProposal::schedule_review_item(
-                    "biology-midterm",
-                    "voice-session-1",
-                    "nadh",
-                    "strong",
-                ),
+                "nadh",
+                decision_at(GRADED_AT, ConceptStatus::Strong, None),
             )
             .await
             .expect("strong schedule");
@@ -5880,11 +5131,11 @@ mod review_schedule_decision_tests {
             .create_file_study_set(CreateFileStudySet {
                 user_id: "user-1".to_owned(),
                 study_set_id: None,
-                title: "Bio PDF".to_owned(),
+                title: "Bio notes".to_owned(),
                 course: Some("Biology 201".to_owned()),
                 exam_date: Some(CLOSE_EXAM_AT.to_owned()),
-                file_name: "Lecture 9.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "Lecture 9.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: ingestible_text().into_bytes(),
                 session_id: Some("file-session-exam".to_owned()),
             })
@@ -5916,8 +5167,8 @@ mod review_schedule_decision_tests {
                 title: String::new(),
                 course: None,
                 exam_date: None,
-                file_name: "Lecture 9 rescan.pdf".to_owned(),
-                content_type: Some("application/pdf".to_owned()),
+                file_name: "Lecture 9 rescan.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
                 file_bytes: ingestible_text().into_bytes(),
                 session_id: Some("file-session-exam-retry".to_owned()),
             })
@@ -5989,7 +5240,9 @@ mod review_schedule_decision_tests {
     #[tokio::test]
     async fn review_schedule_decision_library_snapshot_reads_only_valid_v1_decisions() {
         let store = seeded_session_store().await;
-        store
+        // The fixture only needs the session row to exist; Task 4 is where insert-versus-replay
+        // truth is asserted.
+        let _outcome = store
             .record_voice_session(&SessionConfig {
                 session_id: Some(SessionId::new("voice-session-2")),
                 user_id: Some("user-1".to_owned()),
@@ -6139,5 +5392,843 @@ mod review_schedule_decision_tests {
         }
         let encoded = serde_json::to_string(&store.snapshot()).expect("snapshot serializes");
         assert!(!encoded.contains("2026-06-"), "{encoded}");
+    }
+}
+
+/// `DATA-014`/`COR-04`: PDF uploads fail closed until real page-aware extraction
+/// exists.
+///
+/// The fixtures here are generated, not checked in, and each builder validates its
+/// own structure before the bytes reach ingestion — a fixture that silently stopped
+/// being a PDF would otherwise turn these into tests of nothing. The MD5 and RC4
+/// routines exist only to build the encrypted fixture and are checked against their
+/// published vectors below; nothing outside this module may use them, and no
+/// production dependency was added for a fixture.
+#[cfg(test)]
+pub(crate) mod pdf_ingestion_tests {
+    use super::*;
+    use agent_domain::{CreateFileStudySet, PortErrorKind, StudyMemoryStore};
+
+    // -----------------------------------------------------------------------
+    // Test-only primitives (RFC 1321 MD5, RC4, zlib stored-block DEFLATE).
+    // -----------------------------------------------------------------------
+
+    const MD5_SHIFTS: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+
+    const MD5_SINE: [u32; 64] = [
+        0xd76a_a478,
+        0xe8c7_b756,
+        0x2420_70db,
+        0xc1bd_ceee,
+        0xf57c_0faf,
+        0x4787_c62a,
+        0xa830_4613,
+        0xfd46_9501,
+        0x6980_98d8,
+        0x8b44_f7af,
+        0xffff_5bb1,
+        0x895c_d7be,
+        0x6b90_1122,
+        0xfd98_7193,
+        0xa679_438e,
+        0x49b4_0821,
+        0xf61e_2562,
+        0xc040_b340,
+        0x265e_5a51,
+        0xe9b6_c7aa,
+        0xd62f_105d,
+        0x0244_1453,
+        0xd8a1_e681,
+        0xe7d3_fbc8,
+        0x21e1_cde6,
+        0xc337_07d6,
+        0xf4d5_0d87,
+        0x455a_14ed,
+        0xa9e3_e905,
+        0xfcef_a3f8,
+        0x676f_02d9,
+        0x8d2a_4c8a,
+        0xfffa_3942,
+        0x8771_f681,
+        0x6d9d_6122,
+        0xfde5_380c,
+        0xa4be_ea44,
+        0x4bde_cfa9,
+        0xf6bb_4b60,
+        0xbebf_bc70,
+        0x289b_7ec6,
+        0xeaa1_27fa,
+        0xd4ef_3085,
+        0x0488_1d05,
+        0xd9d4_d039,
+        0xe6db_99e5,
+        0x1fa2_7cf8,
+        0xc4ac_5665,
+        0xf429_2244,
+        0x432a_ff97,
+        0xab94_23a7,
+        0xfc93_a039,
+        0x655b_59c3,
+        0x8f0c_cc92,
+        0xffef_f47d,
+        0x8584_5dd1,
+        0x6fa8_7e4f,
+        0xfe2c_e6e0,
+        0xa301_4314,
+        0x4e08_11a1,
+        0xf753_7e82,
+        0xbd3a_f235,
+        0x2ad7_d2bb,
+        0xeb86_d391,
+    ];
+
+    fn md5(input: &[u8]) -> [u8; 16] {
+        let mut message = input.to_vec();
+        let bit_length = (input.len() as u64).wrapping_mul(8);
+        message.push(0x80);
+        while message.len() % 64 != 56 {
+            message.push(0);
+        }
+        message.extend_from_slice(&bit_length.to_le_bytes());
+
+        let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+        for chunk in message.chunks_exact(64) {
+            let mut words = [0u32; 16];
+            for (index, word) in words.iter_mut().enumerate() {
+                let start = index * 4;
+                *word = u32::from_le_bytes([
+                    chunk[start],
+                    chunk[start + 1],
+                    chunk[start + 2],
+                    chunk[start + 3],
+                ]);
+            }
+            let [mut a, mut b, mut c, mut d] = state;
+            for round in 0..64usize {
+                let (mixed, word_index) = match round {
+                    0..=15 => ((b & c) | (!b & d), round),
+                    16..=31 => ((d & b) | (!d & c), (5 * round + 1) % 16),
+                    32..=47 => (b ^ c ^ d, (3 * round + 5) % 16),
+                    _ => (c ^ (b | !d), (7 * round) % 16),
+                };
+                let temp = d;
+                d = c;
+                c = b;
+                let sum = a
+                    .wrapping_add(mixed)
+                    .wrapping_add(MD5_SINE[round])
+                    .wrapping_add(words[word_index]);
+                b = b.wrapping_add(sum.rotate_left(MD5_SHIFTS[round]));
+                a = temp;
+            }
+            state[0] = state[0].wrapping_add(a);
+            state[1] = state[1].wrapping_add(b);
+            state[2] = state[2].wrapping_add(c);
+            state[3] = state[3].wrapping_add(d);
+        }
+
+        let mut digest = [0u8; 16];
+        for (index, word) in state.iter().enumerate() {
+            digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        digest
+    }
+
+    fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
+        assert!(!key.is_empty(), "RC4 needs a key");
+        let mut permutation: [u8; 256] = core::array::from_fn(|index| index as u8);
+        let mut swap_index = 0usize;
+        for index in 0..256usize {
+            swap_index = (swap_index
+                + usize::from(permutation[index])
+                + usize::from(key[index % key.len()]))
+                % 256;
+            permutation.swap(index, swap_index);
+        }
+        let (mut i, mut j) = (0usize, 0usize);
+        data.iter()
+            .map(|byte| {
+                i = (i + 1) % 256;
+                j = (j + usize::from(permutation[i])) % 256;
+                permutation.swap(i, j);
+                let keystream =
+                    permutation[(usize::from(permutation[i]) + usize::from(permutation[j])) % 256];
+                byte ^ keystream
+            })
+            .collect()
+    }
+
+    fn adler32(data: &[u8]) -> u32 {
+        let (mut low, mut high) = (1u32, 0u32);
+        for byte in data {
+            low = (low + u32::from(*byte)) % 65521;
+            high = (high + low) % 65521;
+        }
+        (high << 16) | low
+    }
+
+    /// zlib container around a single stored (uncompressed) DEFLATE block. This is a
+    /// real `/FlateDecode` stream: an extractor that inflates it recovers the page
+    /// content operators exactly.
+    fn zlib_stored(data: &[u8]) -> Vec<u8> {
+        assert!(data.len() <= 0xFFFF, "one stored block only");
+        let mut out = vec![0x78, 0x01];
+        out.push(0x01);
+        let length = u16::try_from(data.len()).expect("stored block length fits");
+        out.extend_from_slice(&length.to_le_bytes());
+        out.extend_from_slice(&(!length).to_le_bytes());
+        out.extend_from_slice(data);
+        out.extend_from_slice(&adler32(data).to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn test_only_md5_matches_rfc_1321_vectors() {
+        assert_eq!(hex(&md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(hex(&md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            hex(&md5(b"message digest")),
+            "f96b697d7cb7938d525a2f31aaf161d0"
+        );
+        assert_eq!(
+            hex(&md5(b"abcdefghijklmnopqrstuvwxyz")),
+            "c3fcd3d76192e4007dfb496cca67e13b"
+        );
+    }
+
+    #[test]
+    fn test_only_rc4_matches_its_published_vector() {
+        assert_eq!(hex(&rc4(b"Key", b"Plaintext")), "bbf316e8d940af0ad3");
+        assert_eq!(
+            hex(&rc4(b"Secret", b"Attack at dawn")),
+            "45a01f645fc35b383552544b9bf5"
+        );
+        // Symmetric: decrypting the ciphertext returns the plaintext.
+        assert_eq!(
+            rc4(b"Key", &rc4(b"Key", b"Plaintext")),
+            b"Plaintext".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_only_zlib_stored_block_round_trips_through_its_own_header() {
+        let stream = zlib_stored(b"BT /F1 12 Tf ET");
+        assert_eq!(&stream[0..2], &[0x78, 0x01], "zlib header");
+        assert_eq!(
+            (u32::from(stream[0]) * 256 + u32::from(stream[1])) % 31,
+            0,
+            "zlib header check bits"
+        );
+        assert_eq!(stream[2] & 0x07, 0x01, "final stored block");
+        let length = u16::from_le_bytes([stream[3], stream[4]]);
+        let inverse = u16::from_le_bytes([stream[5], stream[6]]);
+        assert_eq!(length, 15);
+        assert_eq!(inverse, !length);
+        assert_eq!(&stream[7..7 + 15], b"BT /F1 12 Tf ET");
+        assert_eq!(
+            u32::from_be_bytes([
+                stream[stream.len() - 4],
+                stream[stream.len() - 3],
+                stream[stream.len() - 2],
+                stream[stream.len() - 1],
+            ]),
+            adler32(b"BT /F1 12 Tf ET")
+        );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(&mut out, "{byte:02x}");
+        }
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // PDF fixture builder.
+    // -----------------------------------------------------------------------
+
+    struct PdfBuilder {
+        bytes: Vec<u8>,
+        offsets: Vec<usize>,
+    }
+
+    impl PdfBuilder {
+        fn new() -> Self {
+            Self {
+                bytes: b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec(),
+                offsets: Vec::new(),
+            }
+        }
+
+        /// Objects are emitted in order, so the object number is always
+        /// `offsets.len() + 1` and the recorded offset is the real byte position.
+        fn object(&mut self, body: &[u8]) -> usize {
+            let number = self.offsets.len() + 1;
+            self.offsets.push(self.bytes.len());
+            self.bytes
+                .extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            self.bytes.extend_from_slice(body);
+            self.bytes.extend_from_slice(b"\nendobj\n");
+            number
+        }
+
+        fn stream_object(&mut self, dictionary_extra: &str, payload: &[u8]) -> usize {
+            let mut body = format!(
+                "<< /Length {}{dictionary_extra} >>\nstream\n",
+                payload.len()
+            )
+            .into_bytes();
+            body.extend_from_slice(payload);
+            body.extend_from_slice(b"\nendstream");
+            self.object(&body)
+        }
+
+        fn finish(mut self, root: usize, trailer_extra: &str) -> Vec<u8> {
+            let xref_offset = self.bytes.len();
+            let count = self.offsets.len() + 1;
+            self.bytes
+                .extend_from_slice(format!("xref\n0 {count}\n").as_bytes());
+            self.bytes.extend_from_slice(b"0000000000 65535 f \n");
+            for offset in &self.offsets {
+                self.bytes
+                    .extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+            }
+            self.bytes.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {count} /Root {root} 0 R{trailer_extra} >>\nstartxref\n{xref_offset}\n%%EOF\n"
+                )
+                .as_bytes(),
+            );
+            assert_valid_pdf(&self.bytes, count, xref_offset, root);
+            self.bytes
+        }
+    }
+
+    /// Every builder proves its own output before ingestion sees it: header, exact
+    /// xref byte offsets, `startxref`, trailer, and root reference.
+    fn assert_valid_pdf(bytes: &[u8], count: usize, xref_offset: usize, root: usize) {
+        assert!(bytes.starts_with(b"%PDF-1.7"), "PDF header");
+        assert_eq!(
+            &bytes[xref_offset..xref_offset + 4],
+            b"xref",
+            "xref keyword"
+        );
+
+        // Byte operations only: this module must contain no lossy UTF-8 decoding at
+        // all, which is exactly the property the production gate scans for.
+        let marker = b"startxref\n";
+        let marker_start = rfind(bytes, marker).expect("startxref present");
+        let value_start = marker_start + marker.len();
+        let value_end = value_start
+            + bytes[value_start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .expect("startxref value ends");
+        let startxref: usize = std::str::from_utf8(&bytes[value_start..value_end])
+            .expect("startxref value is ascii")
+            .parse()
+            .expect("startxref parses");
+        assert_eq!(startxref, xref_offset, "startxref points at the xref table");
+        assert!(
+            find(bytes, format!("/Root {root} 0 R").as_bytes()).is_some(),
+            "trailer root"
+        );
+        assert!(bytes.ends_with(b"%%EOF\n"), "EOF marker");
+
+        // Each recorded offset must actually be where that object starts.
+        let table_start = xref_offset + format!("xref\n0 {count}\n").len();
+        for object_number in 1..count {
+            let entry_start = table_start + object_number * 20;
+            let entry = &bytes[entry_start..entry_start + 20];
+            assert_eq!(entry.len(), 20, "xref entries are exactly 20 bytes");
+            let offset: usize = std::str::from_utf8(&entry[0..10])
+                .expect("offset is ascii")
+                .parse()
+                .expect("offset parses");
+            let expected = format!("{object_number} 0 obj\n");
+            assert_eq!(
+                &bytes[offset..offset + expected.len()],
+                expected.as_bytes(),
+                "xref offset for object {object_number}"
+            );
+        }
+    }
+
+    /// A real one-page text PDF: catalog, page tree, page, font, content stream.
+    pub(crate) fn generated_text_pdf() -> Vec<u8> {
+        let mut pdf = PdfBuilder::new();
+        let catalog = pdf.object(b"<< /Type /Catalog /Pages 2 0 R >>");
+        let _pages = pdf.object(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        let _page = pdf.object(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        );
+        let _font = pdf.object(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        let content =
+            b"BT /F1 12 Tf 72 720 Td (Oxidative phosphorylation builds a proton gradient.) Tj ET";
+        let _contents = pdf.stream_object("", content);
+        assert_eq!(catalog, 1);
+        let bytes = pdf.finish(catalog, "");
+        assert!(
+            find(&bytes, b" Tj").is_some(),
+            "the text page must carry a real text-showing operator"
+        );
+        bytes
+    }
+
+    /// The same page with its content stream really deflated.
+    pub(crate) fn generated_flate_pdf() -> Vec<u8> {
+        let content =
+            b"BT /F1 12 Tf 72 720 Td (ATP synthase converts the gradient into ATP.) Tj ET";
+        let deflated = zlib_stored(content);
+        let mut pdf = PdfBuilder::new();
+        let catalog = pdf.object(b"<< /Type /Catalog /Pages 2 0 R >>");
+        pdf.object(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        pdf.object(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        );
+        pdf.object(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        pdf.stream_object(" /Filter /FlateDecode", &deflated);
+        let bytes = pdf.finish(catalog, "");
+        assert!(find(&bytes, b"/FlateDecode").is_some(), "declared filter");
+        // A stored DEFLATE block keeps its payload verbatim, so the operators appear
+        // inside the stream and only there: an extractor still has to inflate the
+        // declared filter to reach them, and a byte scan of the file is not
+        // extraction.
+        let stream_start = find(&bytes, b"stream\n").expect("content stream present") + 7;
+        assert_eq!(
+            &bytes[stream_start..stream_start + 2],
+            &[0x78, 0x01],
+            "the stream begins with the zlib header"
+        );
+        assert!(
+            find(&bytes[..stream_start], b" Tj").is_none(),
+            "no text operator exists outside the compressed stream"
+        );
+        assert!(
+            find(&bytes, deflated.as_slice()).is_some(),
+            "the deflated bytes are embedded verbatim"
+        );
+        bytes
+    }
+
+    /// A scanned page: one image XObject, no text operators anywhere.
+    pub(crate) fn generated_scanned_pdf() -> Vec<u8> {
+        // 8x8 greyscale, deliberately not text.
+        let image: Vec<u8> = (0..64u16).map(|value| (value * 4) as u8).collect();
+        let mut pdf = PdfBuilder::new();
+        let catalog = pdf.object(b"<< /Type /Catalog /Pages 2 0 R >>");
+        pdf.object(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        pdf.object(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>",
+        );
+        pdf.stream_object(
+            " /Type /XObject /Subtype /Image /Width 8 /Height 8 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &image,
+        );
+        pdf.stream_object("", b"q 612 0 0 792 0 0 cm /Im0 Do Q");
+        let bytes = pdf.finish(catalog, "");
+        assert!(find(&bytes, b"/Subtype /Image").is_some(), "image xobject");
+        assert!(
+            find(&bytes, b" Tj").is_none() && find(&bytes, b" TJ").is_none(),
+            "a scanned page carries no text-showing operator"
+        );
+        bytes
+    }
+
+    const PDF_PASSWORD_PADDING: [u8; 32] = [
+        0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01,
+        0x08, 0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53,
+        0x69, 0x7A,
+    ];
+
+    fn padded_password(password: &[u8]) -> [u8; 32] {
+        let mut padded = [0u8; 32];
+        let taken = password.len().min(32);
+        padded[..taken].copy_from_slice(&password[..taken]);
+        padded[taken..].copy_from_slice(&PDF_PASSWORD_PADDING[..32 - taken]);
+        padded
+    }
+
+    /// PDF Standard Security Handler, revision 2 (40-bit RC4), with deterministic
+    /// test passwords. Algorithms 2, 3, 4 and 1 from the PDF specification.
+    pub(crate) fn generated_encrypted_pdf() -> Vec<u8> {
+        const USER_PASSWORD: &[u8] = b"viva-user";
+        const OWNER_PASSWORD: &[u8] = b"viva-owner";
+        const PERMISSIONS: i32 = -1;
+        let document_id: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ];
+
+        // Algorithm 3: /O.
+        let owner_digest = md5(&padded_password(OWNER_PASSWORD));
+        let owner_entry = rc4(&owner_digest[..5], &padded_password(USER_PASSWORD));
+        assert_eq!(owner_entry.len(), 32, "/O is 32 bytes");
+
+        // Algorithm 2: the file encryption key.
+        let mut key_input = Vec::new();
+        key_input.extend_from_slice(&padded_password(USER_PASSWORD));
+        key_input.extend_from_slice(&owner_entry);
+        key_input.extend_from_slice(&PERMISSIONS.to_le_bytes());
+        key_input.extend_from_slice(&document_id);
+        let encryption_key = md5(&key_input)[..5].to_vec();
+
+        // Algorithm 4: /U for revision 2.
+        let user_entry = rc4(&encryption_key, &PDF_PASSWORD_PADDING);
+        assert_eq!(user_entry.len(), 32, "/U is 32 bytes");
+
+        // Algorithm 1: the per-object key for the content stream (object 5).
+        let mut object_key_input = encryption_key.clone();
+        object_key_input.extend_from_slice(&5u32.to_le_bytes()[..3]);
+        object_key_input.extend_from_slice(&0u32.to_le_bytes()[..2]);
+        let object_key = md5(&object_key_input)[..(encryption_key.len() + 5).min(16)].to_vec();
+        let plaintext_content =
+            b"BT /F1 12 Tf 72 720 Td (Encrypted lecture content.) Tj ET".to_vec();
+        let encrypted_content = rc4(&object_key, &plaintext_content);
+        assert_ne!(
+            encrypted_content, plaintext_content,
+            "the content stream must actually be encrypted"
+        );
+
+        let mut pdf = PdfBuilder::new();
+        let catalog = pdf.object(b"<< /Type /Catalog /Pages 2 0 R >>");
+        pdf.object(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        pdf.object(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        );
+        pdf.object(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        pdf.stream_object("", &encrypted_content);
+        let encrypt_dictionary = format!(
+            "<< /Filter /Standard /V 1 /R 2 /O <{}> /U <{}> /P {PERMISSIONS} >>",
+            hex(&owner_entry),
+            hex(&user_entry)
+        );
+        let encrypt = pdf.object(encrypt_dictionary.as_bytes());
+        let trailer_extra = format!(
+            " /Encrypt {encrypt} 0 R /ID [<{}> <{}>]",
+            hex(&document_id),
+            hex(&document_id)
+        );
+        let bytes = pdf.finish(catalog, &trailer_extra);
+        assert!(find(&bytes, b"/Filter /Standard").is_some(), "std handler");
+        assert!(find(&bytes, b"/R 2").is_some(), "revision 2");
+        assert!(
+            find(&bytes, format!("/Encrypt {encrypt} 0 R").as_bytes()).is_some(),
+            "the trailer references the encrypt dictionary"
+        );
+        assert!(
+            find(&bytes, b"Encrypted lecture content").is_none(),
+            "no plaintext content survives in the encrypted file"
+        );
+        bytes
+    }
+
+    /// A PDF whose xref table and trailer are cut off mid-file.
+    pub(crate) fn generated_malformed_pdf() -> Vec<u8> {
+        let complete = generated_text_pdf();
+        let xref_start = find(&complete, b"xref\n").expect("xref keyword present");
+        let mut truncated = complete[..xref_start + 12].to_vec();
+        truncated.extend_from_slice(b"000000");
+        assert!(
+            truncated.starts_with(b"%PDF-1.7"),
+            "still claims to be a PDF"
+        );
+        assert!(
+            find(&truncated, b"trailer").is_none() && find(&truncated, b"startxref").is_none(),
+            "the xref/trailer really is gone"
+        );
+        truncated
+    }
+
+    /// UTF-8 study prose wearing a `%PDF-1.7` header and nothing else.
+    pub(crate) fn magic_prefixed_plaintext() -> Vec<u8> {
+        let text = "%PDF-1.7\nMitochondria transfer electrons from NADH to oxygen. \
+             The proton gradient powers ATP synthase during oxidative phosphorylation. \
+             Chemiosmosis couples the gradient to ADP phosphorylation.";
+        let bytes = text.as_bytes().to_vec();
+        assert!(bytes.starts_with(b"%PDF"), "carries the magic prefix");
+        assert!(find(&bytes, b" obj").is_none(), "carries no PDF object");
+        assert!(find(&bytes, b"xref").is_none(), "carries no xref table");
+        assert!(std::str::from_utf8(&bytes).is_ok(), "is valid UTF-8 prose");
+        bytes
+    }
+
+    /// The whole persisted state as bytes. Comparing serialized state, not field by
+    /// field, is what makes "no artifact was created" mean every artifact.
+    fn state_bytes(state: &InMemoryStudyState) -> String {
+        serde_json::to_string(state).expect("in-memory state serializes")
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .rposition(|window| window == needle)
+    }
+
+    // -----------------------------------------------------------------------
+    // Fail-closed behaviour.
+    // -----------------------------------------------------------------------
+
+    fn assert_unsupported_pdf(error: &PortError) {
+        assert_eq!(error.kind(), PortErrorKind::InvalidInput);
+        assert_eq!(error.port(), "study_store.file_ingestion");
+        assert_eq!(error.id(), "unsupported_pdf");
+        assert_eq!(
+            error.reason(),
+            "PDF ingestion requires page-aware extraction"
+        );
+    }
+
+    fn file_input(
+        file_name: &str,
+        content_type: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> CreateFileStudySet {
+        CreateFileStudySet {
+            user_id: "user-1".to_owned(),
+            study_set_id: None,
+            title: "Lecture upload".to_owned(),
+            course: Some("Biology 201".to_owned()),
+            exam_date: None,
+            file_name: file_name.to_owned(),
+            content_type: content_type.map(ToOwned::to_owned),
+            file_bytes: bytes,
+            session_id: Some("file-session-pdf".to_owned()),
+        }
+    }
+
+    /// Reject the upload and prove nothing at all was written: not a study set, a
+    /// document, a source span, a concept, a question, a session, or a nonce.
+    async fn assert_rejected_without_artifacts(
+        file_name: &str,
+        content_type: Option<&str>,
+        bytes: Vec<u8>,
+    ) {
+        let store = InMemoryStudyStore::new();
+        let before = store.snapshot();
+        let before_counts = store.write_counts();
+
+        let error = store
+            .create_file_study_set(file_input(file_name, content_type, bytes))
+            .await
+            .expect_err("PDF ingestion must fail closed");
+        assert_unsupported_pdf(&error);
+
+        let after = store.snapshot();
+        assert_eq!(
+            state_bytes(&after),
+            state_bytes(&before),
+            "the store must be byte-identical after a rejected PDF"
+        );
+        assert_eq!(store.write_counts(), before_counts);
+        assert!(after.study_sets.is_empty());
+        assert!(after.documents.is_empty());
+        assert!(after.source_spans.is_empty());
+        assert!(after.concepts.is_empty());
+        assert!(after.questions.is_empty());
+        assert!(after.sessions.is_empty());
+        assert!(after.session_token_nonces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_text_page_without_artifacts() {
+        assert_rejected_without_artifacts(
+            "Lecture 9.pdf",
+            Some("application/pdf"),
+            generated_text_pdf(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_flate_compressed_text_without_artifacts() {
+        assert_rejected_without_artifacts(
+            "Lecture 9 compressed.pdf",
+            Some("application/pdf"),
+            generated_flate_pdf(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_scanned_image_only_without_artifacts() {
+        assert_rejected_without_artifacts(
+            "Scan 2026-08-24.pdf",
+            Some("application/pdf; charset=binary"),
+            generated_scanned_pdf(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_standard_encrypted_without_artifacts() {
+        assert_rejected_without_artifacts(
+            "Protected.pdf",
+            Some("application/pdf"),
+            generated_encrypted_pdf(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_malformed_without_artifacts() {
+        assert_rejected_without_artifacts(
+            "Truncated.PDF",
+            Some("APPLICATION/PDF"),
+            generated_malformed_pdf(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_magic_prefixed_plaintext_without_artifacts() {
+        assert_rejected_without_artifacts(
+            "notes.pdf",
+            Some("application/pdf"),
+            magic_prefixed_plaintext(),
+        )
+        .await;
+    }
+
+    /// The name and the declared type are both attacker-controlled, so neither may be
+    /// the only thing standing between a PDF and the extractor that cannot read it.
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_magic_even_without_pdf_name_or_mime() {
+        assert_rejected_without_artifacts("notes.txt", Some("text/plain"), generated_text_pdf())
+            .await;
+        assert_rejected_without_artifacts("notes.txt", None, generated_flate_pdf()).await;
+        // A UTF-8 BOM and leading whitespace do not hide the magic.
+        let mut disguised = vec![0xEF, 0xBB, 0xBF, b'\n', b' ', b'\t'];
+        disguised.extend_from_slice(&generated_text_pdf());
+        assert_rejected_without_artifacts("notes.txt", Some("text/plain"), disguised).await;
+    }
+
+    /// A rejected retry must leave the study set exactly as the successful ingestion
+    /// left it: same rows, same ids, same status.
+    #[tokio::test]
+    async fn pdf_ingestion_fails_closed_retry_without_state_mutation() {
+        let store = InMemoryStudyStore::new();
+        let ready = store
+            .create_file_study_set(CreateFileStudySet {
+                file_name: "notes.txt".to_owned(),
+                content_type: Some("text/plain".to_owned()),
+                file_bytes: ingestible_text().into_bytes(),
+                ..file_input("notes.txt", Some("text/plain"), Vec::new())
+            })
+            .await
+            .expect("plain text ingests");
+        assert_eq!(
+            ready.study_set.ingestion_status,
+            StudySetIngestionStatus::Ready
+        );
+
+        let before = store.snapshot();
+        let before_counts = store.write_counts();
+        let error = store
+            .retry_file_study_set(CreateFileStudySet {
+                study_set_id: Some(ready.study_set.id.clone()),
+                file_name: "rescan.pdf".to_owned(),
+                content_type: Some("application/pdf".to_owned()),
+                file_bytes: generated_text_pdf(),
+                session_id: Some("file-session-pdf-retry".to_owned()),
+                ..file_input("rescan.pdf", Some("application/pdf"), Vec::new())
+            })
+            .await
+            .expect_err("a PDF retry must fail closed");
+        assert_unsupported_pdf(&error);
+
+        assert_eq!(
+            state_bytes(&store.snapshot()),
+            state_bytes(&before),
+            "a rejected retry must leave byte-equivalent state"
+        );
+        assert_eq!(store.write_counts(), before_counts);
+        assert!(store
+            .active_question("user-1", &ready.study_set.id)
+            .await
+            .expect("active question read")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn non_pdf_utf8_file_still_ingests_and_becomes_ready() {
+        let store = InMemoryStudyStore::new();
+        let record = store
+            .create_file_study_set(file_input(
+                "notes.txt",
+                Some("text/plain"),
+                ingestible_text().into_bytes(),
+            ))
+            .await
+            .expect("valid non-PDF UTF-8 still ingests");
+
+        assert_eq!(
+            record.study_set.ingestion_status,
+            StudySetIngestionStatus::Ready
+        );
+        assert_eq!(record.documents[0].source_kind, "file");
+        assert!(!record.source_spans.is_empty());
+        assert!(!record.concepts.is_empty());
+        assert_eq!(record.questions.len(), record.concepts.len());
+        assert!(store
+            .active_question("user-1", &record.study_set.id)
+            .await
+            .expect("active question read")
+            .is_some());
+    }
+
+    /// Invalid UTF-8 is refused, not repaired. A replacement character is a
+    /// fabricated learner fact: it claims the file said something it did not.
+    #[tokio::test]
+    async fn non_pdf_invalid_utf8_fails_without_lossy_replacement() {
+        let store = InMemoryStudyStore::new();
+        let before = store.snapshot();
+
+        let mut bytes = ingestible_text().into_bytes();
+        bytes.extend_from_slice(&[0xFF, 0xFE, 0x80, 0x9F]);
+        let error = store
+            .create_file_study_set(file_input("notes.txt", Some("text/plain"), bytes))
+            .await
+            .expect_err("invalid UTF-8 must fail closed");
+
+        assert_eq!(error.kind(), PortErrorKind::InvalidInput);
+        assert_eq!(error.port(), "study_store.file_ingestion");
+        assert_eq!(error.id(), "invalid_utf8_file");
+
+        assert_eq!(
+            state_bytes(&store.snapshot()),
+            state_bytes(&before),
+            "nothing was written"
+        );
+        let persisted = serde_json::to_string(&store.snapshot()).expect("snapshot serializes");
+        assert!(
+            !persisted.contains('\u{FFFD}'),
+            "no replacement character may reach the store"
+        );
+    }
+
+    fn ingestible_text() -> String {
+        [
+            "Mitochondria electron transport builds a proton gradient across the inner membrane.",
+            "NADH transfers electrons while oxygen accepts them at the end of the chain.",
+            "ATP synthase uses chemiosmosis to make ATP from ADP.",
+        ]
+        .join("\n")
     }
 }

@@ -80,11 +80,15 @@ pub enum VoiceEvidenceEventKind {
     PartialRecap,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VoiceEvidenceEvent {
     pub kind: VoiceEvidenceEventKind,
     pub voice_session_id: Option<String>,
-    pub detail: String,
+    /// `DATA-007`: the type, not a convention, is what makes this sanitized.
+    /// `SanitizedEvidenceDetail` has a private inner `String` and no unchecked
+    /// constructor, so the only ways to obtain one are the two sanitizing
+    /// entry points below.
+    pub detail: SanitizedEvidenceDetail,
 }
 
 impl VoiceEvidenceEvent {
@@ -102,7 +106,38 @@ impl VoiceEvidenceEvent {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// `DATA-007`: the exact wire shape, and nothing else.
+///
+/// It exists so `Deserialize for VoiceEvidenceEvent` can read the three JSON
+/// fields and then hand them to the one kind-aware constructor. Without it, a
+/// derived `Deserialize` would write straight into `detail` and every sanitation
+/// rule in this file would apply only to values built in-process.
+#[derive(Deserialize)]
+struct RawVoiceEvidenceEvent {
+    kind: VoiceEvidenceEventKind,
+    voice_session_id: Option<String>,
+    detail: String,
+}
+
+impl<'de> Deserialize<'de> for VoiceEvidenceEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawVoiceEvidenceEvent::deserialize(deserializer)?;
+        Ok(Self::new(raw.kind, raw.voice_session_id, raw.detail))
+    }
+}
+
+/// A detail string that has already been through the sanitizer.
+///
+/// The inner `String` is private and there is no unchecked constructor, so the
+/// type is the proof: holding one means the scans and the cap have run.
+/// `Serialize` is transparent and there is no `Deserialize`, so the JSON shape is
+/// an ordinary string on the way out and can only come back in through
+/// `VoiceEvidenceEvent`'s constructor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct SanitizedEvidenceDetail(String);
 
 impl SanitizedEvidenceDetail {
@@ -115,26 +150,93 @@ impl SanitizedEvidenceDetail {
         if SAFE_EVIDENCE_DETAIL_LITERALS.contains(&detail.as_str()) {
             return Self(detail);
         }
-        if contains_forbidden_evidence_detail_marker(&detail) {
+        // `DATA-006`: build the allowed-character form *before* deciding, then scan
+        // both forms. The filter deletes code points, and deleting a code point can
+        // rejoin a marker that the raw string had split — `answer\u{200b}_text`
+        // scans clean and filters to `answer_text`. Scanning only the raw form
+        // means the reassembled marker is the thing that actually gets emitted.
+        let filtered = detail
+            .chars()
+            .filter(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(
+                        character,
+                        ' ' | '-' | '_' | ':' | '.' | '/' | '=' | ',' | ';' | '(' | ')'
+                    )
+            })
+            .collect::<String>();
+        if contains_forbidden_evidence_detail_marker(&detail)
+            || contains_forbidden_evidence_detail_marker(&filtered)
+        {
             return Self(REDACTED_EVIDENCE_DETAIL.to_owned());
         }
-        Self(
-            detail
-                .chars()
-                .filter(|character| {
-                    character.is_ascii_alphanumeric()
-                        || matches!(
-                            character,
-                            ' ' | '-' | '_' | ':' | '.' | '/' | '=' | ',' | ';' | '(' | ')'
-                        )
-                })
-                .take(max_chars)
-                .collect(),
-        )
+        // The cap is last: truncating first could cut a marker in half and let the
+        // remainder through.
+        Self(filtered.chars().take(max_chars).collect())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
     pub fn into_string(self) -> String {
         self.0
+    }
+}
+
+impl std::ops::Deref for SanitizedEvidenceDetail {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<str> for SanitizedEvidenceDetail {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SanitizedEvidenceDetail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for SanitizedEvidenceDetail {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for SanitizedEvidenceDetail {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<String> for SanitizedEvidenceDetail {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
+}
+
+impl PartialEq<SanitizedEvidenceDetail> for str {
+    fn eq(&self, other: &SanitizedEvidenceDetail) -> bool {
+        self == other.0
+    }
+}
+
+impl PartialEq<SanitizedEvidenceDetail> for &str {
+    fn eq(&self, other: &SanitizedEvidenceDetail) -> bool {
+        *self == other.0
+    }
+}
+
+impl PartialEq<SanitizedEvidenceDetail> for String {
+    fn eq(&self, other: &SanitizedEvidenceDetail) -> bool {
+        self == &other.0
     }
 }
 
@@ -151,14 +253,20 @@ pub fn sanitize_evidence_detail(detail: String) -> String {
     SanitizedEvidenceDetail::from_raw(detail).into_string()
 }
 
-fn sanitize_evidence_detail_for_kind(kind: &VoiceEvidenceEventKind, detail: String) -> String {
+/// The one kind-aware constructor. Both the in-process path
+/// (`VoiceEvidenceEvent::new`) and the wire path (`Deserialize`) go through it,
+/// so the per-kind cap is not something a caller can choose or skip.
+fn sanitize_evidence_detail_for_kind(
+    kind: &VoiceEvidenceEventKind,
+    detail: String,
+) -> SanitizedEvidenceDetail {
     let max_chars = match kind {
         VoiceEvidenceEventKind::ProviderStageFailure => {
             PROVIDER_STAGE_FAILURE_EVIDENCE_DETAIL_MAX_CHARS
         }
         _ => DEFAULT_EVIDENCE_DETAIL_MAX_CHARS,
     };
-    SanitizedEvidenceDetail::from_raw_with_max(detail, max_chars).into_string()
+    SanitizedEvidenceDetail::from_raw_with_max(detail, max_chars)
 }
 
 fn contains_forbidden_evidence_detail_marker(detail: &str) -> bool {
