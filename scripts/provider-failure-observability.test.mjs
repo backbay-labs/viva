@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import test from "node:test";
 
 import fixture from "./fixtures/provider-failure-dashboard-samples.json" with { type: "json" };
@@ -91,10 +91,7 @@ test("provider failure observability defines reusable sanitized log queries", ()
     queriesById.get("rollback_observed").railway_query,
     /rollback_drain\.production_release_gate\.reason/,
   );
-  assert.doesNotMatch(
-    queriesById.get("rollback_observed").railway_query,
-    /rollback_drain\.schema/,
-  );
+  assert.doesNotMatch(queriesById.get("rollback_observed").railway_query, /rollback_drain\.schema/);
   assert.match(
     queriesById.get("token_refresh_failure").railway_query,
     /service:"web" event:"viva_session_route_failure"/,
@@ -135,14 +132,8 @@ test("provider failure observability defines reusable sanitized log queries", ()
   assert.match(queriesById.get("startup_unavailable").railway_query, /route:"start"/);
   assert.doesNotMatch(queriesById.get("startup_unavailable").railway_query, /route:"refresh"/);
   assert.match(queriesById.get("stuck_checking").railway_query, /monitor\.stuck_checking_sessions/);
-  assert.match(
-    queriesById.get("release_gate_stale_evidence").railway_query,
-    /generated_at/,
-  );
-  assert.doesNotMatch(
-    queriesById.get("release_gate_stale_evidence").railway_query,
-    /<now-24h/,
-  );
+  assert.match(queriesById.get("release_gate_stale_evidence").railway_query, /generated_at/);
+  assert.doesNotMatch(queriesById.get("release_gate_stale_evidence").railway_query, /<now-24h/);
   assert.match(
     queriesById.get("release_gate_stale_evidence").railway_query,
     /release_gate\.browser_skip_shortcut/,
@@ -170,7 +161,10 @@ test("token refresh query only counts blocked refreshes when rate limited", () =
     railwayQuery,
     /\(token_refresh_outcome:"blocked" \(failure_class:"rate_limit" OR error:"session_mint_rate_limited"\)\)/,
   );
-  assert.doesNotMatch(railwayQuery, /token_refresh_outcome:"failed" OR token_refresh_outcome:"blocked"/);
+  assert.doesNotMatch(
+    railwayQuery,
+    /token_refresh_outcome:"failed" OR token_refresh_outcome:"blocked"/,
+  );
 });
 
 test("startup query matches web start-route failures by emitted failure class", () => {
@@ -275,11 +269,7 @@ test("reviewed BAC-525 queries name emitted log and evidence surfaces", () => {
       .evidence_fields.includes("rollback_drain.owner_decision.decision"),
     "rollback observed query must expose release-evidence owner decisions",
   );
-  assert(
-    queriesById
-      .get("release_gate_stale_evidence")
-      .evidence_fields.includes("generated_at"),
-  );
+  assert(queriesById.get("release_gate_stale_evidence").evidence_fields.includes("generated_at"));
   assert(
     queriesById
       .get("release_gate_stale_evidence")
@@ -356,7 +346,16 @@ test("release check exposes stale-evidence inputs without storing write-time age
 });
 
 test("runtime emitters expose BAC-510 startup and refresh auth failure classes", async () => {
-  const agentWs = await readFile("agent/crates/agent-service/src/ws.rs", "utf8");
+  // Node 08 decomposed ws.rs into ws/ modules; the emitters live in the
+  // module tree, so the scan covers the root file plus every ws/ source.
+  const wsModuleDir = "agent/crates/agent-service/src/ws";
+  const wsModuleFiles = (await readdir(wsModuleDir)).filter((name) => name.endsWith(".rs"));
+  const agentWs = (
+    await Promise.all([
+      readFile("agent/crates/agent-service/src/ws.rs", "utf8"),
+      ...wsModuleFiles.map((name) => readFile(`${wsModuleDir}/${name}`, "utf8")),
+    ])
+  ).join("\n");
   const webSessionRoute = await readFile("apps/web/app/api/viva-session/shared.ts", "utf8");
 
   assert.match(agentWs, /failure_class: "pre_loop_unavailable"/);
