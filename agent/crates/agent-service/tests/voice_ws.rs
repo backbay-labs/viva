@@ -12,18 +12,21 @@ use agent_adapters::{cartesia_gemini::FakeCartesiaGeminiRuntime, SyntheticBrain}
 use agent_domain::{
     decide_review_schedule, parse_utc_instant, AnswerAttemptEnvelope, AnswerCaptureMode,
     AnswerCaptureStatus, AnswerContentPolicy, AnswerEvaluation, AudioFrame, BrainError, BrainEvent,
-    BrainInput, BrainProviderError, BrainProviderFailure, BrainProviderFailureParts, BrainUsage,
-    ConceptStatus, PortError, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession,
-    RealtimeSessionTaskGuard, RecapSourceMoment, ReviewOutcomeV1, ReviewSchedulingContextV1,
-    SessionConfig, SessionId, SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudyQuestion,
-    StudySessionRecap, StudySetIngestionStatus, StudySourceReference, StudyStoreBackend,
-    StudyStoreCapabilities, StudyStoreWriteCounts, TerminalSessionReason, VoiceUsageRecord,
-    VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+    BrainFailureClass, BrainFailureStage, BrainInput, BrainProviderError, BrainProviderFailure,
+    BrainProviderFailureParts, BrainUsage, ConceptStatus, PortError, RealtimeBrain,
+    RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard, ReviewOutcomeV1,
+    ReviewSchedulingContextV1, SessionConfig, SessionId, SessionTokenNonceClaim, StudyMemoryStore,
+    StudyMode, StudyQuestion, StudySessionRecap, StudySetIngestionStatus, StudySourceReference,
+    StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts, TerminalSessionReason,
+    VoiceUsageRecord, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use agent_service::{
-    build_router, AppState, ClientFrame, FailureControlConfig, FailureControlScenario, ServerFrame,
-    VivaServerEvent, VoiceDrainSignal, VoiceEvidenceRecorder, VoiceLimitConfig, VoiceWsAccess,
-    WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
+    begin_drain_and_wait, build_router, verify_session_token_at, AppState, ClientFrame,
+    ClientTurnIntent, DrainOutcome, ExpectedSessionBinding, FailureControlConfig,
+    FailureControlScenario, OperatorAccess, ProjectionReadAccess, RecorderLimits, RedactedSecret,
+    ServerFrame, VivaServerEvent, VoiceDrainSignal, VoiceEvidenceRecorder, VoiceLimitConfig,
+    VoiceRuntimeSnapshot, VoiceServerErrorCode, VoiceUsageRecorder, VoiceWsAccess, WsTimeouts,
+    VIVA_VOICE_PROTOCOL_VERSION,
 };
 use axum::{
     body::Body,
@@ -36,14 +39,14 @@ use base64::{
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
-use observe::{VoiceEvidenceEventKind, VoiceUsageEvent};
+use observe::{VoiceEvidenceEvent, VoiceEvidenceEventKind, VoiceUsageEvent};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::ErrorKind;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, Notify},
+    sync::{mpsc, Notify, Semaphore},
     task::JoinHandle,
     time::{Duration, Instant},
 };
@@ -55,6 +58,47 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 use tower::ServiceExt;
+
+/// A missing provider credential is a `ProviderAuthFailure` observed at the
+/// provider-auth stage; the former stringly `MissingApiKey` variant is gone.
+fn missing_api_key_error() -> BrainError {
+    BrainError::from_failure(BrainProviderFailure::new(BrainProviderFailureParts {
+        failure_class: BrainFailureClass::ProviderAuthFailure,
+        stage: BrainFailureStage::ProviderAuth,
+        retry_eligible: false,
+        latency_ms: 0,
+        provider: "cartesia_gemini".to_owned(),
+        model: String::new(),
+        metadata: "error_kind=missing_api_key".to_owned(),
+    }))
+}
+
+/// A store write that failed while opening a session. The `PortErrorKind` token is
+/// carried as metadata; nothing classifies on it.
+fn store_stage_error(error_kind: &str) -> BrainError {
+    BrainError::from_failure(BrainProviderFailure::new(BrainProviderFailureParts {
+        failure_class: BrainFailureClass::DurabilityDegraded,
+        stage: BrainFailureStage::Store,
+        retry_eligible: false,
+        latency_ms: 0,
+        provider: "fake-provider-store".to_owned(),
+        model: String::new(),
+        metadata: format!("error_kind={error_kind}"),
+    }))
+}
+
+/// A session config that cannot supply a required bound identity.
+fn session_config_error(error_kind: &str) -> BrainError {
+    BrainError::from_failure(BrainProviderFailure::new(BrainProviderFailureParts {
+        failure_class: BrainFailureClass::Rollback,
+        stage: BrainFailureStage::Session,
+        retry_eligible: false,
+        latency_ms: 0,
+        provider: "fake-provider".to_owned(),
+        model: String::new(),
+        metadata: format!("error_kind={error_kind}"),
+    }))
+}
 
 fn test_state(max_sessions: usize) -> AppState {
     test_state_with_store(
@@ -98,7 +142,7 @@ fn provider_limiter_test_state(
         provider,
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -115,8 +159,8 @@ fn test_state_with_rest_auth(
         Arc::new(SyntheticBrain::with_study_store(store.clone())),
         "synthetic",
         VoiceWsAccess {
-            required_bearer: Some("rest-secret".to_owned()),
-            session_token_secret: Some("session-secret".to_owned()),
+            required_bearer: Some("rest-secret".into()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         max_sessions,
@@ -138,7 +182,7 @@ fn test_state_with_session_token_and_store(
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some(secret.to_owned()),
+            session_token_secret: Some(secret.into()),
             allowed_origins: vec![],
         },
         1,
@@ -181,7 +225,11 @@ impl StudyMemoryStore for FailingStudyStore {
         claim: agent_domain::SessionTokenNonceClaim,
     ) -> Result<(), PortError> {
         if matches!(self.mode, FailingStudyStoreMode::ClaimNonce) {
-            return Err(PortError::adapter("test_store", "nonce write failed"));
+            return Err(PortError::unavailable(
+                "test_store",
+                "nonce",
+                "nonce write failed",
+            ));
         }
         self.inner.claim_session_token_nonce(claim).await
     }
@@ -192,7 +240,11 @@ impl StudyMemoryStore for FailingStudyStore {
         study_set_id: &str,
     ) -> Result<Option<serde_json::Value>, PortError> {
         if matches!(self.mode, FailingStudyStoreMode::StudyContext) {
-            return Err(PortError::adapter("test_store", "study context failed"));
+            return Err(PortError::unavailable(
+                "test_store",
+                "study-context",
+                "study context failed",
+            ));
         }
         self.inner.study_context(user_id, study_set_id).await
     }
@@ -348,7 +400,7 @@ async fn seed_authoritative_review_schedule(store: &Arc<data::InMemoryStudyStore
 }
 
 async fn seed_completed_library_session(store: &Arc<data::InMemoryStudyStore>) {
-    store
+    let _outcome = store
         .record_voice_session(&SessionConfig {
             session_id: Some(SessionId::new("voice-session-1")),
             user_id: Some("user-1".to_owned()),
@@ -377,18 +429,28 @@ async fn seed_completed_library_session(store: &Arc<data::InMemoryStudyStore>) {
             "voice-session-1",
             "response-recap",
             StudySessionRecap {
+                schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+                deferred_turns: 0,
                 voice_session_id: "voice-session-1".to_owned(),
                 headline: "Completed session".to_owned(),
                 summary: "NADH needs one more recall pass.".to_owned(),
-                strong_concepts: vec!["oxidative-phosphorylation".to_owned()],
-                shaky_concepts: vec!["nadh".to_owned()],
-                missed_concepts: vec![],
-                review_later: vec!["nadh".to_owned()],
+                concepts: vec![
+                    agent_domain::RecapConceptOutcome {
+                        concept_id: "oxidative-phosphorylation".to_owned(),
+                        label: "oxidative-phosphorylation".to_owned(),
+                        status: agent_domain::ConceptStatus::Strong,
+                    },
+                    agent_domain::RecapConceptOutcome {
+                        concept_id: "nadh".to_owned(),
+                        label: "nadh".to_owned(),
+                        status: agent_domain::ConceptStatus::Shaky,
+                    },
+                ],
+                review_schedule: vec![],
                 next_action: "Review NADH tomorrow.".to_owned(),
-                source_moments: vec![RecapSourceMoment {
-                    text: "NADH needs one more recall pass.".to_owned(),
-                    source: agent_domain::fixture_source_reference(),
-                    status: ConceptStatus::Shaky,
+                source_moments: vec![agent_domain::learning_recap::RecapSourceMoment {
+                    response_id: "response-recap".to_owned(),
+                    source_id: agent_domain::fixture_source_reference().source_id.clone(),
                 }],
             },
         )
@@ -476,6 +538,1144 @@ async fn ready_and_brain_health_routes_report_configured_synthetic_provider() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&brain_body).unwrap()["usage"]["total_tokens"],
         0
+    );
+}
+
+/// Fake, non-secret credentials for the operator route tests. They authenticate
+/// nothing outside this test binary.
+const FIXTURE_OPERATOR_CREDENTIAL: &str = "viva-fixture-operator-credential-0001";
+const FIXTURE_LIBRARY_READ_CREDENTIAL: &str = "viva-fixture-library-read-cred-000001";
+
+/// A public deployment under `D-07 TOKEN_ONLY_REFRESH`: there is no WebSocket
+/// bearer at all, so the absent-permissive WebSocket bearer check would leave
+/// readiness wide open. Readiness therefore carries its own operator credential.
+fn operator_auth_test_state() -> AppState {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(store.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".into()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    )
+    .with_operator_access(OperatorAccess::new(Some(
+        FIXTURE_OPERATOR_CREDENTIAL.into(),
+    )))
+}
+
+async fn operator_route_response(
+    app: &axum::Router,
+    path: &str,
+    authorization: Option<&str>,
+) -> (StatusCode, String) {
+    let mut request = Request::builder().uri(path);
+    if let Some(authorization) = authorization {
+        request = request.header("authorization", authorization);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn readiness_operator_auth_denies_absent_and_wrong_credentials() {
+    let app = build_router(operator_auth_test_state());
+
+    for path in ["/ready", "/health/brain"] {
+        let (status, body) = operator_route_response(&app, path, None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} admitted a request with no operator credential"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["access"]["status"],
+            "denied"
+        );
+
+        let (status, body) = operator_route_response(
+            &app,
+            path,
+            Some(&format!("Bearer {FIXTURE_LIBRARY_READ_CREDENTIAL}")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} admitted a request with the wrong operator credential"
+        );
+        assert!(!body.contains(FIXTURE_LIBRARY_READ_CREDENTIAL));
+        assert!(!body.contains(FIXTURE_OPERATOR_CREDENTIAL));
+        assert!(!body.contains("session-secret"));
+
+        let (status, body) = operator_route_response(
+            &app,
+            path,
+            Some(&format!("Bearer {FIXTURE_OPERATOR_CREDENTIAL}")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{path} rejected the configured operator credential"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["access"]["status"],
+            "allowed"
+        );
+        assert!(!body.contains(FIXTURE_OPERATOR_CREDENTIAL));
+        assert!(!body.contains("session-secret"));
+    }
+}
+
+#[tokio::test]
+async fn readiness_operator_auth_keeps_live_public_and_minimal() {
+    let app = build_router(operator_auth_test_state());
+
+    let (status, body) = operator_route_response(&app, "/live", None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed, serde_json::json!({ "live": true }));
+    assert!(!body.contains(FIXTURE_OPERATOR_CREDENTIAL));
+    assert!(!body.contains("session-secret"));
+}
+
+/// `SERVICE-005`: a long-lived process must not accumulate telemetry forever. The
+/// recorders keep at most `capacity` newest sanitized events while their counters
+/// and aggregates keep counting every event that was ever recorded.
+#[test]
+fn recorder_retention_is_bounded() {
+    const CAPACITY: usize = 257;
+    const RECORDED: u64 = 1_000_000;
+
+    let evidence = VoiceEvidenceRecorder::with_capacity(CAPACITY);
+    let usage = VoiceUsageRecorder::with_capacity(CAPACITY);
+    let per_event_usage = BrainUsage {
+        audio_input_tokens: 3,
+        text_input_tokens: 1,
+        audio_output_tokens: 4,
+        text_output_tokens: 2,
+        ..BrainUsage::default()
+    };
+    let per_event_cost = observe::CostModel::default().estimate_usd(&per_event_usage);
+
+    for index in 0..RECORDED {
+        evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::StoreCounts,
+            None,
+            format!("deterministic_event_{index}"),
+        ));
+        usage.record(
+            None,
+            "synthetic",
+            "synthetic-viva",
+            per_event_usage.clone(),
+            1,
+            None,
+        );
+    }
+
+    let evidence_stats = evidence.stats();
+    assert_eq!(evidence_stats.capacity, CAPACITY);
+    assert_eq!(evidence_stats.retained, CAPACITY);
+    assert_eq!(evidence_stats.total_recorded, RECORDED);
+    assert_eq!(evidence_stats.dropped, RECORDED - CAPACITY as u64);
+    assert_eq!(evidence_stats.dropped, 999_743);
+
+    let retained = evidence.snapshot();
+    assert_eq!(retained.len(), CAPACITY);
+    assert_eq!(
+        retained.first().expect("oldest retained event").detail,
+        format!("deterministic_event_{}", RECORDED - CAPACITY as u64)
+    );
+    assert_eq!(
+        retained.last().expect("newest retained event").detail,
+        format!("deterministic_event_{}", RECORDED - 1)
+    );
+
+    let usage_stats = usage.stats();
+    assert_eq!(usage_stats.capacity, CAPACITY);
+    assert_eq!(usage_stats.retained, CAPACITY);
+    assert_eq!(usage_stats.total_recorded, RECORDED);
+    assert_eq!(usage_stats.dropped, 999_743);
+    assert_eq!(usage.snapshot().len(), CAPACITY);
+
+    // The aggregate counted every event, including the 999,743 already evicted.
+    let aggregate = usage.aggregate();
+    assert_eq!(aggregate.prompt_tokens, RECORDED * 4);
+    assert_eq!(aggregate.completion_tokens, RECORDED * 6);
+    assert_eq!(aggregate.total_tokens, RECORDED * 10);
+    assert_eq!(aggregate.invalid_cost_events, 0);
+    let expected_cost = per_event_cost * RECORDED as f64;
+    assert!(
+        (aggregate.estimated_cost_usd - expected_cost).abs() <= expected_cost * 1e-9,
+        "estimated cost {} drifted from {expected_cost}",
+        aggregate.estimated_cost_usd
+    );
+}
+
+/// The zero-capacity negative control: retention is off, accounting is not.
+#[test]
+fn recorder_zero_capacity_retains_nothing_and_keeps_counting() {
+    let evidence = VoiceEvidenceRecorder::with_capacity(0);
+    let usage = VoiceUsageRecorder::with_capacity(0);
+
+    for index in 0..8_u64 {
+        evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::StoreCounts,
+            None,
+            format!("zero_capacity_event_{index}"),
+        ));
+        usage.record(
+            None,
+            "synthetic",
+            "synthetic-viva",
+            BrainUsage {
+                text_input_tokens: 5,
+                text_output_tokens: 7,
+                ..BrainUsage::default()
+            },
+            1,
+            None,
+        );
+    }
+
+    assert!(evidence.snapshot().is_empty());
+    assert!(usage.snapshot().is_empty());
+    assert_eq!(
+        (
+            evidence.stats().capacity,
+            evidence.stats().retained,
+            evidence.stats().total_recorded,
+            evidence.stats().dropped
+        ),
+        (0, 0, 8, 8)
+    );
+    assert_eq!(
+        (
+            usage.stats().capacity,
+            usage.stats().retained,
+            usage.stats().total_recorded,
+            usage.stats().dropped
+        ),
+        (0, 0, 8, 8)
+    );
+    let aggregate = usage.aggregate();
+    assert_eq!(aggregate.prompt_tokens, 40);
+    assert_eq!(aggregate.completion_tokens, 56);
+    assert_eq!(aggregate.total_tokens, 96);
+}
+
+/// Hostile strings never reach retention. `provider` and `model` are server-chosen
+/// identifiers; a signed credential, a bearer header, transcript prose, or a base64
+/// audio blob offered in their place is replaced before it can be retained.
+const HOSTILE_SIGNED_CREDENTIAL: &str = "viva1.eyJ1c2VyX2lkIjoidXNlci0xIn0.c2ln";
+const HOSTILE_AUTHORIZATION_VALUE: &str = "Bearer viva-fixture-hostile-credential";
+const HOSTILE_TRANSCRIPT_TEXT: &str = "the mitochondria is the powerhouse of the cell";
+const HOSTILE_BASE64_AUDIO: &str =
+    "UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAAAAAAAAAAAAAAA";
+
+fn hostile_recorder_values() -> [&'static str; 4] {
+    [
+        HOSTILE_SIGNED_CREDENTIAL,
+        HOSTILE_AUTHORIZATION_VALUE,
+        HOSTILE_TRANSCRIPT_TEXT,
+        HOSTILE_BASE64_AUDIO,
+    ]
+}
+
+/// The two retention boundaries make different guarantees, and each is asserted
+/// where it holds. `provider` and `model` are server-chosen identifiers, so every
+/// hostile class is replaced before retention. An evidence `detail` is
+/// server-authored prose that the shared sanitizing constructor scans for
+/// credential markers, so the credential-shaped classes are redacted there.
+/// Readiness JSON carries only counts, so none of the four ever reaches it — that
+/// half is asserted by `readiness_recorder_aggregates_carry_no_subject_material`.
+#[test]
+fn recorder_sanitizes_hostile_event_provider_and_model_values() {
+    let evidence = VoiceEvidenceRecorder::with_capacity(64);
+    let usage = VoiceUsageRecorder::with_capacity(64);
+
+    for hostile in hostile_recorder_values() {
+        evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::StoreCounts,
+            None,
+            hostile,
+        ));
+        usage.record(None, hostile, hostile, BrainUsage::default(), 1, None);
+    }
+
+    let evidence_json = serde_json::to_string(&evidence.snapshot()).unwrap();
+    let usage_json = serde_json::to_string(&usage.snapshot()).unwrap();
+    for hostile in [HOSTILE_SIGNED_CREDENTIAL, HOSTILE_AUTHORIZATION_VALUE] {
+        assert!(
+            !evidence_json.contains(hostile),
+            "evidence retention leaked credential-shaped material"
+        );
+    }
+    for hostile in hostile_recorder_values() {
+        assert!(
+            !usage_json.contains(hostile),
+            "usage retention leaked a hostile value"
+        );
+    }
+    for retained in usage.snapshot() {
+        assert_eq!(retained.provider, "redacted_usage_label");
+        assert_eq!(retained.model, "redacted_usage_label");
+    }
+    assert_eq!(
+        evidence
+            .snapshot()
+            .iter()
+            .filter(|event| event.detail == "redacted_evidence_detail")
+            .count(),
+        2,
+        "both credential-shaped details must be redacted before retention"
+    );
+}
+
+#[tokio::test]
+async fn readiness_recorder_aggregates_carry_no_subject_material() {
+    let state = operator_auth_test_state().with_recorder_limits(RecorderLimits {
+        evidence_events: 8,
+        usage_events: 4,
+    });
+    for hostile in hostile_recorder_values() {
+        state.evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::StoreCounts,
+            Some(hostile.to_owned()),
+            hostile,
+        ));
+        state.usage.record(
+            Some(hostile),
+            hostile,
+            hostile,
+            BrainUsage {
+                text_input_tokens: 2,
+                text_output_tokens: 3,
+                ..BrainUsage::default()
+            },
+            1,
+            None,
+        );
+    }
+    let app = build_router(state);
+
+    let (status, body) = operator_route_response(
+        &app,
+        "/health/brain",
+        Some(&format!("Bearer {FIXTURE_OPERATOR_CREDENTIAL}")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["usage"]["events"], 4);
+    assert_eq!(payload["usage"]["prompt_tokens"], 8);
+    assert_eq!(payload["usage"]["completion_tokens"], 12);
+    assert_eq!(payload["usage"]["total_tokens"], 20);
+    assert_eq!(payload["usage"]["invalid_cost_events"], 0);
+    assert_eq!(payload["usage"]["retention"]["capacity"], 4);
+    assert_eq!(payload["usage"]["retention"]["retained"], 4);
+    assert_eq!(payload["usage"]["retention"]["total_recorded"], 4);
+    assert_eq!(payload["usage"]["retention"]["dropped"], 0);
+    assert_eq!(payload["evidence"]["capacity"], 8);
+    assert_eq!(payload["evidence"]["retained"], 4);
+    assert_eq!(payload["evidence"]["total_recorded"], 4);
+    assert_eq!(payload["evidence"]["dropped"], 0);
+
+    for forbidden in hostile_recorder_values() {
+        assert!(
+            !body.contains(forbidden),
+            "readiness JSON leaked a forbidden value"
+        );
+    }
+    for forbidden in [
+        "user-1",
+        "voice-session-1",
+        "biology-midterm",
+        "session-secret",
+        FIXTURE_OPERATOR_CREDENTIAL,
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "readiness JSON leaked subject or credential material"
+        );
+    }
+}
+
+/// Plan 05's immutable session-token vectors. The secret, the clock, the expected
+/// binding, and every rejection code are read from the file at test time; nothing
+/// here is minted by the verifier under test.
+const SESSION_TOKEN_VECTORS_JSON: &str =
+    include_str!("../../../fixtures/session-token/v1/vectors.json");
+
+#[derive(Deserialize)]
+struct SessionTokenVectors {
+    version: u32,
+    fake_secret_base64: String,
+    clock_unix_seconds: u64,
+    cases: Vec<SessionTokenVectorCase>,
+}
+
+#[derive(Deserialize)]
+struct SessionTokenVectorCase {
+    id: String,
+    token: String,
+    claims: Option<serde_json::Value>,
+    valid: bool,
+    rejection: Option<String>,
+}
+
+fn session_token_vectors() -> SessionTokenVectors {
+    serde_json::from_str(SESSION_TOKEN_VECTORS_JSON).expect("session-token vectors parse")
+}
+
+/// `SERVICE-004`: one strict verifier, proven against every published vector.
+#[test]
+fn session_token_v1_vectors() {
+    let vectors = session_token_vectors();
+    assert_eq!(vectors.version, 1);
+
+    let secret: RedactedSecret = String::from_utf8(
+        STANDARD
+            .decode(&vectors.fake_secret_base64)
+            .expect("fixture secret is base64"),
+    )
+    .expect("fixture secret is textual")
+    .into();
+
+    // The expected binding is the canonical vector's own identity, read from the
+    // file rather than restated here.
+    let canonical = vectors
+        .cases
+        .iter()
+        .find(|case| case.id == "VOICE-TOKEN-VALID-CANONICAL")
+        .and_then(|case| case.claims.as_ref())
+        .expect("canonical vector carries its claims");
+    let expected_user_id = canonical["user_id"].as_str().expect("user_id").to_owned();
+    let expected_study_set_id = canonical["study_set_id"]
+        .as_str()
+        .expect("study_set_id")
+        .to_owned();
+    let expected_session_id = canonical["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    let expected = ExpectedSessionBinding {
+        user_id: &expected_user_id,
+        study_set_id: &expected_study_set_id,
+        session_id: &expected_session_id,
+    };
+
+    for case in &vectors.cases {
+        let outcome = verify_session_token_at(
+            &case.token,
+            &secret,
+            vectors.clock_unix_seconds,
+            Some(expected),
+        );
+        match (case.valid, outcome) {
+            (true, Ok(claims)) => {
+                assert_eq!(
+                    serde_json::to_value(&claims).expect("claims serialize"),
+                    *case.claims.as_ref().expect("valid vector carries claims"),
+                    "{} returned different claims",
+                    case.id
+                );
+                assert_eq!(
+                    format!("{claims:?}"),
+                    "SessionTokenClaims([REDACTED])",
+                    "{} rendered claim values in Debug",
+                    case.id
+                );
+            }
+            (false, Err(error)) => {
+                assert_eq!(
+                    error.code(),
+                    case.rejection.as_deref().expect("rejection code"),
+                    "{} returned the wrong rejection code",
+                    case.id
+                );
+                let rendered = format!("{error:?} {error}");
+                assert!(
+                    !rendered.contains(&case.token) && !rendered.contains(&expected_user_id),
+                    "{} leaked encoded input or claim values",
+                    case.id
+                );
+            }
+            (true, Err(error)) => {
+                panic!("{} should verify, got {}", case.id, error.code())
+            }
+            (false, Ok(_)) => panic!("{} must be rejected", case.id),
+        }
+    }
+
+    // The 60-second expiry grace the old verifier applied is gone: expiry is exact.
+    let canonical_token = &vectors
+        .cases
+        .iter()
+        .find(|case| case.id == "VOICE-TOKEN-VALID-CANONICAL")
+        .expect("canonical vector")
+        .token;
+    let expires_at = canonical["expires_at"].as_u64().expect("expires_at");
+    assert!(verify_session_token_at(canonical_token, &secret, expires_at - 1, None).is_ok());
+    assert_eq!(
+        verify_session_token_at(canonical_token, &secret, expires_at, None)
+            .expect_err("expiry is exclusive")
+            .code(),
+        "expired"
+    );
+    assert_eq!(
+        verify_session_token_at(canonical_token, &secret, expires_at + 59, None)
+            .expect_err("there is no expiry grace window")
+            .code(),
+        "expired"
+    );
+
+    // A wrong secret never reveals more than the coarse signature rejection.
+    assert_eq!(
+        verify_session_token_at(
+            canonical_token,
+            &"viva-fixture-not-the-signing-secret-1".into(),
+            vectors.clock_unix_seconds,
+            None,
+        )
+        .expect_err("a wrong secret cannot verify")
+        .code(),
+        "invalid_signature"
+    );
+}
+
+/// `SERVICE-004`: server-owned observation of the admission ordering. The log
+/// records store operations in the order the socket performed them, so the test
+/// reads the server's own sequence rather than a client-visible side effect.
+#[derive(Default)]
+struct NonceAuditLog {
+    operations: Mutex<Vec<&'static str>>,
+    nonce_calls: AtomicUsize,
+    nonce_successes: AtomicUsize,
+}
+
+impl NonceAuditLog {
+    fn record(&self, operation: &'static str) {
+        self.operations.lock().unwrap().push(operation);
+    }
+
+    fn operations(&self) -> Vec<&'static str> {
+        self.operations.lock().unwrap().clone()
+    }
+}
+
+struct NonceAuditStudyStore {
+    inner: Arc<data::InMemoryStudyStore>,
+    audit: Arc<NonceAuditLog>,
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for NonceAuditStudyStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    async fn claim_session_token_nonce(
+        &self,
+        claim: SessionTokenNonceClaim,
+    ) -> Result<(), PortError> {
+        self.audit.record("claim_session_token_nonce");
+        self.audit.nonce_calls.fetch_add(1, Ordering::SeqCst);
+        let outcome = self.inner.claim_session_token_nonce(claim).await;
+        if outcome.is_ok() {
+            self.audit.nonce_successes.fetch_add(1, Ordering::SeqCst);
+        }
+        outcome
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        self.audit.record("study_context");
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn review_scheduling_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<ReviewSchedulingContextV1, PortError> {
+        self.inner
+            .review_scheduling_context(user_id, study_set_id, concept_id)
+            .await
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        decision: agent_domain::ReviewScheduleDecisionV1,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .persist_review_schedule_decision(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                decision,
+            )
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+}
+
+const NONCE_AUDIT_SECRET: &str = "viva-fixture-session-signing-secret01";
+
+fn nonce_audit_state() -> (AppState, Arc<NonceAuditLog>) {
+    let inner = provider_limiter_test_store();
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner: inner.clone(),
+        audit: audit.clone(),
+    });
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(inner)),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some(NONCE_AUDIT_SECRET.into()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    );
+    (state, audit)
+}
+
+fn nonce_audit_backoff_state(opens: Arc<AtomicUsize>) -> (AppState, Arc<NonceAuditLog>) {
+    let inner = provider_limiter_test_store();
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner,
+        audit: audit.clone(),
+    });
+    let state = AppState::with_study_store(
+        Arc::new(OpenRateLimitFailureBrain { opens }),
+        "cartesia_gemini",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some(NONCE_AUDIT_SECRET.into()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    );
+    (state, audit)
+}
+
+fn nonce_audit_token(session_id: &str, nonce: &str) -> String {
+    nonce_audit_token_for("biology-midterm", session_id, nonce)
+}
+
+fn nonce_audit_token_for(study_set_id: &str, session_id: &str, nonce: &str) -> String {
+    signed_session_token(
+        NONCE_AUDIT_SECRET,
+        "user-1",
+        study_set_id,
+        session_id,
+        unix_timestamp_now() + 60,
+        nonce,
+    )
+}
+
+/// The upgrade request the token-only browser client makes: the signed credential
+/// rides in the `bearer.<base64url(token)>` subprotocol entry.
+fn token_only_request(
+    url: &str,
+    token: &str,
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_str(&format!(
+            "viva-voice, bearer.{}",
+            URL_SAFE_NO_PAD.encode(token)
+        ))
+        .expect("subprotocol header is valid"),
+    );
+    request
+}
+
+/// `SERVICE-004`: the preflight never touches the nonce store; the one atomic
+/// claim happens after admission and before any study lookup; and it succeeds at
+/// most once for a given credential.
+#[tokio::test]
+async fn signed_session_nonce_is_claimed_after_admission_and_once_only() {
+    let (state, audit) = nonce_audit_state();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let token = nonce_audit_token("voice-session-1", "nonce-audit-order-1");
+
+    let (mut socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .expect("a verified token opens the socket");
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    assert_eq!(
+        audit.nonce_calls.load(Ordering::SeqCst),
+        0,
+        "the HTTP upgrade must never call the nonce store"
+    );
+
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token("biology-midterm", "voice-session-1", &token)
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let question = read_server_frame(&mut socket).await;
+    assert!(
+        matches!(question, ServerFrame::Event { .. }),
+        "the bound config opens the session, got {question:?}"
+    );
+
+    let operations = audit.operations();
+    let claim_index = operations
+        .iter()
+        .position(|operation| *operation == "claim_session_token_nonce")
+        .expect("the bound config claims the nonce exactly once");
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == "claim_session_token_nonce")
+            .count(),
+        1
+    );
+    if let Some(study_index) = operations
+        .iter()
+        .position(|operation| *operation == "study_context")
+    {
+        assert!(
+            claim_index < study_index,
+            "the nonce claim must precede any study lookup, got {operations:?}"
+        );
+    }
+    assert_eq!(audit.nonce_successes.load(Ordering::SeqCst), 1);
+
+    socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut socket).await;
+
+    // Replaying the same credential is refused, and the store still records one
+    // successful claim in total.
+    let (mut replay, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .expect("the upgrade still verifies the signature");
+    assert_eq!(read_server_frame(&mut replay).await, ServerFrame::ready());
+    replay
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token("biology-midterm", "voice-session-1", &token)
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_server_frames_until_close(&mut replay).await;
+    assert_eq!(
+        audit.nonce_successes.load(Ordering::SeqCst),
+        1,
+        "a replayed credential must not produce a second successful claim"
+    );
+}
+
+/// A provider-backoff denial closes the socket without consuming the nonce, so the
+/// same credential still opens a session once the backoff window has passed. This
+/// is the explicit lease-denial case beside the baseline
+/// `websocket_provider_backoff_denial_does_not_consume_signed_nonce`, which stays.
+#[tokio::test]
+async fn signed_session_nonce_survives_capacity_and_backoff_denial() {
+    let opens = Arc::new(AtomicUsize::new(0));
+    let (state, audit) = nonce_audit_backoff_state(opens.clone());
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let first_token = nonce_audit_token_for(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-audit-backoff-first",
+    );
+    let denied_token = nonce_audit_token_for(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-audit-backoff-denied",
+    );
+
+    let (mut first, _) = connect_async(token_only_request(&url, &first_token))
+        .await
+        .unwrap();
+    assert_ready_provider(&mut first, "cartesia_gemini").await;
+    first
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token(
+                "biology-midterm",
+                "voice-session-1",
+                &first_token,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut first).await,
+        TerminalSessionReason::ProviderRateLimited,
+    );
+    let _ = read_server_frames_until_close(&mut first).await;
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        audit.nonce_successes.load(Ordering::SeqCst),
+        1,
+        "an admitted connection claims its own nonce once"
+    );
+
+    // Inside the backoff window admission is denied before the nonce is touched.
+    let (mut denied, _) = connect_async(token_only_request(&url, &denied_token))
+        .await
+        .unwrap();
+    assert_ready_provider(&mut denied, "cartesia_gemini").await;
+    denied
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token(
+                "chemistry-final",
+                "voice-session-2",
+                &denied_token,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut denied).await,
+        TerminalSessionReason::ProviderRateLimited,
+    );
+    assert_close_code(&mut denied, CloseCode::Policy).await;
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        1,
+        "an active backoff denies before reopening the provider"
+    );
+    assert_eq!(
+        audit.nonce_successes.load(Ordering::SeqCst),
+        1,
+        "a backoff denial must not consume the nonce"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut retry, _) = connect_async(token_only_request(&url, &denied_token))
+        .await
+        .unwrap();
+    assert_ready_provider(&mut retry, "cartesia_gemini").await;
+    retry
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token(
+                "chemistry-final",
+                "voice-session-2",
+                &denied_token,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut retry).await,
+        TerminalSessionReason::ProviderRateLimited,
+    );
+    let _ = read_server_frames_until_close(&mut retry).await;
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        2,
+        "the denied credential still opens a provider turn after the backoff"
+    );
+    assert_eq!(
+        audit.nonce_successes.load(Ordering::SeqCst),
+        2,
+        "the denied credential was still claimable on the later attempt"
+    );
+}
+
+fn token_only_preflight_state() -> (AppState, Arc<NonceAuditLog>, Arc<Semaphore>) {
+    let (state, audit) = nonce_audit_state();
+    let state = state.with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(4),
+        ..VoiceLimitConfig::default()
+    });
+    let slots = state.session_slots.clone();
+    (state, audit, slots)
+}
+
+/// The upgrade request a trusted service makes: a shared bearer in `Authorization`.
+/// The first bound frame still carries its own signed credential.
+fn service_bearer_request(
+    url: &str,
+    bearer: &str,
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {bearer}")).expect("authorization header is valid"),
+    );
+    request
+}
+
+fn token_only_request_with_protocol(
+    url: &str,
+    protocol: &str,
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_str(protocol).expect("subprotocol header is valid"),
+    );
+    request
+}
+
+/// `SERVICE-004` / `D-07 TOKEN_ONLY_REFRESH` branch `retain-token-only`: in public
+/// token-only mode the signed credential is verified during the HTTP upgrade, so
+/// an unverified upgrade never reaches `Ready`, never takes a session slot or an
+/// IP lease, and never touches the nonce store.
+#[tokio::test]
+async fn token_only_preflight_rejects_unverified_upgrades() {
+    let (state, audit, slots) = token_only_preflight_state();
+    let limits = state.limit_state.clone();
+    let total_slots = slots.available_permits();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let valid = nonce_audit_token("voice-session-1", "nonce-token-only-valid");
+    let expired = signed_session_token(
+        NONCE_AUDIT_SECRET,
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now().saturating_sub(120),
+        "nonce-token-only-expired",
+    );
+    let wrong_secret_token = signed_session_token(
+        "viva-fixture-not-the-signing-secret-1",
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() + 60,
+        "nonce-token-only-bad-signature",
+    );
+
+    let rejected: Vec<(&str, String)> = vec![
+        ("missing token", "viva-voice".to_owned()),
+        (
+            "wrong subprotocol",
+            format!("viva-audio, session.{}", URL_SAFE_NO_PAD.encode(&valid)),
+        ),
+        (
+            "malformed token",
+            "viva-voice, bearer.not-a-canonical-token".to_owned(),
+        ),
+        (
+            "bad signature",
+            format!(
+                "viva-voice, bearer.{}",
+                URL_SAFE_NO_PAD.encode(&wrong_secret_token)
+            ),
+        ),
+        (
+            "expired token",
+            format!("viva-voice, bearer.{}", URL_SAFE_NO_PAD.encode(&expired)),
+        ),
+    ];
+
+    for (name, protocol) in rejected {
+        match connect_async(token_only_request_with_protocol(&url, &protocol)).await {
+            Ok(_) => panic!("{name} must not upgrade"),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{name} was not rejected with 401"
+            ),
+            Err(other) => panic!("{name} expected HTTP 401, got {other:?}"),
+        }
+        assert_eq!(
+            slots.available_permits(),
+            total_slots,
+            "{name} consumed a session slot"
+        );
+        assert_eq!(
+            limits.ip_lease_count("127.0.0.1"),
+            None,
+            "{name} took an IP lease"
+        );
+        assert_eq!(
+            audit.nonce_calls.load(Ordering::SeqCst),
+            0,
+            "{name} reached the nonce store"
+        );
+    }
+
+    let (mut socket, _) = connect_async(token_only_request(&url, &valid))
+        .await
+        .expect("a verified token upgrades");
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    assert_eq!(audit.nonce_calls.load(Ordering::SeqCst), 0);
+    socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut socket).await;
+}
+
+/// The verified preflight does not consume the nonce: a socket that disconnects
+/// before its bound `session_config` leaves the credential usable exactly once
+/// more, and the attempt after that is refused.
+#[tokio::test]
+async fn token_only_preflight_nonce_is_consumed_once_across_reconnects() {
+    let (state, audit, _slots) = token_only_preflight_state();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let token = nonce_audit_token("voice-session-1", "nonce-token-only-reconnect");
+    let config =
+        session_config_json_with_ids_and_token("biology-midterm", "voice-session-1", &token);
+
+    // 1. Verified upgrade, then disconnect before any bound config.
+    let (mut first, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .expect("a verified token upgrades");
+    assert_eq!(read_server_frame(&mut first).await, ServerFrame::ready());
+    first.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut first).await;
+    assert_eq!(
+        audit.nonce_calls.load(Ordering::SeqCst),
+        0,
+        "an upgrade that never bound a config must not touch the nonce store"
+    );
+
+    // 2. The same credential still opens a session.
+    let (mut second, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .expect("the credential is still usable");
+    assert_eq!(read_server_frame(&mut second).await, ServerFrame::ready());
+    second
+        .send(WsMessage::Text(config.clone().into()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_server_frame(&mut second).await,
+        ServerFrame::Event { .. }
+    ));
+    assert_eq!(audit.nonce_successes.load(Ordering::SeqCst), 1);
+    second.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut second).await;
+
+    // 3. A third attempt with the same credential is a replay.
+    let (mut third, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .expect("the signature still verifies at the upgrade");
+    assert_eq!(read_server_frame(&mut third).await, ServerFrame::ready());
+    third.send(WsMessage::Text(config.into())).await.unwrap();
+    let _ = read_server_frames_until_close(&mut third).await;
+    assert_eq!(
+        audit.nonce_successes.load(Ordering::SeqCst),
+        1,
+        "the nonce store must record exactly one successful claim in total"
     );
 }
 
@@ -632,19 +1832,24 @@ async fn ready_route_distinguishes_dependency_failure_from_access_denial() {
     assert_eq!(payload["access"]["status"], "denied");
     assert_eq!(payload["access"]["reason"], "origin_denied");
 
+    // `SERVICE-010`: readiness denial is keyed on the operator credential, not on
+    // the WebSocket bearer, which is legitimately absent under token-only access.
     let bearer_state = AppState::with_study_store(
         Arc::new(SyntheticBrain::with_study_store(Arc::new(
             data::InMemoryStudyStore::seeded_fixture(),
         ))),
         "synthetic",
         VoiceWsAccess {
-            required_bearer: Some("rest-secret".to_owned()),
+            required_bearer: Some("rest-secret".into()),
             session_token_secret: None,
             allowed_origins: vec![],
         },
         4,
         Arc::new(data::InMemoryStudyStore::seeded_fixture()),
-    );
+    )
+    .with_operator_access(OperatorAccess::new(Some(
+        FIXTURE_OPERATOR_CREDENTIAL.into(),
+    )));
     let bearer_app = build_router(bearer_state);
     let missing_bearer = bearer_app
         .clone()
@@ -691,6 +1896,945 @@ async fn ready_route_distinguishes_dependency_failure_from_access_denial() {
     assert_eq!(payload["access"]["reason"], "invalid_bearer");
 }
 
+// --- `SERVICE-015` / `SERVICE-016` / `COR-04` ingestion contract ------------------
+
+/// The exact body every ingestion route returns for a request that does not match
+/// its contract.
+const INVALID_INGESTION_BODY: &str = r#"{"error":"invalid_ingestion_request","message":"request body does not match the ingestion contract"}"#;
+
+/// The fixed public message every sanitized `InvalidInput` upload refusal carries.
+const UNSUPPORTED_UPLOAD_MESSAGE: &str = "uploaded content is invalid or unsupported";
+
+#[derive(Default)]
+struct IngestionCallCounts {
+    paste: AtomicUsize,
+    create_file: AtomicUsize,
+    retry_file: AtomicUsize,
+}
+
+impl IngestionCallCounts {
+    fn total(&self) -> usize {
+        self.paste.load(Ordering::SeqCst)
+            + self.create_file.load(Ordering::SeqCst)
+            + self.retry_file.load(Ordering::SeqCst)
+    }
+}
+
+/// A real store that additionally records every ingestion call, so a rejected body
+/// can be proven never to have reached it.
+struct RecordingIngestionStore {
+    inner: Arc<data::InMemoryStudyStore>,
+    counts: Arc<IngestionCallCounts>,
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for RecordingIngestionStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+
+    async fn create_paste_study_set(
+        &self,
+        input: agent_domain::CreatePasteStudySet,
+    ) -> Result<agent_domain::StudySetIngestionRecord, PortError> {
+        self.counts.paste.fetch_add(1, Ordering::SeqCst);
+        self.inner.create_paste_study_set(input).await
+    }
+
+    async fn create_file_study_set(
+        &self,
+        input: agent_domain::CreateFileStudySet,
+    ) -> Result<agent_domain::StudySetIngestionRecord, PortError> {
+        self.counts.create_file.fetch_add(1, Ordering::SeqCst);
+        self.inner.create_file_study_set(input).await
+    }
+
+    async fn retry_file_study_set(
+        &self,
+        input: agent_domain::CreateFileStudySet,
+    ) -> Result<agent_domain::StudySetIngestionRecord, PortError> {
+        self.counts.retry_file.fetch_add(1, Ordering::SeqCst);
+        self.inner.retry_file_study_set(input).await
+    }
+
+    async fn library_snapshot(
+        &self,
+        user_id: &str,
+    ) -> Result<agent_domain::StudyLibrarySnapshot, PortError> {
+        self.inner.library_snapshot(user_id).await
+    }
+
+    async fn authenticated_study_projection(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::AuthenticatedStudyProjectionV1, PortError> {
+        self.inner
+            .authenticated_study_projection(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn review_scheduling_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<ReviewSchedulingContextV1, PortError> {
+        self.inner
+            .review_scheduling_context(user_id, study_set_id, concept_id)
+            .await
+    }
+}
+
+fn ingestion_app() -> (
+    axum::Router,
+    Arc<IngestionCallCounts>,
+    Arc<data::InMemoryStudyStore>,
+) {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let counts = Arc::new(IngestionCallCounts::default());
+    let store = Arc::new(RecordingIngestionStore {
+        inner: inner.clone(),
+        counts: counts.clone(),
+    });
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(inner.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: Some("rest-secret".into()),
+            session_token_secret: Some("session-secret".into()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    );
+    (build_router(state), counts, inner)
+}
+
+fn ingestion_request(uri: &str, body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("origin", "http://localhost:3000")
+        .header("authorization", "Bearer rest-secret")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// `SERVICE-015`: an authority-shaped member is a rejected request, never a silently
+/// discarded field, and it never reaches the store.
+#[tokio::test]
+async fn ingestion_request_shape_rejects_authority_and_unknown_members() {
+    let valid_paste = serde_json::json!({
+        "title": "Cell Division",
+        "course": "Biology 201",
+        "exam_date": null,
+        "pasted_text": "mitosis chromosome spindle metaphase cytokinesis",
+    });
+    let valid_file = serde_json::json!({
+        "title": "Lecture Notes",
+        "course": null,
+        "exam_date": null,
+        "file_name": "notes.txt",
+        "content_type": "text/plain",
+        "file_base64": STANDARD.encode(b"Mitosis separates chromosomes into two daughter cells."),
+    });
+    let valid_retry = serde_json::json!({
+        "file_name": "notes.txt",
+        "content_type": "text/plain",
+        "file_base64": STANDARD.encode(b"Replacement study notes for the failed upload."),
+    });
+
+    let routes = [
+        ("/study-sets/paste", valid_paste),
+        ("/study-sets/files", valid_file),
+        (
+            "/study-sets/biology-midterm/files/retry?user_id=user-1",
+            valid_retry,
+        ),
+    ];
+    let forbidden_members = [
+        ("user_id", serde_json::json!("attacker-user")),
+        ("session_id", serde_json::json!("attacker-session")),
+        (
+            "source_spans",
+            serde_json::json!([{ "id": "browser-span" }]),
+        ),
+        (
+            "questions",
+            serde_json::json!([{ "question_id": "browser-question" }]),
+        ),
+        ("viva_arbitrary_key", serde_json::json!("browser-supplied")),
+    ];
+
+    for (uri, valid) in &routes {
+        for (key, value) in &forbidden_members {
+            let (app, counts, _inner) = ingestion_app();
+            let mut body = valid.clone();
+            body[*key] = value.clone();
+            let response = app
+                .oneshot(ingestion_request(uri, body.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri} accepted {key}"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_eq!(text, INVALID_INGESTION_BODY, "{uri} / {key}");
+            assert!(!text.contains(*key), "{uri} echoed the rejected key");
+            assert!(
+                !text.contains(&value.to_string()),
+                "{uri} echoed the rejected value"
+            );
+            assert_eq!(counts.total(), 0, "{uri} / {key} reached the store");
+        }
+    }
+
+    // Duplicate JSON keys and malformed JSON are the same fixed rejection.
+    for (uri, raw) in [
+        (
+            "/study-sets/paste",
+            r#"{"title":"A","title":"B","course":null,"exam_date":null,"pasted_text":"x"}"#
+                .to_owned(),
+        ),
+        ("/study-sets/paste", r#"{"title":"A","#.to_owned()),
+        (
+            "/study-sets/files",
+            r#"{"title":"A","title":"B","course":null,"exam_date":null,"file_name":"a.txt","content_type":"text/plain","file_base64":"QQ=="}"#
+                .to_owned(),
+        ),
+        ("/study-sets/files", "not json at all".to_owned()),
+        (
+            "/study-sets/biology-midterm/files/retry?user_id=user-1",
+            r#"{"file_name":"a.txt","file_name":"b.txt","content_type":"text/plain","file_base64":"QQ=="}"#
+                .to_owned(),
+        ),
+    ] {
+        let (app, counts, _inner) = ingestion_app();
+        let response = app.oneshot(ingestion_request(uri, raw.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}: {raw}");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), INVALID_INGESTION_BODY);
+        assert_eq!(counts.total(), 0, "{uri}: {raw} reached the store");
+    }
+}
+
+/// `SERVICE-015`: the accepted contract still works, and every returned fact is
+/// server-derived. `A-02`: the ingestion `exam_date` input becomes the authoritative
+/// exam instant with no calendar-day rounding.
+#[tokio::test]
+async fn ingestion_request_shape_accepts_the_contract_and_binds_the_exam_instant() {
+    let (app, counts, inner) = ingestion_app();
+    let response = app
+        .oneshot(ingestion_request(
+            "/study-sets/paste",
+            serde_json::json!({
+                "title": "Cell Division",
+                "course": "Biology 201",
+                "exam_date": "2031-06-01T09:30:00.000Z",
+                "pasted_text": "mitosis chromosome spindle metaphase cytokinesis",
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(counts.paste.load(Ordering::SeqCst), 1);
+    // Identity is server state, never a caller-authored fact.
+    assert_eq!(payload["study_set"]["user_id"], "user-1");
+    assert!(payload["session_id"].as_str().unwrap().len() > 20);
+
+    let study_set_id = payload["study_set"]["id"].as_str().unwrap();
+    let concept_id = payload["concepts"][0]["public_id"]
+        .as_str()
+        .expect("ingestion derives at least one server-owned concept");
+    let context = inner
+        .review_scheduling_context("user-1", study_set_id, concept_id)
+        .await
+        .expect("scheduling context reads");
+    assert_eq!(
+        context.exam_at,
+        agent_domain::parse_utc_instant("2031-06-01T09:30:00.000Z"),
+        "A-02: the exam instant is the exact UTC input, not a rounded calendar day"
+    );
+}
+
+// --- `COR-04` generated PDF matrix ----------------------------------------------
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GeneratedPdfCase {
+    TextUncompressed,
+    TextFlateCompressed,
+    ScannedImageOnly,
+    Encrypted,
+    MalformedXref,
+    MagicHeaderPlaintext,
+}
+
+impl GeneratedPdfCase {
+    const ALL: [Self; 6] = [
+        Self::TextUncompressed,
+        Self::TextFlateCompressed,
+        Self::ScannedImageOnly,
+        Self::Encrypted,
+        Self::MalformedXref,
+        Self::MagicHeaderPlaintext,
+    ];
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::TextUncompressed => "Lecture 9.pdf",
+            Self::TextFlateCompressed => "Lecture 9 compressed.pdf",
+            Self::ScannedImageOnly => "Scan 2026-08-24.pdf",
+            Self::Encrypted => "Protected.pdf",
+            Self::MalformedXref => "Truncated.PDF",
+            Self::MagicHeaderPlaintext => "notes.pdf",
+        }
+    }
+}
+
+const PDF_TEXT_STREAM: &[u8] =
+    b"BT /F1 12 Tf 72 720 Td (Mitosis chromosome spindle metaphase cytokinesis) Tj ET";
+
+const PDF_FLATE_TEXT_STREAM: [u8; 83] = [
+    120, 156, 13, 202, 49, 14, 128, 32, 12, 5, 208, 171, 252, 81, 39, 133, 197, 221, 68, 55, 183,
+    94, 128, 64, 13, 168, 80, 98, 89, 188, 189, 36, 111, 124, 43, 97, 218, 13, 140, 5, 157, 88,
+    108, 55, 131, 2, 134, 35, 53, 209, 164, 240, 241, 149, 44, 42, 153, 161, 53, 149, 240, 48, 50,
+    55, 87, 163, 83, 134, 255, 154, 220, 169, 112, 143, 35, 232, 194, 70, 63, 178, 209, 25, 220,
+];
+
+/// The plaintext study prose the magic-header case carries. It is deliberately not a
+/// PDF: only its first line pretends to be one.
+const PDF_MAGIC_HEADER_PLAINTEXT: &str = "%PDF-1.7\nMitosis separates duplicated chromosomes. \
+The spindle attaches at kinetochores and cytokinesis divides the cytoplasm.";
+
+fn pdf_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn pdf_rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
+
+fn pdf_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+const MD5_SINE: [u32; 64] = [
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+];
+
+const MD5_SHIFTS: [u32; 64] = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9,
+    14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15,
+    21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+];
+
+/// Test-only MD5, required by the PDF Standard Security Handler. No production
+/// crypto or PDF dependency is added for the fixture factory.
+fn pdf_md5(input: &[u8]) -> [u8; 16] {
+    let mut message = input.to_vec();
+    let bit_length = (input.len() as u64).wrapping_mul(8);
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_length.to_le_bytes());
+
+    let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+    for chunk in message.chunks_exact(64) {
+        let mut words = [0u32; 16];
+        for (index, word) in words.iter_mut().enumerate() {
+            let start = index * 4;
+            *word = u32::from_le_bytes([
+                chunk[start],
+                chunk[start + 1],
+                chunk[start + 2],
+                chunk[start + 3],
+            ]);
+        }
+        let [mut a, mut b, mut c, mut d] = state;
+        for round in 0..64usize {
+            let (mixed, word_index) = match round {
+                0..=15 => ((b & c) | (!b & d), round),
+                16..=31 => ((d & b) | (!d & c), (5 * round + 1) % 16),
+                32..=47 => (b ^ c ^ d, (3 * round + 5) % 16),
+                _ => (c ^ (b | !d), (7 * round) % 16),
+            };
+            let temp = d;
+            d = c;
+            c = b;
+            let sum = a
+                .wrapping_add(mixed)
+                .wrapping_add(MD5_SINE[round])
+                .wrapping_add(words[word_index]);
+            b = b.wrapping_add(sum.rotate_left(MD5_SHIFTS[round]));
+            a = temp;
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+    }
+
+    let mut digest = [0u8; 16];
+    for (index, word) in state.iter().enumerate() {
+        digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    digest
+}
+
+/// Test-only RC4, required by the revision-2 security handler.
+fn pdf_rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
+    assert!(!key.is_empty(), "RC4 needs a key");
+    let mut permutation: [u8; 256] = core::array::from_fn(|index| index as u8);
+    let mut swap_index = 0usize;
+    for index in 0..256usize {
+        swap_index =
+            (swap_index + usize::from(permutation[index]) + usize::from(key[index % key.len()]))
+                % 256;
+        permutation.swap(index, swap_index);
+    }
+    let (mut i, mut j) = (0usize, 0usize);
+    data.iter()
+        .map(|byte| {
+            i = (i + 1) % 256;
+            j = (j + usize::from(permutation[i])) % 256;
+            permutation.swap(i, j);
+            let keystream =
+                permutation[(usize::from(permutation[i]) + usize::from(permutation[j])) % 256];
+            byte ^ keystream
+        })
+        .collect()
+}
+
+const PDF_PASSWORD_PADDING: [u8; 32] = [
+    0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08,
+    0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
+];
+
+fn pdf_padded_password(password: &[u8]) -> [u8; 32] {
+    let mut padded = [0u8; 32];
+    let taken = password.len().min(32);
+    padded[..taken].copy_from_slice(&password[..taken]);
+    padded[taken..].copy_from_slice(&PDF_PASSWORD_PADDING[..32 - taken]);
+    padded
+}
+
+/// Builds numbered indirect objects and computes every xref byte offset plus
+/// `startxref` from the generated buffer itself.
+struct PdfBuilder {
+    bytes: Vec<u8>,
+    offsets: Vec<usize>,
+}
+
+impl PdfBuilder {
+    fn new() -> Self {
+        Self {
+            bytes: b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec(),
+            offsets: Vec::new(),
+        }
+    }
+
+    fn object(&mut self, body: &[u8]) -> usize {
+        let number = self.offsets.len() + 1;
+        self.offsets.push(self.bytes.len());
+        self.bytes
+            .extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        self.bytes.extend_from_slice(body);
+        self.bytes.extend_from_slice(b"\nendobj\n");
+        number
+    }
+
+    fn stream_object(&mut self, dictionary_extra: &str, payload: &[u8]) -> usize {
+        let mut body = format!(
+            "<< /Length {}{dictionary_extra} >>\nstream\n",
+            payload.len()
+        )
+        .into_bytes();
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"\nendstream");
+        self.object(&body)
+    }
+
+    fn finish(mut self, root: usize, trailer_extra: &str) -> Vec<u8> {
+        let xref_offset = self.bytes.len();
+        let count = self.offsets.len() + 1;
+        self.bytes
+            .extend_from_slice(format!("xref\n0 {count}\n").as_bytes());
+        self.bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in &self.offsets {
+            self.bytes
+                .extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        self.bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root {root} 0 R{trailer_extra} >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        assert_generated_pdf_is_valid(&self.bytes, count, xref_offset, root);
+        self.bytes
+    }
+}
+
+/// Every builder proves its own output before the HTTP request sees it: header,
+/// object offsets, xref, `startxref`, trailer/root, and the EOF marker.
+fn assert_generated_pdf_is_valid(bytes: &[u8], count: usize, xref_offset: usize, root: usize) {
+    assert!(bytes.starts_with(b"%PDF-1.7"), "PDF header");
+    assert_eq!(
+        &bytes[xref_offset..xref_offset + 4],
+        b"xref",
+        "xref keyword"
+    );
+    let marker = b"startxref\n";
+    let marker_start = pdf_rfind(bytes, marker).expect("startxref present");
+    let value_start = marker_start + marker.len();
+    let value_end = value_start
+        + bytes[value_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("startxref value ends");
+    let startxref: usize = std::str::from_utf8(&bytes[value_start..value_end])
+        .expect("startxref value is ascii")
+        .parse()
+        .expect("startxref parses");
+    assert_eq!(startxref, xref_offset, "startxref points at the xref table");
+    assert!(
+        pdf_find(bytes, format!("/Root {root} 0 R").as_bytes()).is_some(),
+        "trailer root"
+    );
+    assert!(bytes.ends_with(b"%%EOF\n"), "EOF marker");
+
+    let table_start = xref_offset + format!("xref\n0 {count}\n").len();
+    for object_number in 1..count {
+        let entry_start = table_start + object_number * 20;
+        let offset: usize = std::str::from_utf8(&bytes[entry_start..entry_start + 10])
+            .expect("offset is ascii")
+            .parse()
+            .expect("offset parses");
+        let expected = format!("{object_number} 0 obj\n");
+        assert_eq!(
+            &bytes[offset..offset + expected.len()],
+            expected.as_bytes(),
+            "xref offset for object {object_number}"
+        );
+    }
+}
+
+/// A test-only fixture factory, never a production parser. Each case is a real file
+/// of its declared kind; only `MagicHeaderPlaintext` is deliberately not a PDF.
+fn generated_pdf(case: GeneratedPdfCase) -> Vec<u8> {
+    match case {
+        GeneratedPdfCase::TextUncompressed => {
+            let mut pdf = PdfBuilder::new();
+            let catalog = pdf.object(b"<< /Type /Catalog /Pages 2 0 R >>");
+            pdf.object(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+            pdf.object(
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                  /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            );
+            pdf.object(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+            pdf.stream_object("", PDF_TEXT_STREAM);
+            let bytes = pdf.finish(catalog, "");
+            assert!(
+                pdf_find(&bytes, b" Tj").is_some(),
+                "the text page carries a real text-showing operator"
+            );
+            bytes
+        }
+        GeneratedPdfCase::TextFlateCompressed => {
+            let mut pdf = PdfBuilder::new();
+            let catalog = pdf.object(b"<< /Type /Catalog /Pages 2 0 R >>");
+            pdf.object(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+            pdf.object(
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                  /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            );
+            pdf.object(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+            pdf.stream_object(" /Filter /FlateDecode", &PDF_FLATE_TEXT_STREAM);
+            let bytes = pdf.finish(catalog, "");
+            assert!(
+                pdf_find(&bytes, b"/FlateDecode").is_some(),
+                "declared filter"
+            );
+            let stream_start = pdf_find(&bytes, b"stream\n").expect("content stream") + 7;
+            assert_eq!(
+                &bytes[stream_start..stream_start + 2],
+                &[0x78, 0x9C],
+                "the stream begins with the zlib header"
+            );
+            assert!(
+                pdf_find(&bytes, b" Tj").is_none(),
+                "no text operator exists outside the compressed stream"
+            );
+            bytes
+        }
+        GeneratedPdfCase::ScannedImageOnly => {
+            let mut pdf = PdfBuilder::new();
+            let catalog = pdf.object(b"<< /Type /Catalog /Pages 2 0 R >>");
+            pdf.object(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+            pdf.object(
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                  /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>",
+            );
+            pdf.stream_object(
+                " /Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                 /ColorSpace /DeviceGray /BitsPerComponent 8",
+                &[0x7F],
+            );
+            pdf.stream_object("", b"q 612 0 0 792 0 0 cm /Im0 Do Q");
+            let bytes = pdf.finish(catalog, "");
+            assert!(
+                pdf_find(&bytes, b"/Subtype /Image").is_some(),
+                "image xobject"
+            );
+            assert!(
+                pdf_find(&bytes, b" Tj").is_none() && pdf_find(&bytes, b" TJ").is_none(),
+                "a scanned page carries no text-showing operator"
+            );
+            bytes
+        }
+        GeneratedPdfCase::Encrypted => {
+            const USER_PASSWORD: &[u8] = b"viva-user";
+            const OWNER_PASSWORD: &[u8] = b"viva-owner";
+            const PERMISSIONS: i32 = -1;
+            let document_id: [u8; 16] = [
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+                0xFF, 0x00,
+            ];
+            // Algorithm 3: /O.
+            let owner_digest = pdf_md5(&pdf_padded_password(OWNER_PASSWORD));
+            let owner_entry = pdf_rc4(&owner_digest[..5], &pdf_padded_password(USER_PASSWORD));
+            assert_eq!(owner_entry.len(), 32, "/O is 32 bytes");
+            // Algorithm 2: the file encryption key.
+            let mut key_input = Vec::new();
+            key_input.extend_from_slice(&pdf_padded_password(USER_PASSWORD));
+            key_input.extend_from_slice(&owner_entry);
+            key_input.extend_from_slice(&PERMISSIONS.to_le_bytes());
+            key_input.extend_from_slice(&document_id);
+            let encryption_key = pdf_md5(&key_input)[..5].to_vec();
+            // Algorithm 4: /U for revision 2.
+            let user_entry = pdf_rc4(&encryption_key, &PDF_PASSWORD_PADDING);
+            assert_eq!(user_entry.len(), 32, "/U is 32 bytes");
+            // Algorithm 1: the per-object key for the content stream (object 5).
+            let mut object_key_input = encryption_key.clone();
+            object_key_input.extend_from_slice(&5u32.to_le_bytes()[..3]);
+            object_key_input.extend_from_slice(&0u32.to_le_bytes()[..2]);
+            let object_key =
+                pdf_md5(&object_key_input)[..(encryption_key.len() + 5).min(16)].to_vec();
+            let encrypted_content = pdf_rc4(&object_key, PDF_TEXT_STREAM);
+            assert_ne!(
+                encrypted_content.as_slice(),
+                PDF_TEXT_STREAM,
+                "the content stream must actually be encrypted"
+            );
+
+            let mut pdf = PdfBuilder::new();
+            let catalog = pdf.object(b"<< /Type /Catalog /Pages 2 0 R >>");
+            pdf.object(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+            pdf.object(
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                  /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            );
+            pdf.object(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+            pdf.stream_object("", &encrypted_content);
+            let encrypt_dictionary = format!(
+                "<< /Filter /Standard /V 1 /R 2 /O <{}> /U <{}> /P {PERMISSIONS} >>",
+                pdf_hex(&owner_entry),
+                pdf_hex(&user_entry)
+            );
+            let encrypt = pdf.object(encrypt_dictionary.as_bytes());
+            let trailer_extra = format!(
+                " /Encrypt {encrypt} 0 R /ID [<{}> <{}>]",
+                pdf_hex(&document_id),
+                pdf_hex(&document_id)
+            );
+            let bytes = pdf.finish(catalog, &trailer_extra);
+            assert!(
+                pdf_find(&bytes, b"/Filter /Standard").is_some(),
+                "std handler"
+            );
+            assert!(pdf_find(&bytes, b"/R 2").is_some(), "revision 2");
+            assert!(
+                pdf_find(&bytes, format!("/Encrypt {encrypt} 0 R").as_bytes()).is_some(),
+                "the trailer references the encrypt dictionary"
+            );
+            assert!(
+                pdf_find(&bytes, b"Mitosis chromosome").is_none(),
+                "no plaintext survives in the encrypted file"
+            );
+            bytes
+        }
+        GeneratedPdfCase::MalformedXref => {
+            let complete = generated_pdf(GeneratedPdfCase::TextUncompressed);
+            let xref_start = pdf_find(&complete, b"xref\n").expect("xref keyword present");
+            let mut truncated = complete[..xref_start + 12].to_vec();
+            truncated.extend_from_slice(b"000000");
+            assert!(
+                truncated.starts_with(b"%PDF-1.7"),
+                "still claims to be a PDF"
+            );
+            assert!(
+                pdf_find(&truncated, b"trailer").is_none()
+                    && pdf_find(&truncated, b"startxref").is_none(),
+                "the xref and trailer really are gone"
+            );
+            truncated
+        }
+        GeneratedPdfCase::MagicHeaderPlaintext => {
+            let bytes = PDF_MAGIC_HEADER_PLAINTEXT.as_bytes().to_vec();
+            assert!(bytes.starts_with(b"%PDF"), "carries the magic prefix");
+            assert!(pdf_find(&bytes, b" obj").is_none(), "carries no PDF object");
+            assert!(pdf_find(&bytes, b"xref").is_none(), "carries no xref table");
+            assert!(std::str::from_utf8(&bytes).is_ok(), "is valid UTF-8 prose");
+            bytes
+        }
+    }
+}
+
+/// The store facts a refused upload must never create.
+fn ingestion_artifact_counts(store: &data::InMemoryStudyStore) -> serde_json::Value {
+    serde_json::to_value(store.snapshot()).expect("store snapshot serializes")
+}
+
+fn assert_sanitized_upload_refusal(text: &str, expected_code: &str) {
+    let payload: serde_json::Value = serde_json::from_str(text).expect("refusal is JSON");
+    assert_eq!(payload["error"], expected_code, "{text}");
+    assert_eq!(payload["message"], UNSUPPORTED_UPLOAD_MESSAGE, "{text}");
+    for forbidden in [
+        "session_token",
+        "viva1.",
+        "study_set",
+        "session_id",
+        "documents",
+        "source_spans",
+        "concepts",
+        "questions",
+        "%PDF",
+        "unsupported_pdf",
+        "page-aware",
+        "Mitosis",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "refusal leaked {forbidden}: {text}"
+        );
+    }
+}
+
+/// `COR-04` / `SERVICE-016`: every generated PDF category fails closed at the
+/// ingestion route with one sanitized `400`, and the store is byte-identical after.
+#[tokio::test]
+async fn ingestion_unsupported_pdf_fails_closed_on_create() {
+    for case in GeneratedPdfCase::ALL {
+        let (app, counts, inner) = ingestion_app();
+        let before = ingestion_artifact_counts(&inner);
+        let response = app
+            .oneshot(ingestion_request(
+                "/study-sets/files",
+                serde_json::json!({
+                    "title": "Bio PDF",
+                    "course": "Biology 201",
+                    "exam_date": null,
+                    "file_name": case.file_name(),
+                    "content_type": "application/pdf",
+                    "file_base64": STANDARD.encode(generated_pdf(case)),
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case:?}");
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "no-store",
+            "{case:?}"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_sanitized_upload_refusal(&text, "file_ingestion_failed");
+        assert_eq!(counts.create_file.load(Ordering::SeqCst), 1, "{case:?}");
+        assert_eq!(
+            ingestion_artifact_counts(&inner),
+            before,
+            "{case:?} changed durable state"
+        );
+    }
+}
+
+/// `COR-04`: the retry route fails closed identically, and a legitimate pre-existing
+/// failed record is left byte-for-byte unchanged — it never becomes `retry` or `ready`.
+#[tokio::test]
+async fn ingestion_unsupported_pdf_fails_closed_on_retry() {
+    let (app, counts, inner) = ingestion_app();
+    let seeded = app
+        .clone()
+        .oneshot(ingestion_request(
+            "/study-sets/files",
+            serde_json::json!({
+                "title": "Bad Upload",
+                "course": null,
+                "exam_date": null,
+                "file_name": "empty.txt",
+                "content_type": "text/plain",
+                "file_base64": STANDARD.encode(b"!!! ??? ---"),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(seeded.status(), StatusCode::CREATED);
+    let seeded_bytes = seeded.into_body().collect().await.unwrap().to_bytes();
+    let seeded_payload: serde_json::Value = serde_json::from_slice(&seeded_bytes).unwrap();
+    assert_eq!(seeded_payload["study_set"]["ingestion_status"], "failed");
+    let study_set_id = seeded_payload["study_set"]["id"]
+        .as_str()
+        .expect("failed study set id")
+        .to_owned();
+    let before = ingestion_artifact_counts(&inner);
+
+    for case in GeneratedPdfCase::ALL {
+        let response = app
+            .clone()
+            .oneshot(ingestion_request(
+                &format!("/study-sets/{study_set_id}/files/retry?user_id=user-1"),
+                serde_json::json!({
+                    "file_name": case.file_name(),
+                    "content_type": "application/pdf",
+                    "file_base64": STANDARD.encode(generated_pdf(case)),
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case:?}");
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "no-store",
+            "{case:?}"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_sanitized_upload_refusal(&text, "file_retry_failed");
+        assert_eq!(
+            ingestion_artifact_counts(&inner),
+            before,
+            "{case:?} mutated the pre-existing failed record"
+        );
+    }
+    assert_eq!(counts.retry_file.load(Ordering::SeqCst), 6);
+}
+
 #[tokio::test]
 async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token() {
     let store = Arc::new(data::InMemoryStudyStore::new());
@@ -699,7 +2843,7 @@ async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -707,8 +2851,11 @@ async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token
     );
     let app = build_router(state);
     let pasted_text = "mitosis chromosome spindle metaphase cytokinesis";
-    let forged_excerpt = "browser forged source excerpt should never survive";
 
+    // `SERVICE-015`: an authority-shaped member is no longer silently discarded, it
+    // is rejected outright — see `ingestion_request_shape_rejects_authority_and_unknown_members`.
+    // What remains provable here is the other half: a contract-shaped request returns
+    // only server-derived facts.
     let response = app
         .oneshot(
             Request::builder()
@@ -718,29 +2865,10 @@ async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "user_id": "attacker-user",
-                        "session_id": "attacker-session",
                         "title": "Cell Division",
                         "course": "Biology 201",
+                        "exam_date": null,
                         "pasted_text": pasted_text,
-                        "source_spans": [{
-                            "id": "browser-span",
-                            "document_id": "browser-doc",
-                            "locator": { "page": 7, "bbox": [1, 2, 3, 4], "span": "page:7:bbox" },
-                            "excerpt": forged_excerpt,
-                            "confidence": "high",
-                            "retrieval_reason": "browser supplied"
-                        }],
-                        "questions": [{
-                            "source": {
-                                "source_id": "browser-span",
-                                "document_id": "browser-doc",
-                                "span": "page:7:bbox",
-                                "excerpt": forged_excerpt,
-                                "confidence": "high",
-                                "retrieval_reason": "browser supplied"
-                            }
-                        }]
                     })
                     .to_string(),
                 ))
@@ -761,7 +2889,6 @@ async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["study_set"]["ingestion_status"], "ready");
     assert_eq!(payload["study_set"]["user_id"], "user-1");
-    assert_ne!(payload["session_id"], "attacker-session");
     assert_eq!(payload["documents"][0]["processing_status"], "ready");
     let locator = &payload["source_spans"][0]["locator"];
     assert!(locator["span"].as_str().unwrap().starts_with("chars:"));
@@ -772,10 +2899,6 @@ async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token
     assert_ne!(excerpt, pasted_text);
     let payload_json = payload.to_string();
     assert!(!payload_json.contains(pasted_text));
-    assert!(!payload_json.contains("browser-span"));
-    assert!(!payload_json.contains("browser-doc"));
-    assert!(!payload_json.contains(forged_excerpt));
-    assert!(!payload_json.contains("page:7:bbox"));
     assert!(excerpt.chars().count() <= 360);
     assert_eq!(
         payload["source_spans"][0]["id"],
@@ -804,14 +2927,17 @@ async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token
 }
 
 #[tokio::test]
-async fn file_study_set_route_creates_server_owned_ready_pdf_without_exact_region_claims() {
+async fn file_study_set_route_creates_server_owned_ready_document_without_exact_region_claims() {
     let store = Arc::new(data::InMemoryStudyStore::new());
     let app = build_router(test_state_with_session_token_and_store(
         "session-secret",
         store.clone(),
     ));
+    // `COR-04`: a PDF of any shape now fails closed at ingestion, proven by
+    // `ingestion_unsupported_pdf_fails_closed_on_create`. The property this test owns
+    // is the supported-upload lifecycle: server-owned spans with document-level
+    // locators and no exact page or bounding-box claim.
     let file_text = [
-        "%PDF-1.7",
         "Mitochondria electron transport builds a proton gradient for ATP synthase.",
         "NADH carries electrons to Complex I and oxygen accepts electrons at the chain end.",
         "Chemiosmosis connects proton movement with ATP production.",
@@ -828,11 +2954,11 @@ async fn file_study_set_route_creates_server_owned_ready_pdf_without_exact_regio
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "title": "Bio PDF",
+                        "title": "Bio Notes",
                         "course": "Biology 201",
                         "exam_date": null,
-                        "file_name": "Lecture 9.pdf",
-                        "content_type": "application/pdf",
+                        "file_name": "Lecture 9.txt",
+                        "content_type": "text/plain",
                         "file_base64": STANDARD.encode(file_text.as_bytes()),
                     })
                     .to_string(),
@@ -846,8 +2972,8 @@ async fn file_study_set_route_creates_server_owned_ready_pdf_without_exact_regio
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["study_set"]["ingestion_status"], "ready");
-    assert_eq!(payload["documents"][0]["display_name"], "Lecture 9.pdf");
-    assert_eq!(payload["documents"][0]["source_kind"], "pdf");
+    assert_eq!(payload["documents"][0]["display_name"], "Lecture 9.txt");
+    assert_eq!(payload["documents"][0]["source_kind"], "file");
     assert_eq!(payload["documents"][0]["processing_status"], "ready");
     assert!(payload["session_token"]
         .as_str()
@@ -885,11 +3011,11 @@ async fn file_study_set_route_creates_server_owned_ready_pdf_without_exact_regio
         .as_array()
         .unwrap()
         .iter()
-        .find(|set| set["title"] == "Bio PDF")
+        .find(|set| set["title"] == "Bio Notes")
         .expect("file study set in library");
     assert_eq!(file_set["ingestion_status"], "ready");
     assert_eq!(file_set["actions"]["start"]["available"], true);
-    assert_eq!(file_set["documents"][0]["source_kind"], "pdf");
+    assert_eq!(file_set["documents"][0]["source_kind"], "file");
 
     let snapshot_json = serde_json::to_string(&store.snapshot()).unwrap();
     assert!(!snapshot_json.contains(&file_text));
@@ -898,6 +3024,10 @@ async fn file_study_set_route_creates_server_owned_ready_pdf_without_exact_regio
 
 #[tokio::test]
 async fn file_study_set_route_blocks_failed_upload_and_retries_to_ready() {
+    // `COR-04`: PDF uploads never reach this lifecycle at all — they fail closed, and
+    // `ingestion_unsupported_pdf_fails_closed_on_retry` proves a pre-existing failed
+    // record survives a PDF retry unchanged. This test keeps the supported-upload
+    // failed / retry / ready progression.
     let app = build_router(test_state_with_rest_auth(
         4,
         Arc::new(data::InMemoryStudyStore::seeded_fixture()),
@@ -912,11 +3042,11 @@ async fn file_study_set_route_blocks_failed_upload_and_retries_to_ready() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "title": "Bad PDF",
+                        "title": "Bad Upload",
                         "course": null,
                         "exam_date": null,
-                        "file_name": "empty.pdf",
-                        "content_type": "application/pdf",
+                        "file_name": "empty.txt",
+                        "content_type": "text/plain",
                         "file_base64": STANDARD.encode(b"!!! ??? ---"),
                     })
                     .to_string(),
@@ -976,8 +3106,8 @@ async fn file_study_set_route_blocks_failed_upload_and_retries_to_ready() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "file_name": "still-empty.pdf",
-                        "content_type": "application/pdf",
+                        "file_name": "still-empty.txt",
+                        "content_type": "text/plain",
                         "file_base64": STANDARD.encode(b"??? --- !!!"),
                     })
                     .to_string(),
@@ -1041,8 +3171,8 @@ async fn file_study_set_route_blocks_failed_upload_and_retries_to_ready() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "file_name": "replacement.pdf",
-                        "content_type": "application/pdf",
+                        "file_name": "replacement.txt",
+                        "content_type": "text/plain",
                         "file_base64": STANDARD.encode(retry_text.as_bytes()),
                     })
                     .to_string(),
@@ -1072,7 +3202,7 @@ async fn paste_study_set_route_does_not_mint_session_token_for_failed_ingestion(
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -1195,7 +3325,7 @@ async fn library_route_projects_server_owned_sets_and_completed_session_history(
         active: true,
     });
 
-    store
+    let _outcome = store
         .record_voice_session(&SessionConfig {
             session_id: Some(SessionId::new("voice-session-1")),
             user_id: Some("user-1".to_owned()),
@@ -1224,18 +3354,28 @@ async fn library_route_projects_server_owned_sets_and_completed_session_history(
             "voice-session-1",
             "response-recap",
             StudySessionRecap {
+                schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+                deferred_turns: 0,
                 voice_session_id: "voice-session-1".to_owned(),
                 headline: "Completed session".to_owned(),
                 summary: "NADH needs one more recall pass.".to_owned(),
-                strong_concepts: vec!["oxidative-phosphorylation".to_owned()],
-                shaky_concepts: vec!["nadh".to_owned()],
-                missed_concepts: vec![],
-                review_later: vec!["nadh".to_owned()],
+                concepts: vec![
+                    agent_domain::RecapConceptOutcome {
+                        concept_id: "oxidative-phosphorylation".to_owned(),
+                        label: "oxidative-phosphorylation".to_owned(),
+                        status: agent_domain::ConceptStatus::Strong,
+                    },
+                    agent_domain::RecapConceptOutcome {
+                        concept_id: "nadh".to_owned(),
+                        label: "nadh".to_owned(),
+                        status: agent_domain::ConceptStatus::Shaky,
+                    },
+                ],
+                review_schedule: vec![],
                 next_action: "Review NADH tomorrow.".to_owned(),
-                source_moments: vec![RecapSourceMoment {
-                    text: "NADH needs one more recall pass.".to_owned(),
-                    source: agent_domain::fixture_source_reference(),
-                    status: ConceptStatus::Shaky,
+                source_moments: vec![agent_domain::learning_recap::RecapSourceMoment {
+                    response_id: "response-recap".to_owned(),
+                    source_id: agent_domain::fixture_source_reference().source_id.clone(),
                 }],
             },
         )
@@ -1245,7 +3385,7 @@ async fn library_route_projects_server_owned_sets_and_completed_session_history(
         .close_voice_session("voice-session-1", "completed")
         .await
         .unwrap();
-    store
+    let _outcome = store
         .record_voice_session(&SessionConfig {
             session_id: Some(SessionId::new("open-session-1")),
             user_id: Some("user-1".to_owned()),
@@ -1261,7 +3401,7 @@ async fn library_route_projects_server_owned_sets_and_completed_session_history(
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -1673,10 +3813,30 @@ async fn delete_study_set_tombstones_sources_hides_history_and_is_idempotent() {
     assert_eq!(first.status(), axum::http::StatusCode::OK);
     let first_body = first.into_body().collect().await.unwrap().to_bytes();
     let first_payload: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    // `D-05 HARD_PURGE_TEXT`: Plan 09's receipt is content-free and derivable from
+    // the tombstone alone, so it carries no per-request counts. The pre-D-05
+    // `deleted_documents` / `hidden_sessions` counters are gone, and a replay must
+    // return byte-identical bytes rather than a second set of zeroed counters.
+    assert_eq!(
+        first_payload
+            .as_object()
+            .expect("deletion receipt is an object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            "deleted_at".to_owned(),
+            "policy".to_owned(),
+            "status".to_owned(),
+            "study_set_id".to_owned(),
+        ]
+    );
     assert_eq!(first_payload["study_set_id"], "biology-midterm");
     assert_eq!(first_payload["status"], "deleted");
-    assert_eq!(first_payload["deleted_documents"], 1);
-    assert_eq!(first_payload["hidden_sessions"], 1);
+    assert_eq!(first_payload["policy"], "hard_purge_text");
+    assert!(first_payload["deleted_at"].as_str().is_some_and(|value| {
+        value.ends_with('Z') && agent_domain::parse_utc_instant(value).is_some()
+    }));
 
     let second = app
         .clone()
@@ -1694,8 +3854,10 @@ async fn delete_study_set_tombstones_sources_hides_history_and_is_idempotent() {
     assert_eq!(second.status(), axum::http::StatusCode::OK);
     let second_body = second.into_body().collect().await.unwrap().to_bytes();
     let second_payload: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
-    assert_eq!(second_payload["deleted_documents"], 0);
-    assert_eq!(second_payload["hidden_sessions"], 0);
+    assert_eq!(
+        second_payload, first_payload,
+        "an idempotent delete replays the original receipt byte for byte"
+    );
 
     let library = app
         .clone()
@@ -1713,20 +3875,17 @@ async fn delete_study_set_tombstones_sources_hides_history_and_is_idempotent() {
     assert_eq!(library.status(), axum::http::StatusCode::OK);
     let library_body = library.into_body().collect().await.unwrap().to_bytes();
     let library_payload: serde_json::Value = serde_json::from_slice(&library_body).unwrap();
-    let biology = library_payload["study_sets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|set| set["id"] == "biology-midterm")
-        .expect("biology study set");
-    assert_eq!(biology["documents"][0]["deleted"], true);
-    assert_eq!(biology["question_count"], 0);
-    assert_eq!(biology["actions"]["start"]["available"], false);
-    assert_eq!(
-        biology["actions"]["start"]["unavailable_reason"],
-        "source_deleted"
+    // `D-05 HARD_PURGE_TEXT`: the tombstone is the one place a read path asks
+    // "is this deleted?", and every projection excludes it. There is no residual
+    // soft-deleted row carrying document flags, counts, or disabled actions.
+    assert!(
+        !library_payload["study_sets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|set| set["id"] == "biology-midterm"),
+        "a hard-purged set is not projected back to the library"
     );
-    assert_eq!(biology["actions"]["delete"]["available"], false);
     assert!(library_payload["sessions"].as_array().unwrap().is_empty());
 
     let cross_user = app
@@ -1741,7 +3900,605 @@ async fn delete_study_set_tombstones_sources_hides_history_and_is_idempotent() {
         )
         .await
         .unwrap();
-    assert_eq!(cross_user.status(), axum::http::StatusCode::NOT_FOUND);
+    // `SERVICE-016` / `DATA-014`: status is selected only from `PortErrorKind`, and
+    // the closed taxonomy has no "not found" kind. A cross-user target answers with
+    // the same coarse `Unavailable` status and fixed prose as any other set this
+    // caller cannot read, so the response distinguishes "not yours" from "does not
+    // exist" no more than the old 404 did.
+    assert_eq!(
+        cross_user.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let cross_user_body = cross_user.into_body().collect().await.unwrap().to_bytes();
+    let cross_user_payload: serde_json::Value = serde_json::from_slice(&cross_user_body).unwrap();
+    assert_eq!(cross_user_payload["error"], "study_set_delete_failed");
+    assert_eq!(
+        cross_user_payload["message"],
+        "the requested resource is unavailable"
+    );
+}
+
+// --- `SERVICE-011` authenticated study projection --------------------------------
+
+const PROJECTION_SESSION_SECRET: &str = "viva-fixture-projection-signing-secret";
+const PROJECTION_ORIGIN: &str = "http://localhost:3000";
+
+/// Counts every projection read and the exact tuple it was asked for, so a
+/// confused-deputy request can be proven never to reach the store.
+type PortErrorFactory = Box<dyn Fn() -> PortError + Send + Sync>;
+
+struct ProjectionAuditStore {
+    inner: Arc<data::InMemoryStudyStore>,
+    reads: Mutex<Vec<(String, String, String)>>,
+    fail: Option<PortErrorFactory>,
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for ProjectionAuditStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+
+    async fn delete_study_set(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner.delete_study_set(user_id, study_set_id).await
+    }
+
+    async fn authenticated_study_projection(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::AuthenticatedStudyProjectionV1, PortError> {
+        self.reads.lock().expect("read log").push((
+            user_id.to_owned(),
+            study_set_id.to_owned(),
+            voice_session_id.to_owned(),
+        ));
+        if let Some(fail) = &self.fail {
+            return Err(fail());
+        }
+        self.inner
+            .authenticated_study_projection(user_id, study_set_id, voice_session_id)
+            .await
+    }
+}
+
+async fn projection_app(
+    fail: Option<PortErrorFactory>,
+) -> (
+    axum::Router,
+    Arc<ProjectionAuditStore>,
+    Arc<data::InMemoryStudyStore>,
+) {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    seed_completed_library_session(&inner).await;
+    let store = Arc::new(ProjectionAuditStore {
+        inner: inner.clone(),
+        reads: Mutex::new(Vec::new()),
+        fail,
+    });
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(inner.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some(PROJECTION_SESSION_SECRET.into()),
+            allowed_origins: vec![PROJECTION_ORIGIN.to_owned()],
+        },
+        4,
+        store.clone(),
+    )
+    .with_operator_access(OperatorAccess::new(Some(
+        FIXTURE_OPERATOR_CREDENTIAL.into(),
+    )))
+    .with_projection_read_access(ProjectionReadAccess::new(
+        FIXTURE_LIBRARY_READ_CREDENTIAL.into(),
+        PROJECTION_SESSION_SECRET.into(),
+        vec![PROJECTION_ORIGIN.to_owned()],
+    ));
+    (build_router(state), store, inner)
+}
+
+fn projection_token(user_id: &str, study_set_id: &str, session_id: &str, nonce: &str) -> String {
+    signed_session_token(
+        PROJECTION_SESSION_SECRET,
+        user_id,
+        study_set_id,
+        session_id,
+        unix_timestamp_now() + 60,
+        nonce,
+    )
+}
+
+struct ProjectionRequest<'a> {
+    uri: &'a str,
+    bearer: Option<&'a str>,
+    session_token: Option<&'a str>,
+    origin: Option<&'a str>,
+}
+
+fn projection_request(request: ProjectionRequest<'_>) -> Request<Body> {
+    let mut builder = Request::builder().method("GET").uri(request.uri);
+    if let Some(bearer) = request.bearer {
+        builder = builder.header("authorization", format!("Bearer {bearer}"));
+    }
+    if let Some(token) = request.session_token {
+        builder = builder.header("x-viva-session-token", token);
+    }
+    if let Some(origin) = request.origin {
+        builder = builder.header("origin", origin);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+const VALID_PROJECTION_URI: &str =
+    "/v1/study-sets/biology-midterm/projection?voice_session_id=voice-session-1";
+
+/// `SERVICE-011`: the projection route is authorized by the Plan 11 scoped read
+/// credential plus a signed access credential, and its identity comes only from the
+/// verified claims. Every rejection is coarse and echoes no credential.
+#[tokio::test]
+async fn authenticated_projection_requires_both_scoped_credentials() {
+    let (app, store, _inner) = projection_app(None).await;
+    let token = projection_token("user-1", "biology-midterm", "voice-session-1", "proj-1");
+
+    let cases: Vec<(&str, ProjectionRequest<'_>, StatusCode)> = vec![
+        (
+            "no scoped bearer",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: None,
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "wrong scoped bearer",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some("viva-fixture-not-the-read-credential-1"),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "operator bearer must not authorize a projection read",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_OPERATOR_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "session token alone must not authorize",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: None,
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "scoped bearer alone must not authorize",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: None,
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "malformed session token",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some("viva1.not-a-token"),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "missing origin",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: None,
+            },
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "wrong origin",
+            ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some("https://evil.example"),
+            },
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "duplicate query key",
+            ProjectionRequest {
+                uri: "/v1/study-sets/biology-midterm/projection?voice_session_id=voice-session-1&voice_session_id=voice-session-1",
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "extra query key",
+            ProjectionRequest {
+                uri: "/v1/study-sets/biology-midterm/projection?voice_session_id=voice-session-1&user_id=user-1",
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "missing query key",
+            ProjectionRequest {
+                uri: "/v1/study-sets/biology-midterm/projection",
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "path study set does not match the claim",
+            ProjectionRequest {
+                uri: "/v1/study-sets/chemistry-final/projection?voice_session_id=voice-session-1",
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "query session does not match the claim",
+            ProjectionRequest {
+                uri: "/v1/study-sets/biology-midterm/projection?voice_session_id=voice-session-9",
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            },
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+
+    for (label, request, expected) in cases {
+        let response = app
+            .clone()
+            .oneshot(projection_request(request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{label}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        for forbidden in [
+            FIXTURE_LIBRARY_READ_CREDENTIAL,
+            FIXTURE_OPERATOR_CREDENTIAL,
+            PROJECTION_SESSION_SECRET,
+            token.as_str(),
+            "user-1",
+            "proj-1",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{label} leaked credential or subject material: {text}"
+            );
+        }
+        // Every denial body is one of exactly three fixed public shapes. Serde and
+        // extractor diagnostics never reach the caller.
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let (code, message) = match expected {
+            StatusCode::UNAUTHORIZED => (
+                "projection_unauthorized",
+                "projection access is not authorized",
+            ),
+            StatusCode::FORBIDDEN => ("projection_forbidden", "projection access is forbidden"),
+            StatusCode::BAD_REQUEST => ("projection_invalid", "projection request is invalid"),
+            other => panic!("{label} produced an unclassified status {other}"),
+        };
+        assert_eq!(payload["error"], code, "{label}");
+        assert_eq!(payload["message"], message, "{label}");
+    }
+
+    assert!(
+        store.reads.lock().expect("read log").is_empty(),
+        "no rejected request may reach the store"
+    );
+}
+
+/// `SERVICE-011`: an expired or wrongly signed access credential is refused with the
+/// same coarse status, and neither reaches the store.
+#[tokio::test]
+async fn authenticated_projection_rejects_expired_and_forged_tokens() {
+    let (app, store, _inner) = projection_app(None).await;
+    let expired = signed_session_token(
+        PROJECTION_SESSION_SECRET,
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() - 1,
+        "proj-expired",
+    );
+    let forged = signed_session_token(
+        "viva-fixture-not-the-projection-secret",
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() + 60,
+        "proj-forged",
+    );
+
+    for token in [expired, forged] {
+        let response = app
+            .clone()
+            .oneshot(projection_request(ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    assert!(store.reads.lock().expect("read log").is_empty());
+}
+
+/// `SERVICE-011`: a credential for user A plus a path and query naming user B's live
+/// study set and session is refused before any store read for B.
+#[tokio::test]
+async fn authenticated_projection_refuses_the_confused_deputy() {
+    let (app, store, inner) = projection_app(None).await;
+    inner.upsert_study_set(data::StudySetRecord {
+        study_set_id: "victim-set".to_owned(),
+        user_id: "user-2".to_owned(),
+        title: "Victim Set".to_owned(),
+        course: None,
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    let attacker = projection_token("user-1", "biology-midterm", "voice-session-1", "proj-cd");
+
+    let response = app
+        .oneshot(projection_request(ProjectionRequest {
+            uri: "/v1/study-sets/victim-set/projection?voice_session_id=voice-session-2",
+            bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+            session_token: Some(&attacker),
+            origin: Some(PROJECTION_ORIGIN),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(!text.contains("victim-set") && !text.contains("user-2"));
+    assert!(
+        store.reads.lock().expect("read log").is_empty(),
+        "the store is never asked about another user's set"
+    );
+}
+
+/// `SERVICE-011`: the authorized read returns Plan 04's exact type, keyed only by the
+/// verified claims, with no-store caching and nosniff.
+#[tokio::test]
+async fn authenticated_projection_returns_the_claim_bound_projection() {
+    let (app, store, inner) = projection_app(None).await;
+    let token = projection_token("user-1", "biology-midterm", "voice-session-1", "proj-ok");
+
+    let response = app
+        .clone()
+        .oneshot(projection_request(ProjectionRequest {
+            uri: VALID_PROJECTION_URI,
+            bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+            session_token: Some(&token),
+            origin: Some(PROJECTION_ORIGIN),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let returned: agent_domain::AuthenticatedStudyProjectionV1 =
+        serde_json::from_slice(&body).expect("the route returns Plan 04's exact type");
+    let expected = inner
+        .authenticated_study_projection("user-1", "biology-midterm", "voice-session-1")
+        .await
+        .expect("store projection");
+    assert_eq!(returned, expected, "the route must not reshape the type");
+    assert_eq!(
+        store.reads.lock().expect("read log").as_slice(),
+        [(
+            "user-1".to_owned(),
+            "biology-midterm".to_owned(),
+            "voice-session-1".to_owned(),
+        )],
+        "identity comes only from the verified claims"
+    );
+}
+
+/// `SERVICE-011`: a store failure is reported through the shared coarse taxonomy
+/// mapping under this route's own error code, and never leaks the scoped credential.
+///
+/// The exact `PortErrorKind` to status matrix and the removal of store prose from the
+/// public message are `SERVICE-016`'s remediation of `store_json_error` (Task 7); this
+/// test pins the route code and the credential boundary that hold either way.
+#[tokio::test]
+async fn authenticated_projection_sanitizes_store_failures() {
+    let hostile = format!(
+        "Bearer {FIXTURE_LIBRARY_READ_CREDENTIAL} user-1 voice-session-1 {HOSTILE_TRANSCRIPT_TEXT}"
+    );
+    let unavailable = hostile.clone();
+    let durability = hostile.clone();
+    let factories: Vec<PortErrorFactory> = vec![
+        Box::new(move || PortError::unavailable("memory", "projection-read", unavailable.clone())),
+        Box::new(move || PortError::durability("postgres", "durable-read", durability.clone())),
+    ];
+    for error in factories {
+        let (app, _store, _inner) = projection_app(Some(error)).await;
+        let token = projection_token("user-1", "biology-midterm", "voice-session-1", "proj-fail");
+        let response = app
+            .oneshot(projection_request(ProjectionRequest {
+                uri: VALID_PROJECTION_URI,
+                bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                session_token: Some(&token),
+                origin: Some(PROJECTION_ORIGIN),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error() || response.status().is_server_error(),
+            "a failed store read is never a success"
+        );
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["error"], "projection_failed",
+            "the caller learns only this route's coarse code"
+        );
+    }
+}
+
+/// `D-04 CONFIRM_DELETE`: no restore route exists. This characterization is the guard
+/// that a later half-implementation cannot land silently.
+#[tokio::test]
+async fn restore_route_absent_when_confirm_delete_selected() {
+    let (app, _store, _inner) = projection_app(None).await;
+    for method in ["POST", "GET"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/v1/study-sets/biology-midterm/restore")
+                    .header("origin", PROJECTION_ORIGIN)
+                    .header(
+                        "authorization",
+                        format!("Bearer {FIXTURE_LIBRARY_READ_CREDENTIAL}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{method} /v1/study-sets/{{id}}/restore must not exist under CONFIRM_DELETE"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1837,7 +4594,7 @@ async fn library_route_rejects_cross_user_token_minting_without_rest_auth() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -1867,7 +4624,7 @@ async fn library_route_rejects_public_unauthenticated_token_minting() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec!["https://viva.example".to_owned()],
         },
         4,
@@ -1898,8 +4655,8 @@ async fn library_route_mints_session_tokens_with_public_bearer_auth() {
         Arc::new(SyntheticBrain::with_study_store(store.clone())),
         "synthetic",
         VoiceWsAccess {
-            required_bearer: Some("rest-secret".to_owned()),
-            session_token_secret: Some("session-secret".to_owned()),
+            required_bearer: Some("rest-secret".into()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec!["https://viva.example".to_owned()],
         },
         4,
@@ -1945,7 +4702,7 @@ async fn paste_study_set_route_rejects_public_unauthenticated_token_minting() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec!["https://viva.example".to_owned()],
         },
         4,
@@ -1984,7 +4741,7 @@ async fn paste_study_set_route_rejects_public_unauthenticated_token_minting() {
             "synthetic",
             VoiceWsAccess {
                 required_bearer: None,
-                session_token_secret: Some("session-secret".to_owned()),
+                session_token_secret: Some("session-secret".into()),
                 allowed_origins: vec!["https://viva.example".to_owned()],
             },
             4,
@@ -2386,6 +5143,7 @@ async fn websocket_first_frame_timeout_records_terminal_reason() {
         first_frame: Duration::from_millis(25),
         idle: Duration::from_secs(30),
         session: Duration::from_secs(30),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -2397,7 +5155,7 @@ async fn websocket_first_frame_timeout_records_terminal_reason() {
     let error = read_server_frame(&mut socket).await;
     assert!(matches!(
         error,
-        ServerFrame::Error { message, .. } if message == "first client frame timeout"
+        ServerFrame::Error { error, .. } if error.message == "first client frame timeout"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
 
@@ -2421,7 +5179,7 @@ async fn websocket_malformed_frame_reports_protocol_close_code() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -2435,7 +5193,7 @@ async fn websocket_malformed_frame_reports_protocol_close_code() {
     let error = read_server_frame(&mut socket).await;
     assert!(matches!(
         error,
-        ServerFrame::Error { message, .. } if message == "invalid client frame"
+        ServerFrame::Error { error, .. } if error.message == "invalid client frame"
     ));
     assert_close_code(&mut socket, CloseCode::Protocol).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
@@ -2458,7 +5216,7 @@ async fn websocket_oversized_text_frame_closes_with_size_and_terminal_reason() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -2474,7 +5232,7 @@ async fn websocket_oversized_text_frame_closes_with_size_and_terminal_reason() {
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "text frame exceeds maximum size"
+        ServerFrame::Error { error, .. } if error.message == "text frame exceeds maximum size"
     ));
     assert_close_code(&mut socket, CloseCode::Size).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
@@ -2485,7 +5243,7 @@ async fn websocket_oversized_text_frame_closes_with_size_and_terminal_reason() {
 }
 
 #[tokio::test]
-async fn websocket_oversized_binary_frame_closes_with_size_and_terminal_reason() {
+async fn websocket_binary_frame_closes_as_unsupported_with_terminal_reason() {
     let state = test_state(1);
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -2497,28 +5255,28 @@ async fn websocket_oversized_binary_frame_closes_with_size_and_terminal_reason()
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
     let _ = read_server_frame(&mut socket).await;
     let _ = read_server_frame(&mut socket).await;
+    // Protocol v5 carries audio as bounded JSON chunks, so no binary frame is
+    // acceptable at any size.
     socket
-        .send(WsMessage::Binary(
-            vec![0_u8; agent_service::VIVA_VOICE_MAX_BINARY_FRAME_BYTES + 1].into(),
-        ))
+        .send(WsMessage::Binary(vec![0_u8; 1].into()))
         .await
         .unwrap();
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "binary frame exceeds maximum size"
+        ServerFrame::Error { error, .. } if error.message == "binary client frames are not accepted"
     ));
-    assert_close_code(&mut socket, CloseCode::Size).await;
+    assert_close_code(&mut socket, CloseCode::Unsupported).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::TerminalReason
-            && event.detail == "oversized_binary_frame"
+            && event.detail == "unsupported_binary_frame"
     }));
 }
 
@@ -2529,11 +5287,7 @@ async fn websocket_strips_browser_source_context_before_trusted_output() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-    let mut session_frame = fixture.client[0].clone();
+    let mut session_frame = fixture_session_config_frame();
     let ClientFrame::SessionConfig { session, .. } = &mut session_frame else {
         panic!("expected session config");
     };
@@ -2572,7 +5326,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
     for session in [
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -2584,7 +5338,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         },
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -2596,7 +5350,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         },
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -2608,7 +5362,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         },
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -2620,7 +5374,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         },
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -2642,7 +5396,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         send_client_frame(&mut socket, &session).await;
         assert!(matches!(
             read_server_frame(&mut socket).await,
-            ServerFrame::Error { message, .. } if message == "session auth failed"
+            ServerFrame::Error { error, .. } if error.message == "session auth failed"
         ));
         assert_close_code(&mut socket, CloseCode::Policy).await;
         let auth_events =
@@ -2671,7 +5425,6 @@ async fn websocket_accepts_signed_session_token_matching_initial_config() {
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let (mut socket, _) = connect_async(url).await.unwrap();
     let token = signed_session_token(
         "session-secret",
         "user-1",
@@ -2680,6 +5433,9 @@ async fn websocket_accepts_signed_session_token_matching_initial_config() {
         unix_timestamp_now() + 60,
         "nonce-valid",
     );
+    let (mut socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -2717,6 +5473,8 @@ async fn websocket_records_auth_failure_for_forged_config_refresh() {
             serde_json::json!({
                 "type": "session_config",
                 "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
                 "session": session,
             })
             .to_string()
@@ -2736,6 +5494,8 @@ async fn websocket_records_auth_failure_for_forged_config_refresh() {
             serde_json::json!({
                 "type": "session_config",
                 "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
                 "session": forged_refresh,
             })
             .to_string()
@@ -2746,8 +5506,8 @@ async fn websocket_records_auth_failure_for_forged_config_refresh() {
 
     let frames = read_server_frames_until_close(&mut socket).await;
     for frame in frames {
-        if let ServerFrame::Error { message, .. } = frame {
-            assert_eq!(message, "session auth failed");
+        if let ServerFrame::Error { error, .. } = frame {
+            assert_eq!(error.message, "session auth failed");
         }
     }
     let auth_events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
@@ -2758,6 +5518,757 @@ async fn websocket_records_auth_failure_for_forged_config_refresh() {
             && event.detail.contains("retry_eligible=false")
             && !event.detail.contains("user-2")
     }));
+}
+
+/// `SERVICE-009` / architecture recommendation R2: the service consumes exactly one
+/// typed first-frame parser and one published ready shape. These are source-level
+/// absence characterizations, so an accidental re-introduction of a private shadow
+/// type fails here instead of drifting silently.
+const PROTOCOL_SOURCE: &str = include_str!("../src/protocol.rs");
+const LIB_SOURCE: &str = include_str!("../src/lib.rs");
+const MAIN_SOURCE: &str = include_str!("../src/main.rs");
+
+/// `SERVICE-017`: a module's whole source, root file plus the `src/<name>/*.rs`
+/// responsibility modules it declares, concatenated in a stable order.
+///
+/// Read at run time rather than `include_str!`d so that a structural
+/// characterization is about the RESPONSIBILITY, not about which file currently
+/// holds it — the same assertion has to mean the same thing before and after the
+/// decomposition, without its body being edited.
+fn module_source(name: &str) -> String {
+    module_source_with(name, false)
+}
+
+/// The same concatenation with each file truncated at its own first
+/// `#[cfg(test)]`, so "no production site does X" stays exactly that claim once a
+/// module has been split into several files that each carry their own tests.
+fn production_module_source(name: &str) -> String {
+    module_source_with(name, true)
+}
+
+fn module_source_with(name: &str, production_only: bool) -> String {
+    // A module is either `src/<name>.rs` or `src/<name>/mod.rs`, and may in
+    // addition declare `src/<name>/*.rs` responsibility modules.
+    let root = std::path::PathBuf::from(format!("src/{name}.rs"));
+    let mut paths = if root.exists() {
+        vec![root]
+    } else {
+        Vec::new()
+    };
+    if let Ok(entries) = std::fs::read_dir(format!("src/{name}")) {
+        let mut children = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+            .collect::<Vec<_>>();
+        children.sort();
+        paths.extend(children);
+    }
+    assert!(
+        !paths.is_empty(),
+        "src/{name}.rs or src/{name}/ must exist, read from the crate root"
+    );
+    let mut source = String::new();
+    for path in paths {
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "{} is readable from the crate root: {error}",
+                path.display()
+            )
+        });
+        let text = if production_only {
+            text.split("#[cfg(test)]").next().unwrap_or("").to_owned()
+        } else {
+            text
+        };
+        source.push_str(&text);
+        source.push('\n');
+    }
+    source
+}
+
+fn ws_source() -> String {
+    module_source("ws")
+}
+
+fn app_source() -> String {
+    module_source("app")
+}
+
+/// `app.rs` composes the router from the `src/http` responsibility modules once
+/// they exist, so an HTTP structural characterization spans both.
+fn http_surface_source() -> String {
+    let mut source = app_source();
+    if std::path::Path::new("src/http").exists() {
+        source.push('\n');
+        source.push_str(&module_source("http"));
+    }
+    source
+}
+
+#[test]
+fn protocol_v5_fixture_shadow_types_are_absent() {
+    // `SERVICE-009`: Plan 05's `VOICE-READY-001` removed the duplicate ready shape.
+    assert!(
+        !PROTOCOL_SOURCE.contains("ReadyFrame"),
+        "protocol.rs still declares a duplicate ReadyFrame: return the defect to Plan 05"
+    );
+    assert!(
+        !LIB_SOURCE.contains("ReadyFrame"),
+        "lib.rs still re-exports ReadyFrame: return the defect to Plan 05"
+    );
+
+    // `SERVICE-007`: the private parallel first-frame struct is deleted; the initial
+    // frame is Plan 05's public `ClientFrame::SessionConfig`.
+    assert!(
+        !ws_source().contains("InitialClientFrame"),
+        "ws.rs still declares a private first-frame shadow of ClientFrame::SessionConfig"
+    );
+
+    // `SERVICE-008` overlap: no service-local wire error JSON survives; the only
+    // fallback is Plan 05's published constant.
+    assert!(
+        ws_source().contains("VOICE_SERIALIZATION_FALLBACK_FRAME"),
+        "ws.rs must serialize through Plan 05's published fallback constant"
+    );
+    assert!(
+        !ws_source().contains("VOICE_INTERNAL_SERIALIZATION"),
+        "ws.rs must not restate the fallback frame body"
+    );
+}
+
+/// `SERVICE-002`: one deadline per outbound write, owned in exactly one place.
+///
+/// Every server frame, Ready, provider event, protocol error, Ping/Pong,
+/// terminal frame, and Close frame goes through the single `BoundedSender`, so
+/// the configured write deadline is read exactly once — where that sender is
+/// built — and nowhere else. A second reader would mean a second, unaudited
+/// write-deadline policy, which is the defect this row closes; a send that
+/// wrapped itself in its own `tokio::time::timeout` would be the same defect
+/// wearing a different name. This is a source-level absence characterization,
+/// like its neighbour above, so a re-introduction fails here rather than
+/// drifting silently.
+#[test]
+fn outbound_writes_have_exactly_one_deadline_owner() {
+    assert_eq!(
+        ws_source().matches("ws_timeouts.outbound_write").count(),
+        1,
+        "the outbound write deadline must be read exactly once, where BoundedSender is built"
+    );
+    assert_eq!(
+        ws_source().matches("struct BoundedSender").count(),
+        1,
+        "there is exactly one bounded sender type"
+    );
+    // The deadline is applied by `BoundedSender::send` alone. The only other
+    // `tokio::time::timeout` calls in the module are read-side or drain-side
+    // waits, never a write.
+    let ws_source = ws_source();
+    let bounded_send = ws_source
+        .split_once("impl<S> BoundedSender<S>")
+        .expect("BoundedSender impl block")
+        .1;
+    assert!(
+        bounded_send.contains("tokio::time::timeout(self.timeout, self.inner.send(message))"),
+        "BoundedSender::send is where the write deadline is applied"
+    );
+}
+
+#[derive(Deserialize)]
+struct VoiceFixtureManifest {
+    protocol_version: u32,
+    fixtures: Vec<VoiceFixtureManifestRow>,
+}
+
+#[derive(Deserialize)]
+struct VoiceFixtureManifestRow {
+    id: String,
+    path: String,
+}
+
+/// `SERVICE-007`: the two exact v5 client fixtures deserialize through the imported
+/// contract, and their declared version is the imported constant rather than a
+/// number restated here.
+#[test]
+fn protocol_v5_fixture_client_frames_bind_the_imported_version() {
+    assert_eq!(VIVA_VOICE_PROTOCOL_VERSION, 5);
+
+    let signed_config: ClientFrame = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/v5/client-session-config-signed.json"
+    ))
+    .expect("signed session config fixture parses");
+    let ClientFrame::SessionConfig {
+        version,
+        client_generation_id,
+        session_token,
+        session,
+    } = &signed_config
+    else {
+        panic!("signed config fixture is not a session_config frame");
+    };
+    assert_eq!(*version, VIVA_VOICE_PROTOCOL_VERSION);
+    assert_eq!(signed_config.version(), VIVA_VOICE_PROTOCOL_VERSION);
+    assert_eq!(client_generation_id, "viva-session-bootstrap-1-fixture");
+    assert!(session_token.starts_with("viva1."));
+    assert_eq!(session.user_id.as_deref(), Some("fixture-user"));
+    assert_eq!(session.study_set_id.as_deref(), Some("fixture-study-set"));
+    assert_eq!(
+        session.session_id.as_ref().map(ToString::to_string),
+        Some("fixture-session".to_owned())
+    );
+
+    let refresh: ClientFrame = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/v5/client-session-refresh.json"
+    ))
+    .expect("session refresh fixture parses");
+    let ClientFrame::SessionRefresh {
+        version,
+        client_generation_id,
+        context,
+    } = &refresh
+    else {
+        panic!("refresh fixture is not a session_refresh frame");
+    };
+    assert_eq!(*version, VIVA_VOICE_PROTOCOL_VERSION);
+    assert_eq!(refresh.version(), VIVA_VOICE_PROTOCOL_VERSION);
+    assert_eq!(client_generation_id, "viva-session-bootstrap-1-fixture");
+    assert!(!context.is_empty());
+
+    let manifest: VoiceFixtureManifest = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/v5/manifest.json"
+    ))
+    .expect("manifest parses");
+    assert_eq!(manifest.protocol_version, VIVA_VOICE_PROTOCOL_VERSION);
+    for (id, path) in [
+        (
+            "VOICE-CLIENT-SESSION-CONFIG-SIGNED",
+            "agent/fixtures/voice-protocol/v5/client-session-config-signed.json",
+        ),
+        (
+            "VOICE-CLIENT-SESSION-REFRESH",
+            "agent/fixtures/voice-protocol/v5/client-session-refresh.json",
+        ),
+    ] {
+        assert!(
+            manifest
+                .fixtures
+                .iter()
+                .any(|row| row.id == id && row.path == path),
+            "manifest does not name {id}"
+        );
+    }
+}
+
+/// A provider that keeps every `BrainInput` the socket admits, so a refresh test can
+/// read the server-owned session identity the provider actually received.
+struct RecordingInputBrain {
+    inputs: Arc<Mutex<Vec<BrainInput>>>,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for RecordingInputBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "recording_input".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(&self, _config: SessionConfig) -> Result<RealtimeSession, BrainError> {
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(16);
+        let (event_tx, events) = mpsc::channel(16);
+        let inputs = self.inputs.clone();
+        tokio::spawn(async move {
+            while let Some(received) = input_rx.recv().await {
+                inputs.lock().expect("input log lock").push(received);
+            }
+            drop(event_tx);
+        });
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: None,
+        })
+    }
+}
+
+fn refresh_identity_state(
+    store: Arc<dyn StudyMemoryStore>,
+    inner: Arc<data::InMemoryStudyStore>,
+    access: VoiceWsAccess,
+) -> (AppState, Arc<Mutex<Vec<BrainInput>>>) {
+    let inputs = Arc::new(Mutex::new(Vec::new()));
+    let _ = inner;
+    let state = AppState::with_study_store(
+        Arc::new(RecordingInputBrain {
+            inputs: inputs.clone(),
+        }),
+        "recording_input",
+        access,
+        2,
+        store,
+    );
+    (state, inputs)
+}
+
+fn recorded_context_refreshes(inputs: &Arc<Mutex<Vec<BrainInput>>>) -> Vec<serde_json::Value> {
+    inputs
+        .lock()
+        .expect("input log lock")
+        .iter()
+        .filter_map(|input| match input {
+            BrainInput::SessionContextRefresh(value) => Some(value.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `SERVICE-007` (review Minor M2): the trusted socket rotates the voice session ID
+/// the provider and store see, so the browser cannot know it. A context refresh must
+/// therefore be validated against the identity the client is allowed to assert and
+/// rewritten to the unchanged server session ID — not rejected as an identity
+/// mismatch, which is what the pre-remediation binding did.
+#[tokio::test]
+async fn refresh_identity_trusted_context_refresh_binds_the_server_session_id() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner: inner.clone(),
+        audit: audit.clone(),
+    });
+    let (state, inputs) = refresh_identity_state(store, inner, VoiceWsAccess::default());
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut socket, "recording_input").await;
+
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+    let opened = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::ConfigAccepted).await;
+    assert!(opened
+        .iter()
+        .any(|event| event.detail == "session config accepted"));
+
+    // The same bound generation and the identity the browser knows: its own.
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+
+    let refreshed = wait_for_evidence_detail(
+        &evidence,
+        VoiceEvidenceEventKind::ConfigAccepted,
+        "config refresh received",
+    )
+    .await;
+    assert!(
+        refreshed,
+        "a trusted context refresh naming the client's own session must be accepted"
+    );
+
+    let contexts = recorded_context_refreshes(&inputs);
+    assert_eq!(
+        contexts.len(),
+        1,
+        "exactly one context refresh is forwarded"
+    );
+    let forwarded = contexts[0]["session_id"]
+        .as_str()
+        .expect("forwarded refresh carries a session id")
+        .to_owned();
+    assert_ne!(
+        forwarded, "voice-session-1",
+        "the provider must never be re-pointed at the browser-asserted session id"
+    );
+    assert_eq!(
+        forwarded,
+        uuid::Uuid::from_u128(1).to_string(),
+        "the refresh must carry the unchanged rotated server session id"
+    );
+    assert_eq!(
+        audit.nonce_calls.load(Ordering::SeqCst),
+        0,
+        "a context refresh performs zero nonce-store calls"
+    );
+
+    socket.close(None).await.unwrap();
+}
+
+/// `SERVICE-007`: the bound `client_generation_id` is the socket's generation. A
+/// stale or different generation cannot refresh this socket's context.
+#[tokio::test]
+async fn refresh_identity_stale_generation_is_rejected() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner: inner.clone(),
+        audit: audit.clone(),
+    });
+    let (state, inputs) = refresh_identity_state(store, inner, VoiceWsAccess::default());
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut socket, "recording_input").await;
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+    let _ = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::ConfigAccepted).await;
+
+    // The bound generation is accepted, so the rejection below can only be the
+    // generation comparison rather than a blanket refusal of every refresh.
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        wait_for_evidence_detail(
+            &evidence,
+            VoiceEvidenceEventKind::ConfigAccepted,
+            "config refresh received",
+        )
+        .await,
+        "the bound generation must be accepted"
+    );
+
+    let session: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/session-config.json"
+    ))
+    .unwrap();
+    socket
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "session_config",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": "voice-test-generation-2",
+                "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
+                "session": session,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let frames = read_server_frames_until_close(&mut socket).await;
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Error { error, .. } if error.code == VoiceServerErrorCode::AuthIdentityMismatch.as_str()
+        )),
+        "a different generation must fail the bound identity comparison, got {frames:?}"
+    );
+    assert_eq!(
+        recorded_context_refreshes(&inputs).len(),
+        1,
+        "a stale generation never reaches the provider"
+    );
+    assert_eq!(audit.nonce_calls.load(Ordering::SeqCst), 0);
+}
+
+/// The exact recoverable policy-denial event Plan 05 publishes for `D-03B QUIZ_ONLY`.
+const REFRESH_POLICY_DENIED_WIRE: &str = "{\"type\":\"event\",\"version\":5,\"event\":{\"type\":\"structured_error\",\"source\":\"agent-service\",\"code\":\"VOICE_SESSION_REFRESH_POLICY_DENIED\",\"message\":\"Session refresh is not authorized.\",\"terminality\":\"recoverable\"}}";
+
+fn refresh_policy_denied_fixture_frame() -> String {
+    #[derive(Deserialize)]
+    struct TerminalSequences {
+        sequences: Vec<TerminalSequence>,
+    }
+
+    #[derive(Deserialize)]
+    struct TerminalSequence {
+        id: String,
+        terminal_reason: Option<String>,
+        terminal_at_index: Option<usize>,
+        wire_sequence_json: Vec<String>,
+    }
+
+    let file: TerminalSequences = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/v5/terminal-sequences.json"
+    ))
+    .expect("terminal sequences fixture parses");
+    let case = file
+        .sequences
+        .into_iter()
+        .find(|sequence| sequence.id == "VOICE-RECOVERABLE-SESSION-REFRESH-POLICY-DENIED")
+        .expect("the recoverable refresh-denial case is published");
+    assert_eq!(
+        case.terminal_reason, None,
+        "the denial is classified nonterminal"
+    );
+    assert_eq!(case.terminal_at_index, None);
+    case.wire_sequence_json
+        .into_iter()
+        .next()
+        .expect("the denial event is the first entry")
+}
+
+/// `SERVICE-007` / `D-03B QUIZ_ONLY`: the in-socket `session_refresh` frame parses,
+/// but the one engine has no client-selectable context, so the service answers with
+/// Plan 05's recoverable structured error, keeps the socket and its deadlines, and
+/// performs no provider or store work.
+#[tokio::test]
+async fn refresh_identity_session_refresh_is_recoverable_policy_denial() {
+    assert_eq!(
+        refresh_policy_denied_fixture_frame(),
+        REFRESH_POLICY_DENIED_WIRE
+    );
+
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner: inner.clone(),
+        audit: audit.clone(),
+    });
+    let (state, inputs) = refresh_identity_state(store, inner, VoiceWsAccess::default());
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut socket, "recording_input").await;
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+    let _ = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::ConfigAccepted).await;
+
+    for _ in 0..2 {
+        socket
+            .send(WsMessage::Text(
+                serde_json::json!({
+                    "type": "session_refresh",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                    "context": { "mode": "quiz", "initial_goal": "Review the fixture source." },
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let raw = read_server_text_frame(&mut socket).await;
+        assert_eq!(
+            raw, REFRESH_POLICY_DENIED_WIRE,
+            "the denial must match Plan 05's published bytes exactly"
+        );
+    }
+
+    // The socket is still live: a valid context refresh still works afterwards.
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        wait_for_evidence_detail(
+            &evidence,
+            VoiceEvidenceEventKind::ConfigAccepted,
+            "config refresh received",
+        )
+        .await,
+        "a recoverable denial must not end the session"
+    );
+
+    assert_eq!(
+        recorded_context_refreshes(&inputs).len(),
+        1,
+        "the denied refreshes performed no provider work"
+    );
+    assert_eq!(audit.nonce_calls.load(Ordering::SeqCst), 0);
+    socket.close(None).await.unwrap();
+}
+
+/// `SERVICE-007`: token renewal and identity rebinding never happen inside an open
+/// socket. Plan 05's strict parser refuses every authority member on `session_refresh`,
+/// and a second `session_config` presenting a different credential is refused before
+/// any nonce, provider, or store work.
+#[tokio::test]
+async fn refresh_identity_new_access_token_requires_a_new_socket() {
+    for forbidden in [
+        serde_json::json!({ "session_token": "viva1.aaa.bbb" }),
+        serde_json::json!({ "user_id": "user-2" }),
+        serde_json::json!({ "study_set_id": "other-set" }),
+        serde_json::json!({ "session_id": "voice-session-2" }),
+        serde_json::json!({ "source_context": [] }),
+        serde_json::json!({ "active_concepts": [] }),
+    ] {
+        let mut frame = serde_json::json!({
+            "type": "session_refresh",
+            "version": VIVA_VOICE_PROTOCOL_VERSION,
+            "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+            "context": { "mode": "quiz" },
+        });
+        for (key, value) in forbidden.as_object().expect("object") {
+            frame[key] = value.clone();
+        }
+        assert!(
+            agent_service::parse_client_frame_json(&frame.to_string()).is_err(),
+            "session_refresh must not carry {forbidden}"
+        );
+    }
+
+    let inner = provider_limiter_test_store();
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner: inner.clone(),
+        audit: audit.clone(),
+    });
+    let (state, inputs) = refresh_identity_state(
+        store,
+        inner,
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some(NONCE_AUDIT_SECRET.into()),
+            allowed_origins: vec![],
+        },
+    );
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let first = nonce_audit_token("voice-session-1", "refresh-nonce-1");
+    let second = nonce_audit_token("voice-session-1", "refresh-nonce-2");
+
+    let (mut socket, _) = connect_async(token_only_request(&url, &first))
+        .await
+        .unwrap();
+    assert_ready_provider(&mut socket, "recording_input").await;
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&first).into(),
+        ))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        audit.nonce_successes.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    // A different credential cannot be presented on the open socket.
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(&second).into(),
+        ))
+        .await
+        .unwrap();
+    let frames = read_server_frames_until_close(&mut socket).await;
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Error { error, .. } if error.code == VoiceServerErrorCode::AuthIdentityMismatch.as_str()
+        )),
+        "a renewed credential must not rebind an open socket, got {frames:?}"
+    );
+    assert!(
+        recorded_context_refreshes(&inputs).is_empty(),
+        "a renewed credential never reaches the provider"
+    );
+    assert_eq!(
+        audit.nonce_successes.load(Ordering::SeqCst),
+        1,
+        "the second credential's nonce is never consumed in the old socket"
+    );
+
+    // It succeeds only as the initial config of a new socket and generation.
+    let (mut renewed, _) = connect_async(token_only_request(&url, &second))
+        .await
+        .unwrap();
+    assert_ready_provider(&mut renewed, "recording_input").await;
+    renewed
+        .send(WsMessage::Text(
+            session_config_json_with_token(&second).into(),
+        ))
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        audit.nonce_successes.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    renewed.close(None).await.unwrap();
+}
+
+/// `SERVICE-007`: the absolute socket deadline is server configuration. Recoverable
+/// refresh denials neither reset nor extend it.
+#[tokio::test]
+async fn refresh_identity_absolute_deadline_survives_context_refreshes() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner: inner.clone(),
+        audit,
+    });
+    let (state, _inputs) = refresh_identity_state(store, inner, VoiceWsAccess::default());
+    let state = state.with_ws_timeouts(WsTimeouts {
+        session: Duration::from_millis(900),
+        ..WsTimeouts::default()
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut socket, "recording_input").await;
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_token(VOICE_TEST_PLACEHOLDER_CREDENTIAL).into(),
+        ))
+        .await
+        .unwrap();
+
+    let started = Instant::now();
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        socket
+            .send(WsMessage::Text(
+                serde_json::json!({
+                    "type": "session_refresh",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                    "context": { "mode": "quiz" },
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let frames = read_server_frames_until_close(&mut socket).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the original absolute deadline must not be reset by context refreshes"
+    );
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::StructuredError { code, .. }
+                        if code == "VOICE_SESSION_REFRESH_POLICY_DENIED"
+                )
+        )),
+        "the socket answered at least one refresh before its deadline, got {frames:?}"
+    );
 }
 
 #[tokio::test]
@@ -2791,7 +6302,7 @@ async fn websocket_failure_control_claim_forces_sanitized_provider_terminal_path
         run_id: "run-control-1",
         control_nonce: "nonce-control-claim",
     });
-    let mut request = url.as_str().into_client_request().unwrap();
+    let mut request = token_only_request(&url, &token);
     request
         .headers_mut()
         .insert("origin", HeaderValue::from_str(origin).unwrap());
@@ -2824,10 +6335,13 @@ async fn websocket_failure_control_claim_forces_sanitized_provider_terminal_path
 
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "synthetic answer".to_owned(),
-            client_generation_id: None,
+            client_generation_id: "v5-answer-1".to_owned(),
+            turn_id: "v5-turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "synthetic answer".to_owned(),
+            },
         },
     )
     .await;
@@ -2859,7 +6373,7 @@ async fn websocket_failure_control_provider_error_does_not_backoff_normal_sessio
         "cartesia_gemini",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         2,
@@ -2892,7 +6406,7 @@ async fn websocket_failure_control_provider_error_does_not_backoff_normal_sessio
         run_id: "run-control-backoff-1",
         control_nonce: "nonce-control-claim-backoff",
     });
-    let mut control_request = url.as_str().into_client_request().unwrap();
+    let mut control_request = token_only_request(&url, &control_token);
     control_request
         .headers_mut()
         .insert("origin", HeaderValue::from_str(origin).unwrap());
@@ -2906,10 +6420,13 @@ async fn websocket_failure_control_provider_error_does_not_backoff_normal_sessio
         .unwrap();
     send_client_frame(
         &mut control_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "control probe".to_owned(),
-            client_generation_id: Some("bac519-failure-control-backoff".to_owned()),
+            client_generation_id: "bac519-failure-control-backoff".to_owned(),
+            turn_id: "v5-turn-2".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "control probe".to_owned(),
+            },
         },
     )
     .await;
@@ -2930,7 +6447,9 @@ async fn websocket_failure_control_provider_error_does_not_backoff_normal_sessio
         unix_timestamp_now() + 60,
         "nonce-normal-after-failure-control",
     );
-    let (mut normal_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut normal_socket, _) = connect_async(token_only_request(&url, &normal_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut normal_socket, "cartesia_gemini").await;
     normal_socket
         .send(WsMessage::Text(
@@ -2951,10 +6470,13 @@ async fn websocket_failure_control_provider_error_does_not_backoff_normal_sessio
     ));
     send_client_frame(
         &mut normal_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "normal probe".to_owned(),
-            client_generation_id: Some("bac519-normal-after-failure-control".to_owned()),
+            client_generation_id: "bac519-normal-after-failure-control".to_owned(),
+            turn_id: "v5-turn-3".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "normal probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3259,7 +6781,7 @@ async fn websocket_provider_backoff_denies_next_answer_before_brain_input() {
     first_socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3267,10 +6789,13 @@ async fn websocket_provider_backoff_denies_next_answer_before_brain_input() {
         .unwrap();
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-backoff-first".to_owned()),
+            client_generation_id: "bac519-backoff-first".to_owned(),
+            turn_id: "v5-turn-4".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3295,7 +6820,7 @@ async fn websocket_provider_backoff_denies_next_answer_before_brain_input() {
     second_socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3348,7 +6873,7 @@ async fn websocket_unstructured_provider_rate_limit_sets_default_backoff() {
     first_socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3356,10 +6881,13 @@ async fn websocket_unstructured_provider_rate_limit_sets_default_backoff() {
         .unwrap();
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-unstructured-backoff-first".to_owned()),
+            client_generation_id: "bac519-unstructured-backoff-first".to_owned(),
+            turn_id: "v5-turn-5".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3378,7 +6906,7 @@ async fn websocket_unstructured_provider_rate_limit_sets_default_backoff() {
     second_socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3428,7 +6956,7 @@ async fn websocket_open_rate_limit_backoff_denies_next_socket_before_brain_open(
     first_socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3446,7 +6974,7 @@ async fn websocket_open_rate_limit_backoff_denies_next_socket_before_brain_open(
     second_socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3485,14 +7013,21 @@ async fn websocket_provider_backoff_denial_does_not_consume_signed_nonce() {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-open-backoff-first",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-open-backoff-first",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -3505,12 +7040,16 @@ async fn websocket_provider_backoff_denial_does_not_consume_signed_nonce() {
     assert_close_code(&mut first_socket, CloseCode::Error).await;
     assert_eq!(opens.load(Ordering::SeqCst), 1);
 
-    let retry_session = provider_limiter_session_config(
+    let retry_token = provider_limiter_token(
         "chemistry-final",
         "voice-session-2",
         "nonce-open-backoff-retry",
     );
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let retry_session =
+        session_config_json_with_ids_and_token("chemistry-final", "voice-session-2", &retry_token);
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &retry_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(retry_session.clone().into()))
@@ -3528,7 +7067,9 @@ async fn websocket_provider_backoff_denial_does_not_consume_signed_nonce() {
     );
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let (mut retry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut retry_socket, _) = connect_async(token_only_request(&url, &retry_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut retry_socket, "cartesia_gemini").await;
     retry_socket
         .send(WsMessage::Text(retry_session.into()))
@@ -3565,14 +7106,21 @@ async fn websocket_provider_global_turn_limit_denies_queue_overflow() {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -3591,10 +7139,13 @@ async fn websocket_provider_global_turn_limit_denies_queue_overflow() {
     ));
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-queue-first".to_owned()),
+            client_generation_id: "bac519-queue-first".to_owned(),
+            turn_id: "v5-turn-6".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3607,14 +7158,21 @@ async fn websocket_provider_global_turn_limit_denies_queue_overflow() {
     })
     .await;
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-limiter-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-limiter-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -3637,10 +7195,13 @@ async fn websocket_provider_global_turn_limit_denies_queue_overflow() {
     );
     send_client_frame(
         &mut second_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-queue-second".to_owned()),
+            client_generation_id: "bac519-queue-second".to_owned(),
+            turn_id: "v5-turn-7".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3692,7 +7253,7 @@ async fn websocket_provider_queue_rejects_overlapping_same_socket_turn_without_d
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3711,10 +7272,13 @@ async fn websocket_provider_queue_rejects_overlapping_same_socket_turn_without_d
     ));
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-overlap-first".to_owned()),
+            client_generation_id: "bac519-overlap-first".to_owned(),
+            turn_id: "v5-turn-8".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3725,10 +7289,13 @@ async fn websocket_provider_queue_rejects_overlapping_same_socket_turn_without_d
 
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-overlap-second".to_owned()),
+            client_generation_id: "bac519-overlap-second".to_owned(),
+            turn_id: "v5-turn-9".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3773,14 +7340,21 @@ async fn websocket_provider_queue_depth_waits_for_slot_before_forwarding() {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -3799,10 +7373,13 @@ async fn websocket_provider_queue_depth_waits_for_slot_before_forwarding() {
     ));
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-queue-wait-first".to_owned()),
+            client_generation_id: "bac519-queue-wait-first".to_owned(),
+            turn_id: "v5-turn-10".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3811,14 +7388,21 @@ async fn websocket_provider_queue_depth_waits_for_slot_before_forwarding() {
     })
     .await;
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-limiter-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-limiter-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -3841,10 +7425,13 @@ async fn websocket_provider_queue_depth_waits_for_slot_before_forwarding() {
     );
     send_client_frame(
         &mut second_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-queue-wait-second".to_owned()),
+            client_generation_id: "bac519-queue-wait-second".to_owned(),
+            turn_id: "v5-turn-11".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3902,7 +7489,7 @@ async fn websocket_provider_admission_rejects_audio_continuation_without_second_
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3920,18 +7507,12 @@ async fn websocket_provider_admission_rejects_audio_continuation_without_second_
             )
     ));
 
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-1", &[1_u8, 2]).await;
     wait_until(Duration::from_secs(2), || {
         audio_inputs.load(Ordering::SeqCst) == 1
     })
     .await;
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-2", &[3_u8, 4]).await;
 
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -3975,18 +7556,26 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
             ..VoiceLimitConfig::default()
         },
     );
+    let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -4005,10 +7594,13 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
     ));
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-queue-cancel-holder".to_owned()),
+            client_generation_id: "bac519-queue-cancel-holder".to_owned(),
+            turn_id: "v5-turn-12".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -4017,14 +7609,21 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
     })
     .await;
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-limiter-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-limiter-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -4032,10 +7631,13 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
         .unwrap();
     send_client_frame(
         &mut second_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "queued probe".to_owned(),
-            client_generation_id: Some("bac519-queue-cancel-pending".to_owned()),
+            client_generation_id: "bac519-queue-cancel-pending".to_owned(),
+            turn_id: "v5-turn-13".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "queued probe".to_owned(),
+            },
         },
     )
     .await;
@@ -4044,12 +7646,17 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
         &mut second_socket,
         &ClientFrame::Cancel {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            client_generation_id: None,
+            client_generation_id: "v5-cancel".to_owned(),
             turn_id: None,
         },
     )
     .await;
 
+    // The cancel and the first socket's close travel on two separate loopback
+    // connections, so "sent" is not "processed". The server's own CancelReceived
+    // evidence is the ordering the assertion below depends on: the queued
+    // admission must already be dropped when the provider slot opens.
+    wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::CancelReceived).await;
     first_socket.close(None).await.unwrap();
     let _ = read_server_frames_until_close(&mut first_socket).await;
     let forwarded_after_cancel = tokio::time::timeout(Duration::from_millis(250), async {
@@ -4087,21 +7694,33 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
     )
     .with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
-        idle: Duration::from_millis(40),
+        // `SERVICE-001`: the deadline a cancelled queued submission returns to is
+        // the between-turn one. The in-turn deadline stays long so the socket
+        // holding the only provider slot survives the probe.
+        idle: Duration::from_secs(5),
+        between_turn_idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -4120,10 +7739,13 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
     ));
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission holder".to_owned(),
-            client_generation_id: Some("bac519-queue-cancel-idle-holder".to_owned()),
+            client_generation_id: "bac519-queue-cancel-idle-holder".to_owned(),
+            turn_id: "v5-turn-14".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission holder".to_owned(),
+            },
         },
     )
     .await;
@@ -4132,14 +7754,21 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
     })
     .await;
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-limiter-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-limiter-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -4147,10 +7776,13 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
         .unwrap();
     send_client_frame(
         &mut second_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "queued probe".to_owned(),
-            client_generation_id: Some("bac519-queue-cancel-idle-pending".to_owned()),
+            client_generation_id: "bac519-queue-cancel-idle-pending".to_owned(),
+            turn_id: "v5-turn-15".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "queued probe".to_owned(),
+            },
         },
     )
     .await;
@@ -4159,7 +7791,7 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
         &mut second_socket,
         &ClientFrame::Cancel {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            client_generation_id: None,
+            client_generation_id: "v5-cancel".to_owned(),
             turn_id: None,
         },
     )
@@ -4201,19 +7833,27 @@ async fn websocket_provider_queue_arms_turn_cap_while_waiting_for_admission() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -4232,10 +7872,13 @@ async fn websocket_provider_queue_arms_turn_cap_while_waiting_for_admission() {
     ));
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission holder".to_owned(),
-            client_generation_id: Some("bac519-queue-turn-cap-holder".to_owned()),
+            client_generation_id: "bac519-queue-turn-cap-holder".to_owned(),
+            turn_id: "v5-turn-16".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission holder".to_owned(),
+            },
         },
     )
     .await;
@@ -4244,14 +7887,21 @@ async fn websocket_provider_queue_arms_turn_cap_while_waiting_for_admission() {
     })
     .await;
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-limiter-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-limiter-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -4270,10 +7920,13 @@ async fn websocket_provider_queue_arms_turn_cap_while_waiting_for_admission() {
     ));
     send_client_frame(
         &mut second_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "queued admission should time out".to_owned(),
-            client_generation_id: Some("bac519-queue-turn-cap-pending".to_owned()),
+            client_generation_id: "bac519-queue-turn-cap-pending".to_owned(),
+            turn_id: "v5-turn-17".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "queued admission should time out".to_owned(),
+            },
         },
     )
     .await;
@@ -4315,20 +7968,28 @@ async fn websocket_provider_queue_rejects_audio_continuation_without_second_leas
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(200),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -4347,10 +8008,13 @@ async fn websocket_provider_queue_rejects_audio_continuation_without_second_leas
     ));
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-queued-audio-holder".to_owned()),
+            client_generation_id: "bac519-queued-audio-holder".to_owned(),
+            turn_id: "v5-turn-18".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -4359,14 +8023,21 @@ async fn websocket_provider_queue_rejects_audio_continuation_without_second_leas
     })
     .await;
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-limiter-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-limiter-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -4383,14 +8054,8 @@ async fn websocket_provider_queue_rejects_audio_continuation_without_second_leas
                 }
             )
     ));
-    second_socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
-    second_socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut second_socket, "audio-turn-3", &[1_u8, 2]).await;
+    send_v5_audio_turn(&mut second_socket, "audio-turn-4", &[3_u8, 4]).await;
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let frame = read_server_frame(&mut second_socket).await;
@@ -4436,14 +8101,21 @@ async fn websocket_provider_active_audio_rejects_later_frame_without_second_leas
         return;
     };
 
-    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    let socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut socket, _) = connect_async(token_only_request(&url, &socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut socket, "cartesia_gemini").await;
     socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &socket_token,
             )
             .into(),
         ))
@@ -4460,18 +8132,12 @@ async fn websocket_provider_active_audio_rejects_later_frame_without_second_leas
                 }
             )
     ));
-    socket
-        .send(WsMessage::Binary(vec![1_u8].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-5", &[1_u8]).await;
     wait_until(Duration::from_secs(2), || {
         audio_inputs.lock().unwrap().len() == 1
     })
     .await;
-    socket
-        .send(WsMessage::Binary(vec![2_u8].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-6", &[2_u8]).await;
 
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -4485,7 +8151,9 @@ async fn websocket_provider_active_audio_rejects_later_frame_without_second_leas
     .expect("active audio continuation without a second lease should be denied");
     assert_terminal_session_phase(terminal, TerminalSessionReason::SlowClient);
     assert_close_code(&mut socket, CloseCode::Policy).await;
-    assert_eq!(*audio_inputs.lock().unwrap(), vec![vec![1_u8]]);
+    // v5 PCM16 payloads are a whole number of samples, so the bounded assembler
+    // admits the even-length turn the helper actually sent.
+    assert_eq!(*audio_inputs.lock().unwrap(), vec![vec![1_u8, 2]]);
     assert!(evidence.snapshot().iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::ProviderAdmission
             && event.detail.contains("admission_decision=denied")
@@ -4513,7 +8181,7 @@ async fn websocket_failure_control_cap_is_identity_scoped_across_study_sets() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -4561,7 +8229,7 @@ async fn websocket_failure_control_cap_is_identity_scoped_across_study_sets() {
         control_nonce: "nonce-control-chemistry-claim",
     });
 
-    let mut biology_request = url.as_str().into_client_request().unwrap();
+    let mut biology_request = token_only_request(&url, &biology_token);
     biology_request
         .headers_mut()
         .insert("origin", HeaderValue::from_str(origin).unwrap());
@@ -4581,7 +8249,7 @@ async fn websocket_failure_control_cap_is_identity_scoped_across_study_sets() {
     })
     .await;
 
-    let mut chemistry_request = url.as_str().into_client_request().unwrap();
+    let mut chemistry_request = token_only_request(&url, &chemistry_token);
     chemistry_request
         .headers_mut()
         .insert("origin", HeaderValue::from_str(origin).unwrap());
@@ -4627,7 +8295,7 @@ async fn websocket_failure_control_still_honors_user_total_session_cap() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -4679,7 +8347,7 @@ async fn websocket_failure_control_still_honors_user_total_session_cap() {
         control_nonce: "nonce-control-user-total-chemistry-claim",
     });
 
-    let mut biology_request = url.as_str().into_client_request().unwrap();
+    let mut biology_request = token_only_request(&url, &biology_token);
     biology_request
         .headers_mut()
         .insert("origin", HeaderValue::from_str(origin).unwrap());
@@ -4699,7 +8367,7 @@ async fn websocket_failure_control_still_honors_user_total_session_cap() {
     })
     .await;
 
-    let mut chemistry_request = url.as_str().into_client_request().unwrap();
+    let mut chemistry_request = token_only_request(&url, &chemistry_token);
     chemistry_request
         .headers_mut()
         .insert("origin", HeaderValue::from_str(origin).unwrap());
@@ -4738,7 +8406,7 @@ async fn websocket_rejects_failure_control_claim_from_wrong_origin_before_brain_
         "open_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         1,
@@ -4770,7 +8438,7 @@ async fn websocket_rejects_failure_control_claim_from_wrong_origin_before_brain_
         run_id: "run-origin-1",
         control_nonce: "nonce-origin-claim",
     });
-    let mut request = url.as_str().into_client_request().unwrap();
+    let mut request = token_only_request(&url, &token);
     request
         .headers_mut()
         .insert("origin", HeaderValue::from_static("https://evil.example"));
@@ -4786,7 +8454,7 @@ async fn websocket_rejects_failure_control_claim_from_wrong_origin_before_brain_
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "session auth failed"
+        ServerFrame::Error { error, .. } if error.message == "session auth failed"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
     assert!(!opened.load(Ordering::SeqCst));
@@ -4803,7 +8471,7 @@ async fn websocket_rejects_replayed_session_token_before_brain_open() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         2,
@@ -4821,7 +8489,9 @@ async fn websocket_rejects_replayed_session_token_before_brain_open() {
         "nonce-replay",
     );
 
-    let (mut first_socket, _) = connect_async(url.clone()).await.unwrap();
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "open_probe").await;
     first_socket
         .send(WsMessage::Text(
@@ -4833,7 +8503,9 @@ async fn websocket_rejects_replayed_session_token_before_brain_open() {
     assert!(opened.load(Ordering::SeqCst));
 
     opened.store(false, Ordering::SeqCst);
-    let (mut replay_socket, _) = connect_async(url).await.unwrap();
+    let (mut replay_socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut replay_socket, "open_probe").await;
     replay_socket
         .send(WsMessage::Text(
@@ -4844,7 +8516,7 @@ async fn websocket_rejects_replayed_session_token_before_brain_open() {
 
     assert!(matches!(
         read_server_frame(&mut replay_socket).await,
-        ServerFrame::Error { message, .. } if message == "session auth failed"
+        ServerFrame::Error { error, .. } if error.message == "session auth failed"
     ));
     assert_close_code(&mut replay_socket, CloseCode::Policy).await;
     let auth_events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
@@ -4870,7 +8542,7 @@ async fn websocket_records_nonce_store_errors_without_replay_auth_evidence() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         1,
@@ -4888,7 +8560,9 @@ async fn websocket_records_nonce_store_errors_without_replay_auth_evidence() {
         unix_timestamp_now() + 60,
         "nonce-store-outage",
     );
-    let (mut socket, _) = connect_async(url).await.unwrap();
+    let (mut socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
 
     assert_ready_provider(&mut socket, "open_probe").await;
     socket
@@ -4900,7 +8574,7 @@ async fn websocket_records_nonce_store_errors_without_replay_auth_evidence() {
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "session token nonce store unavailable"
+        ServerFrame::Error { error, .. } if error.message == "session token nonce store unavailable"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
@@ -4932,7 +8606,7 @@ async fn websocket_durable_store_replay_still_reports_session_auth_failure() {
         "open_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         2,
@@ -4951,7 +8625,9 @@ async fn websocket_durable_store_replay_still_reports_session_auth_failure() {
         "nonce-durable-replay",
     );
 
-    let (mut first_socket, _) = connect_async(url.clone()).await.unwrap();
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut first_socket).await else {
         panic!("expected ready frame");
     };
@@ -4966,7 +8642,9 @@ async fn websocket_durable_store_replay_still_reports_session_auth_failure() {
     assert!(opened.load(Ordering::SeqCst));
 
     opened.store(false, Ordering::SeqCst);
-    let (mut replay_socket, _) = connect_async(url).await.unwrap();
+    let (mut replay_socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut replay_socket).await else {
         panic!("expected ready frame");
     };
@@ -4980,7 +8658,7 @@ async fn websocket_durable_store_replay_still_reports_session_auth_failure() {
 
     assert!(matches!(
         read_server_frame(&mut replay_socket).await,
-        ServerFrame::Error { message, .. } if message == "session auth failed"
+        ServerFrame::Error { error, .. } if error.message == "session auth failed"
     ));
     assert_close_code(&mut replay_socket, CloseCode::Policy).await;
     let auth_events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
@@ -5016,7 +8694,7 @@ async fn websocket_nonce_store_failure_emits_durability_degraded_before_brain_op
         "open_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         2,
@@ -5035,7 +8713,9 @@ async fn websocket_nonce_store_failure_emits_durability_degraded_before_brain_op
         "nonce-store-failure",
     );
 
-    let (mut socket, _) = connect_async(url).await.unwrap();
+    let (mut socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
@@ -5083,17 +8763,12 @@ async fn websocket_study_context_store_failure_emits_durability_degraded_before_
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -5109,6 +8784,10 @@ async fn websocket_study_context_store_failure_emits_durability_degraded_before_
 }
 
 #[tokio::test]
+/// `D-07` branch `retain-token-only` moved the token-only rejection to the HTTP
+/// upgrade (`token_only_preflight_rejects_unverified_upgrades`). The per-code
+/// first-frame classification stays reachable behind a service-authenticated
+/// boundary, which is what this probe now exercises.
 async fn websocket_rejects_invalid_session_token_before_brain_open() {
     for (token, expected_code) in [
         (
@@ -5143,8 +8822,8 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
             }),
             "synthetic",
             VoiceWsAccess {
-                required_bearer: None,
-                session_token_secret: Some("session-secret".to_owned()),
+                required_bearer: Some("rest-secret".into()),
+                session_token_secret: Some("session-secret".into()),
                 allowed_origins: vec![],
             },
             1,
@@ -5153,7 +8832,9 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
         let Some(url) = spawn_server(state).await else {
             return;
         };
-        let (mut socket, _) = connect_async(url).await.unwrap();
+        let (mut socket, _) = connect_async(service_bearer_request(&url, "rest-secret"))
+            .await
+            .unwrap();
 
         assert_ready_provider(&mut socket, "open_probe").await;
         socket
@@ -5165,7 +8846,7 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
 
         assert!(matches!(
             read_server_frame(&mut socket).await,
-            ServerFrame::Error { message, .. } if message == "session auth failed"
+            ServerFrame::Error { error, .. } if error.message == "session auth failed"
         ));
         assert_close_code(&mut socket, CloseCode::Policy).await;
         let auth_events =
@@ -5218,7 +8899,7 @@ async fn websocket_rejects_token_claim_mismatch_before_brain_open() {
             "synthetic",
             VoiceWsAccess {
                 required_bearer: None,
-                session_token_secret: Some("session-secret".to_owned()),
+                session_token_secret: Some("session-secret".into()),
                 allowed_origins: vec![],
             },
             1,
@@ -5227,7 +8908,9 @@ async fn websocket_rejects_token_claim_mismatch_before_brain_open() {
         let Some(url) = spawn_server(state).await else {
             return;
         };
-        let (mut socket, _) = connect_async(url).await.unwrap();
+        let (mut socket, _) = connect_async(token_only_request(&url, &token))
+            .await
+            .unwrap();
 
         assert_ready_provider(&mut socket, "open_probe").await;
         socket
@@ -5239,7 +8922,7 @@ async fn websocket_rejects_token_claim_mismatch_before_brain_open() {
 
         assert!(matches!(
             read_server_frame(&mut socket).await,
-            ServerFrame::Error { message, .. } if message == "session auth failed"
+            ServerFrame::Error { error, .. } if error.message == "session auth failed"
         ));
         assert_close_code(&mut socket, CloseCode::Policy).await;
         let auth_events =
@@ -5287,6 +8970,8 @@ async fn websocket_checks_study_set_access_before_brain_open() {
             serde_json::json!({
                 "type": "session_config",
                 "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
                 "session": session,
             })
             .to_string()
@@ -5297,7 +8982,7 @@ async fn websocket_checks_study_set_access_before_brain_open() {
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "session auth failed"
+        ServerFrame::Error { error, .. } if error.message == "session auth failed"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
     assert!(!opened.load(Ordering::SeqCst));
@@ -5345,6 +9030,8 @@ async fn websocket_records_study_context_store_errors_without_access_denied_auth
             serde_json::json!({
                 "type": "session_config",
                 "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
                 "session": session,
             })
             .to_string()
@@ -5355,7 +9042,7 @@ async fn websocket_records_study_context_store_errors_without_access_denied_auth
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "study store unavailable"
+        ServerFrame::Error { error, .. } if error.message == "study store unavailable"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
@@ -5384,14 +9071,9 @@ async fn websocket_brain_open_auth_failure_emits_terminal_phase_without_raw_erro
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let _ = read_server_frame(&mut socket).await;
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -5424,17 +9106,12 @@ async fn websocket_brain_open_failure_with_missing_session_close_keeps_provider_
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -5452,8 +9129,15 @@ async fn websocket_brain_open_failure_with_missing_session_close_keeps_provider_
     }));
 }
 
+/// `ADAPTER-06` closed (A-20.1, node-07 appendix): the adapter preserves the
+/// store's `PortErrorKind` across the question-progression seam, so a durable
+/// store read failure at voice-session open reaches operators as
+/// `durability_degraded`. The service reports the typed reason the brain hands
+/// it and derives nothing from prose (`DOMAIN-009`). Controls:
+/// `websocket_protocol_wrapped_open_store_failure_emits_durability_degraded_terminal_phase`
+/// and `websocket_untyped_provider_error_cannot_be_classified_from_its_message`.
 #[tokio::test]
-async fn websocket_brain_open_store_failure_emits_durability_degraded_terminal_phase() {
+async fn websocket_brain_open_store_failure_reports_the_brains_typed_terminal_reason() {
     let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let store = Arc::new(DurableStoreDegradingStore {
         inner: inner.clone(),
@@ -5472,18 +9156,18 @@ async fn websocket_brain_open_store_failure_emits_durability_degraded_terminal_p
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
+    // `DOMAIN-009` / `SERVICE-006`: the service reports the typed terminal reason
+    // the brain handed it and derives nothing from the store's prose. Since the
+    // A-20.1 node-07 appendix, the adapter preserves the store's Durability kind
+    // across the progression seam, so the brain hands the service a typed
+    // durability degradation and that is what the socket truthfully reports.
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
         TerminalSessionReason::DurabilityDegraded,
@@ -5494,6 +9178,9 @@ async fn websocket_brain_open_store_failure_emits_durability_degraded_terminal_p
         event.kind == VoiceEvidenceEventKind::TerminalReason
             && event.detail == "durability_degraded"
     }));
+    assert!(events
+        .iter()
+        .all(|event| !event.detail.contains("durable store read failed")));
 }
 
 #[tokio::test]
@@ -5515,18 +9202,13 @@ async fn websocket_protocol_wrapped_open_store_failure_emits_durability_degraded
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert_eq!(brain.provider, "open_protocol_store_failure");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -5540,17 +9222,28 @@ async fn websocket_protocol_wrapped_open_store_failure_emits_durability_degraded
     }));
 }
 
+/// `DOMAIN-009`: the terminal reason comes from the typed failure the provider
+/// error carries. The diagnostic `message` beside it is never parsed and never
+/// reaches the wire, however suggestive its prose is.
 #[tokio::test]
 async fn websocket_provider_error_event_emits_terminal_phase_without_raw_message() {
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let mut provider_error =
+        BrainProviderError::from_failure(BrainProviderFailure::new(BrainProviderFailureParts {
+            failure_class: BrainFailureClass::ProviderAuthFailure,
+            stage: BrainFailureStage::ProviderAuth,
+            retry_eligible: false,
+            latency_ms: 0,
+            provider: "cartesia_gemini".to_owned(),
+            model: String::new(),
+            metadata: "error_kind=missing_api_key".to_owned(),
+        }));
+    provider_error.message =
+        "raw answer transcript with CARTESIA_API_KEY must not surface".to_owned();
     let state = AppState::with_study_store(
         Arc::new(EventProbeBrain {
             study_store: None,
-            events: vec![BrainEvent::Error(BrainProviderError {
-                source: "cartesia_gemini".to_owned(),
-                message: "raw answer transcript with CARTESIA_API_KEY must not surface".to_owned(),
-                failure: None,
-            })],
+            events: vec![BrainEvent::Error(provider_error)],
         }),
         "event_probe",
         VoiceWsAccess::default(),
@@ -5560,20 +9253,64 @@ async fn websocket_provider_error_event_emits_terminal_phase_without_raw_message
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     assert_ready_provider(&mut socket, "event_probe").await;
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
-    assert_terminal_session_phase(
-        read_server_frame(&mut socket).await,
-        TerminalSessionReason::ProviderAuthFailed,
+    let terminal = read_server_frame(&mut socket).await;
+    assert!(
+        !serde_json::to_string(&terminal)
+            .unwrap()
+            .contains("CARTESIA_API_KEY"),
+        "the provider diagnostic must never reach the wire"
     );
+    assert_terminal_session_phase(terminal, TerminalSessionReason::ProviderAuthFailed);
     assert_close_code(&mut socket, CloseCode::Error).await;
+}
+
+/// `DOMAIN-009` misclassification control: a provider error that arrives without
+/// its typed failure is an invariant breach, not an invitation to read its
+/// prose. Its message names an auth failure and a durable-store failure at once;
+/// the service refuses to derive either and reports the explicit rollback.
+#[tokio::test]
+async fn websocket_untyped_provider_error_cannot_be_classified_from_its_message() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(EventProbeBrain {
+            study_store: None,
+            events: vec![BrainEvent::Error(BrainProviderError {
+                source: "cartesia_gemini".to_owned(),
+                message: "CARTESIA_API_KEY rejected; postgres adapter error: durable store write failed; rate limit"
+                    .to_owned(),
+                failure: None,
+            })],
+        }),
+        "event_probe",
+        VoiceWsAccess::default(),
+        4,
+        store,
+    );
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut socket, "event_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+
+    let terminal = read_server_frame(&mut socket).await;
+    let rendered = serde_json::to_string(&terminal).unwrap();
+    assert!(!rendered.contains("CARTESIA_API_KEY"), "{rendered}");
+    assert!(!rendered.contains("postgres"), "{rendered}");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::Rollback);
+    assert_close_code(&mut socket, CloseCode::Error).await;
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(events.iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::TerminalReason && event.detail == "rollback"
+    }));
+    assert!(events.iter().all(|event| {
+        !event.detail.contains("CARTESIA_API_KEY") && !event.detail.contains("postgres")
+    }));
 }
 
 #[tokio::test]
@@ -5588,11 +9325,19 @@ async fn websocket_runtime_store_error_event_emits_durability_degraded_terminal_
     let state = AppState::with_study_store(
         Arc::new(EventProbeBrain {
             study_store: Some(brain_store),
-            events: vec![BrainEvent::Error(BrainProviderError {
-                source: "synthetic-memory".to_owned(),
-                message: "postgres adapter error: durable store write failed".to_owned(),
-                failure: None,
-            })],
+            // `DOMAIN-009`: the durability classification is read from the typed
+            // failure, never from the adapter prose beside it.
+            events: vec![BrainEvent::Error(BrainProviderError::from_failure(
+                BrainProviderFailure::new(BrainProviderFailureParts {
+                    failure_class: BrainFailureClass::DurabilityDegraded,
+                    stage: BrainFailureStage::Store,
+                    retry_eligible: false,
+                    latency_ms: 0,
+                    provider: "synthetic-memory".to_owned(),
+                    model: String::new(),
+                    metadata: "error_kind=store_write_failed".to_owned(),
+                }),
+            ))],
         }),
         "event_probe",
         VoiceWsAccess::default(),
@@ -5603,18 +9348,13 @@ async fn websocket_runtime_store_error_event_emits_durability_degraded_terminal_
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert_eq!(brain.provider, "event_probe");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     let frames = read_server_frames_until_terminal_reason(
         &mut socket,
@@ -5664,18 +9404,13 @@ async fn websocket_durable_store_failure_mid_turn_emits_durability_degraded_term
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert_eq!(brain.provider, "event_probe");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     let frames = read_server_frames_until_terminal_reason(
         &mut socket,
@@ -5719,23 +9454,18 @@ async fn websocket_durable_semantic_authority_miss_remains_provider_source_rejec
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     let frames = read_server_frames_until_close(&mut socket).await;
 
     assert!(frames.iter().any(|frame| matches!(
         frame,
-        ServerFrame::Error { message, .. } if message == "provider source authority rejected"
+        ServerFrame::Error { error, .. } if error.message == "provider source authority rejected"
     )));
     assert!(frames.iter().all(|frame| {
         terminal_session_reason(frame) != Some(TerminalSessionReason::DurabilityDegraded)
@@ -5764,24 +9494,20 @@ async fn websocket_durable_terminal_close_failure_emits_durability_degraded_term
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let drain = state.drain_signal.clone();
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert_eq!(brain.provider, "idle_probe");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
     assert!(matches!(
         read_server_frame(&mut socket).await,
         ServerFrame::Event {
@@ -5828,23 +9554,19 @@ async fn websocket_client_stop_close_failure_emits_durability_degraded_terminal_
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert_eq!(brain.provider, "idle_probe");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
     assert!(matches!(
         read_server_frame(&mut socket).await,
         ServerFrame::Event {
@@ -5852,7 +9574,16 @@ async fn websocket_client_stop_close_failure_emits_durability_degraded_terminal_
             ..
         } if matches!(event.as_ref(), VivaServerEvent::SessionPhase { .. })
     ));
-    send_client_frame(&mut socket, &fixture.client[3]).await;
+    // The frozen fixture's `stop` frame predates the v5 generation binding (`W-06`),
+    // so the stop this test needs is built here rather than read from it.
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Stop {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: VOICE_TEST_CLIENT_GENERATION.to_owned(),
+        },
+    )
+    .await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -5888,23 +9619,19 @@ async fn websocket_peer_close_failure_records_durability_degraded_terminal_reaso
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert_eq!(brain.provider, "idle_probe");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
     assert!(matches!(
         read_server_frame(&mut socket).await,
         ServerFrame::Event {
@@ -5948,18 +9675,13 @@ async fn websocket_durable_store_write_failure_mid_turn_emits_durability_degrade
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
     assert_eq!(brain.provider, "event_probe");
     assert!(store.durable);
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     let frames = read_server_frames_until_terminal_reason(
         &mut socket,
@@ -5986,13 +9708,8 @@ async fn websocket_rejects_browser_tool_result_as_untrusted() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
-    send_client_frame(&mut socket, &fixture.client[0]).await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
     let _ = read_server_frame(&mut socket).await;
     let _ = read_server_frame(&mut socket).await;
     socket
@@ -6019,15 +9736,19 @@ async fn websocket_rejects_browser_tool_result_as_untrusted() {
         .await
         .unwrap();
 
+    // `VOICE-AUTHORITY-001`: `tool_result` is not a member of the v5 browser-sendable
+    // union, so the forged frame cannot parse into anything the server could act on.
+    // The tool authority is unreachable from the wire rather than refused by a policy
+    // branch a refactor could delete.
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "browser tool_result frames are not trusted"
+        ServerFrame::Error { error, .. } if error.message == "invalid client frame"
     ));
-    assert_close_code(&mut socket, CloseCode::Policy).await;
+    assert_close_code(&mut socket, CloseCode::Protocol).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::TerminalReason
-            && event.detail == "untrusted_tool_result"
+            && event.detail == "invalid_client_frame"
     }));
 }
 
@@ -6038,6 +9759,7 @@ async fn websocket_drain_emits_terminal_phase_before_close() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let drain = state.drain_signal.clone();
     let evidence = state.evidence.clone();
@@ -6050,7 +9772,7 @@ async fn websocket_drain_emits_terminal_phase_before_close() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6111,6 +9833,163 @@ async fn websocket_preflight_rejects_new_sessions_after_drain_begins() {
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::PreflightRejected && event.detail == "server draining"
     }));
+}
+
+/// The loopback peer every test socket actually connects from. Forwarding headers
+/// name other addresses; none of them may ever key a lease.
+const TEST_PEER_IP: &str = "127.0.0.1";
+
+async fn wait_for_released_ip_lease(limits: &agent_service::VoiceLimitState, ip: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if limits.ip_lease_count(ip).is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "IP lease for {ip} was still held at {:?}",
+        limits.ip_lease_count(ip)
+    );
+}
+
+/// `SERVICE-003`: the per-IP cap keys off the socket peer. A direct client that
+/// varies `X-Forwarded-For` gets one bucket, not one bucket per spoofed value.
+#[tokio::test]
+async fn ip_cap_holds_when_forwarded_headers_vary() {
+    let state = test_state(8).with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(2),
+        ..VoiceLimitConfig::default()
+    });
+    let limits = state.limit_state.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let mut sockets = Vec::new();
+    for spoofed in ["198.51.100.1", "198.51.100.2"] {
+        let mut request = url.as_str().into_client_request().unwrap();
+        request.headers_mut().insert(
+            "x-forwarded-for",
+            HeaderValue::from_str(spoofed).expect("header value is valid"),
+        );
+        let (mut socket, _) = connect_async(request)
+            .await
+            .expect("the direct peer is under its cap");
+        assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+        sockets.push(socket);
+    }
+
+    let mut over_cap = url.as_str().into_client_request().unwrap();
+    over_cap
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.3"));
+    let error = connect_async(over_cap)
+        .await
+        .expect_err("a forwarding header must not buy a third lease for one peer");
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        other => panic!("expected HTTP 429 from the per-IP cap, got {other:?}"),
+    }
+
+    assert_eq!(limits.ip_lease_count(TEST_PEER_IP), Some(2));
+    for spoofed in ["198.51.100.1", "198.51.100.2", "198.51.100.3", "unknown"] {
+        assert_eq!(
+            limits.ip_lease_count(spoofed),
+            None,
+            "a forwarding header must never key a per-IP lease"
+        );
+    }
+
+    for mut socket in sockets {
+        socket.close(None).await.unwrap();
+        let _ = read_server_frames_until_close(&mut socket).await;
+    }
+    wait_for_released_ip_lease(&limits, TEST_PEER_IP).await;
+}
+
+/// Every server-owned exit releases the peer's lease and removes its entry.
+#[tokio::test]
+async fn ip_cap_releases_peer_lease_on_every_exit() {
+    // 1. Ordinary disconnect.
+    let state = test_state(4).with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(2),
+        ..VoiceLimitConfig::default()
+    });
+    let limits = state.limit_state.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    assert_eq!(limits.ip_lease_count(TEST_PEER_IP), Some(1));
+    socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut socket).await;
+    wait_for_released_ip_lease(&limits, TEST_PEER_IP).await;
+
+    // 2. Preflight rejection takes no lease at all.
+    let capacity_state = test_state(1).with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(1),
+        ..VoiceLimitConfig::default()
+    });
+    let capacity_limits = capacity_state.limit_state.clone();
+    let Some(capacity_url) = spawn_server(capacity_state).await else {
+        return;
+    };
+    let (mut held, _) = connect_async(capacity_url.as_str()).await.unwrap();
+    assert_eq!(read_server_frame(&mut held).await, ServerFrame::ready());
+    let rejected = connect_async(capacity_url.as_str())
+        .await
+        .expect_err("the peer is at its cap");
+    assert!(matches!(
+        rejected,
+        tokio_tungstenite::tungstenite::Error::Http(_)
+    ));
+    assert_eq!(capacity_limits.ip_lease_count(TEST_PEER_IP), Some(1));
+    held.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut held).await;
+    wait_for_released_ip_lease(&capacity_limits, TEST_PEER_IP).await;
+
+    // 3. A server-owned first-frame timeout.
+    let timeout_state = test_state(4)
+        .with_voice_limits(VoiceLimitConfig {
+            max_ip_sessions: Some(2),
+            ..VoiceLimitConfig::default()
+        })
+        .with_ws_timeouts(WsTimeouts {
+            first_frame: Duration::from_millis(25),
+            ..WsTimeouts::default()
+        });
+    let timeout_limits = timeout_state.limit_state.clone();
+    let Some(timeout_url) = spawn_server(timeout_state).await else {
+        return;
+    };
+    let (mut silent, _) = connect_async(timeout_url.as_str()).await.unwrap();
+    assert_eq!(read_server_frame(&mut silent).await, ServerFrame::ready());
+    let _ = read_server_frames_until_close(&mut silent).await;
+    wait_for_released_ip_lease(&timeout_limits, TEST_PEER_IP).await;
+
+    // 4. Drain.
+    let drain_state = test_state(4).with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(2),
+        ..VoiceLimitConfig::default()
+    });
+    let drain_limits = drain_state.limit_state.clone();
+    let drain_signal = drain_state.drain_signal.clone();
+    let Some(drain_url) = spawn_server(drain_state).await else {
+        return;
+    };
+    let (mut draining, _) = connect_async(drain_url.as_str()).await.unwrap();
+    assert_eq!(read_server_frame(&mut draining).await, ServerFrame::ready());
+    assert_eq!(drain_limits.ip_lease_count(TEST_PEER_IP), Some(1));
+    drain_signal.begin_drain();
+    // The drained terminal phase is observed at the next client frame today; the
+    // lease must be gone once the socket ends, whatever ends it.
+    send_client_frame(&mut draining, &fixture_session_config_frame()).await;
+    let _ = read_server_frames_until_close(&mut draining).await;
+    wait_for_released_ip_lease(&drain_limits, TEST_PEER_IP).await;
 }
 
 #[tokio::test]
@@ -6176,6 +10055,7 @@ async fn websocket_drain_latches_before_socket_subscribes() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let drain = state.drain_signal.clone();
     let evidence = state.evidence.clone();
@@ -6189,7 +10069,7 @@ async fn websocket_drain_latches_before_socket_subscribes() {
     drain.begin_drain();
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6211,6 +10091,7 @@ async fn websocket_session_cap_emits_terminal_phase_before_close() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_millis(25),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -6222,7 +10103,7 @@ async fn websocket_session_cap_emits_terminal_phase_before_close() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6267,7 +10148,7 @@ async fn websocket_user_study_set_cap_stays_one_when_user_session_knob_is_above_
     assert_ready_provider(&mut first_socket, "backpressured_input_probe").await;
     first_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6283,7 +10164,7 @@ async fn websocket_user_study_set_cap_stays_one_when_user_session_knob_is_above_
     assert_ready_provider(&mut second_socket, "backpressured_input_probe").await;
     second_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6300,7 +10181,7 @@ async fn websocket_user_study_set_cap_stays_one_when_user_session_knob_is_above_
     assert_ready_provider(&mut third_socket, "backpressured_input_probe").await;
     third_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6340,7 +10221,7 @@ async fn websocket_user_study_set_rejection_releases_user_total_lease() {
         "backpressured_input_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -6390,7 +10271,9 @@ async fn websocket_user_study_set_rejection_releases_user_total_lease() {
         &chemistry_token,
     );
 
-    let (mut biology_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut biology_socket, _) = connect_async(token_only_request(&url, &biology_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut biology_socket, "backpressured_input_probe").await;
     biology_socket
         .send(WsMessage::Text(biology_session.into()))
@@ -6404,7 +10287,10 @@ async fn websocket_user_study_set_rejection_releases_user_total_lease() {
     })
     .await;
 
-    let (mut duplicate_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut duplicate_socket, _) =
+        connect_async(token_only_request(&url, &duplicate_biology_token))
+            .await
+            .unwrap();
     assert_ready_provider(&mut duplicate_socket, "backpressured_input_probe").await;
     duplicate_socket
         .send(WsMessage::Text(duplicate_biology_session.into()))
@@ -6416,7 +10302,9 @@ async fn websocket_user_study_set_rejection_releases_user_total_lease() {
     );
     assert_close_code(&mut duplicate_socket, CloseCode::Policy).await;
 
-    let (mut chemistry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut chemistry_socket, _) = connect_async(token_only_request(&url, &chemistry_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut chemistry_socket, "backpressured_input_probe").await;
     chemistry_socket
         .send(WsMessage::Text(chemistry_session.into()))
@@ -6466,7 +10354,7 @@ async fn websocket_user_study_set_cap_still_rejects_duplicate_when_user_total_li
     assert_ready_provider(&mut first_socket, "backpressured_input_probe").await;
     first_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6475,7 +10363,7 @@ async fn websocket_user_study_set_cap_still_rejects_duplicate_when_user_total_li
     assert_ready_provider(&mut second_socket, "backpressured_input_probe").await;
     second_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6514,7 +10402,7 @@ async fn websocket_default_study_set_cap_rejects_duplicate_tab_and_releases() {
     assert_ready_provider(&mut first_socket, "backpressured_input_probe").await;
     first_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6530,7 +10418,7 @@ async fn websocket_default_study_set_cap_rejects_duplicate_tab_and_releases() {
     assert_ready_provider(&mut second_socket, "backpressured_input_probe").await;
     second_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6550,7 +10438,7 @@ async fn websocket_default_study_set_cap_rejects_duplicate_tab_and_releases() {
     assert_ready_provider(&mut third_socket, "backpressured_input_probe").await;
     third_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6590,7 +10478,7 @@ async fn websocket_default_limits_allow_different_study_sets_but_reject_duplicat
         "backpressured_input_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -6636,7 +10524,9 @@ async fn websocket_default_limits_allow_different_study_sets_but_reject_duplicat
         &chemistry_token,
     );
 
-    let (mut biology_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut biology_socket, _) = connect_async(token_only_request(&url, &biology_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut biology_socket, "backpressured_input_probe").await;
     biology_socket
         .send(WsMessage::Text(biology_session.into()))
@@ -6650,7 +10540,9 @@ async fn websocket_default_limits_allow_different_study_sets_but_reject_duplicat
     })
     .await;
 
-    let (mut chemistry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut chemistry_socket, _) = connect_async(token_only_request(&url, &chemistry_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut chemistry_socket, "backpressured_input_probe").await;
     chemistry_socket
         .send(WsMessage::Text(chemistry_session.into()))
@@ -6666,7 +10558,10 @@ async fn websocket_default_limits_allow_different_study_sets_but_reject_duplicat
     })
     .await;
 
-    let (mut duplicate_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut duplicate_socket, _) =
+        connect_async(token_only_request(&url, &duplicate_biology_token))
+            .await
+            .unwrap();
     assert_ready_provider(&mut duplicate_socket, "backpressured_input_probe").await;
     duplicate_socket
         .send(WsMessage::Text(duplicate_biology_session.into()))
@@ -6717,7 +10612,7 @@ async fn websocket_user_session_cap_allows_different_study_sets_until_user_total
         "backpressured_input_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -6764,7 +10659,9 @@ async fn websocket_user_session_cap_allows_different_study_sets_until_user_total
     let physics_session =
         session_config_json_with_ids_and_token("physics-quiz", "voice-session-3", &physics_token);
 
-    let (mut biology_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut biology_socket, _) = connect_async(token_only_request(&url, &biology_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut biology_socket, "backpressured_input_probe").await;
     biology_socket
         .send(WsMessage::Text(biology_session.into()))
@@ -6778,7 +10675,9 @@ async fn websocket_user_session_cap_allows_different_study_sets_until_user_total
     })
     .await;
 
-    let (mut chemistry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut chemistry_socket, _) = connect_async(token_only_request(&url, &chemistry_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut chemistry_socket, "backpressured_input_probe").await;
     chemistry_socket
         .send(WsMessage::Text(chemistry_session.into()))
@@ -6794,7 +10693,9 @@ async fn websocket_user_session_cap_allows_different_study_sets_until_user_total
     })
     .await;
 
-    let (mut physics_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut physics_socket, _) = connect_async(token_only_request(&url, &physics_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut physics_socket, "backpressured_input_probe").await;
     physics_socket
         .send(WsMessage::Text(physics_session.into()))
@@ -6835,7 +10736,7 @@ async fn websocket_user_session_cap_rejects_different_study_set_above_user_total
         "backpressured_input_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -6872,7 +10773,9 @@ async fn websocket_user_session_cap_rejects_different_study_set_above_user_total
         &chemistry_token,
     );
 
-    let (mut biology_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut biology_socket, _) = connect_async(token_only_request(&url, &biology_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut biology_socket, "backpressured_input_probe").await;
     biology_socket
         .send(WsMessage::Text(biology_session.into()))
@@ -6886,7 +10789,9 @@ async fn websocket_user_session_cap_rejects_different_study_set_above_user_total
     })
     .await;
 
-    let (mut chemistry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut chemistry_socket, _) = connect_async(token_only_request(&url, &chemistry_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut chemistry_socket, "backpressured_input_probe").await;
     chemistry_socket
         .send(WsMessage::Text(chemistry_session.into()))
@@ -6931,14 +10836,11 @@ async fn websocket_audio_byte_cap_emits_rate_limit_terminal_phase() {
     assert_ready_provider(&mut socket, "backpressured_input_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2, 3, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-7", &[1_u8, 2, 3, 4]).await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -6982,7 +10884,7 @@ async fn websocket_cost_budget_emits_cost_budget_terminal_phase() {
     assert_ready_provider(&mut socket, "event_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -7004,6 +10906,7 @@ async fn websocket_turn_cap_emits_terminal_phase_before_close() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -7015,14 +10918,13 @@ async fn websocket_turn_cap_emits_terminal_phase_before_close() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(Vec::new().into()))
-        .await
-        .unwrap();
+    // v5 has no binary client surface: an answer-bearing frame is one bounded
+    // audio turn.
+    send_v5_audio_turn(&mut socket, "turn-cap-arm", &[1_u8, 2]).await;
     let _ = read_server_frame(&mut socket).await;
     let _ = read_server_frame(&mut socket).await;
 
@@ -7048,6 +10950,7 @@ async fn websocket_records_configured_turn_cap_evidence() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -7059,7 +10962,7 @@ async fn websocket_records_configured_turn_cap_evidence() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -7080,6 +10983,7 @@ async fn websocket_turn_cap_waits_for_answer_frame() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(200),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -7090,7 +10994,7 @@ async fn websocket_turn_cap_waits_for_answer_frame() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -7115,10 +11019,9 @@ async fn websocket_turn_cap_waits_for_answer_frame() {
         "turn cap fired before an answer-bearing frame"
     );
 
-    socket
-        .send(WsMessage::Binary(Vec::new().into()))
-        .await
-        .unwrap();
+    // v5 has no binary client surface: an answer-bearing frame is one bounded
+    // audio turn.
+    send_v5_audio_turn(&mut socket, "turn-cap-arm", &[1_u8, 2]).await;
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
         TerminalSessionReason::TurnCap,
@@ -7127,10 +11030,15 @@ async fn websocket_turn_cap_waits_for_answer_frame() {
 
 #[tokio::test]
 async fn websocket_post_config_idle_timeout_closes_without_answer_frame() {
+    // `SERVICE-001`: a socket that never submits an answer is a sleeping client,
+    // so the deadline that ends it is the between-turn one, not the in-turn
+    // progress deadline.
     let state = test_state(1).with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
-        idle: Duration::from_millis(25),
+        idle: Duration::from_secs(5),
+        between_turn_idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -7141,7 +11049,7 @@ async fn websocket_post_config_idle_timeout_closes_without_answer_frame() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -7186,6 +11094,7 @@ async fn websocket_turn_cap_disarms_after_answer_resolution() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(250),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -7196,16 +11105,19 @@ async fn websocket_turn_cap_disarms_after_answer_resolution() {
     assert_ready_provider(&mut socket, "gated_completion_provider_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "resolved answer".to_owned(),
-            client_generation_id: Some("turn-cap-resolution".to_owned()),
+            client_generation_id: "turn-cap-resolution".to_owned(),
+            turn_id: "v5-turn-19".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "resolved answer".to_owned(),
+            },
         },
     )
     .await;
@@ -7265,7 +11177,7 @@ async fn websocket_provider_slot_releases_on_answer_evaluated() {
         "gated_completion_provider_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -7280,14 +11192,21 @@ async fn websocket_provider_slot_releases_on_answer_evaluated() {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-slot-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "gated_completion_provider_probe").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-slot-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -7295,10 +11214,13 @@ async fn websocket_provider_slot_releases_on_answer_evaluated() {
         .unwrap();
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "first provider turn".to_owned(),
-            client_generation_id: Some("bac519-answer-evaluated-held-1".to_owned()),
+            client_generation_id: "bac519-answer-evaluated-held-1".to_owned(),
+            turn_id: "v5-turn-20".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "first provider turn".to_owned(),
+            },
         },
     )
     .await;
@@ -7322,14 +11244,21 @@ async fn websocket_provider_slot_releases_on_answer_evaluated() {
     .expect("first answer evaluation should arrive");
     assert_eq!(text_inputs.load(Ordering::SeqCst), 1);
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-slot-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "gated_completion_provider_probe").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-slot-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -7337,10 +11266,13 @@ async fn websocket_provider_slot_releases_on_answer_evaluated() {
         .unwrap();
     send_client_frame(
         &mut second_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "second provider turn".to_owned(),
-            client_generation_id: Some("bac519-answer-evaluated-held-2".to_owned()),
+            client_generation_id: "bac519-answer-evaluated-held-2".to_owned(),
+            turn_id: "v5-turn-21".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "second provider turn".to_owned(),
+            },
         },
     )
     .await;
@@ -7390,7 +11322,7 @@ async fn websocket_provider_slot_prefers_queued_completion_before_same_socket_ov
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -7398,10 +11330,13 @@ async fn websocket_provider_slot_prefers_queued_completion_before_same_socket_ov
         .unwrap();
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "first provider turn".to_owned(),
-            client_generation_id: Some("bac519-queued-completion-release-1".to_owned()),
+            client_generation_id: "bac519-queued-completion-release-1".to_owned(),
+            turn_id: "v5-turn-22".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "first provider turn".to_owned(),
+            },
         },
     )
     .await;
@@ -7413,10 +11348,13 @@ async fn websocket_provider_slot_prefers_queued_completion_before_same_socket_ov
 
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "second provider turn".to_owned(),
-            client_generation_id: Some("bac519-queued-completion-release-2".to_owned()),
+            client_generation_id: "bac519-queued-completion-release-2".to_owned(),
+            turn_id: "v5-turn-23".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "second provider turn".to_owned(),
+            },
         },
     )
     .await;
@@ -7466,7 +11404,7 @@ async fn websocket_provider_drains_queued_usage_before_next_admission() {
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -7474,10 +11412,13 @@ async fn websocket_provider_drains_queued_usage_before_next_admission() {
         .unwrap();
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "first provider turn".to_owned(),
-            client_generation_id: Some("bac519-queued-usage-release-1".to_owned()),
+            client_generation_id: "bac519-queued-usage-release-1".to_owned(),
+            turn_id: "v5-turn-24".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "first provider turn".to_owned(),
+            },
         },
     )
     .await;
@@ -7500,10 +11441,13 @@ async fn websocket_provider_drains_queued_usage_before_next_admission() {
     usage_gate.notify_waiters();
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "second provider turn".to_owned(),
-            client_generation_id: Some("bac519-queued-usage-release-2".to_owned()),
+            client_generation_id: "bac519-queued-usage-release-2".to_owned(),
+            turn_id: "v5-turn-25".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "second provider turn".to_owned(),
+            },
         },
     )
     .await;
@@ -7535,10 +11479,15 @@ async fn websocket_audio_continuation_requires_second_lease_when_limiter_enabled
         VoiceWsAccess::default(),
         1,
     )
+    // The subject here is the provider lease, not a deadline: the in-turn
+    // progress deadline stays well clear of the first turn's admission so the
+    // second audio turn is denied for the overlap it is, rather than racing the
+    // turn cap.
     .with_ws_timeouts(WsTimeouts {
         first_frame: Duration::from_secs(5),
-        idle: Duration::from_millis(40),
-        session: Duration::from_secs(5),
+        idle: Duration::from_secs(4),
+        session: Duration::from_secs(8),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -7550,24 +11499,18 @@ async fn websocket_audio_continuation_requires_second_lease_when_limiter_enabled
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-8", &[1_u8, 2]).await;
     wait_until(Duration::from_secs(2), || {
         audio_inputs.lock().unwrap().len() == 1
     })
     .await;
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-9", &[3_u8, 4]).await;
 
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -7609,6 +11552,7 @@ async fn websocket_audio_continuations_keep_turn_cap_with_limits(voice_limits: V
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(250),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     })
     .with_voice_limits(voice_limits);
     let Some(url) = spawn_server(state).await else {
@@ -7621,24 +11565,18 @@ async fn websocket_audio_continuations_keep_turn_cap_with_limits(voice_limits: V
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-10", &[1_u8, 2]).await;
     wait_until(Duration::from_secs(2), || {
         audio_inputs.lock().unwrap().len() == 1
     })
     .await;
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-11", &[3_u8, 4]).await;
     wait_until(Duration::from_secs(2), || {
         audio_inputs.lock().unwrap().len() == 2
     })
@@ -7682,6 +11620,7 @@ async fn websocket_turn_cap_stays_armed_for_newer_submission_after_one_resolutio
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(250),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     })
     .with_voice_limits(VoiceLimitConfig {
         provider_limiter_enabled: false,
@@ -7696,25 +11635,31 @@ async fn websocket_turn_cap_stays_armed_for_newer_submission_after_one_resolutio
     assert_ready_provider(&mut socket, "first_answer_only_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "first pending answer".to_owned(),
-            client_generation_id: Some("turn-cap-newer-submission-1".to_owned()),
+            client_generation_id: "turn-cap-newer-submission-1".to_owned(),
+            turn_id: "v5-turn-26".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "first pending answer".to_owned(),
+            },
         },
     )
     .await;
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "second pending answer".to_owned(),
-            client_generation_id: Some("turn-cap-newer-submission-2".to_owned()),
+            client_generation_id: "turn-cap-newer-submission-2".to_owned(),
+            turn_id: "v5-turn-27".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "second pending answer".to_owned(),
+            },
         },
     )
     .await;
@@ -7777,6 +11722,7 @@ async fn websocket_turn_cap_dedupes_duplicate_response_resolution_ids() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     })
     .with_voice_limits(VoiceLimitConfig {
         provider_limiter_enabled: false,
@@ -7791,25 +11737,31 @@ async fn websocket_turn_cap_dedupes_duplicate_response_resolution_ids() {
     assert_ready_provider(&mut socket, "duplicate_resolution_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "first duplicate-resolution answer".to_owned(),
-            client_generation_id: Some("turn-cap-duplicate-resolution-1".to_owned()),
+            client_generation_id: "turn-cap-duplicate-resolution-1".to_owned(),
+            turn_id: "v5-turn-28".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "first duplicate-resolution answer".to_owned(),
+            },
         },
     )
     .await;
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "second duplicate-resolution answer".to_owned(),
-            client_generation_id: Some("turn-cap-duplicate-resolution-2".to_owned()),
+            client_generation_id: "turn-cap-duplicate-resolution-2".to_owned(),
+            turn_id: "v5-turn-29".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "second duplicate-resolution answer".to_owned(),
+            },
         },
     )
     .await;
@@ -7848,6 +11800,7 @@ async fn websocket_turn_cap_ignores_response_less_phase_after_new_submission() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -7858,14 +11811,11 @@ async fn websocket_turn_cap_ignores_response_less_phase_after_new_submission() {
     assert_ready_provider(&mut socket, "response_then_phase_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-12", &[1_u8, 2]).await;
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -7888,10 +11838,7 @@ async fn websocket_turn_cap_ignores_response_less_phase_after_new_submission() {
     .await
     .expect("first answer resolution should arrive before the second submission");
 
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-13", &[3_u8, 4]).await;
 
     let terminal = tokio::time::timeout(Duration::from_millis(100), async {
         loop {
@@ -7929,6 +11876,7 @@ async fn websocket_turn_cap_ignores_suppressed_stale_resolution_after_new_submis
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -7939,14 +11887,11 @@ async fn websocket_turn_cap_ignores_suppressed_stale_resolution_after_new_submis
     assert_ready_provider(&mut socket, "cancelled_then_stale_resolution_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-14", &[1_u8, 2]).await;
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -7968,10 +11913,7 @@ async fn websocket_turn_cap_ignores_suppressed_stale_resolution_after_new_submis
     .await
     .expect("first answer cancellation should arrive before the second submission");
 
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-15", &[3_u8, 4]).await;
 
     let terminal = tokio::time::timeout(Duration::from_millis(100), async {
         loop {
@@ -8009,6 +11951,7 @@ async fn websocket_turn_cap_is_not_postponed_by_provider_events() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -8020,14 +11963,13 @@ async fn websocket_turn_cap_is_not_postponed_by_provider_events() {
     assert_ready_provider(&mut socket, "chatty_phase_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(Vec::new().into()))
-        .await
-        .unwrap();
+    // v5 has no binary client surface: an answer-bearing frame is one bounded
+    // audio turn.
+    send_v5_audio_turn(&mut socket, "turn-cap-arm", &[1_u8, 2]).await;
 
     let mut saw_provider_phase = false;
     for _ in 0..50 {
@@ -8069,6 +12011,7 @@ async fn websocket_extra_audio_frame_without_second_lease_closes_slow_client() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -8079,19 +12022,13 @@ async fn websocket_extra_audio_frame_without_second_lease_closes_slow_client() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-16", &[1_u8, 2]).await;
     tokio::time::sleep(Duration::from_millis(30)).await;
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-17", &[3_u8, 4]).await;
 
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -8132,6 +12069,7 @@ async fn websocket_turn_cap_includes_backpressured_answer_send() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -8142,14 +12080,11 @@ async fn websocket_turn_cap_includes_backpressured_answer_send() {
     assert_ready_provider(&mut socket, "backpressured_input_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-18", &[1_u8, 2]).await;
 
     assert_terminal_session_phase(
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -8185,6 +12120,7 @@ async fn websocket_turn_cap_aborts_provider_before_stop_can_write_late_answer() 
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -8196,14 +12132,11 @@ async fn websocket_turn_cap_aborts_provider_before_stop_can_write_late_answer() 
     assert_ready_provider(&mut socket, "stop_writes_answer_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2, 3, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-19", &[1_u8, 2, 3, 4]).await;
 
     assert_terminal_session_phase(
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -8241,6 +12174,7 @@ async fn websocket_turn_cap_is_not_postponed_by_client_keepalives() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -8251,14 +12185,13 @@ async fn websocket_turn_cap_is_not_postponed_by_client_keepalives() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(Vec::new().into()))
-        .await
-        .unwrap();
+    // v5 has no binary client surface: an answer-bearing frame is one bounded
+    // audio turn.
+    send_v5_audio_turn(&mut socket, "turn-cap-arm", &[1_u8, 2]).await;
 
     let start = Instant::now();
     while start.elapsed() < Duration::from_millis(80) {
@@ -8300,6 +12233,7 @@ async fn websocket_drain_interrupts_active_provider_response() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let drain = state.drain_signal.clone();
     let evidence = state.evidence.clone();
@@ -8312,7 +12246,7 @@ async fn websocket_drain_interrupts_active_provider_response() {
     assert_ready_provider(&mut socket, "chatty_phase_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -8390,7 +12324,7 @@ async fn websocket_default_trusted_mode_rotates_internal_session_for_reconnect()
         assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
         socket
             .send(WsMessage::Text(
-                format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+                format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
             ))
             .await
             .unwrap();
@@ -8407,8 +12341,8 @@ async fn websocket_default_trusted_mode_rotates_internal_session_for_reconnect()
                     saw_question = true;
                     break;
                 }
-                ServerFrame::Error { message, .. } => {
-                    panic!("unexpected websocket error: {message}")
+                ServerFrame::Error { error, .. } => {
+                    panic!("unexpected websocket error: {}", error.message)
                 }
                 _ => {}
             }
@@ -8440,7 +12374,7 @@ async fn websocket_disconnect_aborts_provider_tasks_and_releases_capacity() {
     assert_ready_provider(&mut socket, "abort_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -8467,6 +12401,7 @@ async fn websocket_drain_aborts_provider_tasks_and_releases_capacity() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let drain = state.drain_signal.clone();
     let slots = state.session_slots.clone();
@@ -8479,7 +12414,7 @@ async fn websocket_drain_aborts_provider_tasks_and_releases_capacity() {
     assert_ready_provider(&mut socket, "abort_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -8511,6 +12446,7 @@ async fn websocket_drain_interrupts_backpressured_provider_input() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     })
     .with_voice_limits(VoiceLimitConfig {
         provider_limiter_enabled: false,
@@ -8528,19 +12464,13 @@ async fn websocket_drain_interrupts_backpressured_provider_input() {
     assert_ready_provider(&mut socket, "backpressured_input_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2, 3, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-20", &[1_u8, 2, 3, 4]).await;
     wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AnswerReceived).await;
-    socket
-        .send(WsMessage::Binary(vec![5_u8, 6, 7, 8].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-21", &[5_u8, 6, 7, 8]).await;
     tokio::time::sleep(Duration::from_millis(25)).await;
 
     drain.begin_drain();
@@ -8567,6 +12497,7 @@ async fn websocket_disconnect_releases_backpressured_provider_input() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let slots = state.session_slots.clone();
     let evidence = state.evidence.clone();
@@ -8579,14 +12510,11 @@ async fn websocket_disconnect_releases_backpressured_provider_input() {
     assert_ready_provider(&mut socket, "backpressured_input_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2, 3, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-22", &[1_u8, 2, 3, 4]).await;
     wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AnswerReceived).await;
     drop(socket);
 
@@ -8626,6 +12554,8 @@ async fn websocket_hydrates_active_concepts_from_server_context_before_brain_ope
             serde_json::json!({
                 "type": "session_config",
                 "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
                 "session": session,
             })
             .to_string()
@@ -8675,7 +12605,7 @@ async fn websocket_suppresses_stale_events_after_cancelled_response() {
     assert_ready_provider(&mut socket, "stale_event_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -8730,7 +12660,7 @@ async fn websocket_global_cancellation_suppresses_active_response_events() {
     assert_ready_provider(&mut socket, "global_cancel_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -8811,18 +12741,21 @@ async fn websocket_rejects_forged_provider_source_tuples_without_leaks_or_writes
         confidence_score: 0.84,
     };
     let unpersisted_recap = agent_domain::StudySessionRecap {
+        schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+        deferred_turns: 0,
         voice_session_id: "voice-session-1".to_owned(),
         headline: "Unpersisted recap should not leak".to_owned(),
         summary: "Unpersisted recap summary should not leak".to_owned(),
-        strong_concepts: vec!["nadh".to_owned()],
-        shaky_concepts: vec![],
-        missed_concepts: vec![],
-        review_later: vec![],
-        next_action: "Stop".to_owned(),
-        source_moments: vec![agent_domain::RecapSourceMoment {
-            text: "Unpersisted recap source should not leak".to_owned(),
-            source: fixture_question.source.clone(),
+        concepts: vec![agent_domain::RecapConceptOutcome {
+            concept_id: "nadh".to_owned(),
+            label: "nadh".to_owned(),
             status: agent_domain::ConceptStatus::Strong,
+        }],
+        review_schedule: vec![],
+        next_action: "Stop".to_owned(),
+        source_moments: vec![agent_domain::learning_recap::RecapSourceMoment {
+            response_id: "response-recap".to_owned(),
+            source_id: fixture_question.source.clone().source_id.clone(),
         }],
     };
     let cases = vec![
@@ -8911,18 +12844,22 @@ async fn websocket_rejects_forged_provider_source_tuples_without_leaks_or_writes
             BrainEvent::RecapReady {
                 response_id: "forged-response".to_owned(),
                 recap: agent_domain::StudySessionRecap {
+                    schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA
+                        .to_owned(),
+                    deferred_turns: 0,
                     voice_session_id: "voice-session-1".to_owned(),
                     headline: "Forged recap".to_owned(),
                     summary: "Forged recap".to_owned(),
-                    strong_concepts: vec!["nadh".to_owned()],
-                    shaky_concepts: vec![],
-                    missed_concepts: vec![],
-                    review_later: vec![],
-                    next_action: "Stop".to_owned(),
-                    source_moments: vec![agent_domain::RecapSourceMoment {
-                        text: "Forged recap source".to_owned(),
-                        source: forged_source,
+                    concepts: vec![agent_domain::RecapConceptOutcome {
+                        concept_id: "nadh".to_owned(),
+                        label: "nadh".to_owned(),
                         status: agent_domain::ConceptStatus::Strong,
+                    }],
+                    review_schedule: vec![],
+                    next_action: "Stop".to_owned(),
+                    source_moments: vec![agent_domain::learning_recap::RecapSourceMoment {
+                        response_id: "response-recap".to_owned(),
+                        source_id: forged_source.source_id.clone(),
                     }],
                 },
             },
@@ -8967,7 +12904,7 @@ async fn websocket_rejects_forged_provider_source_tuples_without_leaks_or_writes
         assert_ready_provider(&mut socket, "event_probe").await;
         socket
             .send(WsMessage::Text(
-                format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+                format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
             ))
             .await
             .unwrap();
@@ -8976,7 +12913,7 @@ async fn websocket_rejects_forged_provider_source_tuples_without_leaks_or_writes
         let payload = serde_json::to_string(&frames).unwrap();
         assert!(frames.iter().any(|frame| matches!(
             frame,
-            ServerFrame::Error { message, .. } if message == "provider source authority rejected"
+            ServerFrame::Error { error, .. } if error.message == "provider source authority rejected"
         )));
         assert!(!payload.contains(forged_excerpt));
         assert!(!payload.contains("wrong-doc"));
@@ -9028,7 +12965,7 @@ async fn websocket_rejects_authorized_payload_replayed_under_wrong_response_id()
     assert_ready_provider(&mut socket, "response_replay_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -9036,7 +12973,7 @@ async fn websocket_rejects_authorized_payload_replayed_under_wrong_response_id()
     let frames = read_server_frames_until_close(&mut socket).await;
     assert!(frames.iter().any(|frame| matches!(
         frame,
-        ServerFrame::Error { message, .. } if message == "provider source authority rejected"
+        ServerFrame::Error { error, .. } if error.message == "provider source authority rejected"
     )));
     assert!(frames.iter().all(|frame| !matches!(
         frame,
@@ -9107,7 +13044,7 @@ async fn open_streamed_audio_session(state: AppState) -> Option<TestWebSocket> {
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -9206,7 +13143,7 @@ async fn assert_streamed_audio_turn_admits_one_provider_turn(seconds: u32) {
         .unwrap();
 
     assert_eq!(
-        read_server_frame(&mut socket).await,
+        read_server_frame_exact(&mut socket).await,
         ServerFrame::AudioTurnAccepted {
             version: VIVA_VOICE_PROTOCOL_VERSION,
             client_generation_id: STREAMED_AUDIO_GENERATION.to_owned(),
@@ -9233,8 +13170,30 @@ async fn assert_streamed_audio_turn_admits_one_provider_turn(seconds: u32) {
         )),
         "the synthetic provider must transcribe exactly one assembled {seconds}s turn"
     );
-    assert_eq!(count_events(&frames, BrowserEventKind::AnswerEvaluated), 1);
-    assert_eq!(count_events(&frames, BrowserEventKind::ConceptStatus), 1);
+    // `A-19.3`: the assembled turn produces exactly one durable outcome, and on this
+    // path that outcome is a retryable deferral. The synthetic runtime injects a
+    // corpus-bound evaluator that replays one checked-in `learning-core` case chosen
+    // by the response identity — it never reads the transcript at all — and this
+    // session's response id selects `deferred_insufficient_semantic_evidence`. The
+    // pin is therefore "one outcome, and it is that deferral", not a claim that the
+    // byte-count placeholder was semantically judged. A deferred turn records the
+    // attempt but writes no mastery.
+    assert_eq!(count_events(&frames, BrowserEventKind::AnswerEvaluated), 0);
+    assert_eq!(count_events(&frames, BrowserEventKind::TurnDeferred), 1);
+    assert_eq!(count_events(&frames, BrowserEventKind::ConceptStatus), 0);
+    assert!(store.snapshot().concept_statuses.is_empty());
+    assert!(frames.iter().any(|frame| matches!(
+        frame,
+        ServerFrame::Event { event, .. }
+            if matches!(
+                event.as_ref(),
+                agent_service::VivaServerEvent::TurnDeferred {
+                    reason: agent_domain::learning_outcome::EvaluationDeferralReason::InsufficientSemanticEvidence,
+                    can_retry_same_question: true,
+                    ..
+                }
+            )
+    )));
     assert_eq!(
         frames
             .iter()
@@ -9264,6 +13223,7 @@ async fn streamed_audio_turns_complete_a_forty_five_second_turn() {
 
 async fn assert_streamed_audio_protocol_error(
     client_frames: Vec<String>,
+    expected_code: VoiceServerErrorCode,
     expected_message: &str,
     expected_close: CloseCode,
 ) {
@@ -9281,7 +13241,7 @@ async fn assert_streamed_audio_protocol_error(
     );
     assert_eq!(
         serde_json::from_str::<ServerFrame>(&raw).unwrap(),
-        ServerFrame::error(expected_message)
+        ServerFrame::error(expected_code, expected_message)
     );
     assert_close_code(&mut socket, expected_close).await;
 }
@@ -9345,8 +13305,13 @@ async fn streamed_audio_turns_reject_invalid_sequences_and_identities() {
 
     for (label, frames) in cases {
         println!("streamed audio negative case: {label}");
-        assert_streamed_audio_protocol_error(frames, "invalid audio frame", CloseCode::Protocol)
-            .await;
+        assert_streamed_audio_protocol_error(
+            frames,
+            VoiceServerErrorCode::ClientFrameMalformed,
+            "invalid audio frame",
+            CloseCode::Protocol,
+        )
+        .await;
     }
 }
 
@@ -9358,6 +13323,7 @@ async fn streamed_audio_turns_reject_an_oversized_chunk() {
             0,
             STREAMED_AUDIO_MAX_CHUNK_BYTES + 2,
         )],
+        VoiceServerErrorCode::ClientFrameTooLarge,
         "audio chunk exceeds maximum size",
         CloseCode::Size,
     )
@@ -9378,6 +13344,7 @@ async fn streamed_audio_turns_reject_an_over_limit_tail() {
 
     assert_streamed_audio_protocol_error(
         frames,
+        VoiceServerErrorCode::ClientTurnTooLarge,
         "audio turn exceeds maximum size",
         CloseCode::Size,
     )
@@ -9414,7 +13381,7 @@ async fn streamed_audio_turns_cancel_halfway_creates_no_provider_work() {
         .await
         .unwrap();
     assert_eq!(
-        read_server_frame(&mut socket).await,
+        read_server_frame_exact(&mut socket).await,
         ServerFrame::AudioTurnAccepted {
             version: VIVA_VOICE_PROTOCOL_VERSION,
             client_generation_id: STREAMED_AUDIO_GENERATION.to_owned(),
@@ -9427,7 +13394,11 @@ async fn streamed_audio_turns_cancel_halfway_creates_no_provider_work() {
         agent_domain::StudySessionPhase::Correction,
     )
     .await;
-    assert_eq!(count_events(&frames, BrowserEventKind::AnswerEvaluated), 1);
+    // As above (`A-19.3`): the corpus-bound evaluator resolves this response identity
+    // to a deferral, and the point of this case is that the post-cancel turn still
+    // produces exactly one outcome.
+    assert_eq!(count_events(&frames, BrowserEventKind::AnswerEvaluated), 0);
+    assert_eq!(count_events(&frames, BrowserEventKind::TurnDeferred), 1);
     assert!(frames.iter().any(|frame| matches!(
         frame,
         ServerFrame::Event { event, .. }
@@ -9443,6 +13414,7 @@ async fn streamed_audio_turns_cancel_halfway_creates_no_provider_work() {
 enum BrowserEventKind {
     QuestionStarted,
     AnswerEvaluated,
+    TurnDeferred,
     SourceReference,
     ConceptStatus,
     ManuscriptIntent,
@@ -9460,6 +13432,9 @@ impl BrowserEventKind {
                 event,
                 agent_service::VivaServerEvent::AnswerEvaluated { .. }
             ),
+            Self::TurnDeferred => {
+                matches!(event, agent_service::VivaServerEvent::TurnDeferred { .. })
+            }
             Self::SourceReference => matches!(
                 event,
                 agent_service::VivaServerEvent::SourceReference { .. }
@@ -9482,6 +13457,16 @@ struct FullSessionFixture {
     server: Vec<ServerFrame>,
 }
 
+/// `VOICE-AUTH-001`: protocol v5 makes the client generation and the signed
+/// credential required members of `session_config`, so every test socket names
+/// this one generation. The value is a fixed test literal, never a credential.
+const VOICE_TEST_CLIENT_GENERATION: &str = "voice-test-generation-1";
+
+/// A placeholder in the signed-credential position for the sockets whose access
+/// mode is trusted loopback: those tests assert runtime behaviour, not token
+/// verification, and the server never reads this value on that path.
+const VOICE_TEST_PLACEHOLDER_CREDENTIAL: &str = "placeholder-session-material";
+
 type TestWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn spawn_server(state: AppState) -> Option<String> {
@@ -9498,10 +13483,55 @@ async fn spawn_server(state: AppState) -> Option<String> {
     let addr = listener.local_addr().unwrap();
     let app = build_router(state);
     let handle: JoinHandle<()> = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     drop(handle);
     Some(format!("ws://{addr}/ws"))
+}
+
+/// Protocol v5 removed the raw binary client surface, so an answer that used to be
+/// one WebSocket binary frame is now exactly one bounded audio turn: a single
+/// `audio_chunk` plus its explicit `audio_end`.
+async fn send_v5_audio_turn(socket: &mut TestWebSocket, turn_id: &str, pcm16: &[u8]) {
+    let pcm16 = if pcm16.len() < 2 || !pcm16.len().is_multiple_of(2) {
+        vec![1_u8, 2]
+    } else {
+        pcm16.to_vec()
+    };
+    socket
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "audio_chunk",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "turn_id": turn_id,
+                "sequence": 0,
+                "frame": { "pcm16_base64": STANDARD.encode(&pcm16) },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "audio_end",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "turn_id": turn_id,
+                "final_sequence": 0,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
 }
 
 async fn send_client_frame(socket: &mut TestWebSocket, frame: &ClientFrame) {
@@ -9513,6 +13543,19 @@ async fn send_client_frame(socket: &mut TestWebSocket, frame: &ClientFrame) {
         .unwrap();
 }
 
+/// The v5 initial `session_config` frame, built from Plan 05's session fixture.
+///
+/// The frozen unversioned full-session fixtures still carry v4 client frames (`W-06`),
+/// so a test that only needs to open a session builds the frame here instead of
+/// reading `fixture.client[0]`; the session payload itself is still the shared
+/// fixture, and only the v5 envelope the frozen file lacks is supplied locally.
+fn fixture_session_config_frame() -> ClientFrame {
+    serde_json::from_str(&session_config_json_with_token(
+        VOICE_TEST_PLACEHOLDER_CREDENTIAL,
+    ))
+    .expect("v5 session config frame parses")
+}
+
 fn session_config_json_with_token(token: &str) -> String {
     let session: serde_json::Value = serde_json::from_str(include_str!(
         "../../../fixtures/voice-protocol/session-config.json"
@@ -9521,6 +13564,7 @@ fn session_config_json_with_token(token: &str) -> String {
     serde_json::json!({
         "type": "session_config",
         "version": VIVA_VOICE_PROTOCOL_VERSION,
+        "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
         "session": session,
         "session_token": token,
     })
@@ -9541,22 +13585,25 @@ fn session_config_json_with_ids_and_token(
     serde_json::json!({
         "type": "session_config",
         "version": VIVA_VOICE_PROTOCOL_VERSION,
+        "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
         "session": session,
         "session_token": token,
     })
     .to_string()
 }
 
-fn provider_limiter_session_config(study_set_id: &str, session_id: &str, nonce: &str) -> String {
-    let token = signed_session_token(
+/// `SERVICE-004`: the provider-limiter sockets are token-only deployments, so the
+/// same signed credential is presented at the HTTP upgrade and in the first bound
+/// frame. Minting it once keeps the two identical.
+fn provider_limiter_token(study_set_id: &str, session_id: &str, nonce: &str) -> String {
+    signed_session_token(
         "session-secret",
         "user-1",
         study_set_id,
         session_id,
         unix_timestamp_now() + 60,
         nonce,
-    );
-    session_config_json_with_ids_and_token(study_set_id, session_id, &token)
+    )
 }
 
 fn signed_session_token(
@@ -9567,10 +13614,13 @@ fn signed_session_token(
     expires_at: u64,
     nonce: &str,
 ) -> String {
+    let issued_at = expires_at.saturating_sub(900);
     let claims = serde_json::json!({
         "user_id": user_id,
         "study_set_id": study_set_id,
         "session_id": session_id,
+        "issued_at": issued_at,
+        "not_before": issued_at,
         "expires_at": expires_at,
         "nonce": nonce,
     });
@@ -9609,10 +13659,13 @@ fn signed_session_token_with_failure_control(fixture: FailureControlTokenFixture
             fixture.control_nonce,
         ),
     });
+    let issued_at = fixture.expires_at.saturating_sub(900);
     let claims = serde_json::json!({
         "user_id": fixture.user_id,
         "study_set_id": fixture.study_set_id,
         "session_id": fixture.session_id,
+        "issued_at": issued_at,
+        "not_before": issued_at,
         "expires_at": fixture.expires_at,
         "nonce": fixture.nonce,
         "failure_control": failure_control,
@@ -9666,7 +13719,8 @@ fn unix_timestamp_now() -> u64 {
         .as_secs()
 }
 
-async fn read_server_frame(socket: &mut TestWebSocket) -> ServerFrame {
+/// The next server frame, exactly as sent, with no filtering.
+async fn read_server_frame_exact(socket: &mut TestWebSocket) -> ServerFrame {
     match tokio::time::timeout(Duration::from_secs(2), socket.next())
         .await
         .unwrap()
@@ -9675,6 +13729,20 @@ async fn read_server_frame(socket: &mut TestWebSocket) -> ServerFrame {
     {
         WsMessage::Text(text) => serde_json::from_str(&text).unwrap(),
         other => panic!("expected text server frame, got {other:?}"),
+    }
+}
+
+/// The next server frame a browser would act on. Protocol v5 acknowledges every
+/// admitted audio turn with `audio_turn_accepted`; that acknowledgment is turn
+/// bookkeeping rather than session progress, so tests asserting a sequence of
+/// session frames read past it. Tests that assert the acknowledgment itself use
+/// [`read_server_frame_exact`].
+async fn read_server_frame(socket: &mut TestWebSocket) -> ServerFrame {
+    loop {
+        let frame = read_server_frame_exact(socket).await;
+        if !matches!(frame, ServerFrame::AudioTurnAccepted { .. }) {
+            return frame;
+        }
     }
 }
 
@@ -9788,6 +13856,40 @@ async fn wait_for_evidence_kind(
     })
     .await;
     evidence.snapshot()
+}
+
+/// Waits for one exact sanitized evidence detail under a kind, without asserting on
+/// a timeout: the caller decides whether its absence is the failure.
+async fn wait_for_evidence_detail(
+    evidence: &VoiceEvidenceRecorder,
+    kind: VoiceEvidenceEventKind,
+    detail: &str,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if evidence
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == kind && event.detail == detail)
+        {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    false
+}
+
+/// The next server frame as raw wire bytes, for byte-for-byte fixture comparison.
+async fn read_server_text_frame(socket: &mut TestWebSocket) -> String {
+    match tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    {
+        WsMessage::Text(text) => text.to_string(),
+        other => panic!("expected text server frame, got {other:?}"),
+    }
 }
 
 async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
@@ -9954,7 +14056,7 @@ async fn run_partial_recap_provider_failure_probe_with_extended_options(
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -9976,10 +14078,13 @@ async fn run_partial_recap_provider_failure_probe_with_extended_options(
     }
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "raw learner answer should not be persisted or recapped".to_owned(),
-            client_generation_id: Some("bac522-partial-recap".to_owned()),
+            client_generation_id: "bac522-partial-recap".to_owned(),
+            turn_id: "v5-turn-30".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "raw learner answer should not be persisted or recapped".to_owned(),
+            },
         },
     )
     .await;
@@ -9992,6 +14097,7 @@ async fn run_partial_recap_provider_failure_probe_with_extended_options(
             &mut socket,
             &ClientFrame::Stop {
                 version: VIVA_VOICE_PROTOCOL_VERSION,
+                client_generation_id: "v5-stop".to_owned(),
             },
         )
         .await;
@@ -10014,7 +14120,7 @@ impl RealtimeBrain for CapabilityProbeBrain {
         &self,
         _config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        Err(BrainError::MissingApiKey)
+        Err(missing_api_key_error())
     }
 }
 
@@ -10035,7 +14141,7 @@ impl RealtimeBrain for OpenAuthFailureBrain {
         &self,
         _config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        Err(BrainError::MissingApiKey)
+        Err(missing_api_key_error())
     }
 }
 
@@ -10056,9 +14162,17 @@ impl RealtimeBrain for OpenProtocolStoreFailureBrain {
         &self,
         _config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        Err(BrainError::Protocol(
-            "postgres durable store read failed".to_owned(),
-        ))
+        Err(BrainError::from_failure(BrainProviderFailure::new(
+            BrainProviderFailureParts {
+                failure_class: BrainFailureClass::DurabilityDegraded,
+                stage: BrainFailureStage::Store,
+                retry_eligible: false,
+                latency_ms: 0,
+                provider: "open_protocol_store_failure".to_owned(),
+                model: String::new(),
+                metadata: "error_kind=durable_store_read_failed".to_owned(),
+            },
+        )))
     }
 }
 
@@ -10082,18 +14196,17 @@ impl RealtimeBrain for OpenRateLimitFailureBrain {
         _config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
         self.opens.fetch_add(1, Ordering::SeqCst);
-        Err(BrainError::StageFailure(Box::new(
+        Err(BrainError::from_failure(
             BrainProviderFailure::new(BrainProviderFailureParts {
-                failure_class: "quota_rate_failure".to_owned(),
-                stage: "gemini".to_owned(),
-                terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                failure_class: BrainFailureClass::QuotaRateFailure,
+                stage: BrainFailureStage::Gemini,
                 retry_eligible: true,
                 latency_ms: 17,
                 provider: "gemini".to_owned(),
                 model: "gemini-3.5-flash".to_owned(),
                 metadata: "http_status=429 retry_after_ms=250 retry_after_source=retry_after_delta reset_hint=2030-01-01T00:00:00Z body_status=resource_exhausted budget_state=within_limit deploy_sha=test-sha".to_owned(),
             }),
-        )))
+        ))
     }
 }
 
@@ -10188,24 +14301,25 @@ impl RealtimeBrain for StopWritesAnswerProbeBrain {
     }
 
     async fn open(&self, config: SessionConfig) -> Result<RealtimeSession, BrainError> {
-        self.study_store
+        let _outcome = self
+            .study_store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let user_id = config
             .user_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_user_id"))?
             .to_owned();
         let study_set_id = config
             .study_set_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_study_set_id"))?
             .to_owned();
         let voice_session_id = config
             .session_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_session_id"))?
             .to_owned();
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
@@ -10355,12 +14469,19 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         claim: SessionTokenNonceClaim,
     ) -> Result<(), PortError> {
         if self.failure == DurableStoreFailureMode::NonceClaim {
-            return Err(PortError::adapter("postgres", "durable store write failed"));
+            return Err(PortError::durability(
+                "postgres",
+                "durable-write",
+                "durable store write failed",
+            ));
         }
         self.inner.claim_session_token_nonce(claim).await
     }
 
-    async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<agent_domain::StudyStoreWriteOutcome, PortError> {
         self.inner.record_voice_session(config).await
     }
 
@@ -10370,7 +14491,11 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         terminal_reason: &str,
     ) -> Result<serde_json::Value, PortError> {
         if self.failure == DurableStoreFailureMode::SessionClose {
-            return Err(PortError::adapter("postgres", "durable store write failed"));
+            return Err(PortError::durability(
+                "postgres",
+                "durable-write",
+                "durable store write failed",
+            ));
         }
         if self.failure == DurableStoreFailureMode::SessionCloseMissing {
             return Err(PortError::unavailable(
@@ -10390,7 +14515,11 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         study_set_id: &str,
     ) -> Result<Option<serde_json::Value>, PortError> {
         if self.failure == DurableStoreFailureMode::StudyContext {
-            return Err(PortError::adapter("postgres", "durable store read failed"));
+            return Err(PortError::durability(
+                "postgres",
+                "durable-read",
+                "durable store read failed",
+            ));
         }
         self.inner.study_context(user_id, study_set_id).await
     }
@@ -10401,7 +14530,11 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         study_set_id: &str,
     ) -> Result<Option<StudyQuestion>, PortError> {
         if self.failure == DurableStoreFailureMode::ActiveQuestion {
-            return Err(PortError::adapter("postgres", "durable store read failed"));
+            return Err(PortError::durability(
+                "postgres",
+                "durable-read",
+                "durable store read failed",
+            ));
         }
         self.inner.active_question(user_id, study_set_id).await
     }
@@ -10422,16 +14555,19 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
                 .await;
         }
         match self.failure {
-            DurableStoreFailureMode::QuestionAuthorizationSemanticMiss => Err(PortError::adapter(
-                "postgres",
-                format!(
-                    "question tuple does not match deterministic retrieval for {}",
-                    question.question_id
-                ),
-            )),
-            DurableStoreFailureMode::QuestionAuthorizationWriteFailure => {
-                Err(PortError::adapter("postgres", "durable store read failed"))
+            DurableStoreFailureMode::QuestionAuthorizationSemanticMiss => {
+                Err(PortError::invalid_input(
+                    "postgres",
+                    question.question_id.clone(),
+                    format!(
+                        "question tuple does not match deterministic retrieval for {}",
+                        question.question_id
+                    ),
+                ))
             }
+            DurableStoreFailureMode::QuestionAuthorizationWriteFailure => Err(
+                PortError::durability("postgres", "durable-read", "durable store read failed"),
+            ),
             DurableStoreFailureMode::ActiveQuestion
             | DurableStoreFailureMode::NoFailure
             | DurableStoreFailureMode::NonceClaim
@@ -10551,12 +14687,88 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
             .await
     }
 
-    async fn record_voice_usage(&self, event: VoiceUsageRecord) -> Result<(), PortError> {
+    async fn select_next_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        policy: agent_domain::ProgressionPolicyId,
+    ) -> Result<agent_domain::QuestionProgressionResult, PortError> {
+        // `LEARN-004B` moved question selection onto a per-session progression
+        // cursor, so this — not `active_question` — is the durable read a session
+        // open actually performs.
+        if self.failure == DurableStoreFailureMode::ActiveQuestion {
+            return Err(PortError::durability(
+                "postgres",
+                "durable-read",
+                "durable store read failed",
+            ));
+        }
+        self.inner
+            .select_next_question(user_id, study_set_id, voice_session_id, response_id, policy)
+            .await
+    }
+
+    async fn session_learning_evidence(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::SessionLearningEvidence, PortError> {
+        self.inner
+            .session_learning_evidence(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn authenticated_study_projection(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::AuthenticatedStudyProjectionV1, PortError> {
+        self.inner
+            .authenticated_study_projection(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn record_answer_attempt_envelope(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        envelope: AnswerAttemptEnvelope,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_attempt_envelope(user_id, study_set_id, voice_session_id, envelope)
+            .await
+    }
+
+    async fn record_turn_outcome(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        outcome: agent_domain::TurnOutcome,
+    ) -> Result<agent_domain::PersistedTurnOutcome, PortError> {
+        self.inner
+            .record_turn_outcome(user_id, study_set_id, voice_session_id, outcome)
+            .await
+    }
+
+    async fn record_voice_usage(
+        &self,
+        event: VoiceUsageRecord,
+    ) -> Result<agent_domain::StudyStoreWriteOutcome, PortError> {
         if self.failure != DurableStoreFailureMode::UsageRecording {
             return self.inner.record_voice_usage(event).await;
         }
         drop(event);
-        Err(PortError::adapter("postgres", "durable store write failed"))
+        Err(PortError::durability(
+            "postgres",
+            "durable-write",
+            "durable store write failed",
+        ))
     }
 }
 
@@ -10583,24 +14795,25 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
     }
 
     async fn open(&self, config: SessionConfig) -> Result<RealtimeSession, BrainError> {
-        self.study_store
+        let _outcome = self
+            .study_store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let user_id = config
             .user_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_user_id"))?
             .to_owned();
         let study_set_id = config
             .study_set_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_study_set_id"))?
             .to_owned();
         let voice_session_id = config
             .session_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_session_id"))?
             .to_owned();
         let study_store = self.study_store.clone();
         let terminal_reason = self.terminal_reason;
@@ -10622,17 +14835,38 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                 })
                 .await;
             while let Some(input) = input_rx.recv().await {
-                let (char_count, client_generation_id) = match input {
-                    BrainInput::Text(text) => (Some(text.chars().count() as u64), None),
+                // `DOMAIN-003` emission boundary: a typed answer envelope carries
+                // both the byte count every capture mode records and the char
+                // count typed capture requires. Omitting either is what the
+                // upstream `validate_fail_closed` refuses, so this probe supplies
+                // the same pair the production runtimes do.
+                let (byte_count, char_count, client_generation_id) = match input {
+                    BrainInput::Text(text) => (
+                        Some(text.len() as u64),
+                        Some(text.chars().count() as u64),
+                        None,
+                    ),
                     BrainInput::TextWithMetadata {
                         text,
                         client_generation_id,
-                    } => (Some(text.chars().count() as u64), client_generation_id),
-                    BrainInput::Audio(frame) => (Some(frame.pcm16_bytes().len() as u64), None),
+                    } => (
+                        Some(text.len() as u64),
+                        Some(text.chars().count() as u64),
+                        client_generation_id,
+                    ),
+                    BrainInput::Audio(frame) => (
+                        Some(frame.pcm16_bytes().len() as u64),
+                        Some(frame.pcm16_bytes().len() as u64),
+                        None,
+                    ),
                     BrainInput::AudioWithMetadata {
                         frame,
                         client_generation_id,
-                    } => (Some(frame.pcm16_bytes().len() as u64), client_generation_id),
+                    } => (
+                        Some(frame.pcm16_bytes().len() as u64),
+                        Some(frame.pcm16_bytes().len() as u64),
+                        client_generation_id,
+                    ),
                     BrainInput::Stop => break,
                     _ => continue,
                 };
@@ -10651,7 +14885,7 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                                     question.question_id
                                 ),
                                 capture_mode: AnswerCaptureMode::Typed,
-                                byte_count: None,
+                                byte_count,
                                 char_count,
                                 duration_ms: None,
                                 client_generation_id: client_generation_id.clone(),
@@ -10681,7 +14915,7 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                                     question.question_id
                                 ),
                                 capture_mode: AnswerCaptureMode::Typed,
-                                byte_count: None,
+                                byte_count,
                                 char_count,
                                 duration_ms: None,
                                 client_generation_id,
@@ -10724,13 +14958,18 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                 }
                 if recap_before_failure {
                     let recap = StudySessionRecap {
+                        schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA
+                            .to_owned(),
+                        deferred_turns: 0,
                         voice_session_id: voice_session_id.clone(),
                         headline: "Full recap".to_owned(),
                         summary: "Durable model recap already exists.".to_owned(),
-                        strong_concepts: vec!["NADH".to_owned()],
-                        shaky_concepts: vec![],
-                        missed_concepts: vec![],
-                        review_later: vec!["ATP synthase".to_owned()],
+                        concepts: vec![agent_domain::RecapConceptOutcome {
+                            concept_id: "NADH".to_owned(),
+                            label: "NADH".to_owned(),
+                            status: agent_domain::ConceptStatus::Strong,
+                        }],
+                        review_schedule: vec![],
                         next_action: "Continue".to_owned(),
                         source_moments: vec![],
                     };
@@ -10758,18 +14997,27 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                         })
                         .await;
                 }
+                // The class is the single authority for the terminal reason, so the
+                // scenario picks a class rather than asserting a reason beside it.
                 let failure_class = match terminal_reason {
-                    TerminalSessionReason::ProviderRateLimited => "quota_rate_failure",
-                    TerminalSessionReason::ProviderTimeout => "provider_timeout",
-                    TerminalSessionReason::ProviderAuthFailed => "provider_auth_failed",
-                    TerminalSessionReason::ProviderMalformedStream => "malformed_stream",
-                    TerminalSessionReason::ProviderNetworkDisconnect => "network_disconnect",
-                    _ => "provider_failure",
+                    TerminalSessionReason::ProviderRateLimited => {
+                        BrainFailureClass::QuotaRateFailure
+                    }
+                    TerminalSessionReason::ProviderTimeout => BrainFailureClass::Timeout,
+                    TerminalSessionReason::ProviderAuthFailed => {
+                        BrainFailureClass::ProviderAuthFailure
+                    }
+                    TerminalSessionReason::ProviderMalformedStream => {
+                        BrainFailureClass::MalformedStream
+                    }
+                    TerminalSessionReason::ProviderNetworkDisconnect => {
+                        BrainFailureClass::NetworkDisconnect
+                    }
+                    other => panic!("unmapped provider terminal reason {}", other.as_str()),
                 };
                 let failure = BrainProviderFailure::new(BrainProviderFailureParts {
-                    failure_class: failure_class.to_owned(),
-                    stage: "gemini".to_owned(),
-                    terminal_reason,
+                    failure_class,
+                    stage: BrainFailureStage::Gemini,
                     retry_eligible: true,
                     latency_ms: 29,
                     provider: "gemini".to_owned(),
@@ -10777,9 +15025,7 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                     metadata: "http_status=429 retry_after_ms=250 deploy_sha=test-sha".to_owned(),
                 });
                 let _ = event_tx
-                    .send(BrainEvent::Error(BrainProviderError::from_stage_failure(
-                        failure,
-                    )))
+                    .send(BrainEvent::Error(BrainProviderError::from_failure(failure)))
                     .await;
                 break;
             }
@@ -10823,9 +15069,8 @@ impl RealtimeBrain for StructuredRateLimitProbeBrain {
                 ) {
                     text_inputs.fetch_add(1, Ordering::SeqCst);
                     let failure = BrainProviderFailure::new(BrainProviderFailureParts {
-                        failure_class: "quota_rate_failure".to_owned(),
-                        stage: "gemini".to_owned(),
-                        terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                        failure_class: BrainFailureClass::QuotaRateFailure,
+                        stage: BrainFailureStage::Gemini,
                         retry_eligible: true,
                         latency_ms: 17,
                         provider: "gemini".to_owned(),
@@ -10833,9 +15078,7 @@ impl RealtimeBrain for StructuredRateLimitProbeBrain {
                         metadata: "http_status=429 retry_after_ms=250 retry_after_source=retry_after_delta reset_hint=2030-01-01T00:00:00Z body_status=resource_exhausted budget_state=within_limit deploy_sha=test-sha".to_owned(),
                     });
                     let _ = event_tx
-                        .send(BrainEvent::Error(BrainProviderError::from_stage_failure(
-                            failure,
-                        )))
+                        .send(BrainEvent::Error(BrainProviderError::from_failure(failure)))
                         .await;
                     break;
                 }
@@ -10879,9 +15122,16 @@ impl RealtimeBrain for UnstructuredRateLimitProbeBrain {
                 ) {
                     text_inputs.fetch_add(1, Ordering::SeqCst);
                     let _ = event_tx
-                        .send(BrainEvent::Error(BrainProviderError::new(
-                            "cartesia_gemini",
-                            "provider 429 quota rate limit",
+                        .send(BrainEvent::Error(BrainProviderError::from_failure(
+                            BrainProviderFailure::new(BrainProviderFailureParts {
+                                failure_class: BrainFailureClass::QuotaRateFailure,
+                                stage: BrainFailureStage::Gemini,
+                                retry_eligible: true,
+                                latency_ms: 0,
+                                provider: "cartesia_gemini".to_owned(),
+                                model: "gemini-3.5-flash".to_owned(),
+                                metadata: "http_status=429".to_owned(),
+                            }),
                         )))
                         .await;
                     break;
@@ -11163,10 +15413,11 @@ impl RealtimeBrain for GlobalCancellationProbeBrain {
         &self,
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        self.store
+        let _outcome = self
+            .store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let (input, _input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
         let task = tokio::spawn(async move {
@@ -11183,18 +15434,21 @@ impl RealtimeBrain for GlobalCancellationProbeBrain {
                 confidence_score: 0.84,
             };
             let recap = StudySessionRecap {
+                schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+                deferred_turns: 0,
                 voice_session_id: "voice-session-1".to_owned(),
                 headline: "Stale recap".to_owned(),
                 summary: "Stale recap summary".to_owned(),
-                strong_concepts: vec!["NADH".to_owned()],
-                shaky_concepts: vec![],
-                missed_concepts: vec![],
-                review_later: vec![],
-                next_action: "Do not surface stale recap.".to_owned(),
-                source_moments: vec![RecapSourceMoment {
-                    text: "Stale recap source".to_owned(),
-                    source: source.clone(),
+                concepts: vec![agent_domain::RecapConceptOutcome {
+                    concept_id: "NADH".to_owned(),
+                    label: "NADH".to_owned(),
                     status: agent_domain::ConceptStatus::Strong,
+                }],
+                review_schedule: vec![],
+                next_action: "Do not surface stale recap.".to_owned(),
+                source_moments: vec![agent_domain::learning_recap::RecapSourceMoment {
+                    response_id: "response-recap".to_owned(),
+                    source_id: source.clone().source_id.clone(),
                 }],
             };
             let _ = event_tx
@@ -11266,22 +15520,23 @@ impl RealtimeBrain for ResponseReplayProbeBrain {
         &self,
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        self.study_store
+        let _outcome = self
+            .study_store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let user_id = config
             .user_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?;
+            .ok_or_else(|| session_config_error("missing_user_id"))?;
         let study_set_id = config
             .study_set_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?;
+            .ok_or_else(|| session_config_error("missing_study_set_id"))?;
         let voice_session_id = config
             .session_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?;
+            .ok_or_else(|| session_config_error("missing_session_id"))?;
         let question = agent_domain::fixture_question();
         let evaluation = agent_domain::AnswerEvaluation {
             question_id: question.question_id.clone(),
@@ -11302,7 +15557,7 @@ impl RealtimeBrain for ResponseReplayProbeBrain {
                 evaluation.clone(),
             )
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
 
         let (input, _input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
@@ -11339,10 +15594,10 @@ impl RealtimeBrain for EventProbeBrain {
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
         if let Some(store) = &self.study_store {
-            store
+            let _outcome = store
                 .record_voice_session(&config)
                 .await
-                .map_err(|error| BrainError::Connection(error.to_string()))?;
+                .map_err(|error| store_stage_error(error.kind().as_str()))?;
         }
         let (input, _input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
@@ -11377,10 +15632,10 @@ impl RealtimeBrain for IdleProbeBrain {
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
         if let Some(store) = &self.study_store {
-            store
+            let _outcome = store
                 .record_voice_session(&config)
                 .await
-                .map_err(|error| BrainError::Connection(error.to_string()))?;
+                .map_err(|error| store_stage_error(error.kind().as_str()))?;
         }
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
@@ -11471,24 +15726,25 @@ impl RealtimeBrain for FirstAnswerOnlyProbeBrain {
         &self,
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        self.study_store
+        let _outcome = self
+            .study_store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let user_id = config
             .user_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_user_id"))?
             .to_owned();
         let study_set_id = config
             .study_set_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_study_set_id"))?
             .to_owned();
         let voice_session_id = config
             .session_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_session_id"))?
             .to_owned();
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
@@ -11569,24 +15825,25 @@ impl RealtimeBrain for GatedCompletionProviderProbeBrain {
         &self,
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        self.study_store
+        let _outcome = self
+            .study_store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let user_id = config
             .user_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_user_id"))?
             .to_owned();
         let study_set_id = config
             .study_set_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_study_set_id"))?
             .to_owned();
         let voice_session_id = config
             .session_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_session_id"))?
             .to_owned();
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
@@ -11669,24 +15926,25 @@ impl RealtimeBrain for AnswerEvaluatedProviderProbeBrain {
         &self,
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        self.study_store
+        let _outcome = self
+            .study_store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let user_id = config
             .user_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_user_id"))?
             .to_owned();
         let study_set_id = config
             .study_set_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_study_set_id"))?
             .to_owned();
         let voice_session_id = config
             .session_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_session_id"))?
             .to_owned();
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
@@ -11915,4 +16173,2694 @@ impl RealtimeBrain for CancelledThenStaleResolutionProbeBrain {
             task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
         })
     }
+}
+
+// -------------------------------------------------------------------------
+// Task 8 (SERVICE-001, SERVICE-006, SERVICE-014): durable deferred turns and
+// the between-turn idle deadline, proved on a real socket.
+// -------------------------------------------------------------------------
+
+/// Every store call the synthetic (Plan 07) outcome path makes, in order, with a
+/// single injectable `record_turn_outcome` failure. Nothing is simulated: each
+/// call is delegated to the real in-memory store, so a durable read after a wire
+/// frame observes the same rows the runtime wrote.
+struct TurnOutcomeAuditStore {
+    inner: Arc<data::InMemoryStudyStore>,
+    fail_turn_outcome: bool,
+    calls: Mutex<Vec<&'static str>>,
+}
+
+impl TurnOutcomeAuditStore {
+    fn new(inner: Arc<data::InMemoryStudyStore>, fail_turn_outcome: bool) -> Self {
+        Self {
+            inner,
+            fail_turn_outcome,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn record(&self, call: &'static str) {
+        self.calls
+            .lock()
+            .expect("turn outcome audit lock poisoned")
+            .push(call);
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls
+            .lock()
+            .expect("turn outcome audit lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for TurnOutcomeAuditStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    async fn pending_answer_attempts_for_session(
+        &self,
+        voice_session_id: &str,
+    ) -> Result<usize, PortError> {
+        self.inner
+            .pending_answer_attempts_for_session(voice_session_id)
+            .await
+    }
+
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<agent_domain::StudyStoreWriteOutcome, PortError> {
+        self.inner.record_voice_session(config).await
+    }
+
+    async fn study_session_durable_counts(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::StudySessionDurableCounts, PortError> {
+        self.inner
+            .study_session_durable_counts(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn answer_attempt_was_recorded(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+    ) -> Result<bool, PortError> {
+        self.inner
+            .answer_attempt_was_recorded(user_id, study_set_id, voice_session_id, response_id)
+            .await
+    }
+
+    async fn claim_session_token_nonce(
+        &self,
+        claim: SessionTokenNonceClaim,
+    ) -> Result<(), PortError> {
+        self.inner.claim_session_token_nonce(claim).await
+    }
+
+    async fn close_voice_session(
+        &self,
+        voice_session_id: &str,
+        terminal_reason: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .close_voice_session(voice_session_id, terminal_reason)
+            .await
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn active_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<StudyQuestion>, PortError> {
+        self.inner.active_question(user_id, study_set_id).await
+    }
+
+    async fn authorize_question_started(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        question: &StudyQuestion,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_question_started(user_id, study_set_id, voice_session_id, question)
+            .await
+    }
+
+    async fn authorize_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: &AnswerEvaluation,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn authorize_source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        source: &StudySourceReference,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_source_reference(user_id, study_set_id, voice_session_id, source)
+            .await
+    }
+
+    async fn authorize_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: &ConceptStatus,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn authorize_manuscript_intent(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        intent: &agent_domain::ManuscriptIntent,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_manuscript_intent(user_id, study_set_id, voice_session_id, intent)
+            .await
+    }
+
+    async fn authorize_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: &StudySessionRecap,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+
+    async fn record_answer_attempt_envelope(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        envelope: AnswerAttemptEnvelope,
+    ) -> Result<serde_json::Value, PortError> {
+        self.record("record_answer_attempt_envelope");
+        self.inner
+            .record_answer_attempt_envelope(user_id, study_set_id, voice_session_id, envelope)
+            .await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.record("record_answer_evaluation");
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.record("record_concept_status");
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.record("schedule_review_item");
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn review_scheduling_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<ReviewSchedulingContextV1, PortError> {
+        self.inner
+            .review_scheduling_context(user_id, study_set_id, concept_id)
+            .await
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        decision: agent_domain::ReviewScheduleDecisionV1,
+    ) -> Result<serde_json::Value, PortError> {
+        self.record("persist_review_schedule_decision");
+        self.inner
+            .persist_review_schedule_decision(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                decision,
+            )
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.record("record_recap");
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+
+    async fn record_voice_usage(
+        &self,
+        event: VoiceUsageRecord,
+    ) -> Result<agent_domain::StudyStoreWriteOutcome, PortError> {
+        self.inner.record_voice_usage(event).await
+    }
+
+    async fn record_turn_outcome(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        outcome: agent_domain::TurnOutcome,
+    ) -> Result<agent_domain::PersistedTurnOutcome, PortError> {
+        self.record("record_turn_outcome");
+        if self.fail_turn_outcome {
+            return Err(PortError::durability(
+                "postgres",
+                voice_session_id,
+                "durable store write failed",
+            ));
+        }
+        self.inner
+            .record_turn_outcome(user_id, study_set_id, voice_session_id, outcome)
+            .await
+    }
+
+    async fn session_learning_evidence(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::SessionLearningEvidence, PortError> {
+        self.inner
+            .session_learning_evidence(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn select_next_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        policy: agent_domain::ProgressionPolicyId,
+    ) -> Result<agent_domain::QuestionProgressionResult, PortError> {
+        self.inner
+            .select_next_question(user_id, study_set_id, voice_session_id, response_id, policy)
+            .await
+    }
+
+    async fn record_challenge_resolution(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        resolution: agent_domain::ChallengeResolution,
+    ) -> Result<agent_domain::ChallengeResolution, PortError> {
+        self.inner
+            .record_challenge_resolution(user_id, study_set_id, voice_session_id, resolution)
+            .await
+    }
+
+    async fn authenticated_study_projection(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::AuthenticatedStudyProjectionV1, PortError> {
+        self.inner
+            .authenticated_study_projection(user_id, study_set_id, voice_session_id)
+            .await
+    }
+}
+
+/// `bac522-deferred-2` is chosen so the synthetic fixture evaluator's
+/// response-identity cursor lands on `deferred_insufficient_semantic_evidence`.
+/// The assertion on the wire reason keeps a drift in that cursor loud instead of
+/// silently turning this into an evaluated-turn test.
+const TURN_DEFERRED_GENERATION_ID: &str = "bac522-deferred-2";
+
+fn turn_deferred_session_config_json(generation_id: &str) -> String {
+    let session: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/voice-protocol/session-config.json"
+    ))
+    .unwrap();
+    serde_json::json!({
+        "type": "session_config",
+        "version": VIVA_VOICE_PROTOCOL_VERSION,
+        "client_generation_id": generation_id,
+        "session": session,
+        "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
+    })
+    .to_string()
+}
+
+async fn run_turn_deferred_probe(
+    fail_turn_outcome: bool,
+) -> Option<(Vec<ServerFrame>, Arc<TurnOutcomeAuditStore>)> {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(TurnOutcomeAuditStore::new(inner, fail_turn_outcome));
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(brain_store)),
+        "synthetic",
+        VoiceWsAccess::default(),
+        2,
+        state_store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(10),
+        between_turn_idle: Duration::from_secs(10),
+        session: Duration::from_secs(20),
+        ..WsTimeouts::default()
+    });
+    let url = spawn_server(state).await?;
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    assert_ready_provider(&mut socket, "synthetic").await;
+    socket
+        .send(WsMessage::Text(
+            turn_deferred_session_config_json(TURN_DEFERRED_GENERATION_ID).into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut frames = Vec::new();
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        let saw_question = matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        );
+        frames.push(frame);
+        if saw_question {
+            break;
+        }
+    }
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: TURN_DEFERRED_GENERATION_ID.to_owned(),
+            turn_id: "turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "electrons move through the chain".to_owned(),
+            },
+        },
+    )
+    .await;
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        let frame = tokio::time::timeout(Duration::from_secs(4), socket.next()).await;
+        let Ok(Some(Ok(message))) = frame else {
+            break;
+        };
+        match message {
+            WsMessage::Text(text) => {
+                let frame: ServerFrame = serde_json::from_str(&text).unwrap();
+                let stop = matches!(
+                    &frame,
+                    ServerFrame::Event { event, .. }
+                        if matches!(event.as_ref(), VivaServerEvent::TurnDeferred { .. })
+                ) || terminal_session_reason(&frame).is_some();
+                frames.push(frame);
+                if stop {
+                    break;
+                }
+            }
+            WsMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+    Some((frames, store))
+}
+
+/// `SERVICE-014`: the deferral the learner sees is the one Plan 07 already
+/// persisted. The durable outcome is readable at the instant the nonterminal
+/// frame arrives, and the frame carries the persisted turn binding.
+#[tokio::test]
+async fn turn_deferred_frame_follows_the_persisted_outcome() {
+    let Some((frames, store)) = run_turn_deferred_probe(false).await else {
+        return;
+    };
+
+    let (turn_id, response_id, question_id, reason, can_retry_same_question) = frames
+        .iter()
+        .find_map(|frame| match frame {
+            ServerFrame::Event { event, .. } => match event.as_ref() {
+                VivaServerEvent::TurnDeferred {
+                    turn_id,
+                    response_id,
+                    question_id,
+                    reason,
+                    can_retry_same_question,
+                } => Some((
+                    turn_id.clone(),
+                    response_id.clone(),
+                    question_id.clone(),
+                    reason.clone(),
+                    *can_retry_same_question,
+                )),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("turn_deferred frame");
+
+    let question_turn_id = frames
+        .iter()
+        .find_map(|frame| match frame {
+            ServerFrame::Event { event, .. } => match event.as_ref() {
+                VivaServerEvent::QuestionStarted {
+                    turn_id,
+                    response_id: question_response_id,
+                    ..
+                } if *question_response_id == response_id => Some(turn_id.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("question_started that opened the deferred turn");
+    assert_eq!(
+        turn_id, question_turn_id,
+        "the deferral must name the turn its question opened"
+    );
+    assert_eq!(
+        reason,
+        agent_domain::EvaluationDeferralReason::InsufficientSemanticEvidence
+    );
+    assert!(can_retry_same_question);
+    assert!(!question_id.trim().is_empty());
+
+    // The deferral is nonterminal: no terminal phase precedes it.
+    let deferred_index = frames
+        .iter()
+        .position(|frame| {
+            matches!(
+                frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(event.as_ref(), VivaServerEvent::TurnDeferred { .. })
+            )
+        })
+        .expect("deferral index");
+    assert!(
+        frames[..deferred_index]
+            .iter()
+            .all(|frame| terminal_session_reason(frame).is_none()),
+        "a deferral is never preceded by a terminal phase"
+    );
+
+    let calls = store.calls();
+    assert!(
+        calls.contains(&"record_turn_outcome"),
+        "the persisted outcome is the only source of a deferral: {calls:?}"
+    );
+    // A deferred outcome states no mastery: no evaluation, status, schedule, or
+    // recap write is authorized by it.
+    let counts = store.write_counts();
+    assert_eq!(counts.concept_statuses, 0, "{calls:?}");
+    assert_eq!(counts.review_items, 0, "{calls:?}");
+    assert!(
+        !frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::AnswerEvaluated { .. } | VivaServerEvent::ConceptStatus { .. }
+                )
+        )),
+        "a deferral never carries a graded fact"
+    );
+}
+
+/// A store that cannot persist the outcome yields no learner fact at all: no
+/// deferral, no evaluation, no concept status, no review write, no graded recap.
+#[tokio::test]
+async fn turn_deferred_store_failure_emits_no_learner_fact() {
+    let Some((frames, store)) = run_turn_deferred_probe(true).await else {
+        return;
+    };
+
+    assert!(store.calls().contains(&"record_turn_outcome"));
+    assert!(
+        !frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::TurnDeferred { .. }
+                        | VivaServerEvent::AnswerEvaluated { .. }
+                        | VivaServerEvent::ConceptStatus { .. }
+                )
+        )),
+        "a failed outcome write must not reach the learner: {frames:?}"
+    );
+    assert!(
+        !frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::RecapReady { .. })
+        )),
+        "a failed outcome write must not produce a graded recap"
+    );
+    let counts = store.write_counts();
+    assert_eq!(counts.concept_statuses, 0);
+    assert_eq!(counts.review_items, 0);
+    assert_eq!(counts.recaps, 0);
+    let calls = store.calls();
+    assert!(!calls.contains(&"record_answer_evaluation"), "{calls:?}");
+    assert!(!calls.contains(&"record_concept_status"), "{calls:?}");
+    assert!(
+        !calls.contains(&"persist_review_schedule_decision"),
+        "{calls:?}"
+    );
+    assert!(!calls.contains(&"record_recap"), "{calls:?}");
+}
+
+/// A provider that persists its outcome through Plan 07's durable port and then
+/// resolves a response identity it never announced, while **two** client
+/// submissions are open. Nothing on the wire says which of the two the deferral
+/// belongs to, so the socket must refuse to name either.
+struct AmbiguousDeferralProbeBrain {
+    study_store: Arc<dyn StudyMemoryStore>,
+}
+
+const AMBIGUOUS_DEFERRAL_RESPONSE_ID: &str = "response-1-generation-rekeyed-by-the-provider";
+
+#[async_trait::async_trait]
+impl RealtimeBrain for AmbiguousDeferralProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "ambiguous_deferral_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(&self, config: SessionConfig) -> Result<RealtimeSession, BrainError> {
+        let _outcome = self
+            .study_store
+            .record_voice_session(&config)
+            .await
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
+        let store = self.study_store.clone();
+        let user_id = config.user_id.clone().unwrap_or_default();
+        let study_set_id = config.study_set_id.clone().unwrap_or_default();
+        let voice_session_id = config
+            .session_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = event_tx
+                .send(BrainEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                })
+                .await;
+            let question = agent_domain::fixture_question();
+            let question_id = question.question_id.clone();
+            let _ = event_tx
+                .send(BrainEvent::QuestionStarted {
+                    response_id: "response-1".to_owned(),
+                    question: question.clone(),
+                })
+                .await;
+            let mut answers = 0_u32;
+            while let Some(input) = input_rx.recv().await {
+                if !matches!(
+                    input,
+                    BrainInput::Text(_)
+                        | BrainInput::TextWithMetadata { .. }
+                        | BrainInput::Audio(_)
+                        | BrainInput::AudioWithMetadata { .. }
+                ) {
+                    continue;
+                }
+                answers += 1;
+                // The deferral is emitted only once BOTH submissions are open,
+                // so the ambiguity is a property of the test, not of a race.
+                if answers < 2 {
+                    // The announced question resolves, which frees the socket to
+                    // admit a second submission. `response_completed` carries no
+                    // browser frame of its own, so a `feedback` phase follows it
+                    // as the marker the client waits on before speaking again —
+                    // that keeps the second submission out of a race with the
+                    // first turn's admission.
+                    let _ = event_tx
+                        .send(BrainEvent::ResponseCompleted {
+                            response_id: "response-1".to_owned(),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(BrainEvent::SessionPhase {
+                            phase: agent_domain::StudySessionPhase::Feedback,
+                        })
+                        .await;
+                    continue;
+                }
+                // Plan 07's real durable path: the outcome is persisted before
+                // any learner-visible event derived from it is emitted.
+                let outcome = agent_domain::TurnOutcome {
+                    schema: agent_domain::learning_outcome::VIVA_TURN_OUTCOME_SCHEMA.to_owned(),
+                    response_id: AMBIGUOUS_DEFERRAL_RESPONSE_ID.to_owned(),
+                    question_id: question_id.clone(),
+                    rubric_policy_version: "viva.rubric.v1".to_owned(),
+                    recorded_at: "2026-08-24T00:00:00Z".to_owned(),
+                    source_ids: vec![],
+                    supersedes_response_id: None,
+                    resolution: agent_domain::TurnResolution::Deferred {
+                        reason: agent_domain::EvaluationDeferralReason::EvaluatorUnavailable,
+                        can_retry_same_question: true,
+                        disposition: agent_domain::QuestionDisposition::RetryCurrent,
+                    },
+                };
+                if store
+                    .record_turn_outcome(&user_id, &study_set_id, &voice_session_id, outcome)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                let _ = event_tx
+                    .send(BrainEvent::TurnDeferred {
+                        response_id: AMBIGUOUS_DEFERRAL_RESPONSE_ID.to_owned(),
+                        question_id: question_id.clone(),
+                        reason: agent_domain::EvaluationDeferralReason::EvaluatorUnavailable,
+                        can_retry_same_question: true,
+                    })
+                    .await;
+                // A later announced question is the probe for what the refused
+                // deferral did to the socket's ledger: it must still find the
+                // oldest open submission waiting for it.
+                let _ = event_tx
+                    .send(BrainEvent::QuestionStarted {
+                        response_id: "response-2".to_owned(),
+                        question: question.clone(),
+                    })
+                    .await;
+            }
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+/// `SERVICE-014`: missing and ambiguous turn bindings fail closed.
+///
+/// The provider persists a real deferred outcome and then resolves a response
+/// identity this socket never announced, with two client submissions open. The
+/// oldest open submission is not evidence that the deferral belongs to it, so
+/// the socket must emit no `turn_deferred` frame at all rather than name a turn
+/// it cannot show the deferral belongs to — and it must not consume that turn's
+/// binding either, which is the harm a silent oldest-first guess causes: the
+/// next announced question would then be bound to the wrong submission.
+#[tokio::test]
+async fn turn_deferred_ambiguous_binding_emits_no_frame_and_consumes_no_submission() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(TurnOutcomeAuditStore::new(inner, false));
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(AmbiguousDeferralProbeBrain {
+            study_store: brain_store,
+        }),
+        "ambiguous_deferral_probe",
+        VoiceWsAccess::default(),
+        2,
+        state_store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(10),
+        between_turn_idle: Duration::from_secs(10),
+        session: Duration::from_secs(20),
+        ..WsTimeouts::default()
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "ambiguous_deferral_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+
+    let announced_turn_id = loop {
+        let frame = read_server_frame(&mut socket).await;
+        if let ServerFrame::Event { event, .. } = &frame {
+            if let VivaServerEvent::QuestionStarted { turn_id, .. } = event.as_ref() {
+                break turn_id.clone();
+            }
+        }
+    };
+
+    // Two open client submissions, neither of which the provider ever announced
+    // a question for: the client names its own turn ids, the way a streamed
+    // audio turn does. The second is sent only after the first has resolved, so
+    // it is admitted rather than refused as an overlapping turn.
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-ambiguous-a".to_owned(),
+            turn_id: "turn-a".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "an answer submitted as turn-a".to_owned(),
+            },
+        },
+    )
+    .await;
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::SessionPhase { phase, .. }
+                        if *phase == agent_domain::StudySessionPhase::Feedback
+                )
+        ) {
+            break;
+        }
+    }
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-ambiguous-b".to_owned(),
+            turn_id: "turn-b".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "an answer submitted as turn-b".to_owned(),
+            },
+        },
+    )
+    .await;
+
+    // Read until the provider's next announced question, which is emitted right
+    // after the refused deferral, or until the socket ends.
+    let mut frames = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        let Ok(Some(Ok(message))) =
+            tokio::time::timeout(Duration::from_secs(2), socket.next()).await
+        else {
+            break;
+        };
+        match message {
+            WsMessage::Text(text) => {
+                let frame: ServerFrame = serde_json::from_str(&text).unwrap();
+                let stop = matches!(
+                    &frame,
+                    ServerFrame::Event { event, .. }
+                        if matches!(
+                            event.as_ref(),
+                            VivaServerEvent::QuestionStarted { response_id, .. }
+                                if response_id == "response-2"
+                        )
+                ) || terminal_session_reason(&frame).is_some();
+                frames.push(frame);
+                if stop {
+                    break;
+                }
+            }
+            WsMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    // The durable outcome was written: this is a binding refusal, not a missing
+    // provider result.
+    assert!(
+        store.calls().contains(&"record_turn_outcome"),
+        "the probe must have persisted its outcome: {:?}",
+        store.calls()
+    );
+    let deferrals = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            ServerFrame::Event { event, .. } => match event.as_ref() {
+                VivaServerEvent::TurnDeferred { turn_id, .. } => Some(turn_id.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        deferrals.is_empty(),
+        "an ambiguous deferral must name no turn at all, got {deferrals:?} \
+         (open submissions were turn-a and turn-b; the announced turn was {announced_turn_id})"
+    );
+
+    // Nothing was consumed: the next announced question still finds the oldest
+    // open submission. A silent oldest-first guess would have spent `turn-a` on
+    // the refused deferral and bound this question to `turn-b`.
+    let next_question_turn_id = frames
+        .iter()
+        .find_map(|frame| match frame {
+            ServerFrame::Event { event, .. } => match event.as_ref() {
+                VivaServerEvent::QuestionStarted {
+                    turn_id,
+                    response_id,
+                    ..
+                } if response_id == "response-2" => Some(turn_id.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the provider's next announced question");
+    assert_eq!(
+        next_question_turn_id, "turn-a",
+        "the refused deferral must not have consumed an open submission: {frames:?}"
+    );
+}
+
+/// A provider that finishes one turn and then says nothing. The socket must be
+/// returned to the between-turn deadline rather than left alive until the
+/// six-hour absolute session cap.
+struct BetweenTurnIdleProbeBrain {
+    study_store: Arc<dyn StudyMemoryStore>,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for BetweenTurnIdleProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "between_turn_idle_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(&self, config: SessionConfig) -> Result<RealtimeSession, BrainError> {
+        let _outcome = self
+            .study_store
+            .record_voice_session(&config)
+            .await
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = event_tx
+                .send(BrainEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                })
+                .await;
+            let _ = event_tx
+                .send(BrainEvent::QuestionStarted {
+                    response_id: "response-1".to_owned(),
+                    question: agent_domain::fixture_question(),
+                })
+                .await;
+            while let Some(input) = input_rx.recv().await {
+                if !matches!(
+                    input,
+                    BrainInput::Text(_)
+                        | BrainInput::TextWithMetadata { .. }
+                        | BrainInput::Audio(_)
+                        | BrainInput::AudioWithMetadata { .. }
+                ) {
+                    continue;
+                }
+                let _ = event_tx
+                    .send(BrainEvent::ResponseCompleted {
+                        response_id: "response-1".to_owned(),
+                    })
+                    .await;
+            }
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+/// `SERVICE-001`: a completed provider turn re-arms the between-turn deadline,
+/// and its expiry drops every server-owned lease.
+#[tokio::test]
+async fn between_turn_idle_expiry_releases_session_ip_and_provider_leases() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(BetweenTurnIdleProbeBrain {
+            study_store: store.clone(),
+        }),
+        "between_turn_idle_probe",
+        VoiceWsAccess::default(),
+        2,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(2),
+        max_user_sessions: Some(1),
+        provider_limiter_enabled: true,
+        max_provider_concurrent_turns: Some(1),
+        max_provider_queue_depth: Some(1),
+        ..VoiceLimitConfig::default()
+    })
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        // The in-turn deadline is deliberately long: only the between-turn
+        // deadline may end a socket whose turn already resolved.
+        idle: Duration::from_secs(4),
+        between_turn_idle: Duration::from_millis(250),
+        session: Duration::from_secs(8),
+        ..WsTimeouts::default()
+    });
+    let limits = state.limit_state.clone();
+    let slots = state.session_slots.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "between_turn_idle_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+    assert_eq!(limits.ip_lease_count(TEST_PEER_IP), Some(1));
+
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-between-turn-idle".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "an answer the provider completes".to_owned(),
+            },
+        },
+    )
+    .await;
+
+    let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = read_server_frame(&mut socket).await;
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("a completed provider turn must re-arm the between-turn deadline");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
+    assert_close_code(&mut socket, CloseCode::Policy).await;
+
+    wait_for_released_ip_lease(&limits, TEST_PEER_IP).await;
+    wait_until(Duration::from_secs(5), || slots.available_permits() == 2).await;
+
+    // The user, study-set, and provider leases are gone too: the same identity
+    // reconnects and is admitted a provider turn immediately.
+    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut second_socket, "between_turn_idle_probe").await;
+    send_client_frame(&mut second_socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut second_socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+    send_client_frame(
+        &mut second_socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-between-turn-idle-2".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "the provider slot was released".to_owned(),
+            },
+        },
+    )
+    .await;
+    let second_terminal = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = read_server_frame(&mut second_socket).await;
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("the reconnecting session was admitted and re-armed");
+    assert_terminal_session_phase(second_terminal, TerminalSessionReason::TurnCap);
+}
+
+/// Keepalives are not work: a Ping/Pong pair cannot postpone the between-turn
+/// deadline of a socket whose turn already resolved.
+#[tokio::test]
+async fn between_turn_idle_is_not_postponed_by_client_keepalives() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(BetweenTurnIdleProbeBrain {
+            study_store: store.clone(),
+        }),
+        "between_turn_idle_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(4),
+        between_turn_idle: Duration::from_millis(250),
+        session: Duration::from_secs(8),
+        ..WsTimeouts::default()
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "between_turn_idle_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-between-turn-keepalive".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "an answer the provider completes".to_owned(),
+            },
+        },
+    )
+    .await;
+
+    let started = Instant::now();
+    let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let _ = socket.send(WsMessage::Ping(Vec::new().into())).await;
+            let Some(Ok(message)) = socket.next().await else {
+                panic!("socket ended without a terminal phase");
+            };
+            let WsMessage::Text(text) = message else {
+                continue;
+            };
+            let frame: ServerFrame = serde_json::from_str(&text).unwrap();
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::TurnCap) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("client keepalives postponed the between-turn deadline");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::TurnCap);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the between-turn deadline moved with keepalives"
+    );
+}
+
+// -------------------------------------------------------------------------
+// Task 10 (SERVICE-001): a half-open socket expires on the server's own
+// heartbeat rather than surviving to the absolute session cap.
+// -------------------------------------------------------------------------
+
+/// A provider that holds one turn open forever, so the only thing that can end
+/// the socket is a server-owned deadline.
+struct HalfOpenProbeBrain {
+    study_store: Arc<dyn StudyMemoryStore>,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for HalfOpenProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "half_open_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(&self, config: SessionConfig) -> Result<RealtimeSession, BrainError> {
+        let _outcome = self
+            .study_store
+            .record_voice_session(&config)
+            .await
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = event_tx
+                .send(BrainEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                })
+                .await;
+            let _ = event_tx
+                .send(BrainEvent::QuestionStarted {
+                    response_id: "response-1".to_owned(),
+                    question: agent_domain::fixture_question(),
+                })
+                .await;
+            // Consume input and never resolve the turn.
+            while input_rx.recv().await.is_some() {}
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+/// `SERVICE-001`: a client that stops reading and stops writing is detected by
+/// the server's own heartbeat. Every server-owned permit — session slot, IP
+/// lease, user/study-set lease, provider lease — is back before one heartbeat
+/// interval has passed, and a fresh client for the same identity connects.
+#[tokio::test]
+async fn half_open_socket_expires_and_releases_every_server_owned_lease() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(HalfOpenProbeBrain {
+            study_store: store.clone(),
+        }),
+        "half_open_probe",
+        VoiceWsAccess::default(),
+        2,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(2),
+        max_user_sessions: Some(1),
+        provider_limiter_enabled: true,
+        max_provider_concurrent_turns: Some(1),
+        max_provider_queue_depth: Some(1),
+        ..VoiceLimitConfig::default()
+    })
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        // Every other deadline is far away: only the heartbeat can end this socket.
+        idle: Duration::from_secs(30),
+        between_turn_idle: Duration::from_secs(30),
+        session: Duration::from_secs(30),
+        heartbeat_interval: Duration::from_millis(120),
+        pong_timeout: Duration::from_millis(60),
+        ..WsTimeouts::default()
+    });
+    let limits = state.limit_state.clone();
+    let slots = state.session_slots.clone();
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "half_open_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+    // One admitted answer holds the only provider slot; the provider never
+    // resolves it.
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-half-open".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "an answer the provider never resolves".to_owned(),
+            },
+        },
+    )
+    .await;
+    wait_until(Duration::from_secs(2), || {
+        limits.ip_lease_count(TEST_PEER_IP) == Some(1)
+    })
+    .await;
+    assert_eq!(slots.available_permits(), 1);
+
+    // The client goes half-open: the socket object is kept alive, but the test
+    // stops reading it and never writes again, so no Pong will ever be answered.
+    let half_open = socket;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if limits.ip_lease_count(TEST_PEER_IP).is_none() && slots.available_permits() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        limits.ip_lease_count(TEST_PEER_IP),
+        None,
+        "the half-open socket must release its IP lease"
+    );
+    assert_eq!(slots.available_permits(), 2);
+    // The half-open detection signal this row exists to add: the recorded label
+    // is `heartbeat_timeout`, never the slow-reader label a missed outbound
+    // write records. The wire still closes on Plan 05's published slow-client
+    // contract — `ws::tests::heartbeat_expiry_records_heartbeat_timeout_on_the_slow_client_wire_contract`
+    // pins both halves against a recording sink.
+    let recorded = evidence.snapshot();
+    assert!(
+        recorded.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::TerminalReason
+                && event.detail == "heartbeat_timeout"
+        }),
+        "{recorded:?}"
+    );
+    assert!(
+        !recorded.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::TerminalReason
+                && event.detail == TerminalSessionReason::SlowClient.as_str()
+        }),
+        "a half-open socket must not be recorded as a slow reader: {recorded:?}"
+    );
+    drop(half_open);
+
+    // The user, study-set, and provider leases are gone too: the same identity
+    // reconnects and is admitted a provider turn.
+    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut second_socket, "half_open_probe").await;
+    send_client_frame(&mut second_socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut second_socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+    send_client_frame(
+        &mut second_socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-half-open-2".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "the provider slot was released".to_owned(),
+            },
+        },
+    )
+    .await;
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .filter(|event| {
+                event.kind == VoiceEvidenceEventKind::AnswerReceived
+                    && event.detail == "text answer received"
+            })
+            .count()
+            == 2
+    })
+    .await;
+}
+
+/// A client that keeps answering the server's Pings stays connected across many
+/// heartbeat intervals; the keepalives never end the socket and never move any
+/// other deadline.
+#[tokio::test]
+async fn half_open_answered_heartbeats_keep_the_socket_alive() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(HalfOpenProbeBrain {
+            study_store: store.clone(),
+        }),
+        "half_open_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(30),
+        between_turn_idle: Duration::from_secs(30),
+        session: Duration::from_secs(30),
+        heartbeat_interval: Duration::from_millis(60),
+        pong_timeout: Duration::from_millis(30),
+        ..WsTimeouts::default()
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "half_open_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+
+    // Reading the socket is what answers the server's Pings: tokio-tungstenite
+    // replies to a Ping while the stream is polled.
+    let mut pings = 0_usize;
+    let deadline = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), socket.next()).await {
+            Ok(Some(Ok(WsMessage::Ping(_)))) => pings += 1,
+            Ok(Some(Ok(WsMessage::Close(frame)))) => {
+                panic!("an answered heartbeat must not close the socket: {frame:?}")
+            }
+            Ok(Some(Ok(_))) | Err(_) => {}
+            Ok(Some(Err(error))) => panic!("socket error: {error:?}"),
+            Ok(None) => panic!("an answered heartbeat must not end the socket"),
+        }
+    }
+    assert!(
+        pings >= 3,
+        "the server must keep pinging across heartbeat intervals, saw {pings}"
+    );
+}
+
+/// `SERVICE-002`: the last two bounded writes survive the unwind.
+///
+/// A client that pipelines frames still has bytes on the wire when the server
+/// decides to close. Dropping a socket that holds unread client bytes resets the
+/// connection, and a reset discards the error frame and the Close frame the
+/// server already wrote — the learner sees a transport error instead of the
+/// reason they were closed. This is the socket-level half of Task 9: the
+/// deterministic sink tests are in-crate because a TCP buffer cannot simulate a
+/// stalled reader, but *this* property is only observable over a real socket,
+/// and only with a real backlog behind the offending frame.
+#[tokio::test]
+async fn bounded_writes_deliver_the_terminal_frame_and_close_with_client_bytes_in_flight() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(HalfOpenProbeBrain {
+            study_store: store.clone(),
+        }),
+        "half_open_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(30),
+        between_turn_idle: Duration::from_secs(30),
+        session: Duration::from_secs(30),
+        ..WsTimeouts::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "half_open_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+
+    // One frame the server refuses, then a real backlog written behind it
+    // without reading anything back. The server stops reading at the refusal, so
+    // the filler stays unread while the error frame and the Close frame are
+    // written. Each filler frame stays under the protocol's text-frame ceiling,
+    // and the whole burst stays well under a socket send buffer so the client
+    // itself never blocks.
+    const INFLIGHT_FILLER_FRAMES: usize = 6;
+    const INFLIGHT_FILLER_BYTES: usize = 32 * 1024;
+    socket
+        .send(WsMessage::Text(
+            "x".repeat(agent_service::VIVA_VOICE_MAX_TEXT_FRAME_BYTES + 1)
+                .into(),
+        ))
+        .await
+        .unwrap();
+    for index in 1..=INFLIGHT_FILLER_FRAMES {
+        send_client_frame(
+            &mut socket,
+            &ClientFrame::TurnIntent {
+                version: VIVA_VOICE_PROTOCOL_VERSION,
+                client_generation_id: format!("bac522-inflight-{index}"),
+                turn_id: format!("turn-inflight-{index}"),
+                intent: ClientTurnIntent::AnswerText {
+                    text: "x".repeat(INFLIGHT_FILLER_BYTES),
+                },
+            },
+        )
+        .await;
+    }
+
+    // Both writes reach the client rather than dying with the connection.
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Error { error, .. } if error.message == "text frame exceeds maximum size"
+    ));
+    match tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("the close frame must arrive rather than the connection resetting")
+        .expect("the socket must not end before its close frame")
+        .expect("the socket must not fail before its close frame")
+    {
+        WsMessage::Close(Some(frame)) => assert_eq!(frame.code, CloseCode::Size),
+        other => panic!("expected a close frame, got {other:?}"),
+    }
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(
+        events.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::TerminalReason
+                && event.detail == "oversized_text_frame"
+        }),
+        "{events:?}"
+    );
+}
+
+/// `A-20.2`: a `slow_client` terminal REASON is not a failed write SIDE.
+///
+/// `slow_client` is Plan 05's published wire reason for "this socket is not
+/// keeping up", and the overlapping-provider-turn policy denial closes with it
+/// while every server write is succeeding instantly. Inferring "the write side
+/// failed" from that sanitized label skipped the closing handshake, so the
+/// socket was dropped on top of the client's still-unread pipelined bytes and
+/// the connection reset — discarding the terminal frame and the Close frame the
+/// server had already written. The learner is told nothing; the browser sees a
+/// transport error.
+///
+/// This is the same property as the test above, taken on the other branch of the
+/// guard: the client is reading perfectly well, it simply has bytes in flight
+/// behind the frame the server refused.
+#[tokio::test]
+async fn bounded_writes_deliver_the_terminal_frame_and_close_after_a_denied_overlapping_turn() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let state = AppState::new(
+        Arc::new(BlockingProviderProbeBrain {
+            text_inputs: text_inputs.clone(),
+        }),
+        "cartesia_gemini",
+        VoiceWsAccess::default(),
+        4,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_provider_concurrent_turns: Some(1),
+        max_provider_queue_depth: Some(1),
+        ..VoiceLimitConfig::default()
+    })
+    // The subject is the closing handshake, not a deadline: every deadline stays
+    // far clear of the denial so nothing else can end this socket.
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(30),
+        between_turn_idle: Duration::from_secs(30),
+        session: Duration::from_secs(30),
+        ..WsTimeouts::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "cartesia_gemini").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Event { event, .. }
+            if matches!(
+                event.as_ref(),
+                VivaServerEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                    terminal_reason: None,
+                }
+            )
+    ));
+
+    // One answer the provider never resolves, so it keeps the only provider slot.
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "a20-handshake-first".to_owned(),
+            turn_id: "turn-a20-first".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
+        },
+    )
+    .await;
+    wait_until(Duration::from_secs(2), || {
+        text_inputs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    // The overlapping answers, written as one burst without reading anything
+    // back. The server refuses the first one it cannot queue and stops reading
+    // there, so the rest of the burst is still unread when the socket unwinds.
+    // Each frame stays under the protocol's text-frame ceiling, and the whole
+    // burst stays well under a socket send buffer so the client never blocks.
+    const INFLIGHT_FILLER_FRAMES: usize = 6;
+    const INFLIGHT_FILLER_BYTES: usize = 32 * 1024;
+    for index in 1..=INFLIGHT_FILLER_FRAMES {
+        socket
+            .feed(WsMessage::Text(
+                serde_json::to_string(&ClientFrame::TurnIntent {
+                    version: VIVA_VOICE_PROTOCOL_VERSION,
+                    client_generation_id: format!("a20-handshake-inflight-{index}"),
+                    turn_id: format!("turn-a20-inflight-{index}"),
+                    intent: ClientTurnIntent::AnswerText {
+                        text: "x".repeat(INFLIGHT_FILLER_BYTES),
+                    },
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    }
+    socket.flush().await.unwrap();
+
+    // Both writes must reach the client rather than dying with the connection.
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = match socket.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    serde_json::from_str::<ServerFrame>(&text).unwrap()
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(error)) => panic!(
+                    "the denied overlap must deliver its terminal frame, not reset the \
+                     connection: {error:?}"
+                ),
+                None => panic!("the socket ended before its terminal frame"),
+            };
+            if terminal_session_reason(&frame) == Some(TerminalSessionReason::SlowClient) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("the denied overlap must deliver its terminal frame");
+    assert_terminal_session_phase(terminal, TerminalSessionReason::SlowClient);
+    match tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("the close frame must arrive rather than the connection resetting")
+        .expect("the socket must not end before its close frame")
+        .expect("the socket must not fail before its close frame")
+    {
+        WsMessage::Close(Some(frame)) => assert_eq!(frame.code, CloseCode::Policy),
+        other => panic!("expected a close frame, got {other:?}"),
+    }
+    match tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("the socket must reach a clean end of stream")
+    {
+        None => {}
+        Some(Ok(other)) => panic!("expected end of stream, got {other:?}"),
+        Some(Err(error)) => panic!(
+            "the closing handshake must complete rather than resetting the connection: {error:?}"
+        ),
+    }
+    assert_eq!(text_inputs.load(Ordering::SeqCst), 1);
+    assert!(evidence.snapshot().iter().any(|event| {
+        event.kind == VoiceEvidenceEventKind::ProviderAdmission
+            && event.detail.contains("admission_decision=denied")
+            && event.detail.contains("reason=overlapping_provider_turn")
+            && event.detail.contains("terminal_reason=slow_client")
+    }));
+}
+
+/// Independent-review CRITICAL (cancel-after-submit): a scoped cancel that names
+/// a turn the client has already ended must not end the session.
+///
+/// The browser decides to cancel while its own `audio_end` is already on the
+/// wire; the server has no way to make that race disappear. Before this fix the
+/// late cancel found no open assembly, was classified `invalid_audio_frame`, and
+/// closed the socket with a PROTOCOL code — a learner losing their session for
+/// tapping cancel a few milliseconds late. Existing coverage stopped at the
+/// mid-stream cancel; this is the after-`audio_end` case.
+#[tokio::test]
+async fn websocket_scoped_cancel_after_audio_end_does_not_close_the_session() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(HalfOpenProbeBrain {
+            study_store: store.clone(),
+        }),
+        "half_open_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(10),
+        between_turn_idle: Duration::from_secs(10),
+        session: Duration::from_secs(20),
+        ..WsTimeouts::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "half_open_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+
+    send_v5_audio_turn(&mut socket, "turn-late-cancel", &[1_u8, 2]).await;
+    assert!(matches!(
+        read_server_frame_exact(&mut socket).await,
+        ServerFrame::AudioTurnAccepted { turn_id, .. } if turn_id == "turn-late-cancel"
+    ));
+
+    // The cancel the learner sent a moment too late.
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Cancel {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: VOICE_TEST_CLIENT_GENERATION.to_owned(),
+            turn_id: Some("turn-late-cancel".to_owned()),
+        },
+    )
+    .await;
+
+    // It is recorded as a cancel, and the socket is still open: no error frame,
+    // no close, no terminal reason.
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == VoiceEvidenceEventKind::CancelReceived)
+    })
+    .await;
+    match tokio::time::timeout(Duration::from_millis(300), socket.next()).await {
+        Err(_) => {}
+        Ok(Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_)))) => {}
+        Ok(other) => panic!("a late scoped cancel must not end the session, got {other:?}"),
+    }
+    assert!(
+        evidence.snapshot().iter().all(|event| {
+            event.kind != VoiceEvidenceEventKind::TerminalReason
+                && event.kind != VoiceEvidenceEventKind::Close
+        }),
+        "{:?}",
+        evidence.snapshot()
+    );
+
+    // Repeating the late cancel is still benign, and a cancel naming a turn this
+    // connection never saw is still refused.
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Cancel {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: VOICE_TEST_CLIENT_GENERATION.to_owned(),
+            turn_id: Some("turn-late-cancel".to_owned()),
+        },
+    )
+    .await;
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Cancel {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: VOICE_TEST_CLIENT_GENERATION.to_owned(),
+            turn_id: Some("turn-never-seen".to_owned()),
+        },
+    )
+    .await;
+    let error = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    if let ServerFrame::Error { error, .. } =
+                        serde_json::from_str::<ServerFrame>(&text).unwrap()
+                    {
+                        return error;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected the unknown turn to be refused, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a cancel for a turn this connection never saw is still refused");
+    assert_eq!(
+        error.code,
+        VoiceServerErrorCode::ClientFrameMalformed.as_str()
+    );
+    assert_close_code(&mut socket, CloseCode::Protocol).await;
+}
+
+/// `SERVICE-012`: the drain's missed-wakeup guard, pinned where it actually lives.
+///
+/// `Notify::notify_waiters` stores no permit, so a waiter that registers *after*
+/// its zero check can never be woken by the drop that made the check stale — the
+/// drain would then sit out its whole grace with the runtime already at zero.
+/// The ordering is a property of one function, and the window it closes is a few
+/// instructions wide, so it is characterized here rather than raced for.
+#[test]
+fn server_owned_capacity_drain_registers_its_waiter_before_each_zero_check() {
+    // The drain lives in the module that owns admission closure; this reads the
+    // responsibility, not a file name.
+    let ws_source = ws_source();
+    let body = ws_source
+        .split_once("pub async fn begin_drain_and_wait")
+        .expect("begin_drain_and_wait is the one drain entry point")
+        .1
+        .split_once("\n}\n")
+        .expect("the drain function closes")
+        .0;
+    let enable = body
+        .find(".enable();")
+        .expect("the zero waiter is enabled, not merely constructed");
+    let zero_check = body
+        .find("state.runtime_tracker.counts() == (0, 0)")
+        .expect("the drain waits on both counters");
+    let wait = body
+        .find("tokio::time::timeout_at(deadline, notified)")
+        .expect("the wait is bounded by the absolute grace deadline");
+    let notified = body
+        .find("state.runtime_tracker.zero.notified()")
+        .expect("the waiter is built from the tracker's zero notification");
+    assert!(
+        notified < enable && enable < zero_check && zero_check < wait,
+        "the waiter must be constructed and enabled before the zero check,          and only then awaited"
+    );
+    assert_eq!(
+        body.matches("state.runtime_tracker.counts()").count(),
+        1,
+        "one zero check, inside the loop that owns the registered waiter"
+    );
+    // The drain flag is closed before the accepted sessions are told to stop, so
+    // no upgrade can slip in behind the wait.
+    let begin_drain = body
+        .find("state.runtime_tracker.begin_drain();")
+        .expect("the tracker drain latches first");
+    let signal_drain = body
+        .find("state.drain_signal.begin_drain();")
+        .expect("the accepted sessions are signalled second");
+    assert!(begin_drain < signal_drain && signal_drain < notified);
+}
+
+/// `SERVICE-012`: the process no longer sleeps a fixed two seconds and hopes.
+#[test]
+fn server_owned_capacity_shutdown_waits_on_the_configured_drain_grace() {
+    assert!(
+        MAIN_SOURCE.contains("begin_drain_and_wait(&state, grace)"),
+        "shutdown drains through the server-owned wait"
+    );
+    assert!(
+        MAIN_SOURCE.contains("let grace = state.ws_timeouts.drain_grace;"),
+        "the grace is the configured VIVA_VOICE_DRAIN_GRACE_SECONDS bound"
+    );
+    assert!(
+        !MAIN_SOURCE.contains("tokio::time::sleep"),
+        "no unconditional shutdown sleep survives"
+    );
+    // Only counts reach the log when the grace expires.
+    let timed_out = MAIN_SOURCE
+        .split_once("DrainOutcome::TimedOut(snapshot)")
+        .expect("the timeout arm is handled")
+        .1;
+    for forbidden in [
+        "user_id",
+        "voice_session_id",
+        "study_set_id",
+        "ip =",
+        "peer",
+    ] {
+        assert!(
+            !timed_out.contains(forbidden),
+            "the drain timeout log must carry counts only, found {forbidden}"
+        );
+    }
+}
+
+/// `D-04 CONFIRM_DELETE` is the recorded branch, so no deletion finalizer exists
+/// to join at drain and no production path acquires a background-worker guard.
+/// The counter is still waited on, so a future worker cannot be drained past.
+#[test]
+fn server_owned_capacity_has_no_background_worker_under_confirm_delete() {
+    for production in [
+        production_module_source("ws"),
+        production_module_source("app"),
+        MAIN_SOURCE.to_owned(),
+    ] {
+        assert_eq!(
+            production.matches("enter_background_worker()").count(),
+            0,
+            "no production site acquires a background-worker guard under CONFIRM_DELETE"
+        );
+    }
+    assert!(
+        ws_source().contains("pub fn enter_background_worker"),
+        "the guard the drain waits on still exists"
+    );
+    assert!(
+        !LIB_SOURCE.contains("restore") && !ws_source().contains("deletion_finalizer"),
+        "CONFIRM_DELETE leaves no restore or finalizer surface"
+    );
+}
+
+/// `SERVICE-012`: every capacity dimension the server owns, read back through the
+/// one sanitized runtime snapshot. Nothing here reads a client close frame.
+fn capacity_probe_state(
+    max_sessions: usize,
+    text_inputs: Arc<AtomicUsize>,
+    voice_limits: VoiceLimitConfig,
+) -> AppState {
+    // One active session per (user, study set) is a separate server-owned cap, so
+    // every concurrent probe socket names a different set.
+    let store = provider_limiter_test_store();
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "physics-final".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Physics Final".to_owned(),
+        course: Some("Physics 201".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    AppState::with_study_store(
+        Arc::new(BlockingProviderProbeBrain { text_inputs }),
+        "cartesia_gemini",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".into()),
+            allowed_origins: vec![],
+        },
+        max_sessions,
+        store,
+    )
+    .with_voice_limits(voice_limits)
+}
+
+fn empty_runtime_snapshot(session_capacity: usize) -> VoiceRuntimeSnapshot {
+    VoiceRuntimeSnapshot {
+        session_capacity,
+        session_in_use: 0,
+        user_leases: 0,
+        ip_leases: 0,
+        provider_inflight: 0,
+        provider_waiting: 0,
+        active_handlers: 0,
+        background_workers: 0,
+        draining: false,
+    }
+}
+
+/// Opens one admitted socket, binds it, and leaves it holding whatever provider
+/// capacity its turn intent claims.
+async fn open_capacity_probe_socket(
+    url: &str,
+    study_set_id: &str,
+    session_id: &str,
+    nonce: &str,
+) -> TestWebSocket {
+    let token = provider_limiter_token(study_set_id, session_id, nonce);
+    let (mut socket, _) = connect_async(token_only_request(url, &token))
+        .await
+        .expect("capacity probe socket upgrades");
+    assert_ready_provider(&mut socket, "cartesia_gemini").await;
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token(study_set_id, session_id, &token).into(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Event { event, .. }
+            if matches!(
+                event.as_ref(),
+                VivaServerEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                    terminal_reason: None,
+                }
+            )
+    ));
+    socket
+}
+
+async fn send_capacity_probe_turn(socket: &mut TestWebSocket, generation: &str, turn_id: &str) {
+    send_client_frame(
+        socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: generation.to_owned(),
+            turn_id: turn_id.to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "capacity probe".to_owned(),
+            },
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn server_owned_capacity_snapshot_moves_once_per_transition_and_returns_to_zero() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let state = capacity_probe_state(
+        2,
+        text_inputs.clone(),
+        VoiceLimitConfig {
+            max_user_sessions: Some(2),
+            max_ip_sessions: Some(2),
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        },
+    );
+    let observed = state.clone();
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    assert_eq!(observed.runtime_snapshot(), empty_runtime_snapshot(2));
+
+    let mut holder = open_capacity_probe_socket(
+        &url,
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-capacity-biology",
+    )
+    .await;
+    send_capacity_probe_turn(&mut holder, "capacity-holder", "v5-capacity-1").await;
+    wait_until(Duration::from_secs(2), || {
+        text_inputs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(
+        observed.runtime_snapshot(),
+        VoiceRuntimeSnapshot {
+            session_capacity: 2,
+            session_in_use: 1,
+            user_leases: 1,
+            ip_leases: 1,
+            provider_inflight: 1,
+            provider_waiting: 0,
+            active_handlers: 1,
+            background_workers: 0,
+            draining: false,
+        }
+    );
+
+    let mut queued = open_capacity_probe_socket(
+        &url,
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-capacity-chemistry",
+    )
+    .await;
+    send_capacity_probe_turn(&mut queued, "capacity-queued", "v5-capacity-2").await;
+    wait_until(Duration::from_secs(2), || {
+        observed.runtime_snapshot().provider_waiting == 1
+    })
+    .await;
+    let saturated = VoiceRuntimeSnapshot {
+        session_capacity: 2,
+        session_in_use: 2,
+        user_leases: 2,
+        ip_leases: 2,
+        provider_inflight: 1,
+        provider_waiting: 1,
+        active_handlers: 2,
+        background_workers: 0,
+        draining: false,
+    };
+    assert_eq!(observed.runtime_snapshot(), saturated);
+
+    // Every configured cap is now exactly full and none of them was exceeded.
+    assert!(saturated.session_in_use <= saturated.session_capacity);
+    assert_eq!(saturated.user_leases, 2);
+    assert_eq!(saturated.ip_leases, 2);
+    assert_eq!(saturated.provider_inflight, 1);
+    assert_eq!(saturated.provider_waiting, 1);
+
+    // A denied upgrade takes nothing: the snapshot is byte-identical afterwards.
+    let refused = connect_async(token_only_request(
+        &url,
+        &provider_limiter_token(
+            "biology-midterm",
+            "voice-session-3",
+            "nonce-capacity-denied",
+        ),
+    ))
+    .await;
+    assert!(
+        refused.is_err(),
+        "a third upgrade must be refused at the session cap"
+    );
+    assert_eq!(observed.runtime_snapshot(), saturated);
+
+    // Cancelling the queued turn decrements the waiting counter exactly once.
+    send_client_frame(
+        &mut queued,
+        &ClientFrame::Cancel {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "capacity-queued".to_owned(),
+            turn_id: None,
+        },
+    )
+    .await;
+    wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::CancelReceived).await;
+    wait_until(Duration::from_secs(2), || {
+        observed.runtime_snapshot().provider_waiting == 0
+    })
+    .await;
+    assert_eq!(
+        observed.runtime_snapshot(),
+        VoiceRuntimeSnapshot {
+            provider_waiting: 0,
+            ..saturated
+        }
+    );
+
+    holder.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut holder).await;
+    queued.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut queued).await;
+
+    wait_until(Duration::from_secs(5), || {
+        observed.runtime_snapshot() == empty_runtime_snapshot(2)
+    })
+    .await;
+    assert_eq!(observed.runtime_snapshot(), empty_runtime_snapshot(2));
+    assert_eq!(observed.session_slots.available_permits(), 2);
+}
+
+#[tokio::test]
+async fn server_owned_capacity_denial_returns_the_session_slot_it_reserved() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let state = capacity_probe_state(
+        4,
+        text_inputs.clone(),
+        VoiceLimitConfig {
+            max_ip_sessions: Some(1),
+            ..VoiceLimitConfig::default()
+        },
+    );
+    let observed = state.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let mut admitted = open_capacity_probe_socket(
+        &url,
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-capacity-ip-first",
+    )
+    .await;
+    let held = observed.runtime_snapshot();
+    assert_eq!(held.session_in_use, 1);
+    assert_eq!(held.ip_leases, 1);
+
+    // The per-IP refusal happens after a session permit was reserved. The permit
+    // must come back, or a deployment behind one proxy leaks its whole capacity.
+    let refused = connect_async(token_only_request(
+        &url,
+        &provider_limiter_token(
+            "chemistry-final",
+            "voice-session-2",
+            "nonce-capacity-ip-second",
+        ),
+    ))
+    .await;
+    assert!(refused.is_err(), "the second upgrade shares the peer IP");
+    wait_until(Duration::from_secs(2), || {
+        observed.runtime_snapshot() == held
+    })
+    .await;
+    assert_eq!(observed.runtime_snapshot(), held);
+    assert_eq!(observed.session_slots.available_permits(), 3);
+
+    admitted.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut admitted).await;
+    wait_until(Duration::from_secs(5), || {
+        observed.runtime_snapshot() == empty_runtime_snapshot(4)
+    })
+    .await;
+    assert_eq!(observed.runtime_snapshot(), empty_runtime_snapshot(4));
+}
+
+/// `SERVICE-012` drain race: sessions parked in first-frame wait, holding active
+/// provider work, queued behind it, and one whose peer stopped reading all reach
+/// zero inside the server-owned grace, and admission closes before a slot is
+/// allocated. `D-04 CONFIRM_DELETE` is the selected branch, so there is no
+/// deletion finalizer to join and `background_workers` stays zero throughout.
+#[tokio::test]
+async fn websocket_drain_releases_every_lease_and_reports_drained() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let state = capacity_probe_state(
+        4,
+        text_inputs.clone(),
+        VoiceLimitConfig {
+            max_user_sessions: Some(4),
+            max_ip_sessions: Some(4),
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        },
+    );
+    // A socket parked in first-frame wait is released by the server-owned
+    // first-frame bound, so this state pins that bound well inside the grace
+    // rather than waiting out the 10-second production default.
+    let state = state.with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(2),
+        ..WsTimeouts::default()
+    });
+    let drain_state = state.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    // 1. A socket parked in the first-frame wait: it owns a session slot and an
+    //    active-handler guard but has bound no identity yet.
+    let first_frame_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-9",
+        "nonce-drain-firstframe",
+    );
+    let (mut first_frame_wait, _) = connect_async(token_only_request(&url, &first_frame_token))
+        .await
+        .expect("first-frame socket upgrades");
+    assert_ready_provider(&mut first_frame_wait, "cartesia_gemini").await;
+
+    // 2. A socket holding the single provider inflight slot.
+    let mut holder = open_capacity_probe_socket(
+        &url,
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-drain-holder",
+    )
+    .await;
+    send_capacity_probe_turn(&mut holder, "drain-holder", "v5-drain-1").await;
+    wait_until(Duration::from_secs(2), || {
+        text_inputs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    // 3. A socket queued behind it.
+    let mut queued = open_capacity_probe_socket(
+        &url,
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-drain-queued",
+    )
+    .await;
+    send_capacity_probe_turn(&mut queued, "drain-queued", "v5-drain-2").await;
+    wait_until(Duration::from_secs(2), || {
+        drain_state.runtime_snapshot().provider_waiting == 1
+    })
+    .await;
+
+    // 4. A socket whose peer has stopped reading, so the drain's own terminal
+    //    write is the last thing standing between it and zero.
+    let silent = open_capacity_probe_socket(
+        &url,
+        "physics-final",
+        "voice-session-4",
+        "nonce-drain-silent",
+    )
+    .await;
+
+    let before = drain_state.runtime_snapshot();
+    assert_eq!(before.active_handlers, 4);
+    assert_eq!(before.session_in_use, 4);
+    assert_eq!(before.provider_inflight, 1);
+    assert_eq!(before.provider_waiting, 1);
+    assert!(!before.draining);
+
+    let started = Instant::now();
+    let outcome = begin_drain_and_wait(&drain_state, Duration::from_secs(20)).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(outcome, DrainOutcome::Drained);
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the drain must finish inside its grace, took {elapsed:?}"
+    );
+    assert_eq!(
+        drain_state.runtime_snapshot(),
+        VoiceRuntimeSnapshot {
+            draining: true,
+            ..empty_runtime_snapshot(4)
+        }
+    );
+    assert_eq!(drain_state.session_slots.available_permits(), 4);
+
+    // The queued provider answer was never forwarded once the drain started.
+    assert_eq!(text_inputs.load(Ordering::SeqCst), 1);
+
+    // A new upgrade is refused before it can allocate a session slot.
+    let refused = connect_async(token_only_request(
+        &url,
+        &provider_limiter_token("biology-midterm", "voice-session-5", "nonce-drain-refused"),
+    ))
+    .await;
+    assert!(refused.is_err(), "a draining server admits no new session");
+    assert_eq!(drain_state.session_slots.available_permits(), 4);
+    assert_eq!(drain_state.runtime_snapshot().active_handlers, 0);
+
+    drop(first_frame_wait);
+    drop(holder);
+    drop(queued);
+    drop(silent);
+}
+
+/// `SERVICE-017`: the router surface, frozen before the responsibility split.
+///
+/// Every registered route is exercised with its correct method and a minimally
+/// valid body, and each response is asserted to be neither `404` nor `405`. The
+/// matched-route pattern is recorded by a `route_layer`, so a handler that never
+/// ran, ran under a different pattern, or ran twice is visible directly rather
+/// than inferred from a status code.
+fn router_surface_app() -> (axum::Router, Arc<Mutex<Vec<String>>>) {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(inner.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: Some("rest-secret".into()),
+            session_token_secret: Some("session-secret".into()),
+            allowed_origins: vec![],
+        },
+        4,
+        inner,
+    )
+    .with_operator_access(OperatorAccess::new(Some(RedactedSecret::from(
+        FIXTURE_OPERATOR_CREDENTIAL,
+    ))));
+    let matched = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorder = matched.clone();
+    let router = build_router(state).route_layer(axum::middleware::from_fn(
+        move |request: Request<Body>, next: axum::middleware::Next| {
+            let recorder = recorder.clone();
+            async move {
+                if let Some(matched_path) = request.extensions().get::<axum::extract::MatchedPath>()
+                {
+                    recorder
+                        .lock()
+                        .expect("matched path log poisoned")
+                        .push(matched_path.as_str().to_owned());
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    (router, matched)
+}
+
+fn router_surface_request(method: &str, uri: &str, body: Option<&str>) -> Request<Body> {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("origin", "http://localhost:3000")
+        .header("authorization", "Bearer rest-secret")
+        .header("content-type", "application/json");
+    builder
+        .body(body.map_or_else(Body::empty, |body| Body::from(body.to_owned())))
+        .expect("router surface request builds")
+}
+
+const ROUTER_SURFACE_PASTE_BODY: &str = r#"{"title":"Cell Division","course":"Biology 201","exam_date":"2031-06-01T09:30:00.000Z","pasted_text":"mitosis chromosome spindle metaphase cytokinesis"}"#;
+const ROUTER_SURFACE_FILE_BODY: &str = r#"{"title":"Lecture 9","course":"Biology 201","exam_date":"2031-06-01T09:30:00.000Z","file_name":"lecture-9.txt","content_base64":"bWl0b3NpcyBjaHJvbW9zb21lIHNwaW5kbGUgbWV0YXBoYXNlIGN5dG9raW5lc2lz"}"#;
+const ROUTER_SURFACE_RETRY_BODY: &str = r#"{"file_name":"lecture-9.txt","content_base64":"bWl0b3NpcyBjaHJvbW9zb21lIHNwaW5kbGUgbWV0YXBoYXNlIGN5dG9raW5lc2lz"}"#;
+
+#[tokio::test]
+async fn router_surface_registration_matches_every_route_exactly_once() {
+    let rows: Vec<(&str, &str, Option<&str>, &str)> = vec![
+        ("GET", "/", None, "/"),
+        ("GET", "/health", None, "/health"),
+        ("GET", "/live", None, "/live"),
+        ("GET", "/ready", None, "/ready"),
+        ("GET", "/health/brain", None, "/health/brain"),
+        (
+            "POST",
+            "/study-sets/paste",
+            Some(ROUTER_SURFACE_PASTE_BODY),
+            "/study-sets/paste",
+        ),
+        (
+            "POST",
+            "/study-sets/files",
+            Some(ROUTER_SURFACE_FILE_BODY),
+            "/study-sets/files",
+        ),
+        (
+            "POST",
+            "/study-sets/biology-midterm/files/retry",
+            Some(ROUTER_SURFACE_RETRY_BODY),
+            "/study-sets/{study_set_id}/files/retry",
+        ),
+        ("GET", "/study-sets/export", None, "/study-sets/export"),
+        ("GET", "/study-sets/library", None, "/study-sets/library"),
+        (
+            "GET",
+            "/v1/study-sets/biology-midterm/projection?voice_session_id=voice-session-1",
+            None,
+            "/v1/study-sets/{study_set_id}/projection",
+        ),
+        (
+            "DELETE",
+            "/study-sets/biology-midterm",
+            None,
+            "/study-sets/{study_set_id}",
+        ),
+        (
+            "DELETE",
+            "/study-sets/biology-midterm/sessions/voice-session-1",
+            None,
+            "/study-sets/{study_set_id}/sessions/{voice_session_id}",
+        ),
+        ("GET", "/ws", None, "/ws"),
+    ];
+
+    for (method, uri, body, expected_pattern) in rows {
+        let (app, matched) = router_surface_app();
+        let response = app
+            .oneshot(router_surface_request(method, uri, body))
+            .await
+            .expect("router surface request completes");
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{method} {uri} is not registered"
+        );
+        assert_ne!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {uri} is registered under a different method"
+        );
+        let matched = matched.lock().expect("matched path log poisoned").clone();
+        assert_eq!(
+            matched,
+            vec![expected_pattern.to_owned()],
+            "{method} {uri} must run exactly one handler, under its own pattern"
+        );
+    }
+}
+
+#[tokio::test]
+async fn router_surface_registration_rejects_unknown_paths_and_wrong_methods() {
+    let (app, matched) = router_surface_app();
+    let response = app
+        .oneshot(router_surface_request(
+            "GET",
+            "/not-a-registered-route",
+            None,
+        ))
+        .await
+        .expect("unknown path completes");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        matched
+            .lock()
+            .expect("matched path log poisoned")
+            .is_empty(),
+        "an unknown path must reach no handler"
+    );
+
+    // `D-04 CONFIRM_DELETE`: there is no restore route to match.
+    let (app, matched) = router_surface_app();
+    let response = app
+        .oneshot(router_surface_request(
+            "POST",
+            "/v1/study-sets/biology-midterm/restore",
+            None,
+        ))
+        .await
+        .expect("restore path completes");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(matched
+        .lock()
+        .expect("matched path log poisoned")
+        .is_empty());
+
+    for (method, uri) in [("DELETE", "/live"), ("POST", "/ready"), ("DELETE", "/ws")] {
+        let (app, _matched) = router_surface_app();
+        let response = app
+            .oneshot(router_surface_request(method, uri, None))
+            .await
+            .expect("wrong-method request completes");
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {uri} must be refused as a wrong method, not routed"
+        );
+    }
+}
+
+/// A merge that registered a group twice would panic inside `Router::merge`, and
+/// a path registered in two groups would too. Building the router is therefore
+/// itself the duplicate-merge control; this pins that it is exercised.
+#[test]
+fn router_surface_registration_builds_without_a_duplicate_registration() {
+    let (_app, _matched) = router_surface_app();
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(inner.clone())),
+        "synthetic",
+        VoiceWsAccess::default(),
+        1,
+        inner,
+    );
+    let _router = build_router(state);
+}
+
+/// `SERVICE-017`: the two state-machine properties that are about ORDER and
+/// OWNERSHIP rather than about a value, frozen across the responsibility split.
+/// Both read the whole `src/ws` surface, so the same claim means the same thing
+/// before and after the move without the assertion being edited.
+#[test]
+fn ws_state_transition_characterization_releases_a_binding_only_after_forwarding() {
+    let source = ws_source();
+    assert_eq!(
+        source.matches("turn_bindings.release_response(").count(),
+        1,
+        "a response binding is released in exactly one place"
+    );
+    let accounting = source
+        .split_once("async fn forward_brain_event_with_turn_accounting")
+        .expect("the one accounting forwarder")
+        .1;
+    let forward = accounting
+        .find("let result = forward_brain_event(")
+        .expect("the event is forwarded first");
+    let guard = accounting
+        .find("if matches!(result, ForwardBrainEvent::Continue) {")
+        .expect("accounting is guarded by a successful forward");
+    let apply = accounting
+        .find("apply_provider_turn_accounting(resolution, runtime);")
+        .expect("the single classification is applied once");
+    let release = accounting
+        .find("turn_bindings.release_response(response_id);")
+        .expect("the binding is released inside that guard");
+    assert!(
+        forward < guard && guard < apply && apply < release,
+        "the resolution must reach the wire before its binding is spent"
+    );
+    assert_eq!(
+        source
+            .matches("let resolution = classify_provider_turn_event(&event);")
+            .count(),
+        1,
+        "one classifier, one call site: both counters consume the same value"
+    );
+}
+
+#[test]
+fn ws_state_transition_characterization_terminal_paths_drop_every_owned_guard() {
+    let source = ws_source();
+    let admission = source
+        .split_once("struct VoiceAdmission {")
+        .expect("the admission carrier")
+        .1
+        .split_once("\n}\n")
+        .expect("the admission carrier closes")
+        .0;
+    for owned in ["_permit:", "_ip_lease:", "_handler_guard:"] {
+        assert!(
+            admission.contains(owned),
+            "the admission carries {owned} so every exit releases it"
+        );
+    }
+    // Taken by value, so there is no exit — slow client, heartbeat expiry, drain,
+    // policy close, or panic-free early return — that can leave one held.
+    assert!(
+        source.contains("admission: VoiceAdmission,"),
+        "the session takes ownership of the admission"
+    );
+    for leak in [
+        "std::mem::forget",
+        "ManuallyDrop",
+        "Box::leak",
+        ".into_raw(",
+    ] {
+        assert!(
+            !source.contains(leak),
+            "nothing in the websocket runtime may defeat a guard's Drop ({leak})"
+        );
+    }
+}
+
+/// Every registered route path is declared exactly once across the HTTP surface,
+/// so a group cannot be merged twice or a path registered in two groups.
+#[test]
+fn router_surface_registration_declares_every_path_once() {
+    let source = http_surface_source();
+    for path in [
+        "\"/\"",
+        "\"/health\"",
+        "\"/live\"",
+        "\"/ready\"",
+        "\"/health/brain\"",
+        "\"/study-sets/paste\"",
+        "\"/study-sets/files\"",
+        "\"/study-sets/{study_set_id}/files/retry\"",
+        "\"/study-sets/export\"",
+        "\"/study-sets/library\"",
+        "\"/v1/study-sets/{study_set_id}/projection\"",
+        "\"/study-sets/{study_set_id}\"",
+        "\"/study-sets/{study_set_id}/sessions/{voice_session_id}\"",
+        "\"/ws\"",
+    ] {
+        assert_eq!(
+            source.matches(path).count(),
+            1,
+            "{path} must be registered exactly once across the HTTP surface"
+        );
+    }
+    // `D-04 CONFIRM_DELETE`: no restore path is registered anywhere.
+    assert!(!source.contains("/restore"));
 }

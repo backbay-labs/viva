@@ -207,7 +207,7 @@ pub fn fixture_source_reference() -> StudySourceReference {
 pub fn fixture_question() -> StudyQuestion {
     StudyQuestion {
         question_id: "q-oxidative-phosphorylation-nadh".to_owned(),
-        concept_id: "concept-oxidative-phosphorylation".to_owned(),
+        concept_id: "oxidative-phosphorylation".to_owned(),
         prompt: "Explain the role of NADH in oxidative phosphorylation.".to_owned(),
         expected_terms: vec![
             "electron donor".to_owned(),
@@ -228,7 +228,7 @@ pub fn fixture_rubric() -> EvaluationRubricV1 {
         criteria: vec![
             crate::learning_outcome::RubricCriterionV1 {
                 criterion_id: "crit-oxphos-donor".to_owned(),
-                concept_id: "concept-oxidative-phosphorylation".to_owned(),
+                concept_id: "oxidative-phosphorylation".to_owned(),
                 claim: "NADH donates high-energy electrons to the electron transport chain."
                     .to_owned(),
                 source_id: "src-lecture-5-slide-18".to_owned(),
@@ -236,7 +236,7 @@ pub fn fixture_rubric() -> EvaluationRubricV1 {
             },
             crate::learning_outcome::RubricCriterionV1 {
                 criterion_id: "crit-oxphos-gradient".to_owned(),
-                concept_id: "concept-oxidative-phosphorylation".to_owned(),
+                concept_id: "oxidative-phosphorylation".to_owned(),
                 claim: "Electron flow pumps protons across the inner mitochondrial membrane."
                     .to_owned(),
                 source_id: "src-lecture-5-slide-18".to_owned(),

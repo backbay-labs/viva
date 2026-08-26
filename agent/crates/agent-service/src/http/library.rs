@@ -1,0 +1,721 @@
+//! `SERVICE-017`: the authenticated projection, the library snapshot/export, and the delete surface.
+//!
+//! Moved verbatim out of `app.rs` by the responsibility split. No route,
+//! response, timer, authorization decision, store call, or error mapping
+//! changed; only the file the code lives in and the visibility the move forces.
+
+use agent_domain::{
+    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary,
+    StudySetIngestionStatus,
+};
+use axum::{
+    extract::{rejection::QueryRejection, Path, Query},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    routing::{delete, get},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use uuid::Uuid;
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::app::*;
+use crate::config::ProjectionRejection;
+use crate::config::{ProjectionReadAccess, RedactedSecret, SessionTokenClaims};
+use crate::http::ingestion::store_json_error;
+
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct LibrarySnapshotQuery {
+    user_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct LibrarySnapshotResponse {
+    user_id: String,
+    privacy: LibraryPrivacyResponse,
+    study_sets: Vec<LibraryStudySetResponse>,
+    sessions: Vec<LibrarySessionSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct LibraryExportResponse {
+    user_id: String,
+    privacy: LibraryPrivacyResponse,
+    study_sets: Vec<LibraryExportStudySetResponse>,
+    sessions: Vec<LibrarySessionSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct LibraryPrivacyResponse {
+    voice_recordings_saved: bool,
+    transcripts_saved: bool,
+    raw_audio_persistence: bool,
+    transcript_persistence: bool,
+    export_contains_raw_provider_payloads: bool,
+    export: LibraryAction,
+    copy: &'static str,
+    data_handling_statement: &'static str,
+    retention_statement: &'static str,
+    deletion_statement: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct LibraryStudySetResponse {
+    id: String,
+    user_id: String,
+    title: String,
+    course: Option<String>,
+    ingestion_status: StudySetIngestionStatus,
+    ingestion_error: Option<String>,
+    server_owned: bool,
+    documents: Vec<LibraryStudyDocumentSummary>,
+    concept_count: usize,
+    question_count: usize,
+    actions: LibraryStudySetActions,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct LibraryExportStudySetResponse {
+    id: String,
+    user_id: String,
+    title: String,
+    course: Option<String>,
+    ingestion_status: StudySetIngestionStatus,
+    ingestion_error: Option<String>,
+    server_owned: bool,
+    documents: Vec<LibraryStudyDocumentSummary>,
+    concept_count: usize,
+    question_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct LibraryStudySetActions {
+    start: LibraryAction,
+    resume: LibraryAction,
+    archive: LibraryAction,
+    delete: LibraryAction,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct LibraryAction {
+    available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable_reason: Option<&'static str>,
+}
+
+pub(super) async fn library_snapshot(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Query(query): Query<LibrarySnapshotQuery>,
+    headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let response_headers = match optional_cors_json_headers(&state.ws_access, &headers) {
+        Ok(headers) => headers,
+        Err(error) => return cors_json_error(error),
+    };
+    let user_id = query
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&state.trusted_user_id);
+    if !state.unauthenticated_paste_allowed || user_id != state.trusted_user_id {
+        if state.ws_access.required_bearer.is_none() {
+            return (
+                StatusCode::FORBIDDEN,
+                response_headers,
+                Json(json!({
+                    "error": "library_snapshot_auth_required",
+                    "message": "cross-user library snapshots require authenticated REST access",
+                })),
+            );
+        }
+        if let Err(error) = state.ws_access.validate_bearer_headers(&headers) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                response_headers,
+                Json(json!({
+                    "error": "library_snapshot_auth_failed",
+                    "message": error.to_string(),
+                })),
+            );
+        }
+    }
+    let snapshot = match state.study_store.library_snapshot(user_id).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                response_headers,
+                Json(json!({
+                    "error": "library_snapshot_failed",
+                    "message": error.to_string(),
+                })),
+            );
+        }
+    };
+    let request_origin = request_origin(&headers).map(ToOwned::to_owned);
+    let study_sets = snapshot
+        .study_sets
+        .into_iter()
+        .map(|study_set| {
+            let mutation_control_token = signed_library_control_token(&state, &study_set.user_id);
+            let unavailable_reason = study_set_start_unavailable_reason(&study_set);
+            let start = match unavailable_reason {
+                Some(reason) => unavailable_action(reason),
+                None => {
+                    let session_id = Uuid::new_v4().to_string();
+                    signed_library_action(
+                        &state,
+                        &study_set.user_id,
+                        &study_set.id,
+                        session_id,
+                        request_origin.as_deref(),
+                    )
+                }
+            };
+            let resume = match (unavailable_reason, study_set.open_session_id.clone()) {
+                (Some(reason), _) => unavailable_action(reason),
+                (None, Some(session_id)) => signed_library_action(
+                    &state,
+                    &study_set.user_id,
+                    &study_set.id,
+                    session_id,
+                    request_origin.as_deref(),
+                ),
+                (None, None) => unavailable_action("no_open_session"),
+            };
+            let mutation_auth_unavailable_reason =
+                library_mutation_access_unavailable_reason(&state, &headers, &study_set.user_id);
+            let delete = if let Some(reason) = mutation_auth_unavailable_reason {
+                unavailable_action(reason)
+            } else if mutation_control_token.is_none() {
+                unavailable_action("control_token_unavailable")
+            } else if study_set.server_owned
+                && !study_set.documents.is_empty()
+                && study_set.documents.iter().any(|document| !document.deleted)
+            {
+                available_mutation_action(mutation_control_token.clone())
+            } else {
+                unavailable_action(unavailable_reason.unwrap_or("source_deleted"))
+            };
+
+            LibraryStudySetResponse {
+                id: study_set.id,
+                user_id: study_set.user_id,
+                title: study_set.title,
+                course: study_set.course,
+                ingestion_status: study_set.ingestion_status,
+                ingestion_error: study_set.ingestion_error,
+                server_owned: study_set.server_owned,
+                documents: study_set.documents,
+                concept_count: study_set.concept_count,
+                question_count: study_set.question_count,
+                actions: LibraryStudySetActions {
+                    start,
+                    resume,
+                    archive: unavailable_action("server_mutation_unavailable"),
+                    delete,
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+
+    (
+        StatusCode::OK,
+        response_headers,
+        Json(
+            serde_json::to_value(LibrarySnapshotResponse {
+                user_id: snapshot.user_id,
+                privacy: privacy_response_for_headers(&state, &headers, user_id),
+                study_sets,
+                sessions: snapshot.sessions,
+            })
+            .unwrap_or_else(|error| {
+                json!({
+                    "error": "library_response_failed",
+                    "message": error.to_string(),
+                })
+            }),
+        ),
+    )
+}
+
+pub(super) async fn library_export(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Query(query): Query<LibrarySnapshotQuery>,
+    headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let response_headers = match optional_cors_json_headers(&state.ws_access, &headers) {
+        Ok(headers) => headers,
+        Err(error) => return cors_json_error(error),
+    };
+    let user_id = requested_library_user_id(&query, &state);
+    if let Some(error) = require_library_control_access(
+        &state,
+        &headers,
+        &response_headers,
+        &user_id,
+        "library_export",
+    ) {
+        return error;
+    }
+    let snapshot = match state.study_store.library_snapshot(&user_id).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return store_json_error(response_headers, error, "library_export_failed"),
+    };
+    let study_sets = snapshot
+        .study_sets
+        .into_iter()
+        .map(|study_set| LibraryExportStudySetResponse {
+            id: study_set.id,
+            user_id: study_set.user_id,
+            title: study_set.title,
+            course: study_set.course,
+            ingestion_status: study_set.ingestion_status,
+            ingestion_error: study_set.ingestion_error,
+            server_owned: study_set.server_owned,
+            documents: study_set.documents,
+            concept_count: study_set.concept_count,
+            question_count: study_set.question_count,
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        response_headers,
+        Json(
+            serde_json::to_value(LibraryExportResponse {
+                user_id: snapshot.user_id,
+                privacy: privacy_response(&state, available_mutation_action(None)),
+                study_sets,
+                sessions: snapshot.sessions,
+            })
+            .unwrap_or_else(|error| {
+                json!({
+                    "error": "library_export_response_failed",
+                    "message": error.to_string(),
+                })
+            }),
+        ),
+    )
+}
+
+/// `SERVICE-011`: the only selector the projection route accepts. `deny_unknown_fields`
+/// makes an extra or duplicate query key a contract violation rather than a silently
+/// ignored one.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProjectionQuery {
+    voice_session_id: String,
+}
+
+pub(super) fn projection_error(
+    response_headers: HeaderMap,
+    rejection: ProjectionRejection,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let status = match rejection {
+        ProjectionRejection::Unauthorized => StatusCode::UNAUTHORIZED,
+        ProjectionRejection::Forbidden => StatusCode::FORBIDDEN,
+        ProjectionRejection::Invalid => StatusCode::BAD_REQUEST,
+    };
+    (
+        status,
+        response_headers,
+        Json(json!({
+            "error": rejection.error_code(),
+            "message": rejection.message(),
+        })),
+    )
+}
+
+/// Headers every projection response carries, success or failure. The learner state
+/// this route returns is never cached and never content-sniffed.
+pub(super) fn projection_response_headers(
+    access: Option<&ProjectionReadAccess>,
+    request_headers: &HeaderMap,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    if let Some(origin) = access.and_then(|access| access.allowed_origin_header(request_headers)) {
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    }
+    headers
+}
+
+/// `SERVICE-011`: the claim-bound study projection Plans 04, 09, 10, and 11 consume.
+///
+/// The Plan 11 scoped read credential authorizes the caller; the signed access
+/// credential supplies identity. `user_id`, `study_set_id`, and `voice_session_id` are
+/// read from the verified claims and the request's path/query selectors are compared
+/// with them in constant time, so a request can never name an identity it did not
+/// prove. Plan 09's port answers, and Plan 04's exact type is returned unchanged.
+pub(super) async fn authenticated_study_projection(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Path(study_set_id): Path<String>,
+    query: Result<Query<ProjectionQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let response_headers =
+        projection_response_headers(state.projection_read_access.as_ref(), &headers);
+    let Some(access) = state.projection_read_access.as_ref() else {
+        return projection_error(response_headers, ProjectionRejection::Unauthorized);
+    };
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(elapsed) => elapsed.as_secs(),
+        Err(_) => {
+            return projection_error(response_headers, ProjectionRejection::Unauthorized);
+        }
+    };
+    let claims = match access.authorize(&headers, now) {
+        Ok(claims) => claims,
+        Err(rejection) => return projection_error(response_headers, rejection),
+    };
+    // Extractor diagnostics are never returned: an invalid selector shape is one
+    // fixed public body.
+    let Ok(Query(query)) = query else {
+        return projection_error(response_headers, ProjectionRejection::Invalid);
+    };
+    if let Err(rejection) =
+        ProjectionReadAccess::bind_selectors(&claims, &study_set_id, &query.voice_session_id)
+    {
+        return projection_error(response_headers, rejection);
+    }
+
+    match state
+        .study_store
+        .authenticated_study_projection(&claims.user_id, &claims.study_set_id, &claims.session_id)
+        .await
+    {
+        Ok(projection) => match serde_json::to_value(&projection) {
+            Ok(value) => (StatusCode::OK, response_headers, Json(value)),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                response_headers,
+                Json(json!({
+                    "error": "projection_failed",
+                    "message": "study projection is unavailable",
+                })),
+            ),
+        },
+        Err(error) => store_json_error(response_headers, error, "projection_failed"),
+    }
+}
+
+pub(super) async fn delete_study_set(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Path(study_set_id): Path<String>,
+    Query(query): Query<LibrarySnapshotQuery>,
+    headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let response_headers = match optional_cors_json_headers(&state.ws_access, &headers) {
+        Ok(headers) => headers,
+        Err(error) => return cors_json_error(error),
+    };
+    let user_id = requested_library_user_id(&query, &state);
+    if let Some(error) = require_library_control_access(
+        &state,
+        &headers,
+        &response_headers,
+        &user_id,
+        "study_set_delete",
+    ) {
+        return error;
+    }
+
+    match state
+        .study_store
+        .delete_study_set(&user_id, &study_set_id)
+        .await
+    {
+        Ok(result) => (StatusCode::OK, response_headers, Json(result)),
+        Err(error) => store_json_error(response_headers, error, "study_set_delete_failed"),
+    }
+}
+
+pub(super) async fn delete_session_history(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Path((study_set_id, voice_session_id)): Path<(String, String)>,
+    Query(query): Query<LibrarySnapshotQuery>,
+    headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    let response_headers = match optional_cors_json_headers(&state.ws_access, &headers) {
+        Ok(headers) => headers,
+        Err(error) => return cors_json_error(error),
+    };
+    let user_id = requested_library_user_id(&query, &state);
+    if let Some(error) = require_library_control_access(
+        &state,
+        &headers,
+        &response_headers,
+        &user_id,
+        "session_delete",
+    ) {
+        return error;
+    }
+
+    match state
+        .study_store
+        .delete_session_history(&user_id, &study_set_id, &voice_session_id)
+        .await
+    {
+        Ok(result) => (StatusCode::OK, response_headers, Json(result)),
+        Err(error) => store_json_error(response_headers, error, "session_delete_failed"),
+    }
+}
+
+pub(super) fn study_set_start_unavailable_reason(
+    study_set: &LibraryStudySetSummary,
+) -> Option<&'static str> {
+    if !study_set.server_owned {
+        return Some("not_server_owned");
+    }
+    match study_set.ingestion_status {
+        StudySetIngestionStatus::Pending => return Some("ingestion_pending"),
+        StudySetIngestionStatus::Processing => return Some("ingestion_processing"),
+        StudySetIngestionStatus::Retry => return Some("ingestion_retry"),
+        StudySetIngestionStatus::Failed => return Some("ingestion_failed"),
+        StudySetIngestionStatus::Ready => {}
+    }
+    if !study_set.documents.is_empty()
+        && study_set.documents.iter().all(|document| document.deleted)
+    {
+        return Some("source_deleted");
+    }
+    if study_set.question_count == 0 {
+        return Some("no_active_questions");
+    }
+    None
+}
+
+pub(super) fn unavailable_action(reason: &'static str) -> LibraryAction {
+    LibraryAction {
+        available: false,
+        session_id: None,
+        session_token: None,
+        control_token: None,
+        unavailable_reason: Some(reason),
+    }
+}
+
+pub(super) fn available_mutation_action(control_token: Option<String>) -> LibraryAction {
+    LibraryAction {
+        available: true,
+        session_id: None,
+        session_token: None,
+        control_token,
+        unavailable_reason: None,
+    }
+}
+
+pub(super) fn signed_library_action(
+    state: &AppState,
+    user_id: &str,
+    study_set_id: &str,
+    session_id: String,
+    origin: Option<&str>,
+) -> LibraryAction {
+    let Some(secret) = state
+        .ws_access
+        .session_token_secret
+        .as_ref()
+        .map(RedactedSecret::as_str)
+    else {
+        return unavailable_action("session_token_unavailable");
+    };
+    let Ok(failure_control) =
+        failure_control_claim_for(state, user_id, study_set_id, &session_id, origin)
+    else {
+        return unavailable_action("session_token_unavailable");
+    };
+    let Ok(session_token) =
+        signed_session_token_for(user_id, study_set_id, &session_id, secret, failure_control)
+    else {
+        return unavailable_action("session_token_unavailable");
+    };
+    LibraryAction {
+        available: true,
+        session_id: Some(session_id),
+        session_token: Some(session_token),
+        control_token: None,
+        unavailable_reason: None,
+    }
+}
+
+pub(super) fn signed_library_control_token(state: &AppState, user_id: &str) -> Option<String> {
+    let secret = state
+        .ws_access
+        .session_token_secret
+        .as_ref()
+        .map(RedactedSecret::as_str)?;
+    signed_session_token_for(
+        user_id,
+        "__library_control__",
+        &Uuid::new_v4().to_string(),
+        secret,
+        None,
+    )
+    .ok()
+}
+
+pub(super) fn requested_library_user_id(query: &LibrarySnapshotQuery, state: &AppState) -> String {
+    query
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&state.trusted_user_id)
+        .to_owned()
+}
+
+pub(super) fn require_library_control_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    response_headers: &HeaderMap,
+    user_id: &str,
+    operation: &'static str,
+) -> Option<(StatusCode, HeaderMap, Json<serde_json::Value>)> {
+    if state.ws_access.required_bearer.is_none() && state.ws_access.session_token_secret.is_none() {
+        return Some((
+            StatusCode::FORBIDDEN,
+            response_headers.clone(),
+            Json(json!({
+                "error": format!("{operation}_auth_required"),
+                "message": "library export and deletion controls require authenticated REST access",
+            })),
+        ));
+    }
+    if state.ws_access.required_bearer.is_some()
+        && state.ws_access.validate_bearer_headers(headers).is_ok()
+    {
+        return None;
+    }
+    if validate_library_control_token(state, headers, user_id).is_ok() {
+        return None;
+    }
+    let message = if headers.get("x-viva-library-control-token").is_some() {
+        "invalid library control token"
+    } else {
+        "missing bearer token or library control token"
+    };
+    Some((
+        StatusCode::UNAUTHORIZED,
+        response_headers.clone(),
+        Json(json!({
+            "error": format!("{operation}_auth_failed"),
+            "message": message,
+        })),
+    ))
+}
+
+pub(super) fn validate_library_control_token(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: &str,
+) -> Result<(), crate::config::SessionTokenError> {
+    let secret = state
+        .ws_access
+        .session_token_secret
+        .as_ref()
+        .map(RedactedSecret::as_str)
+        .ok_or(crate::config::SessionTokenError::Invalid)?;
+    let token = headers
+        .get("x-viva-library-control-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(crate::config::SessionTokenError::Malformed)?;
+    let claims = SessionTokenClaims::verify(token, secret)?;
+    if claims.user_id != user_id || claims.study_set_id != "__library_control__" {
+        return Err(crate::config::SessionTokenError::Invalid);
+    }
+    Ok(())
+}
+
+pub(super) fn library_mutation_access_unavailable_reason(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: &str,
+) -> Option<&'static str> {
+    if state.ws_access.required_bearer.is_some()
+        && state.ws_access.validate_bearer_headers(headers).is_ok()
+    {
+        return None;
+    }
+    if validate_library_control_token(state, headers, user_id).is_ok() {
+        return None;
+    }
+    Some("mutation_auth_required")
+}
+
+pub(super) fn privacy_response_for_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: &str,
+) -> LibraryPrivacyResponse {
+    let export = match library_mutation_access_unavailable_reason(state, headers, user_id) {
+        Some(reason) => unavailable_action(reason),
+        None => match signed_library_control_token(state, user_id) {
+            Some(token) => available_mutation_action(Some(token)),
+            None => unavailable_action("control_token_unavailable"),
+        },
+    };
+    privacy_response(state, export)
+}
+
+pub(super) fn privacy_response(state: &AppState, export: LibraryAction) -> LibraryPrivacyResponse {
+    let store = state.study_store.capabilities();
+    LibraryPrivacyResponse {
+        voice_recordings_saved: store.raw_audio_persistence,
+        transcripts_saved: store.transcript_persistence,
+        raw_audio_persistence: store.raw_audio_persistence,
+        transcript_persistence: store.transcript_persistence,
+        export_contains_raw_provider_payloads: false,
+        export,
+        copy: if store.raw_audio_persistence || store.transcript_persistence {
+            "Voice recordings or transcripts may be persisted by this configured store."
+        } else {
+            "Voice recordings and transcripts are not saved; Viva stores sanitized study meaning only."
+        },
+        data_handling_statement: "Viva records sanitized study-set records, source summaries, session status, recaps, review items, usage rows, answer-attempt envelopes, and nonce rows; this configured store does not retain raw microphone audio or raw transcripts.",
+        retention_statement: "Durable Postgres rows remain until the tester deletes the session recap or the study set; local in-memory rows expire with the process.",
+        deletion_statement: "Delete recap removes the session recap, review items, usage rows, answer-attempt envelopes, and nonce rows while marking the session deleted. Delete source tombstones source material and purges the set's session artifacts.",
+    }
+}
+
+/// `D-04 CONFIRM_DELETE` is the recorded branch, so no restore route is
+/// registered here or anywhere else.
+pub(super) fn routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/study-sets/export",
+            get(library_export).options(paste_options),
+        )
+        .route("/study-sets/library", get(library_snapshot))
+        .route(
+            "/v1/study-sets/{study_set_id}/projection",
+            get(authenticated_study_projection),
+        )
+        .route(
+            "/study-sets/{study_set_id}",
+            delete(delete_study_set).options(paste_options),
+        )
+        .route(
+            "/study-sets/{study_set_id}/sessions/{voice_session_id}",
+            delete(delete_session_history).options(paste_options),
+        )
+}
