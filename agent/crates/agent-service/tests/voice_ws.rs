@@ -5558,6 +5558,42 @@ fn protocol_v5_fixture_shadow_types_are_absent() {
     );
 }
 
+/// `SERVICE-002`: one deadline per outbound write, owned in exactly one place.
+///
+/// Every server frame, Ready, provider event, protocol error, Ping/Pong,
+/// terminal frame, and Close frame goes through the single `BoundedSender`, so
+/// the configured write deadline is read exactly once — where that sender is
+/// built — and nowhere else. A second reader would mean a second, unaudited
+/// write-deadline policy, which is the defect this row closes; a send that
+/// wrapped itself in its own `tokio::time::timeout` would be the same defect
+/// wearing a different name. This is a source-level absence characterization,
+/// like its neighbour above, so a re-introduction fails here rather than
+/// drifting silently.
+#[test]
+fn outbound_writes_have_exactly_one_deadline_owner() {
+    assert_eq!(
+        WS_SOURCE.matches("ws_timeouts.outbound_write").count(),
+        1,
+        "the outbound write deadline must be read exactly once, where BoundedSender is built"
+    );
+    assert_eq!(
+        WS_SOURCE.matches("struct BoundedSender").count(),
+        1,
+        "there is exactly one bounded sender type"
+    );
+    // The deadline is applied by `BoundedSender::send` alone. The only other
+    // `tokio::time::timeout` calls in the module are read-side or drain-side
+    // waits, never a write.
+    let bounded_send = WS_SOURCE
+        .split_once("impl<S> BoundedSender<S>")
+        .expect("BoundedSender impl block")
+        .1;
+    assert!(
+        bounded_send.contains("tokio::time::timeout(self.timeout, self.inner.send(message))"),
+        "BoundedSender::send is where the write deadline is applied"
+    );
+}
+
 #[derive(Deserialize)]
 struct VoiceFixtureManifest {
     protocol_version: u32,
@@ -17534,6 +17570,107 @@ async fn half_open_answered_heartbeats_keep_the_socket_alive() {
     assert!(
         pings >= 3,
         "the server must keep pinging across heartbeat intervals, saw {pings}"
+    );
+}
+
+/// `SERVICE-002`: the last two bounded writes survive the unwind.
+///
+/// A client that pipelines frames still has bytes on the wire when the server
+/// decides to close. Dropping a socket that holds unread client bytes resets the
+/// connection, and a reset discards the error frame and the Close frame the
+/// server already wrote — the learner sees a transport error instead of the
+/// reason they were closed. This is the socket-level half of Task 9: the
+/// deterministic sink tests are in-crate because a TCP buffer cannot simulate a
+/// stalled reader, but *this* property is only observable over a real socket,
+/// and only with a real backlog behind the offending frame.
+#[tokio::test]
+async fn bounded_writes_deliver_the_terminal_frame_and_close_with_client_bytes_in_flight() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(HalfOpenProbeBrain {
+            study_store: store.clone(),
+        }),
+        "half_open_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(30),
+        between_turn_idle: Duration::from_secs(30),
+        session: Duration::from_secs(30),
+        ..WsTimeouts::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "half_open_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+
+    // One frame the server refuses, then a real backlog written behind it
+    // without reading anything back. The server stops reading at the refusal, so
+    // the filler stays unread while the error frame and the Close frame are
+    // written. Each filler frame stays under the protocol's text-frame ceiling,
+    // and the whole burst stays well under a socket send buffer so the client
+    // itself never blocks.
+    const INFLIGHT_FILLER_FRAMES: usize = 6;
+    const INFLIGHT_FILLER_BYTES: usize = 32 * 1024;
+    socket
+        .send(WsMessage::Text(
+            "x".repeat(agent_service::VIVA_VOICE_MAX_TEXT_FRAME_BYTES + 1)
+                .into(),
+        ))
+        .await
+        .unwrap();
+    for index in 1..=INFLIGHT_FILLER_FRAMES {
+        send_client_frame(
+            &mut socket,
+            &ClientFrame::TurnIntent {
+                version: VIVA_VOICE_PROTOCOL_VERSION,
+                client_generation_id: format!("bac522-inflight-{index}"),
+                turn_id: format!("turn-inflight-{index}"),
+                intent: ClientTurnIntent::AnswerText {
+                    text: "x".repeat(INFLIGHT_FILLER_BYTES),
+                },
+            },
+        )
+        .await;
+    }
+
+    // Both writes reach the client rather than dying with the connection.
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Error { error, .. } if error.message == "text frame exceeds maximum size"
+    ));
+    match tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("the close frame must arrive rather than the connection resetting")
+        .expect("the socket must not end before its close frame")
+        .expect("the socket must not fail before its close frame")
+    {
+        WsMessage::Close(Some(frame)) => assert_eq!(frame.code, CloseCode::Size),
+        other => panic!("expected a close frame, got {other:?}"),
+    }
+    let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
+    assert!(
+        events.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::TerminalReason
+                && event.detail == "oversized_text_frame"
+        }),
+        "{events:?}"
     );
 }
 
