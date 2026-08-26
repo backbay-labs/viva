@@ -18068,8 +18068,10 @@ async fn websocket_scoped_cancel_after_audio_end_does_not_close_the_session() {
 /// instructions wide, so it is characterized here rather than raced for.
 #[test]
 fn server_owned_capacity_drain_registers_its_waiter_before_each_zero_check() {
-    let app_source = app_source();
-    let body = app_source
+    // The drain lives in the module that owns admission closure; this reads the
+    // responsibility, not a file name.
+    let ws_source = ws_source();
+    let body = ws_source
         .split_once("pub async fn begin_drain_and_wait")
         .expect("begin_drain_and_wait is the one drain entry point")
         .1
@@ -18159,7 +18161,7 @@ fn server_owned_capacity_has_no_background_worker_under_confirm_delete() {
         );
     }
     assert!(
-        app_source().contains("pub fn enter_background_worker"),
+        ws_source().contains("pub fn enter_background_worker"),
         "the guard the drain waits on still exists"
     );
     assert!(

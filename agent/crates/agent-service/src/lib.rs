@@ -2,13 +2,12 @@
 
 mod app;
 mod config;
+mod http;
 mod protocol;
 mod ws;
 
 pub use app::{
-    begin_drain_and_wait, build_router, ActiveHandlerGuard, AppState, BackgroundWorkerGuard,
-    DrainOutcome, RecorderStats, RuntimeDraining, VoiceDrainSignal, VoiceEvidenceRecorder,
-    VoiceLimitState, VoiceRuntimeSnapshot, VoiceRuntimeTracker, VoiceUsageAggregate,
+    build_router, AppState, RecorderStats, VoiceEvidenceRecorder, VoiceUsageAggregate,
     VoiceUsageRecorder, WsTimeouts,
 };
 pub use config::{
@@ -29,4 +28,8 @@ pub use protocol::{
     VIVA_VOICE_MAX_TEXT_FRAME_BYTES, VIVA_VOICE_MAX_TURN_SECONDS, VIVA_VOICE_PROTOCOL_VERSION,
     VIVA_VOICE_SAMPLE_RATE_HZ, VIVA_VOICE_SUPPORTED_PROTOCOL_VERSIONS, VOICE_DEFERRAL_REASONS,
     VOICE_NORMAL_CLOSE_CODE, VOICE_PROTOCOL_ADVERTISEMENT, VOICE_SERIALIZATION_FALLBACK_FRAME,
+};
+pub use ws::admission::{
+    begin_drain_and_wait, ActiveHandlerGuard, BackgroundWorkerGuard, DrainOutcome, RuntimeDraining,
+    VoiceDrainSignal, VoiceLimitState, VoiceRuntimeSnapshot, VoiceRuntimeTracker,
 };
