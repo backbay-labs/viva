@@ -447,12 +447,15 @@ async fn fake_runtime_is_selectable_realtime_brain_without_live_keys() {
         .unwrap_or_else(|| panic!("stopping the session publishes its recap: {closing:?}"));
     assert_eq!(recap.voice_session_id, "voice-session-1");
     // Mastery and scheduling are persisted inside one canonical turn outcome;
-    // there is no separate adapter-driven status or review write any more.
+    // there is no separate adapter-driven status or review write any more. `A-22`:
+    // that one outcome is also what records the session-scoped status write its
+    // `concept_status` browser event is authorized against — still one write, made
+    // by the outcome authority rather than by this adapter.
     let snapshot = store.snapshot();
     assert_eq!(snapshot.sessions.len(), 1);
     assert_eq!(snapshot.answer_attempts.len(), 1);
     assert_eq!(snapshot.turn_outcomes.len(), 1);
-    assert!(snapshot.concept_statuses.is_empty());
+    assert_eq!(snapshot.concept_statuses.len(), 1);
     assert_eq!(snapshot.review_schedule_decisions.len(), 1);
     assert_eq!(snapshot.review_items.len(), 1);
     assert_eq!(snapshot.recaps.len(), 1);
@@ -879,7 +882,10 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
     // was cancelled before its commit.
     assert_eq!(snapshot.turn_outcomes.len(), 1);
     assert_eq!(snapshot.turn_outcomes[0].response_id, "response-2");
-    assert!(snapshot.concept_statuses.is_empty());
+    // `A-22`: the surviving outcome records the status write its own
+    // `concept_status` event is authorized against; the cancelled turn recorded
+    // none, which is what keeps this exactly one.
+    assert_eq!(snapshot.concept_statuses.len(), 1);
     assert_eq!(snapshot.review_items.len(), 1);
     assert_eq!(snapshot.recaps.len(), 1);
 }

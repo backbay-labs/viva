@@ -61,12 +61,12 @@
       "detail": "audio frame received"
     },
     {
-      "kind": "evaluation_emitted",
+      "kind": "source_emitted",
       "voice_session_id": "voice-session-1",
       "detail": "response-1-generation-1"
     },
     {
-      "kind": "source_emitted",
+      "kind": "evaluation_emitted",
       "voice_session_id": "voice-session-1",
       "detail": "response-1-generation-1"
     },

@@ -2975,11 +2975,15 @@ mod tests {
         let snapshot = store.snapshot();
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.answer_attempts.len(), 1);
-        // Plan 04's turn-outcome authority owns the concept transition: the graded
-        // status is persisted inside the turn outcome and its review card, not as a
-        // standalone `concept_statuses` row. The `concept_status` wire event above is
-        // still emitted and still asserted frame-exactly; only the store shape moved.
-        assert!(snapshot.concept_statuses.is_empty());
+        // Plan 04's turn-outcome authority owns the concept transition, and `A-22`
+        // made that authority record the session-scoped status write the transition
+        // implies — the write the browser's `concept_status` event is authorized
+        // against. Still exactly one write per graded turn, made by the outcome
+        // authority rather than by a standalone `record_concept_status` call, which is
+        // the count this repository's frozen store contracts already pinned:
+        // `count-truth-table.json`'s `happy` scenario and both v5 runtime evidence
+        // packs say `concept_statuses=1`.
+        assert_eq!(snapshot.concept_statuses.len(), 1);
         assert_eq!(snapshot.review_items.len(), 1);
         assert_eq!(snapshot.recaps.len(), 1);
     }
@@ -3038,11 +3042,15 @@ mod tests {
         let snapshot = store.snapshot();
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.answer_attempts.len(), 1);
-        // Plan 04's turn-outcome authority owns the concept transition: the graded
-        // status is persisted inside the turn outcome and its review card, not as a
-        // standalone `concept_statuses` row. The `concept_status` wire event above is
-        // still emitted and still asserted frame-exactly; only the store shape moved.
-        assert!(snapshot.concept_statuses.is_empty());
+        // Plan 04's turn-outcome authority owns the concept transition, and `A-22`
+        // made that authority record the session-scoped status write the transition
+        // implies — the write the browser's `concept_status` event is authorized
+        // against. Still exactly one write per graded turn, made by the outcome
+        // authority rather than by a standalone `record_concept_status` call, which is
+        // the count this repository's frozen store contracts already pinned:
+        // `count-truth-table.json`'s `happy` scenario and both v5 runtime evidence
+        // packs say `concept_statuses=1`.
+        assert_eq!(snapshot.concept_statuses.len(), 1);
         assert_eq!(snapshot.review_items.len(), 1);
         assert_eq!(snapshot.recaps.len(), 1);
     }
