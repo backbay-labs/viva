@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use reqwest::Url;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -122,17 +123,34 @@ fn ink_provider_error_failure() -> BrainError {
     )
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// `ADAPTER-07`: the operator-supplied Ink numerics are finite bounded values,
+/// not free-form strings. A volume threshold is a fraction; a silence window is
+/// a positive number of seconds this adapter is willing to wait inside its own
+/// stage deadline.
+pub const INK_MIN_VOLUME_RANGE: std::ops::RangeInclusive<f32> = 0.0..=1.0;
+pub const INK_MAX_SILENCE_SECS_RANGE: std::ops::RangeInclusive<f32> = 0.01..=60.0;
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct InkConfig {
     pub websocket_url: String,
     pub model: String,
     pub language: String,
     pub encoding: String,
     pub sample_rate: u32,
-    pub min_volume: String,
-    pub max_silence_duration_secs: String,
+    pub min_volume: f32,
+    pub max_silence_duration_secs: f32,
     pub cartesia_version: String,
     pub stage_timeout: Duration,
+}
+
+/// Parse one operator-supplied Ink numeric, or refuse it.
+///
+/// `NaN`, an infinity, a value outside the documented range, and anything
+/// carrying query syntax are all rejected the same way: the caller keeps its
+/// documented safe default. Operator-controlled query syntax is never accepted.
+pub fn parse_ink_numeric(value: &str, range: &std::ops::RangeInclusive<f32>) -> Option<f32> {
+    let parsed = value.trim().parse::<f32>().ok()?;
+    (parsed.is_finite() && range.contains(&parsed)).then_some(parsed)
 }
 
 impl Default for InkConfig {
@@ -143,8 +161,8 @@ impl Default for InkConfig {
             language: "en".to_owned(),
             encoding: "pcm_s16le".to_owned(),
             sample_rate: CARTESIA_SAMPLE_RATE,
-            min_volume: "0.05".to_owned(),
-            max_silence_duration_secs: "0.7".to_owned(),
+            min_volume: 0.05,
+            max_silence_duration_secs: 0.7,
             cartesia_version: DEFAULT_CARTESIA_VERSION.to_owned(),
             stage_timeout: Duration::from_secs(4),
         }
@@ -152,18 +170,30 @@ impl Default for InkConfig {
 }
 
 impl InkConfig {
+    /// `ADAPTER-07`: the endpoint is assembled through URL query-pair APIs, so
+    /// every operator-supplied value is percent-encoded data. A `&`, `#`, or `?`
+    /// in a value can no longer inject a second pair or truncate the query.
     pub fn websocket_endpoint(&self) -> String {
-        format!(
-            "{}?model={}&language={}&encoding={}&sample_rate={}&min_volume={}&max_silence_duration_secs={}&cartesia_version={}",
-            self.websocket_url,
-            self.model,
-            self.language,
-            self.encoding,
-            self.sample_rate,
-            self.min_volume,
-            self.max_silence_duration_secs,
-            self.cartesia_version
-        )
+        self.websocket_url_result()
+            .map_or_else(|| self.websocket_url.clone(), String::from)
+    }
+
+    fn websocket_url_result(&self) -> Option<Url> {
+        let mut url = Url::parse(&self.websocket_url).ok()?;
+        url.set_fragment(None);
+        url.query_pairs_mut()
+            .clear()
+            .append_pair("model", &self.model)
+            .append_pair("language", &self.language)
+            .append_pair("encoding", &self.encoding)
+            .append_pair("sample_rate", &self.sample_rate.to_string())
+            .append_pair("min_volume", &self.min_volume.to_string())
+            .append_pair(
+                "max_silence_duration_secs",
+                &self.max_silence_duration_secs.to_string(),
+            )
+            .append_pair("cartesia_version", &self.cartesia_version);
+        Some(url)
     }
 
     pub fn websocket_request(&self, api_key: &str) -> Result<Request<()>, BrainError> {
@@ -172,8 +202,11 @@ impl InkConfig {
             return Err(ink_auth_failure("missing_api_key"));
         }
 
-        let mut request = self
-            .websocket_endpoint()
+        let endpoint = self
+            .websocket_url_result()
+            .ok_or_else(|| ink_protocol_failure("invalid_endpoint"))?;
+        let mut request = endpoint
+            .as_str()
             .into_client_request()
             .map_err(|_| ink_protocol_failure("invalid_endpoint"))?;
         let authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
@@ -188,14 +221,26 @@ impl InkConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum InkEvent {
     TurnStart,
-    TurnUpdate { text: String },
-    TurnEagerEnd { text: String },
+    TurnUpdate {
+        text: String,
+    },
+    TurnEagerEnd {
+        text: String,
+    },
     TurnResume,
-    TurnEnd { text: String },
-    Error { message: String },
+    TurnEnd {
+        text: String,
+        /// `ADAPTER-07`: the provider's own score, present only when the event
+        /// schema supplied a finite value in `[0, 1]`. The adapter never
+        /// substitutes one.
+        confidence: Option<f32>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub fn audio_frame_bytes(frame: &AudioFrame) -> Bytes {
@@ -339,8 +384,9 @@ where
             InkEvent::TurnResume => {
                 accumulator.interim_text.clear();
             }
-            InkEvent::TurnEnd { text } => {
+            InkEvent::TurnEnd { text, confidence } => {
                 accumulator.final_text = Some(text);
+                accumulator.confidence = confidence;
                 let transcript = accumulator.finish()?;
                 // The Ink turn endpoint is short-lived by design: the socket is
                 // closed with the turn rather than kept idle against Cartesia's
@@ -360,6 +406,7 @@ where
 struct InkTranscriptAccumulator {
     interim_text: String,
     final_text: Option<String>,
+    confidence: Option<f32>,
 }
 
 impl InkTranscriptAccumulator {
@@ -370,7 +417,7 @@ impl InkTranscriptAccumulator {
         Ok(InkTranscript {
             interim_text: self.interim_text,
             final_text,
-            confidence: None,
+            confidence: self.confidence,
         })
     }
 }
@@ -471,14 +518,20 @@ pub fn parse_ink_value(value: &Value) -> Option<InkEvent> {
         "turn.update" => transcript_text(value).map(|text| InkEvent::TurnUpdate { text }),
         "turn.eager_end" => transcript_text(value).map(|text| InkEvent::TurnEagerEnd { text }),
         "turn.resume" => Some(InkEvent::TurnResume),
-        "turn.end" => transcript_text(value).map(|text| InkEvent::TurnEnd { text }),
+        "turn.end" => transcript_text(value).map(|text| InkEvent::TurnEnd {
+            text,
+            confidence: transcript_confidence(value),
+        }),
         "transcript" => transcript_text(value).map(|text| {
             if value
                 .get("is_final")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             {
-                InkEvent::TurnEnd { text }
+                InkEvent::TurnEnd {
+                    text,
+                    confidence: transcript_confidence(value),
+                }
             } else {
                 InkEvent::TurnUpdate { text }
             }
@@ -493,6 +546,16 @@ pub fn parse_ink_value(value: &Value) -> Option<InkEvent> {
         }),
         _ => None,
     }
+}
+
+/// The provider's confidence, or nothing.
+///
+/// `ADAPTER-07`: only a JSON number that is finite and inside `[0, 1]` is a
+/// score. A string, a null, a `NaN`, and an out-of-range value are all absences
+/// — never clamped, never defaulted.
+fn transcript_confidence(value: &Value) -> Option<f32> {
+    let confidence = value.get("confidence")?.as_f64()? as f32;
+    (confidence.is_finite() && (0.0..=1.0).contains(&confidence)).then_some(confidence)
 }
 
 fn transcript_text(value: &Value) -> Option<String> {
@@ -534,7 +597,8 @@ mod tests {
                 &json!({ "type": "transcript", "is_final": true, "text": "ATP synthase" })
             ),
             Some(InkEvent::TurnEnd {
-                text: "ATP synthase".to_owned()
+                text: "ATP synthase".to_owned(),
+                confidence: None,
             })
         );
     }
@@ -569,6 +633,89 @@ mod tests {
             request.headers().get("Cartesia-Version").unwrap(),
             "2026-03-01"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Task 7 (`ADAPTER-07`): the Ink endpoint is built through URL query pairs,
+    // so an operator-supplied value is data and can never become structure.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ink_endpoint_percent_encodes_every_query_value_without_parameter_injection() {
+        // Hostile values in every operator-controlled *string* field. The two
+        // numeric fields cannot hold `0.05&language=de` / `0.7?model=forged` at
+        // all — `from_env` refuses them, which the companion config test pins —
+        // so this asserts the pairs they were meant to inject never appear.
+        let config = InkConfig {
+            model: "ink-2&language=de".to_owned(),
+            language: "en US#fragment".to_owned(),
+            encoding: "pcm_s16le?model=forged".to_owned(),
+            cartesia_version: "2026-03-01 #x".to_owned(),
+            ..InkConfig::default()
+        };
+
+        let endpoint = config.websocket_endpoint();
+        let url = reqwest::Url::parse(&endpoint).expect("the endpoint is a parseable URL");
+        assert_eq!(url.fragment(), None, "{endpoint}");
+
+        let pairs = url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        let count = |key: &str| pairs.iter().filter(|(name, _)| name == key).count();
+        let value = |key: &str| {
+            pairs
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| panic!("{key} is missing from {endpoint}"))
+        };
+
+        for key in [
+            "model",
+            "language",
+            "encoding",
+            "sample_rate",
+            "min_volume",
+            "max_silence_duration_secs",
+            "cartesia_version",
+        ] {
+            assert_eq!(count(key), 1, "{key} appears more than once in {endpoint}");
+        }
+        assert_eq!(pairs.len(), 7, "{endpoint}");
+
+        // Every hostile value survives verbatim as *data*.
+        assert_eq!(value("model"), "ink-2&language=de");
+        assert_eq!(value("language"), "en US#fragment");
+        assert_eq!(value("encoding"), "pcm_s16le?model=forged");
+        assert_eq!(value("cartesia_version"), "2026-03-01 #x");
+        assert_eq!(value("sample_rate"), CARTESIA_SAMPLE_RATE.to_string());
+        assert_eq!(value("min_volume"), "0.05");
+        assert_eq!(value("max_silence_duration_secs"), "0.7");
+
+        // …and none of it became structure.
+        assert!(
+            !pairs
+                .iter()
+                .any(|(key, value)| key == "language" && value == "de"),
+            "{endpoint}"
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|(key, value)| key == "model" && value == "forged"),
+            "{endpoint}"
+        );
+
+        // The authenticated request carries the same single-valued query and
+        // keeps the credential in a header, never in the URL.
+        let request = config
+            .websocket_request("sk_car_url_probe")
+            .expect("a usable credential builds a request");
+        let request_url =
+            reqwest::Url::parse(&request.uri().to_string()).expect("the request URI is a URL");
+        assert_eq!(request_url.query_pairs().count(), 7, "{}", request.uri());
+        assert!(!request.uri().to_string().contains("sk_car_url_probe"));
     }
 
     #[tokio::test]

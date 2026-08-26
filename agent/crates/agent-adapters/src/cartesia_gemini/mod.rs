@@ -33,7 +33,10 @@ pub use llm::{
     gemini_request, parse_gemini_sse_line, viva_tool_declarations, GeminiConfig, GeminiStreamEvent,
     ThinkingLevel,
 };
-pub use stt::{audio_frame_bytes, parse_ink_event, InkConfig, InkEvent};
+pub use stt::{
+    audio_frame_bytes, parse_ink_event, parse_ink_numeric, InkConfig, InkEvent,
+    INK_MAX_SILENCE_SECS_RANGE, INK_MIN_VOLUME_RANGE,
+};
 pub use tts::{parse_sonic_event, sonic_generation_request, SonicConfig, SonicEvent};
 
 use runner::{
@@ -648,7 +651,7 @@ pub(crate) async fn select_session_question(
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CartesiaGeminiConfig {
     pub cartesia_api_key: String,
     pub gemini: GeminiConfig,
@@ -763,10 +766,18 @@ impl CartesiaGeminiConfig {
         {
             config.ink.sample_rate = sample_rate;
         }
-        if let Some(min_volume) = env_value("CARTESIA_INK_MIN_VOLUME") {
+        // `ADAPTER-07`: an operator-supplied numeric is parsed into a finite
+        // bounded value or refused outright; a malformed one keeps the
+        // documented safe default instead of becoming free-form query syntax.
+        if let Some(min_volume) = env_value("CARTESIA_INK_MIN_VOLUME")
+            .as_deref()
+            .and_then(|value| parse_ink_numeric(value, &INK_MIN_VOLUME_RANGE))
+        {
             config.ink.min_volume = min_volume;
         }
         if let Some(max_silence_duration_secs) = env_value("CARTESIA_INK_MAX_SILENCE_DURATION_SECS")
+            .as_deref()
+            .and_then(|value| parse_ink_numeric(value, &INK_MAX_SILENCE_SECS_RANGE))
         {
             config.ink.max_silence_duration_secs = max_silence_duration_secs;
         }
@@ -1809,9 +1820,79 @@ mod tests {
         assert_eq!(config.ink.language, "en");
         assert_eq!(config.ink.encoding, "pcm_f32le");
         assert_eq!(config.ink.sample_rate, 16_000);
-        assert_eq!(config.ink.min_volume, "0.2");
-        assert_eq!(config.ink.max_silence_duration_secs, "1.1");
+        assert!((config.ink.min_volume - 0.2).abs() < f32::EPSILON);
+        assert!((config.ink.max_silence_duration_secs - 1.1).abs() < f32::EPSILON);
         assert_eq!(config.ink.cartesia_version, "2026-03-01");
+    }
+
+    // -----------------------------------------------------------------
+    // Task 7 (`ADAPTER-07`): the two operator-supplied Ink numerics are parsed
+    // into finite bounded values, and a malformed one keeps the documented safe
+    // default rather than becoming free-form query syntax.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ink_numeric_environment_values_fail_closed_when_malformed() {
+        let with_numerics = |min_volume: &str, max_silence: &str| {
+            let min_volume = min_volume.to_owned();
+            let max_silence = max_silence.to_owned();
+            CartesiaGeminiConfig::from_env_with(move |name| match name {
+                "CARTESIA_INK_MIN_VOLUME" => Some(min_volume.clone()),
+                "CARTESIA_INK_MAX_SILENCE_DURATION_SECS" => Some(max_silence.clone()),
+                _ => None,
+            })
+            .ink
+        };
+
+        let defaults = InkConfig::default();
+        for hostile in [
+            "NaN", "nan", "inf", "-inf", "-0.1", "0.7&x=1", "", " ", "abc", "0x1",
+        ] {
+            let ink = with_numerics(hostile, hostile);
+            assert_eq!(
+                ink.min_volume, defaults.min_volume,
+                "min_volume must fail closed for {hostile:?}"
+            );
+            assert_eq!(
+                ink.max_silence_duration_secs, defaults.max_silence_duration_secs,
+                "max_silence_duration_secs must fail closed for {hostile:?}"
+            );
+            let endpoint = ink.websocket_endpoint();
+            assert!(
+                hostile.trim().is_empty() || !endpoint.contains(hostile.trim()),
+                "{endpoint}"
+            );
+            assert!(!endpoint.contains("x=1"), "{endpoint}");
+        }
+
+        // A volume threshold is a fraction, so anything above 1 is refused even
+        // though it is a perfectly good number of seconds for the other field.
+        assert_eq!(
+            with_numerics("1.1", "0.7").min_volume,
+            defaults.min_volume,
+            "min_volume must fail closed for a value above 1"
+        );
+
+        // Accepted boundary values are preserved exactly.
+        let ink = with_numerics("0", "0.25");
+        assert!((ink.min_volume - 0.0).abs() < f32::EPSILON);
+        assert!((ink.max_silence_duration_secs - 0.25).abs() < f32::EPSILON);
+        let ink = with_numerics("1", "60");
+        assert!((ink.min_volume - 1.0).abs() < f32::EPSILON);
+        assert!((ink.max_silence_duration_secs - 60.0).abs() < f32::EPSILON);
+        let ink = with_numerics(" 0.2 ", " 1.1 ");
+        assert!((ink.min_volume - 0.2).abs() < f32::EPSILON);
+        assert!((ink.max_silence_duration_secs - 1.1).abs() < f32::EPSILON);
+
+        // A silence window of zero is not a window; an out-of-range one is not a
+        // configuration this adapter will send.
+        for rejected in ["0", "-1", "60.1", "1e9"] {
+            assert_eq!(
+                with_numerics("0.05", rejected).max_silence_duration_secs,
+                defaults.max_silence_duration_secs,
+                "max_silence_duration_secs must fail closed for {rejected:?}"
+            );
+        }
     }
 
     #[test]

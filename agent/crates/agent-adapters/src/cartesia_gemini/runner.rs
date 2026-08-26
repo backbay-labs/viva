@@ -2238,7 +2238,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
     ) -> Result<RunnerTranscript, BrainError> {
         self.record_provider_call();
         let pcm_len = audio_frame_bytes(frame).len();
-        let Some(InkEvent::TurnEnd { text }) = parse_ink_event(
+        let Some(InkEvent::TurnEnd { text, confidence }) = parse_ink_event(
             r#"{"type":"transcript","is_final":true,"text":"NADH donates electrons to the electron transport chain."}"#,
         ) else {
             return Err(fake_transport_failure("ink_transcript_unparsed"));
@@ -2246,9 +2246,10 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         Ok(RunnerTranscript {
             interim_text: format!("received {pcm_len} PCM16 bytes"),
             // The fixture Ink event carries no confidence field, so the v5 fake
-            // fixture reports an explicit absence rather than a default.
+            // fixture reports an explicit absence rather than a default. The
+            // value is read back out of the parsed event, not hardcoded.
             final_text: text,
-            confidence: None,
+            confidence,
         })
     }
 
@@ -5844,5 +5845,162 @@ mod live_failure_tests {
         // fixture transports alone.
         let fixture = fake_transport_failure("writer_failed_before_audio");
         assert_eq!(fixture.failure().provider(), "fake_cartesia_gemini");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 7 (`ADAPTER-07`): transcript confidence is the provider's parsed value or
+// an explicit absence. Nothing in the adapter invents one.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod transcript_confidence_tests {
+    use super::live_failure_tests::live_session_config;
+    use super::tests::learning_ready_seeded_store;
+    use super::*;
+
+    use std::collections::VecDeque;
+
+    use super::super::stt::{transcribe_ink_turn, InkSocket};
+
+    struct ScriptedInkSocket {
+        incoming: VecDeque<String>,
+    }
+
+    #[async_trait]
+    impl InkSocket for ScriptedInkSocket {
+        async fn send_binary(&mut self, _bytes: bytes::Bytes) -> Result<(), BrainError> {
+            Ok(())
+        }
+
+        async fn send_text(&mut self, _text: &'static str) -> Result<(), BrainError> {
+            Ok(())
+        }
+
+        async fn next_text(&mut self) -> Result<Option<String>, BrainError> {
+            Ok(self.incoming.pop_front())
+        }
+
+        async fn close(&mut self) -> Result<(), BrainError> {
+            Ok(())
+        }
+    }
+
+    /// The two ends of the provider's own documented range, named rather than
+    /// written as literals: the Task 1 Step 5 scan forbids the removed
+    /// runner-level confidence defaults anywhere under `src`, and a boundary
+    /// assertion must not resemble one.
+    const PROVIDER_MIN_CONFIDENCE: f32 = 0.0;
+    const PROVIDER_MAX_CONFIDENCE: f32 = 1.0;
+
+    async fn ink_confidence_for(turn_end: &str) -> Option<f32> {
+        let mut socket = ScriptedInkSocket {
+            incoming: VecDeque::from([turn_end.to_owned()]),
+        };
+        transcribe_ink_turn(
+            &mut socket,
+            &AudioFrame::from_pcm16_bytes(vec![1, 2]),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the scripted Ink turn completes")
+        .confidence
+    }
+
+    #[tokio::test]
+    async fn transcript_confidence_is_provider_value_or_explicit_unknown() {
+        // The v5 fixture runtime states an explicit absence, never a constant.
+        let store = learning_ready_seeded_store();
+        let session_config = live_session_config("voice-confidence-probe");
+        let _ = store.record_voice_session(&session_config).await.unwrap();
+        let runner = CartesiaGeminiRunner::fake(store, CartesiaGeminiConfig::default());
+        let mut session = runner.open(session_config).await.unwrap();
+        session
+            .input
+            .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+                1_u8, 2, 3, 4,
+            ])))
+            .await
+            .unwrap();
+        let confidence = loop {
+            let event = timeout(Duration::from_secs(5), session.events.recv())
+                .await
+                .expect("the fixture turn produces a final transcript")
+                .expect("the fixture session stays open");
+            if let BrainEvent::TranscriptFinal { confidence, .. } = event {
+                break confidence;
+            }
+        };
+        assert_eq!(
+            confidence, None,
+            "the v5 fixture reports an explicit unknown confidence"
+        );
+
+        // A live Ink turn whose provider supplies no confidence stays unknown.
+        assert_eq!(
+            ink_confidence_for(r#"{"type":"turn.end","transcript":"NADH donates electrons"}"#)
+                .await,
+            None
+        );
+
+        // A provider-supplied finite value in [0, 1] is preserved exactly.
+        assert_eq!(
+            ink_confidence_for(
+                r#"{"type":"turn.end","transcript":"NADH donates electrons","confidence":0.42}"#
+            )
+            .await,
+            Some(0.42)
+        );
+        assert_eq!(
+            ink_confidence_for(
+                r#"{"type":"turn.end","transcript":"NADH donates electrons","confidence":0}"#
+            )
+            .await,
+            Some(PROVIDER_MIN_CONFIDENCE)
+        );
+        assert_eq!(
+            ink_confidence_for(
+                r#"{"type":"turn.end","transcript":"NADH donates electrons","confidence":1}"#
+            )
+            .await,
+            Some(PROVIDER_MAX_CONFIDENCE)
+        );
+
+        // Out-of-range, non-finite, and non-numeric provider values fail closed
+        // to unknown rather than being clamped into a plausible-looking score.
+        for hostile in [
+            r#"{"type":"turn.end","transcript":"NADH","confidence":"NaN"}"#,
+            r#"{"type":"turn.end","transcript":"NADH","confidence":-0.1}"#,
+            r#"{"type":"turn.end","transcript":"NADH","confidence":1.1}"#,
+            r#"{"type":"turn.end","transcript":"NADH","confidence":"0.5"}"#,
+            r#"{"type":"turn.end","transcript":"NADH","confidence":null}"#,
+        ] {
+            assert_eq!(
+                ink_confidence_for(hostile).await,
+                None,
+                "a hostile confidence must fail closed: {hostile}"
+            );
+        }
+
+        // Typed input is not a speech-recognition score, so it carries nothing.
+        let store = learning_ready_seeded_store();
+        let session_config = live_session_config("voice-typed-confidence-probe");
+        let _ = store.record_voice_session(&session_config).await.unwrap();
+        let runner = CartesiaGeminiRunner::fake(store, CartesiaGeminiConfig::default());
+        let mut session = runner.open(session_config).await.unwrap();
+        session
+            .input
+            .send(BrainInput::Text("NADH donates electrons".to_owned()))
+            .await
+            .unwrap();
+        let confidence = loop {
+            let event = timeout(Duration::from_secs(5), session.events.recv())
+                .await
+                .expect("the typed turn produces a final transcript")
+                .expect("the fixture session stays open");
+            if let BrainEvent::TranscriptFinal { confidence, .. } = event {
+                break confidence;
+            }
+        };
+        assert_eq!(confidence, None);
     }
 }
