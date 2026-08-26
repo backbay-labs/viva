@@ -1248,6 +1248,935 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*api_key:\ "viva\-release\-check\-gemini\-placeholder\-key"\.to_owned\(\),\s*$/,
     ]),
   },
+  // A-21 (2026-08-26): coordinator-applied sanction rows for Plan 08 agent-service
+  // sources (node 08 admission), generated from the audit own detection over the
+  // lane diff, dual-keyed (evidence marker + structural field). Anchored literals
+  // of reviewed lines only. Plan 12 reconciles at 12B.
+  {
+    file: "agent/crates/agent-service/src/app.rs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*\/\/\/\ value\ that\ is\ not\ a\ short\ identifier\ —\ a\ signed\ credential,\ a\ bearer\ header,\s*$/,
+      /^\s*\|\ crate::config::VoiceWsAccessError::InvalidBearer\ =>\ StatusCode::UNAUTHORIZED,\s*$/,
+      /^\s*crate::config::VoiceWsAccessError::MissingBearer\ =>\ "missing_bearer",\s*$/,
+      /^\s*crate::config::VoiceWsAccessError::InvalidBearer\ =>\ "invalid_bearer",\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/app.rs",
+    marker: "prompt",
+    patterns: Object.freeze([
+      /^\s*let\ prompt\ =\ event\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/app.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*pub\(crate\)\ fn\ signed_session_token\(\s*$/,
+      /^\s*pub\(crate\)\ fn\ signed_session_token_for\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/config.rs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*\/\/\/\ separate\ from\ \[`VoiceWsAccess`\],\ whose\ bearer\ check\ succeeds\ when\ no\ WebSocket\s*$/,
+      /^\s*\/\/\/\ bearer\ is\ configured\ —\ the\ exact\ case\ `D\-07\ TOKEN_ONLY_REFRESH`\ makes\ normal\.\s*$/,
+      /^\s*Self\ \{\ bearer\ \}\s*$/,
+      /^\s*let\ Some\(required\)\ =\ \&self\.bearer\ else\ \{\s*$/,
+      /^\s*config\.ws_access\.required_bearer\ =\ Some\(secret\.into\(\)\);\s*$/,
+      /^\s*config\.library_read_bearer\ =\s*$/,
+      /^\s*config\.library_delete_bearer\ =\s*$/,
+      /^\s*if\ let\ Some\(required\)\ =\ \&access\.required_bearer\ \{\s*$/,
+      /^\s*\/\/\/\ library\ credentials,\ so\ the\ WebSocket\ bearer\ alone\ no\ longer\ validates\.\s*$/,
+      /^\s*\/\/\/\ which\ intentionally\ succeeds\ when\ no\ WebSocket\ bearer\ is\ configured\.\s*$/,
+      /^\s*"the\ websocket\ bearer\ check\ is\ absent\-permissive\ by\ design"\s*$/,
+      /^\s*HeaderValue::from_str\(\&format!\("Bearer\ \{FIXTURE_LIBRARY_READ_CREDENTIAL\}"\)\)\s*$/,
+      /^\s*HeaderValue::from_str\(\&format!\("Bearer\ \{FIXTURE_OPERATOR_CREDENTIAL\}"\)\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/config.rs",
+    marker: "bearer",
+    patterns: Object.freeze([
+      /^\s*bearer:\ Option<RedactedSecret>,\s*$/,
+      /^\s*pub\ fn\ new\(bearer:\ Option<RedactedSecret>\)\ \->\ Self\ \{\s*$/,
+      /^\s*Self\ \{\ bearer\ \}\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/config.rs",
+    marker: "bearer.",
+    patterns: Object.freeze([
+      /^\s*self\.bearer\.is_some\(\)\s*$/,
+      /^\s*self\.library_read_bearer\.as_str\(\)\.as_bytes\(\),\s*$/,
+      /^\s*self\.library_read_bearer\.is_some\(\),\s*$/,
+      /^\s*self\.library_delete_bearer\.is_some\(\),\s*$/,
+      /^\s*self\.operator_access\.bearer\.as_ref\(\),\s*$/,
+      /^\s*self\.library_read_bearer\.as_ref\(\),\s*$/,
+      /^\s*self\.library_delete_bearer\.as_ref\(\),\s*$/,
+      /^\s*self\.ws_access\.required_bearer\.as_ref\(\),\s*$/,
+      /^\s*return\ if\ access\.required_bearer\.is_some\(\)\ \{\s*$/,
+      /^\s*assert!\(config\.ws_access\.required_bearer\.is_some\(\)\);\s*$/,
+      /^\s*assert!\(defaults\.library_read_bearer\.is_none\(\)\);\s*$/,
+      /^\s*assert!\(defaults\.library_delete_bearer\.is_none\(\)\);\s*$/,
+      /^\s*\&\&\ config\.library_read_bearer\.is_some\(\)\s*$/,
+      /^\s*\&\&\ config\.library_delete_bearer\.is_some\(\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/config.rs",
+    marker: "fixture_session_signing_secret",
+    patterns: Object.freeze([
+      /^\s*const\ FIXTURE_SESSION_SIGNING_SECRET:\ \&str\ =\ "viva\-fixture\-session\-signing\-secret01";\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/config.rs",
+    marker: "redacted_secret",
+    patterns: Object.freeze([
+      /^\s*env_value\("VIVA_AGENT_OPERATOR_BEARER_TOKEN"\)\.map\(RedactedSecret::from\),\s*$/,
+      /^\s*env_value\("VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN"\)\.map\(RedactedSecret::from\);\s*$/,
+      /^\s*env_value\("VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN"\)\.map\(RedactedSecret::from\);\s*$/,
+      /^\s*verify_session_token_at\(token,\ \&RedactedSecret::from\(secret\),\ now,\ None\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/config.rs",
+    marker: "secret",
+    patterns: Object.freeze([
+      /^\s*let\ claims\ =\ verify_session_token_at\(\&presented,\ secret,\ now_unix_seconds,\ None\)\s*$/,
+      /^\s*secret:\ \&RedactedSecret,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/config.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*pub\ const\ VIVA_SESSION_TOKEN_HEADER:\ \&str\ =\ "x\-viva\-session\-token";\s*$/,
+      /^\s*session_token_secret:\ RedactedSecret,\s*$/,
+      /^\s*session_token_secret,\s*$/,
+      /^\s*let\ mut\ tokens\ =\ headers\.get_all\(VIVA_SESSION_TOKEN_HEADER\)\.iter\(\);\s*$/,
+      /^\s*verify_session_token_at\(token,\ \&self\.session_token_secret,\ now_unix_seconds,\ None\)\s*$/,
+      /^\s*config\.ws_access\.session_token_secret\ =\ Some\(secret\.into\(\)\);\s*$/,
+      /^\s*"VIVA_VOICE_SESSION_TOKEN_SECRET",\s*$/,
+      /^\s*self\.ws_access\.session_token_secret\.is_some\(\),\s*$/,
+      /^\s*if\ credential\.is_some\(\)\ \&\&\ self\.ws_access\.session_token_secret\.is_none\(\)\ \{\s*$/,
+      /^\s*\#\[error\("`\{0\}`\ requires\ `VIVA_VOICE_SESSION_TOKEN_SECRET`"\)\]\s*$/,
+      /^\s*pub\ session_token_secret:\ Option<RedactedSecret>,\s*$/,
+      /^\s*let\ Some\(secret\)\ =\ \&access\.session_token_secret\ else\ \{\s*$/,
+      /^\s*let\ claims\ =\ verify_session_token_at\(\&presented,\ secret,\ now_unix_seconds,\ None\)\s*$/,
+      /^\s*const\ SESSION_TOKEN_CLAIM_NAMES:\ \&\[\&str\]\ =\ \&\[\s*$/,
+      /^\s*const\ SESSION_TOKEN_REQUIRED_CLAIM_NAMES:\ \&\[\&str\]\ =\ \&\[\s*$/,
+      /^\s*pub\ fn\ verify_session_token_at\(\s*$/,
+      /^\s*let\ claims\ =\ decode_session_token_claims\(\&claims_bytes\)\?;\s*$/,
+      /^\s*fn\ decode_session_token_claims\(bytes:\ \&\[u8\]\)\ \->\ Result<SessionTokenClaims,\ SessionTokenError>\ \{\s*$/,
+      /^\s*\.any\(\|name\|\ !SESSION_TOKEN_CLAIM_NAMES\.contains\(\&name\.as_str\(\)\)\)\s*$/,
+      /^\s*if\ SESSION_TOKEN_REQUIRED_CLAIM_NAMES\s*$/,
+      /^\s*verify_session_token_at\(token,\ \&RedactedSecret::from\(secret\),\ now,\ None\)\s*$/,
+      /^\s*session_token_secret:\ Some\("session\-secret"\.into\(\)\),\s*$/,
+      /^\s*session_token_secret:\ Some\(FIXTURE_SESSION_SIGNING_SECRET\.into\(\)\),\s*$/,
+      /^\s*"VIVA_VOICE_SESSION_TOKEN_SECRET"\ =>\ Some\(FIXTURE_SESSION_SIGNING_SECRET\.to_owned\(\)\),\s*$/,
+      /^\s*public_env\(\&\[\("VIVA_VOICE_SESSION_TOKEN_SECRET",\ None\)\]\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/config.rs",
+    marker: "session_token_secret",
+    patterns: Object.freeze([
+      /^\s*session_token_secret:\ RedactedSecret,\s*$/,
+      /^\s*verify_session_token_at\(token,\ \&self\.session_token_secret,\ now_unix_seconds,\ None\)\s*$/,
+      /^\s*config\.ws_access\.session_token_secret\ =\ Some\(secret\.into\(\)\);\s*$/,
+      /^\s*pub\ session_token_secret:\ Option<RedactedSecret>,\s*$/,
+      /^\s*session_token_secret:\ Some\("session\-secret"\.into\(\)\),\s*$/,
+      /^\s*session_token_secret:\ Some\(FIXTURE_SESSION_SIGNING_SECRET\.into\(\)\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/config.rs",
+    marker: "token",
+    patterns: Object.freeze([
+      /^\s*let\ token\ =\ token\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/ingestion.rs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*"Bearer\ viva\-fixture\-operator\-credential\-0001\ ",\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/ingestion.rs",
+    marker: "bearer.",
+    patterns: Object.freeze([
+      /^\s*if\ state\.ws_access\.required_bearer\.is_none\(\)\ \{\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/ingestion.rs",
+    marker: "pasted_text",
+    patterns: Object.freeze([
+      /^\s*pasted_text:\ String,\s*$/,
+      /^\s*pasted_text:\ request\.pasted_text,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/ingestion.rs",
+    marker: "redacted_secret",
+    patterns: Object.freeze([
+      /^\s*\.map\(RedactedSecret::as_str\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/ingestion.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*if\ let\ Err\(error\)\ =\ attach_ready_session_token\(\&state,\ \&mut\ record,\ request_origin\(\&headers\)\)\ \{\s*$/,
+      /^\s*"error":\ "session_token_failed",\s*$/,
+      /^\s*pub\(super\)\ fn\ attach_ready_session_token\(\s*$/,
+      /^\s*\.session_token_secret\s*$/,
+      /^\s*record\.session_token\ =\ Some\(signed_session_token\(record,\ secret,\ state,\ origin\)\?\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/ingestion.rs",
+    marker: "session_token_secret",
+    patterns: Object.freeze([
+      /^\s*\.session_token_secret\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/ingestion.rs",
+    marker: "viva1.",
+    patterns: Object.freeze([
+      /^\s*"viva1\.eyJ1c2VyX2lkIjoidXNlci0xIn0\.c2ln\ ",\s*$/,
+      /^\s*"viva1\.",\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/library.rs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*"missing\ bearer\ token\ or\ library\ control\ token"\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/library.rs",
+    marker: "bearer.",
+    patterns: Object.freeze([
+      /^\s*if\ state\.ws_access\.required_bearer\.is_none\(\)\ \{\s*$/,
+      /^\s*if\ state\.ws_access\.required_bearer\.is_some\(\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/library.rs",
+    marker: "control_token",
+    patterns: Object.freeze([
+      /^\s*control_token:\ Option<String>,\s*$/,
+      /^\s*control_token:\ None,\s*$/,
+      /^\s*pub\(super\)\ fn\ available_mutation_action\(control_token:\ Option<String>\)\ \->\ LibraryAction\ \{\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/library.rs",
+    marker: "mutation_control_token",
+    patterns: Object.freeze([
+      /^\s*let\ mutation_control_token\ =\ signed_library_control_token\(\&state,\ \&study_set\.user_id\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/library.rs",
+    marker: "redacted_secret",
+    patterns: Object.freeze([
+      /^\s*use\ crate::config::\{ProjectionReadAccess,\ RedactedSecret,\ SessionTokenClaims\};\s*$/,
+      /^\s*\.map\(RedactedSecret::as_str\)\s*$/,
+      /^\s*\.map\(RedactedSecret::as_str\)\?;\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/library.rs",
+    marker: "secret",
+    patterns: Object.freeze([
+      /^\s*signed_session_token_for\(user_id,\ study_set_id,\ \&session_id,\ secret,\ failure_control\)\s*$/,
+      /^\s*let\ secret\ =\ state\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/library.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*session_token:\ Option<String>,\s*$/,
+      /^\s*session_token:\ None,\s*$/,
+      /^\s*\.session_token_secret\s*$/,
+      /^\s*return\ unavailable_action\("session_token_unavailable"\);\s*$/,
+      /^\s*let\ Ok\(session_token\)\ =\s*$/,
+      /^\s*signed_session_token_for\(user_id,\ study_set_id,\ \&session_id,\ secret,\ failure_control\)\s*$/,
+      /^\s*session_token:\ Some\(session_token\),\s*$/,
+      /^\s*signed_session_token_for\(\s*$/,
+      /^\s*if\ state\.ws_access\.required_bearer\.is_none\(\)\ \&\&\ state\.ws_access\.session_token_secret\.is_none\(\)\ \{\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/library.rs",
+    marker: "session_token_secret",
+    patterns: Object.freeze([
+      /^\s*\.session_token_secret\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/http/library.rs",
+    marker: "token",
+    patterns: Object.freeze([
+      /^\s*let\ token\ =\ headers\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/lib.rs",
+    marker: "redacted_secret",
+    patterns: Object.freeze([
+      /^\s*RecorderLimits,\ RedactedSecret,\ ServiceConfig,\ ServiceConfigError,\ SessionTokenClaims,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/lib.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*build_brain,\ build_study_store,\ validate_runtime_store_preflight,\ verify_session_token_at,\s*$/,
+      /^\s*EXPIRY_CLOCK_SKEW_SECONDS,\ VIVA_SESSION_TOKEN_HEADER,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/main.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*\.zip\(config\.ws_access\.session_token_secret\.clone\(\)\)\s*$/,
+      /^\s*\.map\(\|\(library_read_bearer,\ session_token_secret\)\|\ \{\s*$/,
+      /^\s*session_token_secret,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws.rs",
+    marker: "redacted_secret",
+    patterns: Object.freeze([
+      /^\s*authenticate_upgrade,\ bac_510_max_turn_duration,\ FailureControlScenario,\ RedactedSecret,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/preflight.rs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*UpgradePrincipal::ServiceBearer\ =>\ \{\s*$/,
+      /^\s*VoiceWsAccessError::MissingBearer\ \|\ VoiceWsAccessError::InvalidBearer\ =>\ \{\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/preflight.rs",
+    marker: "bound_session_token",
+    patterns: Object.freeze([
+      /^\s*bound_session_token:\ initial\.session_token,\s*$/,
+      /^\s*pub\(super\)\ bound_session_token:\ String,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/preflight.rs",
+    marker: "redacted_secret",
+    patterns: Object.freeze([
+      /^\s*\.map\(RedactedSecret::as_str\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/preflight.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*match\ state\.study_store\.claim_session_token_nonce\(claim\)\.await\ \{\s*$/,
+      /^\s*session_token,\s*$/,
+      /^\s*\.session_token_secret\s*$/,
+      /^\s*let\ token\ =\ initial\.session_token\.as_str\(\);\s*$/,
+      /^\s*bound_session_token:\ initial\.session_token,\s*$/,
+      /^\s*session_token:\ \&str,\s*$/,
+      /^\s*session_binding\.bound_session_token\.as_bytes\(\),\s*$/,
+      /^\s*session_token\.as_bytes\(\),\s*$/,
+      /^\s*pub\(super\)\ bound_session_token:\ String,\s*$/,
+      /^\s*pub\(super\)\ session_token:\ String,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/preflight.rs",
+    marker: "session_token_secret",
+    patterns: Object.freeze([
+      /^\s*\.session_token_secret\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/preflight.rs",
+    marker: "source_context",
+    patterns: Object.freeze([
+      /^\s*config\.source_context\.clear\(\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/preflight.rs",
+    marker: "token",
+    patterns: Object.freeze([
+      /^\s*let\ token\ =\ initial\.session_token\.as_str\(\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/provider.rs",
+    marker: "malformed_token",
+    patterns: Object.freeze([
+      /^\s*\|\ FailureControlScenario::MalformedToken\ =>\ BrainFailureClass::ProviderAuthFailure,\s*$/,
+      /^\s*\|\ FailureControlScenario::MalformedToken\ =>\ BrainFailureStage::SessionAuth,\s*$/,
+      /^\s*\|\ FailureControlScenario::MalformedToken\ =>\ "synthetic\ provider\ auth\ failed",\s*$/,
+      /^\s*\|\ FailureControlScenario::MalformedToken\ =>\ "session_auth",\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/tests.rs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*Ok\(_\)\ =>\ panic!\("expected\ bearer\ rejection"\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/tests.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*answer_text:\ "omitted"\.to_owned\(\),\s*$/,
+      /^\s*"intent":\ \{\ "kind":\ "answer_text",\ "text":\ "quiz\ me"\ \},\s*$/,
+      /^\s*"intent":\ \{\ "kind":\ "answer_text",\ "text":\ "an\ answer\ the\ client\ never\ reads\ back"\ \},\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/tests.rs",
+    marker: "bound_session_token",
+    patterns: Object.freeze([
+      /^\s*bound_session_token:\ "placeholder\-session\-material"\.to_owned\(\),\s*$/,
+      /^\s*bound_session_token:\ "bound\-token"\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/tests.rs",
+    marker: "pcm16_base64",
+    patterns: Object.freeze([
+      /^\s*"frame":\ \{\ "pcm16_base64":\ "AQIDBA=="\ \},\s*$/,
+      /^\s*let\ encoded\ =\ frame\.pcm16_base64\(\);\s*$/,
+      /^\s*assert!\(!error\.message\.contains\("pcm16_base64"\)\);\s*$/,
+      /^\s*"\$\.frame\.pcm16_base64"\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/tests.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*bound_session_token:\ "placeholder\-session\-material"\.to_owned\(\),\s*$/,
+      /^\s*"session_token":\ "placeholder\-session\-material",\s*$/,
+      /^\s*assert_eq!\(initial\.session_token,\ "placeholder\-session\-material"\);\s*$/,
+      /^\s*r\#"\{\{"type":"session_config","version":\{VIVA_VOICE_PROTOCOL_VERSION\},"client_generation_id":"1","session_token":"placeholder\-session\-material","session":\{session\}\}\}"\#\s*$/,
+      /^\s*session_token_secret:\ None,\s*$/,
+      /^\s*r\#"\{\{"type":"session_config","version":\{VIVA_VOICE_PROTOCOL_VERSION\},"client_generation_id":"slow\-client\-1","session_token":"placeholder\-session\-material","session":\{session\}\}\}"\#\s*$/,
+      /^\s*bound_session_token:\ "bound\-token"\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/tests.rs",
+    marker: "session_token_secret",
+    patterns: Object.freeze([
+      /^\s*session_token_secret:\ None,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/tests.rs",
+    marker: "source_context",
+    patterns: Object.freeze([
+      /^\s*"source_context":\ \[\],\s*$/,
+      /^\s*fn\ sanitizes_session_config_identity_and_strips_browser_source_context\(\)\ \{\s*$/,
+      /^\s*assert!\(sanitized\.source_context\.is_empty\(\)\);\s*$/,
+      /^\s*source_context:\ vec!\[agent_domain::SourceContext\ \{\s*$/,
+      /^\s*assert!\(refreshed\.source_context\.is_empty\(\)\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/turn.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*ClientAction::AnswerText\ =>\ \(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/turn.rs",
+    marker: "pcm16_base64",
+    patterns: Object.freeze([
+      /^\s*"\$\.frame\.pcm16_base64"\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/src/ws/turn.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*session_token,\s*$/,
+      /^\s*\&session_token,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*\/\/\/\ bearer\ at\ all,\ so\ the\ absent\-permissive\ WebSocket\ bearer\ check\ would\ leave\s*$/,
+      /^\s*Some\(\&format!\("Bearer\ \{FIXTURE_LIBRARY_READ_CREDENTIAL\}"\)\),\s*$/,
+      /^\s*Some\(\&format!\("Bearer\ \{FIXTURE_OPERATOR_CREDENTIAL\}"\)\),\s*$/,
+      /^\s*\/\/\/\ identifiers;\ a\ signed\ credential,\ a\ bearer\ header,\ transcript\ prose,\ or\ a\ base64\s*$/,
+      /^\s*const\ HOSTILE_AUTHORIZATION_VALUE:\ \&str\ =\ "Bearer\ viva\-fixture\-hostile\-credential";\s*$/,
+      /^\s*\/\/\/\ The\ upgrade\ request\ a\ trusted\ service\ makes:\ a\ shared\ bearer\ in\ `Authorization`\.\s*$/,
+      /^\s*HeaderValue::from_str\(\&format!\("Bearer\ \{bearer\}"\)\)\.expect\("authorization\ header\ is\ valid"\),\s*$/,
+      /^\s*let\ missing_bearer\ =\ bearer_app\s*$/,
+      /^\s*let\ invalid_bearer\ =\ bearer_app\s*$/,
+      /^\s*\.header\("authorization",\ "Bearer\ wrong\-secret"\)\s*$/,
+      /^\s*\.header\("authorization",\ "Bearer\ rest\-secret"\)\s*$/,
+      /^\s*if\ let\ Some\(bearer\)\ =\ request\.bearer\ \{\s*$/,
+      /^\s*builder\ =\ builder\.header\("authorization",\ format!\("Bearer\ \{bearer\}"\)\);\s*$/,
+      /^\s*"operator\ bearer\ must\ not\ authorize\ a\ projection\ read",\s*$/,
+      /^\s*"scoped\ bearer\ alone\ must\ not\ authorize",\s*$/,
+      /^\s*"Bearer\ \{FIXTURE_LIBRARY_READ_CREDENTIAL\}\ user\-1\ voice\-session\-1\ \{HOSTILE_TRANSCRIPT_TEXT\}"\s*$/,
+      /^\s*format!\("Bearer\ \{FIXTURE_LIBRARY_READ_CREDENTIAL\}"\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "CARTESIA_API_KEY",
+    patterns: Object.freeze([
+      /^\s*"raw\ answer\ transcript\ with\ CARTESIA_API_KEY\ must\ not\ surface"\.to_owned\(\);\s*$/,
+      /^\s*\.contains\("CARTESIA_API_KEY"\),\s*$/,
+      /^\s*message:\ "CARTESIA_API_KEY\ rejected;\ postgres\ adapter\ error:\ durable\ store\ write\ failed;\ rate\ limit"\s*$/,
+      /^\s*assert!\(!rendered\.contains\("CARTESIA_API_KEY"\),\ "\{rendered\}"\);\s*$/,
+      /^\s*!event\.detail\.contains\("CARTESIA_API_KEY"\)\ \&\&\ !event\.detail\.contains\("postgres"\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*"answer_text":\ "forged"\s*$/,
+      /^\s*answer_text:\ "forged\ answer"\.to_owned\(\),\s*$/,
+      /^\s*answer_text:\ "unpersisted\ answer\ should\ not\ leak"\.to_owned\(\),\s*$/,
+      /^\s*answer_text:\ "late\ provider\ answer"\.to_owned\(\),\s*$/,
+      /^\s*answer_text:\ "stale\ answer"\.to_owned\(\),\s*$/,
+      /^\s*answer_text:\ "NADH\ gives\ electrons\."\.to_owned\(\),\s*$/,
+      /^\s*answer_text:\ "first\ provider\ turn\ evaluated"\.to_owned\(\),\s*$/,
+      /^\s*answer_text:\ "provider\ turn\ evaluated"\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "authorization",
+    patterns: Object.freeze([
+      /^\s*authorization:\ Option<\&str>,\s*$/,
+      /^\s*let\ authorization\ =\ format!\("Bearer\ \{session_token\}"\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "bearer",
+    patterns: Object.freeze([
+      /^\s*bearer:\ \&str,\s*$/,
+      /^\s*HeaderValue::from_str\(\&format!\("Bearer\ \{bearer\}"\)\)\.expect\("authorization\ header\ is\ valid"\),\s*$/,
+      /^\s*bearer:\ Option<\&'a\ str>,\s*$/,
+      /^\s*builder\ =\ builder\.header\("authorization",\ format!\("Bearer\ \{bearer\}"\)\);\s*$/,
+      /^\s*bearer:\ None,\s*$/,
+      /^\s*bearer:\ Some\("viva\-fixture\-not\-the\-read\-credential\-1"\),\s*$/,
+      /^\s*bearer:\ Some\(FIXTURE_OPERATOR_CREDENTIAL\),\s*$/,
+      /^\s*bearer:\ Some\(FIXTURE_LIBRARY_READ_CREDENTIAL\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "bearer.",
+    patterns: Object.freeze([
+      /^\s*\/\/\/\ rides\ in\ the\ `bearer\.<base64url\(token\)>`\ subprotocol\ entry\.\s*$/,
+      /^\s*"viva\-voice,\ bearer\.\{\}",\s*$/,
+      /^\s*"viva\-voice,\ bearer\.not\-a\-canonical\-token"\.to_owned\(\),\s*$/,
+      /^\s*format!\("viva\-voice,\ bearer\.\{\}",\ URL_SAFE_NO_PAD\.encode\(\&expired\)\),\s*$/,
+      /^\s*assert_eq!\(missing_bearer\.status\(\),\ StatusCode::UNAUTHORIZED\);\s*$/,
+      /^\s*assert_eq!\(invalid_bearer\.status\(\),\ StatusCode::UNAUTHORIZED\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "biology_token",
+    patterns: Object.freeze([
+      /^\s*let\ biology_token\ =\ signed_session_token_with_failure_control\(FailureControlTokenFixture\ \{\s*$/,
+      /^\s*let\ biology_token\ =\ signed_session_token\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "canonical_token",
+    patterns: Object.freeze([
+      /^\s*let\ canonical_token\ =\ \&vectors\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "chemistry_token",
+    patterns: Object.freeze([
+      /^\s*let\ chemistry_token\ =\ signed_session_token_with_failure_control\(FailureControlTokenFixture\ \{\s*$/,
+      /^\s*let\ chemistry_token\ =\ signed_session_token\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "control_secret",
+    patterns: Object.freeze([
+      /^\s*control_secret:\ "control\-secret",\s*$/,
+      /^\s*control_secret:\ \&'a\ str,\s*$/,
+      /^\s*fixture\.control_secret,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "control_token",
+    patterns: Object.freeze([
+      /^\s*let\ control_token\ =\ snapshot_payload\["privacy"\]\["export"\]\["control_token"\]\s*$/,
+      /^\s*let\ control_token\ =\ signed_session_token_with_failure_control\(FailureControlTokenFixture\ \{\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "denied_token",
+    patterns: Object.freeze([
+      /^\s*let\ denied_token\ =\ nonce_audit_token_for\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "duplicate_biology_token",
+    patterns: Object.freeze([
+      /^\s*let\ duplicate_biology_token\ =\ signed_session_token\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "first_frame_token",
+    patterns: Object.freeze([
+      /^\s*let\ first_frame_token\ =\ provider_limiter_token\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "first_socket_token",
+    patterns: Object.freeze([
+      /^\s*let\ first_socket_token\ =\ provider_limiter_token\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "first_token",
+    patterns: Object.freeze([
+      /^\s*let\ first_token\ =\ nonce_audit_token_for\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "nonce_audit_secret",
+    patterns: Object.freeze([
+      /^\s*const\ NONCE_AUDIT_SECRET:\ \&str\ =\ "viva\-fixture\-session\-signing\-secret01";\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "normal_token",
+    patterns: Object.freeze([
+      /^\s*let\ normal_token\ =\ signed_session_token\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "owner_password",
+    patterns: Object.freeze([
+      /^\s*const\ OWNER_PASSWORD:\ \&\[u8\]\ =\ b"viva\-owner";\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "password",
+    patterns: Object.freeze([
+      /^\s*fn\ pdf_padded_password\(password:\ \&\[u8\]\)\ \->\ \[u8;\ 32\]\ \{\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "pasted_text",
+    patterns: Object.freeze([
+      /^\s*"pasted_text":\ "mitosis\ chromosome\ spindle\ metaphase\ cytokinesis",\s*$/,
+      /^\s*r\#"\{"title":"A","title":"B","course":null,"exam_date":null,"pasted_text":"x"\}"\#\s*$/,
+      /^\s*let\ pasted_text\ =\ "mitosis\ chromosome\ spindle\ metaphase\ cytokinesis";\s*$/,
+      /^\s*"pasted_text":\ pasted_text,\s*$/,
+      /^\s*assert_ne!\(excerpt,\ pasted_text\);\s*$/,
+      /^\s*assert!\(!payload_json\.contains\(pasted_text\)\);\s*$/,
+      /^\s*"pasted_text":\ "!!!\ \?\?\?\ \.\.\.\ \-\-\-"\s*$/,
+      /^\s*assert!\(!exported\.contains\("pasted_text"\)\);\s*$/,
+      /^\s*"pasted_text":\ "attacker\ notes\ should\ not\ mint\ a\ token"\s*$/,
+      /^\s*const\ ROUTER_SURFACE_PASTE_BODY:\ \&str\ =\ r\#"\{"title":"Cell\ Division","course":"Biology\ 201","exam_date":"2031\-06\-01T09:30:00\.000Z","pasted_text":"mitosis\ chromosome\ spindle\ metaphase\ cytokinesis"\}"\#;\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "pcm16_base64",
+    patterns: Object.freeze([
+      /^\s*"frame":\ \{\ "pcm16_base64":\ "AQIDBA=="\ \}\s*$/,
+      /^\s*"frame":\ \{\ "pcm16_base64":\ STANDARD\.encode\(pcm16\)\ \},\s*$/,
+      /^\s*"frame":\ \{\ "pcm16_base64":\ STANDARD\.encode\(\&pcm16\)\ \},\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "physics_token",
+    patterns: Object.freeze([
+      /^\s*let\ physics_token\ =\ signed_session_token\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "projection_session_secret",
+    patterns: Object.freeze([
+      /^\s*const\ PROJECTION_SESSION_SECRET:\ \&str\ =\ "viva\-fixture\-projection\-signing\-secret";\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "redacted_secret",
+    patterns: Object.freeze([
+      /^\s*FailureControlScenario,\ OperatorAccess,\ ProjectionReadAccess,\ RecorderLimits,\ RedactedSecret,\s*$/,
+      /^\s*\.with_operator_access\(OperatorAccess::new\(Some\(RedactedSecret::from\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "retry_token",
+    patterns: Object.freeze([
+      /^\s*let\ retry_token\ =\ provider_limiter_token\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "second_socket_token",
+    patterns: Object.freeze([
+      /^\s*let\ second_socket_token\ =\ provider_limiter_token\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "secret",
+    patterns: Object.freeze([
+      /^\s*let\ secret:\ RedactedSecret\ =\ String::from_utf8\(\s*$/,
+      /^\s*secret:\ \&str,\s*$/,
+      /^\s*fn\ signed_session_token_claims\(secret:\ \&str,\ claims:\ serde_json::Value\)\ \->\ String\ \{\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "session-secret",
+    patterns: Object.freeze([
+      /^\s*assert!\(!body\.contains\("session\-secret"\)\);\s*$/,
+      /^\s*"session\-secret",\s*$/,
+      /^\s*session_secret:\ "session\-secret",\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "session_secret",
+    patterns: Object.freeze([
+      /^\s*session_secret:\ "session\-secret",\s*$/,
+      /^\s*session_secret:\ \&'a\ str,\s*$/,
+      /^\s*signed_session_token_claims\(fixture\.session_secret,\ claims\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*begin_drain_and_wait,\ build_router,\ verify_session_token_at,\ AppState,\ ClientFrame,\s*$/,
+      /^\s*session_token_secret:\ Some\("session\-secret"\.into\(\)\),\s*$/,
+      /^\s*session_token_secret:\ Some\(secret\.into\(\)\),\s*$/,
+      /^\s*const\ SESSION_TOKEN_VECTORS_JSON:\ \&str\ =\s*$/,
+      /^\s*fn\ session_token_vectors\(\)\ \->\ SessionTokenVectors\ \{\s*$/,
+      /^\s*serde_json::from_str\(SESSION_TOKEN_VECTORS_JSON\)\.expect\("session\-token\ vectors\ parse"\)\s*$/,
+      /^\s*fn\ session_token_v1_vectors\(\)\ \{\s*$/,
+      /^\s*let\ vectors\ =\ session_token_vectors\(\);\s*$/,
+      /^\s*let\ outcome\ =\ verify_session_token_at\(\s*$/,
+      /^\s*assert!\(verify_session_token_at\(canonical_token,\ \&secret,\ expires_at\ \-\ 1,\ None\)\.is_ok\(\)\);\s*$/,
+      /^\s*verify_session_token_at\(canonical_token,\ \&secret,\ expires_at,\ None\)\s*$/,
+      /^\s*verify_session_token_at\(canonical_token,\ \&secret,\ expires_at\ \+\ 59,\ None\)\s*$/,
+      /^\s*verify_session_token_at\(\s*$/,
+      /^\s*async\ fn\ claim_session_token_nonce\(\s*$/,
+      /^\s*self\.audit\.record\("claim_session_token_nonce"\);\s*$/,
+      /^\s*let\ outcome\ =\ self\.inner\.claim_session_token_nonce\(claim\)\.await;\s*$/,
+      /^\s*session_token_secret:\ Some\(NONCE_AUDIT_SECRET\.into\(\)\),\s*$/,
+      /^\s*signed_session_token\(\s*$/,
+      /^\s*\.position\(\|operation\|\ \*operation\ ==\ "claim_session_token_nonce"\)\s*$/,
+      /^\s*\.filter\(\|operation\|\ \*\*operation\ ==\ "claim_session_token_nonce"\)\s*$/,
+      /^\s*let\ expired\ =\ signed_session_token\(\s*$/,
+      /^\s*let\ wrong_secret_token\ =\ signed_session_token\(\s*$/,
+      /^\s*session_token_secret:\ None,\s*$/,
+      /^\s*"session_token",\s*$/,
+      /^\s*async\ fn\ paste_study_set_route_creates_server_owned_ready_set_with_session_token\(\)\ \{\s*$/,
+      /^\s*assert!\(payload\["session_token"\]\s*$/,
+      /^\s*let\ app\ =\ build_router\(test_state_with_session_token_and_store\(\s*$/,
+      /^\s*assert_eq!\(failed_payload\["session_token"\],\ serde_json::Value::Null\);\s*$/,
+      /^\s*assert_eq!\(still_bad_payload\["session_token"\],\ serde_json::Value::Null\);\s*$/,
+      /^\s*assert!\(retried_payload\["session_token"\]\s*$/,
+      /^\s*async\ fn\ paste_study_set_route_does_not_mint_session_token_for_failed_ingestion\(\)\ \{\s*$/,
+      /^\s*assert!\(payload\["session_token"\]\.is_null\(\)\);\s*$/,
+      /^\s*assert!\(ready\["actions"\]\["start"\]\["session_token"\]\s*$/,
+      /^\s*assert!\(!exported\.contains\("session_token"\)\);\s*$/,
+      /^\s*async\ fn\ library_export_and_delete_reject_browser_session_token_authorization\(\)\ \{\s*$/,
+      /^\s*let\ session_token\ =\ signed_session_token\(\s*$/,
+      /^\s*let\ authorization\ =\ format!\("Bearer\ \{session_token\}"\);\s*$/,
+      /^\s*session_token_secret:\ Some\(PROJECTION_SESSION_SECRET\.into\(\)\),\s*$/,
+      /^\s*session_token:\ Option<\&'a\ str>,\s*$/,
+      /^\s*if\ let\ Some\(token\)\ =\ request\.session_token\ \{\s*$/,
+      /^\s*session_token:\ Some\(\&token\),\s*$/,
+      /^\s*session_token:\ None,\s*$/,
+      /^\s*session_token:\ Some\("viva1\.not\-a\-token"\),\s*$/,
+      /^\s*let\ forged\ =\ signed_session_token\(\s*$/,
+      /^\s*session_token:\ Some\(\&attacker\),\s*$/,
+      /^\s*async\ fn\ library_route_mints_session_tokens_with_public_bearer_auth\(\)\ \{\s*$/,
+      /^\s*format!\(r\#"\{\{"type":"session_config","version":\{VIVA_VOICE_PROTOCOL_VERSION\},"client_generation_id":"\{VOICE_TEST_CLIENT_GENERATION\}","session_token":"\{VOICE_TEST_PLACEHOLDER_CREDENTIAL\}","session":\{session\}\}\}"\#\)\.into\(\),\s*$/,
+      /^\s*r\#"\{\{"type":"session_config","version":\{VIVA_VOICE_PROTOCOL_VERSION\},"client_generation_id":"\{VOICE_TEST_CLIENT_GENERATION\}","session_token":"\{VOICE_TEST_PLACEHOLDER_CREDENTIAL\}","session":\{\}\}\}"\#,\s*$/,
+      /^\s*async\ fn\ websocket_accepts_signed_session_token_matching_initial_config\(\)\ \{\s*$/,
+      /^\s*let\ state\ =\ test_state_with_session_token\("session\-secret"\)\s*$/,
+      /^\s*"session_token":\ VOICE_TEST_PLACEHOLDER_CREDENTIAL,\s*$/,
+      /^\s*session_token,\s*$/,
+      /^\s*assert!\(session_token\.starts_with\("viva1\."\)\);\s*$/,
+      /^\s*serde_json::json!\(\{\ "session_token":\ "viva1\.aaa\.bbb"\ \}\),\s*$/,
+      /^\s*let\ state\ =\ test_state_with_session_token\("session\-secret"\)\.with_failure_control\(\s*$/,
+      /^\s*let\ token\ =\ signed_session_token_with_failure_control\(FailureControlTokenFixture\ \{\s*$/,
+      /^\s*let\ control_token\ =\ signed_session_token_with_failure_control\(FailureControlTokenFixture\ \{\s*$/,
+      /^\s*let\ normal_token\ =\ signed_session_token\(\s*$/,
+      /^\s*r\#"\{\{"type":"session_config","version":\{VIVA_VOICE_PROTOCOL_VERSION\},"client_generation_id":"\{VOICE_TEST_CLIENT_GENERATION\}","session_token":"\{VOICE_TEST_PLACEHOLDER_CREDENTIAL\}","session":\{session\}\}\}"\#\s*$/,
+      /^\s*let\ biology_token\ =\ signed_session_token_with_failure_control\(FailureControlTokenFixture\ \{\s*$/,
+      /^\s*let\ chemistry_token\ =\ signed_session_token_with_failure_control\(FailureControlTokenFixture\ \{\s*$/,
+      /^\s*async\ fn\ websocket_rejects_replayed_session_token_before_brain_open\(\)\ \{\s*$/,
+      /^\s*let\ token\ =\ signed_session_token\(\s*$/,
+      /^\s*async\ fn\ websocket_rejects_invalid_session_token_before_brain_open\(\)\ \{\s*$/,
+      /^\s*let\ biology_token\ =\ signed_session_token\(\s*$/,
+      /^\s*let\ duplicate_biology_token\ =\ signed_session_token\(\s*$/,
+      /^\s*let\ chemistry_token\ =\ signed_session_token\(\s*$/,
+      /^\s*let\ physics_token\ =\ signed_session_token\(\s*$/,
+      /^\s*"session_token":\ token,\s*$/,
+      /^\s*fn\ signed_session_token\(\s*$/,
+      /^\s*signed_session_token_claims\(secret,\ claims\)\s*$/,
+      /^\s*fn\ signed_session_token_with_failure_control\(fixture:\ FailureControlTokenFixture<'_>\)\ \->\ String\ \{\s*$/,
+      /^\s*signed_session_token_claims\(fixture\.session_secret,\ claims\)\s*$/,
+      /^\s*fn\ signed_session_token_claims\(secret:\ \&str,\ claims:\ serde_json::Value\)\ \->\ String\ \{\s*$/,
+      /^\s*self\.inner\.claim_session_token_nonce\(claim\)\.await\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "session_token_secret",
+    patterns: Object.freeze([
+      /^\s*session_token_secret:\ Some\("session\-secret"\.into\(\)\),\s*$/,
+      /^\s*session_token_secret:\ Some\(secret\.into\(\)\),\s*$/,
+      /^\s*session_token_secret:\ Some\(NONCE_AUDIT_SECRET\.into\(\)\),\s*$/,
+      /^\s*session_token_secret:\ None,\s*$/,
+      /^\s*session_token_secret:\ Some\(PROJECTION_SESSION_SECRET\.into\(\)\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "socket_token",
+    patterns: Object.freeze([
+      /^\s*let\ socket_token\ =\ provider_limiter_token\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "source_context",
+    patterns: Object.freeze([
+      /^\s*async\ fn\ websocket_strips_browser_source_context_before_trusted_output\(\)\ \{\s*$/,
+      /^\s*session\.source_context\ =\ vec!\[agent_domain::SourceContext\ \{\s*$/,
+      /^\s*serde_json::json!\(\{\ "source_context":\ \[\]\ \}\),\s*$/,
+      /^\s*"source_context":\ \[\],\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "token",
+    patterns: Object.freeze([
+      /^\s*token:\ String,\s*$/,
+      /^\s*\&case\.token,\s*$/,
+      /^\s*!rendered\.contains\(\&case\.token\)\ \&\&\ !rendered\.contains\(\&expected_user_id\),\s*$/,
+      /^\s*\.token;\s*$/,
+      /^\s*token:\ \&str,\s*$/,
+      /^\s*let\ token\ =\ nonce_audit_token\("voice\-session\-1",\ "nonce\-audit\-order\-1"\);\s*$/,
+      /^\s*let\ token\ =\ nonce_audit_token\("voice\-session\-1",\ "nonce\-token\-only\-reconnect"\);\s*$/,
+      /^\s*let\ token\ =\ projection_token\("user\-1",\ "biology\-midterm",\ "voice\-session\-1",\ "proj\-1"\);\s*$/,
+      /^\s*let\ token\ =\ projection_token\("user\-1",\ "biology\-midterm",\ "voice\-session\-1",\ "proj\-ok"\);\s*$/,
+      /^\s*let\ token\ =\ projection_token\("user\-1",\ "biology\-midterm",\ "voice\-session\-1",\ "proj\-fail"\);\s*$/,
+      /^\s*let\ token\ =\ signed_session_token_with_failure_control\(FailureControlTokenFixture\ \{\s*$/,
+      /^\s*let\ token\ =\ signed_session_token\(\s*$/,
+      /^\s*fn\ session_config_json_with_token\(token:\ \&str\)\ \->\ String\ \{\s*$/,
+      /^\s*let\ token\ =\ provider_limiter_token\(study_set_id,\ session_id,\ nonce\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "transcript_final",
+    patterns: Object.freeze([
+      /^\s*assert!\(!exported\.contains\("transcript_final"\)\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "user_password",
+    patterns: Object.freeze([
+      /^\s*const\ USER_PASSWORD:\ \&\[u8\]\ =\ b"viva\-user";\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "viva1.",
+    patterns: Object.freeze([
+      /^\s*const\ HOSTILE_SIGNED_CREDENTIAL:\ \&str\ =\ "viva1\.eyJ1c2VyX2lkIjoidXNlci0xIn0\.c2ln";\s*$/,
+      /^\s*"viva1\.",\s*$/,
+      /^\s*\.starts_with\("viva1\."\)\);\s*$/,
+      /^\s*assert!\(!exported\.contains\("viva1\."\)\);\s*$/,
+      /^\s*assert!\(control_token\.starts_with\("viva1\."\)\);\s*$/,
+      /^\s*\("viva1\.malformed\.signature"\.to_owned\(\),\ "malformed"\),\s*$/,
+      /^\s*let\ payload\ =\ format!\("viva1\.\{claims\}"\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-service/tests/voice_ws.rs",
+    marker: "wrong_secret_token",
+    patterns: Object.freeze([
+      /^\s*let\ wrong_secret_token\ =\ signed_session_token\(\s*$/,
+    ]),
+  },
+  {
+    file: "agent/fixtures/voice-protocol/fake-cartesia-gemini-study-session.json",
+    marker: "NADH donates high-energy electrons",
+    patterns: Object.freeze([
+      /^\s*"claim":\ "NADH\ donates\ high\-energy\ electrons\ to\ the\ electron\ transport\ chain\.",\s*$/,
+    ]),
+  },
+  {
+    file: "agent/fixtures/voice-protocol/server-event-question-started.json",
+    marker: "NADH donates high-energy electrons",
+    patterns: Object.freeze([
+      /^\s*"claim":\ "NADH\ donates\ high\-energy\ electrons\ to\ the\ electron\ transport\ chain\.",\s*$/,
+    ]),
+  },
+  {
+    file: "agent/fixtures/voice-protocol/synthetic-study-session.json",
+    marker: "NADH donates high-energy electrons",
+    patterns: Object.freeze([
+      /^\s*"claim":\ "NADH\ donates\ high\-energy\ electrons\ to\ the\ electron\ transport\ chain\.",\s*$/,
+    ]),
+  },
 ]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);
