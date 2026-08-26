@@ -1,13 +1,16 @@
 use std::{
+    borrow::Cow,
     collections::HashSet,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use agent_domain::{
-    fixture_question, AudioFrame, BrainError, BrainEvent, BrainInput, BrainProviderError,
-    BrainProviderFailure, PortError, RealtimeSession, RealtimeSessionTaskGuard, SessionConfig,
-    SessionTokenNonceClaim, StudyQuestion, StudySessionDurableCounts, StudySessionPhase,
-    StudySessionRecap, TerminalSessionReason, VoiceUsageRecord,
+    fixture_question, learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA, AudioFrame, BrainError,
+    BrainEvent, BrainFailureClass, BrainFailureStage, BrainInput, BrainProviderError,
+    BrainProviderFailure, BrainProviderFailureParts, PortError, PortErrorKind, RealtimeSession,
+    RealtimeSessionTaskGuard, SessionConfig, SessionTokenNonceClaim, StudyQuestion,
+    StudySessionDurableCounts, StudySessionPhase, StudySessionRecap, TerminalSessionReason,
+    VoiceUsageRecord,
 };
 use axum::{
     extract::{
@@ -40,9 +43,9 @@ use crate::{
         SessionTokenClaims, VoiceLimitConfig, VoiceWsAccessError,
     },
     protocol::{
-        ClientFrame, ServerFrame, VivaServerEvent, VIVA_AUDIO_MAX_CHUNK_BYTES,
-        VIVA_AUDIO_MAX_TURN_BYTES, VIVA_VOICE_MAX_BINARY_FRAME_BYTES,
-        VIVA_VOICE_MAX_TEXT_FRAME_BYTES, VIVA_VOICE_PROTOCOL_VERSION,
+        ClientFrame, ClientTurnIntent, ServerFrame, VivaServerEvent, VoiceServerErrorCode,
+        VIVA_AUDIO_MAX_CHUNK_BYTES, VIVA_AUDIO_MAX_TURN_BYTES, VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
+        VIVA_VOICE_PROTOCOL_VERSION, VOICE_SERIALIZATION_FALLBACK_FRAME,
     },
 };
 
@@ -290,7 +293,10 @@ async fn handle_socket(
         Err(_) => {
             let _ = send_json(
                 &mut sender,
-                &ServerFrame::error("first client frame timeout"),
+                &ServerFrame::error(
+                    VoiceServerErrorCode::ClientFrameMalformed,
+                    "first client frame timeout",
+                ),
             )
             .await;
             let _ = close_with(&mut sender, close_code::POLICY, "first frame timeout").await;
@@ -305,7 +311,9 @@ async fn handle_socket(
                     Ok(config) => config,
                     Err(error) => {
                         record_session_auth_failure(&state, None, error.auth_failure_code).await;
-                        let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+                        let _ =
+                            send_json(&mut sender, &ServerFrame::error(error.code, error.message))
+                                .await;
                         let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
                         record_terminal(&state, None, error.terminal_reason).await;
                         return;
@@ -326,7 +334,7 @@ async fn handle_socket(
         StudySetAccessResult::Denied(error) => {
             record_session_auth_failure(&state, voice_session_id.clone(), error.auth_failure_code)
                 .await;
-            let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+            let _ = send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
             let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
             record_terminal(&state, voice_session_id, error.terminal_reason).await;
             return;
@@ -479,7 +487,8 @@ async fn handle_socket(
                     error.auth_failure_code,
                 )
                 .await;
-                let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+                let _ =
+                    send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
                 let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
                 record_terminal(&state, voice_session_id, error.terminal_reason).await;
                 return;
@@ -536,6 +545,7 @@ async fn handle_socket(
     let mut terminal_persisted = false;
     let mut cancelled_responses = CancelledResponseTracker::default();
     let mut session_limits = SessionLimitRuntime::new();
+    let mut wire_turns = WireTurnLedger::default();
     // One bounded browser audio turn under assembly at a time, connection-local.
     let mut incoming_audio_turn: Option<IncomingAudioTurn> = None;
     let session_cap = tokio::time::sleep(state.ws_timeouts.session);
@@ -732,7 +742,7 @@ async fn handle_socket(
                         break;
                     }
                     Err(ClientMessageError::Frame(error)) => {
-                        let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+                        let _ = send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
                         let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
                         terminal_reason = error.terminal_reason;
                         break;
@@ -801,7 +811,7 @@ async fn handle_socket(
                     Err(ClientMessageError::Frame(error)) => {
                         record_session_auth_failure(&state, voice_session_id.clone(), error.auth_failure_code)
                             .await;
-                        let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+                        let _ = send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
                         let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
                         terminal_reason = error.terminal_reason;
                         break;
@@ -863,7 +873,7 @@ async fn handle_socket(
                             break;
                         }
                         Err(ClientMessageError::Frame(error)) => {
-                            let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+                            let _ = send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
                             let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
                             terminal_reason = error.terminal_reason;
                             break;
@@ -897,6 +907,7 @@ async fn handle_socket(
                             session_binding: &session_binding,
                             limits: &state.voice_limits,
                             session_limits: &mut session_limits,
+                            wire_turns: &mut wire_turns,
                         };
                         let mut provider_runtime = ProviderTurnRuntime {
                             pending_submitted_answers: &mut pending_submitted_answers,
@@ -1110,6 +1121,7 @@ async fn handle_socket(
                                     session_binding: &session_binding,
                                     limits: &state.voice_limits,
                                     session_limits: &mut session_limits,
+                                    wire_turns: &mut wire_turns,
                                 };
                                 match drain_terminal_events(
                                     &mut forward_context,
@@ -1245,7 +1257,7 @@ async fn handle_socket(
                         break;
                     }
                     Err(ClientMessageError::Frame(error)) => {
-                        let _ = send_json(&mut sender, &ServerFrame::error(error.message)).await;
+                        let _ = send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
                         let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
                         terminal_reason = error.terminal_reason;
                         break;
@@ -1276,6 +1288,7 @@ async fn handle_socket(
                     session_binding: &session_binding,
                     limits: &state.voice_limits,
                     session_limits: &mut session_limits,
+                    wire_turns: &mut wire_turns,
                 };
                 let mut provider_runtime = ProviderTurnRuntime {
                     pending_submitted_answers: &mut pending_submitted_answers,
@@ -1545,14 +1558,20 @@ async fn send_terminal_session_phase<S>(
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
-    send_json(
-        sender,
-        &ServerFrame::event(agent_domain::BrainEvent::TerminalSessionPhase {
-            phase: StudySessionPhase::Recap,
-            terminal_reason,
-        }),
-    )
-    .await
+    // Plan 05's mapping converts a terminal session phase unconditionally; a
+    // diagnostic here would mean the shared contract moved under this call, so it
+    // surfaces as the protocol's own fallback frame instead of being dropped.
+    match ServerFrame::event(agent_domain::BrainEvent::TerminalSessionPhase {
+        phase: StudySessionPhase::Recap,
+        terminal_reason,
+    }) {
+        Ok(frame) => send_json(sender, &frame).await,
+        Err(_) => {
+            sender
+                .send(Message::Text(VOICE_SERIALIZATION_FALLBACK_FRAME.into()))
+                .await
+        }
+    }
 }
 
 async fn send_partial_recap_for_provider_failure<S>(
@@ -1712,11 +1731,11 @@ where
         sender,
         &ServerFrame::Event {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            event: Box::new(VivaServerEvent::RecapReady {
-                response_id: response_id.to_owned(),
+            event: Box::new(VivaServerEvent::partial_recap_ready(
+                response_id.to_owned(),
                 recap,
-                partial_reason: Some(terminal_reason),
-            }),
+                terminal_reason,
+            )),
         },
     )
     .await?;
@@ -1741,7 +1760,12 @@ fn deterministic_provider_failure_partial_recap(
     terminal_reason: TerminalSessionReason,
     counts: &StudySessionDurableCounts,
 ) -> StudySessionRecap {
+    // A provider failure produced no graded outcome, so this recap claims none:
+    // concept outcomes, the review schedule, and source moments stay empty rather
+    // than being invented from the question's expected terms. Only Plan 04's
+    // authoritative scheduler may populate `review_schedule`.
     StudySessionRecap {
+        schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
         voice_session_id: voice_session_id.to_owned(),
         headline: "Partial recap: your answer was preserved.".to_owned(),
         summary: format!(
@@ -1755,12 +1779,37 @@ fn deterministic_provider_failure_partial_recap(
             question.source.document_id,
             question.source.span
         ),
-        strong_concepts: vec![],
-        shaky_concepts: vec![],
-        missed_concepts: vec![],
-        review_later: question.expected_terms.iter().take(3).cloned().collect(),
+        concepts: vec![],
+        review_schedule: vec![],
         next_action: "Retry this question when the provider is available, or continue with a fresh prompt.".to_owned(),
         source_moments: vec![],
+        deferred_turns: 0,
+    }
+}
+
+/// `VOICE-TURN-001` / `VOICE-TURN-002`: the socket's wire-turn accounting.
+///
+/// A domain `question_started` carries no turn identity, and Plan 05's contract
+/// refuses to attach one on its behalf, so the socket names the turn. Ids are a
+/// per-socket monotonic sequence: the Nth question this socket asks is `turn-N`,
+/// and the turn stays active until the next question starts, which is what a
+/// deferral or a later turn-bound event binds to.
+#[derive(Debug, Default)]
+struct WireTurnLedger {
+    asked: u32,
+    active_turn_id: Option<String>,
+}
+
+impl WireTurnLedger {
+    fn start_turn(&mut self) -> String {
+        self.asked = self.asked.saturating_add(1);
+        let turn_id = format!("turn-{}", self.asked);
+        self.active_turn_id = Some(turn_id.clone());
+        turn_id
+    }
+
+    fn active_turn_id(&self) -> Option<&str> {
+        self.active_turn_id.as_deref()
     }
 }
 
@@ -1770,6 +1819,7 @@ struct BrainForwardContext<'a> {
     session_binding: &'a AuthorizedClientSession,
     limits: &'a VoiceLimitConfig,
     session_limits: &'a mut SessionLimitRuntime,
+    wire_turns: &'a mut WireTurnLedger,
 }
 
 async fn drain_terminal_events<S>(
@@ -2006,16 +2056,14 @@ where
             return Ok(ForwardBrainEvent::DurabilityDegraded);
         }
         let terminal_reason = terminal_reason_for_provider_error(error);
-        if let Some(failure) = &error.failure {
+        // The failure-control harness fabricates provider failures on demand; feeding
+        // them to the real backoff limiter would let a synthetic scenario throttle
+        // production traffic.
+        if error.source != FAILURE_CONTROL_SOURCE {
             context
                 .state
                 .limit_state
-                .record_provider_failure(context.limits, failure);
-        } else if error.source != "failure_control" {
-            context
-                .state
-                .limit_state
-                .record_provider_terminal_failure(context.limits, terminal_reason);
+                .record_provider_failure(context.limits, &provider_error_failure(error));
         }
         return Ok(ForwardBrainEvent::ProviderFailure {
             reason: terminal_reason,
@@ -2027,7 +2075,10 @@ where
         BrowserEventAuthorization::Rejected => {
             send_json(
                 sender,
-                &ServerFrame::error("provider source authority rejected"),
+                &ServerFrame::error(
+                    VoiceServerErrorCode::ClientAuthorityForbidden,
+                    "provider source authority rejected",
+                ),
             )
             .await?;
             return Ok(ForwardBrainEvent::Rejected);
@@ -2062,42 +2113,54 @@ where
             }
         }
     }
-    let Some(frame) = ServerFrame::browser_event(event) else {
+    // `question_started` and `turn_deferred` are turn-bound: the domain event has no
+    // turn identity, and Plan 05's blanket conversion deliberately refuses to invent
+    // one. The socket supplies it from its own ledger through the explicit
+    // constructors; everything else takes the blanket path unchanged.
+    let frame = match &event {
+        agent_domain::BrainEvent::QuestionStarted { .. } => {
+            let turn_id = context.wire_turns.start_turn();
+            Some(
+                ServerFrame::question_started(&turn_id, &event).map_err(|_| {
+                    axum::Error::new(std::io::Error::other(
+                        "question_started is not turn-bindable",
+                    ))
+                })?,
+            )
+        }
+        agent_domain::BrainEvent::TurnDeferred { .. } => {
+            // A deferral names the turn it defers. Without an active turn there is
+            // nothing truthful to name, so the event is dropped rather than bound to
+            // a fabricated id.
+            match context.wire_turns.active_turn_id() {
+                Some(turn_id) => {
+                    Some(ServerFrame::turn_deferred(turn_id, &event).map_err(|_| {
+                        axum::Error::new(std::io::Error::other(
+                            "turn_deferred is not turn-bindable",
+                        ))
+                    })?)
+                }
+                None => None,
+            }
+        }
+        _ => ServerFrame::browser_event(event),
+    };
+    let Some(frame) = frame else {
         return Ok(ForwardBrainEvent::Continue);
     };
     send_json(sender, &frame).await?;
     Ok(ForwardBrainEvent::Continue)
 }
 
+/// Every brain failure is a classified failure. The terminal reason is implied by
+/// the typed failure class, so no provider message is ever parsed to pick one.
 fn terminal_reason_for_brain_error(error: &BrainError) -> TerminalSessionReason {
-    match error {
-        BrainError::MissingApiKey => TerminalSessionReason::ProviderAuthFailed,
-        BrainError::StageFailure(failure) => failure.terminal_reason,
-        BrainError::Connection(message) => terminal_reason_for_provider_message(message),
-        BrainError::Protocol(message) => {
-            let reason = terminal_reason_for_provider_message(message);
-            if reason == TerminalSessionReason::ProviderNetworkDisconnect {
-                TerminalSessionReason::ProviderMalformedStream
-            } else {
-                reason
-            }
-        }
-    }
+    error.terminal_reason()
 }
 
 fn brain_error_is_durability_degraded(state: &AppState, error: &BrainError) -> bool {
-    if !state.study_store.capabilities().durable {
-        return false;
-    }
-    match error {
-        BrainError::Connection(message) | BrainError::Protocol(message) => {
-            provider_store_error_message_is_durability_degraded(message)
-        }
-        BrainError::StageFailure(failure) => {
-            failure.terminal_reason == TerminalSessionReason::DurabilityDegraded
-        }
-        BrainError::MissingApiKey => false,
-    }
+    state.study_store.capabilities().durable
+        && error.terminal_reason() == TerminalSessionReason::DurabilityDegraded
 }
 
 fn record_brain_open_provider_failure(
@@ -2105,43 +2168,39 @@ fn record_brain_open_provider_failure(
     voice_session_id: Option<String>,
     error: &BrainError,
 ) {
-    match error {
-        BrainError::StageFailure(failure) => {
-            let provider_error = BrainProviderError::from_stage_failure((**failure).clone());
-            record_provider_stage_failure(state, voice_session_id, &provider_error);
-            state
-                .limit_state
-                .record_provider_failure(&state.voice_limits, failure);
-        }
-        _ => {
-            if brain_open_error_is_local_store_failure(error) {
-                return;
-            }
-            state.limit_state.record_provider_terminal_failure(
-                &state.voice_limits,
-                terminal_reason_for_brain_error(error),
-            );
-        }
-    }
+    let failure = error.failure();
+    record_provider_stage_failure(
+        state,
+        voice_session_id,
+        &BrainProviderError::from_failure(failure.clone()),
+    );
+    // `record_provider_failure` already refuses to back off on the store, tool, and
+    // recap stages, so the local-store carve-out no longer needs a message probe.
+    state
+        .limit_state
+        .record_provider_failure(&state.voice_limits, failure);
 }
 
-fn brain_open_error_is_local_store_failure(error: &BrainError) -> bool {
-    let message = match error {
-        BrainError::Connection(message) | BrainError::Protocol(message) => message,
-        BrainError::MissingApiKey | BrainError::StageFailure(_) => return false,
-    };
-    message
-        .to_ascii_lowercase()
-        .contains("record_voice_session")
-        || provider_store_error_message_is_durability_degraded(message)
+/// A provider error that reaches this service without its typed failure is an
+/// invariant breach, never an invitation to classify `source`/`message` prose. It
+/// becomes an explicit rollback failure observed at the WebSocket stage.
+fn provider_error_failure(error: &BrainProviderError) -> Cow<'_, BrainProviderFailure> {
+    match error.require_failure() {
+        Ok(failure) => Cow::Borrowed(failure),
+        Err(_) => Cow::Owned(BrainProviderFailure::new(BrainProviderFailureParts {
+            failure_class: BrainFailureClass::Rollback,
+            stage: BrainFailureStage::Websocket,
+            retry_eligible: false,
+            latency_ms: 0,
+            provider: error.source.clone(),
+            model: String::new(),
+            metadata: "error_kind=missing_typed_failure".to_owned(),
+        })),
+    }
 }
 
 fn terminal_reason_for_provider_error(error: &BrainProviderError) -> TerminalSessionReason {
-    if let Some(failure) = &error.failure {
-        return failure.terminal_reason;
-    }
-    let combined = format!("{} {}", error.source, error.message);
-    terminal_reason_for_provider_message(&combined)
+    provider_error_failure(error).terminal_reason()
 }
 
 fn provider_error_is_durability_degraded(state: &AppState, error: &BrainProviderError) -> bool {
@@ -2152,87 +2211,9 @@ fn provider_error_is_durability_degraded_for_store(
     store_is_durable: bool,
     error: &BrainProviderError,
 ) -> bool {
-    if !store_is_durable {
-        return false;
-    }
-    if let Some(failure) = &error.failure {
-        return failure.terminal_reason == TerminalSessionReason::DurabilityDegraded;
-    }
-    provider_store_error_is_durability_degraded(&error.source, &error.message)
-}
-
-fn provider_store_error_is_durability_degraded(source: &str, message: &str) -> bool {
-    let source = source.to_ascii_lowercase();
-    if !matches!(
-        source.as_str(),
-        "synthetic-memory" | "fake-provider-store" | "cartesia-gemini-store"
-    ) {
-        return false;
-    }
-    message.trim().eq_ignore_ascii_case("store adapter error")
-        || provider_store_error_message_is_durability_degraded(message)
-}
-
-fn provider_store_error_message_is_durability_degraded(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
-    normalized.contains("store unavailable")
-        || normalized.contains("database unavailable")
-        || normalized.contains("durable store")
-        || ((normalized.contains("postgres")
-            || normalized.contains("database")
-            || normalized.contains("store"))
-            && (normalized.contains("connection")
-                || normalized.contains("pool")
-                || normalized.contains("timed out")
-                || normalized.contains("timeout")))
-}
-
-fn terminal_reason_for_provider_message(message: &str) -> TerminalSessionReason {
-    let normalized = message.to_ascii_lowercase();
-    if normalized.contains("auth")
-        || normalized.contains("api key")
-        || normalized.contains("_api_key")
-        || normalized.contains("unauthorized")
-        || normalized.contains("forbidden")
-        || normalized.contains("permission")
-    {
-        return TerminalSessionReason::ProviderAuthFailed;
-    }
-    if normalized.contains("rate")
-        || normalized.contains("quota")
-        || normalized.contains("budget")
-        || normalized.contains("429")
-    {
-        return TerminalSessionReason::ProviderRateLimited;
-    }
-    if normalized.contains("timeout") || normalized.contains("timed out") {
-        return TerminalSessionReason::ProviderTimeout;
-    }
-    if normalized.contains("slow client")
-        || normalized.contains("stale socket")
-        || normalized.contains("double submit")
-        || normalized.contains("mic denied")
-    {
-        return TerminalSessionReason::SlowClient;
-    }
-    if normalized.contains("partial stage success") || normalized.contains("typed fallback") {
-        return TerminalSessionReason::PartialStageSuccess;
-    }
-    if normalized.contains("tool_executor_failure") || normalized.contains("tool executor") {
-        return TerminalSessionReason::ToolExecutorFailure;
-    }
-    if normalized.contains("cancel") || normalized.contains("abort") {
-        return TerminalSessionReason::ProviderCancelled;
-    }
-    if normalized.contains("protocol")
-        || normalized.contains("invalid")
-        || normalized.contains("malformed")
-        || normalized.contains("parse")
-        || normalized.contains("schema")
-    {
-        return TerminalSessionReason::ProviderMalformedStream;
-    }
-    TerminalSessionReason::ProviderNetworkDisconnect
+    store_is_durable
+        && provider_error_failure(error).terminal_reason()
+            == TerminalSessionReason::DurabilityDegraded
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2460,11 +2441,25 @@ async fn open_failure_control_session(
     config: SessionConfig,
     scenario: FailureControlScenario,
 ) -> Result<RealtimeSession, BrainError> {
-    state
+    // The write outcome is deliberately unread here: this rehearsal harness reports
+    // no store counts, and only whether the row committed at all gates the session.
+    let _outcome = state
         .study_store
         .record_voice_session(&config)
         .await
-        .map_err(|error| BrainError::Connection(error.to_string()))?;
+        .map_err(|error| {
+            // A store that cannot record the session is a store-stage durability
+            // failure whatever its diagnostic text says.
+            BrainError::from_failure(BrainProviderFailure::new(BrainProviderFailureParts {
+                failure_class: BrainFailureClass::DurabilityDegraded,
+                stage: BrainFailureStage::Store,
+                retry_eligible: false,
+                latency_ms: 0,
+                provider: FAILURE_CONTROL_SOURCE.to_owned(),
+                model: String::new(),
+                metadata: format!("error_kind={}", error.kind()),
+            }))
+        })?;
 
     let (input, mut input_rx) = mpsc::channel::<BrainInput>(32);
     let (event_tx, events) = mpsc::channel::<BrainEvent>(32);
@@ -2521,12 +2516,86 @@ async fn open_failure_control_session(
     })
 }
 
+/// The synthetic provider identity every failure-control error is attributed to.
+/// It is checked by identity, never by parsing a message.
+const FAILURE_CONTROL_SOURCE: &str = "failure_control";
+
 fn failure_control_provider_error(scenario: FailureControlScenario) -> BrainProviderError {
     BrainProviderError {
-        source: "failure_control".to_owned(),
+        source: FAILURE_CONTROL_SOURCE.to_owned(),
         message: failure_control_provider_message(scenario),
-        failure: None,
+        failure: Some(failure_control_provider_failure(scenario)),
     }
+}
+
+/// Each rehearsal scenario declares its own typed class and stage, so the terminal
+/// reason it produces is chosen here rather than recovered from its message.
+fn failure_control_provider_failure(scenario: FailureControlScenario) -> BrainProviderFailure {
+    BrainProviderFailure::new(BrainProviderFailureParts {
+        failure_class: failure_control_failure_class(scenario),
+        stage: failure_control_failure_stage(scenario),
+        retry_eligible: false,
+        latency_ms: 0,
+        provider: FAILURE_CONTROL_SOURCE.to_owned(),
+        model: scenario.as_str().to_owned(),
+        metadata: failure_control_failure_metadata(scenario),
+    })
+}
+
+fn failure_control_failure_class(scenario: FailureControlScenario) -> BrainFailureClass {
+    match scenario {
+        FailureControlScenario::ProviderRateLimited => BrainFailureClass::QuotaRateFailure,
+        FailureControlScenario::ProviderAuthFailed
+        | FailureControlScenario::InvalidToken
+        | FailureControlScenario::ExpiredToken
+        | FailureControlScenario::ReplayedToken
+        | FailureControlScenario::MalformedToken => BrainFailureClass::ProviderAuthFailure,
+        FailureControlScenario::ProviderTimeout
+        | FailureControlScenario::SonicTtsTimeout
+        | FailureControlScenario::RecapTimeout
+        | FailureControlScenario::SilentStall => BrainFailureClass::Timeout,
+        FailureControlScenario::ProviderMalformedStream => BrainFailureClass::MalformedStream,
+        FailureControlScenario::ProviderNetworkDisconnect => BrainFailureClass::NetworkDisconnect,
+        FailureControlScenario::SlowStaleSocketClose
+        | FailureControlScenario::DoubleSubmitRace
+        | FailureControlScenario::MicDenied => BrainFailureClass::SlowClient,
+        FailureControlScenario::TypedFallback => BrainFailureClass::PartialStageSuccess,
+    }
+}
+
+fn failure_control_failure_stage(scenario: FailureControlScenario) -> BrainFailureStage {
+    match scenario {
+        FailureControlScenario::ProviderRateLimited | FailureControlScenario::ProviderTimeout => {
+            BrainFailureStage::Gemini
+        }
+        FailureControlScenario::ProviderAuthFailed => BrainFailureStage::ProviderAuth,
+        FailureControlScenario::SilentStall
+        | FailureControlScenario::ProviderMalformedStream
+        | FailureControlScenario::ProviderNetworkDisconnect
+        | FailureControlScenario::SonicTtsTimeout => BrainFailureStage::Provider,
+        FailureControlScenario::RecapTimeout => BrainFailureStage::Recap,
+        FailureControlScenario::InvalidToken
+        | FailureControlScenario::ExpiredToken
+        | FailureControlScenario::ReplayedToken
+        | FailureControlScenario::MalformedToken => BrainFailureStage::SessionAuth,
+        FailureControlScenario::SlowStaleSocketClose => BrainFailureStage::Websocket,
+        FailureControlScenario::DoubleSubmitRace => BrainFailureStage::Session,
+        FailureControlScenario::MicDenied | FailureControlScenario::TypedFallback => {
+            BrainFailureStage::Transport
+        }
+    }
+}
+
+fn failure_control_failure_metadata(scenario: FailureControlScenario) -> String {
+    let mut metadata = format!(
+        "scenario={} stage={}",
+        scenario.as_str(),
+        failure_control_stage(scenario)
+    );
+    if scenario == FailureControlScenario::ProviderRateLimited {
+        metadata.push_str(" retry_after_ms=250 retry_after_source=synthetic");
+    }
+    metadata
 }
 
 fn failure_control_provider_message(scenario: FailureControlScenario) -> String {
@@ -2697,20 +2766,13 @@ fn store_write_error_is_durability_degraded(state: &AppState, error: &PortError)
     state.study_store.capabilities().durable && store_adapter_error_is_durability_degraded(error)
 }
 
+/// `PortErrorKind` is the classifier. `reason()` is diagnostics, so a store that
+/// could not durably commit says so with its kind rather than with prose this
+/// service pattern-matches.
 fn store_adapter_error_is_durability_degraded(error: &PortError) -> bool {
-    match error {
-        PortError::Adapter { reason, .. } => {
-            let normalized = reason.to_ascii_lowercase();
-            normalized.contains("durable store")
-                || normalized.contains("store unavailable")
-                || normalized.contains("database unavailable")
-                || normalized.contains("postgres unavailable")
-                || normalized.contains("connection")
-                || normalized.contains("pool")
-                || normalized.contains("timed out")
-                || normalized.contains("timeout")
-        }
-        PortError::Unavailable { .. } => false,
+    match error.kind() {
+        PortErrorKind::Durability | PortErrorKind::Internal => true,
+        PortErrorKind::Unavailable | PortErrorKind::InvalidInput | PortErrorKind::Conflict => false,
     }
 }
 
@@ -2823,11 +2885,11 @@ async fn validate_study_set_access(
     }
 }
 
+/// A reused nonce is the uniqueness race `PortErrorKind::Conflict` names. Matching
+/// the store's diagnostic text instead would silently stop detecting replays the
+/// moment a store reworded it.
 fn nonce_claim_was_replayed(error: &PortError) -> bool {
-    matches!(
-        error,
-        PortError::Unavailable { reason, .. } if reason == "session token nonce already used"
-    )
+    error.kind() == PortErrorKind::Conflict
 }
 
 fn server_active_concepts(study_context: &serde_json::Value) -> Vec<String> {
@@ -3172,33 +3234,50 @@ fn client_input_action(
                         }
                     }
                 }
-                ClientFrame::Text {
-                    text,
+                ClientFrame::TurnIntent {
                     client_generation_id,
+                    intent,
                     ..
                 } => {
                     let client_generation_id =
-                        validated_client_generation_id(client_generation_id)?;
-                    Ok(ClientInputAction::Send {
-                        brain_input: match client_generation_id {
-                            Some(client_generation_id) => BrainInput::TextWithMetadata {
-                                text,
-                                client_generation_id: Some(client_generation_id),
+                        validated_client_generation_id(Some(client_generation_id))?;
+                    match intent {
+                        ClientTurnIntent::AnswerText { text } => Ok(ClientInputAction::Send {
+                            brain_input: match client_generation_id {
+                                Some(client_generation_id) => BrainInput::TextWithMetadata {
+                                    text,
+                                    client_generation_id: Some(client_generation_id),
+                                },
+                                None => BrainInput::Text(text),
                             },
-                            None => BrainInput::Text(text),
-                        },
-                        action: ClientAction::AnswerText,
-                    })
+                            action: ClientAction::AnswerText,
+                        }),
+                        // A citation challenge is not an answer and must never be
+                        // graded as one. No typed provider input carries a challenge
+                        // today, and synthesizing prose to stand in for one is exactly
+                        // the magic-string payload the v5 contract removed, so the
+                        // intent is refused instead of silently downgraded.
+                        ClientTurnIntent::CitationChallenge { .. } => {
+                            Err(ClientFrameError::citation_challenge_unroutable())
+                        }
+                    }
                 }
-                ClientFrame::ToolResult { .. } => Err(ClientFrameError::untrusted_tool_result()),
+                // `D-03B QUIZ_ONLY`: the one engine has no client-selectable mode and
+                // no client goal, so every attempted context change is refused. The
+                // frame reaches neither the provider nor the store.
+                ClientFrame::SessionRefresh { .. } => {
+                    Err(ClientFrameError::session_refresh_policy_denied())
+                }
                 ClientFrame::Cancel {
                     client_generation_id,
                     turn_id,
                     ..
-                } => match (client_generation_id, turn_id) {
+                } => match turn_id {
                     // A scoped cancel discards a matching in-progress assembly and
-                    // never creates a provider turn.
-                    (Some(client_generation_id), Some(turn_id)) => {
+                    // never creates a provider turn. v5 makes the generation
+                    // mandatory, so a turn a client cannot prove it owns is
+                    // unrepresentable rather than rejected at runtime.
+                    Some(turn_id) => {
                         match accept_audio_cancel(audio_assembly, &client_generation_id, &turn_id)?
                         {
                             AudioAssemblyAction::Cancelled => {
@@ -3209,10 +3288,8 @@ fn client_input_action(
                             }
                         }
                     }
-                    // A turn id without a generation names a turn it cannot prove it owns.
-                    (None, Some(_)) => Err(ClientFrameError::invalid_audio_frame()),
-                    // Without both identities this preserves provider-response cancellation.
-                    (Some(_), None) | (None, None) => Ok(ClientInputAction::Send {
+                    // Without a turn id this preserves provider-response cancellation.
+                    None => Ok(ClientInputAction::Send {
                         brain_input: BrainInput::CancelResponse,
                         action: ClientAction::Cancel,
                     }),
@@ -3223,15 +3300,10 @@ fn client_input_action(
                 }),
             }
         }
-        Message::Binary(bytes) => {
-            if bytes.len() > VIVA_VOICE_MAX_BINARY_FRAME_BYTES {
-                return Err(ClientFrameError::oversized_binary());
-            }
-            Ok(ClientInputAction::Send {
-                brain_input: BrainInput::Audio(AudioFrame::from_pcm16_bytes(bytes)),
-                action: ClientAction::Audio,
-            })
-        }
+        // Protocol v5 has no binary client surface. Accepting one here would admit
+        // an audio turn that never passed the bounded assembler, so the frame is
+        // refused without inspecting its bytes.
+        Message::Binary(_) => Err(ClientFrameError::unsupported_binary_frame()),
         Message::Close(_) => Ok(ClientInputAction::TrySend {
             brain_input: BrainInput::Stop,
             action: ClientAction::Close,
@@ -3582,6 +3654,10 @@ enum ClientMessageError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ClientFrameError {
     auth_failure_code: Option<SessionAuthFailureCode>,
+    /// `VOICE-ERROR-001`: the typed code the client frame carries. The wire
+    /// vocabulary is closed by Plan 05, so every rejection selects exactly one
+    /// member of it and `message` stays a human diagnostic nothing branches on.
+    code: VoiceServerErrorCode,
     message: &'static str,
     close_code: u16,
     close_reason: &'static str,
@@ -3592,6 +3668,7 @@ impl ClientFrameError {
     fn invalid_first_frame() -> Self {
         Self {
             auth_failure_code: None,
+            code: VoiceServerErrorCode::ClientFrameMalformed,
             message: "first client frame must be session_config",
             close_code: close_code::PROTOCOL,
             close_reason: "session config required",
@@ -3602,6 +3679,7 @@ impl ClientFrameError {
     fn invalid() -> Self {
         Self {
             auth_failure_code: None,
+            code: VoiceServerErrorCode::ClientFrameMalformed,
             message: "invalid client frame",
             close_code: close_code::PROTOCOL,
             close_reason: "invalid client frame",
@@ -3616,6 +3694,16 @@ impl ClientFrameError {
     fn session_auth_failed(auth_failure_code: SessionAuthFailureCode) -> Self {
         Self {
             auth_failure_code: Some(auth_failure_code),
+            code: match auth_failure_code {
+                SessionAuthFailureCode::Expired => VoiceServerErrorCode::AuthExpired,
+                SessionAuthFailureCode::Replayed => VoiceServerErrorCode::AuthReplayed,
+                SessionAuthFailureCode::IdentityMismatch => {
+                    VoiceServerErrorCode::AuthIdentityMismatch
+                }
+                SessionAuthFailureCode::Malformed
+                | SessionAuthFailureCode::InvalidSignature
+                | SessionAuthFailureCode::AccessDenied => VoiceServerErrorCode::AuthInvalid,
+            },
             message: "session auth failed",
             close_code: close_code::POLICY,
             close_reason: "session auth failed",
@@ -3631,9 +3719,14 @@ impl ClientFrameError {
         Self::session_auth_failed(SessionAuthFailureCode::AccessDenied)
     }
 
+    /// A store that cannot answer at session bootstrap is reported with the same
+    /// coarse authorization code as any other failed admission: the client learns
+    /// only that authorization did not succeed, never which server component
+    /// failed.
     fn study_store_unavailable() -> Self {
         Self {
             auth_failure_code: None,
+            code: VoiceServerErrorCode::AuthInvalid,
             message: "study store unavailable",
             close_code: close_code::POLICY,
             close_reason: "study store unavailable",
@@ -3644,6 +3737,7 @@ impl ClientFrameError {
     fn nonce_store_unavailable() -> Self {
         Self {
             auth_failure_code: None,
+            code: VoiceServerErrorCode::AuthInvalid,
             message: "session token nonce store unavailable",
             close_code: close_code::POLICY,
             close_reason: "session token nonce store unavailable",
@@ -3651,19 +3745,37 @@ impl ClientFrameError {
         }
     }
 
-    fn untrusted_tool_result() -> Self {
+    /// A `citation_challenge` turn intent parses, but no typed provider input
+    /// carries it. Refusing it keeps the challenge out of the answer-grading path
+    /// entirely; it is never coerced into answer text.
+    fn citation_challenge_unroutable() -> Self {
         Self {
             auth_failure_code: None,
-            message: "browser tool_result frames are not trusted",
+            code: VoiceServerErrorCode::ClientAuthorityForbidden,
+            message: "citation challenge is not routable by this server",
             close_code: close_code::POLICY,
-            close_reason: "untrusted tool_result",
-            terminal_reason: "untrusted_tool_result",
+            close_reason: "citation challenge unavailable",
+            terminal_reason: "citation_challenge_unroutable",
+        }
+    }
+
+    /// `D-03B QUIZ_ONLY`: the in-socket context refresh is parsed by Plan 05 but
+    /// carries no change this engine can honour.
+    fn session_refresh_policy_denied() -> Self {
+        Self {
+            auth_failure_code: None,
+            code: VoiceServerErrorCode::ClientAuthorityForbidden,
+            message: "session refresh is not authorized",
+            close_code: close_code::POLICY,
+            close_reason: "session refresh denied",
+            terminal_reason: "session_refresh_policy_denied",
         }
     }
 
     fn oversized_text() -> Self {
         Self {
             auth_failure_code: None,
+            code: VoiceServerErrorCode::ClientFrameTooLarge,
             message: "text frame exceeds maximum size",
             close_code: close_code::SIZE,
             close_reason: "text frame too large",
@@ -3674,6 +3786,7 @@ impl ClientFrameError {
     fn invalid_audio_frame() -> Self {
         Self {
             auth_failure_code: None,
+            code: VoiceServerErrorCode::ClientFrameMalformed,
             message: "invalid audio frame",
             close_code: close_code::PROTOCOL,
             close_reason: "invalid audio frame",
@@ -3684,6 +3797,7 @@ impl ClientFrameError {
     fn oversized_audio_chunk() -> Self {
         Self {
             auth_failure_code: None,
+            code: VoiceServerErrorCode::ClientFrameTooLarge,
             message: "audio chunk exceeds maximum size",
             close_code: close_code::SIZE,
             close_reason: "audio chunk too large",
@@ -3694,6 +3808,7 @@ impl ClientFrameError {
     fn oversized_audio_turn() -> Self {
         Self {
             auth_failure_code: None,
+            code: VoiceServerErrorCode::ClientTurnTooLarge,
             message: "audio turn exceeds maximum size",
             close_code: close_code::SIZE,
             close_reason: "audio turn too large",
@@ -3701,19 +3816,25 @@ impl ClientFrameError {
         }
     }
 
-    fn oversized_binary() -> Self {
+    /// Protocol v5 carries audio as bounded `audio_chunk`/`audio_end` JSON frames.
+    /// A raw WebSocket binary frame is v4 legacy input that would bypass the turn
+    /// assembler's generation, sequence, and aggregate-byte bounds entirely, so it
+    /// is refused outright rather than size-checked.
+    fn unsupported_binary_frame() -> Self {
         Self {
             auth_failure_code: None,
-            message: "binary frame exceeds maximum size",
-            close_code: close_code::SIZE,
-            close_reason: "binary frame too large",
-            terminal_reason: "oversized_binary_frame",
+            code: VoiceServerErrorCode::ClientFrameMalformed,
+            message: "binary client frames are not accepted",
+            close_code: close_code::UNSUPPORTED,
+            close_reason: "binary client frames unsupported",
+            terminal_reason: "unsupported_binary_frame",
         }
     }
 
     fn disconnected() -> Self {
         Self {
             auth_failure_code: None,
+            code: VoiceServerErrorCode::InternalSerialization,
             message: "agent input channel closed",
             close_code: close_code::ABNORMAL,
             close_reason: "agent input closed",
@@ -3796,26 +3917,29 @@ const PROVIDER_STAGE_FAILURE_PROVIDER_MAX_CHARS: usize = 24;
 const PROVIDER_STAGE_FAILURE_METADATA_VALUE_MAX_CHARS: usize = 32;
 
 fn provider_stage_failure_detail(failure: &BrainProviderFailure) -> String {
-    let retry_after_ms = metadata_field(&failure.metadata, "retry_after_ms");
-    let retry_after_source = metadata_field(&failure.metadata, "retry_after_source");
-    let reset_hint = metadata_field(&failure.metadata, "reset_hint");
-    let budget_state = metadata_field(&failure.metadata, "budget_state");
-    let deploy_sha = metadata_field(&failure.metadata, "deploy_sha")
+    let retry_after_ms = metadata_field(failure.metadata(), "retry_after_ms");
+    let retry_after_source = metadata_field(failure.metadata(), "retry_after_source");
+    let reset_hint = metadata_field(failure.metadata(), "reset_hint");
+    let budget_state = metadata_field(failure.metadata(), "budget_state");
+    let deploy_sha = metadata_field(failure.metadata(), "deploy_sha")
         .map(|value| bounded_evidence_value(value, PROVIDER_STAGE_FAILURE_DEPLOY_SHA_MAX_CHARS))
         .unwrap_or_else(|| "unknown".to_owned());
     let mut fields = vec![
-        format!("failure_class={}", failure.failure_class),
-        format!("stage={}", failure.stage),
-        format!("terminal_reason={}", failure.terminal_reason.as_str()),
+        format!("failure_class={}", failure.failure_class()),
+        format!("stage={}", failure.stage()),
+        format!("terminal_reason={}", failure.terminal_reason().as_str()),
         format!(
             "provider={}",
-            bounded_evidence_value(&failure.provider, PROVIDER_STAGE_FAILURE_PROVIDER_MAX_CHARS)
+            bounded_evidence_value(
+                failure.provider(),
+                PROVIDER_STAGE_FAILURE_PROVIDER_MAX_CHARS
+            )
         ),
         format!(
             "model={}",
-            bounded_evidence_value(&failure.model, PROVIDER_STAGE_FAILURE_MODEL_MAX_CHARS)
+            bounded_evidence_value(failure.model(), PROVIDER_STAGE_FAILURE_MODEL_MAX_CHARS)
         ),
-        format!("latency_ms={}", failure.latency_ms),
+        format!("latency_ms={}", failure.latency_ms()),
         format!("deploy_sha={deploy_sha}"),
     ];
     if provider_stage_failure_has_rate_metadata(
@@ -3835,7 +3959,7 @@ fn provider_stage_failure_detail(failure: &BrainProviderFailure) -> String {
             format!("budget_state={}", budget_state.unwrap_or("unknown")),
         ]);
     }
-    fields.extend(safe_provider_stage_metadata_fields(&failure.metadata));
+    fields.extend(safe_provider_stage_metadata_fields(failure.metadata()));
     bounded_evidence_detail(fields)
 }
 
@@ -3846,8 +3970,8 @@ fn provider_stage_failure_has_rate_metadata(
     reset_hint: Option<&str>,
     budget_state: Option<&str>,
 ) -> bool {
-    failure.failure_class == "quota_rate_failure"
-        || failure.terminal_reason.as_str() == "provider_rate_limited"
+    failure.failure_class() == BrainFailureClass::QuotaRateFailure
+        || failure.terminal_reason() == TerminalSessionReason::ProviderRateLimited
         || retry_after_ms.is_some()
         || retry_after_source.is_some()
         || reset_hint.is_some()
@@ -4179,9 +4303,9 @@ async fn send_json<S>(sender: &mut S, frame: &ServerFrame) -> Result<(), axum::E
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
-    let text = serde_json::to_string(frame).unwrap_or_else(|_| {
-        "{\"type\":\"error\",\"version\":1,\"message\":\"serialization failed\"}".to_owned()
-    });
+    // Plan 05 owns the fallback frame; this service never writes its own error JSON.
+    let text = serde_json::to_string(frame)
+        .unwrap_or_else(|_| VOICE_SERIALIZATION_FALLBACK_FRAME.to_owned());
     sender.send(Message::Text(text.into())).await
 }
 
@@ -4227,77 +4351,124 @@ mod tests {
     }
 
     #[test]
-    fn provider_message_classifier_covers_failure_control_terminal_reasons() {
-        assert_eq!(
-            terminal_reason_for_provider_message("synthetic provider 429 rate limit"),
-            TerminalSessionReason::ProviderRateLimited
-        );
-        assert_eq!(
-            terminal_reason_for_provider_message("synthetic provider auth failed"),
-            TerminalSessionReason::ProviderAuthFailed
-        );
-        assert_eq!(
-            terminal_reason_for_provider_message("synthetic provider timeout"),
-            TerminalSessionReason::ProviderTimeout
-        );
-        assert_eq!(
-            terminal_reason_for_provider_message("synthetic provider malformed stream"),
-            TerminalSessionReason::ProviderMalformedStream
-        );
-        assert_eq!(
-            terminal_reason_for_provider_message("synthetic provider network disconnect"),
-            TerminalSessionReason::ProviderNetworkDisconnect
-        );
-        assert_eq!(
-            terminal_reason_for_provider_message("synthetic slow client double submit race"),
-            TerminalSessionReason::SlowClient
-        );
-        assert_eq!(
-            terminal_reason_for_provider_message("synthetic partial stage success typed fallback"),
-            TerminalSessionReason::PartialStageSuccess
-        );
+    fn failure_control_scenarios_declare_typed_terminal_reasons() {
+        for (scenario, expected) in [
+            (
+                FailureControlScenario::ProviderRateLimited,
+                TerminalSessionReason::ProviderRateLimited,
+            ),
+            (
+                FailureControlScenario::ProviderAuthFailed,
+                TerminalSessionReason::ProviderAuthFailed,
+            ),
+            (
+                FailureControlScenario::ProviderTimeout,
+                TerminalSessionReason::ProviderTimeout,
+            ),
+            (
+                FailureControlScenario::SonicTtsTimeout,
+                TerminalSessionReason::ProviderTimeout,
+            ),
+            (
+                FailureControlScenario::RecapTimeout,
+                TerminalSessionReason::ProviderTimeout,
+            ),
+            (
+                FailureControlScenario::SilentStall,
+                TerminalSessionReason::ProviderTimeout,
+            ),
+            (
+                FailureControlScenario::ProviderMalformedStream,
+                TerminalSessionReason::ProviderMalformedStream,
+            ),
+            (
+                FailureControlScenario::ProviderNetworkDisconnect,
+                TerminalSessionReason::ProviderNetworkDisconnect,
+            ),
+            (
+                FailureControlScenario::InvalidToken,
+                TerminalSessionReason::ProviderAuthFailed,
+            ),
+            (
+                FailureControlScenario::ExpiredToken,
+                TerminalSessionReason::ProviderAuthFailed,
+            ),
+            (
+                FailureControlScenario::ReplayedToken,
+                TerminalSessionReason::ProviderAuthFailed,
+            ),
+            (
+                FailureControlScenario::MalformedToken,
+                TerminalSessionReason::ProviderAuthFailed,
+            ),
+            (
+                FailureControlScenario::SlowStaleSocketClose,
+                TerminalSessionReason::SlowClient,
+            ),
+            (
+                FailureControlScenario::DoubleSubmitRace,
+                TerminalSessionReason::SlowClient,
+            ),
+            (
+                FailureControlScenario::MicDenied,
+                TerminalSessionReason::SlowClient,
+            ),
+            (
+                FailureControlScenario::TypedFallback,
+                TerminalSessionReason::PartialStageSuccess,
+            ),
+        ] {
+            let error = failure_control_provider_error(scenario);
+            assert_eq!(
+                terminal_reason_for_provider_error(&error),
+                expected,
+                "scenario {} must declare its terminal reason",
+                scenario.as_str()
+            );
+        }
     }
 
     #[test]
-    fn durability_classifier_ignores_semantic_adapter_errors() {
-        assert!(provider_store_error_message_is_durability_degraded(
-            "postgres adapter error: durable store write failed"
+    fn store_error_durability_classification_reads_the_typed_kind_only() {
+        // A hostile diagnostic string cannot promote a non-durability kind, and a
+        // reassuring one cannot demote a durability kind.
+        assert!(store_adapter_error_is_durability_degraded(
+            &PortError::durability("study_store", "voice-session-1", "everything is fine")
         ));
-        assert!(provider_store_error_message_is_durability_degraded(
-            "postgres connection pool timed out"
+        assert!(store_adapter_error_is_durability_degraded(
+            &PortError::internal("study_store", "voice-session-1", "everything is fine")
         ));
-        assert!(!provider_store_error_message_is_durability_degraded(
-            "postgres adapter error: closed voice session cannot be reopened"
+        assert!(!store_adapter_error_is_durability_degraded(
+            &PortError::unavailable(
+                "study_store",
+                "missing-study-set",
+                "durable store connection pool timed out"
+            )
         ));
-        assert!(!provider_store_error_message_is_durability_degraded(
-            "postgres unavailable for missing-study-set: study set does not exist"
+        assert!(!store_adapter_error_is_durability_degraded(
+            &PortError::invalid_input("study_store", "concept-1", "postgres database unavailable")
         ));
-        assert!(!provider_store_error_message_is_durability_degraded(
-            "postgres unavailable for concept-1: concept is not available for this study set"
-        ));
-        assert!(!provider_store_error_message_is_durability_degraded(
-            "shared Cartesia/Gemini runner is wired but live transports remain gated; no network connection was attempted"
+        assert!(!store_adapter_error_is_durability_degraded(
+            &PortError::conflict(
+                "study_store",
+                "voice-session-1",
+                "session token nonce already used"
+            )
         ));
     }
 
     #[test]
-    fn durability_classifier_preserves_sanitized_store_adapter_marker_for_store_sources() {
-        assert!(provider_store_error_is_durability_degraded(
-            "fake-provider-store",
-            "store adapter error"
-        ));
-        assert!(provider_store_error_is_durability_degraded(
-            "cartesia-gemini-store",
-            "store adapter error"
-        ));
-        assert!(!provider_store_error_is_durability_degraded(
-            "agent-service",
-            "store adapter error"
-        ));
-        assert!(!provider_store_error_is_durability_degraded(
-            "fake-provider-store",
-            "postgres adapter error: closed voice session cannot be reopened"
-        ));
+    fn nonce_replay_is_detected_by_conflict_kind_not_by_reason_text() {
+        assert!(nonce_claim_was_replayed(&PortError::conflict(
+            "study_store",
+            "user-1/set-1/voice-session-1",
+            "any wording at all"
+        )));
+        assert!(!nonce_claim_was_replayed(&PortError::unavailable(
+            "study_store",
+            "user-1/set-1/voice-session-1",
+            "session token nonce already used"
+        )));
     }
 
     #[test]
@@ -4452,13 +4623,14 @@ mod tests {
 
     #[test]
     fn failure_control_provider_message_includes_scenario_and_stage_marker() {
-        let message = failure_control_provider_message(FailureControlScenario::SonicTtsTimeout);
+        let error = failure_control_provider_error(FailureControlScenario::SonicTtsTimeout);
 
-        assert!(message.contains("timeout"));
-        assert!(message.contains("scenario=sonic_tts_timeout"));
-        assert!(message.contains("stage=sonic_tts"));
+        assert!(error.message.contains("timeout"));
+        assert!(error.message.contains("scenario=sonic_tts_timeout"));
+        assert!(error.message.contains("stage=sonic_tts"));
+        // The terminal reason comes from the declared class, not from that message.
         assert_eq!(
-            terminal_reason_for_provider_message(&message),
+            terminal_reason_for_provider_error(&error),
             TerminalSessionReason::ProviderTimeout
         );
     }
@@ -4508,11 +4680,10 @@ mod tests {
 
     #[test]
     fn provider_error_stage_metadata_overrides_message_classifier() {
-        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+        let error = BrainProviderError::from_failure(BrainProviderFailure::new(
             BrainProviderFailureParts {
-                failure_class: "tool_executor_failure".to_owned(),
-                stage: "tools".to_owned(),
-                terminal_reason: TerminalSessionReason::ToolExecutorFailure,
+                failure_class: BrainFailureClass::ToolExecutorFailure,
+                stage: BrainFailureStage::Tools,
                 retry_eligible: true,
                 latency_ms: 12,
                 provider: "server".to_owned(),
@@ -4530,11 +4701,10 @@ mod tests {
 
     #[test]
     fn structured_durability_provider_error_uses_durability_path_classifier() {
-        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+        let error = BrainProviderError::from_failure(BrainProviderFailure::new(
             BrainProviderFailureParts {
-                failure_class: "store_adapter_error".to_owned(),
-                stage: "tools".to_owned(),
-                terminal_reason: TerminalSessionReason::DurabilityDegraded,
+                failure_class: BrainFailureClass::DurabilityDegraded,
+                stage: BrainFailureStage::Tools,
                 retry_eligible: true,
                 latency_ms: 12,
                 provider: "server".to_owned(),
@@ -4542,11 +4712,6 @@ mod tests {
                 metadata: "tool=retrieve_source_reference error_kind=store".to_owned(),
             },
         ));
-        assert!(!provider_store_error_is_durability_degraded(
-            &error.source,
-            &error.message
-        ));
-
         assert!(provider_error_is_durability_degraded_for_store(
             true, &error
         ));
@@ -4572,20 +4737,21 @@ mod tests {
         let binding = fixture_binding();
         let limits = VoiceLimitConfig::default();
         let mut session_limits = SessionLimitRuntime::new();
+        let mut wire_turns = WireTurnLedger::default();
         let mut context = BrainForwardContext {
             state: &state,
             voice_session_id: Some("voice-session-1".to_owned()),
             session_binding: &binding,
             limits: &limits,
             session_limits: &mut session_limits,
+            wire_turns: &mut wire_turns,
         };
         let mut cancelled_responses = CancelledResponseTracker::default();
         let mut sender = RecordingSink::new();
-        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+        let error = BrainProviderError::from_failure(BrainProviderFailure::new(
             BrainProviderFailureParts {
-                failure_class: "store_adapter_error".to_owned(),
-                stage: "recap".to_owned(),
-                terminal_reason: TerminalSessionReason::DurabilityDegraded,
+                failure_class: BrainFailureClass::DurabilityDegraded,
+                stage: BrainFailureStage::Recap,
                 retry_eligible: true,
                 latency_ms: 37,
                 provider: "server".to_owned(),
@@ -4609,7 +4775,7 @@ mod tests {
         let evidence = state.evidence.snapshot();
         assert!(evidence.iter().any(|event| {
             event.kind == VoiceEvidenceEventKind::ProviderStageFailure
-                && event.detail.contains("failure_class=store_adapter_error")
+                && event.detail.contains("failure_class=durability_degraded")
                 && event.detail.contains("stage=recap")
                 && event.detail.contains("terminal_reason=durability_degraded")
                 && event.detail.contains("latency_ms=37")
@@ -4630,11 +4796,10 @@ mod tests {
             crate::VoiceWsAccess::default(),
             1,
         );
-        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+        let error = BrainProviderError::from_failure(BrainProviderFailure::new(
             BrainProviderFailureParts {
-                failure_class: "quota_rate_failure".to_owned(),
-                stage: "gemini".to_owned(),
-                terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                failure_class: BrainFailureClass::QuotaRateFailure,
+                stage: BrainFailureStage::Gemini,
                 retry_eligible: true,
                 latency_ms: 123,
                 provider: "gemini".to_owned(),
@@ -4679,11 +4844,10 @@ mod tests {
             crate::VoiceWsAccess::default(),
             1,
         );
-        let error = BrainProviderError::from_stage_failure(BrainProviderFailure::new(
+        let error = BrainProviderError::from_failure(BrainProviderFailure::new(
             BrainProviderFailureParts {
-                failure_class: "quota_rate_failure".to_owned(),
-                stage: "gemini".to_owned(),
-                terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                failure_class: BrainFailureClass::QuotaRateFailure,
+                stage: BrainFailureStage::Gemini,
                 retry_eligible: true,
                 latency_ms: 123,
                 provider: "gemini".to_owned(),
@@ -4771,15 +4935,15 @@ mod tests {
     #[test]
     fn superseded_recap_suppression_uses_response_identity_not_active_turn_count() {
         let recap = agent_domain::StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
             voice_session_id: "voice-session-1".to_owned(),
             headline: "Session recap".to_owned(),
             summary: "Review oxidative phosphorylation.".to_owned(),
-            strong_concepts: vec![],
-            shaky_concepts: vec![],
-            missed_concepts: vec![],
-            review_later: vec![],
+            concepts: vec![],
+            review_schedule: vec![],
             next_action: "Review the source moment.".to_owned(),
             source_moments: vec![],
+            deferred_turns: 0,
         };
         let stale_recap = BrainEvent::RecapReady {
             response_id: "response-a".to_owned(),
@@ -4814,9 +4978,18 @@ mod tests {
             crate::VoiceWsAccess::default(),
             1,
         );
-        let error = BrainError::Connection(
-            "local record_voice_session database timeout before provider open".to_owned(),
-        );
+        // A store-stage failure at open is a local durability problem, not evidence
+        // about the provider.
+        let error =
+            BrainError::from_failure(BrainProviderFailure::new(BrainProviderFailureParts {
+                failure_class: BrainFailureClass::Timeout,
+                stage: BrainFailureStage::Store,
+                retry_eligible: false,
+                latency_ms: 0,
+                provider: "synthetic".to_owned(),
+                model: String::new(),
+                metadata: "error_kind=voice_session_write_failed".to_owned(),
+            }));
         assert_eq!(
             terminal_reason_for_brain_error(&error),
             TerminalSessionReason::ProviderTimeout
@@ -4846,7 +5019,16 @@ mod tests {
             crate::VoiceWsAccess::default(),
             1,
         );
-        let error = BrainError::Connection("synthetic provider timeout".to_owned());
+        let error =
+            BrainError::from_failure(BrainProviderFailure::new(BrainProviderFailureParts {
+                failure_class: BrainFailureClass::Timeout,
+                stage: BrainFailureStage::Gemini,
+                retry_eligible: false,
+                latency_ms: 0,
+                provider: "synthetic".to_owned(),
+                model: String::new(),
+                metadata: String::new(),
+            }));
         assert_eq!(
             terminal_reason_for_brain_error(&error),
             TerminalSessionReason::ProviderTimeout
@@ -5025,9 +5207,15 @@ mod tests {
         .unwrap();
         handle_client_message(
             Message::Text(
-                json!({"type":"text","version":VIVA_VOICE_PROTOCOL_VERSION,"text":"quiz me"})
-                    .to_string()
-                    .into(),
+                json!({
+                    "type": "turn_intent",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": "1",
+                    "turn_id": "turn-2",
+                    "intent": { "kind": "answer_text", "text": "quiz me" },
+                })
+                .to_string()
+                .into(),
             ),
             &input,
             &binding,
@@ -5037,9 +5225,13 @@ mod tests {
         .unwrap();
         handle_client_message(
             Message::Text(
-                json!({"type":"cancel","version":VIVA_VOICE_PROTOCOL_VERSION})
-                    .to_string()
-                    .into(),
+                json!({
+                    "type": "cancel",
+                    "version": VIVA_VOICE_PROTOCOL_VERSION,
+                    "client_generation_id": "1",
+                })
+                .to_string()
+                .into(),
             ),
             &input,
             &binding,
@@ -5059,7 +5251,13 @@ mod tests {
             other => panic!("expected one assembled audio input, got {other:?}"),
         }
         match received.recv().await.unwrap() {
-            BrainInput::Text(text) => assert_eq!(text, "quiz me"),
+            BrainInput::TextWithMetadata {
+                text,
+                client_generation_id,
+            } => {
+                assert_eq!(text, "quiz me");
+                assert_eq!(client_generation_id.as_deref(), Some("1"));
+            }
             other => panic!("expected text input, got {other:?}"),
         }
         assert!(matches!(
@@ -5109,10 +5307,11 @@ mod tests {
         handle_client_message(
             Message::Text(
                 json!({
-                    "type": "text",
+                    "type": "turn_intent",
                     "version": VIVA_VOICE_PROTOCOL_VERSION,
-                    "text": "quiz me",
                     "client_generation_id": "bfcache_restore-2",
+                    "turn_id": "turn-00",
+                    "intent": { "kind": "answer_text", "text": "quiz me" },
                 })
                 .to_string()
                 .into(),
@@ -5183,32 +5382,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn maps_binary_pcm_frames_to_audio_input() {
-        let (input, mut received) = mpsc::channel(8);
-        let binding = fixture_binding();
-
-        handle_client_message(
-            Message::Binary(vec![5_u8, 6, 7].into()),
-            &input,
-            &binding,
-            &mut None,
-        )
-        .await
-        .unwrap();
-
-        match received.recv().await.unwrap() {
-            BrainInput::Audio(frame) => assert_eq!(frame.pcm16_bytes(), &[5, 6, 7]),
-            other => panic!("expected audio input, got {other:?}"),
-        }
-    }
-
     #[test]
     fn requires_session_config_as_bootstrap_frame() {
         let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
         let message = Message::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"1","session_token":"placeholder-session-material","session":{session}}}"#
             )
             .into(),
         );
@@ -5216,9 +5395,15 @@ mod tests {
 
         assert_eq!(config.study_set_id.as_deref(), Some("biology-midterm"));
         assert!(session_config_from_message(Message::Text(
-            json!({"type":"text","version":VIVA_VOICE_PROTOCOL_VERSION,"text":"quiz me"})
-                .to_string()
-                .into()
+            json!({
+                "type": "turn_intent",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": "1",
+                "turn_id": "turn-1",
+                "intent": { "kind": "answer_text", "text": "quiz me" },
+            })
+            .to_string()
+            .into()
         ))
         .is_err());
     }
@@ -5228,7 +5413,7 @@ mod tests {
         let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
         let message = Message::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"1","session_token":"placeholder-session-material","session":{session}}}"#
             )
             .into(),
         );
@@ -5350,7 +5535,9 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, Err(ClientFrameError::untrusted_tool_result()));
+        // `tool_result` is not a member of the v5 browser-sendable union at all, so
+        // it never parses into a frame the server could act on.
+        assert_eq!(result, Err(ClientFrameError::invalid()));
     }
 
     #[tokio::test]
@@ -5382,11 +5569,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_oversized_text_and_binary_frames() {
+    async fn rejects_oversized_text_and_every_binary_frame() {
         let (input, _received) = mpsc::channel(8);
         let binding = fixture_binding();
         let too_large_text = "x".repeat(VIVA_VOICE_MAX_TEXT_FRAME_BYTES + 1);
-        let too_large_audio = vec![0_u8; VIVA_VOICE_MAX_BINARY_FRAME_BYTES + 1];
+        // Protocol v5 has no binary client surface: even a one-byte frame is refused,
+        // because accepting it would admit audio that skipped the turn assembler.
+        let smallest_binary = vec![0_u8; 1];
 
         assert_eq!(
             handle_client_message(
@@ -5400,13 +5589,13 @@ mod tests {
         );
         assert_eq!(
             handle_client_message(
-                Message::Binary(too_large_audio.into()),
+                Message::Binary(smallest_binary.into()),
                 &input,
                 &binding,
                 &mut None,
             )
             .await,
-            Err(ClientFrameError::oversized_binary())
+            Err(ClientFrameError::unsupported_binary_frame())
         );
     }
 
@@ -5658,6 +5847,7 @@ mod tests {
         let mut sender = RecordingSink::new();
         let limits = VoiceLimitConfig::default();
         let mut session_limits = SessionLimitRuntime::new();
+        let mut wire_turns = WireTurnLedger::default();
         let binding = fixture_binding();
         let mut context = BrainForwardContext {
             state: &state,
@@ -5665,6 +5855,7 @@ mod tests {
             session_binding: &binding,
             limits: &limits,
             session_limits: &mut session_limits,
+            wire_turns: &mut wire_turns,
         };
         let started_at = Instant::now();
 
@@ -5790,9 +5981,8 @@ mod tests {
             to_model: "gemini-3.5-flash".to_owned(),
             reason: "primary_429".to_owned(),
             failure: Some(BrainProviderFailure::new(BrainProviderFailureParts {
-                failure_class: "quota_rate_failure".to_owned(),
-                stage: "gemini".to_owned(),
-                terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                failure_class: BrainFailureClass::QuotaRateFailure,
+                stage: BrainFailureStage::Gemini,
                 retry_eligible: true,
                 latency_ms: 17,
                 provider: "gemini".to_owned(),
@@ -5893,9 +6083,9 @@ mod tests {
         fn assert_sanitized_audio_error(error: ClientFrameError, frame: &AudioFrame) {
             let encoded = frame.pcm16_base64();
             if !encoded.is_empty() {
-                assert!(!error.message.contains(&encoded));
-                assert!(!error.close_reason.contains(&encoded));
-                assert!(!error.terminal_reason.contains(&encoded));
+                assert!(!error.message.contains(encoded));
+                assert!(!error.close_reason.contains(encoded));
+                assert!(!error.terminal_reason.contains(encoded));
             }
             assert!(!error.message.contains("pcm16"));
             assert!(!error.close_reason.contains("pcm16"));

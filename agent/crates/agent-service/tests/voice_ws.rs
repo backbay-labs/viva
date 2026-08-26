@@ -12,18 +12,18 @@ use agent_adapters::{cartesia_gemini::FakeCartesiaGeminiRuntime, SyntheticBrain}
 use agent_domain::{
     decide_review_schedule, parse_utc_instant, AnswerAttemptEnvelope, AnswerCaptureMode,
     AnswerCaptureStatus, AnswerContentPolicy, AnswerEvaluation, AudioFrame, BrainError, BrainEvent,
-    BrainInput, BrainProviderError, BrainProviderFailure, BrainProviderFailureParts, BrainUsage,
-    ConceptStatus, PortError, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession,
-    RealtimeSessionTaskGuard, RecapSourceMoment, ReviewOutcomeV1, ReviewSchedulingContextV1,
-    SessionConfig, SessionId, SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudyQuestion,
-    StudySessionRecap, StudySetIngestionStatus, StudySourceReference, StudyStoreBackend,
-    StudyStoreCapabilities, StudyStoreWriteCounts, TerminalSessionReason, VoiceUsageRecord,
-    VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+    BrainFailureClass, BrainFailureStage, BrainInput, BrainProviderError, BrainProviderFailure,
+    BrainProviderFailureParts, BrainUsage, ConceptStatus, PortError, RealtimeBrain,
+    RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard, ReviewOutcomeV1,
+    ReviewSchedulingContextV1, SessionConfig, SessionId, SessionTokenNonceClaim, StudyMemoryStore,
+    StudyMode, StudyQuestion, StudySessionRecap, StudySetIngestionStatus, StudySourceReference,
+    StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts, TerminalSessionReason,
+    VoiceUsageRecord, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use agent_service::{
-    build_router, AppState, ClientFrame, FailureControlConfig, FailureControlScenario, ServerFrame,
-    VivaServerEvent, VoiceDrainSignal, VoiceEvidenceRecorder, VoiceLimitConfig, VoiceWsAccess,
-    WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
+    build_router, AppState, ClientFrame, ClientTurnIntent, FailureControlConfig,
+    FailureControlScenario, ServerFrame, VivaServerEvent, VoiceDrainSignal, VoiceEvidenceRecorder,
+    VoiceLimitConfig, VoiceServerErrorCode, VoiceWsAccess, WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
 };
 use axum::{
     body::Body,
@@ -55,6 +55,47 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 use tower::ServiceExt;
+
+/// A missing provider credential is a `ProviderAuthFailure` observed at the
+/// provider-auth stage; the former stringly `MissingApiKey` variant is gone.
+fn missing_api_key_error() -> BrainError {
+    BrainError::from_failure(BrainProviderFailure::new(BrainProviderFailureParts {
+        failure_class: BrainFailureClass::ProviderAuthFailure,
+        stage: BrainFailureStage::ProviderAuth,
+        retry_eligible: false,
+        latency_ms: 0,
+        provider: "cartesia_gemini".to_owned(),
+        model: String::new(),
+        metadata: "error_kind=missing_api_key".to_owned(),
+    }))
+}
+
+/// A store write that failed while opening a session. The `PortErrorKind` token is
+/// carried as metadata; nothing classifies on it.
+fn store_stage_error(error_kind: &str) -> BrainError {
+    BrainError::from_failure(BrainProviderFailure::new(BrainProviderFailureParts {
+        failure_class: BrainFailureClass::DurabilityDegraded,
+        stage: BrainFailureStage::Store,
+        retry_eligible: false,
+        latency_ms: 0,
+        provider: "fake-provider-store".to_owned(),
+        model: String::new(),
+        metadata: format!("error_kind={error_kind}"),
+    }))
+}
+
+/// A session config that cannot supply a required bound identity.
+fn session_config_error(error_kind: &str) -> BrainError {
+    BrainError::from_failure(BrainProviderFailure::new(BrainProviderFailureParts {
+        failure_class: BrainFailureClass::Rollback,
+        stage: BrainFailureStage::Session,
+        retry_eligible: false,
+        latency_ms: 0,
+        provider: "fake-provider".to_owned(),
+        model: String::new(),
+        metadata: format!("error_kind={error_kind}"),
+    }))
+}
 
 fn test_state(max_sessions: usize) -> AppState {
     test_state_with_store(
@@ -181,7 +222,11 @@ impl StudyMemoryStore for FailingStudyStore {
         claim: agent_domain::SessionTokenNonceClaim,
     ) -> Result<(), PortError> {
         if matches!(self.mode, FailingStudyStoreMode::ClaimNonce) {
-            return Err(PortError::adapter("test_store", "nonce write failed"));
+            return Err(PortError::unavailable(
+                "test_store",
+                "nonce",
+                "nonce write failed",
+            ));
         }
         self.inner.claim_session_token_nonce(claim).await
     }
@@ -192,7 +237,11 @@ impl StudyMemoryStore for FailingStudyStore {
         study_set_id: &str,
     ) -> Result<Option<serde_json::Value>, PortError> {
         if matches!(self.mode, FailingStudyStoreMode::StudyContext) {
-            return Err(PortError::adapter("test_store", "study context failed"));
+            return Err(PortError::unavailable(
+                "test_store",
+                "study-context",
+                "study context failed",
+            ));
         }
         self.inner.study_context(user_id, study_set_id).await
     }
@@ -348,7 +397,7 @@ async fn seed_authoritative_review_schedule(store: &Arc<data::InMemoryStudyStore
 }
 
 async fn seed_completed_library_session(store: &Arc<data::InMemoryStudyStore>) {
-    store
+    let _outcome = store
         .record_voice_session(&SessionConfig {
             session_id: Some(SessionId::new("voice-session-1")),
             user_id: Some("user-1".to_owned()),
@@ -377,18 +426,28 @@ async fn seed_completed_library_session(store: &Arc<data::InMemoryStudyStore>) {
             "voice-session-1",
             "response-recap",
             StudySessionRecap {
+                schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+                deferred_turns: 0,
                 voice_session_id: "voice-session-1".to_owned(),
                 headline: "Completed session".to_owned(),
                 summary: "NADH needs one more recall pass.".to_owned(),
-                strong_concepts: vec!["oxidative-phosphorylation".to_owned()],
-                shaky_concepts: vec!["nadh".to_owned()],
-                missed_concepts: vec![],
-                review_later: vec!["nadh".to_owned()],
+                concepts: vec![
+                    agent_domain::RecapConceptOutcome {
+                        concept_id: "oxidative-phosphorylation".to_owned(),
+                        label: "oxidative-phosphorylation".to_owned(),
+                        status: agent_domain::ConceptStatus::Strong,
+                    },
+                    agent_domain::RecapConceptOutcome {
+                        concept_id: "nadh".to_owned(),
+                        label: "nadh".to_owned(),
+                        status: agent_domain::ConceptStatus::Shaky,
+                    },
+                ],
+                review_schedule: vec![],
                 next_action: "Review NADH tomorrow.".to_owned(),
-                source_moments: vec![RecapSourceMoment {
-                    text: "NADH needs one more recall pass.".to_owned(),
-                    source: agent_domain::fixture_source_reference(),
-                    status: ConceptStatus::Shaky,
+                source_moments: vec![agent_domain::learning_recap::RecapSourceMoment {
+                    response_id: "response-recap".to_owned(),
+                    source_id: agent_domain::fixture_source_reference().source_id.clone(),
                 }],
             },
         )
@@ -1195,7 +1254,7 @@ async fn library_route_projects_server_owned_sets_and_completed_session_history(
         active: true,
     });
 
-    store
+    let _outcome = store
         .record_voice_session(&SessionConfig {
             session_id: Some(SessionId::new("voice-session-1")),
             user_id: Some("user-1".to_owned()),
@@ -1224,18 +1283,28 @@ async fn library_route_projects_server_owned_sets_and_completed_session_history(
             "voice-session-1",
             "response-recap",
             StudySessionRecap {
+                schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+                deferred_turns: 0,
                 voice_session_id: "voice-session-1".to_owned(),
                 headline: "Completed session".to_owned(),
                 summary: "NADH needs one more recall pass.".to_owned(),
-                strong_concepts: vec!["oxidative-phosphorylation".to_owned()],
-                shaky_concepts: vec!["nadh".to_owned()],
-                missed_concepts: vec![],
-                review_later: vec!["nadh".to_owned()],
+                concepts: vec![
+                    agent_domain::RecapConceptOutcome {
+                        concept_id: "oxidative-phosphorylation".to_owned(),
+                        label: "oxidative-phosphorylation".to_owned(),
+                        status: agent_domain::ConceptStatus::Strong,
+                    },
+                    agent_domain::RecapConceptOutcome {
+                        concept_id: "nadh".to_owned(),
+                        label: "nadh".to_owned(),
+                        status: agent_domain::ConceptStatus::Shaky,
+                    },
+                ],
+                review_schedule: vec![],
                 next_action: "Review NADH tomorrow.".to_owned(),
-                source_moments: vec![RecapSourceMoment {
-                    text: "NADH needs one more recall pass.".to_owned(),
-                    source: agent_domain::fixture_source_reference(),
-                    status: ConceptStatus::Shaky,
+                source_moments: vec![agent_domain::learning_recap::RecapSourceMoment {
+                    response_id: "response-recap".to_owned(),
+                    source_id: agent_domain::fixture_source_reference().source_id.clone(),
                 }],
             },
         )
@@ -1245,7 +1314,7 @@ async fn library_route_projects_server_owned_sets_and_completed_session_history(
         .close_voice_session("voice-session-1", "completed")
         .await
         .unwrap();
-    store
+    let _outcome = store
         .record_voice_session(&SessionConfig {
             session_id: Some(SessionId::new("open-session-1")),
             user_id: Some("user-1".to_owned()),
@@ -2397,7 +2466,7 @@ async fn websocket_first_frame_timeout_records_terminal_reason() {
     let error = read_server_frame(&mut socket).await;
     assert!(matches!(
         error,
-        ServerFrame::Error { message, .. } if message == "first client frame timeout"
+        ServerFrame::Error { error, .. } if error.message == "first client frame timeout"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
 
@@ -2421,7 +2490,7 @@ async fn websocket_malformed_frame_reports_protocol_close_code() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -2435,7 +2504,7 @@ async fn websocket_malformed_frame_reports_protocol_close_code() {
     let error = read_server_frame(&mut socket).await;
     assert!(matches!(
         error,
-        ServerFrame::Error { message, .. } if message == "invalid client frame"
+        ServerFrame::Error { error, .. } if error.message == "invalid client frame"
     ));
     assert_close_code(&mut socket, CloseCode::Protocol).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
@@ -2458,7 +2527,7 @@ async fn websocket_oversized_text_frame_closes_with_size_and_terminal_reason() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -2474,7 +2543,7 @@ async fn websocket_oversized_text_frame_closes_with_size_and_terminal_reason() {
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "text frame exceeds maximum size"
+        ServerFrame::Error { error, .. } if error.message == "text frame exceeds maximum size"
     ));
     assert_close_code(&mut socket, CloseCode::Size).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
@@ -2485,7 +2554,7 @@ async fn websocket_oversized_text_frame_closes_with_size_and_terminal_reason() {
 }
 
 #[tokio::test]
-async fn websocket_oversized_binary_frame_closes_with_size_and_terminal_reason() {
+async fn websocket_binary_frame_closes_as_unsupported_with_terminal_reason() {
     let state = test_state(1);
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -2497,28 +2566,28 @@ async fn websocket_oversized_binary_frame_closes_with_size_and_terminal_reason()
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
     let _ = read_server_frame(&mut socket).await;
     let _ = read_server_frame(&mut socket).await;
+    // Protocol v5 carries audio as bounded JSON chunks, so no binary frame is
+    // acceptable at any size.
     socket
-        .send(WsMessage::Binary(
-            vec![0_u8; agent_service::VIVA_VOICE_MAX_BINARY_FRAME_BYTES + 1].into(),
-        ))
+        .send(WsMessage::Binary(vec![0_u8; 1].into()))
         .await
         .unwrap();
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "binary frame exceeds maximum size"
+        ServerFrame::Error { error, .. } if error.message == "binary client frames are not accepted"
     ));
-    assert_close_code(&mut socket, CloseCode::Size).await;
+    assert_close_code(&mut socket, CloseCode::Unsupported).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::TerminalReason
-            && event.detail == "oversized_binary_frame"
+            && event.detail == "unsupported_binary_frame"
     }));
 }
 
@@ -2572,7 +2641,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
     for session in [
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -2584,7 +2653,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         },
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -2596,7 +2665,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         },
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -2608,7 +2677,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         },
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -2620,7 +2689,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         },
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{}}}"#,
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
                 include_str!("../../../fixtures/voice-protocol/session-config.json")
             ))
             .unwrap();
@@ -2642,7 +2711,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         send_client_frame(&mut socket, &session).await;
         assert!(matches!(
             read_server_frame(&mut socket).await,
-            ServerFrame::Error { message, .. } if message == "session auth failed"
+            ServerFrame::Error { error, .. } if error.message == "session auth failed"
         ));
         assert_close_code(&mut socket, CloseCode::Policy).await;
         let auth_events =
@@ -2717,6 +2786,8 @@ async fn websocket_records_auth_failure_for_forged_config_refresh() {
             serde_json::json!({
                 "type": "session_config",
                 "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
                 "session": session,
             })
             .to_string()
@@ -2736,6 +2807,8 @@ async fn websocket_records_auth_failure_for_forged_config_refresh() {
             serde_json::json!({
                 "type": "session_config",
                 "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
                 "session": forged_refresh,
             })
             .to_string()
@@ -2746,8 +2819,8 @@ async fn websocket_records_auth_failure_for_forged_config_refresh() {
 
     let frames = read_server_frames_until_close(&mut socket).await;
     for frame in frames {
-        if let ServerFrame::Error { message, .. } = frame {
-            assert_eq!(message, "session auth failed");
+        if let ServerFrame::Error { error, .. } = frame {
+            assert_eq!(error.message, "session auth failed");
         }
     }
     let auth_events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
@@ -2824,10 +2897,13 @@ async fn websocket_failure_control_claim_forces_sanitized_provider_terminal_path
 
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "synthetic answer".to_owned(),
-            client_generation_id: None,
+            client_generation_id: "v5-answer-1".to_owned(),
+            turn_id: "v5-turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "synthetic answer".to_owned(),
+            },
         },
     )
     .await;
@@ -2906,10 +2982,13 @@ async fn websocket_failure_control_provider_error_does_not_backoff_normal_sessio
         .unwrap();
     send_client_frame(
         &mut control_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "control probe".to_owned(),
-            client_generation_id: Some("bac519-failure-control-backoff".to_owned()),
+            client_generation_id: "bac519-failure-control-backoff".to_owned(),
+            turn_id: "v5-turn-2".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "control probe".to_owned(),
+            },
         },
     )
     .await;
@@ -2951,10 +3030,13 @@ async fn websocket_failure_control_provider_error_does_not_backoff_normal_sessio
     ));
     send_client_frame(
         &mut normal_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "normal probe".to_owned(),
-            client_generation_id: Some("bac519-normal-after-failure-control".to_owned()),
+            client_generation_id: "bac519-normal-after-failure-control".to_owned(),
+            turn_id: "v5-turn-3".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "normal probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3259,7 +3341,7 @@ async fn websocket_provider_backoff_denies_next_answer_before_brain_input() {
     first_socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3267,10 +3349,13 @@ async fn websocket_provider_backoff_denies_next_answer_before_brain_input() {
         .unwrap();
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-backoff-first".to_owned()),
+            client_generation_id: "bac519-backoff-first".to_owned(),
+            turn_id: "v5-turn-4".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3295,7 +3380,7 @@ async fn websocket_provider_backoff_denies_next_answer_before_brain_input() {
     second_socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3348,7 +3433,7 @@ async fn websocket_unstructured_provider_rate_limit_sets_default_backoff() {
     first_socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3356,10 +3441,13 @@ async fn websocket_unstructured_provider_rate_limit_sets_default_backoff() {
         .unwrap();
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-unstructured-backoff-first".to_owned()),
+            client_generation_id: "bac519-unstructured-backoff-first".to_owned(),
+            turn_id: "v5-turn-5".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3378,7 +3466,7 @@ async fn websocket_unstructured_provider_rate_limit_sets_default_backoff() {
     second_socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3428,7 +3516,7 @@ async fn websocket_open_rate_limit_backoff_denies_next_socket_before_brain_open(
     first_socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3446,7 +3534,7 @@ async fn websocket_open_rate_limit_backoff_denies_next_socket_before_brain_open(
     second_socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3591,10 +3679,13 @@ async fn websocket_provider_global_turn_limit_denies_queue_overflow() {
     ));
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-queue-first".to_owned()),
+            client_generation_id: "bac519-queue-first".to_owned(),
+            turn_id: "v5-turn-6".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3637,10 +3728,13 @@ async fn websocket_provider_global_turn_limit_denies_queue_overflow() {
     );
     send_client_frame(
         &mut second_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-queue-second".to_owned()),
+            client_generation_id: "bac519-queue-second".to_owned(),
+            turn_id: "v5-turn-7".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3692,7 +3786,7 @@ async fn websocket_provider_queue_rejects_overlapping_same_socket_turn_without_d
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3711,10 +3805,13 @@ async fn websocket_provider_queue_rejects_overlapping_same_socket_turn_without_d
     ));
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-overlap-first".to_owned()),
+            client_generation_id: "bac519-overlap-first".to_owned(),
+            turn_id: "v5-turn-8".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3725,10 +3822,13 @@ async fn websocket_provider_queue_rejects_overlapping_same_socket_turn_without_d
 
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-overlap-second".to_owned()),
+            client_generation_id: "bac519-overlap-second".to_owned(),
+            turn_id: "v5-turn-9".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3799,10 +3899,13 @@ async fn websocket_provider_queue_depth_waits_for_slot_before_forwarding() {
     ));
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-queue-wait-first".to_owned()),
+            client_generation_id: "bac519-queue-wait-first".to_owned(),
+            turn_id: "v5-turn-10".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3841,10 +3944,13 @@ async fn websocket_provider_queue_depth_waits_for_slot_before_forwarding() {
     );
     send_client_frame(
         &mut second_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-queue-wait-second".to_owned()),
+            client_generation_id: "bac519-queue-wait-second".to_owned(),
+            turn_id: "v5-turn-11".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -3902,7 +4008,7 @@ async fn websocket_provider_admission_rejects_audio_continuation_without_second_
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -3920,18 +4026,12 @@ async fn websocket_provider_admission_rejects_audio_continuation_without_second_
             )
     ));
 
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-1", &[1_u8, 2]).await;
     wait_until(Duration::from_secs(2), || {
         audio_inputs.load(Ordering::SeqCst) == 1
     })
     .await;
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-2", &[3_u8, 4]).await;
 
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -4005,10 +4105,13 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
     ));
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-queue-cancel-holder".to_owned()),
+            client_generation_id: "bac519-queue-cancel-holder".to_owned(),
+            turn_id: "v5-turn-12".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -4032,10 +4135,13 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
         .unwrap();
     send_client_frame(
         &mut second_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "queued probe".to_owned(),
-            client_generation_id: Some("bac519-queue-cancel-pending".to_owned()),
+            client_generation_id: "bac519-queue-cancel-pending".to_owned(),
+            turn_id: "v5-turn-13".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "queued probe".to_owned(),
+            },
         },
     )
     .await;
@@ -4044,7 +4150,7 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
         &mut second_socket,
         &ClientFrame::Cancel {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            client_generation_id: None,
+            client_generation_id: "v5-cancel".to_owned(),
             turn_id: None,
         },
     )
@@ -4120,10 +4226,13 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
     ));
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission holder".to_owned(),
-            client_generation_id: Some("bac519-queue-cancel-idle-holder".to_owned()),
+            client_generation_id: "bac519-queue-cancel-idle-holder".to_owned(),
+            turn_id: "v5-turn-14".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission holder".to_owned(),
+            },
         },
     )
     .await;
@@ -4147,10 +4256,13 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
         .unwrap();
     send_client_frame(
         &mut second_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "queued probe".to_owned(),
-            client_generation_id: Some("bac519-queue-cancel-idle-pending".to_owned()),
+            client_generation_id: "bac519-queue-cancel-idle-pending".to_owned(),
+            turn_id: "v5-turn-15".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "queued probe".to_owned(),
+            },
         },
     )
     .await;
@@ -4159,7 +4271,7 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
         &mut second_socket,
         &ClientFrame::Cancel {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            client_generation_id: None,
+            client_generation_id: "v5-cancel".to_owned(),
             turn_id: None,
         },
     )
@@ -4232,10 +4344,13 @@ async fn websocket_provider_queue_arms_turn_cap_while_waiting_for_admission() {
     ));
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission holder".to_owned(),
-            client_generation_id: Some("bac519-queue-turn-cap-holder".to_owned()),
+            client_generation_id: "bac519-queue-turn-cap-holder".to_owned(),
+            turn_id: "v5-turn-16".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission holder".to_owned(),
+            },
         },
     )
     .await;
@@ -4270,10 +4385,13 @@ async fn websocket_provider_queue_arms_turn_cap_while_waiting_for_admission() {
     ));
     send_client_frame(
         &mut second_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "queued admission should time out".to_owned(),
-            client_generation_id: Some("bac519-queue-turn-cap-pending".to_owned()),
+            client_generation_id: "bac519-queue-turn-cap-pending".to_owned(),
+            turn_id: "v5-turn-17".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "queued admission should time out".to_owned(),
+            },
         },
     )
     .await;
@@ -4347,10 +4465,13 @@ async fn websocket_provider_queue_rejects_audio_continuation_without_second_leas
     ));
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "admission probe".to_owned(),
-            client_generation_id: Some("bac519-queued-audio-holder".to_owned()),
+            client_generation_id: "bac519-queued-audio-holder".to_owned(),
+            turn_id: "v5-turn-18".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "admission probe".to_owned(),
+            },
         },
     )
     .await;
@@ -4383,14 +4504,8 @@ async fn websocket_provider_queue_rejects_audio_continuation_without_second_leas
                 }
             )
     ));
-    second_socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
-    second_socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut second_socket, "audio-turn-3", &[1_u8, 2]).await;
+    send_v5_audio_turn(&mut second_socket, "audio-turn-4", &[3_u8, 4]).await;
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let frame = read_server_frame(&mut second_socket).await;
@@ -4460,18 +4575,12 @@ async fn websocket_provider_active_audio_rejects_later_frame_without_second_leas
                 }
             )
     ));
-    socket
-        .send(WsMessage::Binary(vec![1_u8].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-5", &[1_u8]).await;
     wait_until(Duration::from_secs(2), || {
         audio_inputs.lock().unwrap().len() == 1
     })
     .await;
-    socket
-        .send(WsMessage::Binary(vec![2_u8].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-6", &[2_u8]).await;
 
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -4786,7 +4895,7 @@ async fn websocket_rejects_failure_control_claim_from_wrong_origin_before_brain_
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "session auth failed"
+        ServerFrame::Error { error, .. } if error.message == "session auth failed"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
     assert!(!opened.load(Ordering::SeqCst));
@@ -4844,7 +4953,7 @@ async fn websocket_rejects_replayed_session_token_before_brain_open() {
 
     assert!(matches!(
         read_server_frame(&mut replay_socket).await,
-        ServerFrame::Error { message, .. } if message == "session auth failed"
+        ServerFrame::Error { error, .. } if error.message == "session auth failed"
     ));
     assert_close_code(&mut replay_socket, CloseCode::Policy).await;
     let auth_events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
@@ -4900,7 +5009,7 @@ async fn websocket_records_nonce_store_errors_without_replay_auth_evidence() {
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "session token nonce store unavailable"
+        ServerFrame::Error { error, .. } if error.message == "session token nonce store unavailable"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
@@ -4980,7 +5089,7 @@ async fn websocket_durable_store_replay_still_reports_session_auth_failure() {
 
     assert!(matches!(
         read_server_frame(&mut replay_socket).await,
-        ServerFrame::Error { message, .. } if message == "session auth failed"
+        ServerFrame::Error { error, .. } if error.message == "session auth failed"
     ));
     assert_close_code(&mut replay_socket, CloseCode::Policy).await;
     let auth_events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AuthFailure).await;
@@ -5165,7 +5274,7 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
 
         assert!(matches!(
             read_server_frame(&mut socket).await,
-            ServerFrame::Error { message, .. } if message == "session auth failed"
+            ServerFrame::Error { error, .. } if error.message == "session auth failed"
         ));
         assert_close_code(&mut socket, CloseCode::Policy).await;
         let auth_events =
@@ -5239,7 +5348,7 @@ async fn websocket_rejects_token_claim_mismatch_before_brain_open() {
 
         assert!(matches!(
             read_server_frame(&mut socket).await,
-            ServerFrame::Error { message, .. } if message == "session auth failed"
+            ServerFrame::Error { error, .. } if error.message == "session auth failed"
         ));
         assert_close_code(&mut socket, CloseCode::Policy).await;
         let auth_events =
@@ -5287,6 +5396,8 @@ async fn websocket_checks_study_set_access_before_brain_open() {
             serde_json::json!({
                 "type": "session_config",
                 "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
                 "session": session,
             })
             .to_string()
@@ -5297,7 +5408,7 @@ async fn websocket_checks_study_set_access_before_brain_open() {
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "session auth failed"
+        ServerFrame::Error { error, .. } if error.message == "session auth failed"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
     assert!(!opened.load(Ordering::SeqCst));
@@ -5345,6 +5456,8 @@ async fn websocket_records_study_context_store_errors_without_access_denied_auth
             serde_json::json!({
                 "type": "session_config",
                 "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
                 "session": session,
             })
             .to_string()
@@ -5355,7 +5468,7 @@ async fn websocket_records_study_context_store_errors_without_access_denied_auth
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "study store unavailable"
+        ServerFrame::Error { error, .. } if error.message == "study store unavailable"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
@@ -5735,7 +5848,7 @@ async fn websocket_durable_semantic_authority_miss_remains_provider_source_rejec
 
     assert!(frames.iter().any(|frame| matches!(
         frame,
-        ServerFrame::Error { message, .. } if message == "provider source authority rejected"
+        ServerFrame::Error { error, .. } if error.message == "provider source authority rejected"
     )));
     assert!(frames.iter().all(|frame| {
         terminal_session_reason(frame) != Some(TerminalSessionReason::DurabilityDegraded)
@@ -6021,7 +6134,7 @@ async fn websocket_rejects_browser_tool_result_as_untrusted() {
 
     assert!(matches!(
         read_server_frame(&mut socket).await,
-        ServerFrame::Error { message, .. } if message == "browser tool_result frames are not trusted"
+        ServerFrame::Error { error, .. } if error.message == "browser tool_result frames are not trusted"
     ));
     assert_close_code(&mut socket, CloseCode::Policy).await;
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
@@ -6050,7 +6163,7 @@ async fn websocket_drain_emits_terminal_phase_before_close() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6189,7 +6302,7 @@ async fn websocket_drain_latches_before_socket_subscribes() {
     drain.begin_drain();
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6222,7 +6335,7 @@ async fn websocket_session_cap_emits_terminal_phase_before_close() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6267,7 +6380,7 @@ async fn websocket_user_study_set_cap_stays_one_when_user_session_knob_is_above_
     assert_ready_provider(&mut first_socket, "backpressured_input_probe").await;
     first_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6283,7 +6396,7 @@ async fn websocket_user_study_set_cap_stays_one_when_user_session_knob_is_above_
     assert_ready_provider(&mut second_socket, "backpressured_input_probe").await;
     second_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6300,7 +6413,7 @@ async fn websocket_user_study_set_cap_stays_one_when_user_session_knob_is_above_
     assert_ready_provider(&mut third_socket, "backpressured_input_probe").await;
     third_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6466,7 +6579,7 @@ async fn websocket_user_study_set_cap_still_rejects_duplicate_when_user_total_li
     assert_ready_provider(&mut first_socket, "backpressured_input_probe").await;
     first_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6475,7 +6588,7 @@ async fn websocket_user_study_set_cap_still_rejects_duplicate_when_user_total_li
     assert_ready_provider(&mut second_socket, "backpressured_input_probe").await;
     second_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6514,7 +6627,7 @@ async fn websocket_default_study_set_cap_rejects_duplicate_tab_and_releases() {
     assert_ready_provider(&mut first_socket, "backpressured_input_probe").await;
     first_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6530,7 +6643,7 @@ async fn websocket_default_study_set_cap_rejects_duplicate_tab_and_releases() {
     assert_ready_provider(&mut second_socket, "backpressured_input_probe").await;
     second_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6550,7 +6663,7 @@ async fn websocket_default_study_set_cap_rejects_duplicate_tab_and_releases() {
     assert_ready_provider(&mut third_socket, "backpressured_input_probe").await;
     third_socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -6931,14 +7044,11 @@ async fn websocket_audio_byte_cap_emits_rate_limit_terminal_phase() {
     assert_ready_provider(&mut socket, "backpressured_input_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2, 3, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-7", &[1_u8, 2, 3, 4]).await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -6982,7 +7092,7 @@ async fn websocket_cost_budget_emits_cost_budget_terminal_phase() {
     assert_ready_provider(&mut socket, "event_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -7015,7 +7125,7 @@ async fn websocket_turn_cap_emits_terminal_phase_before_close() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -7059,7 +7169,7 @@ async fn websocket_records_configured_turn_cap_evidence() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -7090,7 +7200,7 @@ async fn websocket_turn_cap_waits_for_answer_frame() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -7141,7 +7251,7 @@ async fn websocket_post_config_idle_timeout_closes_without_answer_frame() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -7196,16 +7306,19 @@ async fn websocket_turn_cap_disarms_after_answer_resolution() {
     assert_ready_provider(&mut socket, "gated_completion_provider_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "resolved answer".to_owned(),
-            client_generation_id: Some("turn-cap-resolution".to_owned()),
+            client_generation_id: "turn-cap-resolution".to_owned(),
+            turn_id: "v5-turn-19".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "resolved answer".to_owned(),
+            },
         },
     )
     .await;
@@ -7295,10 +7408,13 @@ async fn websocket_provider_slot_releases_on_answer_evaluated() {
         .unwrap();
     send_client_frame(
         &mut first_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "first provider turn".to_owned(),
-            client_generation_id: Some("bac519-answer-evaluated-held-1".to_owned()),
+            client_generation_id: "bac519-answer-evaluated-held-1".to_owned(),
+            turn_id: "v5-turn-20".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "first provider turn".to_owned(),
+            },
         },
     )
     .await;
@@ -7337,10 +7453,13 @@ async fn websocket_provider_slot_releases_on_answer_evaluated() {
         .unwrap();
     send_client_frame(
         &mut second_socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "second provider turn".to_owned(),
-            client_generation_id: Some("bac519-answer-evaluated-held-2".to_owned()),
+            client_generation_id: "bac519-answer-evaluated-held-2".to_owned(),
+            turn_id: "v5-turn-21".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "second provider turn".to_owned(),
+            },
         },
     )
     .await;
@@ -7390,7 +7509,7 @@ async fn websocket_provider_slot_prefers_queued_completion_before_same_socket_ov
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -7398,10 +7517,13 @@ async fn websocket_provider_slot_prefers_queued_completion_before_same_socket_ov
         .unwrap();
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "first provider turn".to_owned(),
-            client_generation_id: Some("bac519-queued-completion-release-1".to_owned()),
+            client_generation_id: "bac519-queued-completion-release-1".to_owned(),
+            turn_id: "v5-turn-22".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "first provider turn".to_owned(),
+            },
         },
     )
     .await;
@@ -7413,10 +7535,13 @@ async fn websocket_provider_slot_prefers_queued_completion_before_same_socket_ov
 
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "second provider turn".to_owned(),
-            client_generation_id: Some("bac519-queued-completion-release-2".to_owned()),
+            client_generation_id: "bac519-queued-completion-release-2".to_owned(),
+            turn_id: "v5-turn-23".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "second provider turn".to_owned(),
+            },
         },
     )
     .await;
@@ -7466,7 +7591,7 @@ async fn websocket_provider_drains_queued_usage_before_next_admission() {
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -7474,10 +7599,13 @@ async fn websocket_provider_drains_queued_usage_before_next_admission() {
         .unwrap();
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "first provider turn".to_owned(),
-            client_generation_id: Some("bac519-queued-usage-release-1".to_owned()),
+            client_generation_id: "bac519-queued-usage-release-1".to_owned(),
+            turn_id: "v5-turn-24".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "first provider turn".to_owned(),
+            },
         },
     )
     .await;
@@ -7500,10 +7628,13 @@ async fn websocket_provider_drains_queued_usage_before_next_admission() {
     usage_gate.notify_waiters();
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "second provider turn".to_owned(),
-            client_generation_id: Some("bac519-queued-usage-release-2".to_owned()),
+            client_generation_id: "bac519-queued-usage-release-2".to_owned(),
+            turn_id: "v5-turn-25".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "second provider turn".to_owned(),
+            },
         },
     )
     .await;
@@ -7550,24 +7681,18 @@ async fn websocket_audio_continuation_requires_second_lease_when_limiter_enabled
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-8", &[1_u8, 2]).await;
     wait_until(Duration::from_secs(2), || {
         audio_inputs.lock().unwrap().len() == 1
     })
     .await;
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-9", &[3_u8, 4]).await;
 
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -7621,24 +7746,18 @@ async fn websocket_audio_continuations_keep_turn_cap_with_limits(voice_limits: V
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-10", &[1_u8, 2]).await;
     wait_until(Duration::from_secs(2), || {
         audio_inputs.lock().unwrap().len() == 1
     })
     .await;
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-11", &[3_u8, 4]).await;
     wait_until(Duration::from_secs(2), || {
         audio_inputs.lock().unwrap().len() == 2
     })
@@ -7696,25 +7815,31 @@ async fn websocket_turn_cap_stays_armed_for_newer_submission_after_one_resolutio
     assert_ready_provider(&mut socket, "first_answer_only_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "first pending answer".to_owned(),
-            client_generation_id: Some("turn-cap-newer-submission-1".to_owned()),
+            client_generation_id: "turn-cap-newer-submission-1".to_owned(),
+            turn_id: "v5-turn-26".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "first pending answer".to_owned(),
+            },
         },
     )
     .await;
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "second pending answer".to_owned(),
-            client_generation_id: Some("turn-cap-newer-submission-2".to_owned()),
+            client_generation_id: "turn-cap-newer-submission-2".to_owned(),
+            turn_id: "v5-turn-27".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "second pending answer".to_owned(),
+            },
         },
     )
     .await;
@@ -7791,25 +7916,31 @@ async fn websocket_turn_cap_dedupes_duplicate_response_resolution_ids() {
     assert_ready_provider(&mut socket, "duplicate_resolution_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "first duplicate-resolution answer".to_owned(),
-            client_generation_id: Some("turn-cap-duplicate-resolution-1".to_owned()),
+            client_generation_id: "turn-cap-duplicate-resolution-1".to_owned(),
+            turn_id: "v5-turn-28".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "first duplicate-resolution answer".to_owned(),
+            },
         },
     )
     .await;
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "second duplicate-resolution answer".to_owned(),
-            client_generation_id: Some("turn-cap-duplicate-resolution-2".to_owned()),
+            client_generation_id: "turn-cap-duplicate-resolution-2".to_owned(),
+            turn_id: "v5-turn-29".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "second duplicate-resolution answer".to_owned(),
+            },
         },
     )
     .await;
@@ -7858,14 +7989,11 @@ async fn websocket_turn_cap_ignores_response_less_phase_after_new_submission() {
     assert_ready_provider(&mut socket, "response_then_phase_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-12", &[1_u8, 2]).await;
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -7888,10 +8016,7 @@ async fn websocket_turn_cap_ignores_response_less_phase_after_new_submission() {
     .await
     .expect("first answer resolution should arrive before the second submission");
 
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-13", &[3_u8, 4]).await;
 
     let terminal = tokio::time::timeout(Duration::from_millis(100), async {
         loop {
@@ -7939,14 +8064,11 @@ async fn websocket_turn_cap_ignores_suppressed_stale_resolution_after_new_submis
     assert_ready_provider(&mut socket, "cancelled_then_stale_resolution_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-14", &[1_u8, 2]).await;
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -7968,10 +8090,7 @@ async fn websocket_turn_cap_ignores_suppressed_stale_resolution_after_new_submis
     .await
     .expect("first answer cancellation should arrive before the second submission");
 
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-15", &[3_u8, 4]).await;
 
     let terminal = tokio::time::timeout(Duration::from_millis(100), async {
         loop {
@@ -8020,7 +8139,7 @@ async fn websocket_turn_cap_is_not_postponed_by_provider_events() {
     assert_ready_provider(&mut socket, "chatty_phase_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -8079,19 +8198,13 @@ async fn websocket_extra_audio_frame_without_second_lease_closes_slow_client() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-16", &[1_u8, 2]).await;
     tokio::time::sleep(Duration::from_millis(30)).await;
-    socket
-        .send(WsMessage::Binary(vec![3_u8, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-17", &[3_u8, 4]).await;
 
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -8142,14 +8255,11 @@ async fn websocket_turn_cap_includes_backpressured_answer_send() {
     assert_ready_provider(&mut socket, "backpressured_input_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-18", &[1_u8, 2]).await;
 
     assert_terminal_session_phase(
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -8196,14 +8306,11 @@ async fn websocket_turn_cap_aborts_provider_before_stop_can_write_late_answer() 
     assert_ready_provider(&mut socket, "stop_writes_answer_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2, 3, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-19", &[1_u8, 2, 3, 4]).await;
 
     assert_terminal_session_phase(
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -8251,7 +8358,7 @@ async fn websocket_turn_cap_is_not_postponed_by_client_keepalives() {
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -8312,7 +8419,7 @@ async fn websocket_drain_interrupts_active_provider_response() {
     assert_ready_provider(&mut socket, "chatty_phase_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -8390,7 +8497,7 @@ async fn websocket_default_trusted_mode_rotates_internal_session_for_reconnect()
         assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
         socket
             .send(WsMessage::Text(
-                format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+                format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
             ))
             .await
             .unwrap();
@@ -8407,8 +8514,8 @@ async fn websocket_default_trusted_mode_rotates_internal_session_for_reconnect()
                     saw_question = true;
                     break;
                 }
-                ServerFrame::Error { message, .. } => {
-                    panic!("unexpected websocket error: {message}")
+                ServerFrame::Error { error, .. } => {
+                    panic!("unexpected websocket error: {}", error.message)
                 }
                 _ => {}
             }
@@ -8440,7 +8547,7 @@ async fn websocket_disconnect_aborts_provider_tasks_and_releases_capacity() {
     assert_ready_provider(&mut socket, "abort_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -8479,7 +8586,7 @@ async fn websocket_drain_aborts_provider_tasks_and_releases_capacity() {
     assert_ready_provider(&mut socket, "abort_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -8528,19 +8635,13 @@ async fn websocket_drain_interrupts_backpressured_provider_input() {
     assert_ready_provider(&mut socket, "backpressured_input_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2, 3, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-20", &[1_u8, 2, 3, 4]).await;
     wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AnswerReceived).await;
-    socket
-        .send(WsMessage::Binary(vec![5_u8, 6, 7, 8].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-21", &[5_u8, 6, 7, 8]).await;
     tokio::time::sleep(Duration::from_millis(25)).await;
 
     drain.begin_drain();
@@ -8579,14 +8680,11 @@ async fn websocket_disconnect_releases_backpressured_provider_input() {
     assert_ready_provider(&mut socket, "backpressured_input_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(vec![1_u8, 2, 3, 4].into()))
-        .await
-        .unwrap();
+    send_v5_audio_turn(&mut socket, "audio-turn-22", &[1_u8, 2, 3, 4]).await;
     wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::AnswerReceived).await;
     drop(socket);
 
@@ -8626,6 +8724,8 @@ async fn websocket_hydrates_active_concepts_from_server_context_before_brain_ope
             serde_json::json!({
                 "type": "session_config",
                 "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "session_token": VOICE_TEST_PLACEHOLDER_CREDENTIAL,
                 "session": session,
             })
             .to_string()
@@ -8675,7 +8775,7 @@ async fn websocket_suppresses_stale_events_after_cancelled_response() {
     assert_ready_provider(&mut socket, "stale_event_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -8730,7 +8830,7 @@ async fn websocket_global_cancellation_suppresses_active_response_events() {
     assert_ready_provider(&mut socket, "global_cancel_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -8811,18 +8911,21 @@ async fn websocket_rejects_forged_provider_source_tuples_without_leaks_or_writes
         confidence_score: 0.84,
     };
     let unpersisted_recap = agent_domain::StudySessionRecap {
+        schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+        deferred_turns: 0,
         voice_session_id: "voice-session-1".to_owned(),
         headline: "Unpersisted recap should not leak".to_owned(),
         summary: "Unpersisted recap summary should not leak".to_owned(),
-        strong_concepts: vec!["nadh".to_owned()],
-        shaky_concepts: vec![],
-        missed_concepts: vec![],
-        review_later: vec![],
-        next_action: "Stop".to_owned(),
-        source_moments: vec![agent_domain::RecapSourceMoment {
-            text: "Unpersisted recap source should not leak".to_owned(),
-            source: fixture_question.source.clone(),
+        concepts: vec![agent_domain::RecapConceptOutcome {
+            concept_id: "nadh".to_owned(),
+            label: "nadh".to_owned(),
             status: agent_domain::ConceptStatus::Strong,
+        }],
+        review_schedule: vec![],
+        next_action: "Stop".to_owned(),
+        source_moments: vec![agent_domain::learning_recap::RecapSourceMoment {
+            response_id: "response-recap".to_owned(),
+            source_id: fixture_question.source.clone().source_id.clone(),
         }],
     };
     let cases = vec![
@@ -8911,18 +9014,22 @@ async fn websocket_rejects_forged_provider_source_tuples_without_leaks_or_writes
             BrainEvent::RecapReady {
                 response_id: "forged-response".to_owned(),
                 recap: agent_domain::StudySessionRecap {
+                    schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA
+                        .to_owned(),
+                    deferred_turns: 0,
                     voice_session_id: "voice-session-1".to_owned(),
                     headline: "Forged recap".to_owned(),
                     summary: "Forged recap".to_owned(),
-                    strong_concepts: vec!["nadh".to_owned()],
-                    shaky_concepts: vec![],
-                    missed_concepts: vec![],
-                    review_later: vec![],
-                    next_action: "Stop".to_owned(),
-                    source_moments: vec![agent_domain::RecapSourceMoment {
-                        text: "Forged recap source".to_owned(),
-                        source: forged_source,
+                    concepts: vec![agent_domain::RecapConceptOutcome {
+                        concept_id: "nadh".to_owned(),
+                        label: "nadh".to_owned(),
                         status: agent_domain::ConceptStatus::Strong,
+                    }],
+                    review_schedule: vec![],
+                    next_action: "Stop".to_owned(),
+                    source_moments: vec![agent_domain::learning_recap::RecapSourceMoment {
+                        response_id: "response-recap".to_owned(),
+                        source_id: forged_source.source_id.clone(),
                     }],
                 },
             },
@@ -8967,7 +9074,7 @@ async fn websocket_rejects_forged_provider_source_tuples_without_leaks_or_writes
         assert_ready_provider(&mut socket, "event_probe").await;
         socket
             .send(WsMessage::Text(
-                format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+                format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
             ))
             .await
             .unwrap();
@@ -8976,7 +9083,7 @@ async fn websocket_rejects_forged_provider_source_tuples_without_leaks_or_writes
         let payload = serde_json::to_string(&frames).unwrap();
         assert!(frames.iter().any(|frame| matches!(
             frame,
-            ServerFrame::Error { message, .. } if message == "provider source authority rejected"
+            ServerFrame::Error { error, .. } if error.message == "provider source authority rejected"
         )));
         assert!(!payload.contains(forged_excerpt));
         assert!(!payload.contains("wrong-doc"));
@@ -9028,7 +9135,7 @@ async fn websocket_rejects_authorized_payload_replayed_under_wrong_response_id()
     assert_ready_provider(&mut socket, "response_replay_probe").await;
     socket
         .send(WsMessage::Text(
-            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#).into(),
+            format!(r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#).into(),
         ))
         .await
         .unwrap();
@@ -9036,7 +9143,7 @@ async fn websocket_rejects_authorized_payload_replayed_under_wrong_response_id()
     let frames = read_server_frames_until_close(&mut socket).await;
     assert!(frames.iter().any(|frame| matches!(
         frame,
-        ServerFrame::Error { message, .. } if message == "provider source authority rejected"
+        ServerFrame::Error { error, .. } if error.message == "provider source authority rejected"
     )));
     assert!(frames.iter().all(|frame| !matches!(
         frame,
@@ -9107,7 +9214,7 @@ async fn open_streamed_audio_session(state: AppState) -> Option<TestWebSocket> {
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -9206,7 +9313,7 @@ async fn assert_streamed_audio_turn_admits_one_provider_turn(seconds: u32) {
         .unwrap();
 
     assert_eq!(
-        read_server_frame(&mut socket).await,
+        read_server_frame_exact(&mut socket).await,
         ServerFrame::AudioTurnAccepted {
             version: VIVA_VOICE_PROTOCOL_VERSION,
             client_generation_id: STREAMED_AUDIO_GENERATION.to_owned(),
@@ -9264,6 +9371,7 @@ async fn streamed_audio_turns_complete_a_forty_five_second_turn() {
 
 async fn assert_streamed_audio_protocol_error(
     client_frames: Vec<String>,
+    expected_code: VoiceServerErrorCode,
     expected_message: &str,
     expected_close: CloseCode,
 ) {
@@ -9281,7 +9389,7 @@ async fn assert_streamed_audio_protocol_error(
     );
     assert_eq!(
         serde_json::from_str::<ServerFrame>(&raw).unwrap(),
-        ServerFrame::error(expected_message)
+        ServerFrame::error(expected_code, expected_message)
     );
     assert_close_code(&mut socket, expected_close).await;
 }
@@ -9345,8 +9453,13 @@ async fn streamed_audio_turns_reject_invalid_sequences_and_identities() {
 
     for (label, frames) in cases {
         println!("streamed audio negative case: {label}");
-        assert_streamed_audio_protocol_error(frames, "invalid audio frame", CloseCode::Protocol)
-            .await;
+        assert_streamed_audio_protocol_error(
+            frames,
+            VoiceServerErrorCode::ClientFrameMalformed,
+            "invalid audio frame",
+            CloseCode::Protocol,
+        )
+        .await;
     }
 }
 
@@ -9358,6 +9471,7 @@ async fn streamed_audio_turns_reject_an_oversized_chunk() {
             0,
             STREAMED_AUDIO_MAX_CHUNK_BYTES + 2,
         )],
+        VoiceServerErrorCode::ClientFrameTooLarge,
         "audio chunk exceeds maximum size",
         CloseCode::Size,
     )
@@ -9378,6 +9492,7 @@ async fn streamed_audio_turns_reject_an_over_limit_tail() {
 
     assert_streamed_audio_protocol_error(
         frames,
+        VoiceServerErrorCode::ClientTurnTooLarge,
         "audio turn exceeds maximum size",
         CloseCode::Size,
     )
@@ -9414,7 +9529,7 @@ async fn streamed_audio_turns_cancel_halfway_creates_no_provider_work() {
         .await
         .unwrap();
     assert_eq!(
-        read_server_frame(&mut socket).await,
+        read_server_frame_exact(&mut socket).await,
         ServerFrame::AudioTurnAccepted {
             version: VIVA_VOICE_PROTOCOL_VERSION,
             client_generation_id: STREAMED_AUDIO_GENERATION.to_owned(),
@@ -9482,6 +9597,16 @@ struct FullSessionFixture {
     server: Vec<ServerFrame>,
 }
 
+/// `VOICE-AUTH-001`: protocol v5 makes the client generation and the signed
+/// credential required members of `session_config`, so every test socket names
+/// this one generation. The value is a fixed test literal, never a credential.
+const VOICE_TEST_CLIENT_GENERATION: &str = "voice-test-generation-1";
+
+/// A placeholder in the signed-credential position for the sockets whose access
+/// mode is trusted loopback: those tests assert runtime behaviour, not token
+/// verification, and the server never reads this value on that path.
+const VOICE_TEST_PLACEHOLDER_CREDENTIAL: &str = "placeholder-session-material";
+
 type TestWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn spawn_server(state: AppState) -> Option<String> {
@@ -9504,6 +9629,46 @@ async fn spawn_server(state: AppState) -> Option<String> {
     Some(format!("ws://{addr}/ws"))
 }
 
+/// Protocol v5 removed the raw binary client surface, so an answer that used to be
+/// one WebSocket binary frame is now exactly one bounded audio turn: a single
+/// `audio_chunk` plus its explicit `audio_end`.
+async fn send_v5_audio_turn(socket: &mut TestWebSocket, turn_id: &str, pcm16: &[u8]) {
+    let pcm16 = if pcm16.len() < 2 || !pcm16.len().is_multiple_of(2) {
+        vec![1_u8, 2]
+    } else {
+        pcm16.to_vec()
+    };
+    socket
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "audio_chunk",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "turn_id": turn_id,
+                "sequence": 0,
+                "frame": { "pcm16_base64": STANDARD.encode(&pcm16) },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "audio_end",
+                "version": VIVA_VOICE_PROTOCOL_VERSION,
+                "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
+                "turn_id": turn_id,
+                "final_sequence": 0,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+}
+
 async fn send_client_frame(socket: &mut TestWebSocket, frame: &ClientFrame) {
     socket
         .send(WsMessage::Text(
@@ -9521,6 +9686,7 @@ fn session_config_json_with_token(token: &str) -> String {
     serde_json::json!({
         "type": "session_config",
         "version": VIVA_VOICE_PROTOCOL_VERSION,
+        "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
         "session": session,
         "session_token": token,
     })
@@ -9541,6 +9707,7 @@ fn session_config_json_with_ids_and_token(
     serde_json::json!({
         "type": "session_config",
         "version": VIVA_VOICE_PROTOCOL_VERSION,
+        "client_generation_id": VOICE_TEST_CLIENT_GENERATION,
         "session": session,
         "session_token": token,
     })
@@ -9666,7 +9833,8 @@ fn unix_timestamp_now() -> u64 {
         .as_secs()
 }
 
-async fn read_server_frame(socket: &mut TestWebSocket) -> ServerFrame {
+/// The next server frame, exactly as sent, with no filtering.
+async fn read_server_frame_exact(socket: &mut TestWebSocket) -> ServerFrame {
     match tokio::time::timeout(Duration::from_secs(2), socket.next())
         .await
         .unwrap()
@@ -9675,6 +9843,20 @@ async fn read_server_frame(socket: &mut TestWebSocket) -> ServerFrame {
     {
         WsMessage::Text(text) => serde_json::from_str(&text).unwrap(),
         other => panic!("expected text server frame, got {other:?}"),
+    }
+}
+
+/// The next server frame a browser would act on. Protocol v5 acknowledges every
+/// admitted audio turn with `audio_turn_accepted`; that acknowledgment is turn
+/// bookkeeping rather than session progress, so tests asserting a sequence of
+/// session frames read past it. Tests that assert the acknowledgment itself use
+/// [`read_server_frame_exact`].
+async fn read_server_frame(socket: &mut TestWebSocket) -> ServerFrame {
+    loop {
+        let frame = read_server_frame_exact(socket).await;
+        if !matches!(frame, ServerFrame::AudioTurnAccepted { .. }) {
+            return frame;
+        }
     }
 }
 
@@ -9954,7 +10136,7 @@ async fn run_partial_recap_provider_failure_probe_with_extended_options(
     socket
         .send(WsMessage::Text(
             format!(
-                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"session":{session}}}"#
+                r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{session}}}"#
             )
             .into(),
         ))
@@ -9976,10 +10158,13 @@ async fn run_partial_recap_provider_failure_probe_with_extended_options(
     }
     send_client_frame(
         &mut socket,
-        &ClientFrame::Text {
+        &ClientFrame::TurnIntent {
             version: VIVA_VOICE_PROTOCOL_VERSION,
-            text: "raw learner answer should not be persisted or recapped".to_owned(),
-            client_generation_id: Some("bac522-partial-recap".to_owned()),
+            client_generation_id: "bac522-partial-recap".to_owned(),
+            turn_id: "v5-turn-30".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "raw learner answer should not be persisted or recapped".to_owned(),
+            },
         },
     )
     .await;
@@ -9992,6 +10177,7 @@ async fn run_partial_recap_provider_failure_probe_with_extended_options(
             &mut socket,
             &ClientFrame::Stop {
                 version: VIVA_VOICE_PROTOCOL_VERSION,
+                client_generation_id: "v5-stop".to_owned(),
             },
         )
         .await;
@@ -10014,7 +10200,7 @@ impl RealtimeBrain for CapabilityProbeBrain {
         &self,
         _config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        Err(BrainError::MissingApiKey)
+        Err(missing_api_key_error())
     }
 }
 
@@ -10035,7 +10221,7 @@ impl RealtimeBrain for OpenAuthFailureBrain {
         &self,
         _config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        Err(BrainError::MissingApiKey)
+        Err(missing_api_key_error())
     }
 }
 
@@ -10056,9 +10242,17 @@ impl RealtimeBrain for OpenProtocolStoreFailureBrain {
         &self,
         _config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        Err(BrainError::Protocol(
-            "postgres durable store read failed".to_owned(),
-        ))
+        Err(BrainError::from_failure(BrainProviderFailure::new(
+            BrainProviderFailureParts {
+                failure_class: BrainFailureClass::DurabilityDegraded,
+                stage: BrainFailureStage::Store,
+                retry_eligible: false,
+                latency_ms: 0,
+                provider: "open_protocol_store_failure".to_owned(),
+                model: String::new(),
+                metadata: "error_kind=durable_store_read_failed".to_owned(),
+            },
+        )))
     }
 }
 
@@ -10082,18 +10276,17 @@ impl RealtimeBrain for OpenRateLimitFailureBrain {
         _config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
         self.opens.fetch_add(1, Ordering::SeqCst);
-        Err(BrainError::StageFailure(Box::new(
+        Err(BrainError::from_failure(
             BrainProviderFailure::new(BrainProviderFailureParts {
-                failure_class: "quota_rate_failure".to_owned(),
-                stage: "gemini".to_owned(),
-                terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                failure_class: BrainFailureClass::QuotaRateFailure,
+                stage: BrainFailureStage::Gemini,
                 retry_eligible: true,
                 latency_ms: 17,
                 provider: "gemini".to_owned(),
                 model: "gemini-3.5-flash".to_owned(),
                 metadata: "http_status=429 retry_after_ms=250 retry_after_source=retry_after_delta reset_hint=2030-01-01T00:00:00Z body_status=resource_exhausted budget_state=within_limit deploy_sha=test-sha".to_owned(),
             }),
-        )))
+        ))
     }
 }
 
@@ -10188,24 +10381,25 @@ impl RealtimeBrain for StopWritesAnswerProbeBrain {
     }
 
     async fn open(&self, config: SessionConfig) -> Result<RealtimeSession, BrainError> {
-        self.study_store
+        let _outcome = self
+            .study_store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let user_id = config
             .user_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_user_id"))?
             .to_owned();
         let study_set_id = config
             .study_set_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_study_set_id"))?
             .to_owned();
         let voice_session_id = config
             .session_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_session_id"))?
             .to_owned();
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
@@ -10355,12 +10549,19 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         claim: SessionTokenNonceClaim,
     ) -> Result<(), PortError> {
         if self.failure == DurableStoreFailureMode::NonceClaim {
-            return Err(PortError::adapter("postgres", "durable store write failed"));
+            return Err(PortError::durability(
+                "postgres",
+                "durable-write",
+                "durable store write failed",
+            ));
         }
         self.inner.claim_session_token_nonce(claim).await
     }
 
-    async fn record_voice_session(&self, config: &SessionConfig) -> Result<(), PortError> {
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<agent_domain::StudyStoreWriteOutcome, PortError> {
         self.inner.record_voice_session(config).await
     }
 
@@ -10370,7 +10571,11 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         terminal_reason: &str,
     ) -> Result<serde_json::Value, PortError> {
         if self.failure == DurableStoreFailureMode::SessionClose {
-            return Err(PortError::adapter("postgres", "durable store write failed"));
+            return Err(PortError::durability(
+                "postgres",
+                "durable-write",
+                "durable store write failed",
+            ));
         }
         if self.failure == DurableStoreFailureMode::SessionCloseMissing {
             return Err(PortError::unavailable(
@@ -10390,7 +10595,11 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         study_set_id: &str,
     ) -> Result<Option<serde_json::Value>, PortError> {
         if self.failure == DurableStoreFailureMode::StudyContext {
-            return Err(PortError::adapter("postgres", "durable store read failed"));
+            return Err(PortError::durability(
+                "postgres",
+                "durable-read",
+                "durable store read failed",
+            ));
         }
         self.inner.study_context(user_id, study_set_id).await
     }
@@ -10401,7 +10610,11 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
         study_set_id: &str,
     ) -> Result<Option<StudyQuestion>, PortError> {
         if self.failure == DurableStoreFailureMode::ActiveQuestion {
-            return Err(PortError::adapter("postgres", "durable store read failed"));
+            return Err(PortError::durability(
+                "postgres",
+                "durable-read",
+                "durable store read failed",
+            ));
         }
         self.inner.active_question(user_id, study_set_id).await
     }
@@ -10422,16 +10635,19 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
                 .await;
         }
         match self.failure {
-            DurableStoreFailureMode::QuestionAuthorizationSemanticMiss => Err(PortError::adapter(
-                "postgres",
-                format!(
-                    "question tuple does not match deterministic retrieval for {}",
-                    question.question_id
-                ),
-            )),
-            DurableStoreFailureMode::QuestionAuthorizationWriteFailure => {
-                Err(PortError::adapter("postgres", "durable store read failed"))
+            DurableStoreFailureMode::QuestionAuthorizationSemanticMiss => {
+                Err(PortError::invalid_input(
+                    "postgres",
+                    question.question_id.clone(),
+                    format!(
+                        "question tuple does not match deterministic retrieval for {}",
+                        question.question_id
+                    ),
+                ))
             }
+            DurableStoreFailureMode::QuestionAuthorizationWriteFailure => Err(
+                PortError::durability("postgres", "durable-read", "durable store read failed"),
+            ),
             DurableStoreFailureMode::ActiveQuestion
             | DurableStoreFailureMode::NoFailure
             | DurableStoreFailureMode::NonceClaim
@@ -10551,12 +10767,19 @@ impl StudyMemoryStore for DurableStoreDegradingStore {
             .await
     }
 
-    async fn record_voice_usage(&self, event: VoiceUsageRecord) -> Result<(), PortError> {
+    async fn record_voice_usage(
+        &self,
+        event: VoiceUsageRecord,
+    ) -> Result<agent_domain::StudyStoreWriteOutcome, PortError> {
         if self.failure != DurableStoreFailureMode::UsageRecording {
             return self.inner.record_voice_usage(event).await;
         }
         drop(event);
-        Err(PortError::adapter("postgres", "durable store write failed"))
+        Err(PortError::durability(
+            "postgres",
+            "durable-write",
+            "durable store write failed",
+        ))
     }
 }
 
@@ -10583,24 +10806,25 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
     }
 
     async fn open(&self, config: SessionConfig) -> Result<RealtimeSession, BrainError> {
-        self.study_store
+        let _outcome = self
+            .study_store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let user_id = config
             .user_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_user_id"))?
             .to_owned();
         let study_set_id = config
             .study_set_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_study_set_id"))?
             .to_owned();
         let voice_session_id = config
             .session_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_session_id"))?
             .to_owned();
         let study_store = self.study_store.clone();
         let terminal_reason = self.terminal_reason;
@@ -10724,13 +10948,18 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                 }
                 if recap_before_failure {
                     let recap = StudySessionRecap {
+                        schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA
+                            .to_owned(),
+                        deferred_turns: 0,
                         voice_session_id: voice_session_id.clone(),
                         headline: "Full recap".to_owned(),
                         summary: "Durable model recap already exists.".to_owned(),
-                        strong_concepts: vec!["NADH".to_owned()],
-                        shaky_concepts: vec![],
-                        missed_concepts: vec![],
-                        review_later: vec!["ATP synthase".to_owned()],
+                        concepts: vec![agent_domain::RecapConceptOutcome {
+                            concept_id: "NADH".to_owned(),
+                            label: "NADH".to_owned(),
+                            status: agent_domain::ConceptStatus::Strong,
+                        }],
+                        review_schedule: vec![],
                         next_action: "Continue".to_owned(),
                         source_moments: vec![],
                     };
@@ -10758,18 +10987,27 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                         })
                         .await;
                 }
+                // The class is the single authority for the terminal reason, so the
+                // scenario picks a class rather than asserting a reason beside it.
                 let failure_class = match terminal_reason {
-                    TerminalSessionReason::ProviderRateLimited => "quota_rate_failure",
-                    TerminalSessionReason::ProviderTimeout => "provider_timeout",
-                    TerminalSessionReason::ProviderAuthFailed => "provider_auth_failed",
-                    TerminalSessionReason::ProviderMalformedStream => "malformed_stream",
-                    TerminalSessionReason::ProviderNetworkDisconnect => "network_disconnect",
-                    _ => "provider_failure",
+                    TerminalSessionReason::ProviderRateLimited => {
+                        BrainFailureClass::QuotaRateFailure
+                    }
+                    TerminalSessionReason::ProviderTimeout => BrainFailureClass::Timeout,
+                    TerminalSessionReason::ProviderAuthFailed => {
+                        BrainFailureClass::ProviderAuthFailure
+                    }
+                    TerminalSessionReason::ProviderMalformedStream => {
+                        BrainFailureClass::MalformedStream
+                    }
+                    TerminalSessionReason::ProviderNetworkDisconnect => {
+                        BrainFailureClass::NetworkDisconnect
+                    }
+                    other => panic!("unmapped provider terminal reason {}", other.as_str()),
                 };
                 let failure = BrainProviderFailure::new(BrainProviderFailureParts {
-                    failure_class: failure_class.to_owned(),
-                    stage: "gemini".to_owned(),
-                    terminal_reason,
+                    failure_class,
+                    stage: BrainFailureStage::Gemini,
                     retry_eligible: true,
                     latency_ms: 29,
                     provider: "gemini".to_owned(),
@@ -10777,9 +11015,7 @@ impl RealtimeBrain for PartialRecapProviderFailureProbeBrain {
                     metadata: "http_status=429 retry_after_ms=250 deploy_sha=test-sha".to_owned(),
                 });
                 let _ = event_tx
-                    .send(BrainEvent::Error(BrainProviderError::from_stage_failure(
-                        failure,
-                    )))
+                    .send(BrainEvent::Error(BrainProviderError::from_failure(failure)))
                     .await;
                 break;
             }
@@ -10823,9 +11059,8 @@ impl RealtimeBrain for StructuredRateLimitProbeBrain {
                 ) {
                     text_inputs.fetch_add(1, Ordering::SeqCst);
                     let failure = BrainProviderFailure::new(BrainProviderFailureParts {
-                        failure_class: "quota_rate_failure".to_owned(),
-                        stage: "gemini".to_owned(),
-                        terminal_reason: TerminalSessionReason::ProviderRateLimited,
+                        failure_class: BrainFailureClass::QuotaRateFailure,
+                        stage: BrainFailureStage::Gemini,
                         retry_eligible: true,
                         latency_ms: 17,
                         provider: "gemini".to_owned(),
@@ -10833,9 +11068,7 @@ impl RealtimeBrain for StructuredRateLimitProbeBrain {
                         metadata: "http_status=429 retry_after_ms=250 retry_after_source=retry_after_delta reset_hint=2030-01-01T00:00:00Z body_status=resource_exhausted budget_state=within_limit deploy_sha=test-sha".to_owned(),
                     });
                     let _ = event_tx
-                        .send(BrainEvent::Error(BrainProviderError::from_stage_failure(
-                            failure,
-                        )))
+                        .send(BrainEvent::Error(BrainProviderError::from_failure(failure)))
                         .await;
                     break;
                 }
@@ -10879,9 +11112,16 @@ impl RealtimeBrain for UnstructuredRateLimitProbeBrain {
                 ) {
                     text_inputs.fetch_add(1, Ordering::SeqCst);
                     let _ = event_tx
-                        .send(BrainEvent::Error(BrainProviderError::new(
-                            "cartesia_gemini",
-                            "provider 429 quota rate limit",
+                        .send(BrainEvent::Error(BrainProviderError::from_failure(
+                            BrainProviderFailure::new(BrainProviderFailureParts {
+                                failure_class: BrainFailureClass::QuotaRateFailure,
+                                stage: BrainFailureStage::Gemini,
+                                retry_eligible: true,
+                                latency_ms: 0,
+                                provider: "cartesia_gemini".to_owned(),
+                                model: "gemini-3.5-flash".to_owned(),
+                                metadata: "http_status=429".to_owned(),
+                            }),
                         )))
                         .await;
                     break;
@@ -11163,10 +11403,11 @@ impl RealtimeBrain for GlobalCancellationProbeBrain {
         &self,
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        self.store
+        let _outcome = self
+            .store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let (input, _input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
         let task = tokio::spawn(async move {
@@ -11183,18 +11424,21 @@ impl RealtimeBrain for GlobalCancellationProbeBrain {
                 confidence_score: 0.84,
             };
             let recap = StudySessionRecap {
+                schema: agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+                deferred_turns: 0,
                 voice_session_id: "voice-session-1".to_owned(),
                 headline: "Stale recap".to_owned(),
                 summary: "Stale recap summary".to_owned(),
-                strong_concepts: vec!["NADH".to_owned()],
-                shaky_concepts: vec![],
-                missed_concepts: vec![],
-                review_later: vec![],
-                next_action: "Do not surface stale recap.".to_owned(),
-                source_moments: vec![RecapSourceMoment {
-                    text: "Stale recap source".to_owned(),
-                    source: source.clone(),
+                concepts: vec![agent_domain::RecapConceptOutcome {
+                    concept_id: "NADH".to_owned(),
+                    label: "NADH".to_owned(),
                     status: agent_domain::ConceptStatus::Strong,
+                }],
+                review_schedule: vec![],
+                next_action: "Do not surface stale recap.".to_owned(),
+                source_moments: vec![agent_domain::learning_recap::RecapSourceMoment {
+                    response_id: "response-recap".to_owned(),
+                    source_id: source.clone().source_id.clone(),
                 }],
             };
             let _ = event_tx
@@ -11266,22 +11510,23 @@ impl RealtimeBrain for ResponseReplayProbeBrain {
         &self,
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        self.study_store
+        let _outcome = self
+            .study_store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let user_id = config
             .user_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?;
+            .ok_or_else(|| session_config_error("missing_user_id"))?;
         let study_set_id = config
             .study_set_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?;
+            .ok_or_else(|| session_config_error("missing_study_set_id"))?;
         let voice_session_id = config
             .session_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?;
+            .ok_or_else(|| session_config_error("missing_session_id"))?;
         let question = agent_domain::fixture_question();
         let evaluation = agent_domain::AnswerEvaluation {
             question_id: question.question_id.clone(),
@@ -11302,7 +11547,7 @@ impl RealtimeBrain for ResponseReplayProbeBrain {
                 evaluation.clone(),
             )
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
 
         let (input, _input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
@@ -11339,10 +11584,10 @@ impl RealtimeBrain for EventProbeBrain {
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
         if let Some(store) = &self.study_store {
-            store
+            let _outcome = store
                 .record_voice_session(&config)
                 .await
-                .map_err(|error| BrainError::Connection(error.to_string()))?;
+                .map_err(|error| store_stage_error(error.kind().as_str()))?;
         }
         let (input, _input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
@@ -11377,10 +11622,10 @@ impl RealtimeBrain for IdleProbeBrain {
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
         if let Some(store) = &self.study_store {
-            store
+            let _outcome = store
                 .record_voice_session(&config)
                 .await
-                .map_err(|error| BrainError::Connection(error.to_string()))?;
+                .map_err(|error| store_stage_error(error.kind().as_str()))?;
         }
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
@@ -11471,24 +11716,25 @@ impl RealtimeBrain for FirstAnswerOnlyProbeBrain {
         &self,
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        self.study_store
+        let _outcome = self
+            .study_store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let user_id = config
             .user_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_user_id"))?
             .to_owned();
         let study_set_id = config
             .study_set_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_study_set_id"))?
             .to_owned();
         let voice_session_id = config
             .session_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_session_id"))?
             .to_owned();
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
@@ -11569,24 +11815,25 @@ impl RealtimeBrain for GatedCompletionProviderProbeBrain {
         &self,
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        self.study_store
+        let _outcome = self
+            .study_store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let user_id = config
             .user_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_user_id"))?
             .to_owned();
         let study_set_id = config
             .study_set_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_study_set_id"))?
             .to_owned();
         let voice_session_id = config
             .session_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_session_id"))?
             .to_owned();
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);
@@ -11669,24 +11916,25 @@ impl RealtimeBrain for AnswerEvaluatedProviderProbeBrain {
         &self,
         config: agent_domain::SessionConfig,
     ) -> Result<RealtimeSession, BrainError> {
-        self.study_store
+        let _outcome = self
+            .study_store
             .record_voice_session(&config)
             .await
-            .map_err(|error| BrainError::Connection(error.to_string()))?;
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
         let user_id = config
             .user_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing user_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_user_id"))?
             .to_owned();
         let study_set_id = config
             .study_set_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing study_set_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_study_set_id"))?
             .to_owned();
         let voice_session_id = config
             .session_id
             .as_deref()
-            .ok_or_else(|| BrainError::Connection("missing session_id".to_owned()))?
+            .ok_or_else(|| session_config_error("missing_session_id"))?
             .to_owned();
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
         let (event_tx, events) = mpsc::channel(8);

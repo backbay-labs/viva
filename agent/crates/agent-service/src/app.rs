@@ -8,10 +8,10 @@ use std::{
 };
 
 use agent_domain::{
-    BrainProviderFailure, BrainUsage, CreateFileStudySet, CreatePasteStudySet,
+    BrainFailureStage, BrainProviderFailure, BrainUsage, CreateFileStudySet, CreatePasteStudySet,
     LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, PortError,
-    RealtimeBrain, StudyMemoryStore, StudySetIngestionRecord, StudySetIngestionStatus,
-    TerminalSessionReason, VoiceUsageRecord,
+    PortErrorKind, RealtimeBrain, StudyMemoryStore, StudySetIngestionRecord,
+    StudySetIngestionStatus, TerminalSessionReason, VoiceUsageRecord,
 };
 use axum::{
     extract::{Path, Query},
@@ -477,46 +477,19 @@ impl VoiceLimitState {
         if !limits.provider_limiter_enabled || !provider_failure_backoff_eligible(failure) {
             return;
         }
-        let retry_after_ms = metadata_u64(&failure.metadata, "retry_after_ms")
+        let retry_after_ms = metadata_u64(failure.metadata(), "retry_after_ms")
             .unwrap_or(limits.provider_backoff_default_ms)
             .min(limits.provider_backoff_max_ms);
         let reset_hint =
-            metadata_value(&failure.metadata, "reset_hint").unwrap_or_else(|| "none".to_owned());
-        let budget_state = metadata_value(&failure.metadata, "budget_state")
+            metadata_value(failure.metadata(), "reset_hint").unwrap_or_else(|| "none".to_owned());
+        let budget_state = metadata_value(failure.metadata(), "budget_state")
             .unwrap_or_else(|| "unknown".to_owned());
         self.record_provider_backoff(ProviderBackoffState {
             until: Instant::now() + Duration::from_millis(retry_after_ms),
             retry_after_ms,
             reset_hint,
             budget_state,
-            terminal_reason: failure.terminal_reason,
-        });
-    }
-
-    pub(crate) fn record_provider_terminal_failure(
-        &self,
-        limits: &VoiceLimitConfig,
-        terminal_reason: TerminalSessionReason,
-    ) {
-        if !limits.provider_limiter_enabled
-            || !matches!(
-                terminal_reason,
-                TerminalSessionReason::ProviderRateLimited
-                    | TerminalSessionReason::ProviderAuthFailed
-                    | TerminalSessionReason::ProviderTimeout
-            )
-        {
-            return;
-        }
-        let retry_after_ms = limits
-            .provider_backoff_default_ms
-            .min(limits.provider_backoff_max_ms);
-        self.record_provider_backoff(ProviderBackoffState {
-            until: Instant::now() + Duration::from_millis(retry_after_ms),
-            retry_after_ms,
-            reset_hint: "none".to_owned(),
-            budget_state: "unknown".to_owned(),
-            terminal_reason,
+            terminal_reason: failure.terminal_reason(),
         });
     }
 
@@ -693,13 +666,14 @@ fn elapsed_ms(start: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use agent_domain::BrainFailureClass;
+
     use super::*;
 
     fn provider_rate_limit_failure(retry_after_ms: u64, reset_hint: &str) -> BrainProviderFailure {
         BrainProviderFailure::new(agent_domain::BrainProviderFailureParts {
-            failure_class: "quota_rate_failure".to_owned(),
-            stage: "gemini".to_owned(),
-            terminal_reason: TerminalSessionReason::ProviderRateLimited,
+            failure_class: BrainFailureClass::QuotaRateFailure,
+            stage: BrainFailureStage::Gemini,
             retry_eligible: true,
             latency_ms: 17,
             provider: "gemini".to_owned(),
@@ -712,7 +686,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_tool_stage_timeout_does_not_record_provider_backoff() {
-        for stage in ["tools", "recap"] {
+        for stage in [BrainFailureStage::Tools, BrainFailureStage::Recap] {
             let state = VoiceLimitState::default();
             let limits = VoiceLimitConfig {
                 provider_backoff_default_ms: 1_000,
@@ -720,9 +694,8 @@ mod tests {
                 ..VoiceLimitConfig::default()
             };
             let failure = BrainProviderFailure::new(agent_domain::BrainProviderFailureParts {
-                failure_class: "timeout".to_owned(),
-                stage: stage.to_owned(),
-                terminal_reason: TerminalSessionReason::ProviderTimeout,
+                failure_class: BrainFailureClass::Timeout,
+                stage,
                 retry_eligible: true,
                 latency_ms: 45_000,
                 provider: "server".to_owned(),
@@ -913,12 +886,15 @@ mod tests {
 
 fn provider_failure_backoff_eligible(failure: &BrainProviderFailure) -> bool {
     matches!(
-        failure.terminal_reason,
+        failure.terminal_reason(),
         TerminalSessionReason::ProviderRateLimited
             | TerminalSessionReason::ProviderAuthFailed
             | TerminalSessionReason::ProviderTimeout
-    ) && failure.provider != "server"
-        && !matches!(failure.stage.as_str(), "tools" | "recap" | "store")
+    ) && failure.provider() != "server"
+        && !matches!(
+            failure.stage(),
+            BrainFailureStage::Tools | BrainFailureStage::Recap | BrainFailureStage::Store
+        )
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -2310,9 +2286,15 @@ fn store_json_error(
     error: PortError,
     error_code: &'static str,
 ) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
-    let status = match &error {
-        PortError::Unavailable { .. } => StatusCode::NOT_FOUND,
-        PortError::Adapter { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    // `PortErrorKind` is the only classifier; `reason()` is diagnostics and is
+    // never branched on. `Unavailable` keeps the historical "no such record"
+    // status; every other typed kind is a server-side fault.
+    let status = match error.kind() {
+        PortErrorKind::Unavailable => StatusCode::NOT_FOUND,
+        PortErrorKind::InvalidInput
+        | PortErrorKind::Conflict
+        | PortErrorKind::Durability
+        | PortErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (
         status,

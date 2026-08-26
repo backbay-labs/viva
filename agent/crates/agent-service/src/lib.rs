@@ -15,8 +15,9 @@ pub use config::{
 };
 pub use protocol::{
     classify_voice_termination, negotiate_voice_protocol_version, parse_client_frame_json,
-    parse_server_frame_json, ClientFrame, ServerFrame, VivaServerEvent, VoiceProtocolAdvertisement,
-    VoiceProtocolDiagnostic, VoiceProtocolDiagnosticCode, VoiceStructuredErrorTerminality,
+    parse_server_frame_json, ClientFrame, ClientTurnIntent, ServerError, ServerFrame,
+    VivaServerEvent, VoiceProtocolAdvertisement, VoiceProtocolDiagnostic,
+    VoiceProtocolDiagnosticCode, VoiceServerErrorCode, VoiceStructuredErrorTerminality,
     VoiceTermination, VoiceTerminationInput, VIVA_AUDIO_MAX_CHUNK_BASE64_CHARS,
     VIVA_VOICE_BYTES_PER_SAMPLE, VIVA_VOICE_CHANNELS, VIVA_VOICE_INPUT_ENCODING,
     VIVA_VOICE_MAX_TEXT_FRAME_BYTES, VIVA_VOICE_MAX_TURN_SECONDS, VIVA_VOICE_PROTOCOL_VERSION,
