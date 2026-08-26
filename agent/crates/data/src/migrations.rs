@@ -6829,19 +6829,13 @@ pub(crate) mod tests {
         expected_delta: ExactCountDelta,
     }
 
-    /// PENDING PLAN 05 FIXTURE AMENDMENT — the unversioned root path is still the
-    /// only place this table exists.
-    ///
-    /// Plan 09 Task 1 Step 5 requires this import to move to a v5 path, but
-    /// `agent/fixtures/voice-protocol/v5/manifest.json` carries no row for the store
-    /// count truth table and `agent/fixtures/voice-protocol/**` is Plan 05's, not
-    /// this lane's. The assertions are still needed — `DATA-002`/`DATA-003` prove
-    /// exact write-count deltas against this table — so the reference is kept and the
-    /// amendment request (add `VOICE-STORE-COUNT-TRUTH-TABLE` at
-    /// `agent/fixtures/voice-protocol/v5/count-truth-table.json`) is escalated to the
-    /// coordinator rather than satisfied by deleting coverage or by this lane writing
-    /// another plan's fixture. Plan 05 must not delete the eleven legacy root fixtures
-    /// until that row exists and this import points at it.
+    /// RESOLVED BY AMENDMENT A-15 (docs/decisions/2026-08-23-plan-amendments.md):
+    /// the store count truth table is a Plan-09-owned root fixture consumed from
+    /// exactly this path — it is a store contract, not a wire-protocol fixture, so
+    /// no `agent/fixtures/voice-protocol/v5/manifest.json` row exists for it and
+    /// none is required. `DATA-002`/`DATA-003` prove exact write-count deltas
+    /// against this table. Plan 05's legacy root-fixture retirement must leave
+    /// `count-truth-table.json` in place.
     fn count_truth_table() -> CountTruthTable {
         serde_json::from_str(include_str!(
             "../../../fixtures/voice-protocol/count-truth-table.json"
