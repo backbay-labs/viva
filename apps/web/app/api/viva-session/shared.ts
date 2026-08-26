@@ -72,13 +72,76 @@ type SessionRequestPayload = {
   user_id?: unknown;
 };
 
-type SessionTokenClaims = {
+export type FailureControlScenario =
+  | "provider_rate_limited"
+  | "provider_auth_failed"
+  | "provider_timeout"
+  | "silent_stall"
+  | "provider_malformed_stream"
+  | "provider_network_disconnect"
+  | "sonic_tts_timeout"
+  | "recap_timeout"
+  | "invalid_token"
+  | "expired_token"
+  | "replayed_token"
+  | "malformed_token"
+  | "slow_stale_socket_close"
+  | "double_submit_race"
+  | "mic_denied"
+  | "typed_fallback";
+
+export type SessionTokenClaims = {
+  user_id: string;
+  study_set_id: string;
+  session_id: string;
+  issued_at: number;
+  not_before: number;
   expires_at: number;
   nonce: string;
-  session_id: string;
-  study_set_id: string;
-  user_id: string;
+  failure_control?: {
+    scenario: FailureControlScenario;
+    run_id: string;
+    expires_at: number;
+    nonce: string;
+    signature: string;
+  };
 };
+
+/**
+ * Closed rejection set shared with Plan 05's `agent/fixtures/session-token/v1/vectors.json`
+ * (manifest ID `VOICE-TOKEN-V1-VECTORS`). The fixture's exact rejection string wins at every
+ * precedence boundary; Node never normalizes a fixture value.
+ */
+export type VivaSessionAccessTokenRejection =
+  | "binding_mismatch"
+  | "duplicate_claim"
+  | "expired"
+  | "invalid_signature"
+  | "invalid_time_order"
+  | "malformed_json"
+  | "malformed_shape"
+  | "missing_claim"
+  | "noncanonical_base64url"
+  | "not_yet_valid"
+  | "unknown_claim";
+
+export type VivaSessionAccessTokenVerification =
+  | { ok: true; claims: SessionTokenClaims }
+  | { ok: false; reason: VivaSessionAccessTokenRejection };
+
+export type SessionTokenBinding = {
+  user_id: string;
+  study_set_id: string;
+  session_id: string;
+};
+
+type SessionAccessTokenVerificationDetail =
+  | { ok: true; claims: SessionTokenClaims }
+  | {
+      ok: false;
+      claims: SessionTokenClaims | null;
+      reason: VivaSessionAccessTokenRejection;
+    };
 
 type SessionBootstrapTokenClaims = {
   expires_at: number;
@@ -139,11 +202,60 @@ type RateLimitBucket = {
   resetAt: number;
 };
 
-type SessionTokenVerification =
-  | { ok: true; expired: boolean; value: SessionTokenClaims }
-  | { ok: false; reason: "invalid_signature" | "malformed" | "missing_secret" };
+type SessionAccessTokenRouteVerification =
+  | { ok: true; claims: SessionTokenClaims; expired: boolean }
+  | { ok: false; reason: VivaSessionAccessTokenRejection | "unavailable" };
 
 const RATE_LIMIT_WINDOW_MS = 60_000;
+const SESSION_ACCESS_TOKEN_PREFIX = "viva1";
+const SESSION_ACCESS_TOKEN_MAX_BYTES = 4_096;
+const SESSION_ACCESS_TOKEN_SIGNATURE_BYTES = 32;
+const SESSION_ACCESS_TOKEN_MAX_CLAIM_DEPTH = 8;
+const WEB_SECRET_MIN_BYTES = 32;
+const SESSION_ACCESS_TOKEN_CLAIM_KEYS = new Set([
+  "user_id",
+  "study_set_id",
+  "session_id",
+  "issued_at",
+  "not_before",
+  "expires_at",
+  "nonce",
+  "failure_control",
+]);
+const SESSION_ACCESS_TOKEN_FAILURE_CONTROL_KEYS = new Set([
+  "scenario",
+  "run_id",
+  "expires_at",
+  "nonce",
+  "signature",
+]);
+const FAILURE_CONTROL_SCENARIOS = new Set<string>([
+  "provider_rate_limited",
+  "provider_auth_failed",
+  "provider_timeout",
+  "silent_stall",
+  "provider_malformed_stream",
+  "provider_network_disconnect",
+  "sonic_tts_timeout",
+  "recap_timeout",
+  "invalid_token",
+  "expired_token",
+  "replayed_token",
+  "malformed_token",
+  "slow_stale_socket_close",
+  "double_submit_race",
+  "mic_denied",
+  "typed_fallback",
+]);
+const WEB_SECRET_PLACEHOLDER_VALUES = new Set([
+  "secret",
+  "password",
+  "changeme",
+  "change-me",
+  "placeholder",
+  "example",
+  "test",
+]);
 const SESSION_BOOTSTRAP_TOKEN_TTL_SECONDS = 5 * 60;
 const SESSION_BOOTSTRAP_TOKEN_PREFIX = "viva-bootstrap1";
 const SESSION_BOOTSTRAP_TOKEN_PURPOSE = "viva_session_bootstrap";
@@ -230,19 +342,19 @@ export async function handleVivaSessionRefresh(request: NextRequest) {
   const access = guardAllowedIdentity(userId, studySetId, logContext);
   if (access) return access;
 
-  const claims = verifySessionTokenClaims(sessionToken);
-  if (!claims.ok) {
-    if (claims.reason === "missing_secret") {
+  const verification = verifySessionAccessTokenForRoute({
+    allowExpired: true,
+    expectedBinding: { session_id: sessionId, study_set_id: studySetId, user_id: userId },
+    token: sessionToken,
+  });
+  if (!verification.ok) {
+    if (verification.reason === "unavailable") {
       return sessionJsonError(503, "viva_session_refresh_unavailable", "failed", logContext);
     }
-    return sessionAuthTerminalJsonError(authFailureCodeForTokenReason(claims.reason), logContext);
-  }
-  if (
-    claims.value.user_id !== userId ||
-    claims.value.study_set_id !== studySetId ||
-    claims.value.session_id !== sessionId
-  ) {
-    return sessionAuthTerminalJsonError("identity_mismatch", logContext);
+    return sessionAuthTerminalJsonError(
+      authFailureCodeForAccessTokenRejection(verification.reason),
+      logContext,
+    );
   }
 
   const limit = guardMintRateLimit(request, userId, studySetId, logContext);
@@ -257,7 +369,7 @@ export async function handleVivaSessionRefresh(request: NextRequest) {
     userId,
   });
   if (!minted.ok) return minted.response;
-  const tokenRefreshOutcome = claims.expired ? "expired_refreshed" : "refreshed";
+  const tokenRefreshOutcome = verification.expired ? "expired_refreshed" : "refreshed";
   return sessionJson(
     {
       failure_class: null,
@@ -744,64 +856,433 @@ async function readJson(response: Response): Promise<VivaLibrarySnapshot> {
   }
 }
 
-function verifySessionTokenClaims(token: string): SessionTokenVerification {
-  const secret = process.env.VIVA_VOICE_SESSION_TOKEN_SECRET?.trim();
-  if (!secret) return { ok: false, reason: "missing_secret" };
-  const parts = token.split(".");
-  if (parts.length !== 3 || parts[0] !== "viva1") return { ok: false, reason: "malformed" };
-  const claimsPart = parts[1] ?? "";
-  const signaturePart = parts[2] ?? "";
-  const signedPayload = `viva1.${claimsPart}`;
-  let providedSignature: Buffer;
-  try {
-    providedSignature = Buffer.from(signaturePart, "base64url");
-  } catch {
-    return { ok: false, reason: "malformed" };
+/**
+ * Strict session access-token verification pinned to Plan 05's shared vectors.
+ *
+ * Ordered exactly as Plan 05 pins it: bounded size, `viva1.<claims>.<signature>` framing,
+ * canonical unpadded base64url on both segments, constant-time 32-byte HMAC, fatal UTF-8
+ * decode, duplicate-key scan before `JSON.parse`, exact claim shapes, time ordering and
+ * window, then identity binding. Returns a closed result; it never throws.
+ */
+export function verifyVivaSessionAccessToken(input: {
+  token: string;
+  secretBytes: Uint8Array;
+  now: number;
+  expectedBinding: SessionTokenBinding;
+  clockSkewSeconds: number;
+}): VivaSessionAccessTokenVerification {
+  const detail = verifySessionAccessTokenDetailed(input);
+  return detail.ok ? { ok: true, claims: detail.claims } : { ok: false, reason: detail.reason };
+}
+
+function verifySessionAccessTokenDetailed(input: {
+  token: string;
+  secretBytes: Uint8Array;
+  now: number;
+  expectedBinding: SessionTokenBinding;
+  clockSkewSeconds: number;
+}): SessionAccessTokenVerificationDetail {
+  const rejected = (
+    reason: VivaSessionAccessTokenRejection,
+    claims: SessionTokenClaims | null = null,
+  ): SessionAccessTokenVerificationDetail => ({ claims, ok: false, reason });
+
+  if (Buffer.byteLength(input.token, "utf8") > SESSION_ACCESS_TOKEN_MAX_BYTES) {
+    return rejected("malformed_json");
   }
-  const expectedSignature = createHmac("sha256", secret).update(signedPayload).digest();
+
+  const segments = input.token.split(".");
+  if (segments.length !== 3 || segments[0] !== SESSION_ACCESS_TOKEN_PREFIX) {
+    return rejected("malformed_shape");
+  }
+  const claimsSegment = segments[1] ?? "";
+  const signatureSegment = segments[2] ?? "";
+
+  const claimsBytes = decodeCanonicalBase64Url(claimsSegment);
+  if (!claimsBytes) return rejected("noncanonical_base64url");
+  const signatureBytes = decodeCanonicalBase64Url(signatureSegment);
+  if (!signatureBytes) return rejected("noncanonical_base64url");
+
+  if (signatureBytes.length !== SESSION_ACCESS_TOKEN_SIGNATURE_BYTES) {
+    return rejected("invalid_signature");
+  }
+  const expectedSignature = createHmac("sha256", input.secretBytes)
+    .update(`${SESSION_ACCESS_TOKEN_PREFIX}.${claimsSegment}`)
+    .digest();
   if (
-    providedSignature.length !== expectedSignature.length ||
-    !timingSafeEqual(providedSignature, expectedSignature)
+    expectedSignature.length !== signatureBytes.length ||
+    !timingSafeEqual(signatureBytes, expectedSignature)
   ) {
-    return { ok: false, reason: "invalid_signature" };
+    return rejected("invalid_signature");
   }
+
+  let claimsText: string;
   try {
-    const raw = Buffer.from(claimsPart, "base64url").toString("utf8");
-    const claims = JSON.parse(raw) as unknown;
-    if (!claims || typeof claims !== "object" || Array.isArray(claims)) {
-      return { ok: false, reason: "malformed" };
-    }
-    const record = claims as Record<string, unknown>;
-    const parsed = {
-      expires_at: numberClaim(record.expires_at),
-      nonce: requiredString(record.nonce),
-      session_id: requiredString(record.session_id),
-      study_set_id: requiredString(record.study_set_id),
-      user_id: requiredString(record.user_id),
-    };
-    if (
-      parsed.expires_at === null ||
-      !parsed.nonce ||
-      !parsed.session_id ||
-      !parsed.study_set_id ||
-      !parsed.user_id
-    ) {
-      return { ok: false, reason: "malformed" };
-    }
-    return {
-      ok: true,
-      expired: parsed.expires_at <= Math.floor(Date.now() / 1000),
-      value: {
-        expires_at: parsed.expires_at,
-        nonce: parsed.nonce,
-        session_id: parsed.session_id,
-        study_set_id: parsed.study_set_id,
-        user_id: parsed.user_id,
-      },
-    };
+    claimsText = new TextDecoder("utf-8", { fatal: true }).decode(claimsBytes);
   } catch {
-    return { ok: false, reason: "malformed" };
+    return rejected("malformed_json");
   }
+
+  const scan = scanJsonForDuplicateObjectKeys(claimsText);
+  if (!scan.ok) return rejected(scan.reason);
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(claimsText) as unknown;
+  } catch {
+    return rejected("malformed_json");
+  }
+  if (!isRecord(parsed)) return rejected("malformed_json");
+
+  for (const key of Object.keys(parsed)) {
+    if (!SESSION_ACCESS_TOKEN_CLAIM_KEYS.has(key)) return rejected("unknown_claim");
+  }
+
+  const userId = nonEmptyClaimString(parsed.user_id);
+  const studySetId = nonEmptyClaimString(parsed.study_set_id);
+  const sessionId = nonEmptyClaimString(parsed.session_id);
+  const nonce = nonEmptyClaimString(parsed.nonce);
+  const issuedAt = safeUnixTimestampClaim(parsed.issued_at);
+  const notBefore = safeUnixTimestampClaim(parsed.not_before);
+  const expiresAt = safeUnixTimestampClaim(parsed.expires_at);
+  if (
+    userId === null ||
+    studySetId === null ||
+    sessionId === null ||
+    nonce === null ||
+    issuedAt === null ||
+    notBefore === null ||
+    expiresAt === null
+  ) {
+    return rejected("missing_claim");
+  }
+
+  let failureControl: SessionTokenClaims["failure_control"];
+  if (parsed.failure_control !== undefined) {
+    const control = parsed.failure_control;
+    if (!isRecord(control)) return rejected("missing_claim");
+    for (const key of Object.keys(control)) {
+      if (!SESSION_ACCESS_TOKEN_FAILURE_CONTROL_KEYS.has(key)) return rejected("unknown_claim");
+    }
+    const scenario = nonEmptyClaimString(control.scenario);
+    const runId = nonEmptyClaimString(control.run_id);
+    const controlNonce = nonEmptyClaimString(control.nonce);
+    const controlSignature = nonEmptyClaimString(control.signature);
+    const controlExpiresAt = safeUnixTimestampClaim(control.expires_at);
+    if (
+      scenario === null ||
+      !FAILURE_CONTROL_SCENARIOS.has(scenario) ||
+      runId === null ||
+      controlNonce === null ||
+      controlSignature === null ||
+      controlExpiresAt === null
+    ) {
+      return rejected("missing_claim");
+    }
+    failureControl = {
+      expires_at: controlExpiresAt,
+      nonce: controlNonce,
+      run_id: runId,
+      scenario: scenario as FailureControlScenario,
+      signature: controlSignature,
+    };
+  }
+
+  const claims: SessionTokenClaims = {
+    expires_at: expiresAt,
+    issued_at: issuedAt,
+    nonce,
+    not_before: notBefore,
+    session_id: sessionId,
+    study_set_id: studySetId,
+    user_id: userId,
+    ...(failureControl ? { failure_control: failureControl } : {}),
+  };
+
+  if (issuedAt > notBefore || notBefore > expiresAt) {
+    return rejected("invalid_time_order", claims);
+  }
+  const skew = Number.isSafeInteger(input.clockSkewSeconds)
+    ? Math.max(0, input.clockSkewSeconds)
+    : 0;
+  if (input.now + skew < notBefore) return rejected("not_yet_valid", claims);
+  if (input.now - skew >= expiresAt) return rejected("expired", claims);
+
+  if (
+    userId !== input.expectedBinding.user_id ||
+    studySetId !== input.expectedBinding.study_set_id ||
+    sessionId !== input.expectedBinding.session_id
+  ) {
+    return rejected("binding_mismatch", claims);
+  }
+
+  return { claims, ok: true };
+}
+
+/**
+ * Canonical unpadded base64url: the segment must use only the URL alphabet and must be the
+ * exact re-encoding of the bytes it decodes to. Padding and trailing-bit variants are rejected.
+ */
+function decodeCanonicalBase64Url(segment: string): Buffer | null {
+  if (!/^[A-Za-z0-9_-]*$/.test(segment)) return null;
+  if (segment.length % 4 === 1) return null;
+  const bytes = Buffer.from(segment, "base64url");
+  return bytes.toString("base64url") === segment ? bytes : null;
+}
+
+/**
+ * String/escape/nesting-aware JSON scanner. It records object keys and reports a duplicate
+ * before `JSON.parse` ever runs; a structural defect is reported as malformed JSON.
+ */
+function scanJsonForDuplicateObjectKeys(
+  text: string,
+): { ok: true } | { ok: false; reason: "duplicate_claim" | "malformed_json" } {
+  let index = 0;
+  let duplicateFound = false;
+
+  const skipWhitespace = () => {
+    while (index < text.length) {
+      const char = text[index];
+      if (char === " " || char === "\t" || char === "\n" || char === "\r") {
+        index += 1;
+        continue;
+      }
+      return;
+    }
+  };
+
+  const readString = (): string | null => {
+    if (text[index] !== '"') return null;
+    index += 1;
+    let value = "";
+    while (index < text.length) {
+      const char = text[index] as string;
+      if (char === '"') {
+        index += 1;
+        return value;
+      }
+      if (char === "\\") {
+        const escaped = text[index + 1];
+        if (escaped === undefined) return null;
+        if (escaped === "u") {
+          const hex = text.slice(index + 2, index + 6);
+          if (!/^[0-9a-fA-F]{4}$/.test(hex)) return null;
+          value += String.fromCharCode(Number.parseInt(hex, 16));
+          index += 6;
+          continue;
+        }
+        const mapped = JSON_SIMPLE_ESCAPES[escaped];
+        if (mapped === undefined) return null;
+        value += mapped;
+        index += 2;
+        continue;
+      }
+      if (char < " ") return null;
+      value += char;
+      index += 1;
+    }
+    return null;
+  };
+
+  const readValue = (depth: number): boolean => {
+    if (depth > SESSION_ACCESS_TOKEN_MAX_CLAIM_DEPTH) return false;
+    skipWhitespace();
+    const char = text[index];
+    if (char === undefined) return false;
+    if (char === '"') return readString() !== null;
+    if (char === "{") {
+      index += 1;
+      const keys = new Set<string>();
+      skipWhitespace();
+      if (text[index] === "}") {
+        index += 1;
+        return true;
+      }
+      while (true) {
+        skipWhitespace();
+        const key = readString();
+        if (key === null) return false;
+        if (keys.has(key)) duplicateFound = true;
+        keys.add(key);
+        skipWhitespace();
+        if (text[index] !== ":") return false;
+        index += 1;
+        if (!readValue(depth + 1)) return false;
+        skipWhitespace();
+        if (text[index] === ",") {
+          index += 1;
+          continue;
+        }
+        if (text[index] === "}") {
+          index += 1;
+          return true;
+        }
+        return false;
+      }
+    }
+    if (char === "[") {
+      index += 1;
+      skipWhitespace();
+      if (text[index] === "]") {
+        index += 1;
+        return true;
+      }
+      while (true) {
+        if (!readValue(depth + 1)) return false;
+        skipWhitespace();
+        if (text[index] === ",") {
+          index += 1;
+          continue;
+        }
+        if (text[index] === "]") {
+          index += 1;
+          return true;
+        }
+        return false;
+      }
+    }
+    for (const literal of ["true", "false", "null"]) {
+      if (text.startsWith(literal, index)) {
+        index += literal.length;
+        return true;
+      }
+    }
+    const number = /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/.exec(text.slice(index));
+    if (number && number[0].length > 0) {
+      index += number[0].length;
+      return true;
+    }
+    return false;
+  };
+
+  if (!readValue(0)) return { ok: false, reason: "malformed_json" };
+  skipWhitespace();
+  if (index !== text.length) return { ok: false, reason: "malformed_json" };
+  return duplicateFound ? { ok: false, reason: "duplicate_claim" } : { ok: true };
+}
+
+const JSON_SIMPLE_ESCAPES: Record<string, string> = {
+  '"': '"',
+  "\\": "\\",
+  "/": "/",
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+};
+
+function nonEmptyClaimString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function safeUnixTimestampClaim(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * Web-owned credential strength gate. Never logs the value, a prefix, its length, or the
+ * environment variable name; callers map a failure onto the coarse public error table.
+ */
+export type VivaWebSecretValidation =
+  | { ok: true; value: string }
+  | { ok: false; reason: "missing" | "placeholder" | "repeated_byte" | "too_long" | "too_short" };
+
+export function validateVivaWebSecret(
+  value: string | undefined,
+  options: { maxBytes?: number } = {},
+): VivaWebSecretValidation {
+  const raw = value?.trim();
+  if (!raw) return { ok: false, reason: "missing" };
+  if (WEB_SECRET_PLACEHOLDER_VALUES.has(raw.toLowerCase())) {
+    return { ok: false, reason: "placeholder" };
+  }
+  if (/<[^>]*>/.test(raw)) return { ok: false, reason: "placeholder" };
+  const bytes = Buffer.from(raw, "utf8");
+  const first = bytes[0];
+  if (first !== undefined && bytes.every((byte) => byte === first)) {
+    return { ok: false, reason: "repeated_byte" };
+  }
+  if (bytes.length < WEB_SECRET_MIN_BYTES) return { ok: false, reason: "too_short" };
+  if (options.maxBytes !== undefined && bytes.length > options.maxBytes) {
+    return { ok: false, reason: "too_long" };
+  }
+  return { ok: true, value: raw };
+}
+
+function validatedSecret(name: string, options: { maxBytes?: number } = {}): string | null {
+  const validation = validateVivaWebSecret(process.env[name], options);
+  return validation.ok ? validation.value : null;
+}
+
+/**
+ * Active plus verify-only previous HMAC keys, converted to UTF-8 bytes exactly once after
+ * validation. An explicitly present but weak previous key fails configuration rather than
+ * silently falling back to the active key alone.
+ */
+function sessionAccessTokenVerificationKeys(): Uint8Array[] | null {
+  return rotatingHmacKeys(
+    "VIVA_VOICE_SESSION_TOKEN_SECRET",
+    "VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET",
+  );
+}
+
+function rotatingHmacKeys(activeName: string, previousName: string): Uint8Array[] | null {
+  const active = validatedSecret(activeName);
+  if (!active) return null;
+  const keys = [utf8Bytes(active)];
+  const previousRaw = process.env[previousName]?.trim();
+  if (previousRaw) {
+    const previous = validateVivaWebSecret(previousRaw);
+    if (!previous.ok) return null;
+    keys.push(utf8Bytes(previous.value));
+  }
+  return keys;
+}
+
+function utf8Bytes(value: string): Uint8Array {
+  return new Uint8Array(Buffer.from(value, "utf8"));
+}
+
+/**
+ * Route wrapper: loads active/previous env secrets and calls the pure verifier with
+ * `clockSkewSeconds: 0`. Only a signature failure retries the previous verification key.
+ */
+function verifySessionAccessTokenForRoute(input: {
+  token: string;
+  expectedBinding: SessionTokenBinding;
+  allowExpired: boolean;
+}): SessionAccessTokenRouteVerification {
+  const keys = sessionAccessTokenVerificationKeys();
+  if (!keys) return { ok: false, reason: "unavailable" };
+  const now = Math.floor(Date.now() / 1000);
+  let last: SessionAccessTokenVerificationDetail | null = null;
+  for (const secretBytes of keys) {
+    const detail = verifySessionAccessTokenDetailed({
+      clockSkewSeconds: 0,
+      expectedBinding: input.expectedBinding,
+      now,
+      secretBytes,
+      token: input.token,
+    });
+    if (detail.ok) return { claims: detail.claims, expired: false, ok: true };
+    last = detail;
+    if (detail.reason !== "invalid_signature") break;
+  }
+  if (!last || last.ok) return { ok: false, reason: "unavailable" };
+  if (input.allowExpired && last.reason === "expired" && last.claims) {
+    // Binding is enforced after the time window, so an expired token still has to prove
+    // its identity here before the route treats expiry as recoverable.
+    if (
+      last.claims.user_id !== input.expectedBinding.user_id ||
+      last.claims.study_set_id !== input.expectedBinding.study_set_id ||
+      last.claims.session_id !== input.expectedBinding.session_id
+    ) {
+      return { ok: false, reason: "binding_mismatch" };
+    }
+    return { claims: last.claims, expired: true, ok: true };
+  }
+  return { ok: false, reason: last.reason };
 }
 
 function sessionAuthFailureProfile(
@@ -819,14 +1300,15 @@ function sessionAuthFailureProfile(
   };
 }
 
-function authFailureCodeForTokenReason(
-  reason: Exclude<SessionTokenVerification, { ok: true }>["reason"],
+function authFailureCodeForAccessTokenRejection(
+  reason: VivaSessionAccessTokenRejection,
 ): Exclude<VivaSessionAuthFailureCode, "expired"> {
-  if (reason === "missing_secret") return "access_denied";
   switch (reason) {
+    case "binding_mismatch":
+      return "identity_mismatch";
     case "invalid_signature":
       return "invalid_signature";
-    case "malformed":
+    default:
       return "malformed";
   }
 }
@@ -1024,12 +1506,12 @@ function sessionBootstrapRequirement(): { required: boolean; secret: string | nu
   return { required: true, secret: sessionBootstrapSecret() };
 }
 
+/**
+ * Bootstrap/control capability signing key. It has its own active/previous pair and never
+ * borrows the session access-token key: one key, one purpose.
+ */
 function sessionBootstrapSecret(): string | null {
-  return (
-    process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET?.trim() ||
-    process.env.VIVA_VOICE_SESSION_TOKEN_SECRET?.trim() ||
-    null
-  );
+  return validatedSecret("VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET");
 }
 
 function verifySessionBootstrapTokenClaims(

@@ -1,12 +1,16 @@
 import * as bunTest from "bun:test";
 import { createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type { NextRequest } from "next/server";
 import { POST as refreshSession } from "../app/api/viva-session/refresh/route";
 import {
   resetVivaSessionMintRateLimitsForTests,
+  type SessionTokenClaims,
   VIVA_SESSION_AUTH_FAILURE_PROFILES,
   type VivaSessionRouteFailureClass,
   type VivaSessionRouteOutcome,
+  validateVivaWebSecret,
+  verifyVivaSessionAccessToken,
   vivaSessionRouteFailureLogPayload,
 } from "../app/api/viva-session/shared";
 import { POST as startSession } from "../app/api/viva-session/start/route";
@@ -23,14 +27,24 @@ const originalEnv = {
   VERCEL_GIT_COMMIT_SHA: process.env.VERCEL_GIT_COMMIT_SHA,
   VIVA_AGENT_HTTP_URL: process.env.VIVA_AGENT_HTTP_URL,
   VIVA_AGENT_REST_BEARER_TOKEN: process.env.VIVA_AGENT_REST_BEARER_TOKEN,
+  VIVA_SESSION_BOOTSTRAP_TOKEN_PREVIOUS_SECRET:
+    process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_PREVIOUS_SECRET,
   VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET: process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET,
   VIVA_SESSION_ALLOWED_STUDY_SET_IDS: process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS,
   VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS: process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS,
   VIVA_SESSION_ALLOWED_USER_IDS: process.env.VIVA_SESSION_ALLOWED_USER_IDS,
   VIVA_SESSION_MINT_MAX_PER_MINUTE: process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE,
+  VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET: process.env.VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET,
   VIVA_VOICE_SESSION_TOKEN_SECRET: process.env.VIVA_VOICE_SESSION_TOKEN_SECRET,
   VIVA_VOICE_WS_BEARER_TOKEN: process.env.VIVA_VOICE_WS_BEARER_TOKEN,
 };
+
+// Fixture credentials: long enough to satisfy the recorded strength floor and
+// clearly non-production. No value here is a real or real-shaped credential.
+const STRONG_SESSION_SECRET = "viva-fixture-session-signing-key-0001";
+const STRONG_PREVIOUS_SESSION_SECRET = "viva-fixture-session-previous-key-0001";
+const STRONG_ROTATED_SESSION_SECRET = "viva-fixture-session-rotated-key-0001";
+const STRONG_BOOTSTRAP_SECRET = "viva-fixture-bootstrap-signing-key-01";
 
 describe("Viva same-origin session API", () => {
   beforeEach(() => {
@@ -38,13 +52,15 @@ describe("Viva same-origin session API", () => {
     resetVivaSessionMintRateLimitsForTests();
     process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
     process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
-    process.env.VIVA_AGENT_REST_BEARER_TOKEN = "redacted-rest-bearer";
-    process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = "redacted-bootstrap-signing-secret";
+    process.env.VIVA_AGENT_REST_BEARER_TOKEN = "viva-fixture-legacy-rest-bearer";
+    process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = STRONG_BOOTSTRAP_SECRET;
+    delete process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_PREVIOUS_SECRET;
     process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user";
     process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
     process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS = "10000";
     process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "20";
-    process.env.VIVA_VOICE_SESSION_TOKEN_SECRET = "redacted-session-signing-secret";
+    delete process.env.VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET;
+    process.env.VIVA_VOICE_SESSION_TOKEN_SECRET = STRONG_SESSION_SECRET;
   });
 
   afterEach(() => {
@@ -94,7 +110,7 @@ describe("Viva same-origin session API", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.input).toBe("https://agent.example/study-sets/library?user_id=synthetic-user");
     const headers = new Headers(calls[0]?.init?.headers);
-    expect(headers.get("authorization")).toBe("Bearer redacted-rest-bearer");
+    expect(headers.get("authorization")).toBe("Bearer viva-fixture-legacy-rest-bearer");
     expect(headers.get("origin")).toBe("https://web.example");
     expect(body).toEqual({
       failure_class: null,
@@ -107,7 +123,7 @@ describe("Viva same-origin session API", () => {
       token_refresh_outcome: "issued",
     });
     const serialized = JSON.stringify(body);
-    expect(serialized).not.toContain("redacted-rest-bearer");
+    expect(serialized).not.toContain("viva-fixture-legacy-rest-bearer");
     expect(serialized).not.toContain("agent.example");
   });
 
@@ -171,7 +187,7 @@ describe("Viva same-origin session API", () => {
       }
       return new Promise<Response>((_resolve, reject) => {
         observedSignal?.addEventListener("abort", () => {
-          reject(new Error("raw upstream timeout with bearer redacted-rest-bearer"));
+          reject(new Error("raw upstream timeout with bearer viva-fixture-legacy-rest-bearer"));
         });
       });
     }) as typeof fetch;
@@ -190,7 +206,7 @@ describe("Viva same-origin session API", () => {
       terminal_reason: "pre_loop_session_unavailable",
       token_refresh_outcome: "failed",
     });
-    expect(JSON.stringify(body)).not.toContain("redacted-rest-bearer");
+    expect(JSON.stringify(body)).not.toContain("viva-fixture-legacy-rest-bearer");
   });
 
   test("start caps configured bootstrap timeout to the contract maximum", async () => {
@@ -207,7 +223,8 @@ describe("Viva same-origin session API", () => {
       return new Promise<Response>((_resolve, reject) => {
         observedSignal?.addEventListener(
           "abort",
-          () => reject(new Error("raw upstream timeout with bearer redacted-rest-bearer")),
+          () =>
+            reject(new Error("raw upstream timeout with bearer viva-fixture-legacy-rest-bearer")),
           { once: true },
         );
       });
@@ -229,7 +246,7 @@ describe("Viva same-origin session API", () => {
         terminal_reason: "pre_loop_session_unavailable",
         token_refresh_outcome: "failed",
       });
-      expect(JSON.stringify(body)).not.toContain("redacted-rest-bearer");
+      expect(JSON.stringify(body)).not.toContain("viva-fixture-legacy-rest-bearer");
     } finally {
       globalThis.setTimeout = originalSetTimeout;
     }
@@ -242,7 +259,7 @@ describe("Viva same-origin session API", () => {
       observedSignal = init?.signal ?? undefined;
       return hangingJsonResponse(
         observedSignal,
-        "raw stalled library body with bearer redacted-rest-bearer",
+        "raw stalled library body with bearer viva-fixture-legacy-rest-bearer",
       );
     }) as typeof fetch;
 
@@ -261,7 +278,7 @@ describe("Viva same-origin session API", () => {
       terminal_reason: "pre_loop_session_unavailable",
       token_refresh_outcome: "failed",
     });
-    expect(JSON.stringify(body)).not.toContain("redacted-rest-bearer");
+    expect(JSON.stringify(body)).not.toContain("viva-fixture-legacy-rest-bearer");
   });
 
   test("start rejects cross-origin callers before contacting the agent", async () => {
@@ -538,13 +555,14 @@ describe("Viva same-origin session API", () => {
     const response = await refreshSession(
       sessionRequest("/api/viva-session/refresh", {
         session_id: "server-session",
-        session_token: signedSessionToken({
-          expires_at: 1,
-          nonce: "expired-nonce",
-          session_id: "server-session",
-          study_set_id: "biology-midterm",
-          user_id: "synthetic-user",
-        }),
+        session_token: signedSessionToken(
+          sessionTokenClaims({
+            expires_at: 1_000_000,
+            issued_at: 900_000,
+            nonce: "expired-nonce",
+            not_before: 900_000,
+          }),
+        ),
         study_set_id: "biology-midterm",
         user_id: "synthetic-user",
       }),
@@ -575,13 +593,7 @@ describe("Viva same-origin session API", () => {
     const response = await refreshSession(
       sessionRequest("/api/viva-session/refresh", {
         session_id: "server-session",
-        session_token: signedSessionToken({
-          expires_at: futureUnixSeconds(),
-          nonce: "valid-refresh-nonce",
-          session_id: "server-session",
-          study_set_id: "biology-midterm",
-          user_id: "synthetic-user",
-        }),
+        session_token: signedSessionToken(sessionTokenClaims({ nonce: "valid-refresh-nonce" })),
         study_set_id: "biology-midterm",
         user_id: "synthetic-user",
       }),
@@ -613,13 +625,7 @@ describe("Viva same-origin session API", () => {
     const response = await refreshSession(
       sessionRequest("/api/viva-session/refresh", {
         session_id: "server-session",
-        session_token: signedSessionToken({
-          expires_at: futureUnixSeconds(),
-          nonce: "valid-nonce",
-          session_id: "server-session",
-          study_set_id: "biology-midterm",
-          user_id: "synthetic-user",
-        }),
+        session_token: signedSessionToken(sessionTokenClaims({ nonce: "valid-nonce" })),
         study_set_id: "biology-midterm",
         user_id: "synthetic-user",
       }),
@@ -645,25 +651,15 @@ describe("Viva same-origin session API", () => {
     const cases = [
       {
         forbiddenFragments: ["mismatch-nonce", "identity_mismatch", "other-user"],
-        token: signedSessionToken({
-          expires_at: futureUnixSeconds(),
-          nonce: "mismatch-nonce",
-          session_id: "server-session",
-          study_set_id: "biology-midterm",
-          user_id: "other-user",
-        }),
+        token: signedSessionToken(
+          sessionTokenClaims({ nonce: "mismatch-nonce", user_id: "other-user" }),
+        ),
       },
       {
         forbiddenFragments: ["invalid-signature-nonce", "invalid_signature", "invalid_rejected"],
         token: signedSessionToken(
-          {
-            expires_at: futureUnixSeconds(),
-            nonce: "invalid-signature-nonce",
-            session_id: "server-session",
-            study_set_id: "biology-midterm",
-            user_id: "synthetic-user",
-          },
-          "wrong-session-signing-secret",
+          sessionTokenClaims({ nonce: "invalid-signature-nonce" }),
+          "viva-fixture-unrelated-signing-secret-000",
         ),
       },
       {
@@ -769,6 +765,373 @@ describe("Viva same-origin session API", () => {
   });
 });
 
+type SessionTokenVectorsV1 = {
+  version: 1;
+  fake_secret_base64: string;
+  clock_unix_seconds: number;
+  cases: Array<{
+    id: string;
+    token: string;
+    claims: Record<string, unknown> | null;
+    valid: boolean;
+    rejection: string | null;
+  }>;
+};
+
+type SessionTokenVectorsManifest = {
+  fixtures: Array<{ id: string; kind: string; path: string }>;
+};
+
+// Plan 05 manifest ID VOICE-TOKEN-V1-VECTORS (kind `token_vectors`). This lane
+// consumes the fixture read-only; any required change returns to Plan 05 and is
+// never normalized inside Node.
+const PLAN_05_TOKEN_VECTOR_MANIFEST_ID = "VOICE-TOKEN-V1-VECTORS";
+const PLAN_05_TOKEN_VECTOR_MANIFEST_PATH = "agent/fixtures/session-token/v1/vectors.json";
+const PLAN_05_TOKEN_VECTOR_SECRET_BASE64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+
+const planFiveSessionTokenVectors = JSON.parse(
+  readFileSync(new URL(`../../../${PLAN_05_TOKEN_VECTOR_MANIFEST_PATH}`, import.meta.url), "utf8"),
+) as SessionTokenVectorsV1;
+
+const planFiveFixtureManifest = JSON.parse(
+  readFileSync(
+    new URL("../../../agent/fixtures/voice-protocol/v5/manifest.json", import.meta.url),
+    "utf8",
+  ),
+) as SessionTokenVectorsManifest;
+
+const PLAN_05_FIXTURE_BINDING = {
+  session_id: "fixture-session",
+  study_set_id: "fixture-study-set",
+  user_id: "fixture-user",
+} as const;
+
+describe("Plan 05 session-token vectors", () => {
+  test("declares the exact read-only fixture schema and fake secret", () => {
+    expect(planFiveSessionTokenVectors.version).toBe(1);
+    expect(planFiveSessionTokenVectors.fake_secret_base64).toBe(PLAN_05_TOKEN_VECTOR_SECRET_BASE64);
+    expect([...planFiveFixtureSecretBytes()]).toEqual(
+      Array.from({ length: 32 }, (_value, index) => index),
+    );
+    expect(Number.isSafeInteger(planFiveSessionTokenVectors.clock_unix_seconds)).toBe(true);
+    expect(planFiveSessionTokenVectors.cases.length).toBeGreaterThan(0);
+    expect(new Set(planFiveSessionTokenVectors.cases.map((entry) => entry.id)).size).toBe(
+      planFiveSessionTokenVectors.cases.length,
+    );
+    expect(
+      planFiveFixtureManifest.fixtures.find(
+        (entry) => entry.id === PLAN_05_TOKEN_VECTOR_MANIFEST_ID,
+      ),
+    ).toEqual({
+      id: PLAN_05_TOKEN_VECTOR_MANIFEST_ID,
+      kind: "token_vectors",
+      path: PLAN_05_TOKEN_VECTOR_MANIFEST_PATH,
+    });
+  });
+
+  test("verifies every vector without filtering and returns the exact closed rejection", () => {
+    const secretBytes = planFiveFixtureSecretBytes();
+    const observed: Array<{ id: string; outcome: string }> = [];
+    const expected: Array<{ id: string; outcome: string }> = [];
+
+    for (const vector of planFiveSessionTokenVectors.cases) {
+      const verification = verifyVivaSessionAccessToken({
+        clockSkewSeconds: 0,
+        expectedBinding: PLAN_05_FIXTURE_BINDING,
+        now: planFiveSessionTokenVectors.clock_unix_seconds,
+        secretBytes,
+        token: vector.token,
+      });
+
+      observed.push({
+        id: vector.id,
+        outcome: verification.ok ? "valid" : verification.reason,
+      });
+      expected.push({
+        id: vector.id,
+        outcome: vector.valid ? "valid" : (vector.rejection ?? "missing_rejection"),
+      });
+
+      if (vector.valid) {
+        expect(verification.ok).toBe(true);
+        if (verification.ok) {
+          expect(verification.claims as unknown as Record<string, unknown>).toEqual(
+            vector.claims as Record<string, unknown>,
+          );
+        }
+      }
+    }
+
+    expect(observed).toEqual(expected);
+    expect(observed.length).toBe(planFiveSessionTokenVectors.cases.length);
+  });
+
+  test("mutation control: a single flipped signature byte fails verification", () => {
+    const secretBytes = planFiveFixtureSecretBytes();
+    const canonical = planFiveSessionTokenVectors.cases.find((entry) => entry.valid);
+    if (!canonical) throw new Error("fixture must contain at least one valid vector");
+
+    expect(
+      verifyVivaSessionAccessToken({
+        clockSkewSeconds: 0,
+        expectedBinding: PLAN_05_FIXTURE_BINDING,
+        now: planFiveSessionTokenVectors.clock_unix_seconds,
+        secretBytes,
+        token: canonical.token,
+      }).ok,
+    ).toBe(true);
+
+    const verification = verifyVivaSessionAccessToken({
+      clockSkewSeconds: 0,
+      expectedBinding: PLAN_05_FIXTURE_BINDING,
+      now: planFiveSessionTokenVectors.clock_unix_seconds,
+      secretBytes,
+      token: flipOneSignatureByte(canonical.token),
+    });
+
+    expect(verification).toEqual({ ok: false, reason: "invalid_signature" });
+  });
+
+  test("mutation control: a mutated fixture secret fails every valid vector", () => {
+    const mutatedSecret = planFiveFixtureSecretBytes();
+    mutatedSecret[0] = (mutatedSecret[0] ?? 0) ^ 0x01;
+
+    for (const vector of planFiveSessionTokenVectors.cases.filter((entry) => entry.valid)) {
+      expect(
+        verifyVivaSessionAccessToken({
+          clockSkewSeconds: 0,
+          expectedBinding: PLAN_05_FIXTURE_BINDING,
+          now: planFiveSessionTokenVectors.clock_unix_seconds,
+          secretBytes: mutatedSecret,
+          token: vector.token,
+        }),
+      ).toEqual({ ok: false, reason: "invalid_signature" });
+    }
+  });
+
+  test("rejects tokens beyond the bounded size before parsing", () => {
+    const canonical = planFiveSessionTokenVectors.cases.find((entry) => entry.valid);
+    if (!canonical) throw new Error("fixture must contain at least one valid vector");
+
+    expect(
+      verifyVivaSessionAccessToken({
+        clockSkewSeconds: 0,
+        expectedBinding: PLAN_05_FIXTURE_BINDING,
+        now: planFiveSessionTokenVectors.clock_unix_seconds,
+        secretBytes: planFiveFixtureSecretBytes(),
+        token: `${canonical.token}${"A".repeat(4096)}`,
+      }),
+    ).toEqual({ ok: false, reason: "malformed_json" });
+  });
+
+  test("enforces the Plan 05 window with no Node-only grace", () => {
+    const secretBytes = planFiveFixtureSecretBytes();
+    const canonical = planFiveSessionTokenVectors.cases.find((entry) => entry.valid);
+    if (!canonical) throw new Error("fixture must contain at least one valid vector");
+    const claims = canonical.claims as unknown as SessionTokenClaims;
+
+    const atNotBefore = verifyVivaSessionAccessToken({
+      clockSkewSeconds: 0,
+      expectedBinding: PLAN_05_FIXTURE_BINDING,
+      now: claims.not_before,
+      secretBytes,
+      token: canonical.token,
+    });
+    const beforeNotBefore = verifyVivaSessionAccessToken({
+      clockSkewSeconds: 0,
+      expectedBinding: PLAN_05_FIXTURE_BINDING,
+      now: claims.not_before - 1,
+      secretBytes,
+      token: canonical.token,
+    });
+    const atExpiry = verifyVivaSessionAccessToken({
+      clockSkewSeconds: 0,
+      expectedBinding: PLAN_05_FIXTURE_BINDING,
+      now: claims.expires_at,
+      secretBytes,
+      token: canonical.token,
+    });
+    const beforeExpiry = verifyVivaSessionAccessToken({
+      clockSkewSeconds: 0,
+      expectedBinding: PLAN_05_FIXTURE_BINDING,
+      now: claims.expires_at - 1,
+      secretBytes,
+      token: canonical.token,
+    });
+
+    expect(atNotBefore.ok).toBe(true);
+    expect(beforeNotBefore).toEqual({ ok: false, reason: "not_yet_valid" });
+    expect(atExpiry).toEqual({ ok: false, reason: "expired" });
+    expect(beforeExpiry.ok).toBe(true);
+  });
+});
+
+describe("Viva web credential configuration", () => {
+  beforeEach(() => {
+    console.warn = () => {};
+    resetVivaSessionMintRateLimitsForTests();
+    process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
+    process.env.VIVA_AGENT_REST_BEARER_TOKEN = "viva-fixture-legacy-rest-bearer";
+    process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = STRONG_BOOTSTRAP_SECRET;
+    process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user";
+    process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+    process.env.VIVA_VOICE_SESSION_TOKEN_SECRET = STRONG_SESSION_SECRET;
+  });
+
+  afterEach(() => {
+    console.warn = originalConsoleWarn;
+    globalThis.fetch = originalFetch;
+    resetVivaSessionMintRateLimitsForTests();
+    for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
+  });
+
+  test("rejects weak secrets across the recorded placeholder table", () => {
+    const weakValues = [
+      "secret",
+      "SECRET",
+      "Password",
+      "changeme",
+      "CHANGE-ME",
+      "placeholder",
+      "Example",
+      "TEST",
+      "<your-session-signing-secret>",
+      "<REPLACE_ME_WITH_A_REAL_SECRET_32B>",
+      "a".repeat(64),
+      "0".repeat(32),
+      "short-but-not-a-placeholder-31b",
+    ];
+
+    for (const value of weakValues) {
+      expect(validateVivaWebSecret(value).ok).toBe(false);
+    }
+    expect(validateVivaWebSecret(undefined)).toEqual({ ok: false, reason: "missing" });
+    expect(validateVivaWebSecret("   ")).toEqual({ ok: false, reason: "missing" });
+    expect(validateVivaWebSecret(STRONG_SESSION_SECRET)).toEqual({
+      ok: true,
+      value: STRONG_SESSION_SECRET,
+    });
+    expect(validateVivaWebSecret("b".repeat(600), { maxBytes: 512 })).toEqual({
+      ok: false,
+      reason: "repeated_byte",
+    });
+    expect(
+      validateVivaWebSecret(`viva-fixture-opaque-credential-${"c".repeat(600)}`, {
+        maxBytes: 512,
+      }),
+    ).toEqual({ ok: false, reason: "too_long" });
+  });
+
+  test("rejects weak secrets at the route boundary without leaking the value or env name", async () => {
+    const calls: string[] = [];
+    process.env.VIVA_VOICE_SESSION_TOKEN_SECRET = "secret";
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(500, { error: "should_not_call_agent" });
+    }) as typeof fetch;
+    const warnings: string[] = [];
+    console.warn = (message?: unknown) => {
+      warnings.push(String(message));
+    };
+
+    const response = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", {
+        session_id: "server-session",
+        session_token: signedSessionToken(
+          sessionTokenClaims({ nonce: "weak-secret-nonce" }),
+          STRONG_SESSION_SECRET,
+        ),
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      }),
+    );
+    const body = (await response.json()) as VivaSessionRouteFailureClass;
+
+    expect(response.status).toBe(503);
+    expect(body).toEqual({
+      error: "viva_session_refresh_unavailable",
+      failure_class: "session_bootstrap_failed",
+      token_refresh_outcome: "failed",
+    });
+    expect(calls).toEqual([]);
+    const evidence = `${JSON.stringify(body)}${warnings.join("")}`;
+    expect(evidence).not.toContain("secret");
+    expect(evidence).not.toContain("VIVA_VOICE_SESSION_TOKEN_SECRET");
+  });
+
+  test("accepts previous verification key during rotation without signing with it", async () => {
+    process.env.VIVA_VOICE_SESSION_TOKEN_SECRET = STRONG_SESSION_SECRET;
+    process.env.VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET = STRONG_PREVIOUS_SESSION_SECRET;
+    globalThis.fetch = (async () =>
+      jsonResponse(
+        200,
+        librarySnapshot({ resumeToken: "viva1.redacted-refresh-token" }),
+      )) as typeof fetch;
+
+    const rotated = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", {
+        session_id: "server-session",
+        session_token: signedSessionToken(
+          sessionTokenClaims({ nonce: "previous-key-nonce" }),
+          STRONG_PREVIOUS_SESSION_SECRET,
+        ),
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      }),
+    );
+    const rotatedBody = (await rotated.json()) as VivaSessionRouteOutcome;
+
+    const active = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", {
+        session_id: "server-session",
+        session_token: signedSessionToken(
+          sessionTokenClaims({ nonce: "active-key-nonce" }),
+          STRONG_SESSION_SECRET,
+        ),
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      }),
+    );
+
+    expect(rotated.status).toBe(200);
+    expect(rotatedBody.token_refresh_outcome).toBe("refreshed");
+    expect(active.status).toBe(200);
+
+    // The previous key is verify-only: it must never become the active signer.
+    process.env.VIVA_VOICE_SESSION_TOKEN_SECRET = STRONG_ROTATED_SESSION_SECRET;
+    const staleActive = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", {
+        session_id: "server-session",
+        session_token: signedSessionToken(
+          sessionTokenClaims({ nonce: "stale-active-nonce" }),
+          "viva-fixture-unrelated-signing-secret-000",
+        ),
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      }),
+    );
+    const staleBody = (await staleActive.json()) as VivaSessionRouteFailureClass;
+
+    expect(staleActive.status).toBe(401);
+    expect(staleBody).toEqual({
+      error: "session_auth_terminal",
+      failure_class: "session_auth_failure",
+      token_refresh_outcome: "terminal",
+    });
+  });
+});
+
+function planFiveFixtureSecretBytes(): Uint8Array {
+  return new Uint8Array(Buffer.from(planFiveSessionTokenVectors.fake_secret_base64, "base64"));
+}
+
+function flipOneSignatureByte(token: string): string {
+  const segments = token.split(".");
+  const signature = Buffer.from(segments[2] ?? "", "base64url");
+  signature[0] = (signature[0] ?? 0) ^ 0x01;
+  return `${segments[0]}.${segments[1]}.${signature.toString("base64url")}`;
+}
+
 function sessionRequest(
   path: string,
   body: Record<string, unknown>,
@@ -814,7 +1177,7 @@ function sessionStartPayload({
 
 function signedSessionBootstrapToken(
   claims: { session_id: string | null; study_set_id: string; user_id: string },
-  secret = "redacted-bootstrap-signing-secret",
+  secret = STRONG_BOOTSTRAP_SECRET,
 ): string {
   const body = {
     ...claims,
@@ -927,12 +1290,29 @@ function librarySnapshot({
 
 function signedSessionToken(
   claims: Record<string, unknown>,
-  secret = "redacted-session-signing-secret",
+  secret = STRONG_SESSION_SECRET,
 ): string {
   const claimsPart = Buffer.from(JSON.stringify(claims)).toString("base64url");
   const payload = `viva1.${claimsPart}`;
   const signature = createHmac("sha256", secret).update(payload).digest("base64url");
   return `${payload}.${signature}`;
+}
+
+// Independent local minting: never reuses the production verifier or signer.
+function sessionTokenClaims(
+  overrides: Partial<Record<keyof SessionTokenClaims, unknown>> = {},
+): Record<string, unknown> {
+  const issuedAt = Math.floor(Date.now() / 1000) - 60;
+  return {
+    expires_at: issuedAt + 900,
+    issued_at: issuedAt,
+    nonce: "fixture-session-nonce",
+    not_before: issuedAt,
+    session_id: "server-session",
+    study_set_id: "biology-midterm",
+    user_id: "synthetic-user",
+    ...overrides,
+  };
 }
 
 function futureUnixSeconds(): number {
