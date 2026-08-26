@@ -9164,14 +9164,10 @@ async fn websocket_brain_open_store_failure_reports_the_brains_typed_terminal_re
     send_client_frame(&mut socket, &fixture_session_config_frame()).await;
 
     // `DOMAIN-009` / `SERVICE-006`: the service reports the typed terminal reason
-    // the brain handed it and derives nothing from the store's prose. The
-    // synthetic adapter classifies a failed durable progression read as a
-    // tool-executor failure at its own tool stage, so that is what the socket
-    // truthfully reports. Recovering the durability signal across that adapter
-    // boundary is Plan 07's `ADAPTER-06` row, not a service-side
-    // reclassification; the protocol-wrapped test below is the companion proof
-    // that a brain which *does* report durability degradation reaches the wire as
-    // `durability_degraded`.
+    // the brain handed it and derives nothing from the store's prose. Since the
+    // A-20.1 node-07 appendix, the adapter preserves the store's Durability kind
+    // across the progression seam, so the brain hands the service a typed
+    // durability degradation and that is what the socket truthfully reports.
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
         TerminalSessionReason::DurabilityDegraded,
@@ -9180,7 +9176,7 @@ async fn websocket_brain_open_store_failure_reports_the_brains_typed_terminal_re
     let events = wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::TerminalReason).await;
     assert!(events.iter().any(|event| {
         event.kind == VoiceEvidenceEventKind::TerminalReason
-            && event.detail == "tool_executor_failure"
+            && event.detail == "durability_degraded"
     }));
     assert!(events
         .iter()
