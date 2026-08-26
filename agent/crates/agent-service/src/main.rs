@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use agent_service::{
     build_brain, build_router, build_study_store, validate_runtime_store_preflight, AppState,
-    ServiceConfig, VoiceDrainSignal, WsTimeouts,
+    ServiceConfig, VoiceDrainSignal,
 };
 
 const VOICE_DRAIN_GRACE_PERIOD: Duration = Duration::from_secs(2);
@@ -33,11 +33,8 @@ async fn main() -> anyhow::Result<()> {
     .with_trusted_user_id(config.trusted_user_id)
     .with_trusted_study_set_id(config.trusted_study_set_id)
     .with_trusted_session_id(config.trusted_session_id)
-    .with_ws_timeouts(WsTimeouts {
-        first_frame: WsTimeouts::default().first_frame,
-        idle: config.max_turn_duration,
-        session: config.max_session_duration,
-    })
+    .with_operator_access(config.operator_access)
+    .with_ws_timeouts(config.ws_timeouts)
     .with_turn_cap_override(config.max_turn_duration_overridden)
     .with_voice_limits(config.voice_limits)
     .with_failure_control(config.failure_control)

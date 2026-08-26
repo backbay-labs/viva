@@ -39,7 +39,7 @@ use crate::{
         ProviderQueueBehavior, VoiceLimitLease, VoiceLimitState,
     },
     config::{
-        bac_510_max_turn_duration, FailureControlScenario, SessionAuthFailureCode,
+        bac_510_max_turn_duration, FailureControlScenario, RedactedSecret, SessionAuthFailureCode,
         SessionTokenClaims, VoiceLimitConfig, VoiceWsAccessError,
     },
     protocol::{
@@ -3433,8 +3433,11 @@ fn authorize_initial_session_config(
 ) -> Result<AuthorizedInitialSessionConfig, ClientFrameError> {
     let mut rotate_trusted_session = false;
     let mut failure_control = None;
-    let (binding, token_nonce_claim) = if let Some(secret) =
-        state.ws_access.session_token_secret.as_deref()
+    let (binding, token_nonce_claim) = if let Some(secret) = state
+        .ws_access
+        .session_token_secret
+        .as_ref()
+        .map(RedactedSecret::as_str)
     {
         let token = initial.session_token.as_deref().ok_or_else(|| {
             ClientFrameError::session_auth_failed(SessionAuthFailureCode::Malformed)
@@ -5610,7 +5613,7 @@ mod tests {
             Arc::new(SyntheticBrain::default()),
             "synthetic",
             crate::VoiceWsAccess {
-                required_bearer: Some("secret".to_owned()),
+                required_bearer: Some("secret".into()),
                 session_token_secret: None,
                 allowed_origins: vec![],
             },

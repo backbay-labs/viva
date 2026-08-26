@@ -22,8 +22,9 @@ use agent_domain::{
 };
 use agent_service::{
     build_router, AppState, ClientFrame, ClientTurnIntent, FailureControlConfig,
-    FailureControlScenario, ServerFrame, VivaServerEvent, VoiceDrainSignal, VoiceEvidenceRecorder,
-    VoiceLimitConfig, VoiceServerErrorCode, VoiceWsAccess, WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
+    FailureControlScenario, OperatorAccess, ServerFrame, VivaServerEvent, VoiceDrainSignal,
+    VoiceEvidenceRecorder, VoiceLimitConfig, VoiceServerErrorCode, VoiceWsAccess, WsTimeouts,
+    VIVA_VOICE_PROTOCOL_VERSION,
 };
 use axum::{
     body::Body,
@@ -139,7 +140,7 @@ fn provider_limiter_test_state(
         provider,
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -156,8 +157,8 @@ fn test_state_with_rest_auth(
         Arc::new(SyntheticBrain::with_study_store(store.clone())),
         "synthetic",
         VoiceWsAccess {
-            required_bearer: Some("rest-secret".to_owned()),
-            session_token_secret: Some("session-secret".to_owned()),
+            required_bearer: Some("rest-secret".into()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         max_sessions,
@@ -179,7 +180,7 @@ fn test_state_with_session_token_and_store(
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some(secret.to_owned()),
+            session_token_secret: Some(secret.into()),
             allowed_origins: vec![],
         },
         1,
@@ -538,6 +539,115 @@ async fn ready_and_brain_health_routes_report_configured_synthetic_provider() {
     );
 }
 
+/// Fake, non-secret credentials for the operator route tests. They authenticate
+/// nothing outside this test binary.
+const FIXTURE_OPERATOR_CREDENTIAL: &str = "viva-fixture-operator-credential-0001";
+const FIXTURE_LIBRARY_READ_CREDENTIAL: &str = "viva-fixture-library-read-cred-000001";
+
+/// A public deployment under `D-07 TOKEN_ONLY_REFRESH`: there is no WebSocket
+/// bearer at all, so the absent-permissive WebSocket bearer check would leave
+/// readiness wide open. Readiness therefore carries its own operator credential.
+fn operator_auth_test_state() -> AppState {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(store.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".into()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    )
+    .with_operator_access(OperatorAccess::new(Some(
+        FIXTURE_OPERATOR_CREDENTIAL.into(),
+    )))
+}
+
+async fn operator_route_response(
+    app: &axum::Router,
+    path: &str,
+    authorization: Option<&str>,
+) -> (StatusCode, String) {
+    let mut request = Request::builder().uri(path);
+    if let Some(authorization) = authorization {
+        request = request.header("authorization", authorization);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn readiness_operator_auth_denies_absent_and_wrong_credentials() {
+    let app = build_router(operator_auth_test_state());
+
+    for path in ["/ready", "/health/brain"] {
+        let (status, body) = operator_route_response(&app, path, None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} admitted a request with no operator credential"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["access"]["status"],
+            "denied"
+        );
+
+        let (status, body) = operator_route_response(
+            &app,
+            path,
+            Some(&format!("Bearer {FIXTURE_LIBRARY_READ_CREDENTIAL}")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} admitted a request with the wrong operator credential"
+        );
+        assert!(!body.contains(FIXTURE_LIBRARY_READ_CREDENTIAL));
+        assert!(!body.contains(FIXTURE_OPERATOR_CREDENTIAL));
+        assert!(!body.contains("session-secret"));
+
+        let (status, body) = operator_route_response(
+            &app,
+            path,
+            Some(&format!("Bearer {FIXTURE_OPERATOR_CREDENTIAL}")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{path} rejected the configured operator credential"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["access"]["status"],
+            "allowed"
+        );
+        assert!(!body.contains(FIXTURE_OPERATOR_CREDENTIAL));
+        assert!(!body.contains("session-secret"));
+    }
+}
+
+#[tokio::test]
+async fn readiness_operator_auth_keeps_live_public_and_minimal() {
+    let app = build_router(operator_auth_test_state());
+
+    let (status, body) = operator_route_response(&app, "/live", None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed, serde_json::json!({ "live": true }));
+    assert!(!body.contains(FIXTURE_OPERATOR_CREDENTIAL));
+    assert!(!body.contains("session-secret"));
+}
+
 #[tokio::test]
 async fn readiness_routes_are_browser_readable_from_allowed_origin() {
     let origin = "http://127.0.0.1:3007";
@@ -691,19 +801,24 @@ async fn ready_route_distinguishes_dependency_failure_from_access_denial() {
     assert_eq!(payload["access"]["status"], "denied");
     assert_eq!(payload["access"]["reason"], "origin_denied");
 
+    // `SERVICE-010`: readiness denial is keyed on the operator credential, not on
+    // the WebSocket bearer, which is legitimately absent under token-only access.
     let bearer_state = AppState::with_study_store(
         Arc::new(SyntheticBrain::with_study_store(Arc::new(
             data::InMemoryStudyStore::seeded_fixture(),
         ))),
         "synthetic",
         VoiceWsAccess {
-            required_bearer: Some("rest-secret".to_owned()),
+            required_bearer: Some("rest-secret".into()),
             session_token_secret: None,
             allowed_origins: vec![],
         },
         4,
         Arc::new(data::InMemoryStudyStore::seeded_fixture()),
-    );
+    )
+    .with_operator_access(OperatorAccess::new(Some(
+        FIXTURE_OPERATOR_CREDENTIAL.into(),
+    )));
     let bearer_app = build_router(bearer_state);
     let missing_bearer = bearer_app
         .clone()
@@ -758,7 +873,7 @@ async fn paste_study_set_route_creates_server_owned_ready_set_with_session_token
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -1131,7 +1246,7 @@ async fn paste_study_set_route_does_not_mint_session_token_for_failed_ingestion(
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -1330,7 +1445,7 @@ async fn library_route_projects_server_owned_sets_and_completed_session_history(
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -1906,7 +2021,7 @@ async fn library_route_rejects_cross_user_token_minting_without_rest_auth() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -1936,7 +2051,7 @@ async fn library_route_rejects_public_unauthenticated_token_minting() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec!["https://viva.example".to_owned()],
         },
         4,
@@ -1967,8 +2082,8 @@ async fn library_route_mints_session_tokens_with_public_bearer_auth() {
         Arc::new(SyntheticBrain::with_study_store(store.clone())),
         "synthetic",
         VoiceWsAccess {
-            required_bearer: Some("rest-secret".to_owned()),
-            session_token_secret: Some("session-secret".to_owned()),
+            required_bearer: Some("rest-secret".into()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec!["https://viva.example".to_owned()],
         },
         4,
@@ -2014,7 +2129,7 @@ async fn paste_study_set_route_rejects_public_unauthenticated_token_minting() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec!["https://viva.example".to_owned()],
         },
         4,
@@ -2053,7 +2168,7 @@ async fn paste_study_set_route_rejects_public_unauthenticated_token_minting() {
             "synthetic",
             VoiceWsAccess {
                 required_bearer: None,
-                session_token_secret: Some("session-secret".to_owned()),
+                session_token_secret: Some("session-secret".into()),
                 allowed_origins: vec!["https://viva.example".to_owned()],
             },
             4,
@@ -2455,6 +2570,7 @@ async fn websocket_first_frame_timeout_records_terminal_reason() {
         first_frame: Duration::from_millis(25),
         idle: Duration::from_secs(30),
         session: Duration::from_secs(30),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -2931,7 +3047,7 @@ async fn websocket_failure_control_provider_error_does_not_backoff_normal_sessio
         "cartesia_gemini",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         2,
@@ -4191,6 +4307,7 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -4309,6 +4426,7 @@ async fn websocket_provider_queue_arms_turn_cap_while_waiting_for_admission() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -4429,6 +4547,7 @@ async fn websocket_provider_queue_rejects_audio_continuation_without_second_leas
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(200),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -4618,7 +4737,7 @@ async fn websocket_failure_control_cap_is_identity_scoped_across_study_sets() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -4732,7 +4851,7 @@ async fn websocket_failure_control_still_honors_user_total_session_cap() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -4843,7 +4962,7 @@ async fn websocket_rejects_failure_control_claim_from_wrong_origin_before_brain_
         "open_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         1,
@@ -4908,7 +5027,7 @@ async fn websocket_rejects_replayed_session_token_before_brain_open() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         2,
@@ -4975,7 +5094,7 @@ async fn websocket_records_nonce_store_errors_without_replay_auth_evidence() {
         "synthetic",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         1,
@@ -5037,7 +5156,7 @@ async fn websocket_durable_store_replay_still_reports_session_auth_failure() {
         "open_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         2,
@@ -5121,7 +5240,7 @@ async fn websocket_nonce_store_failure_emits_durability_degraded_before_brain_op
         "open_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         2,
@@ -5244,7 +5363,7 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
             "synthetic",
             VoiceWsAccess {
                 required_bearer: None,
-                session_token_secret: Some("session-secret".to_owned()),
+                session_token_secret: Some("session-secret".into()),
                 allowed_origins: vec![],
             },
             1,
@@ -5318,7 +5437,7 @@ async fn websocket_rejects_token_claim_mismatch_before_brain_open() {
             "synthetic",
             VoiceWsAccess {
                 required_bearer: None,
-                session_token_secret: Some("session-secret".to_owned()),
+                session_token_secret: Some("session-secret".into()),
                 allowed_origins: vec![],
             },
             1,
@@ -5828,6 +5947,7 @@ async fn websocket_durable_terminal_close_failure_emits_durability_degraded_term
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let drain = state.drain_signal.clone();
     let evidence = state.evidence.clone();
@@ -5887,6 +6007,7 @@ async fn websocket_client_stop_close_failure_emits_durability_degraded_terminal_
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -5951,6 +6072,7 @@ async fn websocket_peer_close_failure_records_durability_degraded_terminal_reaso
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -6090,6 +6212,7 @@ async fn websocket_drain_emits_terminal_phase_before_close() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let drain = state.drain_signal.clone();
     let evidence = state.evidence.clone();
@@ -6228,6 +6351,7 @@ async fn websocket_drain_latches_before_socket_subscribes() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let drain = state.drain_signal.clone();
     let evidence = state.evidence.clone();
@@ -6263,6 +6387,7 @@ async fn websocket_session_cap_emits_terminal_phase_before_close() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_millis(25),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -6392,7 +6517,7 @@ async fn websocket_user_study_set_rejection_releases_user_total_lease() {
         "backpressured_input_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -6642,7 +6767,7 @@ async fn websocket_default_limits_allow_different_study_sets_but_reject_duplicat
         "backpressured_input_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -6769,7 +6894,7 @@ async fn websocket_user_session_cap_allows_different_study_sets_until_user_total
         "backpressured_input_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -6887,7 +7012,7 @@ async fn websocket_user_session_cap_rejects_different_study_set_above_user_total
         "backpressured_input_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -7053,6 +7178,7 @@ async fn websocket_turn_cap_emits_terminal_phase_before_close() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -7096,6 +7222,7 @@ async fn websocket_records_configured_turn_cap_evidence() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -7128,6 +7255,7 @@ async fn websocket_turn_cap_waits_for_answer_frame() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(200),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -7178,6 +7306,7 @@ async fn websocket_post_config_idle_timeout_closes_without_answer_frame() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -7233,6 +7362,7 @@ async fn websocket_turn_cap_disarms_after_answer_resolution() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(250),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -7315,7 +7445,7 @@ async fn websocket_provider_slot_releases_on_answer_evaluated() {
         "gated_completion_provider_probe",
         VoiceWsAccess {
             required_bearer: None,
-            session_token_secret: Some("session-secret".to_owned()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec![],
         },
         4,
@@ -7607,6 +7737,7 @@ async fn websocket_audio_continuation_requires_second_lease_when_limiter_enabled
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -7671,6 +7802,7 @@ async fn websocket_audio_continuations_keep_turn_cap_with_limits(voice_limits: V
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(250),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     })
     .with_voice_limits(voice_limits);
     let Some(url) = spawn_server(state).await else {
@@ -7738,6 +7870,7 @@ async fn websocket_turn_cap_stays_armed_for_newer_submission_after_one_resolutio
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(250),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     })
     .with_voice_limits(VoiceLimitConfig {
         provider_limiter_enabled: false,
@@ -7839,6 +7972,7 @@ async fn websocket_turn_cap_dedupes_duplicate_response_resolution_ids() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     })
     .with_voice_limits(VoiceLimitConfig {
         provider_limiter_enabled: false,
@@ -7916,6 +8050,7 @@ async fn websocket_turn_cap_ignores_response_less_phase_after_new_submission() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -7991,6 +8126,7 @@ async fn websocket_turn_cap_ignores_suppressed_stale_resolution_after_new_submis
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -8065,6 +8201,7 @@ async fn websocket_turn_cap_is_not_postponed_by_provider_events() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -8124,6 +8261,7 @@ async fn websocket_extra_audio_frame_without_second_lease_closes_slow_client() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(40),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -8181,6 +8319,7 @@ async fn websocket_turn_cap_includes_backpressured_answer_send() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -8231,6 +8370,7 @@ async fn websocket_turn_cap_aborts_provider_before_stop_can_write_late_answer() 
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let evidence = state.evidence.clone();
     let Some(url) = spawn_server(state).await else {
@@ -8284,6 +8424,7 @@ async fn websocket_turn_cap_is_not_postponed_by_client_keepalives() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_millis(25),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let Some(url) = spawn_server(state).await else {
         return;
@@ -8342,6 +8483,7 @@ async fn websocket_drain_interrupts_active_provider_response() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let drain = state.drain_signal.clone();
     let evidence = state.evidence.clone();
@@ -8509,6 +8651,7 @@ async fn websocket_drain_aborts_provider_tasks_and_releases_capacity() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let drain = state.drain_signal.clone();
     let slots = state.session_slots.clone();
@@ -8553,6 +8696,7 @@ async fn websocket_drain_interrupts_backpressured_provider_input() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     })
     .with_voice_limits(VoiceLimitConfig {
         provider_limiter_enabled: false,
@@ -8603,6 +8747,7 @@ async fn websocket_disconnect_releases_backpressured_provider_input() {
         first_frame: Duration::from_secs(5),
         idle: Duration::from_secs(5),
         session: Duration::from_secs(5),
+        ..WsTimeouts::default()
     });
     let slots = state.session_slots.clone();
     let evidence = state.evidence.clone();

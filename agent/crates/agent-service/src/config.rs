@@ -1,6 +1,8 @@
 use std::{
-    env, fmt,
-    net::SocketAddr,
+    env,
+    fmt::{self, Debug, Formatter},
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -18,7 +20,205 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+use crate::app::WsTimeouts;
+
 type HmacSha256 = Hmac<Sha256>;
+
+/// The one error type every credential boundary returns. Readiness, library, and
+/// WebSocket admission all deny with the same coarse shape so a rejection never
+/// discloses which credential was offered.
+pub type AccessError = VoiceWsAccessError;
+
+/// A configured credential. The value is reachable only inside this module's
+/// verifiers; every rendering is redacted.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RedactedSecret(Arc<str>);
+
+impl Debug for RedactedSecret {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RedactedSecret([REDACTED])")
+    }
+}
+
+impl RedactedSecret {
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl From<&str> for RedactedSecret {
+    fn from(value: &str) -> Self {
+        Self(Arc::from(value))
+    }
+}
+
+impl From<String> for RedactedSecret {
+    fn from(value: String) -> Self {
+        Self(Arc::from(value.as_str()))
+    }
+}
+
+/// Operator authorization for `/ready` and `/health/brain`. It is deliberately
+/// separate from [`VoiceWsAccess`], whose bearer check succeeds when no WebSocket
+/// bearer is configured — the exact case `D-07 TOKEN_ONLY_REFRESH` makes normal.
+#[derive(Clone, Debug, Default)]
+pub struct OperatorAccess {
+    bearer: Option<RedactedSecret>,
+}
+
+impl OperatorAccess {
+    pub fn new(bearer: Option<RedactedSecret>) -> Self {
+        Self { bearer }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.bearer.is_some()
+    }
+
+    pub fn validate(&self, headers: &HeaderMap) -> Result<(), AccessError> {
+        let Some(required) = &self.bearer else {
+            return Ok(());
+        };
+        let Some(provided) = authorization_bearer_from_headers(headers) else {
+            return Err(AccessError::MissingBearer);
+        };
+        if constant_time_eq(required.as_str().as_bytes(), provided.as_bytes()) {
+            return Ok(());
+        }
+        Err(AccessError::InvalidBearer)
+    }
+}
+
+/// A canonical IPv4/IPv6 CIDR block with host bits normalized away.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IpNetwork {
+    V4 { network: u32, prefix: u8 },
+    V6 { network: u128, prefix: u8 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum IpNetworkError {
+    #[error("CIDR prefix is missing")]
+    MissingPrefix,
+    #[error("CIDR address is invalid")]
+    InvalidAddress,
+    #[error("CIDR prefix is invalid")]
+    InvalidPrefix,
+}
+
+impl FromStr for IpNetwork {
+    type Err = IpNetworkError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (address, prefix) = value.split_once('/').ok_or(IpNetworkError::MissingPrefix)?;
+        let address = address
+            .parse::<IpAddr>()
+            .map_err(|_| IpNetworkError::InvalidAddress)?;
+        let prefix = prefix
+            .parse::<u8>()
+            .map_err(|_| IpNetworkError::InvalidPrefix)?;
+        match address {
+            IpAddr::V4(address) if prefix <= 32 => Ok(Self::V4 {
+                network: u32::from(address) & ipv4_mask(prefix),
+                prefix,
+            }),
+            IpAddr::V6(address) if prefix <= 128 => Ok(Self::V6 {
+                network: u128::from(address) & ipv6_mask(prefix),
+                prefix,
+            }),
+            IpAddr::V4(_) | IpAddr::V6(_) => Err(IpNetworkError::InvalidPrefix),
+        }
+    }
+}
+
+impl IpNetwork {
+    pub fn contains(self, address: IpAddr) -> bool {
+        match (self, address) {
+            (Self::V4 { network, prefix }, IpAddr::V4(address)) => {
+                u32::from(address) & ipv4_mask(prefix) == network
+            }
+            (Self::V6 { network, prefix }, IpAddr::V6(address)) => {
+                u128::from(address) & ipv6_mask(prefix) == network
+            }
+            (Self::V4 { .. }, IpAddr::V6(_)) | (Self::V6 { .. }, IpAddr::V4(_)) => false,
+        }
+    }
+}
+
+fn ipv4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+fn ipv6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
+}
+
+/// The forwarding hops this deployment is willing to skip. Empty means forwarding
+/// headers are ignored entirely.
+#[derive(Clone, Debug)]
+pub struct TrustedProxyConfig {
+    networks: Arc<[IpNetwork]>,
+}
+
+impl Default for TrustedProxyConfig {
+    fn default() -> Self {
+        Self {
+            networks: Arc::from(Vec::new()),
+        }
+    }
+}
+
+impl TrustedProxyConfig {
+    pub fn parse(value: &str) -> Result<Self, IpNetworkError> {
+        let networks = value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(IpNetwork::from_str)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            networks: Arc::from(networks),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.networks.is_empty()
+    }
+
+    pub fn trusts(&self, address: IpAddr) -> bool {
+        self.networks
+            .iter()
+            .any(|network| network.contains(address))
+    }
+}
+
+/// The bounded retention both voice recorders are constructed with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecorderLimits {
+    pub evidence_events: usize,
+    pub usage_events: usize,
+}
+
+impl Default for RecorderLimits {
+    fn default() -> Self {
+        Self {
+            evidence_events: 4_096,
+            usage_events: 1_024,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ServiceConfig {
@@ -29,10 +229,14 @@ pub struct ServiceConfig {
     pub trusted_study_set_id: String,
     pub trusted_session_id: String,
     pub ws_access: VoiceWsAccess,
-    pub max_sessions: usize,
-    pub max_session_duration: Duration,
-    pub max_turn_duration: Duration,
+    pub operator_access: OperatorAccess,
+    pub library_read_bearer: Option<RedactedSecret>,
+    pub library_delete_bearer: Option<RedactedSecret>,
+    pub trusted_proxies: TrustedProxyConfig,
+    pub recorder_limits: RecorderLimits,
+    pub ws_timeouts: WsTimeouts,
     pub max_turn_duration_overridden: bool,
+    pub max_sessions: usize,
     pub voice_limits: VoiceLimitConfig,
     pub failure_control: FailureControlConfig,
 }
@@ -49,10 +253,14 @@ impl Default for ServiceConfig {
             trusted_study_set_id: "biology-midterm".to_owned(),
             trusted_session_id: "voice-session-1".to_owned(),
             ws_access: VoiceWsAccess::default(),
-            max_sessions: 32,
-            max_session_duration: Duration::from_secs(6 * 60 * 60),
-            max_turn_duration: bac_510_max_turn_duration(),
+            operator_access: OperatorAccess::default(),
+            library_read_bearer: None,
+            library_delete_bearer: None,
+            trusted_proxies: TrustedProxyConfig::default(),
+            recorder_limits: RecorderLimits::default(),
+            ws_timeouts: WsTimeouts::default(),
             max_turn_duration_overridden: false,
+            max_sessions: 32,
             voice_limits: VoiceLimitConfig::default(),
             failure_control: FailureControlConfig::default(),
         }
@@ -94,11 +302,71 @@ impl ServiceConfig {
             config.trusted_session_id = trusted_session_id;
         }
         if let Some(secret) = env_value("VIVA_VOICE_WS_BEARER_TOKEN") {
-            config.ws_access.required_bearer = Some(secret);
+            config.ws_access.required_bearer = Some(secret.into());
         }
         if let Some(secret) = env_value("VIVA_VOICE_SESSION_TOKEN_SECRET") {
-            config.ws_access.session_token_secret = Some(secret);
+            config.ws_access.session_token_secret = Some(secret.into());
         }
+        config.operator_access = OperatorAccess::new(
+            env_value("VIVA_AGENT_OPERATOR_BEARER_TOKEN").map(RedactedSecret::from),
+        );
+        config.library_read_bearer =
+            env_value("VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN").map(RedactedSecret::from);
+        config.library_delete_bearer =
+            env_value("VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN").map(RedactedSecret::from);
+        if let Some(cidrs) = env_value("VIVA_VOICE_WS_TRUSTED_PROXY_CIDRS") {
+            config.trusted_proxies = TrustedProxyConfig::parse(&cidrs)
+                .map_err(|_| ServiceConfigError::InvalidTrustedProxyCidr)?;
+        }
+        config.ws_timeouts.heartbeat_interval = bounded_seconds(
+            &env_value,
+            "VIVA_VOICE_WS_HEARTBEAT_SECONDS",
+            1,
+            300,
+            config.ws_timeouts.heartbeat_interval,
+        )?;
+        config.ws_timeouts.pong_timeout = bounded_seconds(
+            &env_value,
+            "VIVA_VOICE_WS_PONG_TIMEOUT_SECONDS",
+            1,
+            60,
+            config.ws_timeouts.pong_timeout,
+        )?;
+        config.ws_timeouts.between_turn_idle = bounded_seconds(
+            &env_value,
+            "VIVA_VOICE_WS_BETWEEN_TURN_IDLE_SECONDS",
+            1,
+            3_600,
+            config.ws_timeouts.between_turn_idle,
+        )?;
+        config.ws_timeouts.outbound_write = bounded_seconds(
+            &env_value,
+            "VIVA_VOICE_WS_WRITE_TIMEOUT_SECONDS",
+            1,
+            30,
+            config.ws_timeouts.outbound_write,
+        )?;
+        config.ws_timeouts.drain_grace = bounded_seconds(
+            &env_value,
+            "VIVA_VOICE_DRAIN_GRACE_SECONDS",
+            1,
+            120,
+            config.ws_timeouts.drain_grace,
+        )?;
+        config.recorder_limits.evidence_events = bounded_count(
+            &env_value,
+            "VIVA_VOICE_EVIDENCE_RETENTION_EVENTS",
+            0,
+            1_000_000,
+            config.recorder_limits.evidence_events,
+        )?;
+        config.recorder_limits.usage_events = bounded_count(
+            &env_value,
+            "VIVA_VOICE_USAGE_RETENTION_EVENTS",
+            0,
+            1_000_000,
+            config.recorder_limits.usage_events,
+        )?;
         if let Some(origins) = env_value("VIVA_VOICE_WS_ALLOWED_ORIGINS") {
             config.ws_access.allowed_origins = origins
                 .split(',')
@@ -116,13 +384,12 @@ impl ServiceConfig {
         if let Some(seconds) =
             env_value("VIVA_VOICE_WS_SESSION_SECONDS").and_then(|value| parse_positive_u64(&value))
         {
-            config.max_session_duration = Duration::from_secs(seconds);
+            config.ws_timeouts.session = Duration::from_secs(seconds);
         }
         if let Some(seconds) =
             env_value("VIVA_VOICE_WS_TURN_SECONDS").and_then(|value| parse_positive_u64(&value))
         {
-            config.max_turn_duration =
-                Duration::from_secs(seconds).min(bac_510_max_turn_duration());
+            config.ws_timeouts.idle = Duration::from_secs(seconds).min(bac_510_max_turn_duration());
             config.max_turn_duration_overridden = true;
         }
         if let Some(max_user_sessions) = env_value("VIVA_VOICE_WS_MAX_USER_SESSIONS")
@@ -176,6 +443,8 @@ impl ServiceConfig {
                 "session token signing secret required",
             ));
         }
+        self.validate_credentials()?;
+        self.validate_runtime_bounds()?;
         if self.bind_addr.ip().is_loopback() {
             return Ok(());
         }
@@ -188,8 +457,155 @@ impl ServiceConfig {
                 self.bind_addr,
             ));
         }
+        for (key, configured) in [
+            (
+                "VIVA_VOICE_SESSION_TOKEN_SECRET",
+                self.ws_access.session_token_secret.is_some(),
+            ),
+            (
+                "VIVA_AGENT_OPERATOR_BEARER_TOKEN",
+                self.operator_access.is_configured(),
+            ),
+            (
+                "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                self.library_read_bearer.is_some(),
+            ),
+            (
+                "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+                self.library_delete_bearer.is_some(),
+            ),
+        ] {
+            if !configured {
+                return Err(ServiceConfigError::PublicBindMissingCredential(
+                    key,
+                    self.bind_addr,
+                ));
+            }
+        }
         Ok(())
     }
+
+    /// Route scopes must not collapse by configuration: every configured
+    /// credential is length-bounded and byte-distinct from every other one, and a
+    /// library credential without a signing secret is startup-fatal.
+    fn validate_credentials(&self) -> Result<(), ServiceConfigError> {
+        let credentials = [
+            (
+                "VIVA_AGENT_OPERATOR_BEARER_TOKEN",
+                self.operator_access.bearer.as_ref(),
+            ),
+            (
+                "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                self.library_read_bearer.as_ref(),
+            ),
+            (
+                "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+                self.library_delete_bearer.as_ref(),
+            ),
+        ];
+        for (key, credential) in credentials {
+            if let Some(credential) = credential {
+                if credential.len() < 32 || credential.len() > 512 {
+                    return Err(ServiceConfigError::CredentialLengthOutOfRange(key));
+                }
+            }
+        }
+
+        for (key, credential) in [
+            (
+                "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                self.library_read_bearer.as_ref(),
+            ),
+            (
+                "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+                self.library_delete_bearer.as_ref(),
+            ),
+        ] {
+            if credential.is_some() && self.ws_access.session_token_secret.is_none() {
+                return Err(ServiceConfigError::LibraryBearerRequiresSessionTokenSecret(
+                    key,
+                ));
+            }
+        }
+
+        let scoped = [
+            (
+                "VIVA_VOICE_WS_BEARER_TOKEN",
+                self.ws_access.required_bearer.as_ref(),
+            ),
+            (
+                "VIVA_AGENT_OPERATOR_BEARER_TOKEN",
+                self.operator_access.bearer.as_ref(),
+            ),
+            (
+                "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                self.library_read_bearer.as_ref(),
+            ),
+            (
+                "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+                self.library_delete_bearer.as_ref(),
+            ),
+        ];
+        for (index, (left_key, left)) in scoped.iter().enumerate() {
+            for (right_key, right) in scoped.iter().skip(index + 1) {
+                if let (Some(left), Some(right)) = (left, right) {
+                    if left == right {
+                        return Err(ServiceConfigError::CredentialCollision(left_key, right_key));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Client frames cannot extend a runtime bound, so the cross-field invariants
+    /// between them are settled once, at startup.
+    fn validate_runtime_bounds(&self) -> Result<(), ServiceConfigError> {
+        if self.ws_timeouts.pong_timeout > self.ws_timeouts.heartbeat_interval {
+            return Err(ServiceConfigError::PongTimeoutExceedsHeartbeat);
+        }
+        if self.ws_timeouts.between_turn_idle >= self.ws_timeouts.session {
+            return Err(ServiceConfigError::BetweenTurnIdleNotLessThanSession);
+        }
+        Ok(())
+    }
+}
+
+/// A runtime bound expressed in seconds. An absent key keeps the default; a
+/// present key must parse and fall inside the inclusive bound or startup fails.
+fn bounded_seconds(
+    env_value: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    min: u64,
+    max: u64,
+    default: Duration,
+) -> Result<Duration, ServiceConfigError> {
+    let Some(raw) = env_value(key) else {
+        return Ok(default);
+    };
+    raw.parse::<u64>()
+        .ok()
+        .filter(|seconds| (min..=max).contains(seconds))
+        .map(Duration::from_secs)
+        .ok_or(ServiceConfigError::InvalidRuntimeBound(key))
+}
+
+/// A runtime bound expressed as a retained-event count, with the same fail-closed
+/// parse. Zero is a meaningful value: it retains no events.
+fn bounded_count(
+    env_value: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    min: usize,
+    max: usize,
+    default: usize,
+) -> Result<usize, ServiceConfigError> {
+    let Some(raw) = env_value(key) else {
+        return Ok(default);
+    };
+    raw.parse::<usize>()
+        .ok()
+        .filter(|count| (min..=max).contains(count))
+        .ok_or(ServiceConfigError::InvalidRuntimeBound(key))
 }
 
 pub(crate) fn bac_510_max_turn_duration() -> Duration {
@@ -716,12 +1132,32 @@ pub enum ServiceConfigError {
         "public signed-session mode requires nonce replay protection; configured store is `{0}`"
     )]
     NonceReplayProtectionRequiredForSignedSessions(&'static str),
+    #[error("`{0}` is not a valid integer inside its documented bound")]
+    InvalidRuntimeBound(&'static str),
+    #[error("`VIVA_VOICE_WS_TRUSTED_PROXY_CIDRS` contains an entry that is not a valid CIDR")]
+    InvalidTrustedProxyCidr,
+    #[error("public or non-loopback bind `{1}` requires `{0}`")]
+    PublicBindMissingCredential(&'static str, SocketAddr),
+    #[error("the credential configured by `{0}` must be 32-512 bytes")]
+    CredentialLengthOutOfRange(&'static str),
+    #[error("the credentials configured by `{0}` and `{1}` must not be byte-equal")]
+    CredentialCollision(&'static str, &'static str),
+    #[error("`{0}` requires `VIVA_VOICE_SESSION_TOKEN_SECRET`")]
+    LibraryBearerRequiresSessionTokenSecret(&'static str),
+    #[error(
+        "`VIVA_VOICE_WS_PONG_TIMEOUT_SECONDS` must not exceed `VIVA_VOICE_WS_HEARTBEAT_SECONDS`"
+    )]
+    PongTimeoutExceedsHeartbeat,
+    #[error(
+        "`VIVA_VOICE_WS_BETWEEN_TURN_IDLE_SECONDS` must be less than `VIVA_VOICE_WS_SESSION_SECONDS`"
+    )]
+    BetweenTurnIdleNotLessThanSession,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VoiceWsAccess {
-    pub required_bearer: Option<String>,
-    pub session_token_secret: Option<String>,
+    pub required_bearer: Option<RedactedSecret>,
+    pub session_token_secret: Option<RedactedSecret>,
     pub allowed_origins: Vec<String>,
 }
 
@@ -751,7 +1187,7 @@ impl VoiceWsAccess {
         let Some(provided) = authorization_bearer_from_headers(headers) else {
             return Err(VoiceWsAccessError::MissingBearer);
         };
-        if constant_time_eq(required.as_bytes(), provided.as_bytes()) {
+        if constant_time_eq(required.as_str().as_bytes(), provided.as_bytes()) {
             return Ok(());
         }
         Err(VoiceWsAccessError::InvalidBearer)
@@ -764,13 +1200,13 @@ impl VoiceWsAccess {
         let Some(provided) = bearer_from_headers(headers) else {
             return Err(VoiceWsAccessError::MissingBearer);
         };
-        if constant_time_eq(required.as_bytes(), provided.as_bytes()) {
+        if constant_time_eq(required.as_str().as_bytes(), provided.as_bytes()) {
             return Ok(());
         }
         if self
             .session_token_secret
-            .as_deref()
-            .and_then(|secret| SessionTokenClaims::verify(&provided, secret).ok())
+            .as_ref()
+            .and_then(|secret| SessionTokenClaims::verify(&provided, secret.as_str()).ok())
             .is_some()
         {
             return Ok(());
@@ -1005,7 +1441,7 @@ mod tests {
     #[test]
     fn validates_bearer_from_authorization_or_ws_protocol() {
         let access = VoiceWsAccess {
-            required_bearer: Some("secret".to_owned()),
+            required_bearer: Some("secret".into()),
             session_token_secret: None,
             allowed_origins: vec![],
         };
@@ -1030,8 +1466,8 @@ mod tests {
     #[test]
     fn validates_signed_session_token_protocol_when_rest_bearer_is_configured() {
         let access = VoiceWsAccess {
-            required_bearer: Some("rest-secret".to_owned()),
-            session_token_secret: Some("session-secret".to_owned()),
+            required_bearer: Some("rest-secret".into()),
+            session_token_secret: Some("session-secret".into()),
             allowed_origins: vec!["https://web.example".to_owned()],
         };
         let token = SessionTokenClaims {
@@ -1099,7 +1535,7 @@ mod tests {
     #[test]
     fn default_turn_timeout_matches_bac_510_outer_bound() {
         assert_eq!(
-            ServiceConfig::default().max_turn_duration,
+            ServiceConfig::default().ws_timeouts.idle,
             Duration::from_secs(45)
         );
     }
@@ -1107,7 +1543,7 @@ mod tests {
     #[test]
     fn default_turn_timeout_is_loaded_from_bac_510_contract() {
         assert_eq!(
-            ServiceConfig::default().max_turn_duration,
+            ServiceConfig::default().ws_timeouts.idle,
             bac_510_max_turn_duration()
         );
     }
@@ -1125,7 +1561,7 @@ mod tests {
         })
         .expect("loopback turn timeout config should validate");
 
-        assert_eq!(config.max_turn_duration, bac_510_max_turn_duration());
+        assert_eq!(config.ws_timeouts.idle, bac_510_max_turn_duration());
         assert!(config.max_turn_duration_overridden);
     }
 
@@ -1142,8 +1578,8 @@ mod tests {
         })
         .expect("loopback voice limit config should validate");
 
-        assert_eq!(config.max_session_duration, Duration::from_secs(1800));
-        assert_eq!(config.max_turn_duration, Duration::from_secs(45));
+        assert_eq!(config.ws_timeouts.session, Duration::from_secs(1800));
+        assert_eq!(config.ws_timeouts.idle, Duration::from_secs(45));
         assert!(config.max_turn_duration_overridden);
         assert_eq!(config.voice_limits.max_user_sessions, Some(2));
         assert_eq!(config.voice_limits.max_ip_sessions, Some(5));
@@ -1167,12 +1603,12 @@ mod tests {
         .expect("invalid loopback voice limit values should be ignored");
 
         assert_eq!(
-            disabled.max_session_duration,
-            ServiceConfig::default().max_session_duration
+            disabled.ws_timeouts.session,
+            ServiceConfig::default().ws_timeouts.session
         );
         assert_eq!(
-            disabled.max_turn_duration,
-            ServiceConfig::default().max_turn_duration
+            disabled.ws_timeouts.idle,
+            ServiceConfig::default().ws_timeouts.idle
         );
         assert!(!disabled.max_turn_duration_overridden);
         assert_eq!(disabled.voice_limits, VoiceLimitConfig::default());
@@ -1366,7 +1802,7 @@ mod tests {
         let bearer_only = ServiceConfig {
             bind_addr,
             ws_access: VoiceWsAccess {
-                required_bearer: Some("secret".to_owned()),
+                required_bearer: Some("secret".into()),
                 session_token_secret: None,
                 allowed_origins: vec![],
             },
@@ -1380,16 +1816,38 @@ mod tests {
         );
     }
 
+    /// `SERVICE-010` tightened this case: a non-loopback bind now additionally
+    /// requires the session-token signing secret and the three scoped operator and
+    /// library credentials, so the WebSocket bearer alone no longer validates.
     #[test]
     fn service_config_validation_accepts_public_bind_with_bearer_and_origins() {
-        let config = ServiceConfig {
+        let bearer_only = ServiceConfig {
             bind_addr: "0.0.0.0:4318".parse().expect("valid public bind"),
             ws_access: VoiceWsAccess {
-                required_bearer: Some("secret".to_owned()),
+                required_bearer: Some(FIXTURE_WS_CREDENTIAL.into()),
                 session_token_secret: None,
                 allowed_origins: vec!["https://app.example".to_owned()],
             },
             ..ServiceConfig::default()
+        };
+
+        assert_eq!(
+            bearer_only.validate(),
+            Err(ServiceConfigError::PublicBindMissingCredential(
+                "VIVA_VOICE_SESSION_TOKEN_SECRET",
+                "0.0.0.0:4318".parse().expect("valid public bind")
+            ))
+        );
+
+        let config = ServiceConfig {
+            operator_access: OperatorAccess::new(Some(FIXTURE_OPERATOR_CREDENTIAL.into())),
+            library_read_bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL.into()),
+            library_delete_bearer: Some(FIXTURE_LIBRARY_DELETE_CREDENTIAL.into()),
+            ws_access: VoiceWsAccess {
+                session_token_secret: Some(FIXTURE_SESSION_SIGNING_SECRET.into()),
+                ..bearer_only.ws_access.clone()
+            },
+            ..bearer_only
         };
 
         assert_eq!(config.validate(), Ok(()));
@@ -1411,17 +1869,25 @@ mod tests {
 
         let config = ServiceConfig::from_env_with(|name| match name {
             "VIVA_AGENT_BIND_ADDR" => Some("0.0.0.0:4318".to_owned()),
-            "VIVA_VOICE_WS_BEARER_TOKEN" => Some("secret".to_owned()),
+            "VIVA_VOICE_WS_BEARER_TOKEN" => Some(FIXTURE_WS_CREDENTIAL.to_owned()),
             "VIVA_VOICE_WS_ALLOWED_ORIGINS" => Some("https://app.example".to_owned()),
+            "VIVA_VOICE_SESSION_TOKEN_SECRET" => Some(FIXTURE_SESSION_SIGNING_SECRET.to_owned()),
+            "VIVA_AGENT_OPERATOR_BEARER_TOKEN" => Some(FIXTURE_OPERATOR_CREDENTIAL.to_owned()),
+            "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN" => {
+                Some(FIXTURE_LIBRARY_READ_CREDENTIAL.to_owned())
+            }
+            "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN" => {
+                Some(FIXTURE_LIBRARY_DELETE_CREDENTIAL.to_owned())
+            }
             _ => None,
         })
-        .expect("public bind with bearer and origins should validate");
+        .expect("public bind with every scoped credential should validate");
 
         assert_eq!(
             config.bind_addr,
             "0.0.0.0:4318".parse().expect("valid public bind")
         );
-        assert_eq!(config.ws_access.required_bearer, Some("secret".to_owned()));
+        assert!(config.ws_access.required_bearer.is_some());
         assert_eq!(
             config.ws_access.allowed_origins,
             vec!["https://app.example".to_owned()]
@@ -1434,9 +1900,12 @@ mod tests {
             bind_addr: "0.0.0.0:4318".parse().expect("valid public bind"),
             ws_access: VoiceWsAccess {
                 required_bearer: None,
-                session_token_secret: Some("session-secret".to_owned()),
+                session_token_secret: Some(FIXTURE_SESSION_SIGNING_SECRET.into()),
                 allowed_origins: vec!["https://app.example".to_owned()],
             },
+            operator_access: OperatorAccess::new(Some(FIXTURE_OPERATOR_CREDENTIAL.into())),
+            library_read_bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL.into()),
+            library_delete_bearer: Some(FIXTURE_LIBRARY_DELETE_CREDENTIAL.into()),
             ..ServiceConfig::default()
         };
 
@@ -1448,10 +1917,13 @@ mod tests {
         let config = ServiceConfig {
             bind_addr: "0.0.0.0:4318".parse().expect("valid public bind"),
             ws_access: VoiceWsAccess {
-                required_bearer: Some("secret".to_owned()),
-                session_token_secret: Some("session-secret".to_owned()),
+                required_bearer: Some(FIXTURE_WS_CREDENTIAL.into()),
+                session_token_secret: Some(FIXTURE_SESSION_SIGNING_SECRET.into()),
                 allowed_origins: vec!["https://app.example".to_owned()],
             },
+            operator_access: OperatorAccess::new(Some(FIXTURE_OPERATOR_CREDENTIAL.into())),
+            library_read_bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL.into()),
+            library_delete_bearer: Some(FIXTURE_LIBRARY_DELETE_CREDENTIAL.into()),
             ..ServiceConfig::default()
         };
 
@@ -1632,7 +2104,7 @@ mod tests {
             bind_addr: "0.0.0.0:4318".parse().expect("bind parses"),
             ws_access: VoiceWsAccess {
                 required_bearer: None,
-                session_token_secret: Some("session-secret".to_owned()),
+                session_token_secret: Some("session-secret".into()),
                 allowed_origins: vec!["https://viva.example.com".to_owned()],
             },
             ..ServiceConfig::default()
@@ -1654,7 +2126,7 @@ mod tests {
             bind_addr: "127.0.0.1:4318".parse().expect("bind parses"),
             ws_access: VoiceWsAccess {
                 required_bearer: None,
-                session_token_secret: Some("session-secret".to_owned()),
+                session_token_secret: Some("session-secret".into()),
                 allowed_origins: vec!["http://localhost:3000".to_owned()],
             },
             ..ServiceConfig::default()
@@ -1676,7 +2148,7 @@ mod tests {
             bind_addr: "127.0.0.1:4318".parse().expect("bind parses"),
             ws_access: VoiceWsAccess {
                 required_bearer: None,
-                session_token_secret: Some("session-secret".to_owned()),
+                session_token_secret: Some("session-secret".into()),
                 allowed_origins: vec!["http://localhost:3000".to_owned()],
             },
             failure_control: FailureControlConfig::enabled_for_synthetic_identities(
@@ -1694,5 +2166,609 @@ mod tests {
 
         validate_runtime_store_preflight(&config, &store.capabilities())
             .expect("loopback failure-control browser evidence may use the local fixture store");
+    }
+
+    /// Fake, non-secret credentials used only to exercise the length and
+    /// distinctness rules. They are literals in a test module, never values that
+    /// authenticate anything.
+    const FIXTURE_OPERATOR_CREDENTIAL: &str = "viva-fixture-operator-credential-0001";
+    const FIXTURE_LIBRARY_READ_CREDENTIAL: &str = "viva-fixture-library-read-cred-000001";
+    const FIXTURE_LIBRARY_DELETE_CREDENTIAL: &str = "viva-fixture-library-delete-cred-0001";
+    const FIXTURE_WS_CREDENTIAL: &str = "viva-fixture-websocket-cred-00000001";
+    const FIXTURE_SESSION_SIGNING_SECRET: &str = "viva-fixture-session-signing-secret01";
+    const FIXTURE_PUBLIC_BIND: &str = "203.0.113.10:4318";
+    const FIXTURE_ALLOWED_ORIGIN: &str = "https://app.example";
+    const FIXTURE_CREDENTIAL_31_BYTES: &str = "vivafixturecredentialtooshort31";
+    const FIXTURE_CREDENTIAL_32_BYTES: &str = "vivafixturecredentialexactly0032";
+
+    fn config_from(
+        pairs: Vec<(&'static str, &'static str)>,
+    ) -> Result<ServiceConfig, ServiceConfigError> {
+        ServiceConfig::from_env_with(move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
+    }
+
+    fn public_base_env() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("VIVA_AGENT_BIND_ADDR", FIXTURE_PUBLIC_BIND),
+            ("VIVA_VOICE_WS_ALLOWED_ORIGINS", FIXTURE_ALLOWED_ORIGIN),
+            ("VIVA_VOICE_WS_BEARER_TOKEN", FIXTURE_WS_CREDENTIAL),
+            (
+                "VIVA_VOICE_SESSION_TOKEN_SECRET",
+                FIXTURE_SESSION_SIGNING_SECRET,
+            ),
+            (
+                "VIVA_AGENT_OPERATOR_BEARER_TOKEN",
+                FIXTURE_OPERATOR_CREDENTIAL,
+            ),
+            (
+                "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                FIXTURE_LIBRARY_READ_CREDENTIAL,
+            ),
+            (
+                "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+                FIXTURE_LIBRARY_DELETE_CREDENTIAL,
+            ),
+        ]
+    }
+
+    fn public_env(
+        overrides: &[(&'static str, Option<&'static str>)],
+    ) -> Vec<(&'static str, &'static str)> {
+        let mut env = public_base_env();
+        for (key, value) in overrides {
+            env.retain(|(existing, _)| existing != key);
+            if let Some(value) = value {
+                env.push((key, value));
+            }
+        }
+        env
+    }
+
+    /// One accepted row of the runtime-bound table: a label, the environment it
+    /// supplies, and the parsed value it must produce.
+    type AcceptedBoundCase = (
+        &'static str,
+        Vec<(&'static str, &'static str)>,
+        fn(&ServiceConfig) -> bool,
+    );
+
+    /// One rejected row: a label, the environment it supplies, and the exact
+    /// startup-fatal error it must produce.
+    type RejectedBoundCase = (
+        &'static str,
+        Vec<(&'static str, &'static str)>,
+        ServiceConfigError,
+    );
+
+    fn public_bind_addr() -> SocketAddr {
+        FIXTURE_PUBLIC_BIND.parse().expect("valid public bind")
+    }
+
+    /// `SERVICE-010`: every runtime bound and operator credential is validated at
+    /// startup. The table walks each key's default, minimum, maximum, one step
+    /// outside each bound, an unparsable value, the cross-field invariants, and the
+    /// non-loopback credential requirements.
+    #[test]
+    fn runtime_bounds() {
+        let defaults = config_from(vec![]).expect("loopback defaults validate");
+
+        assert_eq!(
+            defaults.ws_timeouts,
+            WsTimeouts {
+                first_frame: Duration::from_secs(10),
+                idle: bac_510_max_turn_duration(),
+                between_turn_idle: Duration::from_secs(600),
+                session: Duration::from_secs(21_600),
+                heartbeat_interval: Duration::from_secs(30),
+                pong_timeout: Duration::from_secs(10),
+                outbound_write: Duration::from_secs(5),
+                drain_grace: Duration::from_secs(20),
+            }
+        );
+        assert_eq!(
+            defaults.recorder_limits,
+            RecorderLimits {
+                evidence_events: 4_096,
+                usage_events: 1_024,
+            }
+        );
+        assert!(defaults.trusted_proxies.is_empty());
+        assert!(!defaults.operator_access.is_configured());
+        assert!(defaults.library_read_bearer.is_none());
+        assert!(defaults.library_delete_bearer.is_none());
+        assert!(!defaults.max_turn_duration_overridden);
+
+        let accepted: Vec<AcceptedBoundCase> = vec![
+            (
+                "heartbeat minimum",
+                vec![
+                    ("VIVA_VOICE_WS_HEARTBEAT_SECONDS", "1"),
+                    ("VIVA_VOICE_WS_PONG_TIMEOUT_SECONDS", "1"),
+                ],
+                |config| {
+                    config.ws_timeouts.heartbeat_interval == Duration::from_secs(1)
+                        && config.ws_timeouts.pong_timeout == Duration::from_secs(1)
+                },
+            ),
+            (
+                "heartbeat maximum",
+                vec![("VIVA_VOICE_WS_HEARTBEAT_SECONDS", "300")],
+                |config| config.ws_timeouts.heartbeat_interval == Duration::from_secs(300),
+            ),
+            (
+                "pong minimum",
+                vec![("VIVA_VOICE_WS_PONG_TIMEOUT_SECONDS", "1")],
+                |config| config.ws_timeouts.pong_timeout == Duration::from_secs(1),
+            ),
+            (
+                "pong maximum",
+                vec![
+                    ("VIVA_VOICE_WS_HEARTBEAT_SECONDS", "300"),
+                    ("VIVA_VOICE_WS_PONG_TIMEOUT_SECONDS", "60"),
+                ],
+                |config| config.ws_timeouts.pong_timeout == Duration::from_secs(60),
+            ),
+            (
+                "between-turn idle minimum",
+                vec![("VIVA_VOICE_WS_BETWEEN_TURN_IDLE_SECONDS", "1")],
+                |config| config.ws_timeouts.between_turn_idle == Duration::from_secs(1),
+            ),
+            (
+                "between-turn idle maximum",
+                vec![("VIVA_VOICE_WS_BETWEEN_TURN_IDLE_SECONDS", "3600")],
+                |config| config.ws_timeouts.between_turn_idle == Duration::from_secs(3_600),
+            ),
+            (
+                "outbound write minimum",
+                vec![("VIVA_VOICE_WS_WRITE_TIMEOUT_SECONDS", "1")],
+                |config| config.ws_timeouts.outbound_write == Duration::from_secs(1),
+            ),
+            (
+                "outbound write maximum",
+                vec![("VIVA_VOICE_WS_WRITE_TIMEOUT_SECONDS", "30")],
+                |config| config.ws_timeouts.outbound_write == Duration::from_secs(30),
+            ),
+            (
+                "drain grace minimum",
+                vec![("VIVA_VOICE_DRAIN_GRACE_SECONDS", "1")],
+                |config| config.ws_timeouts.drain_grace == Duration::from_secs(1),
+            ),
+            (
+                "drain grace maximum",
+                vec![("VIVA_VOICE_DRAIN_GRACE_SECONDS", "120")],
+                |config| config.ws_timeouts.drain_grace == Duration::from_secs(120),
+            ),
+            (
+                "evidence retention zero",
+                vec![("VIVA_VOICE_EVIDENCE_RETENTION_EVENTS", "0")],
+                |config| config.recorder_limits.evidence_events == 0,
+            ),
+            (
+                "evidence retention maximum",
+                vec![("VIVA_VOICE_EVIDENCE_RETENTION_EVENTS", "1000000")],
+                |config| config.recorder_limits.evidence_events == 1_000_000,
+            ),
+            (
+                "usage retention zero",
+                vec![("VIVA_VOICE_USAGE_RETENTION_EVENTS", "0")],
+                |config| config.recorder_limits.usage_events == 0,
+            ),
+            (
+                "usage retention maximum",
+                vec![("VIVA_VOICE_USAGE_RETENTION_EVENTS", "1000000")],
+                |config| config.recorder_limits.usage_events == 1_000_000,
+            ),
+            (
+                "trusted proxy CIDR list",
+                vec![(
+                    "VIVA_VOICE_WS_TRUSTED_PROXY_CIDRS",
+                    " 10.0.0.0/8 , 2001:db8::/32 ",
+                )],
+                |config| {
+                    config
+                        .trusted_proxies
+                        .trusts("10.9.8.7".parse().expect("ipv4"))
+                        && config
+                            .trusted_proxies
+                            .trusts("2001:db8::1".parse().expect("ipv6"))
+                        && !config
+                            .trusted_proxies
+                            .trusts("11.0.0.1".parse().expect("ipv4"))
+                        && !config
+                            .trusted_proxies
+                            .trusts("2001:db9::1".parse().expect("ipv6"))
+                },
+            ),
+            (
+                "session lifetime override",
+                vec![("VIVA_VOICE_WS_SESSION_SECONDS", "1800")],
+                |config| config.ws_timeouts.session == Duration::from_secs(1_800),
+            ),
+            (
+                "turn deadline override below the BAC-510 cap",
+                vec![("VIVA_VOICE_WS_TURN_SECONDS", "30")],
+                |config| {
+                    config.ws_timeouts.idle == Duration::from_secs(30)
+                        && config.max_turn_duration_overridden
+                },
+            ),
+            (
+                "turn deadline override capped at the BAC-510 outer bound",
+                vec![("VIVA_VOICE_WS_TURN_SECONDS", "120")],
+                |config| {
+                    config.ws_timeouts.idle == bac_510_max_turn_duration()
+                        && config.max_turn_duration_overridden
+                },
+            ),
+            (
+                "between-turn idle one second below the session lifetime",
+                vec![
+                    ("VIVA_VOICE_WS_SESSION_SECONDS", "600"),
+                    ("VIVA_VOICE_WS_BETWEEN_TURN_IDLE_SECONDS", "599"),
+                ],
+                |config| {
+                    config.ws_timeouts.between_turn_idle == Duration::from_secs(599)
+                        && config.ws_timeouts.session == Duration::from_secs(600)
+                },
+            ),
+            (
+                "non-loopback bind with every required distinct credential",
+                public_base_env(),
+                |config| {
+                    config.bind_addr == "203.0.113.10:4318".parse().expect("valid public bind")
+                        && config.operator_access.is_configured()
+                        && config.library_read_bearer.is_some()
+                        && config.library_delete_bearer.is_some()
+                },
+            ),
+            (
+                "operator credential at the 32-byte minimum",
+                public_env(&[(
+                    "VIVA_AGENT_OPERATOR_BEARER_TOKEN",
+                    Some(FIXTURE_CREDENTIAL_32_BYTES),
+                )]),
+                |config| config.operator_access.is_configured(),
+            ),
+        ];
+
+        for (name, env, check) in accepted {
+            let config =
+                config_from(env).unwrap_or_else(|error| panic!("{name} should validate: {error}"));
+            assert!(check(&config), "{name} parsed the wrong runtime bound");
+        }
+
+        let rejected: Vec<RejectedBoundCase> = vec![
+            (
+                "heartbeat below the minimum",
+                vec![("VIVA_VOICE_WS_HEARTBEAT_SECONDS", "0")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_WS_HEARTBEAT_SECONDS"),
+            ),
+            (
+                "heartbeat above the maximum",
+                vec![("VIVA_VOICE_WS_HEARTBEAT_SECONDS", "301")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_WS_HEARTBEAT_SECONDS"),
+            ),
+            (
+                "heartbeat is not a number",
+                vec![("VIVA_VOICE_WS_HEARTBEAT_SECONDS", "thirty")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_WS_HEARTBEAT_SECONDS"),
+            ),
+            (
+                "pong below the minimum",
+                vec![("VIVA_VOICE_WS_PONG_TIMEOUT_SECONDS", "0")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_WS_PONG_TIMEOUT_SECONDS"),
+            ),
+            (
+                "pong above the maximum",
+                vec![("VIVA_VOICE_WS_PONG_TIMEOUT_SECONDS", "61")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_WS_PONG_TIMEOUT_SECONDS"),
+            ),
+            (
+                "pong is not a number",
+                vec![("VIVA_VOICE_WS_PONG_TIMEOUT_SECONDS", "-1")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_WS_PONG_TIMEOUT_SECONDS"),
+            ),
+            (
+                "pong greater than the heartbeat interval",
+                vec![
+                    ("VIVA_VOICE_WS_HEARTBEAT_SECONDS", "10"),
+                    ("VIVA_VOICE_WS_PONG_TIMEOUT_SECONDS", "11"),
+                ],
+                ServiceConfigError::PongTimeoutExceedsHeartbeat,
+            ),
+            (
+                "between-turn idle below the minimum",
+                vec![("VIVA_VOICE_WS_BETWEEN_TURN_IDLE_SECONDS", "0")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_WS_BETWEEN_TURN_IDLE_SECONDS"),
+            ),
+            (
+                "between-turn idle above the maximum",
+                vec![("VIVA_VOICE_WS_BETWEEN_TURN_IDLE_SECONDS", "3601")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_WS_BETWEEN_TURN_IDLE_SECONDS"),
+            ),
+            (
+                "between-turn idle equal to the session lifetime",
+                vec![
+                    ("VIVA_VOICE_WS_SESSION_SECONDS", "600"),
+                    ("VIVA_VOICE_WS_BETWEEN_TURN_IDLE_SECONDS", "600"),
+                ],
+                ServiceConfigError::BetweenTurnIdleNotLessThanSession,
+            ),
+            (
+                "outbound write below the minimum",
+                vec![("VIVA_VOICE_WS_WRITE_TIMEOUT_SECONDS", "0")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_WS_WRITE_TIMEOUT_SECONDS"),
+            ),
+            (
+                "outbound write above the maximum",
+                vec![("VIVA_VOICE_WS_WRITE_TIMEOUT_SECONDS", "31")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_WS_WRITE_TIMEOUT_SECONDS"),
+            ),
+            (
+                "drain grace below the minimum",
+                vec![("VIVA_VOICE_DRAIN_GRACE_SECONDS", "0")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_DRAIN_GRACE_SECONDS"),
+            ),
+            (
+                "drain grace above the maximum",
+                vec![("VIVA_VOICE_DRAIN_GRACE_SECONDS", "121")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_DRAIN_GRACE_SECONDS"),
+            ),
+            (
+                "evidence retention above the maximum",
+                vec![("VIVA_VOICE_EVIDENCE_RETENTION_EVENTS", "1000001")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_EVIDENCE_RETENTION_EVENTS"),
+            ),
+            (
+                "evidence retention is not a number",
+                vec![("VIVA_VOICE_EVIDENCE_RETENTION_EVENTS", "-1")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_EVIDENCE_RETENTION_EVENTS"),
+            ),
+            (
+                "usage retention above the maximum",
+                vec![("VIVA_VOICE_USAGE_RETENTION_EVENTS", "1000001")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_USAGE_RETENTION_EVENTS"),
+            ),
+            (
+                "usage retention is not a number",
+                vec![("VIVA_VOICE_USAGE_RETENTION_EVENTS", "many")],
+                ServiceConfigError::InvalidRuntimeBound("VIVA_VOICE_USAGE_RETENTION_EVENTS"),
+            ),
+            (
+                "trusted proxy CIDR without a prefix",
+                vec![("VIVA_VOICE_WS_TRUSTED_PROXY_CIDRS", "10.0.0.0")],
+                ServiceConfigError::InvalidTrustedProxyCidr,
+            ),
+            (
+                "trusted proxy CIDR with an out-of-range prefix",
+                vec![("VIVA_VOICE_WS_TRUSTED_PROXY_CIDRS", "10.0.0.0/33")],
+                ServiceConfigError::InvalidTrustedProxyCidr,
+            ),
+            (
+                "trusted proxy CIDR with an unparsable address",
+                vec![(
+                    "VIVA_VOICE_WS_TRUSTED_PROXY_CIDRS",
+                    "10.0.0.0/8,not-an-ip/8",
+                )],
+                ServiceConfigError::InvalidTrustedProxyCidr,
+            ),
+            (
+                "non-loopback bind without an operator credential",
+                public_env(&[("VIVA_AGENT_OPERATOR_BEARER_TOKEN", None)]),
+                ServiceConfigError::PublicBindMissingCredential(
+                    "VIVA_AGENT_OPERATOR_BEARER_TOKEN",
+                    public_bind_addr(),
+                ),
+            ),
+            (
+                "non-loopback bind without a library read credential",
+                public_env(&[("VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN", None)]),
+                ServiceConfigError::PublicBindMissingCredential(
+                    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                    public_bind_addr(),
+                ),
+            ),
+            (
+                "non-loopback bind without a library delete credential",
+                public_env(&[("VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN", None)]),
+                ServiceConfigError::PublicBindMissingCredential(
+                    "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+                    public_bind_addr(),
+                ),
+            ),
+            (
+                "non-loopback bind without a session-token signing secret",
+                public_env(&[("VIVA_VOICE_SESSION_TOKEN_SECRET", None)]),
+                ServiceConfigError::LibraryBearerRequiresSessionTokenSecret(
+                    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                ),
+            ),
+            (
+                "operator credential one byte below the minimum",
+                public_env(&[(
+                    "VIVA_AGENT_OPERATOR_BEARER_TOKEN",
+                    Some(FIXTURE_CREDENTIAL_31_BYTES),
+                )]),
+                ServiceConfigError::CredentialLengthOutOfRange("VIVA_AGENT_OPERATOR_BEARER_TOKEN"),
+            ),
+            (
+                "library read credential one byte below the minimum",
+                public_env(&[(
+                    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                    Some(FIXTURE_CREDENTIAL_31_BYTES),
+                )]),
+                ServiceConfigError::CredentialLengthOutOfRange(
+                    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                ),
+            ),
+            (
+                "library delete credential one byte below the minimum",
+                public_env(&[(
+                    "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+                    Some(FIXTURE_CREDENTIAL_31_BYTES),
+                )]),
+                ServiceConfigError::CredentialLengthOutOfRange(
+                    "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+                ),
+            ),
+            (
+                "operator credential byte-equal to the library read credential",
+                public_env(&[(
+                    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                    Some(FIXTURE_OPERATOR_CREDENTIAL),
+                )]),
+                ServiceConfigError::CredentialCollision(
+                    "VIVA_AGENT_OPERATOR_BEARER_TOKEN",
+                    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                ),
+            ),
+            (
+                "library delete credential byte-equal to the library read credential",
+                public_env(&[(
+                    "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+                    Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                )]),
+                ServiceConfigError::CredentialCollision(
+                    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                    "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+                ),
+            ),
+            (
+                "library delete credential byte-equal to the websocket credential",
+                public_env(&[(
+                    "VIVA_VOICE_WS_BEARER_TOKEN",
+                    Some(FIXTURE_LIBRARY_DELETE_CREDENTIAL),
+                )]),
+                ServiceConfigError::CredentialCollision(
+                    "VIVA_VOICE_WS_BEARER_TOKEN",
+                    "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+                ),
+            ),
+            (
+                "library credential on loopback without a session-token signing secret",
+                vec![(
+                    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                    FIXTURE_LIBRARY_READ_CREDENTIAL,
+                )],
+                ServiceConfigError::LibraryBearerRequiresSessionTokenSecret(
+                    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                ),
+            ),
+        ];
+
+        for (name, env, expected) in rejected {
+            let error = config_from(env)
+                .map(|_| ())
+                .expect_err(&format!("{name} must be startup-fatal"));
+            assert_eq!(error, expected, "{name} returned the wrong error");
+        }
+    }
+
+    /// A redacting `Debug` is the only rendering of a configured credential.
+    #[test]
+    fn runtime_credentials_render_redacted() {
+        let config = config_from(public_base_env()).expect("public bind config validates");
+
+        let rendered = format!("{config:?}");
+        for credential in [
+            FIXTURE_OPERATOR_CREDENTIAL,
+            FIXTURE_LIBRARY_READ_CREDENTIAL,
+            FIXTURE_LIBRARY_DELETE_CREDENTIAL,
+            FIXTURE_WS_CREDENTIAL,
+            FIXTURE_SESSION_SIGNING_SECRET,
+        ] {
+            assert!(
+                !rendered.contains(credential),
+                "configuration Debug output must never render a credential"
+            );
+        }
+        assert!(rendered.contains("RedactedSecret([REDACTED])"));
+    }
+
+    /// The operator credential is checked independently of the WebSocket bearer,
+    /// which intentionally succeeds when no WebSocket bearer is configured.
+    #[test]
+    fn operator_access_validates_independently_of_the_websocket_bearer() {
+        let config = config_from(public_env(&[("VIVA_VOICE_WS_BEARER_TOKEN", None)]))
+            .expect("token-only public bind validates");
+        let mut headers = HeaderMap::new();
+
+        assert_eq!(
+            config.ws_access.validate_bearer_headers(&headers),
+            Ok(()),
+            "the websocket bearer check is absent-permissive by design"
+        );
+        assert_eq!(
+            config.operator_access.validate(&headers),
+            Err(VoiceWsAccessError::MissingBearer)
+        );
+
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {FIXTURE_LIBRARY_READ_CREDENTIAL}"))
+                .expect("header is valid"),
+        );
+        assert_eq!(
+            config.operator_access.validate(&headers),
+            Err(VoiceWsAccessError::InvalidBearer)
+        );
+
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {FIXTURE_OPERATOR_CREDENTIAL}"))
+                .expect("header is valid"),
+        );
+        assert_eq!(config.operator_access.validate(&headers), Ok(()));
+    }
+
+    /// `IpNetwork` parses canonical CIDR strings, normalizes host bits, and never
+    /// matches across address families.
+    #[test]
+    fn ip_networks_normalize_host_bits_and_stay_family_scoped() {
+        let v4: IpNetwork = "10.1.2.3/8".parse().expect("ipv4 CIDR parses");
+        assert_eq!(
+            v4,
+            IpNetwork::V4 {
+                network: u32::from("10.0.0.0".parse::<std::net::Ipv4Addr>().expect("ipv4")),
+                prefix: 8,
+            }
+        );
+        assert!(v4.contains("10.255.255.255".parse().expect("ipv4")));
+        assert!(!v4.contains("11.0.0.0".parse().expect("ipv4")));
+        assert!(!v4.contains("::1".parse().expect("ipv6")));
+
+        let v6: IpNetwork = "2001:db8::dead:beef/32".parse().expect("ipv6 CIDR parses");
+        assert!(v6.contains("2001:db8:ffff::1".parse().expect("ipv6")));
+        assert!(!v6.contains("2001:db9::1".parse().expect("ipv6")));
+        assert!(!v6.contains("10.0.0.1".parse().expect("ipv4")));
+
+        let any_v4: IpNetwork = "0.0.0.0/0".parse().expect("zero prefix parses");
+        assert!(any_v4.contains("198.51.100.7".parse().expect("ipv4")));
+
+        assert_eq!(
+            "10.0.0.0".parse::<IpNetwork>(),
+            Err(IpNetworkError::MissingPrefix)
+        );
+        assert_eq!(
+            "not-an-ip/8".parse::<IpNetwork>(),
+            Err(IpNetworkError::InvalidAddress)
+        );
+        assert_eq!(
+            "10.0.0.0/many".parse::<IpNetwork>(),
+            Err(IpNetworkError::InvalidPrefix)
+        );
+        assert_eq!(
+            "10.0.0.0/33".parse::<IpNetwork>(),
+            Err(IpNetworkError::InvalidPrefix)
+        );
+        assert_eq!(
+            "2001:db8::/129".parse::<IpNetwork>(),
+            Err(IpNetworkError::InvalidPrefix)
+        );
     }
 }

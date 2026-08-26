@@ -9,9 +9,10 @@ pub use app::{
     build_router, AppState, VoiceDrainSignal, VoiceEvidenceRecorder, VoiceUsageRecorder, WsTimeouts,
 };
 pub use config::{
-    build_brain, build_study_store, validate_runtime_store_preflight, FailureControlConfig,
-    FailureControlScenario, RealtimeProvider, ServiceConfig, ServiceConfigError, VoiceLimitConfig,
-    VoiceWsAccess,
+    build_brain, build_study_store, validate_runtime_store_preflight, AccessError,
+    FailureControlConfig, FailureControlScenario, IpNetwork, IpNetworkError, OperatorAccess,
+    RealtimeProvider, RecorderLimits, RedactedSecret, ServiceConfig, ServiceConfigError,
+    TrustedProxyConfig, VoiceLimitConfig, VoiceWsAccess,
 };
 pub use protocol::{
     classify_voice_termination, negotiate_voice_protocol_version, parse_client_frame_json,

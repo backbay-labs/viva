@@ -29,7 +29,8 @@ use uuid::Uuid;
 use crate::{
     config::{
         bac_510_max_turn_duration, FailureControlClaim, FailureControlClaimRequest,
-        FailureControlConfig, SessionTokenClaims, VoiceLimitConfig, VoiceWsAccess,
+        FailureControlConfig, OperatorAccess, RedactedSecret, SessionTokenClaims, VoiceLimitConfig,
+        VoiceWsAccess,
     },
     ws::voice_ws,
 };
@@ -44,6 +45,7 @@ pub struct AppState {
     pub trusted_session_id: String,
     pub trusted_session_sequence: Arc<AtomicU64>,
     pub ws_access: VoiceWsAccess,
+    pub operator_access: OperatorAccess,
     pub session_slots: Arc<Semaphore>,
     pub ws_timeouts: WsTimeouts,
     pub turn_cap_override: bool,
@@ -88,6 +90,7 @@ impl AppState {
             trusted_session_id: "voice-session-1".to_owned(),
             trusted_session_sequence: Arc::new(AtomicU64::new(0)),
             ws_access,
+            operator_access: OperatorAccess::default(),
             session_slots: Arc::new(Semaphore::new(max_sessions)),
             ws_timeouts: WsTimeouts::default(),
             turn_cap_override: false,
@@ -127,6 +130,11 @@ impl AppState {
     pub fn with_ws_timeouts(mut self, ws_timeouts: WsTimeouts) -> Self {
         self.turn_cap_override = ws_timeouts.idle != WsTimeouts::default().idle;
         self.ws_timeouts = ws_timeouts;
+        self
+    }
+
+    pub fn with_operator_access(mut self, operator_access: OperatorAccess) -> Self {
+        self.operator_access = operator_access;
         self
     }
 
@@ -933,11 +941,18 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Every long-lived WebSocket bound, resolved once from server configuration. A
+/// client frame can never extend one of these.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WsTimeouts {
     pub first_frame: Duration,
     pub idle: Duration,
+    pub between_turn_idle: Duration,
     pub session: Duration,
+    pub heartbeat_interval: Duration,
+    pub pong_timeout: Duration,
+    pub outbound_write: Duration,
+    pub drain_grace: Duration,
 }
 
 impl Default for WsTimeouts {
@@ -945,7 +960,12 @@ impl Default for WsTimeouts {
         Self {
             first_frame: Duration::from_secs(10),
             idle: bac_510_max_turn_duration(),
+            between_turn_idle: Duration::from_secs(600),
             session: Duration::from_secs(6 * 60 * 60),
+            heartbeat_interval: Duration::from_secs(30),
+            pong_timeout: Duration::from_secs(10),
+            outbound_write: Duration::from_secs(5),
+            drain_grace: Duration::from_secs(20),
         }
     }
 }
@@ -1132,7 +1152,7 @@ async fn ready(
         Ok(headers) => headers,
         Err(error) => return cors_json_error(error),
     };
-    if let Err(error) = state.ws_access.validate_bearer_headers(&headers) {
+    if let Err(error) = state.operator_access.validate(&headers) {
         return readiness_access_json_error(error, response_headers);
     }
     let brain = state.brain.capabilities();
@@ -1193,7 +1213,7 @@ async fn brain_health(
         Ok(headers) => headers,
         Err(error) => return cors_json_error(error),
     };
-    if let Err(error) = state.ws_access.validate_bearer_headers(&headers) {
+    if let Err(error) = state.operator_access.validate(&headers) {
         return readiness_access_json_error(error, response_headers);
     }
     let brain = state.brain.capabilities();
@@ -1976,7 +1996,12 @@ fn attach_ready_session_token(
     origin: Option<&str>,
 ) -> Result<(), crate::config::SessionTokenError> {
     if record.study_set.ingestion_status == StudySetIngestionStatus::Ready {
-        if let Some(secret) = state.ws_access.session_token_secret.as_deref() {
+        if let Some(secret) = state
+            .ws_access
+            .session_token_secret
+            .as_ref()
+            .map(RedactedSecret::as_str)
+        {
             record.session_token = Some(signed_session_token(record, secret, state, origin)?);
         }
     }
@@ -2032,7 +2057,12 @@ fn signed_library_action(
     session_id: String,
     origin: Option<&str>,
 ) -> LibraryAction {
-    let Some(secret) = state.ws_access.session_token_secret.as_deref() else {
+    let Some(secret) = state
+        .ws_access
+        .session_token_secret
+        .as_ref()
+        .map(RedactedSecret::as_str)
+    else {
         return unavailable_action("session_token_unavailable");
     };
     let Ok(failure_control) =
@@ -2055,7 +2085,11 @@ fn signed_library_action(
 }
 
 fn signed_library_control_token(state: &AppState, user_id: &str) -> Option<String> {
-    let secret = state.ws_access.session_token_secret.as_deref()?;
+    let secret = state
+        .ws_access
+        .session_token_secret
+        .as_ref()
+        .map(RedactedSecret::as_str)?;
     signed_session_token_for(
         user_id,
         "__library_control__",
@@ -2215,7 +2249,8 @@ fn validate_library_control_token(
     let secret = state
         .ws_access
         .session_token_secret
-        .as_deref()
+        .as_ref()
+        .map(RedactedSecret::as_str)
         .ok_or(crate::config::SessionTokenError::Invalid)?;
     let token = headers
         .get("x-viva-library-control-token")
