@@ -5562,16 +5562,16 @@ mod tests {
             _request: tokio_tungstenite::tungstenite::http::Request<()>,
         ) -> Result<Self::Socket, BrainError> {
             let index = self.script.connects.fetch_add(1, Ordering::SeqCst);
+            // The replaced context's frames are already generated and waiting;
+            // the provider releases them once the cancel arrives, exactly as
+            // Cartesia documents for a request that is already generating.
             let incoming = if index == 0 {
                 std::collections::VecDeque::from([
                     r#"{"type":"chunk","context_id":"response-1","data":"AQI="}"#.to_owned(),
                     r#"{"type":"done","context_id":"response-1"}"#.to_owned(),
                 ])
             } else {
-                std::collections::VecDeque::from([
-                    r#"{"type":"chunk","context_id":"response-2","data":"AwQ="}"#.to_owned(),
-                    r#"{"type":"done","context_id":"response-2"}"#.to_owned(),
-                ])
+                std::collections::VecDeque::new()
             };
             Ok(ScriptedSonicSocket {
                 script: Arc::clone(&self.script),
@@ -5581,6 +5581,9 @@ mod tests {
         }
     }
 
+    /// One multiplexed session connection, as Cartesia documents it: the
+    /// replaced context finishes on the same socket the replacement context is
+    /// then generated on.
     struct ScriptedSonicSocket {
         script: Arc<ScriptedSonicScript>,
         incoming: std::collections::VecDeque<String>,
@@ -5591,11 +5594,28 @@ mod tests {
     impl super::super::tts::SonicSocket for ScriptedSonicSocket {
         async fn send_json(&mut self, value: Value) -> Result<(), BrainError> {
             let cancelled = value.get("cancel").and_then(Value::as_bool) == Some(true);
+            let finalized = value.get("continue").and_then(Value::as_bool) == Some(false);
+            let context_id = value["context_id"]
+                .as_str()
+                .expect("every Sonic control names its context")
+                .to_owned();
             self.script
                 .sent_json
                 .lock()
                 .expect("record lock poisoned")
                 .push(value);
+            if finalized {
+                let data = if context_id == "response-1" {
+                    "AQI="
+                } else {
+                    "AwQ="
+                };
+                self.incoming.push_back(format!(
+                    r#"{{"type":"chunk","context_id":"{context_id}","data":"{data}"}}"#
+                ));
+                self.incoming
+                    .push_back(format!(r#"{{"type":"done","context_id":"{context_id}"}}"#));
+            }
             if cancelled {
                 self.script.released.store(true, Ordering::SeqCst);
                 self.script.release.notify_waiters();

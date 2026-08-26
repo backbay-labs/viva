@@ -401,6 +401,12 @@ where
 /// arrive afterwards are drained and discarded rather than surfacing as the
 /// replacement response's audio. A cancelled context yields no audio and is not
 /// a provider incident.
+///
+/// `ADAPTER-03` / `ADAPTER-04`: the plan closes the socket on "session stop,
+/// stage timeout, fatal provider error, or failed cancel/drain". A cancel the
+/// provider acknowledged inside the bounded drain leaves nothing unread on the
+/// wire, so the multiplexed connection keeps serving the next response context;
+/// only a drain that ran out, broke, or saw an error closes.
 async fn cancel_sonic_context_and_drain<S>(
     socket: &mut S,
     context_id: &str,
@@ -408,24 +414,40 @@ async fn cancel_sonic_context_and_drain<S>(
 where
     S: SonicSocket + ?Sized,
 {
-    if cancel_sonic_context(socket, context_id).await.is_ok() {
-        for _ in 0..SONIC_CANCEL_DRAIN_LIMIT {
-            match socket.next_text().await {
-                Ok(Some(text)) => match parse_sonic_event(&text) {
-                    Some(SonicEvent::Done {
-                        context_id: event_context_id,
-                    }) if event_context_id == context_id => break,
-                    Some(SonicEvent::Error { .. }) => break,
-                    _ => {}
-                },
-                Ok(None) | Err(_) => break,
-            }
+    let drained = cancel_sonic_context(socket, context_id).await.is_ok()
+        && drain_cancelled_sonic_context(socket, context_id).await;
+    if !drained {
+        close_quietly(socket).await;
+        return Ok(SonicContextOutcome {
+            connection_open: false,
+        });
+    }
+    Ok(SonicContextOutcome {
+        connection_open: socket.is_open(),
+    })
+}
+
+/// Read what the provider still finishes for a cancelled context.
+///
+/// Returns whether the context ended inside the bounded drain, i.e. whether the
+/// connection is left with none of that context's frames still to come.
+async fn drain_cancelled_sonic_context<S>(socket: &mut S, context_id: &str) -> bool
+where
+    S: SonicSocket + ?Sized,
+{
+    for _ in 0..SONIC_CANCEL_DRAIN_LIMIT {
+        match socket.next_text().await {
+            Ok(Some(text)) => match parse_sonic_event(&text) {
+                Some(SonicEvent::Done {
+                    context_id: event_context_id,
+                }) if event_context_id == context_id => return true,
+                Some(SonicEvent::Error { .. }) => return false,
+                _ => {}
+            },
+            Ok(None) | Err(_) => return false,
         }
     }
-    close_quietly(socket).await;
-    Ok(SonicContextOutcome {
-        connection_open: false,
-    })
+    false
 }
 
 pub(crate) async fn cancel_sonic_context<S>(
@@ -660,16 +682,25 @@ impl SonicSessionVoice {
         }
     }
 
-    /// Cancel one response's context and close the connection it was using.
+    /// Cancel one response's context on the session connection.
     ///
     /// `ADAPTER-03`: a turn replaced between its last text and its finalizer
-    /// still has an open context on the provider. It is told, drained, and the
-    /// connection is dropped rather than handed to the next turn mid-context.
+    /// still has an open context on the provider. It is told and drained before
+    /// the next turn writes anything. A drain that saw the context finish leaves
+    /// a clean wire and keeps the connection; one that ran out, broke, or saw an
+    /// error closes it, so no unread frame is ever handed to the next context.
     pub(crate) async fn cancel_context(&self, context_id: &str) {
         let mut held = self.held.lock().await;
         let Some(connection) = held.as_mut() else {
             return;
         };
+        if connection.written_context.as_deref() != Some(context_id) {
+            // This context is not the one open on the connection: it already
+            // finished, or was already cancelled. Cancelling it again would only
+            // make the provider's next reply unreadable for the context that is
+            // open now.
+            return;
+        }
         let reusable = cancel_sonic_context_and_drain(connection.socket.as_mut(), context_id)
             .await
             .is_ok_and(|outcome| outcome.connection_open);
@@ -1607,16 +1638,212 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Task 4 (`ADAPTER-04`): the boundary of the session connection's
-    // single redial.
+    // Task 3 / Task 4 (`ADAPTER-03`, `ADAPTER-04`): what a cancel does to the
+    // session connection.
+    //
+    // The plan's close list is "session stop, stage timeout, fatal provider
+    // error, or failed cancel/drain". A cancel the provider acknowledges within
+    // the bounded drain leaves nothing unread on the wire, so the multiplexed
+    // connection carries on serving the next response context; barge-in is the
+    // commonest reason to cancel, and re-dialling on every interruption would
+    // give back exactly what the multiplexed-context design exists to buy.
+    // A cancel the provider never finishes is the opposite case and still
+    // closes.
     // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_clean_barge_in_cancel_keeps_the_session_connection() {
+        let connector = Arc::new(SessionSonicConnector::acknowledging_cancels());
+        let voice = SonicSessionVoice::new(Arc::clone(&connector));
+        let config = SonicConfig::default();
+
+        voice
+            .extend(
+                &config,
+                "sk_car_multiplex_secret",
+                "response-1",
+                "first response text",
+            )
+            .await
+            .unwrap();
+        // The learner barges in before response-1 reached its finalizer.
+        voice.cancel_context("response-1").await;
+
+        let mut heard = RecordedFrames::default();
+        voice
+            .extend(
+                &config,
+                "sk_car_multiplex_secret",
+                "response-2",
+                "second response text",
+            )
+            .await
+            .unwrap();
+        voice
+            .finish(&config, "response-2", &CancellationToken::new(), &mut heard)
+            .await
+            .unwrap();
+
+        assert_eq!(heard.heard.len(), 1);
+        assert_eq!(heard.heard[0].pcm16_bytes(), [1, 2]);
+        let record = connector.record();
+        assert_eq!(
+            record.dials, 1,
+            "a cancel the provider acknowledged keeps the multiplexed session connection"
+        );
+        assert_eq!(
+            record.closes, 0,
+            "a successful cancel/drain is not on the plan's close list"
+        );
+
+        let written = record.context_and_cancel();
+        let cancel_index = written
+            .iter()
+            .position(|(_, cancel)| *cancel)
+            .unwrap_or_else(|| panic!("a barge-in must write a context cancel: {written:?}"));
+        assert!(!written[..cancel_index].is_empty());
+        assert!(written[..cancel_index]
+            .iter()
+            .all(|(context_id, _)| context_id == "response-1"));
+        assert_eq!(written[cancel_index].0, "response-1");
+        assert!(!written[cancel_index + 1..].is_empty());
+        assert!(written[cancel_index + 1..]
+            .iter()
+            .all(|(context_id, cancel)| context_id == "response-2" && !cancel));
+
+        voice.close().await;
+        assert_eq!(
+            connector.record().closes,
+            1,
+            "the session closes its own connection exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_the_provider_never_finishes_closes_the_connection() {
+        let connector = Arc::new(SessionSonicConnector::never_acknowledging_cancels());
+        let voice = SonicSessionVoice::new(Arc::clone(&connector));
+        let config = SonicConfig::default();
+
+        voice
+            .extend(
+                &config,
+                "sk_car_multiplex_secret",
+                "response-1",
+                "first response text",
+            )
+            .await
+            .unwrap();
+        voice.cancel_context("response-1").await;
+
+        assert_eq!(
+            connector.record().closes,
+            1,
+            "a cancel the bounded drain never sees finished leaves unread frames, so it closes"
+        );
+
+        let mut heard = RecordedFrames::default();
+        voice
+            .extend(
+                &config,
+                "sk_car_multiplex_secret",
+                "response-2",
+                "second response text",
+            )
+            .await
+            .unwrap();
+        voice
+            .finish(&config, "response-2", &CancellationToken::new(), &mut heard)
+            .await
+            .unwrap();
+
+        assert_eq!(heard.heard.len(), 1);
+        let record = connector.record();
+        assert_eq!(
+            record.dials, 2,
+            "the replacement context is served by a replacement connection"
+        );
+        assert!(
+            record
+                .sent
+                .iter()
+                .filter(|(socket, _)| *socket == 1)
+                .all(|(_, value)| value["context_id"] == "response-2"),
+            "the un-drained connection is never written to again: {:?}",
+            record.sent
+        );
+    }
+
+    /// A cancel is for the context that is still open. A turn whose speech
+    /// already finished has nothing to cancel, and telling the provider anyway
+    /// would leave the drain waiting for a `done` that never comes — eating the
+    /// frames of the context that *is* open, then closing a healthy connection.
+    #[tokio::test]
+    async fn a_cancel_for_an_already_finished_context_leaves_the_connection_alone() {
+        let connector = Arc::new(SessionSonicConnector::acknowledging_cancels());
+        let voice = SonicSessionVoice::new(Arc::clone(&connector));
+        let config = SonicConfig::default();
+
+        voice
+            .extend(
+                &config,
+                "sk_car_multiplex_secret",
+                "response-1",
+                "first response text",
+            )
+            .await
+            .unwrap();
+        voice
+            .finish(
+                &config,
+                "response-1",
+                &CancellationToken::new(),
+                &mut RecordedFrames::default(),
+            )
+            .await
+            .unwrap();
+
+        // The turn's cleanup path fires after the response already completed.
+        voice.cancel_context("response-1").await;
+
+        let mut heard = RecordedFrames::default();
+        voice
+            .extend(
+                &config,
+                "sk_car_multiplex_secret",
+                "response-2",
+                "second response text",
+            )
+            .await
+            .unwrap();
+        voice
+            .finish(&config, "response-2", &CancellationToken::new(), &mut heard)
+            .await
+            .unwrap();
+
+        assert_eq!(heard.heard.len(), 1);
+        let record = connector.record();
+        assert!(
+            !record
+                .context_and_cancel()
+                .iter()
+                .any(|(_, cancel)| *cancel),
+            "a context that already finished is never cancelled: {:?}",
+            record.sent
+        );
+        assert_eq!(
+            record.dials, 1,
+            "the healthy session connection survives the late cleanup"
+        );
+        assert_eq!(record.closes, 0);
+    }
 
     /// The boundary of the Task 4 redial: a context the provider has already
     /// accepted part of is never re-spoken on a fresh connection, because the
     /// learner would hear a truncated or duplicated response.
     #[tokio::test]
     async fn a_half_written_context_is_never_redialled() {
-        let mut connector = SessionSonicConnector::new();
+        let mut connector = SessionSonicConnector::acknowledging_cancels();
         connector.failing_context = Some("response-2");
         connector.accepted_writes_before_failure = 1;
         let connector = Arc::new(connector);
@@ -1688,11 +1915,31 @@ mod tests {
         sent: Vec<(u32, Value)>,
     }
 
+    impl SessionSonicRecord {
+        /// Each write as `(context_id, is_cancel)`, in order.
+        fn context_and_cancel(&self) -> Vec<(String, bool)> {
+            self.sent
+                .iter()
+                .map(|(_, value)| {
+                    (
+                        value["context_id"]
+                            .as_str()
+                            .expect("every Sonic control names its context")
+                            .to_owned(),
+                        value.get("cancel").and_then(Value::as_bool) == Some(true),
+                    )
+                })
+                .collect()
+        }
+    }
+
     /// A multiplexed session connection: every finalized generation is answered
     /// with one chunk plus `done` for that context, so one socket can serve many
     /// response contexts.
     struct SessionSonicConnector {
         record: Arc<Mutex<SessionSonicRecord>>,
+        /// Whether a context cancel is answered with that context's `done`.
+        acknowledges_cancel: bool,
         /// Writes naming this context are refused once the provider has accepted
         /// `accepted_writes_before_failure` of them.
         failing_context: Option<&'static str>,
@@ -1700,11 +1947,19 @@ mod tests {
     }
 
     impl SessionSonicConnector {
-        fn new() -> Self {
+        fn acknowledging_cancels() -> Self {
             Self {
                 record: Arc::new(Mutex::new(SessionSonicRecord::default())),
+                acknowledges_cancel: true,
                 failing_context: None,
                 accepted_writes_before_failure: 0,
+            }
+        }
+
+        fn never_acknowledging_cancels() -> Self {
+            Self {
+                acknowledges_cancel: false,
+                ..Self::acknowledging_cancels()
             }
         }
 
@@ -1731,9 +1986,11 @@ mod tests {
                 index,
                 record: Arc::clone(&self.record),
                 pending: VecDeque::new(),
+                acknowledges_cancel: self.acknowledges_cancel,
                 failing_context: self.failing_context,
                 accepted_writes_before_failure: self.accepted_writes_before_failure,
                 accepted_for_failing_context: 0,
+                finished: Vec::new(),
             })
         }
     }
@@ -1742,9 +1999,12 @@ mod tests {
         index: u32,
         record: Arc<Mutex<SessionSonicRecord>>,
         pending: VecDeque<String>,
+        acknowledges_cancel: bool,
         failing_context: Option<&'static str>,
         accepted_writes_before_failure: usize,
         accepted_for_failing_context: usize,
+        /// Contexts the provider has already finished generating.
+        finished: Vec<String>,
     }
 
     #[async_trait]
@@ -1766,8 +2026,13 @@ mod tests {
                 self.accepted_for_failing_context += 1;
             }
             if value.get("cancel").and_then(Value::as_bool) == Some(true) {
-                self.pending
-                    .push_back(format!(r#"{{"type":"done","context_id":"{context_id}"}}"#));
+                // A context that already ended has nothing left to cancel, so
+                // the provider says nothing back — exactly as it would on the
+                // wire. Only a context still generating is acknowledged.
+                if self.acknowledges_cancel && !self.finished.contains(&context_id) {
+                    self.pending
+                        .push_back(format!(r#"{{"type":"done","context_id":"{context_id}"}}"#));
+                }
                 return Ok(());
             }
             if value.get("continue").and_then(Value::as_bool) == Some(false) {
@@ -1776,6 +2041,7 @@ mod tests {
                 ));
                 self.pending
                     .push_back(format!(r#"{{"type":"done","context_id":"{context_id}"}}"#));
+                self.finished.push(context_id);
             }
             Ok(())
         }
