@@ -47,6 +47,14 @@ jobs:
           VIVA_ALLOW_CONSTRAINED_RUNNER_VOICE_WS_SKIP: "1"
         run: bun run validate
 
+      - name: Unit suites and lint
+        # These ran on developer machines only until 2026-08-26. The mobile
+        # contrast certification is a unit test — it recomputes WCAG ratios
+        # against the composited vellum endpoints so retoning a token or moving
+        # a ground parameter fails rather than silently shipping unreadable
+        # text. That guarantee is worth nothing if the suite never runs here.
+        run: bun run test && bun run lint
+
       - name: Direct WebSocket replay gate
         env:
           VIVA_AGENT_PROVIDER: fake_cartesia_gemini
