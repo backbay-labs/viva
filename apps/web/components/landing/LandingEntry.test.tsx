@@ -91,6 +91,7 @@ const originalRestBearer = process.env.VIVA_AGENT_REST_BEARER_TOKEN;
 const originalAllowedUsers = process.env.VIVA_SESSION_ALLOWED_USER_IDS;
 const originalAllowedStudySets = process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS;
 const originalBootstrapSecret = process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET;
+const originalCanonicalOrigin = process.env.VIVA_WEB_CANONICAL_ORIGIN;
 
 describe("LandingEntry", () => {
   test("renders the hero without mounting the legacy study app", () => {
@@ -174,6 +175,8 @@ describe("LandingEntry", () => {
       process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
       process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
       process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = "redacted-bootstrap-signing-secret";
+      // SSR capability minting is bound to the configured canonical web origin (WEBAPI-003).
+      process.env.VIVA_WEB_CANONICAL_ORIGIN = "https://web.example";
       globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
         calls.push({ input: String(input), init });
         return new Response(JSON.stringify(librarySnapshot), {
@@ -217,6 +220,7 @@ describe("LandingEntry", () => {
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
       restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
       restoreEnv("VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET", originalBootstrapSecret);
+      restoreEnv("VIVA_WEB_CANONICAL_ORIGIN", originalCanonicalOrigin);
     }
   });
 
