@@ -7064,10 +7064,9 @@ async fn websocket_turn_cap_emits_terminal_phase_before_close() {
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(Vec::new().into()))
-        .await
-        .unwrap();
+    // v5 has no binary client surface: an answer-bearing frame is one bounded
+    // audio turn.
+    send_v5_audio_turn(&mut socket, "turn-cap-arm", &[1_u8, 2]).await;
     let _ = read_server_frame(&mut socket).await;
     let _ = read_server_frame(&mut socket).await;
 
@@ -7160,10 +7159,9 @@ async fn websocket_turn_cap_waits_for_answer_frame() {
         "turn cap fired before an answer-bearing frame"
     );
 
-    socket
-        .send(WsMessage::Binary(Vec::new().into()))
-        .await
-        .unwrap();
+    // v5 has no binary client surface: an answer-bearing frame is one bounded
+    // audio turn.
+    send_v5_audio_turn(&mut socket, "turn-cap-arm", &[1_u8, 2]).await;
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
         TerminalSessionReason::TurnCap,
@@ -8078,10 +8076,9 @@ async fn websocket_turn_cap_is_not_postponed_by_provider_events() {
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(Vec::new().into()))
-        .await
-        .unwrap();
+    // v5 has no binary client surface: an answer-bearing frame is one bounded
+    // audio turn.
+    send_v5_audio_turn(&mut socket, "turn-cap-arm", &[1_u8, 2]).await;
 
     let mut saw_provider_phase = false;
     for _ in 0..50 {
@@ -8297,10 +8294,9 @@ async fn websocket_turn_cap_is_not_postponed_by_client_keepalives() {
         ))
         .await
         .unwrap();
-    socket
-        .send(WsMessage::Binary(Vec::new().into()))
-        .await
-        .unwrap();
+    // v5 has no binary client surface: an answer-bearing frame is one bounded
+    // audio turn.
+    send_v5_audio_turn(&mut socket, "turn-cap-arm", &[1_u8, 2]).await;
 
     let start = Instant::now();
     while start.elapsed() < Duration::from_millis(80) {
