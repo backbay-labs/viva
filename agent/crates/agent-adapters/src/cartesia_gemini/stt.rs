@@ -20,7 +20,11 @@ use agent_domain::{
     AudioFrame, BrainError, BrainFailureClass, BrainFailureStage, BrainProviderFailureParts,
 };
 
-use super::brain_failure;
+use super::{
+    brain_failure, cartesia_handshake_classification, provider_diagnostic_failure,
+    websocket_close_code, websocket_handshake_status, ProviderDiagnostic, ProviderDiagnosticCode,
+    ProviderStageLabel,
+};
 
 use super::constants::{
     CARTESIA_SAMPLE_RATE, DEFAULT_CARTESIA_VERSION, DEFAULT_INK_MODEL,
@@ -75,6 +79,46 @@ fn ink_auth_failure(error_kind: &'static str) -> BrainError {
         BrainFailureStage::ProviderAuth,
         false,
         error_kind,
+    )
+}
+
+/// `ADAPTER-06`: a refused Ink upgrade keeps only its numeric HTTP status and
+/// one allowlisted diagnostic code. The refusal body, the request URL, and the
+/// query are discarded whole.
+fn ink_handshake_failure(status: u16) -> BrainError {
+    let (diagnostic, failure_class, stage) =
+        cartesia_handshake_classification(ProviderStageLabel::CartesiaInk, status);
+    provider_diagnostic_failure(
+        diagnostic,
+        failure_class,
+        stage,
+        "cartesia-ink",
+        Duration::ZERO,
+    )
+}
+
+/// A connected Ink socket the provider closed. Only the numeric close code
+/// survives; the close reason never leaves the transport.
+fn ink_close_failure(close_code: Option<u16>) -> BrainError {
+    provider_diagnostic_failure(
+        ProviderDiagnostic::new(ProviderDiagnosticCode::CartesiaInkWsClosed, true)
+            .with_close_code(close_code),
+        BrainFailureClass::MalformedStream,
+        BrainFailureStage::Provider,
+        "cartesia-ink",
+        Duration::ZERO,
+    )
+}
+
+/// A provider `error` frame. Its message and provider-authored code collapse
+/// into the stage's one provider-error diagnostic.
+fn ink_provider_error_failure() -> BrainError {
+    provider_diagnostic_failure(
+        ProviderDiagnostic::new(ProviderDiagnosticCode::CartesiaInkProviderError, true),
+        BrainFailureClass::MalformedStream,
+        BrainFailureStage::Provider,
+        "cartesia-ink",
+        Duration::ZERO,
     )
 }
 
@@ -171,6 +215,12 @@ pub(crate) trait InkSocket: Send {
     async fn send_text(&mut self, text: &'static str) -> Result<(), BrainError>;
     async fn next_text(&mut self) -> Result<Option<String>, BrainError>;
     async fn close(&mut self) -> Result<(), BrainError>;
+
+    /// The numeric close code the provider sent, once it has closed. The close
+    /// reason is dropped at the transport and is never available here.
+    fn last_close_code(&self) -> Option<u16> {
+        None
+    }
 }
 
 #[async_trait]
@@ -274,8 +324,9 @@ where
             return Err(ink_cancelled_failure());
         };
         let Some(text) = received.map_err(|_| ink_transport_failure("receive_failed"))? else {
+            let close_code = socket.last_close_code();
             close_quietly(socket).await;
-            return Err(ink_protocol_failure("closed_before_final_transcript"));
+            return Err(ink_close_failure(close_code));
         };
         let Some(event) = parse_ink_event(&text) else {
             continue;
@@ -299,7 +350,7 @@ where
             }
             InkEvent::Error { .. } => {
                 close_quietly(socket).await;
-                return Err(ink_protocol_failure("provider_error"));
+                return Err(ink_provider_error_failure());
             }
         }
     }
@@ -339,15 +390,23 @@ impl InkConnector for WebSocketInkConnector {
     type Socket = TungsteniteInkSocket;
 
     async fn connect(&self, request: Request<()>) -> Result<Self::Socket, BrainError> {
-        let (socket, _) = connect_async(request)
-            .await
-            .map_err(|_| ink_transport_failure("connect_failed"))?;
-        Ok(TungsteniteInkSocket { socket })
+        let (socket, _) = connect_async(request).await.map_err(|error| {
+            // A refused upgrade is an HTTP fact; only its status survives.
+            websocket_handshake_status(&error).map_or_else(
+                || ink_transport_failure("connect_failed"),
+                ink_handshake_failure,
+            )
+        })?;
+        Ok(TungsteniteInkSocket {
+            socket,
+            close_code: None,
+        })
     }
 }
 
 struct TungsteniteInkSocket {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    close_code: Option<u16>,
 }
 
 #[async_trait]
@@ -378,7 +437,10 @@ impl InkSocket for TungsteniteInkSocket {
                     .send(Message::Pong(payload))
                     .await
                     .map_err(|_| ink_transport_failure("pong_failed"))?,
-                Ok(Message::Close(_)) => return Ok(None),
+                Ok(Message::Close(frame)) => {
+                    self.close_code = websocket_close_code(frame.as_ref());
+                    return Ok(None);
+                }
                 Ok(Message::Binary(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
                 Err(_) => return Err(ink_transport_failure("receive_failed")),
             }
@@ -390,6 +452,10 @@ impl InkSocket for TungsteniteInkSocket {
             .close(None)
             .await
             .map_err(|_| ink_transport_failure("close_failed"))
+    }
+
+    fn last_close_code(&self) -> Option<u16> {
+        self.close_code
     }
 }
 
@@ -566,7 +632,7 @@ mod tests {
         assert_eq!(failure.stage(), BrainFailureStage::Provider);
         assert_eq!(
             failure.metadata(),
-            "stage=cartesia_ink error_kind=provider_error"
+            "stage=cartesia_ink error_kind=cartesia_ink_provider_error retry_eligible=true"
         );
         let rendered = format!("{error} {failure:?}");
         assert!(!rendered.contains("do not leak this transcript"));
@@ -609,7 +675,7 @@ mod tests {
 
         assert_eq!(
             error.failure().metadata(),
-            "stage=cartesia_ink error_kind=closed_before_final_transcript"
+            "stage=cartesia_ink error_kind=cartesia_ink_ws_closed retry_eligible=true"
         );
         assert!(!format!("{error} {:?}", error.failure()).contains("partial"));
     }

@@ -21,7 +21,11 @@ use agent_domain::{
     AudioFrame, BrainError, BrainFailureClass, BrainFailureStage, BrainProviderFailureParts,
 };
 
-use super::brain_failure;
+use super::{
+    brain_failure, cartesia_handshake_classification, provider_diagnostic_failure,
+    websocket_close_code, websocket_handshake_status, ProviderDiagnostic, ProviderDiagnosticCode,
+    ProviderStageLabel,
+};
 
 use super::constants::{
     CARTESIA_SAMPLE_RATE, DEFAULT_CARTESIA_VERSION, DEFAULT_SONIC_MODEL, DEFAULT_SONIC_VOICE_ID,
@@ -80,6 +84,46 @@ fn sonic_auth_failure(error_kind: &'static str) -> BrainError {
         BrainFailureStage::ProviderAuth,
         false,
         error_kind,
+    )
+}
+
+/// `ADAPTER-06`: a refused Sonic upgrade keeps only its numeric HTTP status and
+/// one allowlisted diagnostic code. The refusal body, the request URL, and the
+/// query are discarded whole.
+fn sonic_handshake_failure(status: u16) -> BrainError {
+    let (diagnostic, failure_class, stage) =
+        cartesia_handshake_classification(ProviderStageLabel::CartesiaSonic, status);
+    provider_diagnostic_failure(
+        diagnostic,
+        failure_class,
+        stage,
+        "cartesia-sonic",
+        Duration::ZERO,
+    )
+}
+
+/// A connected Sonic socket the provider closed. Only the numeric close code
+/// survives; the close reason never leaves the transport.
+fn sonic_close_failure(close_code: Option<u16>) -> BrainError {
+    provider_diagnostic_failure(
+        ProviderDiagnostic::new(ProviderDiagnosticCode::CartesiaSonicWsClosed, true)
+            .with_close_code(close_code),
+        BrainFailureClass::MalformedStream,
+        BrainFailureStage::Provider,
+        "cartesia-sonic",
+        Duration::ZERO,
+    )
+}
+
+/// A provider `error` frame. Its message and provider-authored code collapse
+/// into the stage's one provider-error diagnostic.
+fn sonic_provider_error_failure() -> BrainError {
+    provider_diagnostic_failure(
+        ProviderDiagnostic::new(ProviderDiagnosticCode::CartesiaSonicProviderError, true),
+        BrainFailureClass::MalformedStream,
+        BrainFailureStage::Provider,
+        "cartesia-sonic",
+        Duration::ZERO,
     )
 }
 
@@ -342,8 +386,9 @@ where
             return cancel_sonic_context_and_drain(socket, context_id).await;
         };
         let Some(text) = received.map_err(|_| sonic_transport_failure("receive_failed"))? else {
+            let close_code = socket.last_close_code();
             close_quietly(socket).await;
-            return Err(sonic_protocol_failure("closed_before_done"));
+            return Err(sonic_close_failure(close_code));
         };
 
         let Some(event) = parse_sonic_event(&text) else {
@@ -379,14 +424,14 @@ where
                 context_id: None, ..
             } => {
                 close_quietly(socket).await;
-                return Err(sonic_protocol_failure("provider_error"));
+                return Err(sonic_provider_error_failure());
             }
             SonicEvent::Error {
                 context_id: Some(event_context_id),
                 ..
             } if event_context_id == context_id => {
                 close_quietly(socket).await;
-                return Err(sonic_protocol_failure("provider_error"));
+                return Err(sonic_provider_error_failure());
             }
             _ => {}
         }
@@ -479,6 +524,12 @@ pub(crate) trait SonicSocket: Send {
     async fn send_json(&mut self, value: Value) -> Result<(), BrainError>;
     async fn next_text(&mut self) -> Result<Option<String>, BrainError>;
     async fn close(&mut self) -> Result<(), BrainError>;
+
+    /// The numeric close code the provider sent, once it has closed. The close
+    /// reason is dropped at the transport and is never available here.
+    fn last_close_code(&self) -> Option<u16> {
+        None
+    }
 
     /// Whether this connection is still usable for another response context.
     ///
@@ -764,16 +815,25 @@ impl SonicConnector for WebSocketSonicConnector {
     type Socket = TungsteniteSonicSocket;
 
     async fn connect(&self, request: Request<()>) -> Result<Self::Socket, BrainError> {
-        let (socket, _) = connect_async(request)
-            .await
-            .map_err(|_| sonic_transport_failure("connect_failed"))?;
-        Ok(TungsteniteSonicSocket { socket, open: true })
+        let (socket, _) = connect_async(request).await.map_err(|error| {
+            // A refused upgrade is an HTTP fact; only its status survives.
+            websocket_handshake_status(&error).map_or_else(
+                || sonic_transport_failure("connect_failed"),
+                sonic_handshake_failure,
+            )
+        })?;
+        Ok(TungsteniteSonicSocket {
+            socket,
+            open: true,
+            close_code: None,
+        })
     }
 }
 
 struct TungsteniteSonicSocket {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     open: bool,
+    close_code: Option<u16>,
 }
 
 #[async_trait]
@@ -800,8 +860,9 @@ impl SonicSocket for TungsteniteSonicSocket {
                     .await
                     .inspect_err(|_| self.open = false)
                     .map_err(|_| sonic_transport_failure("pong_failed"))?,
-                Ok(Message::Close(_)) => {
+                Ok(Message::Close(frame)) => {
                     self.open = false;
+                    self.close_code = websocket_close_code(frame.as_ref());
                     return Ok(None);
                 }
                 Ok(Message::Binary(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
@@ -823,6 +884,10 @@ impl SonicSocket for TungsteniteSonicSocket {
 
     fn is_open(&self) -> bool {
         self.open
+    }
+
+    fn last_close_code(&self) -> Option<u16> {
+        self.close_code
     }
 }
 
@@ -1072,7 +1137,7 @@ mod tests {
         assert_eq!(failure.failure_class(), BrainFailureClass::MalformedStream);
         assert_eq!(
             failure.metadata(),
-            "stage=cartesia_sonic error_kind=provider_error"
+            "stage=cartesia_sonic error_kind=cartesia_sonic_provider_error retry_eligible=true"
         );
         let rendered = format!("{error} {failure:?}");
         assert!(!rendered.contains("provider leaked assistant text"));
@@ -1123,7 +1188,7 @@ mod tests {
 
         assert_eq!(
             error.failure().metadata(),
-            "stage=cartesia_sonic error_kind=closed_before_done"
+            "stage=cartesia_sonic error_kind=cartesia_sonic_ws_closed retry_eligible=true"
         );
         assert!(!format!("{error} {:?}", error.failure()).contains("partial assistant text"));
         assert!(socket.closed);

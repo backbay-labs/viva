@@ -121,6 +121,11 @@ impl CartesiaGeminiRunner<FakeCartesiaGeminiTransports> {
     pub(crate) fn sonic_call_count(&self) -> u32 {
         self.transports.sonic_call_count()
     }
+
+    /// How many times this fixture runtime entered a provider stage at all.
+    pub(crate) fn provider_call_count(&self) -> u32 {
+        self.transports.provider_call_count()
+    }
 }
 
 impl CartesiaGeminiRunner<LiveCartesiaGeminiTransports> {
@@ -2196,6 +2201,9 @@ pub(crate) trait CartesiaGeminiTransports: Clone + Send + Sync + 'static {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FakeCartesiaGeminiTransports {
     spoken_contexts: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    /// Every entry into a provider stage, so "no provider call" is observable
+    /// rather than inferred from an absent event.
+    provider_calls: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl FakeCartesiaGeminiTransports {
@@ -2209,6 +2217,14 @@ impl FakeCartesiaGeminiTransports {
             .expect("spoken context lock poisoned")
             .len() as u32
     }
+
+    pub(crate) fn provider_call_count(&self) -> u32 {
+        self.provider_calls.load(Ordering::SeqCst)
+    }
+
+    fn record_provider_call(&self) {
+        self.provider_calls.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
@@ -2220,6 +2236,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         frame: &AudioFrame,
         _cancel: &CancellationToken,
     ) -> Result<RunnerTranscript, BrainError> {
+        self.record_provider_call();
         let pcm_len = audio_frame_bytes(frame).len();
         let Some(InkEvent::TurnEnd { text }) = parse_ink_event(
             r#"{"type":"transcript","is_final":true,"text":"NADH donates electrons to the electron transport chain."}"#,
@@ -2240,6 +2257,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         _config: &CartesiaGeminiConfig,
         request: Value,
     ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
+        self.record_provider_call();
         let has_function_response =
             request["contents"]
                 .as_array()
@@ -2339,6 +2357,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
     ) -> Result<(), BrainError> {
         // Recorded on entry, before any outcome: an asked-for synthesis that
         // then failed is still a context the provider saw.
+        self.record_provider_call();
         self.spoken_contexts
             .lock()
             .expect("spoken context lock poisoned")
@@ -2358,6 +2377,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         _cancel: &CancellationToken,
         sink: &mut dyn SpeechFrameSink,
     ) -> Result<(), BrainError> {
+        self.record_provider_call();
         let _finalizer = sonic_generation_request(&config.sonic, response_id, "", false);
         let sonic = json!({
             "type": "chunk",
@@ -5715,5 +5735,114 @@ mod evaluator_boundary_tests {
             EvaluatorProvenance::LiveGemini
         );
         assert!(!ungated.config.live_runtime_selectable());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 6 (`ADAPTER-06`): a live failure is a live failure. The fixture wording
+// belongs to `FakeCartesiaGeminiTransports` alone and no generic runner path can
+// reach it.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod live_failure_tests {
+    use super::tests::learning_ready_seeded_store;
+    use super::*;
+
+    use agent_domain::{SessionId, StudyMode};
+
+    use super::super::{InkConfig, SonicConfig};
+
+    pub(crate) fn live_session_config(voice_session_id: &str) -> SessionConfig {
+        SessionConfig {
+            session_id: Some(SessionId::new(voice_session_id)),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        }
+    }
+
+    /// A live composition pointed at ports nothing listens on: the transports
+    /// are the real ones, so every failure they produce is a live failure.
+    fn unreachable_live_config() -> CartesiaGeminiConfig {
+        CartesiaGeminiConfig {
+            cartesia_api_key: "sk_car_live_label_probe".to_owned(),
+            gemini: GeminiConfig {
+                api_key: "gemini-live-label-probe".to_owned(),
+                base_url: "http://127.0.0.1:1/v1beta/models".to_owned(),
+                stage_timeout: Duration::from_millis(400),
+                ..GeminiConfig::default()
+            },
+            ink: InkConfig {
+                websocket_url: "ws://127.0.0.1:1/stt/turns/websocket".to_owned(),
+                stage_timeout: Duration::from_millis(400),
+                ..InkConfig::default()
+            },
+            sonic: SonicConfig {
+                websocket_url: "ws://127.0.0.1:1/tts/websocket".to_owned(),
+                stage_timeout: Duration::from_millis(400),
+                ..SonicConfig::default()
+            },
+            live_runtime_enabled: true,
+            ..CartesiaGeminiConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn live_failures_never_emit_fake_provider_labels() {
+        let store = learning_ready_seeded_store();
+        let session_config = live_session_config("voice-live-label-probe");
+        let _ = store.record_voice_session(&session_config).await.unwrap();
+        let runner = CartesiaGeminiRunner::live(store, unreachable_live_config());
+        let mut session = runner.open(session_config).await.unwrap();
+
+        let mut observed = Vec::new();
+        session
+            .input
+            .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+                1_u8, 2, 3, 4,
+            ])))
+            .await
+            .unwrap();
+        let error = loop {
+            let event = timeout(Duration::from_secs(5), session.events.recv())
+                .await
+                .expect("the live turn reports its failure")
+                .expect("the live session stays open until it fails");
+            if let BrainEvent::Error(error) = &event {
+                break error.clone();
+            }
+            observed.push(event);
+        };
+
+        let failure = error
+            .failure
+            .clone()
+            .expect("a live provider failure is typed");
+        assert_eq!(
+            failure.provider(),
+            "cartesia",
+            "a live Ink failure names the live provider: {failure:?}"
+        );
+        let rendered = format!(
+            "{} {} {failure:?} {}",
+            error.source,
+            error.message,
+            serde_json::to_string(&failure).unwrap()
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("fake"),
+            "a live failure must not carry fixture wording: {rendered}"
+        );
+        let observed_json = serde_json::to_string(&observed).unwrap();
+        assert!(
+            !observed_json.to_ascii_lowercase().contains("fake"),
+            "no live event may carry fixture wording: {observed_json}"
+        );
+
+        // Non-vacuity: the fixture wording does exist, and it belongs to the
+        // fixture transports alone.
+        let fixture = fake_transport_failure("writer_failed_before_audio");
+        assert_eq!(fixture.failure().provider(), "fake_cartesia_gemini");
     }
 }

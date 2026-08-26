@@ -1524,6 +1524,7 @@ struct FailStudyToolStore {
     source_reference_calls: Mutex<usize>,
     fail_source_after_question: bool,
     fail_recap: bool,
+    fail_envelope: bool,
 }
 
 impl FailStudyToolStore {
@@ -1533,6 +1534,7 @@ impl FailStudyToolStore {
             source_reference_calls: Mutex::new(0),
             fail_source_after_question: true,
             fail_recap: false,
+            fail_envelope: false,
         }
     }
 
@@ -1542,6 +1544,18 @@ impl FailStudyToolStore {
             source_reference_calls: Mutex::new(0),
             fail_source_after_question: false,
             fail_recap: true,
+            fail_envelope: false,
+        }
+    }
+
+    /// The durable answer-attempt envelope write fails before any provider I/O.
+    fn answer_attempt_envelope(inner: Arc<data::InMemoryStudyStore>) -> Self {
+        Self {
+            inner,
+            source_reference_calls: Mutex::new(0),
+            fail_source_after_question: false,
+            fail_recap: false,
+            fail_envelope: true,
         }
     }
 }
@@ -1586,6 +1600,15 @@ impl StudyMemoryStore for FailStudyToolStore {
         voice_session_id: &str,
         envelope: AnswerAttemptEnvelope,
     ) -> Result<serde_json::Value, PortError> {
+        if self.fail_envelope {
+            return Err(PortError::durability(
+                "answer_attempt_envelope",
+                envelope.response_id.clone(),
+                format!(
+                    "commit refused by {ENVELOPE_STORE_DSN_MARKER} while writing {ENVELOPE_ANSWER_MARKER}"
+                ),
+            ));
+        }
         self.inner
             .record_answer_attempt_envelope(user_id, study_set_id, voice_session_id, envelope)
             .await
@@ -3540,4 +3563,101 @@ async fn fake_cartesia_two_turns_match_manifest_question_correlation() {
         two_turn_question_correlation_result(&duplicated_response_id, &correlation).is_err(),
         "reusing the first response id for the second turn must be rejected"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task 6 (`ADAPTER-06`): a durable-store failure on the pre-provider answer
+// envelope is a typed durability failure, not an untyped runner error and not a
+// fixture-labelled provider incident.
+// ---------------------------------------------------------------------------
+
+const ENVELOPE_STORE_DSN_MARKER: &str = "postgres://viva:marker-dsn-a41@db.internal/viva";
+const ENVELOPE_ANSWER_MARKER: &str = "marker-learner-answer-a42";
+
+#[tokio::test]
+async fn live_envelope_store_failure_is_typed_durability_degraded() {
+    let inner = learning_ready_store();
+    let session = fixture_session_config();
+    let _ = inner.record_voice_session(&session).await.unwrap();
+    let store = Arc::new(FailStudyToolStore::answer_attempt_envelope(inner));
+    let runtime = FakeCartesiaGeminiRuntime::new(store);
+
+    let mut realtime = runtime.open(session).await.unwrap();
+    assert!(matches!(
+        next_event(&mut realtime).await,
+        BrainEvent::SessionPhase { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut realtime).await,
+        BrainEvent::QuestionStarted { .. }
+    ));
+    realtime
+        .input
+        .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+            1_u8, 2, 3, 4,
+        ])))
+        .await
+        .unwrap();
+
+    let mut seen = Vec::new();
+    let error = loop {
+        let event = next_event(&mut realtime).await;
+        if let BrainEvent::Error(error) = event {
+            break error;
+        }
+        seen.push(event);
+    };
+    let failure = error
+        .failure
+        .clone()
+        .expect("a durable-store failure is a typed failure");
+
+    assert_eq!(
+        failure.failure_class(),
+        BrainFailureClass::DurabilityDegraded,
+        "{failure:?}"
+    );
+    assert_eq!(failure.stage(), BrainFailureStage::Store);
+    assert_eq!(
+        failure.terminal_reason(),
+        TerminalSessionReason::DurabilityDegraded
+    );
+    assert!(failure.retry_eligible());
+    assert!(
+        failure
+            .metadata()
+            .contains("tool=record_answer_attempt_envelope"),
+        "{failure:?}"
+    );
+
+    // The envelope write happens before any provider I/O, so the transcription,
+    // model, and speech stages must never have been asked for anything.
+    assert_eq!(
+        runtime.provider_call_count(),
+        0,
+        "a pre-provider durability failure must not call a provider: {seen:?}"
+    );
+    assert_eq!(runtime.sonic_call_count(), 0);
+    assert!(
+        seen.iter().all(|event| !matches!(
+            event,
+            BrainEvent::TranscriptFinal { .. }
+                | BrainEvent::TranscriptDelta { .. }
+                | BrainEvent::AudioDelta { .. }
+                | BrainEvent::AnswerEvaluated { .. }
+                | BrainEvent::RecapReady { .. }
+        )),
+        "{seen:?}"
+    );
+
+    // The store's own prose — including its DSN and the learner's answer — never
+    // reaches the learner-visible error or the failure metadata.
+    let rendered = format!(
+        "{} {failure:?} {}",
+        error.message,
+        serde_json::to_string(&failure).unwrap()
+    );
+    assert!(!rendered.contains(ENVELOPE_STORE_DSN_MARKER), "{rendered}");
+    assert!(!rendered.contains(ENVELOPE_ANSWER_MARKER), "{rendered}");
+    assert!(!rendered.contains("marker-dsn-a41"), "{rendered}");
 }

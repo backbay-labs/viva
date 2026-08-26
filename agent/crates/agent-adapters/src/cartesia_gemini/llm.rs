@@ -19,9 +19,12 @@ use agent_domain::{
     EvaluationRequest, ToolResult,
 };
 
-use super::brain_failure;
 use super::constants::{
     DEFAULT_GEMINI_BASE_URL, DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_THINKING_LEVEL,
+};
+use super::{
+    brain_failure, provider_diagnostic_metadata, ProviderDiagnostic, ProviderDiagnosticCode,
+    ProviderStageLabel, MAX_PROVIDER_DIAGNOSTIC_METADATA_BYTES,
 };
 
 const TRUSTED_SOURCE_CONTEXT_FUNCTION: &str = "trusted_source_context";
@@ -757,7 +760,7 @@ impl GeminiSseClient for ReqwestGeminiSseClient {
                 latency_ms: 0,
                 provider: "gemini".to_owned(),
                 model: "gemini".to_owned(),
-                metadata: "error_kind=invalid_api_key_header".to_owned(),
+                metadata: gemini_stage_metadata("error_kind=invalid_api_key_header"),
             })
         })?;
         let response = self
@@ -785,7 +788,7 @@ fn gemini_client_failure(metadata: &'static str) -> BrainError {
         latency_ms: 0,
         provider: "gemini".to_owned(),
         model: "gemini".to_owned(),
-        metadata: metadata.to_owned(),
+        metadata: gemini_stage_metadata(metadata),
     })
 }
 
@@ -890,15 +893,26 @@ fn gemini_status_stage_failure(
         500..=599 => BrainFailureClass::NetworkDisconnect,
         _ => BrainFailureClass::MalformedStream,
     };
+    let retry_eligible = response.status == 408 || response.status == 429 || response.status >= 500;
     brain_failure(BrainProviderFailureParts {
         failure_class,
         stage: BrainFailureStage::Gemini,
-        retry_eligible: response.status == 408 || response.status == 429 || response.status >= 500,
+        retry_eligible,
         latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
         provider: "gemini".to_owned(),
         model: config.model_id.clone(),
-        metadata: gemini_status_metadata(response),
+        metadata: gemini_status_metadata(response, retry_eligible),
     })
+}
+
+/// `ADAPTER-06`: which allowlisted diagnostic code an HTTP status maps to. The
+/// set is closed; an unrecognized status collapses to `gemini_http_rejected`.
+fn gemini_http_diagnostic_code(status: u16) -> ProviderDiagnosticCode {
+    match status {
+        401 | 403 => ProviderDiagnosticCode::GeminiHttpAuth,
+        429 => ProviderDiagnosticCode::GeminiHttpRateLimited,
+        _ => ProviderDiagnosticCode::GeminiHttpRejected,
+    }
 }
 
 fn gemini_timeout_stage_failure(config: &GeminiConfig, latency: Duration) -> BrainError {
@@ -957,21 +971,37 @@ fn gemini_stage_failure(
         latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
         provider: "gemini".to_owned(),
         model: config.model_id.clone(),
-        metadata: metadata.to_owned(),
+        metadata: gemini_stage_metadata(metadata),
     })
 }
 
-fn gemini_status_metadata(response: &GeminiSseResponse) -> String {
+/// Every Gemini failure names its typed stage with the same canonical key the
+/// Cartesia stages use, so one observability query covers all three.
+fn gemini_stage_metadata(error_kind: &'static str) -> String {
+    format!("stage={} {error_kind}", ProviderStageLabel::Gemini.as_str())
+}
+
+/// A non-429 HTTP refusal: the shared bounded diagnostic plus the one closed
+/// canonical status token the provider's own error envelope names.
+fn gemini_status_metadata(response: &GeminiSseResponse, retry_eligible: bool) -> String {
+    let diagnostic =
+        ProviderDiagnostic::new(gemini_http_diagnostic_code(response.status), retry_eligible)
+            .with_http_status(response.status);
     let retry_hint = retry_after_hint(response.retry_after.as_deref(), response.body.bounded());
-    format!(
-        "http_status={} retry_after_ms={} retry_after_source={} body_status={} budget_state=unknown deploy_sha=unknown",
-        response.status,
+    let metadata = format!(
+        "{} retry_after_ms={} retry_after_source={} body_status={}",
+        provider_diagnostic_metadata(&diagnostic),
         retry_hint.retry_after_ms,
         retry_hint.source,
         sanitized_body_status(response.body.bounded()),
-    )
+    );
+    debug_assert!(metadata.len() <= MAX_PROVIDER_DIAGNOSTIC_METADATA_BYTES);
+    metadata
 }
 
+/// A 429 additionally carries the operational backoff hints
+/// `docs/provider-failure-observability.md` groups on. Every one of them is a
+/// bounded integer or a closed adapter-chosen token; no provider byte survives.
 fn gemini_rate_limit_metadata(response: &GeminiSseResponse) -> String {
     let retry_hint = retry_after_hint(response.retry_after.as_deref(), response.body.bounded());
     let reset_hint = response
@@ -979,13 +1009,18 @@ fn gemini_rate_limit_metadata(response: &GeminiSseResponse) -> String {
         .as_deref()
         .and_then(sanitized_reset_hint)
         .unwrap_or_else(|| "none".to_owned());
-    format!(
-        "reset_hint={} retry_after_ms={} retry_after_source={} http_status=429 body_status={} budget_state=unknown deploy_sha=unknown",
+    let diagnostic = ProviderDiagnostic::new(ProviderDiagnosticCode::GeminiHttpRateLimited, true)
+        .with_http_status(429);
+    let metadata = format!(
+        "{} reset_hint={} retry_after_ms={} retry_after_source={} body_status={}",
+        provider_diagnostic_metadata(&diagnostic),
         reset_hint,
         retry_hint.retry_after_ms,
         retry_hint.source,
         sanitized_body_status(response.body.bounded()),
-    )
+    );
+    debug_assert!(metadata.len() <= MAX_PROVIDER_DIAGNOSTIC_METADATA_BYTES);
+    metadata
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1211,24 +1246,46 @@ fn reset_epoch_millis_in_supported_range(millis: u64) -> bool {
     (MIN_RESET_EPOCH_MS..=MAX_RESET_EPOCH_MS).contains(&millis)
 }
 
+/// The closed set of canonical `google.rpc.Code` status names.
+///
+/// `ADAPTER-06`: the provider authors this token, so it is matched against a
+/// fixed table rather than sanitized in place. Anything the table does not name
+/// — including a hostile status crafted to smuggle bytes into observability —
+/// collapses to `unknown`, so no provider-controlled byte reaches metadata.
+const GEMINI_CANONICAL_BODY_STATUSES: [&str; 17] = [
+    "ok",
+    "cancelled",
+    "unknown",
+    "invalid_argument",
+    "deadline_exceeded",
+    "not_found",
+    "already_exists",
+    "permission_denied",
+    "resource_exhausted",
+    "failed_precondition",
+    "aborted",
+    "out_of_range",
+    "unimplemented",
+    "internal",
+    "unavailable",
+    "data_loss",
+    "unauthenticated",
+];
+
 fn sanitized_body_status(body: &str) -> String {
     serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|value| {
-            value
+            let status = value
                 .pointer("/error/status")
-                .and_then(Value::as_str)
-                .map(|status| {
-                    status
-                        .to_ascii_lowercase()
-                        .chars()
-                        .filter(|character| character.is_ascii_alphanumeric() || *character == '_')
-                        .take(64)
-                        .collect::<String>()
-                })
+                .and_then(Value::as_str)?
+                .to_ascii_lowercase();
+            GEMINI_CANONICAL_BODY_STATUSES
+                .into_iter()
+                .find(|canonical| *canonical == status)
         })
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned())
+        .unwrap_or("unknown")
+        .to_owned()
 }
 
 pub fn gemini_request(config: &GeminiConfig, contents: Vec<Value>, tools: &[Value]) -> Value {
@@ -2229,7 +2286,10 @@ data: [DONE]
 
         assert_eq!(failure.failure_class(), BrainFailureClass::Timeout);
         assert_eq!(failure.stage(), BrainFailureStage::Gemini);
-        assert_eq!(failure.metadata(), "error_kind=generation_stage_timeout");
+        assert_eq!(
+            failure.metadata(),
+            "stage=gemini error_kind=generation_stage_timeout"
+        );
         let rendered = format!("{error} {failure:?}");
         assert!(!rendered.contains(unsafe_marker));
         assert!(!rendered.contains("local-fixture"));
@@ -2279,7 +2339,14 @@ data: [DONE]
         assert!(failure
             .metadata()
             .contains("body_status=resource_exhausted"));
-        assert!(failure.metadata().contains("budget_state=unknown"));
+        // `ADAPTER-06`: the two constant filler keys are gone and the closed
+        // diagnostic code replaces them; the operational backoff hints stay.
+        assert!(failure
+            .metadata()
+            .contains("error_kind=gemini_http_rate_limited"));
+        assert!(failure.metadata().contains("retry_eligible=true"));
+        assert!(!failure.metadata().contains("budget_state="));
+        assert!(!failure.metadata().contains("deploy_sha="));
         assert!(!failure.metadata().contains("UNSAFE_429_BODY_MARKER"));
         assert!(!failure.to_string().contains("UNSAFE_429_BODY_MARKER"));
     }
@@ -2351,6 +2418,284 @@ data: [DONE]
             .contains("body_status=resource_exhausted"));
         assert!(!failure.metadata().contains("RetryInfo"));
         assert!(!failure.metadata().contains("retryDelay"));
+    }
+
+    // -----------------------------------------------------------------
+    // Task 6 (`ADAPTER-06`): every live Gemini HTTP failure exposes only its
+    // typed source, stage, numeric status, retry eligibility, and one
+    // allowlisted diagnostic code. No provider body, prompt, audio, token, URL,
+    // or query survives anywhere it can be read.
+    // -----------------------------------------------------------------
+
+    /// Unique per-source markers. Every one of them is injected into a real
+    /// provider response and asserted absent from every rendering of the
+    /// resulting failure.
+    const GEMINI_BODY_MARKER: &str = "marker-gemini-raw-body-b31";
+    const GEMINI_PROMPT_MARKER: &str = "marker-gemini-prompt-b32";
+    const GEMINI_AUDIO_MARKER: &str = "marker-gemini-audio-base64-b33";
+    const GEMINI_TOKEN_MARKER: &str = "marker-gemini-bearer-token-b34";
+    const GEMINI_URL_MARKER: &str = "marker-gemini-url-b35";
+    const GEMINI_QUERY_MARKER: &str = "marker-gemini-query-b36";
+    const GEMINI_TRANSCRIPT_MARKER: &str = "marker-gemini-transcript-b37";
+
+    fn gemini_leak_markers() -> [&'static str; 7] {
+        [
+            GEMINI_BODY_MARKER,
+            GEMINI_PROMPT_MARKER,
+            GEMINI_AUDIO_MARKER,
+            GEMINI_TOKEN_MARKER,
+            GEMINI_URL_MARKER,
+            GEMINI_QUERY_MARKER,
+            GEMINI_TRANSCRIPT_MARKER,
+        ]
+    }
+
+    fn hostile_gemini_error_body(status_token: &str) -> String {
+        format!(
+            r#"{{"error":{{"code":429,"status":"{status_token}","message":"{GEMINI_BODY_MARKER} {GEMINI_PROMPT_MARKER} {GEMINI_AUDIO_MARKER} {GEMINI_TOKEN_MARKER} {GEMINI_URL_MARKER} {GEMINI_QUERY_MARKER} {GEMINI_TRANSCRIPT_MARKER}"}}}}"#
+        )
+    }
+
+    fn assert_no_gemini_marker(rendered: &str) {
+        for marker in gemini_leak_markers() {
+            assert!(
+                !rendered.contains(marker),
+                "provider marker {marker} survived into: {rendered}"
+            );
+        }
+    }
+
+    fn rendered_failure(failure: &agent_domain::BrainProviderFailure) -> String {
+        format!(
+            "{failure} {failure:?} {}",
+            serde_json::to_string(failure).expect("a typed failure serializes")
+        )
+    }
+
+    #[tokio::test]
+    async fn invalid_gemini_header_is_nonretryable_provider_auth_failure() {
+        // A key `HeaderValue` rejects can never reach the wire, so it is an auth
+        // misconfiguration, never a retryable transport blip.
+        let config = GeminiConfig {
+            api_key: format!("{GEMINI_TOKEN_MARKER}\u{7f}\u{1}"),
+            ..GeminiConfig::default()
+        };
+        let request = GeminiStreamRequest::new(&config, json!({ "contents": [] }))
+            .expect("a non-empty key builds a request");
+        let error = ReqwestGeminiSseClient::shared()
+            .stream(request)
+            .await
+            .expect_err("an unusable credential cannot be sent");
+        let failure = error.failure();
+
+        assert_eq!(
+            failure.failure_class(),
+            BrainFailureClass::ProviderAuthFailure
+        );
+        assert_eq!(
+            failure.terminal_reason(),
+            TerminalSessionReason::ProviderAuthFailed
+        );
+        assert!(!failure.retry_eligible(), "{failure:?}");
+        assert_eq!(failure.provider(), "gemini");
+        assert!(
+            failure.metadata().contains("stage=gemini"),
+            "the typed Gemini stage must survive: {failure:?}"
+        );
+        assert_no_gemini_marker(&rendered_failure(failure));
+
+        // The same taxonomy has to come out of a real 401 and a real 403, with
+        // exactly one attempt and the allowlisted auth diagnostic code.
+        for status in [401_u16, 403] {
+            let attempts = Arc::new(Mutex::new(0_u32));
+            let counted = attempts.clone();
+            let app = Router::new().fallback(post(move || {
+                let counted = counted.clone();
+                async move {
+                    *counted.lock().expect("attempt counter poisoned") += 1;
+                    (
+                        StatusCode::from_u16(status).unwrap(),
+                        [("content-type", "application/json")],
+                        hostile_gemini_error_body("PERMISSION_DENIED"),
+                    )
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind local Gemini auth-status server");
+            let base_url = format!("http://{}/v1beta/models", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve local Gemini auth-status response");
+            });
+
+            let error = stream_gemini_attempt_events_collected(
+                &ReqwestGeminiSseClient::shared(),
+                &GeminiConfig {
+                    api_key: "local-fixture".to_owned(),
+                    base_url,
+                    fallback_model_ids: Vec::new(),
+                    ..GeminiConfig::default()
+                },
+                json!({ "contents": [] }),
+            )
+            .await
+            .expect_err("an auth status is terminal")
+            .error;
+            server.abort();
+
+            let failure = error.failure();
+            assert_eq!(
+                failure.failure_class(),
+                BrainFailureClass::ProviderAuthFailure,
+                "status {status}: {failure:?}"
+            );
+            assert_eq!(failure.stage(), BrainFailureStage::Gemini);
+            assert!(!failure.retry_eligible(), "status {status}: {failure:?}");
+            assert!(
+                failure
+                    .metadata()
+                    .contains(&format!("http_status={status}")),
+                "status {status}: {failure:?}"
+            );
+            assert!(
+                failure.metadata().contains("error_kind=gemini_http_auth"),
+                "status {status} must carry the allowlisted auth diagnostic code: {failure:?}"
+            );
+            assert_eq!(
+                *attempts.lock().expect("attempt counter poisoned"),
+                1,
+                "an auth failure is never retried"
+            );
+            assert_no_gemini_marker(&rendered_failure(failure));
+        }
+    }
+
+    #[tokio::test]
+    async fn gemini_primary_and_fallback_http_diagnostics_are_bounded_and_redacted() {
+        // The primary attempt is refused with an oversized hostile body, which
+        // proves the bound; the fallback attempt is refused with a small hostile
+        // body whose provider-authored status token proves the allowlist.
+        let oversized = format!(
+            r#"{{"error":{{"code":429,"status":"{GEMINI_BODY_MARKER}-oversize","message":"{}"}}}}"#,
+            format!("{GEMINI_BODY_MARKER} {GEMINI_PROMPT_MARKER} {GEMINI_AUDIO_MARKER} {GEMINI_TOKEN_MARKER} {GEMINI_URL_MARKER} {GEMINI_QUERY_MARKER} {GEMINI_TRANSCRIPT_MARKER} ").repeat(2_048)
+        );
+        assert!(oversized.len() > 256 * 1024);
+        let small = hostile_gemini_error_body(&format!("{GEMINI_BODY_MARKER}_status"));
+        let app = Router::new().fallback(post(move |uri: axum::http::Uri| {
+            let oversized = oversized.clone();
+            let small = small.clone();
+            async move {
+                if uri.path().contains("gemini-3.5-flash") {
+                    (
+                        StatusCode::FORBIDDEN,
+                        [("content-type", "application/json")],
+                        small,
+                    )
+                } else {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("content-type", "application/json")],
+                        oversized,
+                    )
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local Gemini diagnostics server");
+        let base_url = format!(
+            "http://{}/v1beta/{GEMINI_URL_MARKER}/models",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve local Gemini diagnostics response");
+        });
+
+        let attempt_failure = stream_gemini_attempt_events_collected(
+            &ReqwestGeminiSseClient::shared(),
+            &GeminiConfig {
+                api_key: "local-fixture".to_owned(),
+                model_id: "gemini-3.5-pro".to_owned(),
+                fallback_model_ids: vec!["gemini-3.5-flash".to_owned()],
+                base_url,
+                ..GeminiConfig::default()
+            },
+            json!({ "contents": [{ "role": "user", "parts": [{ "text": GEMINI_PROMPT_MARKER }] }] }),
+        )
+        .await
+        .expect_err("both attempts are refused");
+        server.abort();
+
+        // The fallback happened, and its own event is bounded too.
+        let fallback = attempt_failure
+            .events
+            .iter()
+            .find(|event| matches!(event, GeminiStreamEvent::FallbackActivated { .. }))
+            .expect("the primary 429 activates the fallback");
+        let GeminiStreamEvent::FallbackActivated {
+            from_model,
+            to_model,
+            failure: fallback_failure,
+            ..
+        } = fallback
+        else {
+            unreachable!("matched above");
+        };
+        assert_eq!(from_model, "gemini-3.5-pro");
+        assert_eq!(to_model, "gemini-3.5-flash");
+        let fallback_failure = fallback_failure
+            .as_ref()
+            .expect("a fallback activation carries its originating failure");
+        assert_eq!(
+            fallback_failure.failure_class(),
+            BrainFailureClass::QuotaRateFailure
+        );
+        assert!(fallback_failure.retry_eligible());
+        assert!(
+            fallback_failure.metadata().contains("http_status=429"),
+            "{fallback_failure:?}"
+        );
+        assert!(
+            fallback_failure
+                .metadata()
+                .contains("error_kind=gemini_http_rate_limited"),
+            "the primary 429 must carry the allowlisted rate-limit code: {fallback_failure:?}"
+        );
+        assert!(
+            fallback_failure.metadata().len() <= 240,
+            "metadata must stay bounded: {fallback_failure:?}"
+        );
+        assert_no_gemini_marker(&rendered_failure(fallback_failure));
+        assert_no_gemini_marker(&format!("{fallback:?}"));
+
+        // The terminal failure is attributed to the model that actually ran.
+        let failure = attempt_failure.error.failure();
+        assert_eq!(
+            failure.failure_class(),
+            BrainFailureClass::ProviderAuthFailure,
+            "{failure:?}"
+        );
+        assert_eq!(failure.stage(), BrainFailureStage::Gemini);
+        assert_eq!(failure.provider(), "gemini");
+        assert_eq!(failure.model(), "gemini-35-flash");
+        assert!(!failure.retry_eligible(), "{failure:?}");
+        assert!(
+            failure.metadata().contains("http_status=403"),
+            "{failure:?}"
+        );
+        assert!(
+            failure.metadata().contains("error_kind=gemini_http_auth"),
+            "the fallback 403 must carry the allowlisted auth code: {failure:?}"
+        );
+        assert!(
+            failure.metadata().len() <= 240,
+            "metadata must stay bounded: {failure:?}"
+        );
+        assert_no_gemini_marker(&rendered_failure(failure));
     }
 
     #[tokio::test]
@@ -2674,7 +3019,10 @@ data: [DONE]
             BrainFailureClass::NetworkDisconnect
         );
         assert_eq!(failure.stage(), BrainFailureStage::Transport);
-        assert_eq!(failure.metadata(), "error_kind=response_read_failed");
+        assert_eq!(
+            failure.metadata(),
+            "stage=gemini error_kind=response_read_failed"
+        );
     }
 
     #[tokio::test]
