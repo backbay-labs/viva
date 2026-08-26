@@ -111,6 +111,16 @@ export type SessionTokenClaims = {
  * Closed rejection set shared with Plan 05's `agent/fixtures/session-token/v1/vectors.json`
  * (manifest ID `VOICE-TOKEN-V1-VECTORS`). The fixture's exact rejection string wins at every
  * precedence boundary; Node never normalizes a fixture value.
+ *
+ * PLAN AMENDMENT (recorded, not silently adopted): Plan 11 Task 2 Step 1 pins this union at ten
+ * values and omits `malformed_shape`. Two of the fixture's nineteen read-only cases —
+ * `VOICE-TOKEN-REJECT-SEGMENT-SHAPE` and `VOICE-TOKEN-REJECT-WRONG-PREFIX` — carry exactly that
+ * rejection, and Plan 05 (`2026-08-23-voice-wire-auth-contract.md` line 720) lists it first among
+ * the closed rejection strings, with line 722 pinning it to a segment-count or prefix violation.
+ * Under Plan 11's own rule that the Plan 05 vector rejection wins at every precedence boundary,
+ * the union carries an eleventh value rather than the read-only fixture being edited or a fixture
+ * value normalized in Node. The fixture is untouched. This needs a coordinator amendment row
+ * before merge; it is not a lane-authored widening of the contract.
  */
 export type VivaSessionAccessTokenRejection =
   | "binding_mismatch"
