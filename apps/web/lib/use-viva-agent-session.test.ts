@@ -5,7 +5,7 @@ import {
   type StudySet,
   seedStudySets,
 } from "@viva/core";
-import fullSessionFixture from "../../../agent/fixtures/voice-protocol/synthetic-study-session.json";
+import fullSessionFixture from "../../../agent/fixtures/voice-protocol/v5/synthetic-runtime-session.json";
 import {
   agentSourceToUiSource,
   createVivaAgentAudioCommands,

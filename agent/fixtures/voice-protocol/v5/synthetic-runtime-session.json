@@ -1,0 +1,324 @@
+{
+  "schema": "viva.voice-runtime-session.v1",
+  "protocol_version": 5,
+  "id": "VOICE-SYNTHETIC-RUNTIME-SESSION",
+  "provider": "synthetic",
+  "client_generation_id": "1",
+  "client": [
+    {
+      "type": "session_config",
+      "version": 5,
+      "client_generation_id": "1",
+      "session_token": "viva1.eyJ1c2VyX2lkIjoidXNlci0xIiwic3R1ZHlfc2V0X2lkIjoiYmlvbG9neS1taWR0ZXJtIiwic2Vzc2lvbl9pZCI6InZvaWNlLXNlc3Npb24tMSIsImlzc3VlZF9hdCI6MTgwMDAwMDAwMCwibm90X2JlZm9yZSI6MTgwMDAwMDAwMCwiZXhwaXJlc19hdCI6MTgwMDAwMDkwMCwibm9uY2UiOiJmaXh0dXJlLW5vbmNlLXJ1bnRpbWUtc3ludGhldGljIn0.ylY3qEeamYw9--bAbLwaoFlBz7pQDmY32_5xcuOb5MI",
+      "session": {
+        "session_id": "voice-session-1",
+        "user_id": "user-1",
+        "study_set_id": "biology-midterm",
+        "mode": "quiz",
+        "source_context": [
+          {
+            "source_id": "src-lecture-5-slide-18",
+            "document_id": "lec-5",
+            "span": "slide:18",
+            "excerpt": "NADH donates high-energy electrons to the electron transport chain. Electron flow pumps protons across the inner mitochondrial membrane, creating the gradient that drives ATP synthase.",
+            "confidence": "high",
+            "retrieval_reason": "seeded next-question context"
+          }
+        ],
+        "active_concepts": [
+          "oxidative-phosphorylation",
+          "nadh",
+          "atp-synthase"
+        ]
+      }
+    },
+    {
+      "type": "turn_intent",
+      "version": 5,
+      "client_generation_id": "1",
+      "turn_id": "turn-1",
+      "intent": {
+        "kind": "answer_text",
+        "text": "NADH gives electrons to the electron transport chain."
+      }
+    },
+    {
+      "type": "cancel",
+      "version": 5,
+      "client_generation_id": "1"
+    },
+    {
+      "type": "stop",
+      "version": 5,
+      "client_generation_id": "1"
+    }
+  ],
+  "server": [
+    {
+      "brain": {
+        "configured": true,
+        "live_runtime": false,
+        "provider": "synthetic",
+        "selectable": true
+      },
+      "input_encoding": "pcm_s16le",
+      "protocol": {
+        "preferred_version": 5,
+        "supported_versions": [
+          5
+        ]
+      },
+      "sample_rate_hz": 24000,
+      "store": {
+        "available": true,
+        "backend": "in_memory",
+        "durable": false,
+        "nonce_replay_protection": true,
+        "raw_audio_persistence": false,
+        "transcript_persistence": false,
+        "uuid_schema_translation": true
+      },
+      "type": "ready",
+      "version": 5
+    },
+    {
+      "event": {
+        "phase": "ready",
+        "type": "session_phase"
+      },
+      "type": "event",
+      "version": 5
+    },
+    {
+      "event": {
+        "question": {
+          "concept_id": "oxidative-phosphorylation",
+          "expected_terms": [
+            "electron donor",
+            "electron transport chain",
+            "proton gradient",
+            "ATP synthase"
+          ],
+          "follow_up": "Now connect that electron flow to ATP synthase in one precise sentence.",
+          "prompt": "Explain the role of NADH in oxidative phosphorylation.",
+          "question_id": "q-oxidative-phosphorylation-nadh",
+          "rubric": {
+            "criteria": [
+              {
+                "claim": "NADH donates high-energy electrons to the electron transport chain.",
+                "concept_id": "oxidative-phosphorylation",
+                "criterion_id": "crit-oxphos-donor",
+                "required": true,
+                "source_id": "src-lecture-5-slide-18"
+              },
+              {
+                "claim": "Electron flow pumps protons across the inner mitochondrial membrane.",
+                "concept_id": "oxidative-phosphorylation",
+                "criterion_id": "crit-oxphos-gradient",
+                "required": true,
+                "source_id": "src-lecture-5-slide-18"
+              }
+            ],
+            "policy_version": "viva.semantic-rubric.v1"
+          },
+          "source": {
+            "confidence": "high",
+            "document_id": "lec-5",
+            "excerpt": "NADH donates high-energy electrons to the electron transport chain. Electron flow pumps protons across the inner mitochondrial membrane, creating the gradient that drives ATP synthase.",
+            "retrieval_reason": "server fixture source for oxidative phosphorylation",
+            "source_id": "src-lecture-5-slide-18",
+            "span": "slide:18"
+          }
+        },
+        "response_id": "response-1-generation-1",
+        "turn_id": "turn-1",
+        "type": "question_started"
+      },
+      "type": "event",
+      "version": 5
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "session_phase",
+        "phase": "listening"
+      }
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "transcript_delta",
+        "response_id": "response-1-generation-1",
+        "text": "NADH gives electrons to the electron transport chain."
+      }
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "transcript_final",
+        "response_id": "response-1-generation-1",
+        "text": "NADH gives electrons to the electron transport chain.",
+        "confidence": null
+      }
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "session_phase",
+        "phase": "thinking"
+      }
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "manuscript_intent",
+        "response_id": "response-1-generation-1",
+        "intent": {
+          "type": "scene_intent",
+          "register": "examining",
+          "emphasis": "measured"
+        }
+      }
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "source_reference",
+        "response_id": "response-1-generation-1",
+        "source": {
+          "source_id": "src-lecture-5-slide-18",
+          "document_id": "lec-5",
+          "span": "slide:18",
+          "excerpt": "NADH donates high-energy electrons to the electron transport chain. Electron flow pumps protons across the inner mitochondrial membrane, creating the gradient that drives ATP synthase.",
+          "confidence": "high",
+          "retrieval_reason": "server fixture source for oxidative phosphorylation"
+        }
+      }
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "answer_evaluated",
+        "response_id": "response-1-generation-1",
+        "evaluation": {
+          "question_id": "q-oxidative-phosphorylation-nadh",
+          "answer_text": "NADH gives electrons to the electron transport chain.",
+          "label": "strong",
+          "concise_feedback": "The chain description held. The proton gradient claim was correct but only weakly supported.",
+          "retry_prompt": "Say precisely where the pumped protons accumulate.",
+          "source": {
+            "source_id": "src-lecture-5-slide-18",
+            "document_id": "lec-5",
+            "span": "slide:18",
+            "excerpt": "NADH donates high-energy electrons to the electron transport chain. Electron flow pumps protons across the inner mitochondrial membrane, creating the gradient that drives ATP synthase.",
+            "confidence": "high",
+            "retrieval_reason": "server fixture source for oxidative phosphorylation"
+          },
+          "concept_status": "strong",
+          "confidence_score": 0.86
+        }
+      }
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "concept_status",
+        "response_id": "response-1-generation-1",
+        "concept_id": "oxidative-phosphorylation",
+        "status": "strong"
+      }
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "manuscript_intent",
+        "response_id": "response-1-generation-1",
+        "intent": {
+          "type": "entity_intent",
+          "entity_id": "oxidative-phosphorylation",
+          "entity_kind": "concept",
+          "register": "correcting",
+          "emphasis": "marked"
+        }
+      }
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "session_phase",
+        "phase": "feedback"
+      }
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "session_phase",
+        "phase": "correction"
+      }
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "cancellation",
+        "response_id": "response-2-generation-1"
+      }
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "recap_ready",
+        "response_id": "response-0-generation-1",
+        "recap": {
+          "schema": "viva.study_session_recap.v2",
+          "voice_session_id": "voice-session-1",
+          "headline": "Strong concepts: 1 of 1.",
+          "summary": "Graded concepts: 1. Evaluated turns: 1. Deferred turns: 0.",
+          "concepts": [
+            {
+              "concept_id": "oxidative-phosphorylation",
+              "label": "Oxidative phosphorylation",
+              "status": "strong"
+            }
+          ],
+          "review_schedule": [
+            {
+              "concept_id": "oxidative-phosphorylation",
+              "due_at": "1970-01-01T00:00:00.000Z",
+              "authority": "server_persisted_fsrs"
+            }
+          ],
+          "next_action": "Review the scheduled concepts on their due dates.",
+          "source_moments": [
+            {
+              "response_id": "response-1-generation-1",
+              "source_id": "src-lecture-5-slide-18"
+            }
+          ],
+          "deferred_turns": 0
+        },
+        "partial": false
+      }
+    },
+    {
+      "type": "event",
+      "version": 5,
+      "event": {
+        "type": "session_phase",
+        "phase": "recap"
+      }
+    }
+  ]
+}

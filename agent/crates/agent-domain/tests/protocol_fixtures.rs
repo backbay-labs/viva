@@ -121,7 +121,7 @@ fn challenge_correction_carries_full_source_tuple() {
 #[test]
 fn shared_session_config_fixture_matches_rust_domain_types() {
     let config: SessionConfig = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/session-config.json"
+        "../../../fixtures/voice-protocol/v5/seeded-session-config.json"
     ))
     .expect("shared session config fixture is valid");
 

@@ -4802,7 +4802,7 @@ async fn ready_and_brain_health_routes_report_configured_fake_cartesia_gemini_pr
 #[tokio::test]
 async fn shared_audio_fixture_matches_client_frame_contract() {
     let audio: ClientFrame = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/client-audio.json"
+        "../../../fixtures/voice-protocol/v5/client-audio-chunk.json"
     ))
     .unwrap();
 
@@ -4831,13 +4831,32 @@ async fn state_session_slots_enforce_configured_capacity() {
 #[test]
 fn ready_fixture_matches_server_frame_shape() {
     let frame: ServerFrame = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/server-ready.json"
+        "../../../fixtures/voice-protocol/v5/server-ready.json"
     ))
     .unwrap();
 
     assert_eq!(frame, ServerFrame::ready());
 }
 
+/// `W-06` Group C — KNOWN RED, cross-plan defect, NOT a fixture or wire problem.
+///
+/// Plan 05's retirement wave migrated both halves of this replay to the versioned v5
+/// corpus, and the fixture's `server` array is the merged runtime's own recorded output
+/// (arbitered frame-exactly by `protocol::tests::*_matches_full_session_fixture_exactly`).
+/// The socket nevertheless refuses the runtime's `answer_evaluated` event and closes the
+/// session with `provider_source_authority_rejected`, so this replay cannot reach its
+/// evidence pack.
+///
+/// Root cause (outside Plan 05's ownership, reproduced from pre-existing v5 fixtures
+/// alone): `StudyMemoryStore::authorize_answer_evaluation` requires an `answer_attempts`
+/// row whose `evaluation` equals the event's `PersistedAnswerEvaluation` plus a matching
+/// `event_authorizations` digest. Both are written only by `record_answer_evaluation`,
+/// which Plan 04's turn-outcome authority retired; the production path now writes
+/// `record_turn_outcome`, which backfills neither. No real evaluated turn can therefore
+/// pass the socket's browser-event authorization gate.
+///
+/// Flip-back condition: once the turn-outcome authority also satisfies that gate, this
+/// test passes unchanged. Nothing here is weakened to accommodate the defect.
 #[tokio::test]
 async fn real_websocket_replays_synthetic_fixture_and_evidence_pack() {
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
@@ -4849,24 +4868,27 @@ async fn real_websocket_replays_synthetic_fixture_and_evidence_pack() {
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
     let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
+        "../../../fixtures/voice-protocol/v5/synthetic-runtime-session.json"
     ))
     .unwrap();
 
-    let mut actual = vec![read_server_frame(&mut socket).await];
+    // v5 acknowledges every admitted audio turn on the wire, and the fixture records
+    // that acknowledgment in place, so this replay reads frames exactly rather than
+    // through the acknowledgment-skipping reader.
+    let mut actual = vec![read_server_frame_exact(&mut socket).await];
     send_client_frame(&mut socket, &fixture.client[0]).await;
     for _ in 0..2 {
-        actual.push(read_server_frame(&mut socket).await);
+        actual.push(read_server_frame_exact(&mut socket).await);
     }
     send_client_frame(&mut socket, &fixture.client[1]).await;
-    for _ in 0..12 {
-        actual.push(read_server_frame(&mut socket).await);
+    for _ in 0..11 {
+        actual.push(read_server_frame_exact(&mut socket).await);
     }
     send_client_frame(&mut socket, &fixture.client[2]).await;
-    actual.push(read_server_frame(&mut socket).await);
+    actual.push(read_server_frame_exact(&mut socket).await);
     send_client_frame(&mut socket, &fixture.client[3]).await;
     for _ in 0..2 {
-        actual.push(read_server_frame(&mut socket).await);
+        actual.push(read_server_frame_exact(&mut socket).await);
     }
     wait_for_socket_close(&mut socket).await;
 
@@ -4875,7 +4897,7 @@ async fn real_websocket_replays_synthetic_fixture_and_evidence_pack() {
         normalized_fixture_value(&fixture.server)
     );
     let expected_pack: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-evidence-pack.json"
+        "../../../fixtures/voice-protocol/v5/synthetic-runtime-evidence-pack.json"
     ))
     .unwrap();
     let snapshot = store.snapshot();
@@ -4933,24 +4955,24 @@ async fn optional_postgres_replays_synthetic_fixture_when_database_url_is_set() 
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
     let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
+        "../../../fixtures/voice-protocol/v5/synthetic-runtime-session.json"
     ))
     .unwrap();
 
-    let mut actual = vec![read_server_frame(&mut socket).await];
+    let mut actual = vec![read_server_frame_exact(&mut socket).await];
     send_client_frame(&mut socket, &fixture.client[0]).await;
     for _ in 0..2 {
-        actual.push(read_server_frame(&mut socket).await);
+        actual.push(read_server_frame_exact(&mut socket).await);
     }
     send_client_frame(&mut socket, &fixture.client[1]).await;
-    for _ in 0..12 {
-        actual.push(read_server_frame(&mut socket).await);
+    for _ in 0..11 {
+        actual.push(read_server_frame_exact(&mut socket).await);
     }
     send_client_frame(&mut socket, &fixture.client[2]).await;
-    actual.push(read_server_frame(&mut socket).await);
+    actual.push(read_server_frame_exact(&mut socket).await);
     send_client_frame(&mut socket, &fixture.client[3]).await;
     for _ in 0..2 {
-        actual.push(read_server_frame(&mut socket).await);
+        actual.push(read_server_frame_exact(&mut socket).await);
     }
     wait_for_socket_close(&mut socket).await;
 
@@ -4980,6 +5002,25 @@ async fn optional_postgres_replays_synthetic_fixture_when_database_url_is_set() 
     );
 }
 
+/// `W-06` Group C — KNOWN RED, cross-plan defect, NOT a fixture or wire problem.
+///
+/// Plan 05's retirement wave migrated both halves of this replay to the versioned v5
+/// corpus, and the fixture's `server` array is the merged runtime's own recorded output
+/// (arbitered frame-exactly by `protocol::tests::*_matches_full_session_fixture_exactly`).
+/// The socket nevertheless refuses the runtime's `answer_evaluated` event and closes the
+/// session with `provider_source_authority_rejected`, so this replay cannot reach its
+/// evidence pack.
+///
+/// Root cause (outside Plan 05's ownership, reproduced from pre-existing v5 fixtures
+/// alone): `StudyMemoryStore::authorize_answer_evaluation` requires an `answer_attempts`
+/// row whose `evaluation` equals the event's `PersistedAnswerEvaluation` plus a matching
+/// `event_authorizations` digest. Both are written only by `record_answer_evaluation`,
+/// which Plan 04's turn-outcome authority retired; the production path now writes
+/// `record_turn_outcome`, which backfills neither. No real evaluated turn can therefore
+/// pass the socket's browser-event authorization gate.
+///
+/// Flip-back condition: once the turn-outcome authority also satisfies that gate, this
+/// test passes unchanged. Nothing here is weakened to accommodate the defect.
 #[tokio::test]
 async fn real_websocket_replays_fake_cartesia_gemini_fixture_and_evidence_pack() {
     let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
@@ -4991,24 +5032,27 @@ async fn real_websocket_replays_fake_cartesia_gemini_fixture_and_evidence_pack()
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
     let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/fake-cartesia-gemini-study-session.json"
+        "../../../fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-session.json"
     ))
     .unwrap();
 
-    let mut actual = vec![read_server_frame(&mut socket).await];
+    let mut actual = vec![read_server_frame_exact(&mut socket).await];
     send_client_frame(&mut socket, &fixture.client[0]).await;
     for _ in 0..2 {
-        actual.push(read_server_frame(&mut socket).await);
+        actual.push(read_server_frame_exact(&mut socket).await);
     }
     // The bounded chunk is retained locally; only the explicit end admits a turn.
     send_client_frame(&mut socket, &fixture.client[1]).await;
     send_client_frame(&mut socket, &fixture.client[2]).await;
     for _ in 0..14 {
-        actual.push(read_server_frame(&mut socket).await);
+        actual.push(read_server_frame_exact(&mut socket).await);
     }
     send_client_frame(&mut socket, &fixture.client[3]).await;
-    actual.push(read_server_frame(&mut socket).await);
+    actual.push(read_server_frame_exact(&mut socket).await);
     send_client_frame(&mut socket, &fixture.client[4]).await;
+    for _ in 0..2 {
+        actual.push(read_server_frame_exact(&mut socket).await);
+    }
     wait_for_socket_close(&mut socket).await;
 
     assert_eq!(
@@ -5016,7 +5060,7 @@ async fn real_websocket_replays_fake_cartesia_gemini_fixture_and_evidence_pack()
         normalized_fixture_value(&fixture.server)
     );
     let expected_pack: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/fake-cartesia-gemini-evidence-pack.json"
+        "../../../fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-evidence-pack.json"
     ))
     .unwrap();
     assert_eq!(
@@ -5061,6 +5105,7 @@ async fn real_websocket_replays_fake_cartesia_gemini_fixture_and_evidence_pack()
 fn normalized_fixture_value<T: Serialize>(value: &T) -> serde_json::Value {
     let mut value = serde_json::to_value(value).expect("fixture value serializes");
     normalize_voice_session_ids(&mut value);
+    normalize_scheduled_due_at(&mut value);
     value
 }
 
@@ -5174,7 +5219,7 @@ async fn websocket_malformed_frame_reports_protocol_close_code() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -5211,7 +5256,7 @@ async fn websocket_oversized_text_frame_closes_with_size_and_terminal_reason() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -5250,7 +5295,7 @@ async fn websocket_binary_frame_closes_as_unsupported_with_terminal_reason() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -5327,7 +5372,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
                 r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
-                include_str!("../../../fixtures/voice-protocol/session-config.json")
+                include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json")
             ))
             .unwrap();
             let ClientFrame::SessionConfig { session, .. } = &mut frame else {
@@ -5339,7 +5384,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
                 r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
-                include_str!("../../../fixtures/voice-protocol/session-config.json")
+                include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json")
             ))
             .unwrap();
             let ClientFrame::SessionConfig { session, .. } = &mut frame else {
@@ -5351,7 +5396,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
                 r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
-                include_str!("../../../fixtures/voice-protocol/session-config.json")
+                include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json")
             ))
             .unwrap();
             let ClientFrame::SessionConfig { session, .. } = &mut frame else {
@@ -5363,7 +5408,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
                 r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
-                include_str!("../../../fixtures/voice-protocol/session-config.json")
+                include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json")
             ))
             .unwrap();
             let ClientFrame::SessionConfig { session, .. } = &mut frame else {
@@ -5375,7 +5420,7 @@ async fn websocket_rejects_missing_or_forged_session_identity_before_open() {
         {
             let mut frame: ClientFrame = serde_json::from_str(&format!(
                 r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"{VOICE_TEST_CLIENT_GENERATION}","session_token":"{VOICE_TEST_PLACEHOLDER_CREDENTIAL}","session":{}}}"#,
-                include_str!("../../../fixtures/voice-protocol/session-config.json")
+                include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json")
             ))
             .unwrap();
             let ClientFrame::SessionConfig { session, .. } = &mut frame else {
@@ -5461,7 +5506,7 @@ async fn websocket_records_auth_failure_for_forged_config_refresh() {
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
     let session: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/session-config.json"
+        "../../../fixtures/voice-protocol/v5/seeded-session-config.json"
     ))
     .unwrap();
     let mut forged_refresh = session.clone();
@@ -5948,7 +5993,7 @@ async fn refresh_identity_stale_generation_is_rejected() {
     );
 
     let session: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/session-config.json"
+        "../../../fixtures/voice-protocol/v5/seeded-session-config.json"
     ))
     .unwrap();
     socket
@@ -6774,7 +6819,7 @@ async fn websocket_provider_backoff_denies_next_answer_before_brain_input() {
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
@@ -6866,7 +6911,7 @@ async fn websocket_unstructured_provider_rate_limit_sets_default_backoff() {
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
@@ -6949,7 +6994,7 @@ async fn websocket_open_rate_limit_backoff_denies_next_socket_before_brain_open(
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
@@ -7246,7 +7291,7 @@ async fn websocket_provider_queue_rejects_overlapping_same_socket_turn_without_d
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut socket, "cartesia_gemini").await;
@@ -7482,7 +7527,7 @@ async fn websocket_provider_admission_rejects_audio_continuation_without_second_
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut socket, "cartesia_gemini").await;
@@ -9020,7 +9065,7 @@ async fn websocket_records_study_context_store_errors_without_access_denied_auth
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
     let session: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/session-config.json"
+        "../../../fixtures/voice-protocol/v5/seeded-session-config.json"
     ))
     .unwrap();
 
@@ -9767,7 +9812,7 @@ async fn websocket_drain_emits_terminal_phase_before_close() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -10063,7 +10108,7 @@ async fn websocket_drain_latches_before_socket_subscribes() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     drain.begin_drain();
@@ -10098,7 +10143,7 @@ async fn websocket_session_cap_emits_terminal_phase_before_close() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -10142,7 +10187,7 @@ async fn websocket_user_study_set_cap_stays_one_when_user_session_knob_is_above_
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut first_socket, "backpressured_input_probe").await;
@@ -10348,7 +10393,7 @@ async fn websocket_user_study_set_cap_still_rejects_duplicate_when_user_total_li
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut first_socket, "backpressured_input_probe").await;
@@ -10396,7 +10441,7 @@ async fn websocket_default_study_set_cap_rejects_duplicate_tab_and_releases() {
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
     assert_ready_provider(&mut first_socket, "backpressured_input_probe").await;
@@ -10831,7 +10876,7 @@ async fn websocket_audio_byte_cap_emits_rate_limit_terminal_phase() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "backpressured_input_probe").await;
     socket
@@ -10879,7 +10924,7 @@ async fn websocket_cost_budget_emits_cost_budget_terminal_phase() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "event_probe").await;
     socket
@@ -10913,7 +10958,7 @@ async fn websocket_turn_cap_emits_terminal_phase_before_close() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -10957,7 +11002,7 @@ async fn websocket_records_configured_turn_cap_evidence() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -10989,7 +11034,7 @@ async fn websocket_turn_cap_waits_for_answer_frame() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -11044,7 +11089,7 @@ async fn websocket_post_config_idle_timeout_closes_without_answer_frame() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -11100,7 +11145,7 @@ async fn websocket_turn_cap_disarms_after_answer_resolution() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "gated_completion_provider_probe").await;
     socket
@@ -11316,7 +11361,7 @@ async fn websocket_provider_slot_prefers_queued_completion_before_same_socket_ov
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "answer_evaluated_provider_probe").await;
     socket
@@ -11398,7 +11443,7 @@ async fn websocket_provider_drains_queued_usage_before_next_admission() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "answer_evaluated_provider_probe").await;
     socket
@@ -11493,7 +11538,7 @@ async fn websocket_audio_continuation_requires_second_lease_when_limiter_enabled
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "cartesia_gemini").await;
     socket
@@ -11559,7 +11604,7 @@ async fn websocket_audio_continuations_keep_turn_cap_with_limits(voice_limits: V
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "cartesia_gemini").await;
     socket
@@ -11630,7 +11675,7 @@ async fn websocket_turn_cap_stays_armed_for_newer_submission_after_one_resolutio
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "first_answer_only_probe").await;
     socket
@@ -11732,7 +11777,7 @@ async fn websocket_turn_cap_dedupes_duplicate_response_resolution_ids() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "duplicate_resolution_probe").await;
     socket
@@ -11806,7 +11851,7 @@ async fn websocket_turn_cap_ignores_response_less_phase_after_new_submission() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "response_then_phase_probe").await;
     socket
@@ -11882,7 +11927,7 @@ async fn websocket_turn_cap_ignores_suppressed_stale_resolution_after_new_submis
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "cancelled_then_stale_resolution_probe").await;
     socket
@@ -11958,7 +12003,7 @@ async fn websocket_turn_cap_is_not_postponed_by_provider_events() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "chatty_phase_probe").await;
     socket
@@ -12017,7 +12062,7 @@ async fn websocket_extra_audio_frame_without_second_lease_closes_slow_client() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -12075,7 +12120,7 @@ async fn websocket_turn_cap_includes_backpressured_answer_send() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "backpressured_input_probe").await;
     socket
@@ -12127,7 +12172,7 @@ async fn websocket_turn_cap_aborts_provider_before_stop_can_write_late_answer() 
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "stop_writes_answer_probe").await;
     socket
@@ -12180,7 +12225,7 @@ async fn websocket_turn_cap_is_not_postponed_by_client_keepalives() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -12241,7 +12286,7 @@ async fn websocket_drain_interrupts_active_provider_response() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "chatty_phase_probe").await;
     socket
@@ -12317,7 +12362,7 @@ async fn websocket_default_trusted_mode_rotates_internal_session_for_reconnect()
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     for _ in 0..2 {
         let (mut socket, _) = connect_async(url.clone()).await.unwrap();
@@ -12369,7 +12414,7 @@ async fn websocket_disconnect_aborts_provider_tasks_and_releases_capacity() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "abort_probe").await;
     socket
@@ -12409,7 +12454,7 @@ async fn websocket_drain_aborts_provider_tasks_and_releases_capacity() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "abort_probe").await;
     socket
@@ -12459,7 +12504,7 @@ async fn websocket_drain_interrupts_backpressured_provider_input() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "backpressured_input_probe").await;
     socket
@@ -12505,7 +12550,7 @@ async fn websocket_disconnect_releases_backpressured_provider_input() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "backpressured_input_probe").await;
     socket
@@ -12539,7 +12584,7 @@ async fn websocket_hydrates_active_concepts_from_server_context_before_brain_ope
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
     let mut session: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/session-config.json"
+        "../../../fixtures/voice-protocol/v5/seeded-session-config.json"
     ))
     .unwrap();
     session["active_concepts"] = serde_json::json!([
@@ -12600,7 +12645,7 @@ async fn websocket_suppresses_stale_events_after_cancelled_response() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "stale_event_probe").await;
     socket
@@ -12655,7 +12700,7 @@ async fn websocket_global_cancellation_suppresses_active_response_events() {
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "global_cancel_probe").await;
     socket
@@ -12899,7 +12944,8 @@ async fn websocket_rejects_forged_provider_source_tuples_without_leaks_or_writes
             return;
         };
         let (mut socket, _) = connect_async(url).await.unwrap();
-        let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+        let session =
+            include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
         assert_ready_provider(&mut socket, "event_probe").await;
         socket
@@ -12960,7 +13006,7 @@ async fn websocket_rejects_authorized_payload_replayed_under_wrong_response_id()
         return;
     };
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "response_replay_probe").await;
     socket
@@ -13038,7 +13084,7 @@ fn streamed_audio_cancel_json(turn_id: &str) -> String {
 async fn open_streamed_audio_session(state: AppState) -> Option<TestWebSocket> {
     let url = spawn_server(state).await?;
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -13457,6 +13503,29 @@ struct FullSessionFixture {
     server: Vec<ServerFrame>,
 }
 
+/// `D-01 SERVER_PERSISTED_FSRS` derives every review `due_at` from the UTC clock at
+/// grading time, so the recap's schedule carries a wall-clock instant no fixture can
+/// pin. Everything else stays byte-exact.
+fn normalize_scheduled_due_at(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, nested) in object.iter_mut() {
+                if key == "due_at" && nested.as_str().is_some() {
+                    *nested = serde_json::Value::String("1970-01-01T00:00:00.000Z".to_owned());
+                } else {
+                    normalize_scheduled_due_at(nested);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                normalize_scheduled_due_at(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `VOICE-AUTH-001`: protocol v5 makes the client generation and the signed
 /// credential required members of `session_config`, so every test socket names
 /// this one generation. The value is a fixed test literal, never a credential.
@@ -13558,7 +13627,7 @@ fn fixture_session_config_frame() -> ClientFrame {
 
 fn session_config_json_with_token(token: &str) -> String {
     let session: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/session-config.json"
+        "../../../fixtures/voice-protocol/v5/seeded-session-config.json"
     ))
     .unwrap();
     serde_json::json!({
@@ -13577,7 +13646,7 @@ fn session_config_json_with_ids_and_token(
     token: &str,
 ) -> String {
     let mut session: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/session-config.json"
+        "../../../fixtures/voice-protocol/v5/seeded-session-config.json"
     ))
     .unwrap();
     session["study_set_id"] = serde_json::json!(study_set_id);
@@ -14050,7 +14119,7 @@ async fn run_partial_recap_provider_failure_probe_with_extended_options(
     let evidence = state.evidence.clone();
     let url = spawn_server(state).await?;
     let (mut socket, _) = connect_async(url).await.unwrap();
-    let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+    let session = include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json");
 
     assert_ready_provider(&mut socket, "partial_recap_probe").await;
     socket
@@ -16595,7 +16664,7 @@ const TURN_DEFERRED_GENERATION_ID: &str = "bac522-deferred-2";
 
 fn turn_deferred_session_config_json(generation_id: &str) -> String {
     let session: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/session-config.json"
+        "../../../fixtures/voice-protocol/v5/seeded-session-config.json"
     ))
     .unwrap();
     serde_json::json!({

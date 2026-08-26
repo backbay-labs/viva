@@ -2576,35 +2576,73 @@ mod tests {
 
     use super::*;
 
-    /// The frozen unversioned corpus is v4 client wire shape — token-less
-    /// `session_config` and plain `text` — so its client half is read as opaque JSON
-    /// rather than through the v5 `ClientFrame`. Task 9 Step 6 deletes the corpus.
+    /// `VOICE-FIXTURE-001` / `VOICE-SESSION-001`: a recorded runtime session. Both
+    /// halves are typed v5 frames — the client half is `ClientFrame`, not opaque JSON —
+    /// because Task 9 Step 6 retired the frozen unversioned corpus whose v4-era client
+    /// frames (token-less `session_config`, the removed `{"type":"text"}` kind) could
+    /// not be read through the v5 union at all. The `server` half is never
+    /// hand-authored: it is whatever the merged runtime emits, arbitered by the
+    /// `*_matches_*_exactly` tests below.
     #[derive(Deserialize)]
-    struct FullSessionFixture {
-        client: Vec<serde_json::Value>,
+    struct RuntimeSessionFixture {
+        client: Vec<ClientFrame>,
         server: Vec<ServerFrame>,
     }
 
-    fn legacy_client_frame(fixture: &FullSessionFixture, index: usize) -> ClientFrame {
-        serde_json::from_value(fixture.client[index].clone())
-            .expect("v5-shaped legacy client frame parses")
+    impl RuntimeSessionFixture {
+        /// The domain config the socket would open, with the frame-level generation
+        /// applied exactly as `ws.rs` applies it to the authorized initial config, so
+        /// an in-process harness cannot silently diverge from the server it asserts
+        /// against.
+        fn session_config(&self) -> agent_domain::SessionConfig {
+            let ClientFrame::SessionConfig {
+                client_generation_id,
+                session,
+                ..
+            } = &self.client[0]
+            else {
+                panic!("the first client frame is the v5 session config");
+            };
+            let mut session = session.clone();
+            session.client_generation_id = Some(client_generation_id.clone());
+            session
+        }
+
+        /// The answer a `turn_intent` frame carries. A citation challenge is not an
+        /// answer, so only `answer_text` yields one.
+        fn answer_text(&self, index: usize) -> String {
+            let ClientFrame::TurnIntent {
+                intent: ClientTurnIntent::AnswerText { text },
+                ..
+            } = &self.client[index]
+            else {
+                panic!("client frame {index} is not an answer_text turn intent");
+            };
+            text.clone()
+        }
     }
 
-    fn legacy_client_frame_type(fixture: &FullSessionFixture, index: usize) -> &str {
-        fixture.client[index]["type"]
-            .as_str()
-            .expect("legacy client frame has a type")
+    const SYNTHETIC_RUNTIME_SESSION_JSON: &str =
+        include_str!("../../../fixtures/voice-protocol/v5/synthetic-runtime-session.json");
+
+    const FAKE_CARTESIA_GEMINI_RUNTIME_SESSION_JSON: &str = include_str!(
+        "../../../fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-session.json"
+    );
+
+    fn synthetic_runtime_session() -> RuntimeSessionFixture {
+        serde_json::from_str(SYNTHETIC_RUNTIME_SESSION_JSON)
+            .expect("the v5 synthetic runtime session parses")
     }
 
-    fn legacy_session_config(fixture: &FullSessionFixture) -> agent_domain::SessionConfig {
-        serde_json::from_value(fixture.client[0]["session"].clone())
-            .expect("legacy session config parses into the domain type")
+    fn fake_cartesia_gemini_runtime_session() -> RuntimeSessionFixture {
+        serde_json::from_str(FAKE_CARTESIA_GEMINI_RUNTIME_SESSION_JSON)
+            .expect("the v5 fake provider runtime session parses")
     }
 
     #[test]
     fn deserializes_shared_audio_fixture() {
         let frame: ClientFrame = serde_json::from_str(include_str!(
-            "../../../fixtures/voice-protocol/client-audio.json"
+            "../../../fixtures/voice-protocol/v5/client-audio-chunk.json"
         ))
         .expect("fixture is valid client audio");
 
@@ -2624,14 +2662,11 @@ mod tests {
 
     #[test]
     fn deserializes_shared_audio_end_frame_from_full_session_fixture() {
-        let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-            "../../../fixtures/voice-protocol/fake-cartesia-gemini-study-session.json"
-        ))
-        .expect("fixture is valid full fake provider session");
+        let fixture = fake_cartesia_gemini_runtime_session();
 
-        let end = legacy_client_frame(&fixture, 2);
+        let end = &fixture.client[2];
         assert_eq!(
-            serde_json::to_value(&end).expect("serializes"),
+            serde_json::to_value(end).expect("serializes"),
             json!({
                 "type": "audio_end",
                 "version": VIVA_VOICE_PROTOCOL_VERSION,
@@ -2657,10 +2692,7 @@ mod tests {
             })
         );
 
-        let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-            "../../../fixtures/voice-protocol/fake-cartesia-gemini-study-session.json"
-        ))
-        .expect("fixture is valid full fake provider session");
+        let fixture = fake_cartesia_gemini_runtime_session();
         assert_eq!(fixture.server.get(3), Some(&frame));
     }
 
@@ -2748,33 +2780,14 @@ mod tests {
         assert_eq!(VIVA_AUDIO_MAX_TURN_BYTES, VIVA_AUDIO_MAX_TURN_SAMPLES * 2);
     }
 
-    /// The frozen unversioned `question_started` fixture predates `VOICE-TURN-001`'s
-    /// required wire `turn_id`, so v5 rejects it at that exact path. Positive coverage
-    /// lives in `turn-outcomes.json` and the two-turn session corpora; Task 9 Step 6
-    /// deletes this fixture.
-    #[test]
-    fn rejects_legacy_question_started_event_fixture() {
-        let diagnostic = parse_server_frame_json(include_str!(
-            "../../../fixtures/voice-protocol/server-event-question-started.json"
-        ))
-        .map(|_| ())
-        .expect_err("a turn-less question start is not a v5 event");
-        assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::MissingField);
-        assert_eq!(diagnostic.path, "$.event.turn_id");
-    }
-
-    /// Likewise, the frozen structured-error fixture predates `VOICE-TERMINAL-002`'s
-    /// required `code` and `terminality`.
-    #[test]
-    fn rejects_legacy_structured_error_event_fixture() {
-        let diagnostic = parse_server_frame_json(include_str!(
-            "../../../fixtures/voice-protocol/server-event-structured-error.json"
-        ))
-        .map(|_| ())
-        .expect_err("an untyped structured error is not a v5 event");
-        assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::MissingField);
-        assert_eq!(diagnostic.path, "$.event.code");
-    }
+    // Task 9 Step 6 retired the two frozen v4-era event fixtures these tests read
+    // (`server-event-question-started.json`, `server-event-structured-error.json`).
+    // Their rejection coverage is not lost: it moved to the versioned differential
+    // corpus, which asserts the same code/path pairs from `server-differential-cases.json`
+    // through `voice_v5_server_differential_cases` —
+    // `VOICE-SERVER-REJECT-QUESTION-STARTED-WITHOUT-TURN` (`VOICE-TURN-001`, MissingField
+    // at `$.event.turn_id`) and `VOICE-SERVER-REJECT-STRUCTURED-ERROR-MISSING-CODE`
+    // (`VOICE-TERMINAL-002`, MissingField at `$.event.code`).
 
     #[test]
     fn maps_provider_failures_to_their_own_terminal_reason() {
@@ -2828,7 +2841,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(frame).expect("serializes"),
             serde_json::from_str::<serde_json::Value>(include_str!(
-                "../../../fixtures/voice-protocol/server-event-manuscript-intent.json"
+                "../../../fixtures/voice-protocol/v5/server-event-manuscript-intent.json"
             ))
             .expect("fixture is valid")
         );
@@ -2859,12 +2872,12 @@ mod tests {
 
     #[test]
     fn parses_shared_full_session_fixture() {
-        let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-            "../../../fixtures/voice-protocol/synthetic-study-session.json"
-        ))
-        .expect("fixture is valid full session");
+        let fixture = synthetic_runtime_session();
 
-        assert_eq!(legacy_client_frame_type(&fixture, 0), "session_config");
+        assert!(matches!(
+            fixture.client.first(),
+            Some(ClientFrame::SessionConfig { .. })
+        ));
         assert_eq!(fixture.server.first(), Some(&ServerFrame::ready()));
         assert!(fixture.server.iter().any(|frame| matches!(
             frame,
@@ -2884,18 +2897,18 @@ mod tests {
 
     #[test]
     fn parses_shared_fake_cartesia_gemini_session_fixture() {
-        let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-            "../../../fixtures/voice-protocol/fake-cartesia-gemini-study-session.json"
-        ))
-        .expect("fixture is valid full fake provider session");
+        let fixture = fake_cartesia_gemini_runtime_session();
 
-        assert_eq!(legacy_client_frame_type(&fixture, 0), "session_config");
         assert!(matches!(
-            legacy_client_frame(&fixture, 1),
+            fixture.client.first(),
+            Some(ClientFrame::SessionConfig { .. })
+        ));
+        assert!(matches!(
+            fixture.client[1],
             ClientFrame::AudioChunk { sequence: 0, .. }
         ));
         assert!(matches!(
-            legacy_client_frame(&fixture, 2),
+            fixture.client[2],
             ClientFrame::AudioEnd {
                 final_sequence: 0,
                 ..
@@ -2925,31 +2938,21 @@ mod tests {
 
     #[tokio::test]
     async fn synthetic_runtime_output_matches_full_session_fixture_exactly() {
-        let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-            "../../../fixtures/voice-protocol/synthetic-study-session.json"
-        ))
-        .expect("fixture is valid full session");
-        let session_config = legacy_session_config(&fixture);
-        let answer_text = fixture.client[1]["text"]
-            .as_str()
-            .expect("legacy answer frame carries text")
-            .to_owned();
+        let fixture = synthetic_runtime_session();
+        let session_config = fixture.session_config();
+        let answer_text = fixture.answer_text(1);
 
         let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
         let brain = agent_adapters::SyntheticBrain::with_study_store(store.clone());
         let mut session = brain.open(session_config).await.expect("opens");
         let mut actual = vec![ServerFrame::ready()];
-        for _ in 0..2 {
-            push_next_browser_frame(&mut actual, &mut session).await;
-        }
+        push_next_browser_frame(&mut actual, &mut session).await;
         session
             .input
             .send(BrainInput::Text(answer_text))
             .await
             .expect("sends answer");
-        for _ in 0..12 {
-            push_next_browser_frame(&mut actual, &mut session).await;
-        }
+        push_until_response_completed(&mut actual, &mut session).await;
         session
             .input
             .send(BrainInput::CancelResponse)
@@ -2965,35 +2968,37 @@ mod tests {
             push_next_browser_frame(&mut actual, &mut session).await;
         }
 
-        assert_eq!(actual, without_websocket_only_frames(&fixture.server));
+        assert_eq!(
+            with_pinned_due_at(&actual),
+            with_pinned_due_at(&without_websocket_only_frames(&fixture.server))
+        );
         let snapshot = store.snapshot();
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.answer_attempts.len(), 1);
-        assert_eq!(snapshot.concept_statuses.len(), 1);
+        // Plan 04's turn-outcome authority owns the concept transition: the graded
+        // status is persisted inside the turn outcome and its review card, not as a
+        // standalone `concept_statuses` row. The `concept_status` wire event above is
+        // still emitted and still asserted frame-exactly; only the store shape moved.
+        assert!(snapshot.concept_statuses.is_empty());
         assert_eq!(snapshot.review_items.len(), 1);
         assert_eq!(snapshot.recaps.len(), 1);
     }
 
     #[tokio::test]
     async fn fake_cartesia_gemini_runtime_output_matches_full_session_fixture_exactly() {
-        let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-            "../../../fixtures/voice-protocol/fake-cartesia-gemini-study-session.json"
-        ))
-        .expect("fixture is valid full fake provider session");
+        let fixture = fake_cartesia_gemini_runtime_session();
         // The real socket path moves the frame-level generation onto the domain
         // config (`ws.rs`, authorized initial session config), so a session's question
-        // response ids carry it. This in-process harness must apply the same assignment
-        // or it silently diverges from the server it is asserting against.
-        let mut session_config = legacy_session_config(&fixture);
-        session_config.client_generation_id = fixture.client[0]["client_generation_id"]
-            .as_str()
-            .map(str::to_owned);
-        let (audio_frame, audio_generation_id) = match legacy_client_frame(&fixture, 1) {
+        // response ids carry it. `RuntimeSessionFixture::session_config` applies the
+        // same assignment or this in-process harness silently diverges from the server
+        // it is asserting against.
+        let session_config = fixture.session_config();
+        let (audio_frame, audio_generation_id) = match &fixture.client[1] {
             ClientFrame::AudioChunk {
                 frame,
                 client_generation_id,
                 ..
-            } => (frame, client_generation_id),
+            } => (frame.clone(), client_generation_id.clone()),
             other => panic!("expected audio chunk frame, got {other:?}"),
         };
 
@@ -3001,9 +3006,7 @@ mod tests {
         let brain = agent_adapters::cartesia_gemini::FakeCartesiaGeminiRuntime::new(store.clone());
         let mut session = brain.open(session_config).await.expect("opens");
         let mut actual = vec![ServerFrame::fake_cartesia_gemini_ready()];
-        for _ in 0..2 {
-            push_next_browser_frame(&mut actual, &mut session).await;
-        }
+        push_next_browser_frame(&mut actual, &mut session).await;
         session
             .input
             .send(BrainInput::AudioWithMetadata {
@@ -3012,32 +3015,42 @@ mod tests {
             })
             .await
             .expect("sends audio");
-        for _ in 0..13 {
-            push_next_browser_frame(&mut actual, &mut session).await;
-        }
+        push_until_response_completed(&mut actual, &mut session).await;
         session
             .input
             .send(BrainInput::CancelResponse)
             .await
             .expect("sends cancel");
         push_next_browser_frame(&mut actual, &mut session).await;
+        session
+            .input
+            .send(BrainInput::Stop)
+            .await
+            .expect("sends stop");
+        for _ in 0..2 {
+            push_next_browser_frame(&mut actual, &mut session).await;
+        }
 
-        assert_eq!(actual, without_websocket_only_frames(&fixture.server));
+        assert_eq!(
+            with_pinned_due_at(&actual),
+            with_pinned_due_at(&without_websocket_only_frames(&fixture.server))
+        );
         let snapshot = store.snapshot();
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.answer_attempts.len(), 1);
-        assert_eq!(snapshot.concept_statuses.len(), 1);
+        // Plan 04's turn-outcome authority owns the concept transition: the graded
+        // status is persisted inside the turn outcome and its review card, not as a
+        // standalone `concept_statuses` row. The `concept_status` wire event above is
+        // still emitted and still asserted frame-exactly; only the store shape moved.
+        assert!(snapshot.concept_statuses.is_empty());
         assert_eq!(snapshot.review_items.len(), 1);
         assert_eq!(snapshot.recaps.len(), 1);
     }
 
     #[tokio::test]
     async fn cancelling_active_synthetic_response_suppresses_memory_writes() {
-        let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-            "../../../fixtures/voice-protocol/synthetic-study-session.json"
-        ))
-        .expect("fixture is valid full session");
-        let session_config = legacy_session_config(&fixture);
+        let fixture = synthetic_runtime_session();
+        let session_config = fixture.session_config();
 
         let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
         let brain = agent_adapters::SyntheticBrain::with_study_store(store.clone());
@@ -3047,9 +3060,7 @@ mod tests {
         }
         session
             .input
-            .send(BrainInput::Text(
-                "NADH gives electrons to the electron transport chain.".to_owned(),
-            ))
+            .send(BrainInput::Text(fixture.answer_text(1)))
             .await
             .expect("sends answer");
         session
@@ -3058,16 +3069,23 @@ mod tests {
             .await
             .expect("sends cancel");
 
-        let mut saw_cancel = false;
-        for _ in 0..8 {
-            if matches!(
-                next_event(&mut session).await,
-                BrainEvent::ResponseCancelledFor { response_id } if response_id == "response-1"
-            ) {
-                saw_cancel = true;
-                break;
+        // A cancelled turn suppresses most of its own events, so the stream can go
+        // quiet before a fixed event budget is spent. The scan is bounded by a deadline
+        // instead; the assertion it guards is unchanged.
+        let saw_cancel = timeout(Duration::from_secs(15), async {
+            while let Some(event) = session.events.recv().await {
+                if matches!(
+                    event,
+                    BrainEvent::ResponseCancelledFor { response_id }
+                        if response_id == "response-1-generation-1"
+                ) {
+                    return true;
+                }
             }
-        }
+            false
+        })
+        .await
+        .unwrap_or(false);
         assert!(saw_cancel);
         tokio::task::yield_now().await;
 
@@ -3078,11 +3096,67 @@ mod tests {
         assert!(snapshot.recaps.is_empty());
     }
 
+    /// The merged Plan 04 evaluator resolves a turn through the rubric, the store's
+    /// turn-outcome authority and D-01 review scheduling, which takes seconds rather
+    /// than the milliseconds the pre-merge synthetic grader took. The budget is
+    /// patience only: every assertion below is still exact.
     async fn next_event(session: &mut agent_domain::RealtimeSession) -> BrainEvent {
-        timeout(Duration::from_secs(1), session.events.recv())
+        timeout(Duration::from_secs(15), session.events.recv())
             .await
             .expect("event arrives")
             .expect("event stream stays open")
+    }
+
+    /// Pushes every browser frame of the current turn and stops on the runtime's own
+    /// end-of-turn marker.
+    ///
+    /// `ResponseCompleted` is the boundary the runtime publishes and suppresses from
+    /// the browser, so it is the only in-process signal that the turn is finished and
+    /// the response counter has advanced. A fixed frame budget cannot express that: it
+    /// stops at the last *visible* frame, which lets the cancel that follows race the
+    /// turn it just finished and non-deterministically name the old response.
+    async fn push_until_response_completed(
+        frames: &mut Vec<ServerFrame>,
+        session: &mut agent_domain::RealtimeSession,
+    ) {
+        loop {
+            let event = next_event(session).await;
+            let completed = matches!(event, BrainEvent::ResponseCompleted { .. });
+            if let Some(frame) = ServerFrame::browser_event(event) {
+                frames.push(frame);
+            }
+            if completed {
+                return;
+            }
+        }
+    }
+
+    /// `D-01 SERVER_PERSISTED_FSRS` derives every review `due_at` from the UTC clock at
+    /// grading time, so a recap's schedule carries a wall-clock instant no fixture can
+    /// pin. The scheduling arithmetic itself is proven by the review-schedule tests;
+    /// here the instant alone is replaced by a stable marker on both sides so every
+    /// other member of every frame stays byte-exact.
+    const FIXTURE_SCHEDULED_DUE_AT: &str = "1970-01-01T00:00:00.000Z";
+
+    fn with_pinned_due_at<T: serde::Serialize>(value: &T) -> serde_json::Value {
+        fn walk(value: &mut Value) {
+            match value {
+                Value::Object(object) => {
+                    for (key, nested) in object.iter_mut() {
+                        if key == "due_at" && nested.as_str().is_some() {
+                            *nested = Value::String(FIXTURE_SCHEDULED_DUE_AT.to_owned());
+                        } else {
+                            walk(nested);
+                        }
+                    }
+                }
+                Value::Array(values) => values.iter_mut().for_each(walk),
+                _ => {}
+            }
+        }
+        let mut value = serde_json::to_value(value).expect("frames serialize");
+        walk(&mut value);
+        value
     }
 
     async fn push_next_browser_frame(
@@ -3098,12 +3172,24 @@ mod tests {
     }
 
     /// Frames only the socket boundary produces: the post-release completion
-    /// marker and the bounded-audio-turn acceptance the assembler emits.
+    /// marker, the bounded-audio-turn acceptance the assembler emits, and the
+    /// turn-bound question start. `VOICE-TURN-001` makes the wire `turn_id` a
+    /// required member of `question_started`, and that id exists only where the
+    /// audio-turn assembler lives, so `ServerFrame::browser_event` returns `None`
+    /// for `QuestionStarted` by construction — an in-process harness cannot
+    /// reproduce it and must not pretend to.
     fn without_websocket_only_frames(frames: &[ServerFrame]) -> Vec<ServerFrame> {
         let mut filtered = Vec::with_capacity(frames.len());
         let mut previous_was_correction = false;
         for frame in frames {
             if matches!(frame, ServerFrame::AudioTurnAccepted { .. }) {
+                continue;
+            }
+            if matches!(
+                frame,
+                ServerFrame::Event { event, .. }
+                    if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+            ) {
                 continue;
             }
             if previous_was_correction
@@ -4916,7 +5002,7 @@ mod tests {
     }
 
     /// `VOICE-FIXTURE-001`: the exact immutable corpus, in manifest order.
-    const EXPECTED_MANIFEST_ROWS: [(&str, &str, &str); 15] = [
+    const EXPECTED_MANIFEST_ROWS: [(&str, &str, &str); 22] = [
         (
             "VOICE-FIXTURE-MANIFEST",
             "agent/fixtures/voice-protocol/v5/manifest.json",
@@ -4935,6 +5021,16 @@ mod tests {
         (
             "VOICE-CLIENT-SESSION-REFRESH",
             "agent/fixtures/voice-protocol/v5/client-session-refresh.json",
+            "client_frame",
+        ),
+        (
+            "VOICE-SEEDED-SESSION-CONFIG",
+            "agent/fixtures/voice-protocol/v5/seeded-session-config.json",
+            "session_payload",
+        ),
+        (
+            "VOICE-CLIENT-AUDIO-CHUNK",
+            "agent/fixtures/voice-protocol/v5/client-audio-chunk.json",
             "client_frame",
         ),
         (
@@ -4958,6 +5054,11 @@ mod tests {
             "server_frame",
         ),
         (
+            "VOICE-SERVER-EVENT-MANUSCRIPT-INTENT",
+            "agent/fixtures/voice-protocol/v5/server-event-manuscript-intent.json",
+            "server_frame",
+        ),
+        (
             "VOICE-TERMINAL-SEQUENCES",
             "agent/fixtures/voice-protocol/v5/terminal-sequences.json",
             "frame_sequence",
@@ -4978,6 +5079,26 @@ mod tests {
             "session_sequence",
         ),
         (
+            "VOICE-SYNTHETIC-RUNTIME-SESSION",
+            "agent/fixtures/voice-protocol/v5/synthetic-runtime-session.json",
+            "runtime_session",
+        ),
+        (
+            "VOICE-FAKE-CARTESIA-GEMINI-RUNTIME-SESSION",
+            "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-session.json",
+            "runtime_session",
+        ),
+        (
+            "VOICE-SYNTHETIC-RUNTIME-EVIDENCE-PACK",
+            "agent/fixtures/voice-protocol/v5/synthetic-runtime-evidence-pack.json",
+            "evidence_pack",
+        ),
+        (
+            "VOICE-FAKE-CARTESIA-GEMINI-RUNTIME-EVIDENCE-PACK",
+            "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-evidence-pack.json",
+            "evidence_pack",
+        ),
+        (
             "VOICE-CLIENT-DIFFERENTIAL-CASES",
             "agent/fixtures/voice-protocol/v5/client-differential-cases.json",
             "differential_cases",
@@ -4995,7 +5116,7 @@ mod tests {
     ];
 
     /// Every manifest-listed file, embedded at compile time so a missing one cannot build.
-    const MANIFEST_FIXTURE_SOURCES: [(&str, &str); 15] = [
+    const MANIFEST_FIXTURE_SOURCES: [(&str, &str); 22] = [
         (
             "agent/fixtures/voice-protocol/v5/manifest.json",
             include_str!("../../../fixtures/voice-protocol/v5/manifest.json"),
@@ -5011,6 +5132,14 @@ mod tests {
         (
             "agent/fixtures/voice-protocol/v5/client-session-refresh.json",
             include_str!("../../../fixtures/voice-protocol/v5/client-session-refresh.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/seeded-session-config.json",
+            include_str!("../../../fixtures/voice-protocol/v5/seeded-session-config.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/client-audio-chunk.json",
+            include_str!("../../../fixtures/voice-protocol/v5/client-audio-chunk.json"),
         ),
         (
             "agent/fixtures/voice-protocol/v5/audio-turn-lifecycle.json",
@@ -5029,6 +5158,12 @@ mod tests {
             include_str!("../../../fixtures/voice-protocol/v5/server-ready.json"),
         ),
         (
+            "agent/fixtures/voice-protocol/v5/server-event-manuscript-intent.json",
+            include_str!(
+                "../../../fixtures/voice-protocol/v5/server-event-manuscript-intent.json"
+            ),
+        ),
+        (
             "agent/fixtures/voice-protocol/v5/terminal-sequences.json",
             include_str!("../../../fixtures/voice-protocol/v5/terminal-sequences.json"),
         ),
@@ -5044,6 +5179,28 @@ mod tests {
             "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-two-turn-session.json",
             include_str!(
                 "../../../fixtures/voice-protocol/v5/fake-cartesia-gemini-two-turn-session.json"
+            ),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/synthetic-runtime-session.json",
+            include_str!("../../../fixtures/voice-protocol/v5/synthetic-runtime-session.json"),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-session.json",
+            include_str!(
+                "../../../fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-session.json"
+            ),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/synthetic-runtime-evidence-pack.json",
+            include_str!(
+                "../../../fixtures/voice-protocol/v5/synthetic-runtime-evidence-pack.json"
+            ),
+        ),
+        (
+            "agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-evidence-pack.json",
+            include_str!(
+                "../../../fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-evidence-pack.json"
             ),
         ),
         (
