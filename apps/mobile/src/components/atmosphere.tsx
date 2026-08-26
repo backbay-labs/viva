@@ -1,5 +1,4 @@
-import { Asset } from "expo-asset";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef } from "react";
 import { Image, StyleSheet, View } from "react-native";
 import Svg, { Defs, RadialGradient, Rect, Stop } from "react-native-svg";
 
@@ -10,6 +9,7 @@ import {
   WELL,
   WELL_RADIUS,
 } from "@/components/atmosphere-geometry";
+import { createReadyLatch, type ReadyLatch } from "@/components/atmosphere-readiness";
 
 // Relative, not "@/assets/...": the tsconfig maps @/assets/* but nothing in the
 // app imports through it yet, so Metro's resolution of that branch is unproven.
@@ -19,55 +19,31 @@ const VELLUM_PLATE = require("../../assets/images/vellum-plate.webp");
 
 const WELL_STOPS = gaussianStops(WELL.peakOpacity, 5);
 
-// How long a caller will wait on the atmosphere before opening anyway. Also
-// caps web cold start, where there is no native splash behind us and first
-// paint is blocked on a 318 KB webp.
+// How long a caller will wait on the atmosphere before opening anyway. Covers a
+// plate that neither decodes nor errors, and caps web cold start, where there is
+// no native splash behind us and first paint is blocked on a 318 KB webp.
 const READY_DEADLINE_MS = 3000;
 
-/**
- * Whether the atmosphere has everything it needs to paint its first frame.
- *
- * The root layout holds the splash on this so the handoff is seamless: opening
- * on fonts alone flashes flat canvas first, which is the exact impression this
- * work exists to remove. It deliberately says nothing about *what* is being
- * waited on — Act 1 decodes a baked plate, Act 2 will warm a shader, and the
- * caller should not have to change when that happens.
- *
- * The gate has to be total. A rejected download, a synchronous throw out of
- * Asset.fromModule, and a promise that simply never settles all end the same
- * way: the app opens on flat canvas, which is far better than an app that never
- * opens at all. Hence the deadline as well as the catch.
- */
-export function useAtmosphereReady(): boolean {
-  const [ready, setReady] = useState(false);
-
-  useEffect(() => {
-    let active = true;
-    let deadline: ReturnType<typeof setTimeout>;
-
-    // Promise.resolve().then(...) so a synchronous throw from fromModule
-    // becomes a rejection this chain can catch, rather than escaping the effect.
-    const decoded = Promise.resolve()
-      .then(() => Asset.fromModule(VELLUM_PLATE).downloadAsync())
-      .catch((error: unknown) => {
-        console.warn("[viva] the vellum plate failed to load; opening on flat canvas.", error);
-      });
-    const timedOut = new Promise<void>((resolve) => {
-      deadline = setTimeout(resolve, READY_DEADLINE_MS);
-    });
-
-    void Promise.race([decoded, timedOut]).finally(() => {
-      if (active) setReady(true);
-    });
-
-    return () => {
-      active = false;
-      clearTimeout(deadline);
-    };
-  }, []);
-
-  return ready;
-}
+export type VivaAtmosphereProps = {
+  /**
+   * Called once, when the ground is on screen — or when waiting for it stopped
+   * being worth it.
+   *
+   * The root layout holds the splash on this so the handoff is seamless:
+   * opening on fonts alone flashes flat canvas first, which is the exact
+   * impression this work exists to remove. It deliberately says nothing about
+   * *what* was being waited on — Act 1 decodes a baked plate, Act 2 will commit
+   * a shader's first frame — so the caller does not change when the tier does.
+   *
+   * Availability is not readiness, and that distinction is the whole point of
+   * this prop. `Asset.downloadAsync()` resolves once the file is local, which on
+   * native says nothing about whether the 1242x2688 plate has been decoded and
+   * drawn; the splash lifted over a plate still decoding. So the signal comes
+   * from the <Image> itself, and the atmosphere has to be mounted while the
+   * caller is still waiting — the plate cannot decode before it is mounted.
+   */
+  onReady?: () => void;
+};
 
 /**
  * The ground every screen sits on.
@@ -80,8 +56,37 @@ export function useAtmosphereReady(): boolean {
  *
  * Purely decorative: hidden from assistive technology and never touchable.
  */
-export function VivaAtmosphere() {
+export function VivaAtmosphere({ onReady }: VivaAtmosphereProps) {
   const gradientId = `viva${useId().replace(/[^a-zA-Z0-9]/g, "")}`;
+
+  // Read the callback through a ref so a caller that passes a fresh closure on
+  // every render cannot restart the deadline underneath itself.
+  const latestOnReady = useRef(onReady);
+  useEffect(() => {
+    latestOnReady.current = onReady;
+  }, [onReady]);
+
+  // One latch per mount rather than one per component: cancelling it is how
+  // unmount is honoured, and React re-runs mount effects (StrictMode does it on
+  // every mount in development), so a latch that outlived the effect would come
+  // back sealed shut.
+  const latch = useRef<ReadyLatch | null>(null);
+  useEffect(() => {
+    const pending = createReadyLatch(() => latestOnReady.current?.(), READY_DEADLINE_MS);
+    latch.current = pending;
+    return () => {
+      latch.current = null;
+      pending.cancel();
+    };
+  }, []);
+
+  // Both tiers deliver the image callbacks on a later tick than this effect, so
+  // the latch is always in place by the time one arrives. If some tier ever
+  // reported synchronously during commit the signal would be dropped and the
+  // deadline would release instead — late, never wedged.
+  const signalReady = () => {
+    latch.current?.signal();
+  };
 
   return (
     // accessibilityElementsHidden is iOS-only and importantForAccessibility is
@@ -95,7 +100,21 @@ export function VivaAtmosphere() {
       pointerEvents="none"
       style={StyleSheet.absoluteFill}
     >
-      <Image resizeMode="cover" source={VELLUM_PLATE} style={styles.plate} />
+      <Image
+        onError={(event) => {
+          // A plate that cannot be decoded must not wedge the splash: the app
+          // opens on flat canvas, which is far better than not opening at all.
+          console.warn(
+            "[viva] the vellum plate failed to load; opening on flat canvas.",
+            event.nativeEvent,
+          );
+          signalReady();
+        }}
+        onLoad={signalReady}
+        resizeMode="cover"
+        source={VELLUM_PLATE}
+        style={styles.plate}
+      />
       <Svg height="100%" style={StyleSheet.absoluteFill} width="100%">
         <Defs>
           {/*

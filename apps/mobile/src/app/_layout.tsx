@@ -14,11 +14,11 @@ import { DefaultTheme, Stack, ThemeProvider } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
 import * as SystemUI from "expo-system-ui";
-import { useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 
-import { useAtmosphereReady, VivaAtmosphere } from "@/components/atmosphere";
+import { VivaAtmosphere } from "@/components/atmosphere";
 import { colors } from "@/theme/tokens";
 
 void SplashScreen.preventAutoHideAsync();
@@ -47,7 +47,8 @@ export default function RootLayout() {
   // The splash background is already the vellum's base colour, so holding it
   // until the atmosphere can paint makes the handoff seamless. What that costs
   // — and which tier is doing the waiting — belongs to the atmosphere, not here.
-  const atmosphereReady = useAtmosphereReady();
+  const [atmosphereReady, setAtmosphereReady] = useState(false);
+  const markAtmosphereReady = useCallback(() => setAtmosphereReady(true), []);
 
   const ready = (fontsLoaded || fontError) && atmosphereReady;
 
@@ -57,34 +58,35 @@ export default function RootLayout() {
     }
   }, [ready]);
 
-  // Not `null`: native has the splash over us, but web does not, so bare null
-  // is a blank white page for up to the full readiness deadline — white being
-  // the one colour this whole branch exists to avoid. Painting the base colour
-  // instead lets the vellum fade in over the ground it is made of.
-  if (!ready) {
-    return <View style={styles.root} />;
-  }
-
+  // The atmosphere is mounted before it is ready, not after: a plate cannot
+  // decode until it is on screen, so gating it on its own readiness would wait
+  // for something that had not started. The loading state is therefore the real
+  // ground rather than a bare base colour — and on web, where there is no
+  // splash over us, that is what stands in for one.
   return (
     <GestureHandlerRootView style={styles.fill}>
       <View style={styles.root}>
-        <VivaAtmosphere />
-        <StatusBar style="dark" />
-        <ThemeProvider value={TRANSPARENT_NAV_THEME}>
-          <Stack
-            screenOptions={{
-              animation: "fade_from_bottom",
-              contentStyle: { backgroundColor: "transparent" },
-              gestureEnabled: true,
-              headerShown: false,
-            }}
-          >
-            <Stack.Screen name="index" />
-            <Stack.Screen name="session" options={{ gestureEnabled: false }} />
-            <Stack.Screen name="recap" />
-            <Stack.Screen name="library" />
-          </Stack>
-        </ThemeProvider>
+        <VivaAtmosphere onReady={markAtmosphereReady} />
+        {ready ? (
+          <>
+            <StatusBar style="dark" />
+            <ThemeProvider value={TRANSPARENT_NAV_THEME}>
+              <Stack
+                screenOptions={{
+                  animation: "fade_from_bottom",
+                  contentStyle: { backgroundColor: "transparent" },
+                  gestureEnabled: true,
+                  headerShown: false,
+                }}
+              >
+                <Stack.Screen name="index" />
+                <Stack.Screen name="session" options={{ gestureEnabled: false }} />
+                <Stack.Screen name="recap" />
+                <Stack.Screen name="library" />
+              </Stack>
+            </ThemeProvider>
+          </>
+        ) : null}
       </View>
     </GestureHandlerRootView>
   );
