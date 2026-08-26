@@ -33,11 +33,12 @@ use uuid::Uuid;
 
 use crate::{
     memory::{
-        current_epoch_seconds, cursor_current_question, deletion_receipt, generate_file_study_set,
-        generate_paste_study_set, last_reviewed_at, payload_sha256, projection_active_question,
-        require_selected_progression_policy, review_schedule_summaries, session_answered_questions,
-        turn_outcome_disposition, turn_outcome_transitions, validate_challenge_resolution,
-        validate_turn_outcome, ConceptStatusEventPayload, EventAuthorizationKind,
+        browser_answer_evaluation, current_epoch_seconds, cursor_current_question,
+        deletion_receipt, generate_file_study_set, generate_paste_study_set, last_reviewed_at,
+        payload_sha256, projection_active_question, require_selected_progression_policy,
+        review_schedule_summaries, session_answered_questions, turn_outcome_disposition,
+        turn_outcome_transitions, validate_challenge_resolution, validate_turn_outcome,
+        AnswerEvaluationEventPayload, ConceptStatusEventPayload, EventAuthorizationKind,
         QuestionProgressionRecord, ReviewScheduleEventPayload, DATA_RETENTION_POLICY,
         DELETED_ROW_CONSTANT, DELETED_STUDY_SET_TITLE, SESSION_TOKEN_NONCE_SKEW_SECONDS,
     },
@@ -116,6 +117,18 @@ impl PostgresStudyStore {
             pool,
             counts: Arc::new(PostgresWriteCounters::default()),
         }
+    }
+
+    /// Read access to the durable pool, for tests that must inspect a row this
+    /// store deliberately publishes no reader for.
+    ///
+    /// `A-22`: the shared conformance suite asserts what `record_turn_outcome`
+    /// actually left in `answer_attempts`, and the port surface exposes only
+    /// whether an attempt exists. Test-only on purpose — production code reads
+    /// through the typed ports, never around them.
+    #[cfg(test)]
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     fn uuid_for(logical_id: &str) -> Result<Uuid, PortError> {
@@ -1331,6 +1344,9 @@ impl StudyMemoryStore for PostgresStudyStore {
             .await;
             match upserted {
                 Ok(Some(inserted)) => {
+                    // `A-22`: one digest definition for the `answer_evaluation`
+                    // event, shared with the turn-outcome authority that
+                    // superseded this writer and with the gate that reads it.
                     Self::insert_event_authorization(
                         &mut tx,
                         user_id,
@@ -1338,7 +1354,7 @@ impl StudyMemoryStore for PostgresStudyStore {
                         voice_session_uuid,
                         response_id,
                         EventAuthorizationKind::AnswerEvaluation,
-                        &evaluation,
+                        &AnswerEvaluationEventPayload::from_browser_event(&evaluation),
                     )
                     .await?;
                     tx.commit().await.map_err(pg_error)?;

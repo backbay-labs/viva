@@ -4796,8 +4796,8 @@ pub(crate) mod tests {
     }
 
     #[derive(Deserialize)]
-    struct LearningTurnOutcomeFixture {
-        outcomes: std::collections::BTreeMap<String, TurnOutcome>,
+    pub(crate) struct LearningTurnOutcomeFixture {
+        pub(crate) outcomes: std::collections::BTreeMap<String, TurnOutcome>,
         persisted: std::collections::BTreeMap<String, PersistedTurnOutcome>,
         challenges: std::collections::BTreeMap<String, ChallengeResolution>,
     }
@@ -4815,7 +4815,7 @@ pub(crate) mod tests {
         .expect("learning-core progression fixture is valid")
     }
 
-    fn turn_outcome_fixture() -> LearningTurnOutcomeFixture {
+    pub(crate) fn turn_outcome_fixture() -> LearningTurnOutcomeFixture {
         serde_json::from_str(include_str!(
             "../../../fixtures/learning-core/turn-outcomes-v1.json"
         ))

@@ -662,6 +662,86 @@ pub(crate) fn session_answered_questions(
         .collect()
 }
 
+/// The exact rubric wire token the browser is shown for a server-derived label
+/// (`A-22`).
+///
+/// `EvaluationLabel`'s own serde encoding is `mostly_correct`; the browser
+/// contract's token is `mostly correct`, and `AnswerEvaluation::validate_fail_closed`
+/// accepts only the browser tokens. The projection that builds the event lives in
+/// `agent-adapters` and this store cannot call it — `data` is a dependency of the
+/// adapters, not the other way round — so the mapping is restated here with the
+/// gate that arbitrates it: `store_conformance`'s `mostly correct` turn refuses
+/// the canonical serde token and admits the browser one, on both backends, and
+/// the frozen v5 replays refuse any drift over a real socket. If Plan 04 ever adds
+/// a label, both mappings gain it or the browser event stops being authorizable.
+pub(crate) fn evaluation_label_wire(label: EvaluationLabel) -> &'static str {
+    match label {
+        EvaluationLabel::Strong => "strong",
+        EvaluationLabel::MostlyCorrect => "mostly correct",
+        EvaluationLabel::PartiallyCorrect => "partially correct",
+        EvaluationLabel::Vague => "vague",
+        EvaluationLabel::Wrong => "wrong",
+        EvaluationLabel::InsufficientEvidence => "insufficient evidence",
+    }
+}
+
+/// The browser `answer_evaluation` payload one persisted turn authorizes
+/// (`A-22`).
+///
+/// Plan 04's turn-outcome authority is the only writer of an evaluated turn, so
+/// it is the only thing that can make that turn's browser events authoritative.
+/// This is the one rule both backends derive that payload with — a second
+/// interpretation would be a browser event authoritative on exactly one
+/// deployment, the same failure `DATA-005` exists to prevent.
+///
+/// It mirrors the adapter projection exactly, because the gate compares against
+/// the event the adapter will actually send: the wire label token, the outcome's
+/// own feedback, its retry prompt (absent means the empty string the browser
+/// contract requires), the question's canonically retrieved source, and the
+/// mastery value of *this question's own concept* — falling back to the first
+/// transition only when the outcome names no transition for it, which is the
+/// adapter's rule too.
+///
+/// `None` — a deferred turn, an evaluated turn that moved no concept at all, or a
+/// question this set no longer publishes — means there is no honest payload to
+/// authorize, so nothing is written and the browser event fails closed at the
+/// gate. `None` is never a silent success: the gate performs the same lookups and
+/// refuses the event on its own.
+pub(crate) fn browser_answer_evaluation(
+    outcome: &TurnOutcome,
+    published: &[StudyQuestion],
+) -> Option<AnswerEvaluationEventPayload> {
+    let TurnResolution::Evaluated {
+        label,
+        confidence,
+        concept_transitions,
+        concise_feedback,
+        retry_prompt,
+        ..
+    } = &outcome.resolution
+    else {
+        return None;
+    };
+    let question = published
+        .iter()
+        .find(|question| question.question_id == outcome.question_id)?;
+    let concept_status = concept_transitions
+        .iter()
+        .find(|transition| transition.concept_id == question.concept_id)
+        .or_else(|| concept_transitions.first())?
+        .to_status
+        .clone();
+    Some(AnswerEvaluationEventPayload {
+        question_id: outcome.question_id.clone(),
+        label: evaluation_label_wire(*label).to_owned(),
+        concise_feedback: concise_feedback.clone(),
+        retry_prompt: retry_prompt.clone().unwrap_or_default(),
+        source: question.source.clone(),
+        concept_status,
+        confidence_score: *confidence,
+    })
+}
+
 /// The projection's active question.
 ///
 /// `LEARN-008` excludes expected terms, rubric answers, and source excerpts: a
@@ -781,6 +861,13 @@ pub(super) fn record_turn_outcome(
     )?;
 
     let mut state = store.inner.write().map_err(|_| state_lock_poisoned())?;
+    // `A-22`: derived under the same write lock that commits the outcome, from the
+    // questions this set publishes, so the browser payload cannot be assembled
+    // from state a concurrent deletion has already removed.
+    let browser_evaluation = browser_answer_evaluation(
+        &outcome,
+        &InMemoryStudyStore::active_questions_locked(&state, study_set_id),
+    );
     {
         let study_set = InMemoryStudyStore::study_set_locked(&state, user_id, study_set_id)?;
         InMemoryStudyStore::ensure_session_locked(&state, user_id, study_set_id, voice_session_id)?;
@@ -900,6 +987,19 @@ pub(super) fn record_turn_outcome(
                 status: &transition.to_status,
             },
         )?;
+        // `A-22`: the digest alone is not what this backend's gate reads. It
+        // requires the persisted status write as well, so the turn-outcome
+        // authority records the same session-scoped row the retired
+        // `record_concept_status` wrote — otherwise the `concept_status` browser
+        // event of a genuinely evaluated turn is refused for a write that did
+        // happen.
+        state.concept_statuses.push(ConceptStatusRecord {
+            user_id: user_id.to_owned(),
+            study_set_id: study_set_id.to_owned(),
+            voice_session_id: voice_session_id.to_owned(),
+            concept_id: transition.concept_id.clone(),
+            status: transition.to_status.clone(),
+        });
         state.event_authorizations.insert(authorization);
 
         // D-01 `SERVER_PERSISTED_FSRS`: an evaluated turn is the graded outcome,
@@ -944,6 +1044,42 @@ pub(super) fn record_turn_outcome(
         voice_session_id,
     );
     InMemoryStudyStore::apply_outcome_disposition(progression, &question_id, disposition);
+
+    // `A-22`: an evaluated turn completes its own answer attempt and authorizes
+    // its own browser evaluation, in this same locked mutation — the attempt row's
+    // evaluation payload and the digest land together with the outcome or not at
+    // all, exactly as the retired `record_answer_evaluation` committed them
+    // together. The attempt row is the learner's capture record, so this completes
+    // one that a capture already wrote and never invents one: an outcome with no
+    // recorded attempt authorizes nothing, and the browser event that would have
+    // claimed it fails closed at the gate.
+    if let Some(payload) = browser_evaluation {
+        let authorization = event_authorization_record(
+            "memory",
+            user_id,
+            study_set_id,
+            voice_session_id,
+            &outcome.response_id,
+            EventAuthorizationKind::AnswerEvaluation,
+            &payload,
+        )?;
+        if let Some(existing) = state.answer_attempts.iter_mut().find(|record| {
+            record.user_id == user_id
+                && record.study_set_id == study_set_id
+                && record.voice_session_id == voice_session_id
+                && record.response_id == outcome.response_id
+        }) {
+            if existing.envelope.question_id != outcome.question_id {
+                return Err(PortError::conflict(
+                    "memory",
+                    &outcome.response_id,
+                    "turn outcome question does not match the recorded answer attempt",
+                ));
+            }
+            existing.evaluation = Some(payload.persisted_evaluation());
+            authorization::record_locked(&mut state, authorization);
+        }
+    }
 
     state.turn_outcomes.push(TurnOutcomeRecord {
         user_id: user_id.to_owned(),

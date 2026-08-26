@@ -104,6 +104,65 @@ pub(crate) struct ConceptStatusEventPayload<'a> {
     pub(crate) status: &'a ConceptStatus,
 }
 
+/// The server-derived half of the browser's `answer_evaluation` payload.
+///
+/// `A-22`: the browser event is an [`AnswerEvaluation`], and every field of it
+/// except `answer_text` is something this store decided — the wire label, the
+/// feedback, the retry prompt, the re-retrieved source, the mastery value, and
+/// the confidence all come from the persisted [`TurnOutcome`] and the question it
+/// names. `answer_text` is the transcript the transport carried. No canonical
+/// persistence type has a field for it (`TurnOutcome` has none, and the store
+/// publishes `transcript_persistence: false`), so the store cannot bind it and
+/// must not pretend to: a digest may only bind what the store itself decided.
+/// This is the same rule [`ReviewScheduleEventPayload`] follows when it hashes
+/// the graded inputs and not the clock-derived date they produce.
+///
+/// Nothing is left unguarded by that boundary. The same transcript reaches the
+/// same browser through `transcript_delta`/`transcript_final`, which the socket
+/// hands over with no authorization at all, so binding it here would protect
+/// nothing. Every field that *is* a server fact is bound, including the two —
+/// `concise_feedback` and `retry_prompt` — that the `answer_attempts` row does
+/// not carry and that only this digest can hold the event to.
+///
+/// The field order is [`AnswerEvaluation`]'s own, minus the transcript, so the
+/// canonical JSON this hashes reads as the browser payload it stands for.
+#[derive(Serialize)]
+pub(crate) struct AnswerEvaluationEventPayload {
+    pub(crate) question_id: String,
+    pub(crate) label: String,
+    pub(crate) concise_feedback: String,
+    pub(crate) retry_prompt: String,
+    pub(crate) source: StudySourceReference,
+    pub(crate) concept_status: ConceptStatus,
+    pub(crate) confidence_score: f32,
+}
+
+impl AnswerEvaluationEventPayload {
+    /// The projection of an event a browser is presenting, for the gate.
+    pub(crate) fn from_browser_event(evaluation: &AnswerEvaluation) -> Self {
+        Self {
+            question_id: evaluation.question_id.clone(),
+            label: evaluation.label.clone(),
+            concise_feedback: evaluation.concise_feedback.clone(),
+            retry_prompt: evaluation.retry_prompt.clone(),
+            source: evaluation.source.clone(),
+            concept_status: evaluation.concept_status.clone(),
+            confidence_score: evaluation.confidence_score,
+        }
+    }
+
+    /// The row projection the `answer_attempts` tuple keeps for the same event.
+    pub(crate) fn persisted_evaluation(&self) -> PersistedAnswerEvaluation {
+        PersistedAnswerEvaluation {
+            question_id: self.question_id.clone(),
+            label: self.label.clone(),
+            concept_status: self.concept_status.clone(),
+            confidence_score: self.confidence_score,
+            source: PersistedSourceReference::from(&self.source),
+        }
+    }
+}
+
 /// The replay-stable half of a scheduling outcome: the graded inputs, never the
 /// clock-derived schedule they produce. Two calls that differ only because the wall
 /// clock moved hash identically here, which is what makes a replay detectable.
@@ -304,7 +363,7 @@ pub(super) fn authorize_answer_evaluation(
         voice_session_id,
         response_id,
         EventAuthorizationKind::AnswerEvaluation,
-        evaluation,
+        &AnswerEvaluationEventPayload::from_browser_event(evaluation),
     )?;
     if !state.event_authorizations.contains(&authorization) {
         return Err(PortError::conflict(

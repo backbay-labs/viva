@@ -21,7 +21,7 @@ use agent_domain::{
     AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
     AnswerEvaluation, AuthenticatedStudyProjectionV1, ChallengeDisposition, ChallengeResolution,
     ConceptStatus, ConceptStatusTransition, CreateFileStudySet, CreatePasteStudySet,
-    LibraryNextReviewSummary, LibrarySessionRecapSummary, LibrarySessionSummary,
+    EvaluationLabel, LibraryNextReviewSummary, LibrarySessionRecapSummary, LibrarySessionSummary,
     LibraryStudyDocumentSummary, LibraryStudySetSummary, PersistedTurnOutcome, PortError,
     ProgressionPolicyId, QuestionDisposition, QuestionProgressionCursor, QuestionProgressionResult,
     ReviewScheduleCapReasonV1, ReviewScheduleDecisionV1, ReviewSchedulingContextV1, SessionConfig,
@@ -64,18 +64,18 @@ mod authorization;
 mod privacy;
 
 pub(crate) use authorization::{
-    current_epoch_seconds, event_authorization_record, payload_sha256, ConceptStatusEventPayload,
-    EventAuthorizationKind, EventAuthorizationRecord, ReviewScheduleEventPayload,
-    SESSION_TOKEN_NONCE_SKEW_SECONDS,
+    current_epoch_seconds, event_authorization_record, payload_sha256,
+    AnswerEvaluationEventPayload, ConceptStatusEventPayload, EventAuthorizationKind,
+    EventAuthorizationRecord, ReviewScheduleEventPayload, SESSION_TOKEN_NONCE_SKEW_SECONDS,
 };
 #[cfg(test)]
 use ingestion::MAX_PASTE_SOURCE_EXCERPT_CHARS;
 pub(crate) use ingestion::{generate_file_study_set, generate_paste_study_set};
 pub(crate) use learning::{
-    cursor_current_question, last_reviewed_at, projection_active_question,
-    require_selected_progression_policy, review_schedule_summaries, session_answered_questions,
-    turn_outcome_disposition, turn_outcome_transitions, validate_challenge_resolution,
-    validate_turn_outcome,
+    browser_answer_evaluation, cursor_current_question, last_reviewed_at,
+    projection_active_question, require_selected_progression_policy, review_schedule_summaries,
+    session_answered_questions, turn_outcome_disposition, turn_outcome_transitions,
+    validate_challenge_resolution, validate_turn_outcome,
 };
 /// The raw-payload inventory is a schema gate, exercised only by the migration
 /// suite that enforces it.
@@ -1732,6 +1732,10 @@ impl StudyMemoryStore for InMemoryStudyStore {
             PortError::invalid_input("memory", &evaluation.question_id, reason)
         })?;
         let persisted_evaluation = PersistedAnswerEvaluation::from(&evaluation);
+        // `A-22`: one digest definition for the `answer_evaluation` event, shared
+        // with the turn-outcome authority that superseded this writer and with the
+        // gate that reads it. A second definition here would authorize on one
+        // write path what the other cannot.
         let authorization = event_authorization_record(
             "memory",
             user_id,
@@ -1739,7 +1743,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             voice_session_id,
             response_id,
             EventAuthorizationKind::AnswerEvaluation,
-            &evaluation,
+            &AnswerEvaluationEventPayload::from_browser_event(&evaluation),
         )?;
         // `DATA-012`: one write lock spans the validation and the write, so a
         // deletion that commits first cannot be followed by a late attempt row or
@@ -4615,7 +4619,12 @@ mod tests {
             StudyStoreWriteCounts {
                 sessions: 1,
                 answer_attempts: 1,
-                concept_statuses: 1,
+                // Two distinct concepts move exactly once each: the explicit
+                // `nadh` call, and the graded transition on
+                // `oxidative-phosphorylation` that the turn outcome now records
+                // under `A-22`, so that turn's `concept_status` browser event is
+                // backed by a durable write rather than a digest alone.
+                concept_statuses: 2,
                 // Two distinct concepts are scheduled exactly once each: the
                 // explicit `atp-synthase` call, and the graded transition on
                 // `oxidative-phosphorylation` that the turn outcome schedules
@@ -4629,7 +4638,7 @@ mod tests {
         let state = store.snapshot();
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.answer_attempts.len(), 1);
-        assert_eq!(state.concept_statuses.len(), 1);
+        assert_eq!(state.concept_statuses.len(), 2);
         assert_eq!(state.review_items.len(), 2);
         assert_eq!(state.review_schedule_decisions.len(), 1);
         assert_eq!(state.recaps.len(), 1);
