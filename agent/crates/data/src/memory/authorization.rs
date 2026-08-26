@@ -106,23 +106,52 @@ pub(crate) struct ConceptStatusEventPayload<'a> {
 
 /// The server-derived half of the browser's `answer_evaluation` payload.
 ///
-/// `A-22`: the browser event is an [`AnswerEvaluation`], and every field of it
-/// except `answer_text` is something this store decided — the wire label, the
-/// feedback, the retry prompt, the re-retrieved source, the mastery value, and
-/// the confidence all come from the persisted [`TurnOutcome`] and the question it
-/// names. `answer_text` is the transcript the transport carried. No canonical
-/// persistence type has a field for it (`TurnOutcome` has none, and the store
-/// publishes `transcript_persistence: false`), so the store cannot bind it and
-/// must not pretend to: a digest may only bind what the store itself decided.
-/// This is the same rule [`ReviewScheduleEventPayload`] follows when it hashes
-/// the graded inputs and not the clock-derived date they produce.
+/// # ESCALATION — awaiting coordinator ratification (`A-22` follow-up)
 ///
-/// Nothing is left unguarded by that boundary. The same transcript reaches the
-/// same browser through `transcript_delta`/`transcript_final`, which the socket
-/// hands over with no authorization at all, so binding it here would protect
-/// nothing. Every field that *is* a server fact is bound, including the two —
-/// `concise_feedback` and `retry_prompt` — that the `answer_attempts` row does
-/// not carry and that only this digest can hold the event to.
+/// **This narrows what the `answer_evaluation` gate binds, and no ratification
+/// covers the narrowing.** A-22 says the digest is written "exactly as the retired
+/// writer did … the browser-event gate's invariants transfer to the turn-outcome
+/// authority unchanged (no gate weakening)", and the plan's Step 3 says "hashes …
+/// `serde_json::to_vec` of the exact Plan 04/agent-domain type. Do not hash ad hoc
+/// maps or backend-specific projections." The retired `record_answer_evaluation`
+/// hashed the whole [`AnswerEvaluation`]; this hashes that type minus
+/// `answer_text`. A worker may not decide on its own what a gate stops binding, so
+/// this stands as an escalation, not as settled discipline: the coordinator either
+/// records the transcript boundary as an amendment or directs different work.
+///
+/// **Why it is structurally forced.** Every field except `answer_text` is
+/// something this store decided — the wire label, the feedback, the retry prompt,
+/// the re-retrieved source, the mastery value, the confidence — and all of them
+/// come from the persisted [`TurnOutcome`] and the question it names. `answer_text`
+/// is the transcript the transport carried, and no canonical persistence type has
+/// a field for it: [`TurnOutcome`] carries none, the store publishes
+/// `transcript_persistence: false`, and both production adapters set
+/// `answer_digest_hmac: None` (a keyed commitment this store holds no key for in
+/// any case). The turn-outcome authority therefore *cannot* reproduce a digest
+/// over the transcript. Binding it anyway — hashing an empty string in its place —
+/// would fail every real browser event closed, which is the defect A-22 exists to
+/// close. There is no third option inside this lane's ownership.
+///
+/// **What the narrowing costs.** Exactly one thing: a provider event that pairs a
+/// legitimately graded `response_id` with a fabricated `answer_text` is now
+/// admitted where it was previously refused. The residual exposure is small but it
+/// is not zero, and it is the coordinator's to accept: the same transcript already
+/// reaches the same browser through `transcript_delta`/`transcript_final`, which
+/// the socket's preflight hands over under its `_ => Authorized` arm with no
+/// authorization at all, so a provider that can fabricate a transcript here can
+/// already fabricate one there.
+///
+/// **What it does not cost.** Every field that *is* a server fact stays bound,
+/// including the two — `concise_feedback` and `retry_prompt` — that the
+/// `answer_attempts` row does not carry and that only this digest can hold the
+/// event to. One definition serves the gate *and* both write paths on both
+/// backends, so no write path can authorize what another cannot.
+///
+/// The two sibling payload types here ([`ConceptStatusEventPayload`],
+/// [`ReviewScheduleEventPayload`]) are already typed crate-private projections
+/// rather than wire types, and both predate A-22 — so the *shape* is the
+/// established in-tree pattern. What needs ratifying is not the shape; it is that
+/// this particular gate now binds one field fewer than it did.
 ///
 /// The field order is [`AnswerEvaluation`]'s own, minus the transcript, so the
 /// canonical JSON this hashes reads as the browser payload it stands for.

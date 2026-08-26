@@ -1127,6 +1127,23 @@ async fn authorize_evaluation(
         .await
 }
 
+/// How many session-scoped concept-status writes this session has published.
+///
+/// Read through the port both backends already publish counts on, so the two are
+/// compared on the number each one *tells a caller* it wrote — the memory
+/// snapshot's row count and Postgres's `concept_status_events` count — rather than
+/// on a backend-specific query the test invents.
+async fn durable_concept_statuses(
+    store: &dyn StudyMemoryStore,
+    fixture: &CanonicalStoreFixture,
+) -> usize {
+    store
+        .study_session_durable_counts(LEARNING_USER_ID, LEARNING_SET_ID, fixture.voice_session_id)
+        .await
+        .expect("the session's durable counts read")
+        .concept_statuses
+}
+
 /// `A-22`: an evaluated turn's browser events are authoritative, and only the
 /// exact payload the store derived is.
 ///
@@ -1217,11 +1234,22 @@ pub(crate) async fn exercise_turn_outcome_browser_authority(
         });
 
     // The transcript echo is the one field the store never sees — `TurnOutcome`
-    // carries no answer text by design, and the store persists none. It is
-    // therefore deliberately outside the digest, and this pins that boundary as a
-    // decision rather than leaving it to be discovered: the same graded payload
-    // under a different transcript is still admitted, exactly as the ungated
-    // `transcript_final` frame that carried it already was.
+    // carries no answer text by design, and the store persists none — so it is
+    // outside the digest, and the same graded payload under a different transcript
+    // is admitted.
+    //
+    // This assertion is deliberately explicit rather than left implicit, because it
+    // is the one place A-22's fix binds *less* than the writer it replaced. That
+    // narrowing is UNRATIFIED and escalated (see the ESCALATION block on
+    // `AnswerEvaluationEventPayload`): if the coordinator rules the transcript must
+    // stay bound, this assertion inverts to an `expect_err` and the fix needs a
+    // persisted transcript commitment the store does not have today. Pinning it
+    // here means that ruling changes a test that says what it is doing, instead of
+    // silently changing what a gate admits.
+    //
+    // The exposure it accepts, stated so the ruling is made on the facts: the
+    // ungated `transcript_final` frame already carried this same text to this same
+    // browser under the socket's `_ => Authorized` arm.
     let mut retranscribed = evaluation.clone();
     retranscribed.answer_text = "A different transcript of the same turn.".to_owned();
     authorize_evaluation(store, fixture, &strong.response_id, &retranscribed)
@@ -1395,6 +1423,82 @@ pub(crate) async fn exercise_turn_outcome_browser_authority(
         .expect_err(&format!(
             "{label}: a deferred turn moves no concept and authorizes no status event"
         ));
+
+    // --- Turn E: two writers of one transition publish one write -------------
+    //
+    // `record_concept_status` is retired from production but is still a published
+    // port method, so a caller can record the same session-scoped transition the
+    // turn outcome is about to commit under the same response identity. Postgres
+    // dedupes that on `concept_status_events`' primary key and counts only the row
+    // it inserted; memory has to reach the same published count or the two
+    // backends disagree about what one turn wrote — and the disagreement would
+    // surface as an unexplained `write_counts` drift rather than as the missing
+    // dedup it is. The retired writer guarded on exactly this digest, so the
+    // authority that replaced it must too.
+    let mut replayed_status = mostly_correct.clone();
+    replayed_status.response_id = "resp-a22-status-replay".to_owned();
+    let TurnResolution::Evaluated {
+        concept_transitions,
+        ..
+    } = &replayed_status.resolution
+    else {
+        panic!("the re-bound template must be an evaluated outcome")
+    };
+    assert!(
+        concept_transitions.len() >= 2,
+        "this turn only discriminates while the outcome moves more than one concept"
+    );
+    let already_written = concept_transitions[0].clone();
+    let written_once = concept_transitions[1].clone();
+
+    let baseline = durable_concept_statuses(store, fixture).await;
+    store
+        .record_concept_status(
+            LEARNING_USER_ID,
+            LEARNING_SET_ID,
+            fixture.voice_session_id,
+            &replayed_status.response_id,
+            &already_written.concept_id,
+            already_written.to_status.clone(),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{label}: the retired status writer still writes: {error:?}")
+        });
+    assert_eq!(
+        durable_concept_statuses(store, fixture).await,
+        baseline + 1,
+        "{label}: the first writer of a transition publishes one write"
+    );
+
+    persist_captured_turn(store, fixture, &question, replayed_status.clone()).await;
+    assert_eq!(
+        durable_concept_statuses(store, fixture).await,
+        baseline + 2,
+        "{label}: the outcome publishes only the transition that was not already \
+         written, not a second copy of one that was"
+    );
+
+    // Deduping cost the turn no authority: both transitions still authorize their
+    // own browser event, the one written twice and the one written once.
+    for transition in [&already_written, &written_once] {
+        store
+            .authorize_concept_status(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                fixture.voice_session_id,
+                &replayed_status.response_id,
+                &transition.concept_id,
+                &transition.to_status,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{label}: `{}` still authorizes its own status event: {error:?}",
+                    transition.concept_id
+                )
+            });
+    }
 }
 
 // ---------------------------------------------------------------------------

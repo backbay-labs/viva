@@ -4646,6 +4646,77 @@ mod tests {
         assert_eq!(state.question_progressions.len(), 1);
         assert_eq!(state.voice_usage_events.len(), 1);
     }
+
+    /// `A-22`: the six wire tokens a browser evaluation is authorized against,
+    /// pinned arm by arm.
+    ///
+    /// The mapping is duplicated in
+    /// `agent_adapters::cartesia_gemini::projection::evaluation_label_wire` with no
+    /// compile-time link between the copies (see the hazard note on
+    /// `learning::evaluation_label_wire`). Only two arms are exercised end to end
+    /// by a fixture — `strong` in the frozen v5 replays, `mostly correct` in the
+    /// shared conformance suite — so the other four were unpinned in either copy,
+    /// and a rename of one of them would have surfaced only as a live session
+    /// closing with `provider source authority rejected`.
+    ///
+    /// Three separate facts, because each fails differently:
+    /// 1. the literal token of every arm, so a rename in this copy is a red test;
+    /// 2. every token passes `AnswerEvaluation::validate_fail_closed`, the check
+    ///    the event itself must survive — a token this store hashed but the domain
+    ///    refuses could never be presented at all;
+    /// 3. no two labels share a token, because the digest is the only thing
+    ///    separating two differently graded turns of the same response identity.
+    #[test]
+    fn a22_evaluation_label_wire_pins_every_arm() {
+        let mapping = [
+            (EvaluationLabel::Strong, "strong"),
+            (EvaluationLabel::MostlyCorrect, "mostly correct"),
+            (EvaluationLabel::PartiallyCorrect, "partially correct"),
+            (EvaluationLabel::Vague, "vague"),
+            (EvaluationLabel::Wrong, "wrong"),
+            (
+                EvaluationLabel::InsufficientEvidence,
+                "insufficient evidence",
+            ),
+        ];
+        let presented = |label: &str| AnswerEvaluation {
+            question_id: "q-1".to_owned(),
+            answer_text: "the learner said something".to_owned(),
+            label: label.to_owned(),
+            concise_feedback: "feedback".to_owned(),
+            retry_prompt: String::new(),
+            source: fixture_source_reference(),
+            concept_status: ConceptStatus::Shaky,
+            confidence_score: 0.5,
+        };
+        for (label, token) in mapping {
+            assert_eq!(
+                super::learning::evaluation_label_wire(label),
+                token,
+                "the browser is shown `{token}` for {label:?}"
+            );
+            presented(token)
+                .validate_fail_closed()
+                .unwrap_or_else(|error| {
+                    panic!("`{token}` must be a label the browser contract accepts: {error}")
+                });
+        }
+        // The negative control: the same construction with a token outside the
+        // rubric is refused for exactly the label reason, so the assertion above is
+        // testing the label and not merely a well-formed struct.
+        assert_eq!(
+            presented("mostly_correct").validate_fail_closed(),
+            Err("answer evaluation label is not in the typed rubric"),
+            "the canonical serde token is not a browser token"
+        );
+        let tokens: std::collections::BTreeSet<&str> =
+            mapping.iter().map(|(_, token)| *token).collect();
+        assert_eq!(
+            tokens.len(),
+            mapping.len(),
+            "two labels sharing a wire token would let one grade authorize the other's event"
+        );
+    }
 }
 
 #[cfg(test)]

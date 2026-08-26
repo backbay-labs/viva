@@ -669,11 +669,28 @@ pub(crate) fn session_answered_questions(
 /// contract's token is `mostly correct`, and `AnswerEvaluation::validate_fail_closed`
 /// accepts only the browser tokens. The projection that builds the event lives in
 /// `agent-adapters` and this store cannot call it — `data` is a dependency of the
-/// adapters, not the other way round — so the mapping is restated here with the
-/// gate that arbitrates it: `store_conformance`'s `mostly correct` turn refuses
-/// the canonical serde token and admits the browser one, on both backends, and
-/// the frozen v5 replays refuse any drift over a real socket. If Plan 04 ever adds
-/// a label, both mappings gain it or the browser event stops being authorizable.
+/// adapters, not the other way round — so the mapping is restated here.
+///
+/// # Known hazard: this is a duplicated mapping with no compile-time link
+///
+/// `agent_adapters::cartesia_gemini::projection::evaluation_label_wire` holds an
+/// independent copy of the same six arms. A new `EvaluationLabel` variant breaks
+/// both crates' builds (the enum is not `#[non_exhaustive]` and both matches are
+/// exhaustive), but a *renamed token* in one copy compiles cleanly in the other,
+/// and the divergence surfaces only at run time: the adapter's event no longer
+/// hashes to the digest this store wrote, `authorize_answer_evaluation` returns
+/// `Conflict`, and the socket closes a live session with `provider source
+/// authority rejected`. Fail-closed, but a session kill.
+///
+/// `a22_evaluation_label_wire_pins_every_arm` (in `memory.rs`'s test module) pins
+/// all six arms of *this* copy against literals and against
+/// `AnswerEvaluation::validate_fail_closed`, so a rename here cannot pass
+/// silently; the adapter copy is Plan 07's file and is pinned only where a fixture
+/// happens to exercise it (`strong` in the v5 replays, `mostly correct` in
+/// `store_conformance`). **Handoff:** hoisting the mapping
+/// into `agent-domain` beside `is_known_evaluation_label` — the one crate both
+/// sides already depend on — would delete the duplication outright, and is a
+/// Plan-04-owned change this lane may not make.
 pub(crate) fn evaluation_label_wire(label: EvaluationLabel) -> &'static str {
     match label {
         EvaluationLabel::Strong => "strong",
@@ -993,13 +1010,25 @@ pub(super) fn record_turn_outcome(
         // `record_concept_status` wrote — otherwise the `concept_status` browser
         // event of a genuinely evaluated turn is refused for a write that did
         // happen.
-        state.concept_statuses.push(ConceptStatusRecord {
-            user_id: user_id.to_owned(),
-            study_set_id: study_set_id.to_owned(),
-            voice_session_id: voice_session_id.to_owned(),
-            concept_id: transition.concept_id.clone(),
-            status: transition.to_status.clone(),
-        });
+        //
+        // Guarded on the digest exactly as that retired writer was, because the
+        // two backends must publish the same count for the same turn: Postgres
+        // inserts this row `ON CONFLICT (…, response_id, concept_id,
+        // payload_sha256) DO NOTHING` and counts only what it inserted, so an
+        // unguarded push here would publish `concept_statuses + 1` where Postgres
+        // publishes `+ 0` the moment any other path records the same transition
+        // for the same response first. The shared conformance suite pins that
+        // parity (`Turn E`); without the guard it reads as an unexplained
+        // cross-backend drift rather than as a missing dedup.
+        if !authorization::is_recorded_locked(&state, &authorization) {
+            state.concept_statuses.push(ConceptStatusRecord {
+                user_id: user_id.to_owned(),
+                study_set_id: study_set_id.to_owned(),
+                voice_session_id: voice_session_id.to_owned(),
+                concept_id: transition.concept_id.clone(),
+                status: transition.to_status.clone(),
+            });
+        }
         state.event_authorizations.insert(authorization);
 
         // D-01 `SERVER_PERSISTED_FSRS`: an evaluated turn is the graded outcome,
