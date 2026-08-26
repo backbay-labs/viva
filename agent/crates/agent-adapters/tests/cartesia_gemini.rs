@@ -3404,6 +3404,31 @@ fn read_repository_fixture(path: &str) -> Result<String, String> {
         .map_err(|error| format!("fixture path `{path}` is not readable: {error}"))
 }
 
+/// Where a manifest kind carries its version, and what strict v5 requires there.
+///
+/// Documents inside the protocol envelope declare `protocol_version`; a single
+/// captured wire frame declares the wire `version` it was captured at. The two
+/// kinds that return `None` are deliberately outside the voice envelope:
+/// `auth_decision` records a decision with no wire version at all, and
+/// `token_vectors` versions the session-token format rather than the protocol.
+/// Returning `Some` makes the field mandatory, so a fixture that dropped it is
+/// rejected rather than resolved.
+fn required_fixture_version(
+    kind: &str,
+) -> Result<Option<(&'static str, serde_json::Value)>, String> {
+    match kind {
+        "manifest" | "frame_sequence" | "client_frame_cases" | "server_event_cases"
+        | "transport_cases" | "session_sequence" | "differential_cases" => {
+            Ok(Some(("protocol_version", json!(5))))
+        }
+        "client_frame" | "server_frame" => Ok(Some(("version", json!(5)))),
+        "auth_decision" | "token_vectors" => Ok(None),
+        unknown => Err(format!(
+            "manifest kind `{unknown}` has no declared version rule; strict v5 cannot resolve it"
+        )),
+    }
+}
+
 /// Resolve one Plan 05 fixture by its published manifest ID.
 ///
 /// The manifest is the only way in: schema, protocol version, supported
@@ -3477,11 +3502,26 @@ fn resolve_voice_fixture_with(
     let body = load(path)?;
     let fixture: serde_json::Value = serde_json::from_str(&body)
         .map_err(|error| format!("fixture {manifest_id} is not JSON: {error}"))?;
-    if let Some(version) = fixture.get("protocol_version") {
-        if version != &json!(5) {
-            return Err(format!(
-                "fixture {manifest_id} declares protocol_version {version}; strict v5 rejects it"
-            ));
+    // A version the fixture never declares is not a pass. Each manifest kind
+    // names where its version lives, so a fixture that dropped the field is
+    // rejected exactly as one that declares the wrong value.
+    match required_fixture_version(kind)? {
+        Some((key, expected)) => {
+            let declared = fixture.get(key).ok_or_else(|| {
+                format!("fixture {manifest_id} declares no {key}; strict v5 rejects it")
+            })?;
+            if declared != &expected {
+                return Err(format!(
+                    "fixture {manifest_id} declares {key} {declared}; strict v5 rejects it"
+                ));
+            }
+        }
+        None => {
+            if let Some(version) = fixture.get("protocol_version") {
+                return Err(format!(
+                    "fixture {manifest_id} is outside the protocol envelope yet declares protocol_version {version}"
+                ));
+            }
         }
     }
     if let Some(supported) = fixture.get("supported_versions") {
@@ -4051,6 +4091,83 @@ fn adapter_fixture_manifest_is_strict_v5_and_complete() {
             "a resolved fixture at protocol_version {version} must be rejected"
         );
     }
+
+    // A fixture that drops its version field entirely is rejected too: an
+    // absent version is not a strict-v5 envelope.
+    let stripped_body = {
+        let mut body = resolve(&manifest).expect("the pristine fixture resolves");
+        body.as_object_mut()
+            .expect("the fixture is an object")
+            .remove("protocol_version");
+        serde_json::to_string(&body).expect("the clone serializes")
+    };
+    let load = move |_path: &str| Ok(stripped_body.clone());
+    assert!(
+        resolve_voice_fixture_with(
+            &manifest,
+            "VOICE-SERVER-DIFFERENTIAL-CASES",
+            "differential_cases",
+            &load,
+        )
+        .is_err(),
+        "a resolved fixture that declares no protocol_version must be rejected"
+    );
+
+    // The same rule reaches a single captured wire frame through its own
+    // `version` key, in both directions.
+    for mutation in [Some(json!(4)), None] {
+        let frame_body = {
+            let mut body = resolve_voice_fixture_with(
+                &manifest,
+                "VOICE-SERVER-READY",
+                "server_frame",
+                &read_repository_fixture,
+            )
+            .expect("the pristine server frame resolves");
+            match &mutation {
+                Some(version) => body["version"] = version.clone(),
+                None => {
+                    body.as_object_mut()
+                        .expect("the frame is an object")
+                        .remove("version");
+                }
+            }
+            serde_json::to_string(&body).expect("the clone serializes")
+        };
+        let load = move |_path: &str| Ok(frame_body.clone());
+        assert!(
+            resolve_voice_fixture_with(&manifest, "VOICE-SERVER-READY", "server_frame", &load,)
+                .is_err(),
+            "a server frame whose version is {mutation:?} must be rejected"
+        );
+    }
+
+    // A fixture the manifest places outside the protocol envelope may not
+    // smuggle a protocol version back in.
+    let versioned_decision = {
+        let mut body = resolve_voice_fixture_with(
+            &manifest,
+            "VOICE-AUTH-DECISION",
+            "auth_decision",
+            &read_repository_fixture,
+        )
+        .expect("the pristine auth decision resolves");
+        body["protocol_version"] = json!(5);
+        serde_json::to_string(&body).expect("the clone serializes")
+    };
+    let load = move |_path: &str| Ok(versioned_decision.clone());
+    assert!(
+        resolve_voice_fixture_with(&manifest, "VOICE-AUTH-DECISION", "auth_decision", &load)
+            .is_err(),
+        "a non-envelope fixture that declares a protocol version must be rejected"
+    );
+
+    // Every published kind has a declared version rule; an unknown one is a
+    // resolution failure rather than an unchecked pass.
+    assert!(
+        required_fixture_version("kind_that_was_never_published").is_err(),
+        "an unpublished manifest kind must have no silent version rule"
+    );
 }
 
 // --- the two-turn adapter parity harness ----------------------------------
