@@ -5861,6 +5861,79 @@ mod tests {
         );
     }
 
+    /// Recorded gate-check: `should_suppress_superseded_recap` versus Plan 07's
+    /// one-recap-on-stop.
+    ///
+    /// DISPOSITION — no collision in the live runtime. Plan 07 emits the stop
+    /// recap under a dedicated turn-0 response identity
+    /// (`SyntheticStudySessionSpec::response_id(0)`), which is never an admitted
+    /// provider turn, therefore never enters `completed_provider_turn_response_ids`,
+    /// therefore can never enter `superseded_provider_turn_response_ids`. The
+    /// suppression rule cannot reach it.
+    ///
+    /// ESCALATED — Plan 05's frozen `v5/synthetic-two-turn-session.json` binds its
+    /// `recap_ready` to `response-1`, the same response the fixture cancels and
+    /// evaluates. On a live socket that recap is suppressed twice over: once by
+    /// `should_suppress_cancelled_response` (its response was cancelled) and again
+    /// by `should_suppress_superseded_recap` once a later turn is admitted. That is
+    /// a fixture/runtime disagreement, not something this service may paper over by
+    /// weakening either rule, so it is reported to the fixture owner rather than
+    /// improvised around here.
+    #[test]
+    fn stop_recap_identity_is_out_of_reach_of_superseded_recap_suppression() {
+        let recap = agent_domain::StudySessionRecap {
+            schema: VIVA_STUDY_SESSION_RECAP_SCHEMA.to_owned(),
+            voice_session_id: "voice-session-1".to_owned(),
+            headline: "Session recap".to_owned(),
+            summary: "Review oxidative phosphorylation.".to_owned(),
+            concepts: vec![],
+            review_schedule: vec![],
+            next_action: "Review the source moment.".to_owned(),
+            source_moments: vec![],
+            deferred_turns: 0,
+        };
+
+        // The turn-0 identity Plan 07's stop recap uses.
+        let stop_recap = BrainEvent::RecapReady {
+            response_id: "response-0-generation-viva-session-bootstrap-1".to_owned(),
+            recap: recap.clone(),
+        };
+        // Every answered turn of the session, completed and then superseded.
+        let mut completed = HashSet::new();
+        completed.insert("response-1-generation-viva-session-bootstrap-1".to_owned());
+        completed.insert("response-2-generation-viva-session-bootstrap-1".to_owned());
+        let mut superseded = HashSet::new();
+        mark_completed_provider_turns_superseded(&completed, &mut superseded);
+
+        assert!(
+            !should_suppress_superseded_recap(&stop_recap, &superseded),
+            "the stop recap's turn-0 identity is never one of the superseded turns"
+        );
+
+        // The fixture's shape, recorded as the escalation it is: a recap bound to
+        // an answered turn that was cancelled and then superseded.
+        let fixture_shaped_recap = BrainEvent::RecapReady {
+            response_id: "response-1-generation-viva-session-bootstrap-1".to_owned(),
+            recap,
+        };
+        assert!(
+            should_suppress_superseded_recap(&fixture_shaped_recap, &superseded),
+            "a recap bound to a superseded answered turn is suppressed"
+        );
+        let mut cancelled = CancelledResponseTracker::default();
+        assert!(!should_suppress_cancelled_response(
+            &mut cancelled,
+            &BrainEvent::ResponseCancelledFor {
+                response_id: "response-1-generation-viva-session-bootstrap-1".to_owned(),
+            }
+        ));
+        assert!(
+            should_suppress_cancelled_response(&mut cancelled, &fixture_shaped_recap),
+            "a recap bound to a cancelled response is already suppressed before the \
+             superseded rule is consulted"
+        );
+    }
+
     #[test]
     fn superseded_recap_suppression_uses_response_identity_not_active_turn_count() {
         let recap = agent_domain::StudySessionRecap {
