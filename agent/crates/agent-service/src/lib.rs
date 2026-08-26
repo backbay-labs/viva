@@ -6,8 +6,10 @@ mod protocol;
 mod ws;
 
 pub use app::{
-    build_router, AppState, RecorderStats, VoiceDrainSignal, VoiceEvidenceRecorder,
-    VoiceLimitState, VoiceUsageAggregate, VoiceUsageRecorder, WsTimeouts,
+    begin_drain_and_wait, build_router, ActiveHandlerGuard, AppState, BackgroundWorkerGuard,
+    DrainOutcome, RecorderStats, RuntimeDraining, VoiceDrainSignal, VoiceEvidenceRecorder,
+    VoiceLimitState, VoiceRuntimeSnapshot, VoiceRuntimeTracker, VoiceUsageAggregate,
+    VoiceUsageRecorder, WsTimeouts,
 };
 pub use config::{
     build_brain, build_study_store, validate_runtime_store_preflight, verify_session_token_at,

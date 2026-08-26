@@ -1,13 +1,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use agent_service::{
-    build_brain, build_router, build_study_store, validate_runtime_store_preflight, AppState,
-    ProjectionReadAccess, ServiceConfig, VoiceDrainSignal,
+    begin_drain_and_wait, build_brain, build_router, build_study_store,
+    validate_runtime_store_preflight, AppState, DrainOutcome, ProjectionReadAccess, ServiceConfig,
 };
-
-const VOICE_DRAIN_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -60,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
         Some(access) => state.with_projection_read_access(access),
         None => state,
     };
-    let drain_signal = state.drain_signal.clone();
+    let shutdown_state = state.clone();
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "viva agent listening");
@@ -68,12 +65,12 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(drain_signal))
+    .with_graceful_shutdown(shutdown_signal(shutdown_state))
     .await?;
     Ok(())
 }
 
-async fn shutdown_signal(drain_signal: VoiceDrainSignal) {
+async fn shutdown_signal(state: AppState) {
     #[cfg(unix)]
     let terminate = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -95,6 +92,27 @@ async fn shutdown_signal(drain_signal: VoiceDrainSignal) {
     }
 
     tracing::info!("viva agent draining voice sessions before shutdown");
-    drain_signal.begin_drain();
-    tokio::time::sleep(VOICE_DRAIN_GRACE_PERIOD).await;
+    // `SERVICE-012`: the drain closes admission, winds every accepted session
+    // down, and then waits on the server's own handler and worker counters up to
+    // the configured grace. Only counts are logged if the grace expires.
+    let grace = state.ws_timeouts.drain_grace;
+    match begin_drain_and_wait(&state, grace).await {
+        DrainOutcome::Drained => {
+            tracing::info!("viva agent voice runtime drained");
+        }
+        DrainOutcome::TimedOut(snapshot) => {
+            tracing::warn!(
+                grace_seconds = grace.as_secs(),
+                active_handlers = snapshot.active_handlers,
+                background_workers = snapshot.background_workers,
+                session_in_use = snapshot.session_in_use,
+                session_capacity = snapshot.session_capacity,
+                user_leases = snapshot.user_leases,
+                ip_leases = snapshot.ip_leases,
+                provider_inflight = snapshot.provider_inflight,
+                provider_waiting = snapshot.provider_waiting,
+                "viva agent drain grace expired"
+            );
+        }
+    }
 }

@@ -21,11 +21,12 @@ use agent_domain::{
     VoiceUsageRecord, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use agent_service::{
-    build_router, verify_session_token_at, AppState, ClientFrame, ClientTurnIntent,
-    ExpectedSessionBinding, FailureControlConfig, FailureControlScenario, OperatorAccess,
-    ProjectionReadAccess, RecorderLimits, RedactedSecret, ServerFrame, VivaServerEvent,
-    VoiceDrainSignal, VoiceEvidenceRecorder, VoiceLimitConfig, VoiceServerErrorCode,
-    VoiceUsageRecorder, VoiceWsAccess, WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
+    begin_drain_and_wait, build_router, verify_session_token_at, AppState, ClientFrame,
+    ClientTurnIntent, DrainOutcome, ExpectedSessionBinding, FailureControlConfig,
+    FailureControlScenario, OperatorAccess, ProjectionReadAccess, RecorderLimits, RedactedSecret,
+    ServerFrame, VivaServerEvent, VoiceDrainSignal, VoiceEvidenceRecorder, VoiceLimitConfig,
+    VoiceRuntimeSnapshot, VoiceServerErrorCode, VoiceUsageRecorder, VoiceWsAccess, WsTimeouts,
+    VIVA_VOICE_PROTOCOL_VERSION,
 };
 use axum::{
     body::Body,
@@ -5526,6 +5527,8 @@ async fn websocket_records_auth_failure_for_forged_config_refresh() {
 const WS_SOURCE: &str = include_str!("../src/ws.rs");
 const PROTOCOL_SOURCE: &str = include_str!("../src/protocol.rs");
 const LIB_SOURCE: &str = include_str!("../src/lib.rs");
+const APP_SOURCE: &str = include_str!("../src/app.rs");
+const MAIN_SOURCE: &str = include_str!("../src/main.rs");
 
 #[test]
 fn protocol_v5_fixture_shadow_types_are_absent() {
@@ -17977,4 +17980,518 @@ async fn websocket_scoped_cancel_after_audio_end_does_not_close_the_session() {
         VoiceServerErrorCode::ClientFrameMalformed.as_str()
     );
     assert_close_code(&mut socket, CloseCode::Protocol).await;
+}
+
+/// `SERVICE-012`: the drain's missed-wakeup guard, pinned where it actually lives.
+///
+/// `Notify::notify_waiters` stores no permit, so a waiter that registers *after*
+/// its zero check can never be woken by the drop that made the check stale — the
+/// drain would then sit out its whole grace with the runtime already at zero.
+/// The ordering is a property of one function, and the window it closes is a few
+/// instructions wide, so it is characterized here rather than raced for.
+#[test]
+fn server_owned_capacity_drain_registers_its_waiter_before_each_zero_check() {
+    let body = APP_SOURCE
+        .split_once("pub async fn begin_drain_and_wait")
+        .expect("begin_drain_and_wait is the one drain entry point")
+        .1
+        .split_once("\n}\n")
+        .expect("the drain function closes")
+        .0;
+    let enable = body
+        .find(".enable();")
+        .expect("the zero waiter is enabled, not merely constructed");
+    let zero_check = body
+        .find("state.runtime_tracker.counts() == (0, 0)")
+        .expect("the drain waits on both counters");
+    let wait = body
+        .find("tokio::time::timeout_at(deadline, notified)")
+        .expect("the wait is bounded by the absolute grace deadline");
+    let notified = body
+        .find("state.runtime_tracker.zero.notified()")
+        .expect("the waiter is built from the tracker's zero notification");
+    assert!(
+        notified < enable && enable < zero_check && zero_check < wait,
+        "the waiter must be constructed and enabled before the zero check,          and only then awaited"
+    );
+    assert_eq!(
+        body.matches("state.runtime_tracker.counts()").count(),
+        1,
+        "one zero check, inside the loop that owns the registered waiter"
+    );
+    // The drain flag is closed before the accepted sessions are told to stop, so
+    // no upgrade can slip in behind the wait.
+    let begin_drain = body
+        .find("state.runtime_tracker.begin_drain();")
+        .expect("the tracker drain latches first");
+    let signal_drain = body
+        .find("state.drain_signal.begin_drain();")
+        .expect("the accepted sessions are signalled second");
+    assert!(begin_drain < signal_drain && signal_drain < notified);
+}
+
+/// `SERVICE-012`: the process no longer sleeps a fixed two seconds and hopes.
+#[test]
+fn server_owned_capacity_shutdown_waits_on_the_configured_drain_grace() {
+    assert!(
+        MAIN_SOURCE.contains("begin_drain_and_wait(&state, grace)"),
+        "shutdown drains through the server-owned wait"
+    );
+    assert!(
+        MAIN_SOURCE.contains("let grace = state.ws_timeouts.drain_grace;"),
+        "the grace is the configured VIVA_VOICE_DRAIN_GRACE_SECONDS bound"
+    );
+    assert!(
+        !MAIN_SOURCE.contains("tokio::time::sleep"),
+        "no unconditional shutdown sleep survives"
+    );
+    // Only counts reach the log when the grace expires.
+    let timed_out = MAIN_SOURCE
+        .split_once("DrainOutcome::TimedOut(snapshot)")
+        .expect("the timeout arm is handled")
+        .1;
+    for forbidden in [
+        "user_id",
+        "voice_session_id",
+        "study_set_id",
+        "ip =",
+        "peer",
+    ] {
+        assert!(
+            !timed_out.contains(forbidden),
+            "the drain timeout log must carry counts only, found {forbidden}"
+        );
+    }
+}
+
+/// `D-04 CONFIRM_DELETE` is the recorded branch, so no deletion finalizer exists
+/// to join at drain and no production path acquires a background-worker guard.
+/// The counter is still waited on, so a future worker cannot be drained past.
+#[test]
+fn server_owned_capacity_has_no_background_worker_under_confirm_delete() {
+    for source in [WS_SOURCE, APP_SOURCE, MAIN_SOURCE] {
+        // Everything before the crate's first `#[cfg(test)]` is what ships.
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert_eq!(
+            production.matches("enter_background_worker()").count(),
+            0,
+            "no production site acquires a background-worker guard under CONFIRM_DELETE"
+        );
+    }
+    assert!(
+        APP_SOURCE.contains("pub fn enter_background_worker"),
+        "the guard the drain waits on still exists"
+    );
+    assert!(
+        !LIB_SOURCE.contains("restore") && !WS_SOURCE.contains("deletion_finalizer"),
+        "CONFIRM_DELETE leaves no restore or finalizer surface"
+    );
+}
+
+/// `SERVICE-012`: every capacity dimension the server owns, read back through the
+/// one sanitized runtime snapshot. Nothing here reads a client close frame.
+fn capacity_probe_state(
+    max_sessions: usize,
+    text_inputs: Arc<AtomicUsize>,
+    voice_limits: VoiceLimitConfig,
+) -> AppState {
+    // One active session per (user, study set) is a separate server-owned cap, so
+    // every concurrent probe socket names a different set.
+    let store = provider_limiter_test_store();
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: "physics-final".to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Physics Final".to_owned(),
+        course: Some("Physics 201".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![],
+        question_ids: vec![],
+    });
+    AppState::with_study_store(
+        Arc::new(BlockingProviderProbeBrain { text_inputs }),
+        "cartesia_gemini",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some("session-secret".into()),
+            allowed_origins: vec![],
+        },
+        max_sessions,
+        store,
+    )
+    .with_voice_limits(voice_limits)
+}
+
+fn empty_runtime_snapshot(session_capacity: usize) -> VoiceRuntimeSnapshot {
+    VoiceRuntimeSnapshot {
+        session_capacity,
+        session_in_use: 0,
+        user_leases: 0,
+        ip_leases: 0,
+        provider_inflight: 0,
+        provider_waiting: 0,
+        active_handlers: 0,
+        background_workers: 0,
+        draining: false,
+    }
+}
+
+/// Opens one admitted socket, binds it, and leaves it holding whatever provider
+/// capacity its turn intent claims.
+async fn open_capacity_probe_socket(
+    url: &str,
+    study_set_id: &str,
+    session_id: &str,
+    nonce: &str,
+) -> TestWebSocket {
+    let token = provider_limiter_token(study_set_id, session_id, nonce);
+    let (mut socket, _) = connect_async(token_only_request(url, &token))
+        .await
+        .expect("capacity probe socket upgrades");
+    assert_ready_provider(&mut socket, "cartesia_gemini").await;
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token(study_set_id, session_id, &token).into(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_server_frame(&mut socket).await,
+        ServerFrame::Event { event, .. }
+            if matches!(
+                event.as_ref(),
+                VivaServerEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                    terminal_reason: None,
+                }
+            )
+    ));
+    socket
+}
+
+async fn send_capacity_probe_turn(socket: &mut TestWebSocket, generation: &str, turn_id: &str) {
+    send_client_frame(
+        socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: generation.to_owned(),
+            turn_id: turn_id.to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "capacity probe".to_owned(),
+            },
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn server_owned_capacity_snapshot_moves_once_per_transition_and_returns_to_zero() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let state = capacity_probe_state(
+        2,
+        text_inputs.clone(),
+        VoiceLimitConfig {
+            max_user_sessions: Some(2),
+            max_ip_sessions: Some(2),
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        },
+    );
+    let observed = state.clone();
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    assert_eq!(observed.runtime_snapshot(), empty_runtime_snapshot(2));
+
+    let mut holder = open_capacity_probe_socket(
+        &url,
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-capacity-biology",
+    )
+    .await;
+    send_capacity_probe_turn(&mut holder, "capacity-holder", "v5-capacity-1").await;
+    wait_until(Duration::from_secs(2), || {
+        text_inputs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(
+        observed.runtime_snapshot(),
+        VoiceRuntimeSnapshot {
+            session_capacity: 2,
+            session_in_use: 1,
+            user_leases: 1,
+            ip_leases: 1,
+            provider_inflight: 1,
+            provider_waiting: 0,
+            active_handlers: 1,
+            background_workers: 0,
+            draining: false,
+        }
+    );
+
+    let mut queued = open_capacity_probe_socket(
+        &url,
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-capacity-chemistry",
+    )
+    .await;
+    send_capacity_probe_turn(&mut queued, "capacity-queued", "v5-capacity-2").await;
+    wait_until(Duration::from_secs(2), || {
+        observed.runtime_snapshot().provider_waiting == 1
+    })
+    .await;
+    let saturated = VoiceRuntimeSnapshot {
+        session_capacity: 2,
+        session_in_use: 2,
+        user_leases: 2,
+        ip_leases: 2,
+        provider_inflight: 1,
+        provider_waiting: 1,
+        active_handlers: 2,
+        background_workers: 0,
+        draining: false,
+    };
+    assert_eq!(observed.runtime_snapshot(), saturated);
+
+    // Every configured cap is now exactly full and none of them was exceeded.
+    assert!(saturated.session_in_use <= saturated.session_capacity);
+    assert_eq!(saturated.user_leases, 2);
+    assert_eq!(saturated.ip_leases, 2);
+    assert_eq!(saturated.provider_inflight, 1);
+    assert_eq!(saturated.provider_waiting, 1);
+
+    // A denied upgrade takes nothing: the snapshot is byte-identical afterwards.
+    let refused = connect_async(token_only_request(
+        &url,
+        &provider_limiter_token(
+            "biology-midterm",
+            "voice-session-3",
+            "nonce-capacity-denied",
+        ),
+    ))
+    .await;
+    assert!(
+        refused.is_err(),
+        "a third upgrade must be refused at the session cap"
+    );
+    assert_eq!(observed.runtime_snapshot(), saturated);
+
+    // Cancelling the queued turn decrements the waiting counter exactly once.
+    send_client_frame(
+        &mut queued,
+        &ClientFrame::Cancel {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "capacity-queued".to_owned(),
+            turn_id: None,
+        },
+    )
+    .await;
+    wait_for_evidence_kind(&evidence, VoiceEvidenceEventKind::CancelReceived).await;
+    wait_until(Duration::from_secs(2), || {
+        observed.runtime_snapshot().provider_waiting == 0
+    })
+    .await;
+    assert_eq!(
+        observed.runtime_snapshot(),
+        VoiceRuntimeSnapshot {
+            provider_waiting: 0,
+            ..saturated
+        }
+    );
+
+    holder.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut holder).await;
+    queued.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut queued).await;
+
+    wait_until(Duration::from_secs(5), || {
+        observed.runtime_snapshot() == empty_runtime_snapshot(2)
+    })
+    .await;
+    assert_eq!(observed.runtime_snapshot(), empty_runtime_snapshot(2));
+    assert_eq!(observed.session_slots.available_permits(), 2);
+}
+
+#[tokio::test]
+async fn server_owned_capacity_denial_returns_the_session_slot_it_reserved() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let state = capacity_probe_state(
+        4,
+        text_inputs.clone(),
+        VoiceLimitConfig {
+            max_ip_sessions: Some(1),
+            ..VoiceLimitConfig::default()
+        },
+    );
+    let observed = state.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let mut admitted = open_capacity_probe_socket(
+        &url,
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-capacity-ip-first",
+    )
+    .await;
+    let held = observed.runtime_snapshot();
+    assert_eq!(held.session_in_use, 1);
+    assert_eq!(held.ip_leases, 1);
+
+    // The per-IP refusal happens after a session permit was reserved. The permit
+    // must come back, or a deployment behind one proxy leaks its whole capacity.
+    let refused = connect_async(token_only_request(
+        &url,
+        &provider_limiter_token(
+            "chemistry-final",
+            "voice-session-2",
+            "nonce-capacity-ip-second",
+        ),
+    ))
+    .await;
+    assert!(refused.is_err(), "the second upgrade shares the peer IP");
+    wait_until(Duration::from_secs(2), || {
+        observed.runtime_snapshot() == held
+    })
+    .await;
+    assert_eq!(observed.runtime_snapshot(), held);
+    assert_eq!(observed.session_slots.available_permits(), 3);
+
+    admitted.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut admitted).await;
+    wait_until(Duration::from_secs(5), || {
+        observed.runtime_snapshot() == empty_runtime_snapshot(4)
+    })
+    .await;
+    assert_eq!(observed.runtime_snapshot(), empty_runtime_snapshot(4));
+}
+
+/// `SERVICE-012` drain race: sessions parked in first-frame wait, holding active
+/// provider work, queued behind it, and one whose peer stopped reading all reach
+/// zero inside the server-owned grace, and admission closes before a slot is
+/// allocated. `D-04 CONFIRM_DELETE` is the selected branch, so there is no
+/// deletion finalizer to join and `background_workers` stays zero throughout.
+#[tokio::test]
+async fn websocket_drain_releases_every_lease_and_reports_drained() {
+    let text_inputs = Arc::new(AtomicUsize::new(0));
+    let state = capacity_probe_state(
+        4,
+        text_inputs.clone(),
+        VoiceLimitConfig {
+            max_user_sessions: Some(4),
+            max_ip_sessions: Some(4),
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        },
+    );
+    // A socket parked in first-frame wait is released by the server-owned
+    // first-frame bound, so this state pins that bound well inside the grace
+    // rather than waiting out the 10-second production default.
+    let state = state.with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(2),
+        ..WsTimeouts::default()
+    });
+    let drain_state = state.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    // 1. A socket parked in the first-frame wait: it owns a session slot and an
+    //    active-handler guard but has bound no identity yet.
+    let first_frame_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-9",
+        "nonce-drain-firstframe",
+    );
+    let (mut first_frame_wait, _) = connect_async(token_only_request(&url, &first_frame_token))
+        .await
+        .expect("first-frame socket upgrades");
+    assert_ready_provider(&mut first_frame_wait, "cartesia_gemini").await;
+
+    // 2. A socket holding the single provider inflight slot.
+    let mut holder = open_capacity_probe_socket(
+        &url,
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-drain-holder",
+    )
+    .await;
+    send_capacity_probe_turn(&mut holder, "drain-holder", "v5-drain-1").await;
+    wait_until(Duration::from_secs(2), || {
+        text_inputs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    // 3. A socket queued behind it.
+    let mut queued = open_capacity_probe_socket(
+        &url,
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-drain-queued",
+    )
+    .await;
+    send_capacity_probe_turn(&mut queued, "drain-queued", "v5-drain-2").await;
+    wait_until(Duration::from_secs(2), || {
+        drain_state.runtime_snapshot().provider_waiting == 1
+    })
+    .await;
+
+    // 4. A socket whose peer has stopped reading, so the drain's own terminal
+    //    write is the last thing standing between it and zero.
+    let silent = open_capacity_probe_socket(
+        &url,
+        "physics-final",
+        "voice-session-4",
+        "nonce-drain-silent",
+    )
+    .await;
+
+    let before = drain_state.runtime_snapshot();
+    assert_eq!(before.active_handlers, 4);
+    assert_eq!(before.session_in_use, 4);
+    assert_eq!(before.provider_inflight, 1);
+    assert_eq!(before.provider_waiting, 1);
+    assert!(!before.draining);
+
+    let started = Instant::now();
+    let outcome = begin_drain_and_wait(&drain_state, Duration::from_secs(20)).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(outcome, DrainOutcome::Drained);
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the drain must finish inside its grace, took {elapsed:?}"
+    );
+    assert_eq!(
+        drain_state.runtime_snapshot(),
+        VoiceRuntimeSnapshot {
+            draining: true,
+            ..empty_runtime_snapshot(4)
+        }
+    );
+    assert_eq!(drain_state.session_slots.available_permits(), 4);
+
+    // The queued provider answer was never forwarded once the drain started.
+    assert_eq!(text_inputs.load(Ordering::SeqCst), 1);
+
+    // A new upgrade is refused before it can allocate a session slot.
+    let refused = connect_async(token_only_request(
+        &url,
+        &provider_limiter_token("biology-midterm", "voice-session-5", "nonce-drain-refused"),
+    ))
+    .await;
+    assert!(refused.is_err(), "a draining server admits no new session");
+    assert_eq!(drain_state.session_slots.available_permits(), 4);
+    assert_eq!(drain_state.runtime_snapshot().active_handlers, 0);
+
+    drop(first_frame_wait);
+    drop(holder);
+    drop(queued);
+    drop(silent);
 }

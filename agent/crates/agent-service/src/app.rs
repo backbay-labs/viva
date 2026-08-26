@@ -56,6 +56,13 @@ pub struct AppState {
     pub projection_read_access: Option<ProjectionReadAccess>,
     pub trusted_proxies: TrustedProxyConfig,
     pub session_slots: Arc<Semaphore>,
+    /// The configured global session capacity `session_slots` was built with.
+    /// The semaphore reports only what is still available, so the total has to be
+    /// carried beside it for `SERVICE-012`'s snapshot to mean anything.
+    pub max_sessions: usize,
+    /// `SERVICE-012`: server-owned handler/worker accounting and the drain gate
+    /// that closes admission before a session slot can be allocated.
+    pub runtime_tracker: VoiceRuntimeTracker,
     pub ws_timeouts: WsTimeouts,
     pub turn_cap_override: bool,
     pub voice_limits: VoiceLimitConfig,
@@ -103,6 +110,8 @@ impl AppState {
             projection_read_access: None,
             trusted_proxies: TrustedProxyConfig::default(),
             session_slots: Arc::new(Semaphore::new(max_sessions)),
+            max_sessions,
+            runtime_tracker: VoiceRuntimeTracker::default(),
             ws_timeouts: WsTimeouts::default(),
             turn_cap_override: false,
             voice_limits: VoiceLimitConfig::default(),
@@ -193,7 +202,32 @@ impl AppState {
     pub fn is_ready(&self) -> bool {
         let brain = self.brain.capabilities();
         let store = self.study_store.capabilities();
-        brain.configured && brain.selectable && store.available && !self.drain_signal.is_draining()
+        brain.configured
+            && brain.selectable
+            && store.available
+            && !self.drain_signal.is_draining()
+            && !self.runtime_tracker.is_draining()
+    }
+
+    /// `SERVICE-012`: the one sanitized view of live runtime occupancy. It is
+    /// built from the server's own permits, counters, and guards, so a client can
+    /// neither inflate nor hide a number in it, and it carries counts only.
+    pub fn runtime_snapshot(&self) -> VoiceRuntimeSnapshot {
+        let leases = self.limit_state.lease_counts();
+        let (active_handlers, background_workers) = self.runtime_tracker.counts();
+        VoiceRuntimeSnapshot {
+            session_capacity: self.max_sessions,
+            session_in_use: self
+                .max_sessions
+                .saturating_sub(self.session_slots.available_permits()),
+            user_leases: leases.users,
+            ip_leases: leases.ips,
+            provider_inflight: leases.provider_inflight,
+            provider_waiting: leases.provider_waiting,
+            active_handlers,
+            background_workers,
+            draining: self.drain_signal.is_draining() || self.runtime_tracker.is_draining(),
+        }
     }
 }
 
@@ -600,6 +634,18 @@ impl VoiceLimitState {
             if *count == 0 {
                 counts.remove(key);
             }
+        }
+    }
+
+    /// `SERVICE-012`: counts only. The map keys this reads over — user ids and
+    /// client addresses — never leave the lock.
+    pub(crate) fn lease_counts(&self) -> VoiceLeaseCounts {
+        let active = self.active.lock().expect("voice limit state lock poisoned");
+        VoiceLeaseCounts {
+            users: active.users.values().copied().sum(),
+            ips: active.ips.values().copied().sum(),
+            provider_inflight: active.provider_inflight,
+            provider_waiting: active.provider_waiting,
         }
     }
 
@@ -1046,6 +1092,196 @@ impl VoiceDrainSignal {
     }
 }
 
+/// `SERVICE-012`: the counts a lease-accounting read can expose. The keys the
+/// limiter maps are indexed by stay behind the lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VoiceLeaseCounts {
+    pub(crate) users: usize,
+    pub(crate) ips: usize,
+    pub(crate) provider_inflight: usize,
+    pub(crate) provider_waiting: usize,
+}
+
+/// `SERVICE-012`: live runtime occupancy, as counts and one drain flag. This is
+/// the only runtime detail an operator-authenticated probe is given: there is no
+/// field here that could carry a user id, a client address, or a session id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct VoiceRuntimeSnapshot {
+    pub session_capacity: usize,
+    pub session_in_use: usize,
+    pub user_leases: usize,
+    pub ip_leases: usize,
+    pub provider_inflight: usize,
+    pub provider_waiting: usize,
+    pub active_handlers: usize,
+    pub background_workers: usize,
+    pub draining: bool,
+}
+
+/// The runtime refused an entry because the process has started draining.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("voice runtime is draining")]
+pub struct RuntimeDraining;
+
+/// `SERVICE-012`: the server's own count of in-flight socket handlers and
+/// background workers, and the gate that closes admission the moment a drain
+/// starts. `enter` checks the drain flag and increments under one lock, so a
+/// handler cannot be admitted after `begin_drain` has returned.
+#[derive(Clone, Debug, Default)]
+pub struct VoiceRuntimeTracker {
+    state: Arc<Mutex<VoiceRuntimeState>>,
+    zero: Arc<Notify>,
+}
+
+#[derive(Debug, Default)]
+struct VoiceRuntimeState {
+    draining: bool,
+    active_handlers: usize,
+    background_workers: usize,
+}
+
+/// Held for exactly as long as one socket handler runs. Dropping it is what the
+/// drain waits on, so it is carried into the handler by `VoiceAdmission` rather
+/// than released at the end of the upgrade.
+pub struct ActiveHandlerGuard {
+    tracker: VoiceRuntimeTracker,
+}
+
+/// Held for exactly as long as one server-owned background worker runs.
+///
+/// `D-04 CONFIRM_DELETE` is the selected deletion branch, so this service starts
+/// no deletion-finalizer worker and no production path acquires this guard; the
+/// `background_workers` count is therefore provably zero on every drain. The
+/// guard exists because the drain contract waits on both counters, and a drain
+/// that could only see handlers would silently succeed past a worker.
+pub struct BackgroundWorkerGuard {
+    tracker: VoiceRuntimeTracker,
+}
+
+impl VoiceRuntimeTracker {
+    pub fn enter(&self) -> Result<ActiveHandlerGuard, RuntimeDraining> {
+        let mut state = self.state.lock().expect("runtime tracker lock poisoned");
+        if state.draining {
+            return Err(RuntimeDraining);
+        }
+        state.active_handlers = state
+            .active_handlers
+            .checked_add(1)
+            .expect("active handler counter overflow");
+        Ok(ActiveHandlerGuard {
+            tracker: self.clone(),
+        })
+    }
+
+    pub fn begin_drain(&self) {
+        self.state
+            .lock()
+            .expect("runtime tracker lock poisoned")
+            .draining = true;
+    }
+
+    pub fn enter_background_worker(&self) -> Result<BackgroundWorkerGuard, RuntimeDraining> {
+        let mut state = self.state.lock().expect("runtime tracker lock poisoned");
+        if state.draining {
+            return Err(RuntimeDraining);
+        }
+        state.background_workers = state
+            .background_workers
+            .checked_add(1)
+            .expect("background worker counter overflow");
+        Ok(BackgroundWorkerGuard {
+            tracker: self.clone(),
+        })
+    }
+
+    /// `(active_handlers, background_workers)` — the two counters the drain waits
+    /// on, read together under one lock so they cannot disagree.
+    pub fn counts(&self) -> (usize, usize) {
+        let state = self.state.lock().expect("runtime tracker lock poisoned");
+        (state.active_handlers, state.background_workers)
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.state
+            .lock()
+            .expect("runtime tracker lock poisoned")
+            .draining
+    }
+}
+
+impl Drop for ActiveHandlerGuard {
+    fn drop(&mut self) {
+        let reached_zero = {
+            let mut state = self
+                .tracker
+                .state
+                .lock()
+                .expect("runtime tracker lock poisoned");
+            state.active_handlers = state
+                .active_handlers
+                .checked_sub(1)
+                .expect("active handler guard dropped twice");
+            state.active_handlers == 0 && state.background_workers == 0
+        };
+        if reached_zero {
+            self.tracker.zero.notify_waiters();
+        }
+    }
+}
+
+impl Drop for BackgroundWorkerGuard {
+    fn drop(&mut self) {
+        let reached_zero = {
+            let mut state = self
+                .tracker
+                .state
+                .lock()
+                .expect("runtime tracker lock poisoned");
+            state.background_workers = state
+                .background_workers
+                .checked_sub(1)
+                .expect("background worker guard dropped twice");
+            state.active_handlers == 0 && state.background_workers == 0
+        };
+        if reached_zero {
+            self.tracker.zero.notify_waiters();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrainOutcome {
+    Drained,
+    TimedOut(VoiceRuntimeSnapshot),
+}
+
+/// `SERVICE-012`: close admission, wind every accepted session down, and wait for
+/// the server's own counters — not a client close frame — to reach zero.
+///
+/// The tracker's drain flag is set first so no handler can be admitted behind the
+/// wait, then the watch signal tells the sessions already accepted to stop. The
+/// grace is an absolute deadline: it is measured from the moment the drain
+/// started, so a session that finishes late cannot extend it.
+pub async fn begin_drain_and_wait(state: &AppState, grace: Duration) -> DrainOutcome {
+    state.runtime_tracker.begin_drain();
+    state.drain_signal.begin_drain();
+
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        // The waiter is registered — `enable`, not merely constructed — before the
+        // zero check, so the last guard drop cannot land in the gap between them.
+        let notified = state.runtime_tracker.zero.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if state.runtime_tracker.counts() == (0, 0) {
+            return DrainOutcome::Drained;
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            return DrainOutcome::TimedOut(state.runtime_snapshot());
+        }
+    }
+}
+
 /// `SERVICE-005`: what a caller may read about retention without walking the
 /// retained events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1386,6 +1622,9 @@ async fn ready(
             "access": {
                 "status": "allowed",
             },
+            // `SERVICE-012`: capacity detail is operator-authenticated only.
+            // `/live` stays public and carries none of it.
+            "runtime": state.runtime_snapshot(),
             "brain": {
                 "provider": brain.provider,
                 "configured": brain.configured,
@@ -1443,6 +1682,7 @@ async fn brain_health(
             "access": {
                 "status": "allowed",
             },
+            "runtime": state.runtime_snapshot(),
             "brain": {
                 "provider": brain.provider,
                 "configured": brain.configured,
@@ -2897,5 +3137,272 @@ mod store_error_mapping_tests {
                 "uploaded content is invalid or unsupported"
             );
         }
+    }
+}
+
+/// `SERVICE-012`: the server's own admission/drain accounting. Every assertion in
+/// this module reads a server-owned counter, guard, or snapshot — a client frame
+/// and a locally green mock prove nothing here.
+#[cfg(test)]
+mod runtime_tracker_tests {
+    use super::*;
+
+    fn tracker_test_state(max_sessions: usize) -> AppState {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        AppState::with_study_store(
+            Arc::new(agent_adapters::SyntheticBrain::with_study_store(
+                store.clone(),
+            )),
+            "synthetic",
+            VoiceWsAccess::default(),
+            max_sessions,
+            store,
+        )
+    }
+
+    #[test]
+    fn runtime_tracker_guard_moves_exactly_one_counter() {
+        let tracker = VoiceRuntimeTracker::default();
+        assert_eq!(tracker.counts(), (0, 0));
+
+        let first = tracker.enter().expect("a fresh tracker admits a handler");
+        let second = tracker.enter().expect("a second handler is admitted");
+        assert_eq!(tracker.counts(), (2, 0));
+
+        let worker = tracker
+            .enter_background_worker()
+            .expect("a background worker is admitted");
+        assert_eq!(tracker.counts(), (2, 1));
+
+        drop(second);
+        assert_eq!(tracker.counts(), (1, 1));
+        drop(worker);
+        assert_eq!(tracker.counts(), (1, 0));
+        drop(first);
+        assert_eq!(tracker.counts(), (0, 0));
+    }
+
+    #[test]
+    fn runtime_tracker_refuses_entry_once_draining() {
+        let tracker = VoiceRuntimeTracker::default();
+        let held = tracker.enter().expect("the pre-drain handler is admitted");
+
+        tracker.begin_drain();
+
+        assert_eq!(tracker.enter().map(|_| ()), Err(RuntimeDraining));
+        assert_eq!(
+            tracker.enter_background_worker().map(|_| ()),
+            Err(RuntimeDraining)
+        );
+        assert!(tracker.is_draining());
+        assert_eq!(
+            tracker.counts(),
+            (1, 0),
+            "a refused entry must not move a counter"
+        );
+
+        drop(held);
+        assert_eq!(tracker.counts(), (0, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_tracker_concurrent_guard_drops_reach_zero_exactly_once() {
+        let tracker = VoiceRuntimeTracker::default();
+        let guards = (0..64)
+            .map(|_| tracker.enter().expect("every handler is admitted"))
+            .collect::<Vec<_>>();
+        let workers = (0..16)
+            .map(|_| {
+                tracker
+                    .enter_background_worker()
+                    .expect("every worker is admitted")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tracker.counts(), (64, 16));
+
+        let mut handles = Vec::new();
+        for guard in guards {
+            handles.push(tokio::spawn(async move {
+                drop(guard);
+            }));
+        }
+        for worker in workers {
+            handles.push(tokio::spawn(async move {
+                drop(worker);
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("guard drop task");
+        }
+
+        assert_eq!(tracker.counts(), (0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_tracker_waiter_started_before_the_last_drop_observes_zero() {
+        let state = tracker_test_state(2);
+        let guard = state
+            .runtime_tracker
+            .enter()
+            .expect("the handler is admitted before the drain");
+        let waiter = {
+            let state = state.clone();
+            tokio::spawn(async move { begin_drain_and_wait(&state, Duration::from_secs(20)).await })
+        };
+
+        // Paused time only advances when every task is idle, so this resolves
+        // exactly when the drain future is parked on its zero notification —
+        // the drop below therefore genuinely happens after the wait started.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(state.runtime_tracker.is_draining());
+        assert_eq!(state.runtime_tracker.counts(), (1, 0));
+
+        drop(guard);
+
+        assert_eq!(waiter.await.expect("drain task"), DrainOutcome::Drained);
+        assert_eq!(state.runtime_tracker.counts(), (0, 0));
+        assert!(state.runtime_snapshot().draining);
+    }
+
+    /// The registration ordering itself, not merely the happy path: the waiter is
+    /// enabled before every zero check, so a last guard drop landing on another
+    /// thread in exactly that window still wakes the drain. `notify_waiters`
+    /// stores no permit, so a drop that arrives before the waiter registers is
+    /// lost forever — the drain would then sit out its whole grace with the
+    /// runtime already at zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_tracker_registers_its_waiter_before_each_zero_check() {
+        for attempt in 0..500 {
+            let state = tracker_test_state(1);
+            let guard = state
+                .runtime_tracker
+                .enter()
+                .expect("the handler is admitted before the drain");
+            let tracker = state.runtime_tracker.clone();
+            // A real thread, released the instant the drain latches, so the drop
+            // lands on the check/registration boundary rather than politely after
+            // the waiter has parked.
+            let dropper = std::thread::spawn(move || {
+                while !tracker.is_draining() {
+                    std::hint::spin_loop();
+                }
+                drop(guard);
+            });
+
+            let outcome = begin_drain_and_wait(&state, Duration::from_millis(50)).await;
+            dropper.join().expect("dropper thread");
+
+            assert_eq!(
+                outcome,
+                DrainOutcome::Drained,
+                "attempt {attempt}: a concurrent last drop was missed"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_tracker_waiter_started_after_zero_returns_without_waiting() {
+        let state = tracker_test_state(2);
+        drop(state.runtime_tracker.enter().expect("admitted"));
+        let started = tokio::time::Instant::now();
+
+        let outcome = begin_drain_and_wait(&state, Duration::from_secs(20)).await;
+
+        assert_eq!(outcome, DrainOutcome::Drained);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(state.drain_signal.is_draining());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_tracker_grace_timeout_reports_the_remaining_handler() {
+        let state = tracker_test_state(3);
+        let _permit = state
+            .session_slots
+            .clone()
+            .try_acquire_owned()
+            .expect("a session slot is available");
+        let _guard = state.runtime_tracker.enter().expect("admitted");
+        let started = tokio::time::Instant::now();
+
+        let outcome = begin_drain_and_wait(&state, Duration::from_secs(20)).await;
+
+        assert_eq!(started.elapsed(), Duration::from_secs(20));
+        let DrainOutcome::TimedOut(snapshot) = outcome else {
+            panic!("a held handler must time the grace out, got {outcome:?}");
+        };
+        assert_eq!(
+            snapshot,
+            VoiceRuntimeSnapshot {
+                session_capacity: 3,
+                session_in_use: 1,
+                user_leases: 0,
+                ip_leases: 0,
+                provider_inflight: 0,
+                provider_waiting: 0,
+                active_handlers: 1,
+                background_workers: 0,
+                draining: true,
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_tracker_grace_timeout_reports_a_remaining_background_worker() {
+        let state = tracker_test_state(1);
+        let _worker = state
+            .runtime_tracker
+            .enter_background_worker()
+            .expect("admitted");
+
+        let outcome = begin_drain_and_wait(&state, Duration::from_secs(20)).await;
+
+        let DrainOutcome::TimedOut(snapshot) = outcome else {
+            panic!("a held background worker must time the grace out, got {outcome:?}");
+        };
+        assert_eq!(snapshot.active_handlers, 0);
+        assert_eq!(snapshot.background_workers, 1);
+        assert!(snapshot.draining);
+    }
+
+    #[test]
+    fn runtime_tracker_snapshot_serializes_counts_only() {
+        let state = tracker_test_state(4);
+        let user_lease = state
+            .limit_state
+            .try_acquire_user("user-with-a-recognisable-identity", 4)
+            .expect("user lease");
+        let ip_lease = state
+            .limit_state
+            .try_acquire_ip("203.0.113.9", 4)
+            .expect("ip lease");
+
+        let rendered = serde_json::to_value(state.runtime_snapshot()).expect("snapshot serializes");
+        let object = rendered.as_object().expect("snapshot is a JSON object");
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "active_handlers",
+                "background_workers",
+                "draining",
+                "ip_leases",
+                "provider_inflight",
+                "provider_waiting",
+                "session_capacity",
+                "session_in_use",
+                "user_leases",
+            ]
+        );
+        let text = rendered.to_string();
+        assert!(!text.contains("user-with-a-recognisable-identity"));
+        assert!(!text.contains("203.0.113.9"));
+        assert_eq!(object["user_leases"], 1);
+        assert_eq!(object["ip_leases"], 1);
+
+        drop(user_lease);
+        drop(ip_lease);
+        assert_eq!(state.runtime_snapshot().user_leases, 0);
+        assert_eq!(state.runtime_snapshot().ip_leases, 0);
     }
 }

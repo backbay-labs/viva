@@ -36,8 +36,8 @@ use tokio::{
 
 use crate::{
     app::{
-        AppState, ProviderAdmission, ProviderAdmissionDecision, ProviderAdmissionDenial,
-        ProviderQueueBehavior, VoiceLimitLease, VoiceLimitState,
+        ActiveHandlerGuard, AppState, ProviderAdmission, ProviderAdmissionDecision,
+        ProviderAdmissionDenial, ProviderQueueBehavior, VoiceLimitLease, VoiceLimitState,
     },
     config::{
         authenticate_upgrade, bac_510_max_turn_duration, FailureControlScenario, RedactedSecret,
@@ -220,6 +220,21 @@ fn validate_ws_preflight(
         },
         None => None,
     };
+    // `SERVICE-012`: the drain flag and the handler count move under one lock,
+    // here, before a session slot is allocated. A drain that starts after this
+    // returns therefore waits for this handler instead of racing it, and a drain
+    // that started before it refuses the upgrade without touching capacity.
+    let handler_guard = state.runtime_tracker.enter().map_err(|_| {
+        state.evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::PreflightRejected,
+            None,
+            "server draining",
+        ));
+        VoiceWsRejection::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": "voice session draining" }),
+        )
+    })?;
     let permit = state
         .session_slots
         .clone()
@@ -260,6 +275,7 @@ fn validate_ws_preflight(
     Ok(VoiceAdmission {
         _permit: permit,
         _ip_lease: ip_lease,
+        _handler_guard: handler_guard,
         principal,
     })
 }
@@ -331,6 +347,9 @@ struct VoiceAdmission {
     _permit: OwnedSemaphorePermit,
     /// `None` only when per-IP limiting is disabled for this deployment.
     _ip_lease: Option<VoiceLimitLease>,
+    /// `SERVICE-012`: carried into the socket handler so the process drain waits
+    /// on the handler itself, not on the upgrade that started it.
+    _handler_guard: ActiveHandlerGuard,
     principal: UpgradePrincipal,
 }
 
@@ -618,6 +637,12 @@ async fn run_voice_session<S, R>(
         return;
     }
 
+    // `SERVICE-012`: a socket parked here holds a session slot and an
+    // active-handler guard, and the process drain waits for both. The deadline it
+    // waits out is this server-owned first-frame bound, which is shorter than the
+    // drain grace; the drain deliberately does not preempt it, because a first
+    // frame the client has already put on the wire must not be discarded by a
+    // reactor-scheduling race.
     let mut initial = match timeout(state.ws_timeouts.first_frame, receiver.next()).await {
         Err(_) => {
             let _ = send_json(
@@ -9148,6 +9173,9 @@ mod tests {
         let admission = VoiceAdmission {
             _permit: permit,
             _ip_lease: Some(ip_lease),
+            // `SERVICE-012`: the handler guard the real upgrade acquires, so the
+            // deterministic cleanup path drops exactly what production drops.
+            _handler_guard: state.runtime_tracker.enter().expect("handler guard"),
             principal: crate::config::UpgradePrincipal::ServiceBearer,
         };
 
@@ -9316,6 +9344,9 @@ mod tests {
         let admission = VoiceAdmission {
             _permit: permit,
             _ip_lease: Some(ip_lease),
+            // `SERVICE-012`: the handler guard the real upgrade acquires, so the
+            // deterministic cleanup path drops exactly what production drops.
+            _handler_guard: state.runtime_tracker.enter().expect("handler guard"),
             principal: crate::config::UpgradePrincipal::ServiceBearer,
         };
 
@@ -9619,6 +9650,9 @@ mod tests {
         let admission = VoiceAdmission {
             _permit: permit,
             _ip_lease: Some(ip_lease),
+            // `SERVICE-012`: the handler guard the real upgrade acquires, so the
+            // deterministic cleanup path drops exactly what production drops.
+            _handler_guard: state.runtime_tracker.enter().expect("handler guard"),
             principal: crate::config::UpgradePrincipal::ServiceBearer,
         };
 
