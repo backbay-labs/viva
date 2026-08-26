@@ -259,7 +259,7 @@ impl RealtimeBrain for SyntheticBrain {
             None => None,
         };
         let first_response_id = spec.response_id(1);
-        let question = match &executor {
+        let mut question = match &executor {
             Some(executor) => {
                 select_session_question(
                     executor,
@@ -333,10 +333,39 @@ impl RealtimeBrain for SyntheticBrain {
                     .response_id_for_generation(turn, answer_input.client_generation_id.as_deref());
                 let answer_turn = turn;
                 turn += 1;
+                // Every later turn asks the question this session's ordered
+                // progression cursor selects for its own response, exactly as
+                // the provider runner does. Re-using the question chosen at
+                // `open` would re-ask the first question forever, which is the
+                // "reselect by fixture convention" the learning-core seam
+                // exists to remove. Turn 1 keeps the question already selected
+                // for its response at `open`.
+                let turn_question = match executor.as_ref().filter(|_| answer_turn > 1) {
+                    Some(executor) => {
+                        match select_session_question(
+                            executor,
+                            &spec.study_set_id,
+                            &spec.voice_session_id,
+                            &response_id,
+                        )
+                        .await
+                        {
+                            Ok(selected) => {
+                                question = selected;
+                                question.clone()
+                            }
+                            Err(error) => {
+                                emit_provider_failure(&event_tx, error).await;
+                                break;
+                            }
+                        }
+                    }
+                    None => question.clone(),
+                };
                 active_response = Some(spawn_study_answer_sequence(
                     event_tx.clone(),
                     spec.clone(),
-                    question.clone(),
+                    turn_question,
                     &response_id,
                     answer_input,
                     answer_turn,

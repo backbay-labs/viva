@@ -2396,10 +2396,13 @@ struct StoreCalls {
 }
 
 struct FixtureOutcomeStore {
-    question: StudyQuestion,
+    questions: Vec<StudyQuestion>,
     sources: Vec<StudySourceReference>,
-    persisted: TurnOutcome,
+    persisted: Vec<TurnOutcome>,
     receipt_response_id: Option<String>,
+    /// Response ids in the order the session first asked for a question, so a
+    /// turn's question and its persisted outcome are always the same ordinal.
+    turn_order: Mutex<Vec<String>>,
     calls: Mutex<StoreCalls>,
 }
 
@@ -2409,11 +2412,31 @@ impl FixtureOutcomeStore {
         sources: Vec<StudySourceReference>,
         persisted: TurnOutcome,
     ) -> Self {
+        Self::per_turn(vec![question], sources, vec![persisted])
+    }
+
+    /// A multi-turn variant: turn *n* is asked `questions[n]` and the store
+    /// persists `persisted[n]` for it. Both vectors must be the same length.
+    fn per_turn(
+        questions: Vec<StudyQuestion>,
+        sources: Vec<StudySourceReference>,
+        persisted: Vec<TurnOutcome>,
+    ) -> Self {
+        assert_eq!(
+            questions.len(),
+            persisted.len(),
+            "one persisted outcome per fixture question"
+        );
+        assert!(
+            !questions.is_empty(),
+            "a session asks at least one question"
+        );
         Self {
-            question,
+            questions,
             sources,
             persisted,
             receipt_response_id: None,
+            turn_order: Mutex::new(Vec::new()),
             calls: Mutex::new(StoreCalls::default()),
         }
     }
@@ -2421,6 +2444,26 @@ impl FixtureOutcomeStore {
     fn with_receipt_response_id(mut self, response_id: &str) -> Self {
         self.receipt_response_id = Some(response_id.to_owned());
         self
+    }
+
+    /// The ordinal of `response_id`, assigned on first sight and stable after.
+    fn turn_index(&self, response_id: &str) -> usize {
+        let mut order = self.turn_order.lock().expect("turn order lock poisoned");
+        if let Some(index) = order.iter().position(|seen| seen == response_id) {
+            return index.min(self.questions.len() - 1);
+        }
+        order.push(response_id.to_owned());
+        (order.len() - 1).min(self.questions.len() - 1)
+    }
+
+    /// The question the session is currently on: the last turn's, or the first
+    /// before any turn has been asked for.
+    fn current_question(&self) -> StudyQuestion {
+        let index = {
+            let order = self.turn_order.lock().expect("turn order lock poisoned");
+            order.len().saturating_sub(1).min(self.questions.len() - 1)
+        };
+        self.questions[index].clone()
     }
 
     fn calls(&self) -> std::sync::MutexGuard<'_, StoreCalls> {
@@ -2462,15 +2505,16 @@ impl StudyMemoryStore for FixtureOutcomeStore {
         _user_id: &str,
         _study_set_id: &str,
         _voice_session_id: &str,
-        _response_id: &str,
+        response_id: &str,
         _policy: ProgressionPolicyId,
     ) -> Result<QuestionProgressionResult, PortError> {
+        let index = self.turn_index(response_id);
         Ok(QuestionProgressionResult::Selected {
-            question: self.question.clone(),
-            ordinal: 1,
-            total: 1,
+            question: self.questions[index].clone(),
+            ordinal: (index + 1) as u32,
+            total: self.questions.len() as u32,
             selection_reason: "ordered_v1".to_owned(),
-            revision: 1,
+            revision: (index + 1) as u64,
         })
     }
 
@@ -2501,8 +2545,8 @@ impl StudyMemoryStore for FixtureOutcomeStore {
             user_id: "user-1".to_owned(),
             study_set_id: "biology-midterm".to_owned(),
             voice_session_id: "voice-session-1".to_owned(),
-            current_question: Some(self.question.clone()),
-            answered_questions: vec![self.question.clone()],
+            current_question: Some(self.current_question()),
+            answered_questions: self.questions.clone(),
             outcomes,
             concept_labels,
             review_decisions: Vec::new(),
@@ -2520,7 +2564,7 @@ impl StudyMemoryStore for FixtureOutcomeStore {
         _voice_session_id: &str,
         outcome: TurnOutcome,
     ) -> Result<PersistedTurnOutcome, PortError> {
-        let mut persisted = self.persisted.clone();
+        let mut persisted = self.persisted[self.turn_index(&outcome.response_id)].clone();
         persisted.response_id = outcome.response_id.clone();
         persisted.question_id = outcome.question_id.clone();
         self.calls().recorded_outcomes.push(persisted.clone());
@@ -2545,10 +2589,9 @@ impl StudyMemoryStore for FixtureOutcomeStore {
         _voice_session_id: &str,
     ) -> Result<agent_domain::AuthenticatedStudyProjectionV1, PortError> {
         let mut concepts = self
-            .question
-            .rubric
-            .criteria
+            .questions
             .iter()
+            .flat_map(|question| question.rubric.criteria.iter())
             .map(|criterion| criterion.concept_id.clone())
             .collect::<Vec<_>>();
         concepts.sort();
@@ -2582,7 +2625,7 @@ impl StudyMemoryStore for FixtureOutcomeStore {
             active_question: None,
             question_progress: agent_domain::study_projection::StudyProjectionQuestionProgressV1 {
                 completed: 0,
-                total: 1,
+                total: self.questions.len() as u32,
             },
             review_schedule: Vec::new(),
         })
@@ -3247,58 +3290,152 @@ fn repository_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-/// Resolve one Plan 05 fixture by its published manifest ID.
-///
-/// The manifest is the only way in: the schema, protocol version, supported
-/// versions, and legacy disposition are validated first, the ID must resolve
-/// exactly once, and the referenced path may not escape `agent/fixtures`. A
-/// missing or duplicated ID fails the test rather than silently selecting one.
-fn resolve_voice_fixture(manifest_id: &str) -> serde_json::Value {
-    let root = repository_root();
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join(VOICE_FIXTURE_MANIFEST_PATH))
+/// Every fixture Plan 05's manifest must publish for this lane, with the exact
+/// `kind` the manifest declares for it. The list is the plan's Global
+/// Constraints written down once, so a fixture that silently disappears or
+/// changes kind fails the manifest test rather than a downstream projection.
+const REQUIRED_VOICE_FIXTURES: [(&str, &str); 15] = [
+    ("VOICE-FIXTURE-MANIFEST", "manifest"),
+    ("VOICE-AUTH-DECISION", "auth_decision"),
+    ("VOICE-CLIENT-SESSION-CONFIG-SIGNED", "client_frame"),
+    ("VOICE-CLIENT-SESSION-REFRESH", "client_frame"),
+    ("VOICE-AUDIO-TURN-LIFECYCLE", "frame_sequence"),
+    ("VOICE-CLIENT-TURN-INTENTS", "client_frame_cases"),
+    ("VOICE-SERVER-TURN-OUTCOMES", "server_event_cases"),
+    ("VOICE-SERVER-READY", "server_frame"),
+    ("VOICE-TERMINAL-SEQUENCES", "frame_sequence"),
+    ("VOICE-TRANSPORT-OUTCOMES", "transport_cases"),
+    ("VOICE-SYNTHETIC-TWO-TURN-SESSION", "session_sequence"),
+    (
+        "VOICE-FAKE-CARTESIA-GEMINI-TWO-TURN-SESSION",
+        "session_sequence",
+    ),
+    ("VOICE-CLIENT-DIFFERENTIAL-CASES", "differential_cases"),
+    ("VOICE-SERVER-DIFFERENTIAL-CASES", "differential_cases"),
+    ("VOICE-TOKEN-V1-VECTORS", "token_vectors"),
+];
+
+fn voice_fixture_manifest() -> serde_json::Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(repository_root().join(VOICE_FIXTURE_MANIFEST_PATH))
             .expect("Plan 05 publishes the v5 fixture manifest"),
     )
-    .expect("the v5 fixture manifest is JSON");
+    .expect("the v5 fixture manifest is JSON")
+}
 
-    assert_eq!(manifest["schema"], VOICE_FIXTURE_MANIFEST_SCHEMA);
-    assert_eq!(manifest["protocol_version"], 5);
-    assert_eq!(manifest["supported_versions"], json!([5]));
-    assert_eq!(manifest["legacy_v4_disposition"], "reject");
+/// The default fixture loader: read the manifest-declared path from the frozen
+/// tree. It is a parameter of the resolver so a control can hand the resolver a
+/// hostile body (a legacy v4 envelope, say) without ever writing a fixture.
+fn read_repository_fixture(path: &str) -> Result<String, String> {
+    std::fs::read_to_string(repository_root().join(path))
+        .map_err(|error| format!("fixture path `{path}` is not readable: {error}"))
+}
+
+/// Resolve one Plan 05 fixture by its published manifest ID.
+///
+/// The manifest is the only way in: schema, protocol version, supported
+/// versions, and legacy disposition are validated first; the ID must resolve
+/// exactly once; the entry's `kind` must be the expected one; the referenced
+/// path may not escape `agent/fixtures`; and the resolved body must be a strict
+/// v5 envelope. Every failure is an `Err` rather than a panic so the Task 10
+/// controls can assert the rejections.
+fn resolve_voice_fixture_with(
+    manifest: &serde_json::Value,
+    manifest_id: &str,
+    expected_kind: &str,
+    load: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<serde_json::Value, String> {
+    if manifest["schema"] != VOICE_FIXTURE_MANIFEST_SCHEMA {
+        return Err(format!("manifest schema is {}", manifest["schema"]));
+    }
+    if manifest["protocol_version"] != 5 {
+        return Err(format!(
+            "manifest protocol_version is {}",
+            manifest["protocol_version"]
+        ));
+    }
+    if manifest["supported_versions"] != json!([5]) {
+        return Err(format!(
+            "manifest supported_versions is {}",
+            manifest["supported_versions"]
+        ));
+    }
+    if manifest["legacy_v4_disposition"] != "reject" {
+        return Err(format!(
+            "manifest legacy_v4_disposition is {}",
+            manifest["legacy_v4_disposition"]
+        ));
+    }
 
     let entries = manifest["fixtures"]
         .as_array()
-        .expect("the manifest publishes a fixture list");
+        .ok_or_else(|| "the manifest publishes no fixture list".to_owned())?;
     let resolved = entries
         .iter()
         .filter(|entry| entry["id"] == manifest_id)
         .collect::<Vec<_>>();
-    assert_eq!(
-        resolved.len(),
-        1,
-        "manifest id {manifest_id} must be published exactly once"
-    );
-    let path = resolved[0]["path"]
+    if resolved.len() != 1 {
+        return Err(format!(
+            "manifest id {manifest_id} resolves {} times, not exactly once",
+            resolved.len()
+        ));
+    }
+    let entry = resolved[0];
+    let kind = entry["kind"]
         .as_str()
-        .expect("a manifest entry names a path");
-    assert!(
-        path.starts_with("agent/fixtures/"),
-        "manifest path {path} escapes the fixture tree"
-    );
-    assert!(
-        !path.contains("/../") && !path.contains("/./"),
-        "manifest path {path} traverses out of the fixture tree"
-    );
+        .ok_or_else(|| format!("manifest entry {manifest_id} names no kind"))?;
+    if kind != expected_kind {
+        return Err(format!(
+            "manifest entry {manifest_id} is kind `{kind}`, not `{expected_kind}`"
+        ));
+    }
+    let path = entry["path"]
+        .as_str()
+        .ok_or_else(|| format!("manifest entry {manifest_id} names no path"))?;
+    if !path.starts_with("agent/fixtures/") {
+        return Err(format!("manifest path {path} escapes the fixture tree"));
+    }
+    if path.contains("/../") || path.contains("/./") || path.contains('\\') {
+        return Err(format!(
+            "manifest path {path} traverses out of the fixture tree"
+        ));
+    }
 
-    let fixture: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join(path)).expect("the manifest path resolves to a fixture"),
+    let body = load(path)?;
+    let fixture: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| format!("fixture {manifest_id} is not JSON: {error}"))?;
+    if let Some(version) = fixture.get("protocol_version") {
+        if version != &json!(5) {
+            return Err(format!(
+                "fixture {manifest_id} declares protocol_version {version}; strict v5 rejects it"
+            ));
+        }
+    }
+    if let Some(supported) = fixture.get("supported_versions") {
+        if supported != &json!([5]) {
+            return Err(format!(
+                "fixture {manifest_id} declares supported_versions {supported}; strict v5 rejects it"
+            ));
+        }
+    }
+    Ok(fixture)
+}
+
+/// The strict wrapper existing tests use: the expected kind comes from the
+/// published requirement table, and any rejection is a test failure.
+fn resolve_voice_fixture(manifest_id: &str) -> serde_json::Value {
+    let expected_kind = REQUIRED_VOICE_FIXTURES
+        .iter()
+        .find(|(id, _)| *id == manifest_id)
+        .unwrap_or_else(|| panic!("{manifest_id} is not a fixture this lane consumes"))
+        .1;
+    resolve_voice_fixture_with(
+        &voice_fixture_manifest(),
+        manifest_id,
+        expected_kind,
+        &read_repository_fixture,
     )
-    .expect("the resolved fixture is JSON");
-    assert_eq!(
-        fixture["protocol_version"], 5,
-        "strict v5 rejects a legacy envelope"
-    );
-    fixture
+    .unwrap_or_else(|error| panic!("{error}"))
 }
 
 /// The adapter-owned half of the frozen two-turn session fixture.
@@ -3660,4 +3797,1820 @@ async fn live_envelope_store_failure_is_typed_durability_degraded() {
     assert!(!rendered.contains(ENVELOPE_STORE_DSN_MARKER), "{rendered}");
     assert!(!rendered.contains(ENVELOPE_ANSWER_MARKER), "{rendered}");
     assert!(!rendered.contains("marker-dsn-a41"), "{rendered}");
+}
+
+// ---------------------------------------------------------------------------
+// Task 10 (`ADAPTER-10`): fixture parity and differential controls.
+//
+// Everything below reads the immutable Plan 04/05 fixtures through the
+// published manifest and compares them with what this crate actually emits. No
+// fixture is ever written: every "must be rejected" control mutates an
+// in-memory clone and asserts the helper refuses it.
+// ---------------------------------------------------------------------------
+
+const LEARNING_CORE_RECAPS_V1: &str =
+    include_str!("../../../fixtures/learning-core/recaps-v1.json");
+const LEARNING_CORE_QUESTION_PROGRESSION_V1: &str =
+    include_str!("../../../fixtures/learning-core/question-progression-v1.json");
+
+/// The adapter-owned event kinds the frozen server sequences publish. The
+/// runner also emits `response_completed`, which the service projects onto a
+/// session phase rather than a distinct wire event, so it has no fixture kind
+/// to compare against and is deliberately outside this set.
+const ADAPTER_LEARNER_VISIBLE_KINDS: [&str; 10] = [
+    "question_started",
+    "transcript_delta",
+    "transcript_final",
+    "answer_evaluated",
+    "turn_deferred",
+    "source_reference",
+    "concept_status",
+    "audio_delta",
+    "cancellation",
+    "recap_ready",
+];
+
+#[test]
+fn adapter_fixture_manifest_is_strict_v5_and_complete() {
+    let manifest = voice_fixture_manifest();
+
+    // Completeness: every fixture the plan's Global Constraints name resolves
+    // exactly once, at its declared kind, inside the frozen tree.
+    for (manifest_id, kind) in REQUIRED_VOICE_FIXTURES {
+        let fixture =
+            resolve_voice_fixture_with(&manifest, manifest_id, kind, &read_repository_fixture)
+                .unwrap_or_else(|error| panic!("{manifest_id}: {error}"));
+        assert!(
+            fixture.is_object(),
+            "{manifest_id} resolves to a JSON object"
+        );
+    }
+    let published = manifest["fixtures"]
+        .as_array()
+        .expect("the manifest publishes a fixture list")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("each entry names an id"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        published.len(),
+        manifest["fixtures"].as_array().unwrap().len(),
+        "the manifest publishes no duplicate id"
+    );
+    for (manifest_id, _) in REQUIRED_VOICE_FIXTURES {
+        assert!(
+            published.contains(manifest_id),
+            "the manifest must publish {manifest_id}"
+        );
+    }
+
+    // Rejection controls. Each mutates a clone; the frozen manifest is never
+    // written. A control that stopped failing would mean the resolver had lost
+    // a guard.
+    let resolve = |manifest: &serde_json::Value| {
+        resolve_voice_fixture_with(
+            manifest,
+            "VOICE-SERVER-DIFFERENTIAL-CASES",
+            "differential_cases",
+            &read_repository_fixture,
+        )
+    };
+    assert!(resolve(&manifest).is_ok(), "the pristine manifest resolves");
+
+    let mut duplicated = manifest.clone();
+    let duplicate_entry = duplicated["fixtures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "VOICE-SERVER-DIFFERENTIAL-CASES")
+        .cloned()
+        .unwrap();
+    duplicated["fixtures"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate_entry);
+    assert!(
+        resolve(&duplicated).is_err(),
+        "a duplicated manifest id must be rejected"
+    );
+
+    for hostile_path in [
+        "agent/fixtures/../../etc/passwd",
+        "/etc/passwd",
+        "agent/fixtures/voice-protocol/./v5/manifest.json",
+        "docs/superpowers/plans/2026-08-23-live-provider-adapters.md",
+    ] {
+        let mut escaped = manifest.clone();
+        for entry in escaped["fixtures"].as_array_mut().unwrap() {
+            if entry["id"] == "VOICE-SERVER-DIFFERENTIAL-CASES" {
+                entry["path"] = json!(hostile_path);
+            }
+        }
+        assert!(
+            resolve(&escaped).is_err(),
+            "manifest path `{hostile_path}` must be rejected"
+        );
+    }
+
+    let mut missing = manifest.clone();
+    for entry in missing["fixtures"].as_array_mut().unwrap() {
+        if entry["id"] == "VOICE-SERVER-DIFFERENTIAL-CASES" {
+            entry["path"] = json!("agent/fixtures/voice-protocol/v5/does-not-exist.json");
+        }
+    }
+    assert!(
+        resolve(&missing).is_err(),
+        "a manifest path that does not exist must be rejected"
+    );
+
+    assert!(
+        resolve_voice_fixture_with(
+            &manifest,
+            "VOICE-SERVER-DIFFERENTIAL-CASES",
+            "session_sequence",
+            &read_repository_fixture,
+        )
+        .is_err(),
+        "resolving at the wrong kind must be rejected"
+    );
+
+    assert!(
+        resolve_voice_fixture_with(
+            &manifest,
+            "VOICE-NOT-PUBLISHED",
+            "differential_cases",
+            &read_repository_fixture,
+        )
+        .is_err(),
+        "an unpublished manifest id must be rejected"
+    );
+
+    for (field, value) in [
+        ("schema", json!("viva.voice-fixtures.manifest.v0")),
+        ("protocol_version", json!(4)),
+        ("supported_versions", json!([4, 5])),
+        ("legacy_v4_disposition", json!("accept")),
+    ] {
+        let mut downgraded = manifest.clone();
+        downgraded[field] = value.clone();
+        assert!(
+            resolve(&downgraded).is_err(),
+            "manifest {field} = {value} must be rejected"
+        );
+    }
+
+    // Mutation control (Step 2, "version 5 -> 4"): the resolved body is refused
+    // when its envelope is not strict v5, whichever direction it drifts.
+    for version in [json!(4), json!(6)] {
+        let downgraded_body = {
+            let mut body = resolve(&manifest).expect("the pristine fixture resolves");
+            body["protocol_version"] = version.clone();
+            serde_json::to_string(&body).expect("the clone serializes")
+        };
+        let load = move |_path: &str| Ok(downgraded_body.clone());
+        assert!(
+            resolve_voice_fixture_with(
+                &manifest,
+                "VOICE-SERVER-DIFFERENTIAL-CASES",
+                "differential_cases",
+                &load,
+            )
+            .is_err(),
+            "a resolved fixture at protocol_version {version} must be rejected"
+        );
+    }
+}
+
+// --- the two-turn adapter parity harness ----------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+enum VoiceFixtureResolution {
+    Evaluated {
+        evaluation: Box<AnswerEvaluation>,
+        source: Box<StudySourceReference>,
+        concept_statuses: Vec<(String, ConceptStatus)>,
+    },
+    Deferred {
+        question_id: String,
+        reason: agent_domain::EvaluationDeferralReason,
+        can_retry_same_question: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct VoiceFixtureTurn {
+    response_id: String,
+    question: StudyQuestion,
+    resolution: VoiceFixtureResolution,
+    /// The fixture's own `transcript_final.confidence`. Plan 05 freezes it as
+    /// `null`; the adapter must emit exactly that absence.
+    transcript_confidence: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct VoiceFixtureAdapterContract {
+    fixture_id: String,
+    provider: String,
+    turns: Vec<VoiceFixtureTurn>,
+    published_kinds: std::collections::BTreeSet<String>,
+    authorized_trailing_kinds: std::collections::BTreeSet<String>,
+    terminal_phase: agent_domain::StudySessionPhase,
+    recap_schema: String,
+    recap_deferred_turns: u32,
+    /// The recap's graded concepts, by identity and status. The label is the
+    /// store's, not the adapter's, so it is deliberately not compared.
+    recap_concepts: Vec<(String, ConceptStatus)>,
+    recap_source_moments: Vec<(String, String)>,
+}
+
+fn fixture_server_events(fixture: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let frames = fixture["server_sequence_json"]
+        .as_array()
+        .ok_or_else(|| "the fixture publishes no server sequence".to_owned())?;
+    let mut events = Vec::new();
+    for frame in frames {
+        let decoded: serde_json::Value = serde_json::from_str(
+            frame
+                .as_str()
+                .ok_or_else(|| "each server frame is encoded JSON".to_owned())?,
+        )
+        .map_err(|error| format!("a server frame is not JSON: {error}"))?;
+        if decoded["version"] != json!(5) {
+            return Err(format!(
+                "server frame declares version {}; strict v5 rejects it",
+                decoded["version"]
+            ));
+        }
+        if decoded["type"] == "event" {
+            events.push(decoded["event"].clone());
+        }
+    }
+    Ok(events)
+}
+
+/// Extract the adapter-owned half of a frozen two-turn session fixture.
+///
+/// This reads only what this crate is responsible for: per-turn correlation,
+/// the question the server asked, the outcome resolution and the learner facts
+/// it authorizes, transcript-confidence nullability, cancellation legality, and
+/// the terminal recap. It never rebuilds the service's wire-envelope mapper.
+fn voice_fixture_adapter_contract(
+    fixture: &serde_json::Value,
+) -> Result<VoiceFixtureAdapterContract, String> {
+    if fixture["schema"] != "viva.voice-session-sequence.v1" {
+        return Err(format!("fixture schema is {}", fixture["schema"]));
+    }
+    let events = fixture_server_events(fixture)?;
+    let published_kinds = events
+        .iter()
+        .filter_map(|event| event["type"].as_str().map(ToOwned::to_owned))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let declared_turns = fixture["turns"]
+        .as_array()
+        .ok_or_else(|| "the fixture publishes no turns".to_owned())?;
+    let mut turns = Vec::new();
+    for declared in declared_turns {
+        let response_id = declared["response_id"]
+            .as_str()
+            .ok_or_else(|| "a turn names no response".to_owned())?
+            .to_owned();
+        let starts = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "question_started" && event["response_id"] == response_id.as_str()
+            })
+            .collect::<Vec<_>>();
+        if starts.len() != 1 {
+            return Err(format!(
+                "{response_id} starts {} questions, not exactly one",
+                starts.len()
+            ));
+        }
+        if starts[0]["turn_id"] != declared["turn_id"] {
+            return Err(format!(
+                "{response_id} starts under turn {} but the fixture declares {}",
+                starts[0]["turn_id"], declared["turn_id"]
+            ));
+        }
+        let question: StudyQuestion = serde_json::from_value(starts[0]["question"].clone())
+            .map_err(|error| format!("{response_id} question does not parse: {error}"))?;
+        if declared["question_id"] != json!(question.question_id.as_str()) {
+            return Err(format!(
+                "{response_id} starts {} but the fixture declares {}",
+                question.question_id, declared["question_id"]
+            ));
+        }
+
+        let bound = |kind: &str| {
+            events
+                .iter()
+                .filter(|event| {
+                    event["type"] == kind && event["response_id"] == response_id.as_str()
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let evaluated = bound("answer_evaluated");
+        let deferred = bound("turn_deferred");
+        if evaluated.len() + deferred.len() != 1 {
+            return Err(format!(
+                "{response_id} resolves {} times, not exactly once",
+                evaluated.len() + deferred.len()
+            ));
+        }
+        let resolution = if let Some(event) = evaluated.first() {
+            let evaluation: AnswerEvaluation = serde_json::from_value(event["evaluation"].clone())
+                .map_err(|error| format!("{response_id} evaluation does not parse: {error}"))?;
+            evaluation
+                .validate_fail_closed()
+                .map_err(|error| format!("{response_id} evaluation is invalid: {error}"))?;
+            let sources = bound("source_reference");
+            if sources.len() != 1 {
+                return Err(format!(
+                    "an evaluated {response_id} cites {} sources, not exactly one",
+                    sources.len()
+                ));
+            }
+            let source: StudySourceReference = serde_json::from_value(sources[0]["source"].clone())
+                .map_err(|error| format!("{response_id} source does not parse: {error}"))?;
+            let mut concept_statuses = Vec::new();
+            for event in bound("concept_status") {
+                let concept_id = event["concept_id"]
+                    .as_str()
+                    .ok_or_else(|| format!("{response_id} concept status names no concept"))?
+                    .to_owned();
+                let status: ConceptStatus = serde_json::from_value(event["status"].clone())
+                    .map_err(|error| format!("{response_id} concept status: {error}"))?;
+                concept_statuses.push((concept_id, status));
+            }
+            if concept_statuses.is_empty() {
+                return Err(format!(
+                    "an evaluated {response_id} publishes no concept status"
+                ));
+            }
+            VoiceFixtureResolution::Evaluated {
+                evaluation: Box::new(evaluation),
+                source: Box::new(source),
+                concept_statuses,
+            }
+        } else {
+            let event = &deferred[0];
+            if event["turn_id"] != declared["turn_id"] {
+                return Err(format!("{response_id} defers under the wrong turn"));
+            }
+            if !bound("concept_status").is_empty() || !bound("answer_evaluated").is_empty() {
+                return Err(format!("a deferred {response_id} publishes a learner fact"));
+            }
+            VoiceFixtureResolution::Deferred {
+                question_id: event["question_id"]
+                    .as_str()
+                    .ok_or_else(|| format!("{response_id} deferral names no question"))?
+                    .to_owned(),
+                reason: serde_json::from_value(event["reason"].clone())
+                    .map_err(|error| format!("{response_id} deferral reason: {error}"))?,
+                can_retry_same_question: event["can_retry_same_question"]
+                    .as_bool()
+                    .ok_or_else(|| format!("{response_id} deferral names no retry flag"))?,
+            }
+        };
+
+        let finals = bound("transcript_final");
+        if finals.len() != 1 {
+            return Err(format!(
+                "{response_id} publishes {} final transcripts, not exactly one",
+                finals.len()
+            ));
+        }
+        if !finals[0]
+            .as_object()
+            .is_some_and(|final_transcript| final_transcript.contains_key("confidence"))
+        {
+            return Err(format!("{response_id} omits transcript confidence"));
+        }
+        let transcript_confidence = finals[0]["confidence"].as_f64();
+
+        turns.push(VoiceFixtureTurn {
+            response_id,
+            question,
+            resolution,
+            transcript_confidence,
+        });
+    }
+    if turns.len() < 2 {
+        return Err("a two-turn fixture publishes two turns".to_owned());
+    }
+    let mut identities = turns
+        .iter()
+        .map(|turn| turn.response_id.as_str())
+        .collect::<Vec<_>>();
+    identities.sort_unstable();
+    identities.dedup();
+    if identities.len() != turns.len() {
+        return Err("the fixture reuses a response id across turns".to_owned());
+    }
+
+    // A cancellation may only name a response the fixture has already started;
+    // naming the replacement context instead would cancel a turn before it
+    // exists.
+    for (index, event) in events.iter().enumerate() {
+        if event["type"] != "cancellation" {
+            continue;
+        }
+        let Some(cancelled) = event["response_id"].as_str() else {
+            continue;
+        };
+        let started = events[..index].iter().any(|earlier| {
+            earlier["type"] == "question_started" && earlier["response_id"] == cancelled
+        });
+        if !started {
+            return Err(format!(
+                "cancellation names {cancelled}, which has not started yet"
+            ));
+        }
+    }
+
+    let second_start = events
+        .iter()
+        .position(|event| {
+            event["type"] == "question_started"
+                && event["response_id"] == turns[1].response_id.as_str()
+        })
+        .ok_or_else(|| "the fixture starts a question for the second response".to_owned())?;
+    let authorized_trailing_kinds = events[second_start + 1..]
+        .iter()
+        .filter(|event| event["response_id"] == turns[0].response_id.as_str())
+        .filter_map(|event| event["type"].as_str().map(ToOwned::to_owned))
+        .collect();
+
+    let terminal_phase: agent_domain::StudySessionPhase = events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "session_phase")
+        .map(|event| serde_json::from_value(event["phase"].clone()))
+        .ok_or_else(|| "the fixture publishes no session phase".to_owned())?
+        .map_err(|error| format!("terminal phase does not parse: {error}"))?;
+
+    let recap = events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "recap_ready")
+        .ok_or_else(|| "the fixture publishes no recap".to_owned())?;
+    let recap_schema = recap["recap"]["schema"]
+        .as_str()
+        .ok_or_else(|| "the fixture recap names no schema".to_owned())?
+        .to_owned();
+    let recap_deferred_turns = recap["recap"]["deferred_turns"]
+        .as_u64()
+        .ok_or_else(|| "the fixture recap counts no deferrals".to_owned())?
+        as u32;
+    let fixture_deferrals = turns
+        .iter()
+        .filter(|turn| matches!(turn.resolution, VoiceFixtureResolution::Deferred { .. }))
+        .count() as u32;
+    if recap_deferred_turns != fixture_deferrals {
+        return Err(format!(
+            "the fixture recap counts {recap_deferred_turns} deferrals but publishes {fixture_deferrals}"
+        ));
+    }
+    let mut recap_concepts = Vec::new();
+    for concept in recap["recap"]["concepts"]
+        .as_array()
+        .ok_or_else(|| "the fixture recap names no concepts".to_owned())?
+    {
+        let concept_id = concept["concept_id"]
+            .as_str()
+            .ok_or_else(|| "a recap concept names no id".to_owned())?
+            .to_owned();
+        let status: ConceptStatus = serde_json::from_value(concept["status"].clone())
+            .map_err(|error| format!("a recap concept status does not parse: {error}"))?;
+        recap_concepts.push((concept_id, status));
+    }
+    let mut recap_source_moments = Vec::new();
+    for moment in recap["recap"]["source_moments"]
+        .as_array()
+        .ok_or_else(|| "the fixture recap names no source moments".to_owned())?
+    {
+        recap_source_moments.push((
+            moment["response_id"]
+                .as_str()
+                .ok_or_else(|| "a recap source moment names no response".to_owned())?
+                .to_owned(),
+            moment["source_id"]
+                .as_str()
+                .ok_or_else(|| "a recap source moment names no source".to_owned())?
+                .to_owned(),
+        ));
+    }
+
+    Ok(VoiceFixtureAdapterContract {
+        fixture_id: fixture["id"]
+            .as_str()
+            .ok_or_else(|| "the fixture names no id".to_owned())?
+            .to_owned(),
+        provider: fixture["provider"]
+            .as_str()
+            .ok_or_else(|| "the fixture names no provider".to_owned())?
+            .to_owned(),
+        turns,
+        published_kinds,
+        authorized_trailing_kinds,
+        terminal_phase,
+        recap_schema,
+        recap_deferred_turns,
+        recap_concepts,
+        recap_source_moments,
+    })
+}
+
+/// The Task 10 parity helper: does this crate's emitted projection agree with
+/// the frozen fixture on every dimension the adapter owns?
+fn adapter_projection_matches_voice_fixture(
+    events: &[BrainEvent],
+    contract: &VoiceFixtureAdapterContract,
+) -> Result<(), String> {
+    // 1. Kind vocabulary: nothing learner-visible is emitted that the fixture
+    //    does not publish.
+    for event in events {
+        let kind = adapter_event_kind(event);
+        if ADAPTER_LEARNER_VISIBLE_KINDS.contains(&kind) && !contract.published_kinds.contains(kind)
+        {
+            return Err(format!(
+                "{kind} is emitted but {} publishes no such event",
+                contract.fixture_id
+            ));
+        }
+    }
+
+    // 2. Correlation: one question start per fixture turn, in order, and each
+    //    is the first response-bound event for its response.
+    let started = events
+        .iter()
+        .filter_map(|event| match event {
+            BrainEvent::QuestionStarted { response_id, .. } => Some(response_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let expected = contract
+        .turns
+        .iter()
+        .map(|turn| turn.response_id.as_str())
+        .collect::<Vec<_>>();
+    if started != expected {
+        return Err(format!(
+            "question starts {started:?} do not match the fixture turns {expected:?}"
+        ));
+    }
+
+    for turn in &contract.turns {
+        let response_id = turn.response_id.as_str();
+        let bound = events
+            .iter()
+            .filter(|event| adapter_event_response_id(event) == Some(response_id))
+            .collect::<Vec<_>>();
+        let Some(first) = bound.first() else {
+            return Err(format!("no event carries {response_id}"));
+        };
+        let BrainEvent::QuestionStarted { question, .. } = first else {
+            return Err(format!(
+                "{response_id} emitted {} before its question started",
+                adapter_event_kind(first)
+            ));
+        };
+        if question != &turn.question {
+            return Err(format!(
+                "{response_id} asked {} but the fixture asks {}",
+                question.question_id, turn.question.question_id
+            ));
+        }
+
+        // 3. Confidence nullability is the fixture's, exactly.
+        let confidences = bound
+            .iter()
+            .filter_map(|event| match event {
+                BrainEvent::TranscriptFinal { confidence, .. } => Some(*confidence),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if confidences.is_empty() {
+            return Err(format!("{response_id} produced no final transcript"));
+        }
+        for confidence in &confidences {
+            if confidence.is_some() != turn.transcript_confidence.is_some() {
+                return Err(format!(
+                    "{response_id} transcript confidence is {confidence:?} but the fixture publishes {:?}",
+                    turn.transcript_confidence
+                ));
+            }
+        }
+
+        // 4. Outcome resolution and the learner facts it authorizes.
+        let evaluations = bound
+            .iter()
+            .filter_map(|event| match event {
+                BrainEvent::AnswerEvaluated { evaluation, .. } => Some(evaluation.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let deferrals = bound
+            .iter()
+            .filter_map(|event| match event {
+                BrainEvent::TurnDeferred {
+                    question_id,
+                    reason,
+                    can_retry_same_question,
+                    ..
+                } => Some((
+                    question_id.clone(),
+                    reason.clone(),
+                    *can_retry_same_question,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let statuses = bound
+            .iter()
+            .filter_map(|event| match event {
+                BrainEvent::ConceptStatus {
+                    concept_id, status, ..
+                } => Some((concept_id.clone(), status.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let sources = bound
+            .iter()
+            .filter_map(|event| match event {
+                BrainEvent::SourceReference { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let audio = bound
+            .iter()
+            .filter(|event| matches!(event, BrainEvent::AudioDelta { .. }))
+            .count();
+
+        match &turn.resolution {
+            VoiceFixtureResolution::Evaluated {
+                evaluation,
+                source,
+                concept_statuses,
+            } => {
+                if !deferrals.is_empty() {
+                    return Err(format!("an evaluated {response_id} also deferred"));
+                }
+                if evaluations.len() != 1 {
+                    return Err(format!(
+                        "{response_id} emitted {} evaluations, not exactly one",
+                        evaluations.len()
+                    ));
+                }
+                if &evaluations[0] != evaluation.as_ref() {
+                    return Err(format!(
+                        "{response_id} evaluation {:?} != fixture {evaluation:?}",
+                        evaluations[0]
+                    ));
+                }
+                if &statuses != concept_statuses {
+                    return Err(format!(
+                        "{response_id} concept statuses {statuses:?} != fixture {concept_statuses:?}"
+                    ));
+                }
+                if !sources.iter().any(|cited| cited == source.as_ref()) {
+                    return Err(format!(
+                        "{response_id} cited {sources:?}, not the fixture source {source:?}"
+                    ));
+                }
+            }
+            VoiceFixtureResolution::Deferred {
+                question_id,
+                reason,
+                can_retry_same_question,
+            } => {
+                if !evaluations.is_empty() || !statuses.is_empty() {
+                    return Err(format!(
+                        "a deferred {response_id} emitted a learner fact: {evaluations:?} {statuses:?}"
+                    ));
+                }
+                if audio != 0 {
+                    return Err(format!("a deferred {response_id} spoke {audio} frames"));
+                }
+                if deferrals.len() != 1 {
+                    return Err(format!(
+                        "{response_id} emitted {} deferrals, not exactly one",
+                        deferrals.len()
+                    ));
+                }
+                if deferrals[0]
+                    != (
+                        question_id.clone(),
+                        reason.clone(),
+                        *can_retry_same_question,
+                    )
+                {
+                    return Err(format!(
+                        "{response_id} deferral {:?} != fixture ({question_id}, {reason:?}, {can_retry_same_question})",
+                        deferrals[0]
+                    ));
+                }
+                if bound
+                    .iter()
+                    .any(|event| matches!(event, BrainEvent::RecapReady { .. }))
+                {
+                    return Err(format!("a deferred {response_id} produced a graded recap"));
+                }
+            }
+        }
+    }
+
+    // 5. Cancellation legality, and no stale response trailing the next turn.
+    for (index, event) in events.iter().enumerate() {
+        let BrainEvent::ResponseCancelledFor { response_id } = event else {
+            continue;
+        };
+        let started_earlier = events[..index].iter().any(|earlier| {
+            matches!(earlier, BrainEvent::QuestionStarted { response_id: started, .. }
+                if started == response_id)
+        });
+        if !started_earlier {
+            return Err(format!(
+                "cancellation names {response_id}, which has not started yet"
+            ));
+        }
+    }
+    let second_start = events
+        .iter()
+        .position(|event| {
+            matches!(event, BrainEvent::QuestionStarted { response_id, .. }
+                if response_id == &contract.turns[1].response_id)
+        })
+        .expect("the second question start was located above");
+    // Nothing but the kinds the fixture itself places after the second question
+    // starts may trail it. In these fixtures that is exactly `recap_ready`, the
+    // one session-scope projection; a stale transcript, evaluation, status, or
+    // audio frame from the previous turn is rejected.
+    for event in &events[second_start + 1..] {
+        let Some(response_id) = adapter_event_response_id(event) else {
+            continue;
+        };
+        if response_id == contract.turns[1].response_id {
+            continue;
+        }
+        let kind = adapter_event_kind(event);
+        if contract.authorized_trailing_kinds.contains(kind) {
+            continue;
+        }
+        return Err(format!(
+            "{kind} for {response_id} trails the start of {}",
+            contract.turns[1].response_id
+        ));
+    }
+
+    // 6. Terminal ordering: the recap is the fixture's schema and deferral
+    //    count, and it precedes the fixture's terminal phase.
+    let recaps = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            BrainEvent::RecapReady { recap, .. } => Some((index, recap.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some((recap_index, recap)) = recaps.last() else {
+        return Err("the session produced no recap".to_owned());
+    };
+    if recap.schema != contract.recap_schema {
+        return Err(format!(
+            "recap schema {} != fixture {}",
+            recap.schema, contract.recap_schema
+        ));
+    }
+    // The recap is a fold over the outcomes that had been persisted when it was
+    // built, so its deferral bucket is compared with this run's own deferral
+    // history. The fixture's own recap was checked against the fixture's
+    // deferrals when the contract was built, so both artefacts obey one law.
+    let deferrals_before_recap = events[..*recap_index]
+        .iter()
+        .filter(|event| matches!(event, BrainEvent::TurnDeferred { .. }))
+        .count() as u32;
+    if recap.deferred_turns != deferrals_before_recap {
+        return Err(format!(
+            "recap counts {} deferrals but {deferrals_before_recap} had happened",
+            recap.deferred_turns
+        ));
+    }
+    let graded = recap
+        .concepts
+        .iter()
+        .map(|concept| (concept.concept_id.clone(), concept.status.clone()))
+        .collect::<Vec<_>>();
+    let expected_graded = contract
+        .recap_concepts
+        .iter()
+        .filter(|(concept_id, _)| {
+            contract.turns.iter().any(|turn| match &turn.resolution {
+                VoiceFixtureResolution::Evaluated {
+                    concept_statuses, ..
+                } => concept_statuses
+                    .iter()
+                    .any(|(graded_id, _)| graded_id == concept_id),
+                VoiceFixtureResolution::Deferred { .. } => false,
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if graded != expected_graded {
+        return Err(format!(
+            "recap concepts {graded:?} != the fixture's graded concepts {expected_graded:?}"
+        ));
+    }
+    let moments = recap
+        .source_moments
+        .iter()
+        .map(|moment| (moment.response_id.clone(), moment.source_id.clone()))
+        .collect::<Vec<_>>();
+    if moments != contract.recap_source_moments {
+        return Err(format!(
+            "recap source moments {moments:?} != fixture {:?}",
+            contract.recap_source_moments
+        ));
+    }
+    let terminal_index = events.iter().rposition(|event| {
+        matches!(event, BrainEvent::SessionPhase { phase } | BrainEvent::TerminalSessionPhase { phase, .. }
+            if phase == &contract.terminal_phase)
+    });
+    let Some(terminal_index) = terminal_index else {
+        return Err(format!(
+            "the session never reached the fixture's terminal phase {:?}",
+            contract.terminal_phase
+        ));
+    };
+    if terminal_index < *recap_index {
+        return Err("the terminal phase preceded the recap".to_owned());
+    }
+    Ok(())
+}
+
+/// The persisted outcome the fixture's own resolution implies, so a run driven
+/// by this store can only match the fixture if the adapter copies the outcome
+/// through unchanged.
+fn voice_fixture_turn_outcome(turn: &VoiceFixtureTurn) -> TurnOutcome {
+    let resolution = match &turn.resolution {
+        VoiceFixtureResolution::Evaluated {
+            evaluation,
+            source,
+            concept_statuses,
+        } => {
+            let _ = source;
+            agent_domain::TurnResolution::Evaluated {
+                label: match evaluation.label.as_str() {
+                    "strong" => agent_domain::EvaluationLabel::Strong,
+                    "mostly correct" => agent_domain::EvaluationLabel::MostlyCorrect,
+                    "partially correct" => agent_domain::EvaluationLabel::PartiallyCorrect,
+                    "vague" => agent_domain::EvaluationLabel::Vague,
+                    "wrong" => agent_domain::EvaluationLabel::Wrong,
+                    "insufficient evidence" => agent_domain::EvaluationLabel::InsufficientEvidence,
+                    other => panic!("the fixture publishes an unknown label `{other}`"),
+                },
+                confidence: evaluation.confidence_score,
+                assessments: turn
+                    .question
+                    .rubric
+                    .criteria
+                    .iter()
+                    .map(|criterion| agent_domain::CriterionAssessment {
+                        criterion_id: criterion.criterion_id.clone(),
+                        assessment: agent_domain::CriterionAssessmentKind::Satisfied,
+                        confidence: evaluation.confidence_score,
+                    })
+                    .collect(),
+                concept_transitions: concept_statuses
+                    .iter()
+                    .map(
+                        |(concept_id, status)| agent_domain::ConceptStatusTransition {
+                            concept_id: concept_id.clone(),
+                            from_status: ConceptStatus::Review,
+                            to_status: status.clone(),
+                            criterion_ids: turn
+                                .question
+                                .rubric
+                                .criteria
+                                .iter()
+                                .filter(|criterion| &criterion.concept_id == concept_id)
+                                .map(|criterion| criterion.criterion_id.clone())
+                                .collect(),
+                        },
+                    )
+                    .collect(),
+                concise_feedback: evaluation.concise_feedback.clone(),
+                retry_prompt: (!evaluation.retry_prompt.is_empty())
+                    .then(|| evaluation.retry_prompt.clone()),
+                disposition: agent_domain::QuestionDisposition::Advance,
+            }
+        }
+        VoiceFixtureResolution::Deferred {
+            reason,
+            can_retry_same_question,
+            ..
+        } => agent_domain::TurnResolution::Deferred {
+            reason: reason.clone(),
+            can_retry_same_question: *can_retry_same_question,
+            disposition: agent_domain::QuestionDisposition::Deferred,
+        },
+    };
+    TurnOutcome {
+        schema: agent_domain::learning_outcome::VIVA_TURN_OUTCOME_SCHEMA.to_owned(),
+        response_id: turn.response_id.clone(),
+        question_id: turn.question.question_id.clone(),
+        rubric_policy_version: turn.question.rubric.policy_version.clone(),
+        recorded_at: "2026-08-24T16:00:00.000Z".to_owned(),
+        source_ids: vec![match &turn.resolution {
+            VoiceFixtureResolution::Evaluated { source, .. } => source.source_id.clone(),
+            VoiceFixtureResolution::Deferred { .. } => turn.question.source.source_id.clone(),
+        }],
+        supersedes_response_id: None,
+        resolution,
+    }
+}
+
+fn voice_fixture_store(contract: &VoiceFixtureAdapterContract) -> Arc<FixtureOutcomeStore> {
+    let mut sources = Vec::new();
+    for turn in &contract.turns {
+        for source in [
+            Some(turn.question.source.clone()),
+            match &turn.resolution {
+                VoiceFixtureResolution::Evaluated { source, .. } => Some(source.as_ref().clone()),
+                VoiceFixtureResolution::Deferred { .. } => None,
+            },
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !sources
+                .iter()
+                .any(|known: &StudySourceReference| known.source_id == source.source_id)
+            {
+                sources.push(source);
+            }
+        }
+    }
+    Arc::new(FixtureOutcomeStore::per_turn(
+        contract
+            .turns
+            .iter()
+            .map(|turn| turn.question.clone())
+            .collect(),
+        sources,
+        contract
+            .turns
+            .iter()
+            .map(voice_fixture_turn_outcome)
+            .collect(),
+    ))
+}
+
+/// The learner answers the fixture's own final transcripts, so the emitted
+/// evaluation's `answer_text` can be compared with the fixture's.
+fn voice_fixture_answers(fixture: &serde_json::Value) -> Vec<String> {
+    fixture_server_events(fixture)
+        .expect("the fixture's server sequence decodes")
+        .iter()
+        .filter(|event| event["type"] == "transcript_final")
+        .filter_map(|event| event["text"].as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
+async fn run_two_turn_fixture_session(
+    session: &mut RealtimeSession,
+    answers: &[String],
+) -> Vec<BrainEvent> {
+    let mut events = Vec::new();
+    // Ready, then the first question.
+    events.push(next_event(session).await);
+    events.push(next_event(session).await);
+    for answer in answers {
+        session
+            .input
+            .send(BrainInput::Text(answer.clone()))
+            .await
+            .expect("text input accepted");
+        while let Ok(Some(event)) = timeout(Duration::from_secs(5), session.events.recv()).await {
+            let completed = matches!(event, BrainEvent::ResponseCompleted { .. });
+            events.push(event);
+            if completed {
+                break;
+            }
+        }
+    }
+    session.input.send(BrainInput::Stop).await.ok();
+    while let Ok(Some(event)) = timeout(Duration::from_secs(5), session.events.recv()).await {
+        let terminal = matches!(
+            event,
+            BrainEvent::SessionPhase {
+                phase: agent_domain::StudySessionPhase::Recap
+            } | BrainEvent::TerminalSessionPhase { .. }
+        );
+        events.push(event);
+        if terminal {
+            break;
+        }
+    }
+    events
+}
+
+async fn two_turn_fixture_projection(
+    manifest_id: &str,
+    runtime: &str,
+) -> (VoiceFixtureAdapterContract, Vec<BrainEvent>) {
+    let fixture = resolve_voice_fixture(manifest_id);
+    let contract = voice_fixture_adapter_contract(&fixture).expect("the fixture contract holds");
+    let answers = voice_fixture_answers(&fixture);
+    let store = voice_fixture_store(&contract);
+    let config = fixture_session_config();
+    let mut session = match runtime {
+        "fake" => FakeCartesiaGeminiRuntime::new(store)
+            .open(config)
+            .await
+            .expect("the fixture runtime opens"),
+        _ => agent_adapters::SyntheticBrain::with_study_store(store)
+            .open(config)
+            .await
+            .expect("the synthetic runtime opens"),
+    };
+    let events = run_two_turn_fixture_session(&mut session, &answers).await;
+    drop(session);
+    (contract, events)
+}
+
+/// The mutation controls Step 2 requires, run against one real projection.
+fn assert_two_turn_mutation_controls(
+    contract: &VoiceFixtureAdapterContract,
+    events: &[BrainEvent],
+) {
+    // The projection must be accepted before a rejection means anything.
+    adapter_projection_matches_voice_fixture(events, contract)
+        .unwrap_or_else(|error| panic!("{error}: {events:?}"));
+    assert_eq!(
+        contract.recap_deferred_turns,
+        contract
+            .turns
+            .iter()
+            .filter(|turn| matches!(turn.resolution, VoiceFixtureResolution::Deferred { .. }))
+            .count() as u32,
+        "the fixture recap counts exactly the deferrals the fixture publishes"
+    );
+
+    // Second-turn response id -> first-turn response id.
+    let mut reused = contract.clone();
+    reused.turns[1].response_id = reused.turns[0].response_id.clone();
+    assert!(
+        adapter_projection_matches_voice_fixture(events, &reused).is_err(),
+        "reusing the first response id for the second turn must be rejected"
+    );
+
+    // Remove the second `QuestionStarted`.
+    let second_start = events
+        .iter()
+        .position(|event| {
+            matches!(event, BrainEvent::QuestionStarted { response_id, .. }
+                if response_id == &contract.turns[1].response_id)
+        })
+        .expect("the second turn started a question");
+    let mut without_second_start = events.to_vec();
+    without_second_start.remove(second_start);
+    assert!(
+        adapter_projection_matches_voice_fixture(&without_second_start, contract).is_err(),
+        "deleting the second question start must be rejected"
+    );
+
+    // `confidence: null` -> `0.91`.
+    let mut invented_confidence = events.to_vec();
+    for event in &mut invented_confidence {
+        if let BrainEvent::TranscriptFinal { confidence, .. } = event {
+            *confidence = Some(0.91);
+        }
+    }
+    assert!(
+        adapter_projection_matches_voice_fixture(&invented_confidence, contract).is_err(),
+        "an invented transcript confidence must be rejected"
+    );
+
+    // A deferred outcome plus an injected `concept_status`.
+    let deferred_response = contract
+        .turns
+        .iter()
+        .find(|turn| matches!(turn.resolution, VoiceFixtureResolution::Deferred { .. }))
+        .expect("the fixture publishes a deferred turn")
+        .response_id
+        .clone();
+    let mut injected_status = events.to_vec();
+    let deferral_index = injected_status
+        .iter()
+        .position(|event| {
+            matches!(event, BrainEvent::TurnDeferred { response_id, .. }
+                if response_id == &deferred_response)
+        })
+        .expect("the deferred turn emitted its deferral");
+    injected_status.insert(
+        deferral_index,
+        BrainEvent::ConceptStatus {
+            response_id: deferred_response.clone(),
+            concept_id: "concept-fixture-2".to_owned(),
+            status: ConceptStatus::Strong,
+        },
+    );
+    assert!(
+        adapter_projection_matches_voice_fixture(&injected_status, contract).is_err(),
+        "mastery injected into a deferral must be rejected"
+    );
+
+    // An evaluated outcome whose transition status drifts from the fixture.
+    let mut drifted_status = events.to_vec();
+    for event in &mut drifted_status {
+        if let BrainEvent::ConceptStatus { status, .. } = event {
+            *status = ConceptStatus::Missed;
+        }
+    }
+    assert!(
+        adapter_projection_matches_voice_fixture(&drifted_status, contract).is_err(),
+        "a concept status that drifts from the fixture must be rejected"
+    );
+
+    // Cancellation naming the replacement context instead of the cancelled one.
+    let mut premature_cancel = events.to_vec();
+    premature_cancel.insert(
+        second_start,
+        BrainEvent::ResponseCancelledFor {
+            response_id: contract.turns[1].response_id.clone(),
+        },
+    );
+    assert!(
+        adapter_projection_matches_voice_fixture(&premature_cancel, contract).is_err(),
+        "cancelling the replacement context before it starts must be rejected"
+    );
+
+    // The recap bucket changed from the Plan 04 fold.
+    let mut drifted_recap = events.to_vec();
+    for event in &mut drifted_recap {
+        if let BrainEvent::RecapReady { recap, .. } = event {
+            recap.deferred_turns = recap.deferred_turns.wrapping_add(1);
+        }
+    }
+    assert!(
+        adapter_projection_matches_voice_fixture(&drifted_recap, contract).is_err(),
+        "a recap deferral count that drifts from the fixture must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn synthetic_two_turn_adapter_projection_matches_voice_fixture() {
+    let (contract, events) =
+        two_turn_fixture_projection("VOICE-SYNTHETIC-TWO-TURN-SESSION", "synthetic").await;
+    assert_eq!(contract.provider, "synthetic");
+    assert_two_turn_mutation_controls(&contract, &events);
+}
+
+#[tokio::test]
+async fn fake_cartesia_two_turn_adapter_projection_matches_voice_fixture() {
+    let (contract, events) =
+        two_turn_fixture_projection("VOICE-FAKE-CARTESIA-GEMINI-TWO-TURN-SESSION", "fake").await;
+    assert_eq!(contract.provider, "fake_cartesia_gemini");
+    assert_two_turn_mutation_controls(&contract, &events);
+}
+
+// --- differential cases and the diagnostics boundary ------------------------
+
+/// Read every `.rs` file under the adapter crate's `src` tree.
+fn adapter_source_files() -> Vec<(std::path::PathBuf, String)> {
+    fn walk(directory: &std::path::Path, found: &mut Vec<(std::path::PathBuf, String)>) {
+        for entry in std::fs::read_dir(directory).expect("the adapter src tree is readable") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                let body = std::fs::read_to_string(&path).expect("an adapter source file reads");
+                found.push((path, body));
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(
+        &repository_root().join("agent/crates/agent-adapters/src"),
+        &mut found,
+    );
+    assert!(!found.is_empty(), "the adapter crate has sources");
+    found
+}
+
+/// The frozen server-differential cases whose rejection is an adapter-owned
+/// domain type's job. Everything else in the corpus is a wire-envelope concern
+/// this crate must not restate.
+const ADAPTER_OWNED_SERVER_REJECTIONS: [&str; 8] = [
+    "VOICE-SERVER-REJECT-MISSING-QUESTION-CONCEPT",
+    "VOICE-SERVER-REJECT-EVALUATION-LABEL",
+    "VOICE-SERVER-REJECT-EVALUATION-CONFIDENCE",
+    "VOICE-SERVER-REJECT-UNKNOWN-RECAP-KEY",
+    "VOICE-SERVER-REJECT-UNKNOWN-RECAP-MOMENT-KEY",
+    "VOICE-SERVER-REJECT-UNKNOWN-RECAP-CONCEPT-KEY",
+    "VOICE-SERVER-REJECT-RECAP-REVIEW-AUTHORITY",
+    "VOICE-SERVER-REJECT-DEFERRED-UNKNOWN-REASON",
+];
+
+/// Parse every adapter-owned payload a server event carries with the exact
+/// domain types this crate consumes. Returns the payloads it recognised so a
+/// case cannot pass vacuously.
+fn adapter_owned_payload_verdict(event: &serde_json::Value) -> Result<Vec<&'static str>, String> {
+    let mut seen = Vec::new();
+    if let Some(question) = event.get("question") {
+        serde_json::from_value::<StudyQuestion>(question.clone())
+            .map_err(|error| format!("question: {error}"))?;
+        seen.push("question");
+    }
+    if let Some(evaluation) = event.get("evaluation") {
+        let evaluation: AnswerEvaluation = serde_json::from_value(evaluation.clone())
+            .map_err(|error| format!("evaluation: {error}"))?;
+        evaluation
+            .validate_fail_closed()
+            .map_err(|error| format!("evaluation: {error}"))?;
+        seen.push("evaluation");
+    }
+    if let Some(recap) = event.get("recap") {
+        serde_json::from_value::<StudySessionRecap>(recap.clone())
+            .map_err(|error| format!("recap: {error}"))?;
+        seen.push("recap");
+    }
+    // `structured_error` also carries a `source`, but it is the emitting
+    // component's name, not a study source: only the source-reference event
+    // publishes an adapter-owned `StudySourceReference`.
+    if event["type"] == "source_reference" {
+        if let Some(source) = event.get("source") {
+            serde_json::from_value::<StudySourceReference>(source.clone())
+                .map_err(|error| format!("source: {error}"))?;
+            seen.push("source");
+        }
+    }
+    if let Some(frame) = event.get("frame") {
+        serde_json::from_value::<AudioFrame>(frame.clone())
+            .map_err(|error| format!("frame: {error}"))?;
+        seen.push("frame");
+    }
+    if event["type"] == "concept_status" {
+        if let Some(status) = event.get("status") {
+            serde_json::from_value::<ConceptStatus>(status.clone())
+                .map_err(|error| format!("status: {error}"))?;
+            seen.push("status");
+        }
+    }
+    if event["type"] == "turn_deferred" {
+        if let Some(reason) = event.get("reason") {
+            serde_json::from_value::<agent_domain::EvaluationDeferralReason>(reason.clone())
+                .map_err(|error| format!("reason: {error}"))?;
+            seen.push("reason");
+        }
+    }
+    Ok(seen)
+}
+
+/// The adapter's own closed provider-diagnostic vocabulary (Task 6). It must
+/// stay disjoint from the wire diagnostics the fixtures publish.
+const ADAPTER_PROVIDER_DIAGNOSTIC_CODES: [&str; 13] = [
+    "gemini_http_auth",
+    "gemini_http_rate_limited",
+    "gemini_http_rejected",
+    "cartesia_ink_http_auth",
+    "cartesia_ink_http_rate_limited",
+    "cartesia_ink_http_rejected",
+    "cartesia_ink_ws_closed",
+    "cartesia_ink_provider_error",
+    "cartesia_sonic_http_auth",
+    "cartesia_sonic_http_rate_limited",
+    "cartesia_sonic_http_rejected",
+    "cartesia_sonic_ws_closed",
+    "cartesia_sonic_provider_error",
+];
+
+/// Does one frozen transport-outcome case agree with the adapter's own typed
+/// auth policy? An unusable credential is terminal for this crate: only an
+/// expiry the client can refresh is retryable.
+fn transport_outcome_agrees_with_adapter_auth_policy(
+    case: &serde_json::Value,
+    adapter_auth_retry_eligible: bool,
+) -> Result<(), String> {
+    if case["expected"]["kind"] != "auth" {
+        return Ok(());
+    }
+    let code = case["expected"]["errorCode"]
+        .as_str()
+        .ok_or_else(|| "an auth case names no error code".to_owned())?;
+    let retryable = case["expected"]["retryable"]
+        .as_bool()
+        .ok_or_else(|| "an auth case declares no retryability".to_owned())?;
+    if code == "VOICE_AUTH_EXPIRED" {
+        // The one refreshable credential failure: the client may mint a new
+        // token. Everything else is the adapter's non-retryable class.
+        return if retryable {
+            Ok(())
+        } else {
+            Err(format!("{code} must stay refreshable"))
+        };
+    }
+    if retryable != adapter_auth_retry_eligible {
+        return Err(format!(
+            "{code} is retryable={retryable} but the adapter's provider-auth failure is retry_eligible={adapter_auth_retry_eligible}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn adapter_consumes_voice_differential_cases_without_redefining_diagnostics() {
+    let server = resolve_voice_fixture("VOICE-SERVER-DIFFERENTIAL-CASES");
+    let client = resolve_voice_fixture("VOICE-CLIENT-DIFFERENTIAL-CASES");
+    let transports = resolve_voice_fixture("VOICE-TRANSPORT-OUTCOMES");
+    let sources = adapter_source_files();
+
+    // 1. The wire diagnostics stay Plan 05's and the service's. This crate
+    //    names none of them and its own closed provider vocabulary is disjoint.
+    let mut wire_codes = std::collections::BTreeSet::new();
+    for corpus in [&server, &client] {
+        for case in corpus["cases"].as_array().expect("a differential corpus") {
+            if let Some(code) = case["diagnostic_code"].as_str() {
+                wire_codes.insert(code.to_owned());
+            }
+        }
+    }
+    assert!(
+        wire_codes.len() >= 8,
+        "the corpora publish a diagnostic vocabulary: {wire_codes:?}"
+    );
+    for code in &wire_codes {
+        for (path, body) in &sources {
+            assert!(
+                !body.contains(code.as_str()),
+                "{} redefines the wire diagnostic {code}",
+                path.display()
+            );
+        }
+        assert!(
+            !ADAPTER_PROVIDER_DIAGNOSTIC_CODES.contains(&code.as_str()),
+            "the adapter's provider vocabulary collides with the wire code {code}"
+        );
+    }
+
+    // 2. Every server case is consumed by the adapter-owned domain types.
+    let cases = server["cases"].as_array().expect("server cases");
+    let mut accepted_payloads = std::collections::BTreeSet::new();
+    let mut adapter_rejections = std::collections::BTreeSet::new();
+    for case in cases {
+        let id = case["id"].as_str().expect("a case names an id");
+        let Ok(frame) = serde_json::from_str::<serde_json::Value>(
+            case["wire_json"].as_str().expect("a case names wire JSON"),
+        ) else {
+            // A malformed-JSON case is an envelope concern by construction.
+            assert_eq!(case["valid"], json!(false), "{id}");
+            continue;
+        };
+        let Some(event) = frame.get("event") else {
+            continue;
+        };
+        let verdict = adapter_owned_payload_verdict(event);
+        if case["valid"] == json!(true) {
+            let payloads = verdict.unwrap_or_else(|error| {
+                panic!("{id} is valid but the adapter refused it: {error}")
+            });
+            accepted_payloads.extend(payloads.into_iter().map(ToOwned::to_owned));
+        } else if verdict.is_err() {
+            adapter_rejections.insert(id.to_owned());
+        }
+    }
+    for payload in [
+        "question",
+        "evaluation",
+        "recap",
+        "source",
+        "frame",
+        "status",
+        "reason",
+    ] {
+        assert!(
+            accepted_payloads.contains(payload),
+            "the corpus never exercised the adapter-owned `{payload}` payload"
+        );
+    }
+    for id in ADAPTER_OWNED_SERVER_REJECTIONS {
+        assert!(
+            cases
+                .iter()
+                .any(|case| case["id"] == id && case["valid"] == json!(false)),
+            "the corpus must still publish the invalid case {id}"
+        );
+        assert!(
+            adapter_rejections.contains(id),
+            "{id} must be rejected by the adapter's own domain type"
+        );
+    }
+
+    // 3. The client corpus is consumed as a strict-v5 guard and as evidence
+    //    that no client credential reaches this crate. Client frames are the
+    //    service's to parse; the adapter never sees one.
+    let client_cases = client["cases"].as_array().expect("client cases");
+    assert!(client_cases.len() >= 10);
+    let mut valid_client_frames = 0_u32;
+    for case in client_cases {
+        let Ok(frame) = serde_json::from_str::<serde_json::Value>(
+            case["wire_json"].as_str().expect("a case names wire JSON"),
+        ) else {
+            assert_eq!(case["valid"], json!(false), "{}", case["id"]);
+            continue;
+        };
+        if case["valid"] == json!(true) {
+            assert_eq!(
+                frame["version"],
+                json!(5),
+                "{} is valid but not strict v5",
+                case["id"]
+            );
+            valid_client_frames += 1;
+        }
+    }
+    assert!(valid_client_frames >= 8);
+    for (path, body) in &sources {
+        assert!(
+            !body.contains("session_token"),
+            "{} names the client session credential",
+            path.display()
+        );
+    }
+
+    // 4. The frozen transport outcomes agree with the adapter's own typed auth
+    //    policy, read out of the real live composition rather than restated.
+    let adapter_auth_retry_eligible = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime")
+        .block_on(async {
+            let brain = CartesiaGeminiBrain::new(
+                CartesiaGeminiConfig {
+                    cartesia_api_key: "viva-release-check-cartesia-placeholder-key".to_owned(),
+                    gemini: GeminiConfig {
+                        api_key: "viva-release-check-gemini-placeholder-key".to_owned(),
+                        ..GeminiConfig::default()
+                    },
+                    live_runtime_enabled: true,
+                    ..CartesiaGeminiConfig::default()
+                },
+                learning_ready_store(),
+            );
+            let error = brain
+                .open(fixture_session_config())
+                .await
+                .err()
+                .expect("an unusable credential never opens a session");
+            let failure = error.failure();
+            assert_eq!(
+                failure.failure_class(),
+                BrainFailureClass::ProviderAuthFailure
+            );
+            assert_eq!(
+                failure.terminal_reason(),
+                TerminalSessionReason::ProviderAuthFailed
+            );
+            failure.retry_eligible()
+        });
+    assert!(
+        !adapter_auth_retry_eligible,
+        "the adapter's provider-auth failure is terminal"
+    );
+
+    let transport_cases = transports["cases"].as_array().expect("transport cases");
+    let auth_cases = transport_cases
+        .iter()
+        .filter(|case| case["expected"]["kind"] == "auth")
+        .count();
+    assert!(auth_cases >= 3, "the corpus publishes auth terminations");
+    for case in transport_cases {
+        transport_outcome_agrees_with_adapter_auth_policy(case, adapter_auth_retry_eligible)
+            .unwrap_or_else(|error| panic!("{}: {error}", case["id"]));
+    }
+
+    // Mutation control: provider auth retryable false -> true.
+    let mut promoted = transport_cases
+        .iter()
+        .find(|case| case["expected"]["errorCode"] == "VOICE_AUTH_INVALID")
+        .expect("the corpus publishes an invalid-credential termination")
+        .clone();
+    promoted["expected"]["retryable"] = json!(true);
+    assert!(
+        transport_outcome_agrees_with_adapter_auth_policy(&promoted, adapter_auth_retry_eligible)
+            .is_err(),
+        "promoting an unusable credential to retryable must be rejected"
+    );
+}
+
+// --- the Plan 04 learning-core corpus --------------------------------------
+
+#[test]
+fn adapter_consumes_learning_core_v1_outcomes_recaps_and_progression() {
+    let outcomes: serde_json::Value =
+        serde_json::from_str(LEARNING_CORE_TURN_OUTCOMES_V1).expect("the outcome corpus parses");
+    assert_eq!(outcomes["schema"], "viva.learning_core.turn_outcomes.v1");
+
+    // Every outcome case is a `TurnOutcome` this crate can project.
+    let mut deferral_reasons = std::collections::BTreeSet::new();
+    let mut evaluated = 0_u32;
+    for (case_id, case) in outcomes["outcomes"]
+        .as_object()
+        .expect("the corpus publishes outcomes")
+    {
+        let outcome: TurnOutcome = serde_json::from_value(case.clone())
+            .unwrap_or_else(|error| panic!("{case_id} does not parse: {error}"));
+        assert_eq!(
+            outcome.schema,
+            agent_domain::learning_outcome::VIVA_TURN_OUTCOME_SCHEMA,
+            "{case_id}"
+        );
+        match &outcome.resolution {
+            agent_domain::TurnResolution::Evaluated {
+                concept_transitions,
+                ..
+            } => {
+                assert!(
+                    !concept_transitions.is_empty(),
+                    "{case_id}: an evaluated outcome names its transitions"
+                );
+                evaluated += 1;
+            }
+            agent_domain::TurnResolution::Deferred { reason, .. } => {
+                deferral_reasons.insert(format!("{reason:?}"));
+            }
+        }
+    }
+    assert!(evaluated >= 5, "the corpus publishes evaluated cases");
+    assert_eq!(
+        deferral_reasons.len(),
+        6,
+        "the corpus covers all six deferral reasons: {deferral_reasons:?}"
+    );
+
+    // The persisted wrapper the adapter deserializes, receipt included.
+    for (case_id, case) in outcomes["persisted"]
+        .as_object()
+        .expect("the corpus publishes persisted records")
+    {
+        let persisted: PersistedTurnOutcome = serde_json::from_value(case.clone())
+            .unwrap_or_else(|error| panic!("{case_id} does not parse: {error}"));
+        assert_eq!(
+            persisted.record.schema,
+            agent_domain::learning_outcome::VIVA_TURN_OUTCOME_RECORD_SCHEMA,
+            "{case_id}"
+        );
+        assert_eq!(
+            persisted.record.response_id, persisted.turn_outcome.response_id,
+            "{case_id}: the receipt names the outcome's own response"
+        );
+    }
+    for (case_id, case) in outcomes["challenges"]
+        .as_object()
+        .expect("the corpus publishes challenge resolutions")
+    {
+        let challenge: agent_domain::ChallengeResolution = serde_json::from_value(case.clone())
+            .unwrap_or_else(|error| panic!("{case_id} does not parse: {error}"));
+        assert_eq!(
+            challenge.schema,
+            agent_domain::learning_outcome::VIVA_CHALLENGE_RESOLUTION_SCHEMA,
+            "{case_id}"
+        );
+    }
+
+    // Mutation control: a deferred outcome plus an injected transition fails
+    // closed before it could become a learner fact.
+    let mut injected = outcomes["outcomes"]["deferred_evaluator_unavailable"].clone();
+    assert!(
+        serde_json::from_value::<TurnOutcome>(injected.clone()).is_ok(),
+        "the unmutated deferred case parses"
+    );
+    injected["resolution"]["concept_transitions"] = json!([{
+        "concept_id": "concept-proton-gradient",
+        "from_status": "review",
+        "to_status": "strong",
+        "criterion_ids": ["crit-etc-gradient"],
+    }]);
+    assert!(
+        serde_json::from_value::<TurnOutcome>(injected).is_err(),
+        "mastery injected into a deferral must fail closed"
+    );
+
+    // Recaps: the adapter builds its recap only through Plan 04's fold, so the
+    // fold must reproduce every published recap exactly.
+    let recaps: serde_json::Value =
+        serde_json::from_str(LEARNING_CORE_RECAPS_V1).expect("the recap corpus parses");
+    assert_eq!(recaps["schema"], "viva.learning_core.recaps.v1");
+    let published = recaps["recaps"].as_object().expect("published recaps");
+    assert!(published.len() >= 8);
+    for (case_id, expected) in published {
+        let evidence: SessionLearningEvidence =
+            serde_json::from_value(recaps["evidence"][case_id].clone())
+                .unwrap_or_else(|error| panic!("{case_id} evidence does not parse: {error}"));
+        let expected: StudySessionRecap = serde_json::from_value(expected.clone())
+            .unwrap_or_else(|error| panic!("{case_id} recap does not parse: {error}"));
+        let built = agent_domain::build_session_recap(&evidence)
+            .unwrap_or_else(|error| panic!("{case_id} does not fold: {error:?}"));
+        assert_eq!(built, expected, "{case_id}");
+        assert_eq!(
+            built.schema,
+            agent_domain::learning_recap::VIVA_STUDY_SESSION_RECAP_SCHEMA
+        );
+    }
+
+    // Mutation control: an evaluated transition changed from the Plan 04
+    // fixture no longer folds to the published recap.
+    let mut drifted: SessionLearningEvidence =
+        serde_json::from_value(recaps["evidence"]["mixed_strong_shaky_missed"].clone())
+            .expect("the mixed case parses");
+    let mut mutated_any = false;
+    for outcome in &mut drifted.outcomes {
+        if let agent_domain::TurnResolution::Evaluated {
+            concept_transitions,
+            ..
+        } = &mut outcome.resolution
+        {
+            for transition in concept_transitions.iter_mut() {
+                if transition.to_status != ConceptStatus::Strong {
+                    transition.to_status = ConceptStatus::Strong;
+                    mutated_any = true;
+                }
+            }
+        }
+    }
+    assert!(
+        mutated_any,
+        "the mixed case carries a non-strong transition"
+    );
+    let expected: StudySessionRecap =
+        serde_json::from_value(recaps["recaps"]["mixed_strong_shaky_missed"].clone())
+            .expect("the mixed recap parses");
+    assert_ne!(
+        agent_domain::build_session_recap(&drifted).expect("the mutated evidence still folds"),
+        expected,
+        "a transition changed from the Plan 04 fixture must change the recap"
+    );
+
+    // Progression: D-02B ordered_v1, consumed exactly as the runner consumes it.
+    let progression: serde_json::Value =
+        serde_json::from_str(LEARNING_CORE_QUESTION_PROGRESSION_V1)
+            .expect("the progression corpus parses");
+    assert_eq!(
+        progression["schema"],
+        "viva.learning_core.question_progression.v1"
+    );
+    assert_eq!(
+        progression["policy"], "ordered_v1",
+        "D-02B selects the ordered progression"
+    );
+    let active = progression["active_question_ids"]
+        .as_array()
+        .expect("active question ids")
+        .iter()
+        .map(|value| value.as_str().expect("an id").to_owned())
+        .collect::<Vec<_>>();
+    for (case_id, case) in progression["cursors"]
+        .as_object()
+        .expect("published cursors")
+    {
+        let cursor: agent_domain::QuestionProgressionCursor = serde_json::from_value(case.clone())
+            .unwrap_or_else(|error| panic!("{case_id} cursor does not parse: {error}"));
+        assert_eq!(cursor.policy, ProgressionPolicyId::OrderedV1, "{case_id}");
+    }
+    let mut selected_questions = Vec::new();
+    for (case_id, case) in progression["results"]
+        .as_object()
+        .expect("published results")
+    {
+        let result: QuestionProgressionResult = serde_json::from_value(case.clone())
+            .unwrap_or_else(|error| panic!("{case_id} result does not parse: {error}"));
+        match result {
+            QuestionProgressionResult::Selected { question, .. }
+            | QuestionProgressionResult::Retry { question, .. } => {
+                assert!(
+                    active.contains(&question.question_id),
+                    "{case_id} selects the inactive question {}",
+                    question.question_id
+                );
+                selected_questions.push(question.question_id);
+            }
+            QuestionProgressionResult::Exhausted {
+                completed, total, ..
+            } => {
+                assert_eq!(completed, total, "{case_id}");
+            }
+        }
+    }
+    selected_questions.sort();
+    selected_questions.dedup();
+    assert_eq!(
+        selected_questions.len(),
+        active.len(),
+        "the corpus exercises every active question"
+    );
+    for inactive in progression["inactive_question_ids"]
+        .as_array()
+        .expect("inactive question ids")
+    {
+        assert!(
+            !selected_questions.iter().any(|id| json!(id) == *inactive),
+            "an archived question was selected: {inactive}"
+        );
+    }
+}
+
+// --- the `#[cfg(test)]` PCM fixture helper ---------------------------------
+
+/// The adapter's only test-side PCM constructor.
+///
+/// Production adapter code builds frames through Plan 06's byte/base64
+/// constructors and reads them back through the borrowed `pcm16_base64()`
+/// accessor; `AudioFrame::from_pcm16_text` is gone and this helper deliberately
+/// does not bring it back. An odd byte count is not PCM16 at all, so it is
+/// refused before any frame exists.
+fn pcm16_fixture_frame(pcm16: &[u8]) -> Result<AudioFrame, String> {
+    if !pcm16.len().is_multiple_of(2) {
+        return Err(format!(
+            "PCM16 needs whole samples; {} bytes is not a sample boundary",
+            pcm16.len()
+        ));
+    }
+    Ok(AudioFrame::from_pcm16_bytes(pcm16.to_vec()))
+}
+
+#[test]
+fn adapter_pcm16_fixture_helper_rejects_odd_byte_length() {
+    for even in [
+        Vec::new(),
+        vec![0_u8, 0],
+        vec![1_u8, 2, 3, 4],
+        vec![0xff_u8; 64],
+    ] {
+        let frame = pcm16_fixture_frame(&even).expect("an even byte count is PCM16");
+        assert_eq!(frame.pcm16_bytes(), &even[..]);
+        // The borrowed accessor is the only way production code reads it back,
+        // and it round-trips through Plan 06's base64 constructor.
+        assert_eq!(
+            AudioFrame::from_base64(frame.pcm16_base64()).expect("cached base64 decodes"),
+            frame
+        );
+    }
+    for odd in [vec![0_u8], vec![1_u8, 2, 3], vec![0xab_u8; 65]] {
+        let error = pcm16_fixture_frame(&odd).expect_err("an odd byte count is not PCM16");
+        assert!(error.contains("sample boundary"), "{error}");
+    }
+
+    // Production adapter code reaches `AudioFrame` only through Plan 06's two
+    // byte/base64 constructors — there is no text constructor to reach for —
+    // and reads it only through the published borrowed accessors.
+    const ALLOWED_FRAME_ASSOCIATED: [&str; 2] = ["from_pcm16_bytes", "from_base64"];
+    const ALLOWED_FRAME_ACCESSORS: [&str; 3] = ["pcm16_bytes", "pcm16_bytes_owned", "pcm16_base64"];
+    let sources = adapter_source_files();
+    let mut associated_seen = std::collections::BTreeSet::new();
+    for (path, body) in &sources {
+        assert!(
+            !body.contains("from_pcm16_text"),
+            "{} names the removed text constructor",
+            path.display()
+        );
+        for (offset, _) in body.match_indices("AudioFrame::") {
+            let tail = &body[offset + "AudioFrame::".len()..];
+            let name = tail
+                .split(|character: char| !character.is_alphanumeric() && character != '_')
+                .next()
+                .unwrap_or_default();
+            assert!(
+                ALLOWED_FRAME_ASSOCIATED.contains(&name),
+                "{} builds an AudioFrame through `{name}`",
+                path.display()
+            );
+            associated_seen.insert(name.to_owned());
+        }
+        for (offset, _) in body.match_indices(".pcm16") {
+            let tail = &body[offset + 1..];
+            let name = tail
+                .split(|character: char| !character.is_alphanumeric() && character != '_')
+                .next()
+                .unwrap_or_default();
+            assert!(
+                ALLOWED_FRAME_ACCESSORS.contains(&name),
+                "{} reads an AudioFrame through `{name}`",
+                path.display()
+            );
+        }
+    }
+    assert!(
+        associated_seen.len() == ALLOWED_FRAME_ASSOCIATED.len(),
+        "both Plan 06 constructors are exercised by production adapter code: {associated_seen:?}"
+    );
+    // `agent-domain` gained no fixtures feature to make this helper shared.
+    let manifest =
+        std::fs::read_to_string(repository_root().join("agent/crates/agent-domain/Cargo.toml"))
+            .expect("the domain manifest reads");
+    assert!(
+        !manifest.contains("[features]") && !manifest.contains("fixtures"),
+        "agent-domain must not grow a fixtures feature for this helper"
+    );
 }
