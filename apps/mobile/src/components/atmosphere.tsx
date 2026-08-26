@@ -27,8 +27,13 @@ export function VivaAtmosphere() {
   const gradientId = `viva${useId().replace(/[^a-zA-Z0-9]/g, "")}`;
 
   return (
+    // accessibilityElementsHidden is iOS-only and importantForAccessibility is
+    // Android-only; react-native-web forwards neither. aria-hidden covers the
+    // web tier, which is not a side-channel here — it is the fallback path
+    // low-end devices take too, so a hole in it is a hole in shipped behaviour.
     <View
       accessibilityElementsHidden
+      aria-hidden
       importantForAccessibility="no-hide-descendants"
       pointerEvents="none"
       style={StyleSheet.absoluteFill}
