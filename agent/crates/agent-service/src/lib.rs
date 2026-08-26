@@ -10,10 +10,11 @@ pub use app::{
     VoiceLimitState, VoiceUsageAggregate, VoiceUsageRecorder, WsTimeouts,
 };
 pub use config::{
-    build_brain, build_study_store, validate_runtime_store_preflight, AccessError,
-    FailureControlConfig, FailureControlScenario, IpNetwork, IpNetworkError, OperatorAccess,
-    RealtimeProvider, RecorderLimits, RedactedSecret, ServiceConfig, ServiceConfigError,
-    TrustedProxyConfig, VoiceLimitConfig, VoiceWsAccess,
+    build_brain, build_study_store, validate_runtime_store_preflight, verify_session_token_at,
+    AccessError, ExpectedSessionBinding, FailureControlConfig, FailureControlScenario, IpNetwork,
+    IpNetworkError, OperatorAccess, RealtimeProvider, RecorderLimits, RedactedSecret,
+    ServiceConfig, ServiceConfigError, SessionTokenClaims, SessionTokenError, TrustedProxyConfig,
+    VoiceLimitConfig, VoiceWsAccess, EXPIRY_CLOCK_SKEW_SECONDS,
 };
 pub use protocol::{
     classify_voice_termination, negotiate_voice_protocol_version, parse_client_frame_json,

@@ -21,10 +21,11 @@ use agent_domain::{
     VoiceUsageRecord, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use agent_service::{
-    build_router, AppState, ClientFrame, ClientTurnIntent, FailureControlConfig,
-    FailureControlScenario, OperatorAccess, RecorderLimits, ServerFrame, VivaServerEvent,
-    VoiceDrainSignal, VoiceEvidenceRecorder, VoiceLimitConfig, VoiceServerErrorCode,
-    VoiceUsageRecorder, VoiceWsAccess, WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
+    build_router, verify_session_token_at, AppState, ClientFrame, ClientTurnIntent,
+    ExpectedSessionBinding, FailureControlConfig, FailureControlScenario, OperatorAccess,
+    RecorderLimits, RedactedSecret, ServerFrame, VivaServerEvent, VoiceDrainSignal,
+    VoiceEvidenceRecorder, VoiceLimitConfig, VoiceServerErrorCode, VoiceUsageRecorder,
+    VoiceWsAccess, WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
 };
 use axum::{
     body::Body,
@@ -44,7 +45,7 @@ use std::io::ErrorKind;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, Notify},
+    sync::{mpsc, Notify, Semaphore},
     task::JoinHandle,
     time::{Duration, Instant},
 };
@@ -910,6 +911,771 @@ async fn readiness_recorder_aggregates_carry_no_subject_material() {
             "readiness JSON leaked subject or credential material"
         );
     }
+}
+
+/// Plan 05's immutable session-token vectors. The secret, the clock, the expected
+/// binding, and every rejection code are read from the file at test time; nothing
+/// here is minted by the verifier under test.
+const SESSION_TOKEN_VECTORS_JSON: &str =
+    include_str!("../../../fixtures/session-token/v1/vectors.json");
+
+#[derive(Deserialize)]
+struct SessionTokenVectors {
+    version: u32,
+    fake_secret_base64: String,
+    clock_unix_seconds: u64,
+    cases: Vec<SessionTokenVectorCase>,
+}
+
+#[derive(Deserialize)]
+struct SessionTokenVectorCase {
+    id: String,
+    token: String,
+    claims: Option<serde_json::Value>,
+    valid: bool,
+    rejection: Option<String>,
+}
+
+fn session_token_vectors() -> SessionTokenVectors {
+    serde_json::from_str(SESSION_TOKEN_VECTORS_JSON).expect("session-token vectors parse")
+}
+
+/// `SERVICE-004`: one strict verifier, proven against every published vector.
+#[test]
+fn session_token_v1_vectors() {
+    let vectors = session_token_vectors();
+    assert_eq!(vectors.version, 1);
+
+    let secret: RedactedSecret = String::from_utf8(
+        STANDARD
+            .decode(&vectors.fake_secret_base64)
+            .expect("fixture secret is base64"),
+    )
+    .expect("fixture secret is textual")
+    .into();
+
+    // The expected binding is the canonical vector's own identity, read from the
+    // file rather than restated here.
+    let canonical = vectors
+        .cases
+        .iter()
+        .find(|case| case.id == "VOICE-TOKEN-VALID-CANONICAL")
+        .and_then(|case| case.claims.as_ref())
+        .expect("canonical vector carries its claims");
+    let expected_user_id = canonical["user_id"].as_str().expect("user_id").to_owned();
+    let expected_study_set_id = canonical["study_set_id"]
+        .as_str()
+        .expect("study_set_id")
+        .to_owned();
+    let expected_session_id = canonical["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    let expected = ExpectedSessionBinding {
+        user_id: &expected_user_id,
+        study_set_id: &expected_study_set_id,
+        session_id: &expected_session_id,
+    };
+
+    for case in &vectors.cases {
+        let outcome = verify_session_token_at(
+            &case.token,
+            &secret,
+            vectors.clock_unix_seconds,
+            Some(expected),
+        );
+        match (case.valid, outcome) {
+            (true, Ok(claims)) => {
+                assert_eq!(
+                    serde_json::to_value(&claims).expect("claims serialize"),
+                    *case.claims.as_ref().expect("valid vector carries claims"),
+                    "{} returned different claims",
+                    case.id
+                );
+                assert_eq!(
+                    format!("{claims:?}"),
+                    "SessionTokenClaims([REDACTED])",
+                    "{} rendered claim values in Debug",
+                    case.id
+                );
+            }
+            (false, Err(error)) => {
+                assert_eq!(
+                    error.code(),
+                    case.rejection.as_deref().expect("rejection code"),
+                    "{} returned the wrong rejection code",
+                    case.id
+                );
+                let rendered = format!("{error:?} {error}");
+                assert!(
+                    !rendered.contains(&case.token) && !rendered.contains(&expected_user_id),
+                    "{} leaked encoded input or claim values",
+                    case.id
+                );
+            }
+            (true, Err(error)) => {
+                panic!("{} should verify, got {}", case.id, error.code())
+            }
+            (false, Ok(_)) => panic!("{} must be rejected", case.id),
+        }
+    }
+
+    // The 60-second expiry grace the old verifier applied is gone: expiry is exact.
+    let canonical_token = &vectors
+        .cases
+        .iter()
+        .find(|case| case.id == "VOICE-TOKEN-VALID-CANONICAL")
+        .expect("canonical vector")
+        .token;
+    let expires_at = canonical["expires_at"].as_u64().expect("expires_at");
+    assert!(verify_session_token_at(canonical_token, &secret, expires_at - 1, None).is_ok());
+    assert_eq!(
+        verify_session_token_at(canonical_token, &secret, expires_at, None)
+            .expect_err("expiry is exclusive")
+            .code(),
+        "expired"
+    );
+    assert_eq!(
+        verify_session_token_at(canonical_token, &secret, expires_at + 59, None)
+            .expect_err("there is no expiry grace window")
+            .code(),
+        "expired"
+    );
+
+    // A wrong secret never reveals more than the coarse signature rejection.
+    assert_eq!(
+        verify_session_token_at(
+            canonical_token,
+            &"viva-fixture-not-the-signing-secret-1".into(),
+            vectors.clock_unix_seconds,
+            None,
+        )
+        .expect_err("a wrong secret cannot verify")
+        .code(),
+        "invalid_signature"
+    );
+}
+
+/// `SERVICE-004`: server-owned observation of the admission ordering. The log
+/// records store operations in the order the socket performed them, so the test
+/// reads the server's own sequence rather than a client-visible side effect.
+#[derive(Default)]
+struct NonceAuditLog {
+    operations: Mutex<Vec<&'static str>>,
+    nonce_calls: AtomicUsize,
+    nonce_successes: AtomicUsize,
+}
+
+impl NonceAuditLog {
+    fn record(&self, operation: &'static str) {
+        self.operations.lock().unwrap().push(operation);
+    }
+
+    fn operations(&self) -> Vec<&'static str> {
+        self.operations.lock().unwrap().clone()
+    }
+}
+
+struct NonceAuditStudyStore {
+    inner: Arc<data::InMemoryStudyStore>,
+    audit: Arc<NonceAuditLog>,
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for NonceAuditStudyStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    async fn claim_session_token_nonce(
+        &self,
+        claim: SessionTokenNonceClaim,
+    ) -> Result<(), PortError> {
+        self.audit.record("claim_session_token_nonce");
+        self.audit.nonce_calls.fetch_add(1, Ordering::SeqCst);
+        let outcome = self.inner.claim_session_token_nonce(claim).await;
+        if outcome.is_ok() {
+            self.audit.nonce_successes.fetch_add(1, Ordering::SeqCst);
+        }
+        outcome
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        self.audit.record("study_context");
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn review_scheduling_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<ReviewSchedulingContextV1, PortError> {
+        self.inner
+            .review_scheduling_context(user_id, study_set_id, concept_id)
+            .await
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        decision: agent_domain::ReviewScheduleDecisionV1,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .persist_review_schedule_decision(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                decision,
+            )
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+}
+
+const NONCE_AUDIT_SECRET: &str = "viva-fixture-session-signing-secret01";
+
+fn nonce_audit_state() -> (AppState, Arc<NonceAuditLog>) {
+    let inner = provider_limiter_test_store();
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner: inner.clone(),
+        audit: audit.clone(),
+    });
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(inner)),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some(NONCE_AUDIT_SECRET.into()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    );
+    (state, audit)
+}
+
+fn nonce_audit_backoff_state(opens: Arc<AtomicUsize>) -> (AppState, Arc<NonceAuditLog>) {
+    let inner = provider_limiter_test_store();
+    let audit = Arc::new(NonceAuditLog::default());
+    let store = Arc::new(NonceAuditStudyStore {
+        inner,
+        audit: audit.clone(),
+    });
+    let state = AppState::with_study_store(
+        Arc::new(OpenRateLimitFailureBrain { opens }),
+        "cartesia_gemini",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some(NONCE_AUDIT_SECRET.into()),
+            allowed_origins: vec![],
+        },
+        4,
+        store,
+    );
+    (state, audit)
+}
+
+fn nonce_audit_token(session_id: &str, nonce: &str) -> String {
+    nonce_audit_token_for("biology-midterm", session_id, nonce)
+}
+
+fn nonce_audit_token_for(study_set_id: &str, session_id: &str, nonce: &str) -> String {
+    signed_session_token(
+        NONCE_AUDIT_SECRET,
+        "user-1",
+        study_set_id,
+        session_id,
+        unix_timestamp_now() + 60,
+        nonce,
+    )
+}
+
+/// The upgrade request the token-only browser client makes: the signed credential
+/// rides in the `bearer.<base64url(token)>` subprotocol entry.
+fn token_only_request(
+    url: &str,
+    token: &str,
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_str(&format!(
+            "viva-voice, bearer.{}",
+            URL_SAFE_NO_PAD.encode(token)
+        ))
+        .expect("subprotocol header is valid"),
+    );
+    request
+}
+
+/// `SERVICE-004`: the preflight never touches the nonce store; the one atomic
+/// claim happens after admission and before any study lookup; and it succeeds at
+/// most once for a given credential.
+#[tokio::test]
+async fn signed_session_nonce_is_claimed_after_admission_and_once_only() {
+    let (state, audit) = nonce_audit_state();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let token = nonce_audit_token("voice-session-1", "nonce-audit-order-1");
+
+    let (mut socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .expect("a verified token opens the socket");
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    assert_eq!(
+        audit.nonce_calls.load(Ordering::SeqCst),
+        0,
+        "the HTTP upgrade must never call the nonce store"
+    );
+
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token("biology-midterm", "voice-session-1", &token)
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let question = read_server_frame(&mut socket).await;
+    assert!(
+        matches!(question, ServerFrame::Event { .. }),
+        "the bound config opens the session, got {question:?}"
+    );
+
+    let operations = audit.operations();
+    let claim_index = operations
+        .iter()
+        .position(|operation| *operation == "claim_session_token_nonce")
+        .expect("the bound config claims the nonce exactly once");
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == "claim_session_token_nonce")
+            .count(),
+        1
+    );
+    if let Some(study_index) = operations
+        .iter()
+        .position(|operation| *operation == "study_context")
+    {
+        assert!(
+            claim_index < study_index,
+            "the nonce claim must precede any study lookup, got {operations:?}"
+        );
+    }
+    assert_eq!(audit.nonce_successes.load(Ordering::SeqCst), 1);
+
+    socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut socket).await;
+
+    // Replaying the same credential is refused, and the store still records one
+    // successful claim in total.
+    let (mut replay, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .expect("the upgrade still verifies the signature");
+    assert_eq!(read_server_frame(&mut replay).await, ServerFrame::ready());
+    replay
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token("biology-midterm", "voice-session-1", &token)
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_server_frames_until_close(&mut replay).await;
+    assert_eq!(
+        audit.nonce_successes.load(Ordering::SeqCst),
+        1,
+        "a replayed credential must not produce a second successful claim"
+    );
+}
+
+/// A provider-backoff denial closes the socket without consuming the nonce, so the
+/// same credential still opens a session once the backoff window has passed. This
+/// is the explicit lease-denial case beside the baseline
+/// `websocket_provider_backoff_denial_does_not_consume_signed_nonce`, which stays.
+#[tokio::test]
+async fn signed_session_nonce_survives_capacity_and_backoff_denial() {
+    let opens = Arc::new(AtomicUsize::new(0));
+    let (state, audit) = nonce_audit_backoff_state(opens.clone());
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let first_token = nonce_audit_token_for(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-audit-backoff-first",
+    );
+    let denied_token = nonce_audit_token_for(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-audit-backoff-denied",
+    );
+
+    let (mut first, _) = connect_async(token_only_request(&url, &first_token))
+        .await
+        .unwrap();
+    assert_ready_provider(&mut first, "cartesia_gemini").await;
+    first
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token(
+                "biology-midterm",
+                "voice-session-1",
+                &first_token,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut first).await,
+        TerminalSessionReason::ProviderRateLimited,
+    );
+    let _ = read_server_frames_until_close(&mut first).await;
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        audit.nonce_successes.load(Ordering::SeqCst),
+        1,
+        "an admitted connection claims its own nonce once"
+    );
+
+    // Inside the backoff window admission is denied before the nonce is touched.
+    let (mut denied, _) = connect_async(token_only_request(&url, &denied_token))
+        .await
+        .unwrap();
+    assert_ready_provider(&mut denied, "cartesia_gemini").await;
+    denied
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token(
+                "chemistry-final",
+                "voice-session-2",
+                &denied_token,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut denied).await,
+        TerminalSessionReason::ProviderRateLimited,
+    );
+    assert_close_code(&mut denied, CloseCode::Policy).await;
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        1,
+        "an active backoff denies before reopening the provider"
+    );
+    assert_eq!(
+        audit.nonce_successes.load(Ordering::SeqCst),
+        1,
+        "a backoff denial must not consume the nonce"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut retry, _) = connect_async(token_only_request(&url, &denied_token))
+        .await
+        .unwrap();
+    assert_ready_provider(&mut retry, "cartesia_gemini").await;
+    retry
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token(
+                "chemistry-final",
+                "voice-session-2",
+                &denied_token,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_terminal_session_phase(
+        read_server_frame(&mut retry).await,
+        TerminalSessionReason::ProviderRateLimited,
+    );
+    let _ = read_server_frames_until_close(&mut retry).await;
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        2,
+        "the denied credential still opens a provider turn after the backoff"
+    );
+    assert_eq!(
+        audit.nonce_successes.load(Ordering::SeqCst),
+        2,
+        "the denied credential was still claimable on the later attempt"
+    );
+}
+
+fn token_only_preflight_state() -> (AppState, Arc<NonceAuditLog>, Arc<Semaphore>) {
+    let (state, audit) = nonce_audit_state();
+    let state = state.with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(4),
+        ..VoiceLimitConfig::default()
+    });
+    let slots = state.session_slots.clone();
+    (state, audit, slots)
+}
+
+/// The upgrade request a trusted service makes: a shared bearer in `Authorization`.
+/// The first bound frame still carries its own signed credential.
+fn service_bearer_request(
+    url: &str,
+    bearer: &str,
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {bearer}")).expect("authorization header is valid"),
+    );
+    request
+}
+
+fn token_only_request_with_protocol(
+    url: &str,
+    protocol: &str,
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_str(protocol).expect("subprotocol header is valid"),
+    );
+    request
+}
+
+/// `SERVICE-004` / `D-07 TOKEN_ONLY_REFRESH` branch `retain-token-only`: in public
+/// token-only mode the signed credential is verified during the HTTP upgrade, so
+/// an unverified upgrade never reaches `Ready`, never takes a session slot or an
+/// IP lease, and never touches the nonce store.
+#[tokio::test]
+async fn token_only_preflight_rejects_unverified_upgrades() {
+    let (state, audit, slots) = token_only_preflight_state();
+    let limits = state.limit_state.clone();
+    let total_slots = slots.available_permits();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let valid = nonce_audit_token("voice-session-1", "nonce-token-only-valid");
+    let expired = signed_session_token(
+        NONCE_AUDIT_SECRET,
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now().saturating_sub(120),
+        "nonce-token-only-expired",
+    );
+    let wrong_secret_token = signed_session_token(
+        "viva-fixture-not-the-signing-secret-1",
+        "user-1",
+        "biology-midterm",
+        "voice-session-1",
+        unix_timestamp_now() + 60,
+        "nonce-token-only-bad-signature",
+    );
+
+    let rejected: Vec<(&str, String)> = vec![
+        ("missing token", "viva-voice".to_owned()),
+        (
+            "wrong subprotocol",
+            format!("viva-audio, session.{}", URL_SAFE_NO_PAD.encode(&valid)),
+        ),
+        (
+            "malformed token",
+            "viva-voice, bearer.not-a-canonical-token".to_owned(),
+        ),
+        (
+            "bad signature",
+            format!(
+                "viva-voice, bearer.{}",
+                URL_SAFE_NO_PAD.encode(&wrong_secret_token)
+            ),
+        ),
+        (
+            "expired token",
+            format!("viva-voice, bearer.{}", URL_SAFE_NO_PAD.encode(&expired)),
+        ),
+    ];
+
+    for (name, protocol) in rejected {
+        match connect_async(token_only_request_with_protocol(&url, &protocol)).await {
+            Ok(_) => panic!("{name} must not upgrade"),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{name} was not rejected with 401"
+            ),
+            Err(other) => panic!("{name} expected HTTP 401, got {other:?}"),
+        }
+        assert_eq!(
+            slots.available_permits(),
+            total_slots,
+            "{name} consumed a session slot"
+        );
+        assert_eq!(
+            limits.ip_lease_count("127.0.0.1"),
+            None,
+            "{name} took an IP lease"
+        );
+        assert_eq!(
+            audit.nonce_calls.load(Ordering::SeqCst),
+            0,
+            "{name} reached the nonce store"
+        );
+    }
+
+    let (mut socket, _) = connect_async(token_only_request(&url, &valid))
+        .await
+        .expect("a verified token upgrades");
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    assert_eq!(audit.nonce_calls.load(Ordering::SeqCst), 0);
+    socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut socket).await;
+}
+
+/// The verified preflight does not consume the nonce: a socket that disconnects
+/// before its bound `session_config` leaves the credential usable exactly once
+/// more, and the attempt after that is refused.
+#[tokio::test]
+async fn token_only_preflight_nonce_is_consumed_once_across_reconnects() {
+    let (state, audit, _slots) = token_only_preflight_state();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let token = nonce_audit_token("voice-session-1", "nonce-token-only-reconnect");
+    let config =
+        session_config_json_with_ids_and_token("biology-midterm", "voice-session-1", &token);
+
+    // 1. Verified upgrade, then disconnect before any bound config.
+    let (mut first, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .expect("a verified token upgrades");
+    assert_eq!(read_server_frame(&mut first).await, ServerFrame::ready());
+    first.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut first).await;
+    assert_eq!(
+        audit.nonce_calls.load(Ordering::SeqCst),
+        0,
+        "an upgrade that never bound a config must not touch the nonce store"
+    );
+
+    // 2. The same credential still opens a session.
+    let (mut second, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .expect("the credential is still usable");
+    assert_eq!(read_server_frame(&mut second).await, ServerFrame::ready());
+    second
+        .send(WsMessage::Text(config.clone().into()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_server_frame(&mut second).await,
+        ServerFrame::Event { .. }
+    ));
+    assert_eq!(audit.nonce_successes.load(Ordering::SeqCst), 1);
+    second.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut second).await;
+
+    // 3. A third attempt with the same credential is a replay.
+    let (mut third, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .expect("the signature still verifies at the upgrade");
+    assert_eq!(read_server_frame(&mut third).await, ServerFrame::ready());
+    third.send(WsMessage::Text(config.into())).await.unwrap();
+    let _ = read_server_frames_until_close(&mut third).await;
+    assert_eq!(
+        audit.nonce_successes.load(Ordering::SeqCst),
+        1,
+        "the nonce store must record exactly one successful claim in total"
+    );
 }
 
 #[tokio::test]
@@ -3116,7 +3882,6 @@ async fn websocket_accepts_signed_session_token_matching_initial_config() {
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let (mut socket, _) = connect_async(url).await.unwrap();
     let token = signed_session_token(
         "session-secret",
         "user-1",
@@ -3125,6 +3890,9 @@ async fn websocket_accepts_signed_session_token_matching_initial_config() {
         unix_timestamp_now() + 60,
         "nonce-valid",
     );
+    let (mut socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
 
     assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
     socket
@@ -3240,7 +4008,7 @@ async fn websocket_failure_control_claim_forces_sanitized_provider_terminal_path
         run_id: "run-control-1",
         control_nonce: "nonce-control-claim",
     });
-    let mut request = url.as_str().into_client_request().unwrap();
+    let mut request = token_only_request(&url, &token);
     request
         .headers_mut()
         .insert("origin", HeaderValue::from_str(origin).unwrap());
@@ -3344,7 +4112,7 @@ async fn websocket_failure_control_provider_error_does_not_backoff_normal_sessio
         run_id: "run-control-backoff-1",
         control_nonce: "nonce-control-claim-backoff",
     });
-    let mut control_request = url.as_str().into_client_request().unwrap();
+    let mut control_request = token_only_request(&url, &control_token);
     control_request
         .headers_mut()
         .insert("origin", HeaderValue::from_str(origin).unwrap());
@@ -3385,7 +4153,9 @@ async fn websocket_failure_control_provider_error_does_not_backoff_normal_sessio
         unix_timestamp_now() + 60,
         "nonce-normal-after-failure-control",
     );
-    let (mut normal_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut normal_socket, _) = connect_async(token_only_request(&url, &normal_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut normal_socket, "cartesia_gemini").await;
     normal_socket
         .send(WsMessage::Text(
@@ -3949,14 +4719,21 @@ async fn websocket_provider_backoff_denial_does_not_consume_signed_nonce() {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-open-backoff-first",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-open-backoff-first",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -3969,12 +4746,16 @@ async fn websocket_provider_backoff_denial_does_not_consume_signed_nonce() {
     assert_close_code(&mut first_socket, CloseCode::Error).await;
     assert_eq!(opens.load(Ordering::SeqCst), 1);
 
-    let retry_session = provider_limiter_session_config(
+    let retry_token = provider_limiter_token(
         "chemistry-final",
         "voice-session-2",
         "nonce-open-backoff-retry",
     );
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let retry_session =
+        session_config_json_with_ids_and_token("chemistry-final", "voice-session-2", &retry_token);
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &retry_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(retry_session.clone().into()))
@@ -3992,7 +4773,9 @@ async fn websocket_provider_backoff_denial_does_not_consume_signed_nonce() {
     );
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let (mut retry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut retry_socket, _) = connect_async(token_only_request(&url, &retry_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut retry_socket, "cartesia_gemini").await;
     retry_socket
         .send(WsMessage::Text(retry_session.into()))
@@ -4029,14 +4812,21 @@ async fn websocket_provider_global_turn_limit_denies_queue_overflow() {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -4074,14 +4864,21 @@ async fn websocket_provider_global_turn_limit_denies_queue_overflow() {
     })
     .await;
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-limiter-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-limiter-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -4249,14 +5046,21 @@ async fn websocket_provider_queue_depth_waits_for_slot_before_forwarding() {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -4290,14 +5094,21 @@ async fn websocket_provider_queue_depth_waits_for_slot_before_forwarding() {
     })
     .await;
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-limiter-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-limiter-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -4455,14 +5266,21 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -4496,14 +5314,21 @@ async fn websocket_provider_queue_cancel_drops_pending_admission_before_forwardi
     })
     .await;
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-limiter-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-limiter-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -4577,14 +5402,21 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -4618,14 +5450,21 @@ async fn websocket_provider_queue_cancel_rearms_pre_answer_idle() {
     })
     .await;
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-limiter-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-limiter-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -4696,14 +5535,21 @@ async fn websocket_provider_queue_arms_turn_cap_while_waiting_for_admission() {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -4737,14 +5583,21 @@ async fn websocket_provider_queue_arms_turn_cap_while_waiting_for_admission() {
     })
     .await;
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-limiter-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-limiter-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -4818,14 +5671,21 @@ async fn websocket_provider_queue_rejects_audio_continuation_without_second_leas
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "cartesia_gemini").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -4859,14 +5719,21 @@ async fn websocket_provider_queue_rejects_audio_continuation_without_second_leas
     })
     .await;
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-limiter-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "cartesia_gemini").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-limiter-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -4930,14 +5797,21 @@ async fn websocket_provider_active_audio_rejects_later_frame_without_second_leas
         return;
     };
 
-    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    let socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-limiter-biology",
+    );
+    let (mut socket, _) = connect_async(token_only_request(&url, &socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut socket, "cartesia_gemini").await;
     socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-limiter-biology",
+                &socket_token,
             )
             .into(),
         ))
@@ -5049,7 +5923,7 @@ async fn websocket_failure_control_cap_is_identity_scoped_across_study_sets() {
         control_nonce: "nonce-control-chemistry-claim",
     });
 
-    let mut biology_request = url.as_str().into_client_request().unwrap();
+    let mut biology_request = token_only_request(&url, &biology_token);
     biology_request
         .headers_mut()
         .insert("origin", HeaderValue::from_str(origin).unwrap());
@@ -5069,7 +5943,7 @@ async fn websocket_failure_control_cap_is_identity_scoped_across_study_sets() {
     })
     .await;
 
-    let mut chemistry_request = url.as_str().into_client_request().unwrap();
+    let mut chemistry_request = token_only_request(&url, &chemistry_token);
     chemistry_request
         .headers_mut()
         .insert("origin", HeaderValue::from_str(origin).unwrap());
@@ -5167,7 +6041,7 @@ async fn websocket_failure_control_still_honors_user_total_session_cap() {
         control_nonce: "nonce-control-user-total-chemistry-claim",
     });
 
-    let mut biology_request = url.as_str().into_client_request().unwrap();
+    let mut biology_request = token_only_request(&url, &biology_token);
     biology_request
         .headers_mut()
         .insert("origin", HeaderValue::from_str(origin).unwrap());
@@ -5187,7 +6061,7 @@ async fn websocket_failure_control_still_honors_user_total_session_cap() {
     })
     .await;
 
-    let mut chemistry_request = url.as_str().into_client_request().unwrap();
+    let mut chemistry_request = token_only_request(&url, &chemistry_token);
     chemistry_request
         .headers_mut()
         .insert("origin", HeaderValue::from_str(origin).unwrap());
@@ -5258,7 +6132,7 @@ async fn websocket_rejects_failure_control_claim_from_wrong_origin_before_brain_
         run_id: "run-origin-1",
         control_nonce: "nonce-origin-claim",
     });
-    let mut request = url.as_str().into_client_request().unwrap();
+    let mut request = token_only_request(&url, &token);
     request
         .headers_mut()
         .insert("origin", HeaderValue::from_static("https://evil.example"));
@@ -5309,7 +6183,9 @@ async fn websocket_rejects_replayed_session_token_before_brain_open() {
         "nonce-replay",
     );
 
-    let (mut first_socket, _) = connect_async(url.clone()).await.unwrap();
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "open_probe").await;
     first_socket
         .send(WsMessage::Text(
@@ -5321,7 +6197,9 @@ async fn websocket_rejects_replayed_session_token_before_brain_open() {
     assert!(opened.load(Ordering::SeqCst));
 
     opened.store(false, Ordering::SeqCst);
-    let (mut replay_socket, _) = connect_async(url).await.unwrap();
+    let (mut replay_socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut replay_socket, "open_probe").await;
     replay_socket
         .send(WsMessage::Text(
@@ -5376,7 +6254,9 @@ async fn websocket_records_nonce_store_errors_without_replay_auth_evidence() {
         unix_timestamp_now() + 60,
         "nonce-store-outage",
     );
-    let (mut socket, _) = connect_async(url).await.unwrap();
+    let (mut socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
 
     assert_ready_provider(&mut socket, "open_probe").await;
     socket
@@ -5439,7 +6319,9 @@ async fn websocket_durable_store_replay_still_reports_session_auth_failure() {
         "nonce-durable-replay",
     );
 
-    let (mut first_socket, _) = connect_async(url.clone()).await.unwrap();
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut first_socket).await else {
         panic!("expected ready frame");
     };
@@ -5454,7 +6336,9 @@ async fn websocket_durable_store_replay_still_reports_session_auth_failure() {
     assert!(opened.load(Ordering::SeqCst));
 
     opened.store(false, Ordering::SeqCst);
-    let (mut replay_socket, _) = connect_async(url).await.unwrap();
+    let (mut replay_socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut replay_socket).await else {
         panic!("expected ready frame");
     };
@@ -5523,7 +6407,9 @@ async fn websocket_nonce_store_failure_emits_durability_degraded_before_brain_op
         "nonce-store-failure",
     );
 
-    let (mut socket, _) = connect_async(url).await.unwrap();
+    let (mut socket, _) = connect_async(token_only_request(&url, &token))
+        .await
+        .unwrap();
     let ServerFrame::Ready { store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
     };
@@ -5592,6 +6478,10 @@ async fn websocket_study_context_store_failure_emits_durability_degraded_before_
 }
 
 #[tokio::test]
+/// `D-07` branch `retain-token-only` moved the token-only rejection to the HTTP
+/// upgrade (`token_only_preflight_rejects_unverified_upgrades`). The per-code
+/// first-frame classification stays reachable behind a service-authenticated
+/// boundary, which is what this probe now exercises.
 async fn websocket_rejects_invalid_session_token_before_brain_open() {
     for (token, expected_code) in [
         (
@@ -5626,7 +6516,7 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
             }),
             "synthetic",
             VoiceWsAccess {
-                required_bearer: None,
+                required_bearer: Some("rest-secret".into()),
                 session_token_secret: Some("session-secret".into()),
                 allowed_origins: vec![],
             },
@@ -5636,7 +6526,9 @@ async fn websocket_rejects_invalid_session_token_before_brain_open() {
         let Some(url) = spawn_server(state).await else {
             return;
         };
-        let (mut socket, _) = connect_async(url).await.unwrap();
+        let (mut socket, _) = connect_async(service_bearer_request(&url, "rest-secret"))
+            .await
+            .unwrap();
 
         assert_ready_provider(&mut socket, "open_probe").await;
         socket
@@ -5710,7 +6602,9 @@ async fn websocket_rejects_token_claim_mismatch_before_brain_open() {
         let Some(url) = spawn_server(state).await else {
             return;
         };
-        let (mut socket, _) = connect_async(url).await.unwrap();
+        let (mut socket, _) = connect_async(token_only_request(&url, &token))
+            .await
+            .unwrap();
 
         assert_ready_provider(&mut socket, "open_probe").await;
         socket
@@ -6988,7 +7882,9 @@ async fn websocket_user_study_set_rejection_releases_user_total_lease() {
         &chemistry_token,
     );
 
-    let (mut biology_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut biology_socket, _) = connect_async(token_only_request(&url, &biology_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut biology_socket, "backpressured_input_probe").await;
     biology_socket
         .send(WsMessage::Text(biology_session.into()))
@@ -7002,7 +7898,10 @@ async fn websocket_user_study_set_rejection_releases_user_total_lease() {
     })
     .await;
 
-    let (mut duplicate_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut duplicate_socket, _) =
+        connect_async(token_only_request(&url, &duplicate_biology_token))
+            .await
+            .unwrap();
     assert_ready_provider(&mut duplicate_socket, "backpressured_input_probe").await;
     duplicate_socket
         .send(WsMessage::Text(duplicate_biology_session.into()))
@@ -7014,7 +7913,9 @@ async fn websocket_user_study_set_rejection_releases_user_total_lease() {
     );
     assert_close_code(&mut duplicate_socket, CloseCode::Policy).await;
 
-    let (mut chemistry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut chemistry_socket, _) = connect_async(token_only_request(&url, &chemistry_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut chemistry_socket, "backpressured_input_probe").await;
     chemistry_socket
         .send(WsMessage::Text(chemistry_session.into()))
@@ -7234,7 +8135,9 @@ async fn websocket_default_limits_allow_different_study_sets_but_reject_duplicat
         &chemistry_token,
     );
 
-    let (mut biology_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut biology_socket, _) = connect_async(token_only_request(&url, &biology_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut biology_socket, "backpressured_input_probe").await;
     biology_socket
         .send(WsMessage::Text(biology_session.into()))
@@ -7248,7 +8151,9 @@ async fn websocket_default_limits_allow_different_study_sets_but_reject_duplicat
     })
     .await;
 
-    let (mut chemistry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut chemistry_socket, _) = connect_async(token_only_request(&url, &chemistry_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut chemistry_socket, "backpressured_input_probe").await;
     chemistry_socket
         .send(WsMessage::Text(chemistry_session.into()))
@@ -7264,7 +8169,10 @@ async fn websocket_default_limits_allow_different_study_sets_but_reject_duplicat
     })
     .await;
 
-    let (mut duplicate_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut duplicate_socket, _) =
+        connect_async(token_only_request(&url, &duplicate_biology_token))
+            .await
+            .unwrap();
     assert_ready_provider(&mut duplicate_socket, "backpressured_input_probe").await;
     duplicate_socket
         .send(WsMessage::Text(duplicate_biology_session.into()))
@@ -7362,7 +8270,9 @@ async fn websocket_user_session_cap_allows_different_study_sets_until_user_total
     let physics_session =
         session_config_json_with_ids_and_token("physics-quiz", "voice-session-3", &physics_token);
 
-    let (mut biology_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut biology_socket, _) = connect_async(token_only_request(&url, &biology_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut biology_socket, "backpressured_input_probe").await;
     biology_socket
         .send(WsMessage::Text(biology_session.into()))
@@ -7376,7 +8286,9 @@ async fn websocket_user_session_cap_allows_different_study_sets_until_user_total
     })
     .await;
 
-    let (mut chemistry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut chemistry_socket, _) = connect_async(token_only_request(&url, &chemistry_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut chemistry_socket, "backpressured_input_probe").await;
     chemistry_socket
         .send(WsMessage::Text(chemistry_session.into()))
@@ -7392,7 +8304,9 @@ async fn websocket_user_session_cap_allows_different_study_sets_until_user_total
     })
     .await;
 
-    let (mut physics_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut physics_socket, _) = connect_async(token_only_request(&url, &physics_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut physics_socket, "backpressured_input_probe").await;
     physics_socket
         .send(WsMessage::Text(physics_session.into()))
@@ -7470,7 +8384,9 @@ async fn websocket_user_session_cap_rejects_different_study_set_above_user_total
         &chemistry_token,
     );
 
-    let (mut biology_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut biology_socket, _) = connect_async(token_only_request(&url, &biology_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut biology_socket, "backpressured_input_probe").await;
     biology_socket
         .send(WsMessage::Text(biology_session.into()))
@@ -7484,7 +8400,9 @@ async fn websocket_user_session_cap_rejects_different_study_set_above_user_total
     })
     .await;
 
-    let (mut chemistry_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let (mut chemistry_socket, _) = connect_async(token_only_request(&url, &chemistry_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut chemistry_socket, "backpressured_input_probe").await;
     chemistry_socket
         .send(WsMessage::Text(chemistry_session.into()))
@@ -7881,14 +8799,21 @@ async fn websocket_provider_slot_releases_on_answer_evaluated() {
         return;
     };
 
-    let (mut first_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let first_socket_token = provider_limiter_token(
+        "biology-midterm",
+        "voice-session-1",
+        "nonce-provider-slot-biology",
+    );
+    let (mut first_socket, _) = connect_async(token_only_request(&url, &first_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut first_socket, "gated_completion_provider_probe").await;
     first_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "biology-midterm",
                 "voice-session-1",
-                "nonce-provider-slot-biology",
+                &first_socket_token,
             )
             .into(),
         ))
@@ -7926,14 +8851,21 @@ async fn websocket_provider_slot_releases_on_answer_evaluated() {
     .expect("first answer evaluation should arrive");
     assert_eq!(text_inputs.load(Ordering::SeqCst), 1);
 
-    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    let second_socket_token = provider_limiter_token(
+        "chemistry-final",
+        "voice-session-2",
+        "nonce-provider-slot-chemistry",
+    );
+    let (mut second_socket, _) = connect_async(token_only_request(&url, &second_socket_token))
+        .await
+        .unwrap();
     assert_ready_provider(&mut second_socket, "gated_completion_provider_probe").await;
     second_socket
         .send(WsMessage::Text(
-            provider_limiter_session_config(
+            session_config_json_with_ids_and_token(
                 "chemistry-final",
                 "voice-session-2",
-                "nonce-provider-slot-chemistry",
+                &second_socket_token,
             )
             .into(),
         ))
@@ -10263,16 +11195,18 @@ fn session_config_json_with_ids_and_token(
     .to_string()
 }
 
-fn provider_limiter_session_config(study_set_id: &str, session_id: &str, nonce: &str) -> String {
-    let token = signed_session_token(
+/// `SERVICE-004`: the provider-limiter sockets are token-only deployments, so the
+/// same signed credential is presented at the HTTP upgrade and in the first bound
+/// frame. Minting it once keeps the two identical.
+fn provider_limiter_token(study_set_id: &str, session_id: &str, nonce: &str) -> String {
+    signed_session_token(
         "session-secret",
         "user-1",
         study_set_id,
         session_id,
         unix_timestamp_now() + 60,
         nonce,
-    );
-    session_config_json_with_ids_and_token(study_set_id, session_id, &token)
+    )
 }
 
 fn signed_session_token(
@@ -10283,10 +11217,13 @@ fn signed_session_token(
     expires_at: u64,
     nonce: &str,
 ) -> String {
+    let issued_at = expires_at.saturating_sub(900);
     let claims = serde_json::json!({
         "user_id": user_id,
         "study_set_id": study_set_id,
         "session_id": session_id,
+        "issued_at": issued_at,
+        "not_before": issued_at,
         "expires_at": expires_at,
         "nonce": nonce,
     });
@@ -10325,10 +11262,13 @@ fn signed_session_token_with_failure_control(fixture: FailureControlTokenFixture
             fixture.control_nonce,
         ),
     });
+    let issued_at = fixture.expires_at.saturating_sub(900);
     let claims = serde_json::json!({
         "user_id": fixture.user_id,
         "study_set_id": fixture.study_set_id,
         "session_id": fixture.session_id,
+        "issued_at": issued_at,
+        "not_before": issued_at,
         "expires_at": fixture.expires_at,
         "nonce": fixture.nonce,
         "failure_control": failure_control,

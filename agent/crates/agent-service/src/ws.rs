@@ -40,8 +40,9 @@ use crate::{
         ProviderQueueBehavior, VoiceLimitLease, VoiceLimitState,
     },
     config::{
-        bac_510_max_turn_duration, FailureControlScenario, RedactedSecret, SessionAuthFailureCode,
-        SessionTokenClaims, TrustedProxyConfig, VoiceLimitConfig, VoiceWsAccessError,
+        authenticate_upgrade, bac_510_max_turn_duration, FailureControlScenario, RedactedSecret,
+        SessionAuthFailureCode, SessionTokenClaims, TrustedProxyConfig, UpgradePrincipal,
+        VoiceLimitConfig, VoiceWsAccessError,
     },
     protocol::{
         ClientFrame, ClientTurnIntent, ServerFrame, VivaServerEvent, VoiceServerErrorCode,
@@ -167,7 +168,7 @@ fn validate_ws_preflight(
             json!({ "error": "voice session draining" }),
         ));
     }
-    if let Err(error) = state.ws_access.validate_headers(headers) {
+    if let Err(error) = state.ws_access.validate_origin(headers) {
         state.evidence.record(VoiceEvidenceEvent::new(
             VoiceEvidenceEventKind::PreflightRejected,
             None,
@@ -175,6 +176,25 @@ fn validate_ws_preflight(
         ));
         return Err(ws_access_error(error));
     }
+    // `SERVICE-004`: the signed access credential is verified here, before a
+    // session slot, an IP lease, or `Ready`. The nonce store is not consulted.
+    let Ok(now) = unix_timestamp_now() else {
+        return Err(VoiceWsRejection::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": "voice session clock unavailable" }),
+        ));
+    };
+    let principal = match authenticate_upgrade(headers, &state.ws_access, now) {
+        Ok(principal) => principal,
+        Err(error) => {
+            state.evidence.record(VoiceEvidenceEvent::new(
+                VoiceEvidenceEventKind::AuthFailure,
+                None,
+                error.to_string(),
+            ));
+            return Err(ws_access_error(error));
+        }
+    };
     // The client address is settled before any resource is acquired, so a chain
     // this deployment cannot attribute never costs a session permit.
     let ip_key = match state.voice_limits.max_ip_sessions {
@@ -234,6 +254,7 @@ fn validate_ws_preflight(
     Ok(VoiceAdmission {
         _permit: permit,
         _ip_lease: ip_lease,
+        principal,
     })
 }
 
@@ -302,7 +323,9 @@ fn request_origin(headers: &HeaderMap) -> Option<String> {
 
 struct VoiceAdmission {
     _permit: OwnedSemaphorePermit,
+    /// `None` only when per-IP limiting is disabled for this deployment.
     _ip_lease: Option<VoiceLimitLease>,
+    principal: UpgradePrincipal,
 }
 
 struct SessionLimitRuntime {
@@ -355,9 +378,10 @@ impl SessionLimitRuntime {
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
-    _admission: VoiceAdmission,
+    admission: VoiceAdmission,
     request_origin: String,
 ) {
+    let principal = admission.principal.clone();
     let (mut sender, mut receiver) = socket.split();
     if send_json(
         &mut sender,
@@ -389,7 +413,7 @@ async fn handle_socket(
         Ok(incoming) => match incoming {
             Some(Ok(message)) => {
                 match initial_session_config_from_message(message).and_then(|config| {
-                    authorize_initial_session_config(config, &state, &request_origin)
+                    authorize_initial_session_config(config, &state, &principal, &request_origin)
                 }) {
                     Ok(config) => config,
                     Err(error) => {
@@ -412,40 +436,6 @@ async fn handle_socket(
     let session_binding = AuthorizedClientSession::from_config(&initial.config)
         .expect("authorized session config has required identity");
     let voice_session_id = initial.config.session_id.as_deref().map(ToOwned::to_owned);
-    let study_context = match validate_study_set_access(&state, &initial.config).await {
-        StudySetAccessResult::Allowed(study_context) => study_context,
-        StudySetAccessResult::Denied(error) => {
-            record_session_auth_failure(&state, voice_session_id.clone(), error.auth_failure_code)
-                .await;
-            let _ = send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
-            let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
-            record_terminal(&state, voice_session_id, error.terminal_reason).await;
-            return;
-        }
-        StudySetAccessResult::DurabilityDegraded => {
-            state.evidence.record(VoiceEvidenceEvent::new(
-                VoiceEvidenceEventKind::StoreCounts,
-                voice_session_id.clone(),
-                "durability_degraded",
-            ));
-            let close_terminal_reason = close_with_terminal_session_phase_only(
-                &mut sender,
-                TerminalSessionReason::DurabilityDegraded,
-                close_code::ERROR,
-            )
-            .await;
-            record_terminal(
-                &state,
-                voice_session_id,
-                terminal_label_after_terminal_phase_close(
-                    TerminalSessionReason::DurabilityDegraded,
-                    close_terminal_reason,
-                ),
-            )
-            .await;
-            return;
-        }
-    };
     let _failure_control_identity_lease = match (
         initial.failure_control,
         state.failure_control.max_sessions_per_identity(),
@@ -578,6 +568,43 @@ async fn handle_socket(
             }
         }
     }
+    // `SERVICE-004`: the single atomic nonce claim above is the last gate before
+    // any study lookup, queueing, or provider input. Moving the lookup here keeps a
+    // replayed credential from reading a study set at all.
+    let study_context = match validate_study_set_access(&state, &initial.config).await {
+        StudySetAccessResult::Allowed(study_context) => study_context,
+        StudySetAccessResult::Denied(error) => {
+            record_session_auth_failure(&state, voice_session_id.clone(), error.auth_failure_code)
+                .await;
+            let _ = send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
+            let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
+            record_terminal(&state, voice_session_id, error.terminal_reason).await;
+            return;
+        }
+        StudySetAccessResult::DurabilityDegraded => {
+            state.evidence.record(VoiceEvidenceEvent::new(
+                VoiceEvidenceEventKind::StoreCounts,
+                voice_session_id.clone(),
+                "durability_degraded",
+            ));
+            let close_terminal_reason = close_with_terminal_session_phase_only(
+                &mut sender,
+                TerminalSessionReason::DurabilityDegraded,
+                close_code::ERROR,
+            )
+            .await;
+            record_terminal(
+                &state,
+                voice_session_id,
+                terminal_label_after_terminal_phase_close(
+                    TerminalSessionReason::DurabilityDegraded,
+                    close_terminal_reason,
+                ),
+            )
+            .await;
+            return;
+        }
+    };
     let mut initial_config = initial.config;
     initial_config.active_concepts = server_active_concepts(&study_context);
     let failure_control = initial.failure_control;
@@ -3512,6 +3539,7 @@ fn sanitize_client_session_config(
 fn authorize_initial_session_config(
     initial: InitialSessionConfig,
     state: &AppState,
+    principal: &UpgradePrincipal,
     request_origin: &str,
 ) -> Result<AuthorizedInitialSessionConfig, ClientFrameError> {
     let mut rotate_trusted_session = false;
@@ -3525,9 +3553,27 @@ fn authorize_initial_session_config(
         let token = initial.session_token.as_deref().ok_or_else(|| {
             ClientFrameError::session_auth_failed(SessionAuthFailureCode::Malformed)
         })?;
-        let claims = SessionTokenClaims::verify(token, secret).map_err(|error| {
-            ClientFrameError::session_auth_failed(SessionAuthFailureCode::from_token_error(&error))
-        })?;
+        // `D-07` branch `retain-token-only`: when the upgrade already verified a
+        // credential, the first frame must present that exact one. It is compared
+        // in constant time and its verified claims are reused; the frame is never
+        // a second chance to present a different credential.
+        let claims = match principal {
+            UpgradePrincipal::TokenOnly(verified) => {
+                if !verified.matches(token) {
+                    return Err(ClientFrameError::session_auth_failed(
+                        SessionAuthFailureCode::IdentityMismatch,
+                    ));
+                }
+                verified.claims().clone()
+            }
+            UpgradePrincipal::ServiceBearer => {
+                SessionTokenClaims::verify(token, secret).map_err(|error| {
+                    ClientFrameError::session_auth_failed(SessionAuthFailureCode::from_token_error(
+                        &error,
+                    ))
+                })?
+            }
+        };
         if let Some(claim) = claims.failure_control.as_ref() {
             failure_control = Some(
                 state

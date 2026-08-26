@@ -708,6 +708,7 @@ impl FailureControlScenario {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FailureControlClaim {
     pub scenario: FailureControlScenario,
     pub run_id: String,
@@ -1161,23 +1162,108 @@ pub struct VoiceWsAccess {
     pub allowed_origins: Vec<String>,
 }
 
-impl VoiceWsAccess {
-    pub fn validate_headers(&self, headers: &HeaderMap) -> Result<(), VoiceWsAccessError> {
-        if !self.allowed_origins.is_empty() {
-            let origin = headers
-                .get("origin")
-                .and_then(|value| value.to_str().ok())
-                .ok_or(VoiceWsAccessError::OriginDenied)?;
-            if !self
-                .allowed_origins
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
-            {
-                return Err(VoiceWsAccessError::OriginDenied);
+/// The credential a verified HTTP upgrade was admitted with.
+///
+/// `D-07 TOKEN_ONLY_REFRESH` branch `retain-token-only` keeps the public
+/// token-only mode, so the signed access credential is verified here — before a
+/// session slot, an IP lease, or `Ready` — and the verified claims are carried
+/// into the socket instead of being re-derived from the first client frame.
+#[derive(Clone)]
+pub struct VerifiedUpgradeToken {
+    encoded: RedactedSecret,
+    claims: SessionTokenClaims,
+}
+
+impl Debug for VerifiedUpgradeToken {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerifiedUpgradeToken([REDACTED])")
+    }
+}
+
+impl VerifiedUpgradeToken {
+    /// Constant-time comparison of the first frame's credential with the one the
+    /// upgrade verified. A frame that presents a different credential is an
+    /// identity mismatch, not a second verification opportunity.
+    pub(crate) fn matches(&self, presented: &str) -> bool {
+        constant_time_eq(self.encoded.as_str().as_bytes(), presented.as_bytes())
+    }
+
+    pub(crate) fn claims(&self) -> &SessionTokenClaims {
+        &self.claims
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum UpgradePrincipal {
+    /// A shared service bearer, or a deployment with no upgrade credential at all
+    /// (trusted loopback). Identity still comes from the first bound frame.
+    ServiceBearer,
+    /// A signed access credential verified during the HTTP upgrade. Boxed so the
+    /// principal stays small enough to move cheaply into every socket task.
+    TokenOnly(Box<VerifiedUpgradeToken>),
+}
+
+/// `SERVICE-004`: the one upgrade authenticator. It never calls the nonce store —
+/// the single atomic claim belongs to the first bound `session_config`.
+pub fn authenticate_upgrade(
+    headers: &HeaderMap,
+    access: &VoiceWsAccess,
+    now_unix_seconds: u64,
+) -> Result<UpgradePrincipal, AccessError> {
+    let presented = bearer_from_headers(headers);
+    if let Some(required) = &access.required_bearer {
+        if let Some(presented) = presented.as_deref() {
+            if constant_time_eq(required.as_str().as_bytes(), presented.as_bytes()) {
+                return Ok(UpgradePrincipal::ServiceBearer);
             }
         }
+    }
+    let Some(secret) = &access.session_token_secret else {
+        return if access.required_bearer.is_some() {
+            Err(match presented {
+                Some(_) => AccessError::InvalidBearer,
+                None => AccessError::MissingBearer,
+            })
+        } else {
+            Ok(UpgradePrincipal::ServiceBearer)
+        };
+    };
+    let Some(presented) = presented else {
+        return Err(AccessError::MissingBearer);
+    };
+    let claims = verify_session_token_at(&presented, secret, now_unix_seconds, None)
+        .map_err(|_| AccessError::InvalidBearer)?;
+    Ok(UpgradePrincipal::TokenOnly(Box::new(
+        VerifiedUpgradeToken {
+            encoded: presented.into(),
+            claims,
+        },
+    )))
+}
 
-        self.validate_ws_bearer_headers(headers)
+impl VoiceWsAccess {
+    pub fn validate_origin(&self, headers: &HeaderMap) -> Result<(), AccessError> {
+        if self.allowed_origins.is_empty() {
+            return Ok(());
+        }
+        let origin = headers
+            .get("origin")
+            .and_then(|value| value.to_str().ok())
+            .ok_or(VoiceWsAccessError::OriginDenied)?;
+        if !self
+            .allowed_origins
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(origin))
+        {
+            return Err(VoiceWsAccessError::OriginDenied);
+        }
+        Ok(())
+    }
+
+    pub fn validate_headers(&self, headers: &HeaderMap) -> Result<(), VoiceWsAccessError> {
+        self.validate_origin(headers)?;
+        let now = unix_timestamp_now().map_err(|_| VoiceWsAccessError::InvalidBearer)?;
+        authenticate_upgrade(headers, self, now).map(|_| ())
     }
 
     pub fn validate_bearer_headers(&self, headers: &HeaderMap) -> Result<(), VoiceWsAccessError> {
@@ -1192,42 +1278,209 @@ impl VoiceWsAccess {
         }
         Err(VoiceWsAccessError::InvalidBearer)
     }
-
-    fn validate_ws_bearer_headers(&self, headers: &HeaderMap) -> Result<(), VoiceWsAccessError> {
-        let Some(required) = &self.required_bearer else {
-            return Ok(());
-        };
-        let Some(provided) = bearer_from_headers(headers) else {
-            return Err(VoiceWsAccessError::MissingBearer);
-        };
-        if constant_time_eq(required.as_str().as_bytes(), provided.as_bytes()) {
-            return Ok(());
-        }
-        if self
-            .session_token_secret
-            .as_ref()
-            .and_then(|secret| SessionTokenClaims::verify(&provided, secret.as_str()).ok())
-            .is_some()
-        {
-            return Ok(());
-        }
-        Err(VoiceWsAccessError::InvalidBearer)
-    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// The signed access credential's claim set.
+///
+/// `Debug` is redacted, so a claim value cannot reach a log, an error, or a
+/// response by accident.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionTokenClaims {
     pub user_id: String,
     pub study_set_id: String,
     pub session_id: String,
+    pub issued_at: u64,
+    pub not_before: u64,
     pub expires_at: u64,
     pub nonce: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_control: Option<FailureControlClaim>,
 }
 
+impl Debug for SessionTokenClaims {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionTokenClaims([REDACTED])")
+    }
+}
+
+/// The identity a caller already knows the token must be bound to. Supplying it
+/// makes the verifier compare, in constant time, rather than making the caller
+/// trust what the token asserts.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ExpectedSessionBinding<'a> {
+    pub user_id: &'a str,
+    pub study_set_id: &'a str,
+    pub session_id: &'a str,
+}
+
+/// The store's nonce-retention grace, published for the `data` crate that mirrors
+/// it. Token verification itself applies no grace window: `expires_at` is exact.
 pub const EXPIRY_CLOCK_SKEW_SECONDS: u64 = 60;
+
+/// The claim names this version of the credential defines. Anything else is an
+/// unknown claim, and a missing one of the first seven is a missing claim.
+const SESSION_TOKEN_CLAIM_NAMES: &[&str] = &[
+    "user_id",
+    "study_set_id",
+    "session_id",
+    "issued_at",
+    "not_before",
+    "expires_at",
+    "nonce",
+    "failure_control",
+];
+const SESSION_TOKEN_REQUIRED_CLAIM_NAMES: &[&str] = &[
+    "user_id",
+    "study_set_id",
+    "session_id",
+    "issued_at",
+    "not_before",
+    "expires_at",
+    "nonce",
+];
+const DUPLICATE_CLAIM_MARKER: &str = "viva-session-token-duplicate-claim";
+
+/// A claim object that rejects a repeated key instead of letting the last one win.
+struct UniqueClaimObject(serde_json::Map<String, serde_json::Value>);
+
+impl<'de> Deserialize<'de> for UniqueClaimObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ObjectVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ObjectVisitor {
+            type Value = UniqueClaimObject;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a session-token claim object")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut claims = serde_json::Map::new();
+                while let Some((name, value)) = access.next_entry::<String, serde_json::Value>()? {
+                    if claims.insert(name, value).is_some() {
+                        return Err(serde::de::Error::custom(DUPLICATE_CLAIM_MARKER));
+                    }
+                }
+                Ok(UniqueClaimObject(claims))
+            }
+        }
+
+        deserializer.deserialize_map(ObjectVisitor)
+    }
+}
+
+/// `SERVICE-004`: the one strict verifier for the signed access credential.
+///
+/// It accepts canonical unpadded base64url only, verifies the HMAC before any
+/// claim is read, rejects unknown, duplicate, and missing claims, requires
+/// `issued_at <= not_before < expires_at` and `not_before <= now < expires_at`,
+/// rejects an empty nonce, and applies `expected` binding when supplied. No
+/// encoded input, claim value, signature, or JSON fragment reaches its errors.
+pub fn verify_session_token_at(
+    encoded: &str,
+    secret: &RedactedSecret,
+    now_unix_seconds: u64,
+    expected: Option<ExpectedSessionBinding<'_>>,
+) -> Result<SessionTokenClaims, SessionTokenError> {
+    if secret.as_str().is_empty() {
+        return Err(SessionTokenError::Invalid);
+    }
+    let mut parts = encoded.split('.');
+    let (Some(prefix), Some(claims_part), Some(signature_part), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(SessionTokenError::Malformed);
+    };
+    if prefix != "viva1" {
+        return Err(SessionTokenError::Malformed);
+    }
+
+    let claims_bytes = decode_canonical_base64url(claims_part)?;
+    let provided_signature = decode_canonical_base64url(signature_part)?;
+    let signed_payload = format!("{prefix}.{claims_part}");
+    let expected_signature = sign_payload(secret.as_str(), signed_payload.as_bytes())?;
+    if !constant_time_eq(&expected_signature, &provided_signature) {
+        return Err(SessionTokenError::Invalid);
+    }
+
+    let claims = decode_session_token_claims(&claims_bytes)?;
+    if claims.issued_at > claims.not_before || claims.not_before >= claims.expires_at {
+        return Err(SessionTokenError::InvalidTimeOrder);
+    }
+    if now_unix_seconds < claims.not_before {
+        return Err(SessionTokenError::NotYetValid);
+    }
+    if now_unix_seconds >= claims.expires_at {
+        return Err(SessionTokenError::Expired);
+    }
+    if let Some(expected) = expected {
+        let bound = constant_time_eq(claims.user_id.as_bytes(), expected.user_id.as_bytes())
+            & constant_time_eq(
+                claims.study_set_id.as_bytes(),
+                expected.study_set_id.as_bytes(),
+            )
+            & constant_time_eq(claims.session_id.as_bytes(), expected.session_id.as_bytes());
+        if !bound {
+            return Err(SessionTokenError::BindingMismatch);
+        }
+    }
+    Ok(claims)
+}
+
+/// Canonical unpadded base64url only. A padded, over-long, or trailing-bit form
+/// decodes to the same bytes under a lenient decoder, so the re-encoding has to
+/// match the input exactly.
+fn decode_canonical_base64url(segment: &str) -> Result<Vec<u8>, SessionTokenError> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(segment)
+        .map_err(|_| SessionTokenError::NoncanonicalBase64Url)?;
+    if URL_SAFE_NO_PAD.encode(&decoded) != segment {
+        return Err(SessionTokenError::NoncanonicalBase64Url);
+    }
+    Ok(decoded)
+}
+
+fn decode_session_token_claims(bytes: &[u8]) -> Result<SessionTokenClaims, SessionTokenError> {
+    let object = serde_json::from_slice::<UniqueClaimObject>(bytes).map_err(|error| {
+        if error.to_string().contains(DUPLICATE_CLAIM_MARKER) {
+            SessionTokenError::DuplicateClaim
+        } else {
+            SessionTokenError::MalformedJson
+        }
+    })?;
+    if object
+        .0
+        .keys()
+        .any(|name| !SESSION_TOKEN_CLAIM_NAMES.contains(&name.as_str()))
+    {
+        return Err(SessionTokenError::UnknownClaim);
+    }
+    if SESSION_TOKEN_REQUIRED_CLAIM_NAMES
+        .iter()
+        .any(|name| !object.0.contains_key(*name))
+    {
+        return Err(SessionTokenError::MissingClaim);
+    }
+    let claims: SessionTokenClaims = serde_json::from_value(serde_json::Value::Object(object.0))
+        .map_err(|error| {
+            if error.to_string().contains("unknown field") {
+                SessionTokenError::UnknownClaim
+            } else {
+                SessionTokenError::MalformedJson
+            }
+        })?;
+    if !claims.has_required_claims() {
+        return Err(SessionTokenError::MissingClaim);
+    }
+    Ok(claims)
+}
 
 impl SessionTokenClaims {
     pub fn sign(&self, secret: &str) -> Result<String, SessionTokenError> {
@@ -1246,44 +1499,7 @@ impl SessionTokenClaims {
     }
 
     fn verify_at(token: &str, secret: &str, now: u64) -> Result<Self, SessionTokenError> {
-        if secret.is_empty() {
-            return Err(SessionTokenError::Invalid);
-        }
-        let mut parts = token.split('.');
-        let Some(prefix) = parts.next() else {
-            return Err(SessionTokenError::Malformed);
-        };
-        let Some(claims_part) = parts.next() else {
-            return Err(SessionTokenError::Malformed);
-        };
-        let Some(signature_part) = parts.next() else {
-            return Err(SessionTokenError::Malformed);
-        };
-        if parts.next().is_some() || prefix != "viva1" {
-            return Err(SessionTokenError::Malformed);
-        }
-
-        let signed_payload = format!("{prefix}.{claims_part}");
-        let provided_signature = URL_SAFE_NO_PAD
-            .decode(signature_part)
-            .map_err(|_| SessionTokenError::Malformed)?;
-        let expected_signature = sign_payload(secret, signed_payload.as_bytes())?;
-        if !constant_time_eq(&expected_signature, &provided_signature) {
-            return Err(SessionTokenError::Invalid);
-        }
-
-        let claims_bytes = URL_SAFE_NO_PAD
-            .decode(claims_part)
-            .map_err(|_| SessionTokenError::Malformed)?;
-        let claims: Self =
-            serde_json::from_slice(&claims_bytes).map_err(|_| SessionTokenError::Malformed)?;
-        if !claims.has_required_claims() {
-            return Err(SessionTokenError::Malformed);
-        }
-        if claims.expires_at.saturating_add(EXPIRY_CLOCK_SKEW_SECONDS) < now {
-            return Err(SessionTokenError::Expired);
-        }
-        Ok(claims)
+        verify_session_token_at(token, &RedactedSecret::from(secret), now, None)
     }
 
     fn has_required_claims(&self) -> bool {
@@ -1303,7 +1519,9 @@ impl SessionTokenClaims {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+/// Every rejection this verifier can return. The `code` strings are the exact
+/// values Plan 05's `session-token/v1` vectors publish.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SessionTokenError {
     #[error("malformed session token")]
     Malformed,
@@ -1311,6 +1529,40 @@ pub enum SessionTokenError {
     Invalid,
     #[error("expired session token")]
     Expired,
+    #[error("session token encoding is not canonical")]
+    NoncanonicalBase64Url,
+    #[error("session token carries an unknown claim")]
+    UnknownClaim,
+    #[error("session token claims are not valid JSON")]
+    MalformedJson,
+    #[error("session token repeats a claim")]
+    DuplicateClaim,
+    #[error("session token is missing a required claim")]
+    MissingClaim,
+    #[error("session token is not valid yet")]
+    NotYetValid,
+    #[error("session token times are out of order")]
+    InvalidTimeOrder,
+    #[error("session token is bound to a different identity")]
+    BindingMismatch,
+}
+
+impl SessionTokenError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed_shape",
+            Self::Invalid => "invalid_signature",
+            Self::Expired => "expired",
+            Self::NoncanonicalBase64Url => "noncanonical_base64url",
+            Self::UnknownClaim => "unknown_claim",
+            Self::MalformedJson => "malformed_json",
+            Self::DuplicateClaim => "duplicate_claim",
+            Self::MissingClaim => "missing_claim",
+            Self::NotYetValid => "not_yet_valid",
+            Self::InvalidTimeOrder => "invalid_time_order",
+            Self::BindingMismatch => "binding_mismatch",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1326,9 +1578,19 @@ pub enum SessionAuthFailureCode {
 impl SessionAuthFailureCode {
     pub fn from_token_error(error: &SessionTokenError) -> Self {
         match error {
+            // Only a genuinely expired credential is recoverable by retrying with
+            // a freshly minted one; every other rejection stays terminal.
             SessionTokenError::Expired => Self::Expired,
-            SessionTokenError::Malformed => Self::Malformed,
             SessionTokenError::Invalid => Self::InvalidSignature,
+            SessionTokenError::BindingMismatch => Self::IdentityMismatch,
+            SessionTokenError::Malformed
+            | SessionTokenError::NoncanonicalBase64Url
+            | SessionTokenError::UnknownClaim
+            | SessionTokenError::MalformedJson
+            | SessionTokenError::DuplicateClaim
+            | SessionTokenError::MissingClaim
+            | SessionTokenError::NotYetValid
+            | SessionTokenError::InvalidTimeOrder => Self::Malformed,
         }
     }
 
@@ -1470,11 +1732,14 @@ mod tests {
             session_token_secret: Some("session-secret".into()),
             allowed_origins: vec!["https://web.example".to_owned()],
         };
+        let issued_at = unix_timestamp_now().expect("time should be available");
         let token = SessionTokenClaims {
             user_id: "user-1".to_owned(),
             study_set_id: "biology-midterm".to_owned(),
             session_id: "voice-session-1".to_owned(),
-            expires_at: unix_timestamp_now().expect("time should be available") + 60,
+            issued_at,
+            not_before: issued_at,
+            expires_at: issued_at + 60,
             nonce: "nonce-1".to_owned(),
             failure_control: None,
         }
@@ -1936,6 +2201,8 @@ mod tests {
             user_id: "user-1".to_owned(),
             study_set_id: "biology-midterm".to_owned(),
             session_id: "voice-session-1".to_owned(),
+            issued_at: 40,
+            not_before: 40,
             expires_at: 100,
             nonce: "nonce-1".to_owned(),
             failure_control: None,
@@ -1951,20 +2218,22 @@ mod tests {
             Err(SessionTokenError::Invalid)
         );
         assert_eq!(
+            SessionTokenClaims::verify_at(&token, "secret", 39),
+            Err(SessionTokenError::NotYetValid)
+        );
+        // `SERVICE-004` removed the hidden 60-second grace: `expires_at` is exact
+        // and exclusive.
+        assert_eq!(
             SessionTokenClaims::verify_at(&token, "secret", 100),
-            Ok(claims.clone())
+            Err(SessionTokenError::Expired)
         );
         assert_eq!(
             SessionTokenClaims::verify_at(&token, "secret", 160),
-            Ok(claims.clone())
-        );
-        assert_eq!(
-            SessionTokenClaims::verify_at(&token, "secret", 161),
             Err(SessionTokenError::Expired)
         );
         assert_eq!(
             SessionTokenClaims::verify_at("viva1.not-json.not-signature", "secret", 99),
-            Err(SessionTokenError::Malformed)
+            Err(SessionTokenError::NoncanonicalBase64Url)
         );
         assert_eq!(
             SessionTokenClaims::verify_at("not-a-viva-token", "secret", 99),
@@ -1974,6 +2243,8 @@ mod tests {
             "user_id": "",
             "study_set_id": "biology-midterm",
             "session_id": "voice-session-1",
+            "issued_at": 40,
+            "not_before": 40,
             "expires_at": 100,
             "nonce": "nonce-1",
         });
@@ -1985,7 +2256,12 @@ mod tests {
         let signed_malformed_claims = format!("{malformed_payload}.{malformed_signature}");
         assert_eq!(
             SessionTokenClaims::verify_at(&signed_malformed_claims, "secret", 99),
-            Err(SessionTokenError::Malformed)
+            Err(SessionTokenError::MissingClaim)
+        );
+        assert_eq!(
+            format!("{claims:?}"),
+            "SessionTokenClaims([REDACTED])",
+            "claim values must never render"
         );
     }
 

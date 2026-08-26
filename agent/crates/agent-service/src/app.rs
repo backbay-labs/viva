@@ -2319,11 +2319,14 @@ fn signed_session_token_for(
     secret: &str,
     failure_control: Option<FailureControlClaim>,
 ) -> Result<String, crate::config::SessionTokenError> {
-    let expires_at = unix_timestamp_now().unwrap_or(0) + 15 * 60;
+    let issued_at = unix_timestamp_now().unwrap_or(0);
+    let expires_at = issued_at + 15 * 60;
     SessionTokenClaims {
         user_id: user_id.to_owned(),
         study_set_id: study_set_id.to_owned(),
         session_id: session_id.to_owned(),
+        issued_at,
+        not_before: issued_at,
         expires_at,
         nonce: Uuid::new_v4().to_string(),
         failure_control,
