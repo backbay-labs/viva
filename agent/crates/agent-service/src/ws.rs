@@ -2249,6 +2249,8 @@ enum TurnBindingError {
     MissingTurn,
     #[error("response id has no turn binding")]
     MissingResponse,
+    #[error("more than one open submission could own this resolution")]
+    AmbiguousTurn,
 }
 
 /// `SERVICE-014`: the socket's own record of which wire turn each provider
@@ -2308,6 +2310,28 @@ impl TurnBindingTracker {
             .get(response_id)
             .map(String::as_str)
             .ok_or(TurnBindingError::MissingTurn)
+    }
+
+    /// Bind a resolution for a response identity this socket never announced.
+    ///
+    /// A provider may resolve a turn it never opened a question for: the runner
+    /// re-keys a first turn's response identity by the client generation of the
+    /// answer it is resolving, without a second `question_started`. The socket
+    /// still owes that resolution a wire turn, and it has exactly one piece of
+    /// evidence to offer — an open submission that nothing else can claim. So
+    /// the binding is allowed only when there is exactly one open submission.
+    /// Two or more make the resolution ambiguous and it fails closed: guessing
+    /// the oldest would spend a *different* submission's turn identity on it.
+    /// Nothing is ever minted here, and a refusal consumes nothing.
+    fn bind_unannounced_deferral(&mut self, response_id: &str) -> Result<&str, TurnBindingError> {
+        if self.response_to_turn.contains_key(response_id) {
+            return Err(TurnBindingError::DuplicateResponse);
+        }
+        match self.pending_turn_ids.len() {
+            0 => Err(TurnBindingError::MissingTurn),
+            1 => self.bind_question(response_id),
+            _ => Err(TurnBindingError::AmbiguousTurn),
+        }
     }
 
     fn turn_for_response(&self, response_id: &str) -> Result<&str, TurnBindingError> {
@@ -2701,9 +2725,9 @@ where
             // A provider may resolve a turn it never announced: the runner re-keys
             // a first turn's response identity by the client generation of the
             // answer it is resolving, without a second `question_started`. That
-            // turn is still one this socket admitted, so the oldest admitted turn
-            // id is bound here under the same oldest-first rule `bind_question`
-            // uses. Nothing is minted: with no admitted turn left to bind, the
+            // resolution is bindable only when a single open submission can own
+            // it; anything ambiguous, absent, or already bound fails closed and
+            // consumes nothing. Nothing is minted: with no bindable turn the
             // mapping below produces `VOICE_PROTOCOL_INVARIANT` and no frame at
             // all rather than a fabricated or borrowed id.
             if context
@@ -2711,7 +2735,7 @@ where
                 .turn_for_response(response_id)
                 .is_err()
             {
-                let _ = context.turn_bindings.bind_question(response_id);
+                let _ = context.turn_bindings.bind_unannounced_deferral(response_id);
             }
             map_turn_deferred(&event, context.turn_bindings).ok()
         }
@@ -6498,6 +6522,102 @@ mod tests {
 
         assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::Invariant);
         assert_eq!(diagnostic.path, "$.event.type");
+    }
+
+    /// `SERVICE-014`: a provider may resolve a turn it never announced — the
+    /// runner re-keys a first turn's response identity by the client generation
+    /// of the answer it is resolving, with no second `question_started`. That
+    /// deferral is bindable only when the socket has exactly one unresolved
+    /// submission, because only then is there a single candidate it can belong
+    /// to. One submission binds it; nothing is minted.
+    #[test]
+    fn turn_deferred_binding_accepts_an_unannounced_deferral_with_one_open_submission() {
+        let mut tracker = TurnBindingTracker::default();
+        tracker.register_submission("turn-a".to_owned()).unwrap();
+
+        assert_eq!(
+            tracker
+                .bind_unannounced_deferral("response-1-generation-rekeyed")
+                .unwrap(),
+            "turn-a"
+        );
+        assert_eq!(
+            tracker
+                .turn_for_response("response-1-generation-rekeyed")
+                .unwrap(),
+            "turn-a"
+        );
+    }
+
+    /// Two open submissions make the same deferral ambiguous, and an ambiguous
+    /// binding fails closed: the socket refuses rather than consuming whichever
+    /// submission happens to be oldest. Nothing is consumed, so both submissions
+    /// are still bindable by their own `question_started`.
+    #[test]
+    fn turn_deferred_binding_refuses_an_ambiguous_unannounced_deferral() {
+        let mut tracker = TurnBindingTracker::default();
+        tracker.register_submission("turn-a".to_owned()).unwrap();
+        tracker.register_submission("turn-b".to_owned()).unwrap();
+
+        assert_eq!(
+            tracker
+                .bind_unannounced_deferral("response-never-announced")
+                .map(ToOwned::to_owned),
+            Err(TurnBindingError::AmbiguousTurn)
+        );
+
+        assert_eq!(tracker.bind_question("response-a").unwrap(), "turn-a");
+        assert_eq!(tracker.bind_question("response-b").unwrap(), "turn-b");
+        assert_eq!(
+            tracker.turn_for_response("response-never-announced"),
+            Err(TurnBindingError::MissingResponse)
+        );
+    }
+
+    /// With no open submission there is nothing to bind, and with an already
+    /// bound response there is nothing to rebind. Both fail closed.
+    #[test]
+    fn turn_deferred_binding_refuses_an_unbindable_unannounced_deferral() {
+        let mut empty = TurnBindingTracker::default();
+        assert_eq!(
+            empty
+                .bind_unannounced_deferral("response-never-announced")
+                .map(ToOwned::to_owned),
+            Err(TurnBindingError::MissingTurn)
+        );
+
+        let mut bound = bound_tracker(&[("turn-1", "response-1")]);
+        bound.register_submission("turn-2".to_owned()).unwrap();
+        assert_eq!(
+            bound
+                .bind_unannounced_deferral("response-1")
+                .map(ToOwned::to_owned),
+            Err(TurnBindingError::DuplicateResponse)
+        );
+        // The open submission survives the refusal.
+        assert_eq!(bound.bind_question("response-2").unwrap(), "turn-2");
+    }
+
+    /// The ambiguous case, end to end through the mapper: no binding means no
+    /// `turn_deferred` frame and a `VOICE_PROTOCOL_INVARIANT` diagnostic, never
+    /// a frame naming a turn the deferral was not shown to belong to.
+    #[test]
+    fn turn_deferred_ambiguous_binding_maps_to_an_invariant_and_no_frame() {
+        let mut tracker = TurnBindingTracker::default();
+        tracker.register_submission("turn-a".to_owned()).unwrap();
+        tracker.register_submission("turn-b".to_owned()).unwrap();
+        let event = deferred_event(
+            "response-never-announced",
+            "question-1",
+            agent_domain::EvaluationDeferralReason::EvaluatorUnavailable,
+            true,
+        );
+
+        let _ = tracker.bind_unannounced_deferral("response-never-announced");
+        let diagnostic = map_turn_deferred(&event, &tracker).expect_err("ambiguous binding");
+
+        assert_eq!(diagnostic.code, VoiceProtocolDiagnosticCode::Invariant);
+        assert_eq!(diagnostic.path, "$.event.turn_id");
     }
 
     #[derive(Deserialize)]

@@ -16714,6 +16714,309 @@ async fn turn_deferred_store_failure_emits_no_learner_fact() {
     assert!(!calls.contains(&"record_recap"), "{calls:?}");
 }
 
+/// A provider that persists its outcome through Plan 07's durable port and then
+/// resolves a response identity it never announced, while **two** client
+/// submissions are open. Nothing on the wire says which of the two the deferral
+/// belongs to, so the socket must refuse to name either.
+struct AmbiguousDeferralProbeBrain {
+    study_store: Arc<dyn StudyMemoryStore>,
+}
+
+const AMBIGUOUS_DEFERRAL_RESPONSE_ID: &str = "response-1-generation-rekeyed-by-the-provider";
+
+#[async_trait::async_trait]
+impl RealtimeBrain for AmbiguousDeferralProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "ambiguous_deferral_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(&self, config: SessionConfig) -> Result<RealtimeSession, BrainError> {
+        let _outcome = self
+            .study_store
+            .record_voice_session(&config)
+            .await
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
+        let store = self.study_store.clone();
+        let user_id = config.user_id.clone().unwrap_or_default();
+        let study_set_id = config.study_set_id.clone().unwrap_or_default();
+        let voice_session_id = config
+            .session_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = event_tx
+                .send(BrainEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                })
+                .await;
+            let question = agent_domain::fixture_question();
+            let question_id = question.question_id.clone();
+            let _ = event_tx
+                .send(BrainEvent::QuestionStarted {
+                    response_id: "response-1".to_owned(),
+                    question: question.clone(),
+                })
+                .await;
+            let mut answers = 0_u32;
+            while let Some(input) = input_rx.recv().await {
+                if !matches!(
+                    input,
+                    BrainInput::Text(_)
+                        | BrainInput::TextWithMetadata { .. }
+                        | BrainInput::Audio(_)
+                        | BrainInput::AudioWithMetadata { .. }
+                ) {
+                    continue;
+                }
+                answers += 1;
+                // The deferral is emitted only once BOTH submissions are open,
+                // so the ambiguity is a property of the test, not of a race.
+                if answers < 2 {
+                    // The announced question resolves, which frees the socket to
+                    // admit a second submission. `response_completed` carries no
+                    // browser frame of its own, so a `feedback` phase follows it
+                    // as the marker the client waits on before speaking again —
+                    // that keeps the second submission out of a race with the
+                    // first turn's admission.
+                    let _ = event_tx
+                        .send(BrainEvent::ResponseCompleted {
+                            response_id: "response-1".to_owned(),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(BrainEvent::SessionPhase {
+                            phase: agent_domain::StudySessionPhase::Feedback,
+                        })
+                        .await;
+                    continue;
+                }
+                // Plan 07's real durable path: the outcome is persisted before
+                // any learner-visible event derived from it is emitted.
+                let outcome = agent_domain::TurnOutcome {
+                    schema: agent_domain::learning_outcome::VIVA_TURN_OUTCOME_SCHEMA.to_owned(),
+                    response_id: AMBIGUOUS_DEFERRAL_RESPONSE_ID.to_owned(),
+                    question_id: question_id.clone(),
+                    rubric_policy_version: "viva.rubric.v1".to_owned(),
+                    recorded_at: "2026-08-24T00:00:00Z".to_owned(),
+                    source_ids: vec![],
+                    supersedes_response_id: None,
+                    resolution: agent_domain::TurnResolution::Deferred {
+                        reason: agent_domain::EvaluationDeferralReason::EvaluatorUnavailable,
+                        can_retry_same_question: true,
+                        disposition: agent_domain::QuestionDisposition::RetryCurrent,
+                    },
+                };
+                if store
+                    .record_turn_outcome(&user_id, &study_set_id, &voice_session_id, outcome)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                let _ = event_tx
+                    .send(BrainEvent::TurnDeferred {
+                        response_id: AMBIGUOUS_DEFERRAL_RESPONSE_ID.to_owned(),
+                        question_id: question_id.clone(),
+                        reason: agent_domain::EvaluationDeferralReason::EvaluatorUnavailable,
+                        can_retry_same_question: true,
+                    })
+                    .await;
+                // A later announced question is the probe for what the refused
+                // deferral did to the socket's ledger: it must still find the
+                // oldest open submission waiting for it.
+                let _ = event_tx
+                    .send(BrainEvent::QuestionStarted {
+                        response_id: "response-2".to_owned(),
+                        question: question.clone(),
+                    })
+                    .await;
+            }
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+/// `SERVICE-014`: missing and ambiguous turn bindings fail closed.
+///
+/// The provider persists a real deferred outcome and then resolves a response
+/// identity this socket never announced, with two client submissions open. The
+/// oldest open submission is not evidence that the deferral belongs to it, so
+/// the socket must emit no `turn_deferred` frame at all rather than name a turn
+/// it cannot show the deferral belongs to — and it must not consume that turn's
+/// binding either, which is the harm a silent oldest-first guess causes: the
+/// next announced question would then be bound to the wrong submission.
+#[tokio::test]
+async fn turn_deferred_ambiguous_binding_emits_no_frame_and_consumes_no_submission() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(TurnOutcomeAuditStore::new(inner, false));
+    let state_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let brain_store: Arc<dyn StudyMemoryStore> = store.clone();
+    let state = AppState::with_study_store(
+        Arc::new(AmbiguousDeferralProbeBrain {
+            study_store: brain_store,
+        }),
+        "ambiguous_deferral_probe",
+        VoiceWsAccess::default(),
+        2,
+        state_store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(10),
+        between_turn_idle: Duration::from_secs(10),
+        session: Duration::from_secs(20),
+        ..WsTimeouts::default()
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "ambiguous_deferral_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+
+    let announced_turn_id = loop {
+        let frame = read_server_frame(&mut socket).await;
+        if let ServerFrame::Event { event, .. } = &frame {
+            if let VivaServerEvent::QuestionStarted { turn_id, .. } = event.as_ref() {
+                break turn_id.clone();
+            }
+        }
+    };
+
+    // Two open client submissions, neither of which the provider ever announced
+    // a question for: the client names its own turn ids, the way a streamed
+    // audio turn does. The second is sent only after the first has resolved, so
+    // it is admitted rather than refused as an overlapping turn.
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-ambiguous-a".to_owned(),
+            turn_id: "turn-a".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "an answer submitted as turn-a".to_owned(),
+            },
+        },
+    )
+    .await;
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    VivaServerEvent::SessionPhase { phase, .. }
+                        if *phase == agent_domain::StudySessionPhase::Feedback
+                )
+        ) {
+            break;
+        }
+    }
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-ambiguous-b".to_owned(),
+            turn_id: "turn-b".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "an answer submitted as turn-b".to_owned(),
+            },
+        },
+    )
+    .await;
+
+    // Read until the provider's next announced question, which is emitted right
+    // after the refused deferral, or until the socket ends.
+    let mut frames = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        let Ok(Some(Ok(message))) =
+            tokio::time::timeout(Duration::from_secs(2), socket.next()).await
+        else {
+            break;
+        };
+        match message {
+            WsMessage::Text(text) => {
+                let frame: ServerFrame = serde_json::from_str(&text).unwrap();
+                let stop = matches!(
+                    &frame,
+                    ServerFrame::Event { event, .. }
+                        if matches!(
+                            event.as_ref(),
+                            VivaServerEvent::QuestionStarted { response_id, .. }
+                                if response_id == "response-2"
+                        )
+                ) || terminal_session_reason(&frame).is_some();
+                frames.push(frame);
+                if stop {
+                    break;
+                }
+            }
+            WsMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    // The durable outcome was written: this is a binding refusal, not a missing
+    // provider result.
+    assert!(
+        store.calls().contains(&"record_turn_outcome"),
+        "the probe must have persisted its outcome: {:?}",
+        store.calls()
+    );
+    let deferrals = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            ServerFrame::Event { event, .. } => match event.as_ref() {
+                VivaServerEvent::TurnDeferred { turn_id, .. } => Some(turn_id.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        deferrals.is_empty(),
+        "an ambiguous deferral must name no turn at all, got {deferrals:?} \
+         (open submissions were turn-a and turn-b; the announced turn was {announced_turn_id})"
+    );
+
+    // Nothing was consumed: the next announced question still finds the oldest
+    // open submission. A silent oldest-first guess would have spent `turn-a` on
+    // the refused deferral and bound this question to `turn-b`.
+    let next_question_turn_id = frames
+        .iter()
+        .find_map(|frame| match frame {
+            ServerFrame::Event { event, .. } => match event.as_ref() {
+                VivaServerEvent::QuestionStarted {
+                    turn_id,
+                    response_id,
+                    ..
+                } if response_id == "response-2" => Some(turn_id.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the provider's next announced question");
+    assert_eq!(
+        next_question_turn_id, "turn-a",
+        "the refused deferral must not have consumed an open submission: {frames:?}"
+    );
+}
+
 /// A provider that finishes one turn and then says nothing. The socket must be
 /// returned to the between-turn deadline rather than left alive until the
 /// six-hour absolute session cap.
