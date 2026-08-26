@@ -772,6 +772,9 @@ describe("Viva library proxy", () => {
         stage: "pre_loop",
         terminal_reason: "pre_loop_ingestion_unavailable",
       });
+      // LIBRARY_READ_BEARER is both the credential this path sends and the credential the
+      // upstream body echoes back, so it is the string that proves the sanitizer held.
+      expect(JSON.stringify(body)).not.toContain(LIBRARY_READ_BEARER);
       expect(JSON.stringify(body)).not.toContain("viva-fixture-legacy-rest-bearer");
       expect(JSON.stringify(body)).not.toContain("agent.test");
       expect(JSON.stringify(body)).not.toContain('"session_token"');
@@ -822,6 +825,9 @@ describe("Viva library proxy", () => {
         stage: "pre_loop",
         terminal_reason: "pre_loop_ingestion_unavailable",
       });
+      // Same leak source as the snapshot-error case above: the scoped read bearer this path
+      // actually sends, echoed back by the upstream body.
+      expect(JSON.stringify(body)).not.toContain(LIBRARY_READ_BEARER);
       expect(JSON.stringify(body)).not.toContain("viva-fixture-legacy-rest-bearer");
       expect(JSON.stringify(body)).not.toContain("agent.test");
       expect(JSON.stringify(body)).not.toContain('"session_token"');

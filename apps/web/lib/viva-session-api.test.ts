@@ -140,6 +140,9 @@ describe("Viva same-origin session API", () => {
       token_refresh_outcome: "issued",
     });
     const serialized = JSON.stringify(body);
+    // The credential this path actually sends upstream is the scoped mint bearer asserted above,
+    // so that is the string whose absence proves nothing leaked back to the browser.
+    expect(serialized).not.toContain(SCOPED_SESSION_MINT_BEARER);
     expect(serialized).not.toContain("viva-fixture-legacy-rest-bearer");
     expect(serialized).not.toContain("agent.example");
   });
@@ -204,7 +207,7 @@ describe("Viva same-origin session API", () => {
       }
       return new Promise<Response>((_resolve, reject) => {
         observedSignal?.addEventListener("abort", () => {
-          reject(new Error("raw upstream timeout with bearer viva-fixture-legacy-rest-bearer"));
+          reject(new Error(`raw upstream timeout with bearer ${SCOPED_SESSION_MINT_BEARER}`));
         });
       });
     }) as typeof fetch;
@@ -223,6 +226,7 @@ describe("Viva same-origin session API", () => {
       terminal_reason: "pre_loop_session_unavailable",
       token_refresh_outcome: "failed",
     });
+    expect(JSON.stringify(body)).not.toContain(SCOPED_SESSION_MINT_BEARER);
     expect(JSON.stringify(body)).not.toContain("viva-fixture-legacy-rest-bearer");
   });
 
@@ -240,8 +244,7 @@ describe("Viva same-origin session API", () => {
       return new Promise<Response>((_resolve, reject) => {
         observedSignal?.addEventListener(
           "abort",
-          () =>
-            reject(new Error("raw upstream timeout with bearer viva-fixture-legacy-rest-bearer")),
+          () => reject(new Error(`raw upstream timeout with bearer ${SCOPED_SESSION_MINT_BEARER}`)),
           { once: true },
         );
       });
@@ -263,6 +266,7 @@ describe("Viva same-origin session API", () => {
         terminal_reason: "pre_loop_session_unavailable",
         token_refresh_outcome: "failed",
       });
+      expect(JSON.stringify(body)).not.toContain(SCOPED_SESSION_MINT_BEARER);
       expect(JSON.stringify(body)).not.toContain("viva-fixture-legacy-rest-bearer");
     } finally {
       globalThis.setTimeout = originalSetTimeout;
@@ -276,7 +280,7 @@ describe("Viva same-origin session API", () => {
       observedSignal = init?.signal ?? undefined;
       return hangingJsonResponse(
         observedSignal,
-        "raw stalled library body with bearer viva-fixture-legacy-rest-bearer",
+        `raw stalled library body with bearer ${SCOPED_SESSION_MINT_BEARER}`,
       );
     }) as typeof fetch;
 
@@ -295,6 +299,7 @@ describe("Viva same-origin session API", () => {
       terminal_reason: "pre_loop_session_unavailable",
       token_refresh_outcome: "failed",
     });
+    expect(JSON.stringify(body)).not.toContain(SCOPED_SESSION_MINT_BEARER);
     expect(JSON.stringify(body)).not.toContain("viva-fixture-legacy-rest-bearer");
   });
 
