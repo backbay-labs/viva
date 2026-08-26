@@ -4523,7 +4523,7 @@ mod tests {
     #[tokio::test]
     async fn sonic_two_turns_use_one_socket_and_distinct_contexts() {
         let store = two_question_seeded_store();
-        let transports = SessionScopedSonicTransports::new(false);
+        let transports = SessionScopedSonicTransports::new(SonicSocketLifetime::Healthy);
         let runner = CartesiaGeminiRunner::scripted(
             CartesiaGeminiConfig::default(),
             transports.clone(),
@@ -4573,7 +4573,7 @@ mod tests {
     #[tokio::test]
     async fn provider_connections_are_session_scoped_and_closed_on_stop() {
         let store = two_question_seeded_store();
-        let transports = SessionScopedSonicTransports::new(false);
+        let transports = SessionScopedSonicTransports::new(SonicSocketLifetime::Healthy);
         let runner = CartesiaGeminiRunner::scripted(
             CartesiaGeminiConfig::default(),
             transports.clone(),
@@ -4658,7 +4658,7 @@ mod tests {
     async fn dead_provider_socket_is_not_returned_to_the_next_turn() {
         let store = two_question_seeded_store();
         // The provider closes the first connection as soon as response-1 ends.
-        let transports = SessionScopedSonicTransports::new(true);
+        let transports = SessionScopedSonicTransports::new(SonicSocketLifetime::ClosesAndReportsIt);
         let runner = CartesiaGeminiRunner::scripted(
             CartesiaGeminiConfig::default(),
             transports.clone(),
@@ -4694,6 +4694,80 @@ mod tests {
         );
     }
 
+    /// Task 4 (`ADAPTER-04`) health control: connection reuse must not turn a
+    /// routine provider hang-up into a dead learner turn.
+    ///
+    /// Cartesia closes idle STT/TTS sockets at documented limits, and a
+    /// peer-initiated close that happens between turns is invisible to a socket
+    /// that is not reading: `is_open()` sampled at the end of the previous
+    /// context still says true, and only the next write discovers it. The first
+    /// write of a new context into a connection held from an earlier one is
+    /// therefore retried once on a fresh dial. Nothing of the new context has
+    /// reached the provider yet, so the replacement speaks it in full.
+    #[tokio::test]
+    async fn a_session_socket_closed_while_idle_is_redialled_for_the_next_turn() {
+        let store = two_question_seeded_store();
+        // The provider hangs up between the turns without the socket noticing.
+        let transports =
+            SessionScopedSonicTransports::new(SonicSocketLifetime::ClosesSilentlyWhileIdle);
+        let runner = CartesiaGeminiRunner::scripted(
+            CartesiaGeminiConfig::default(),
+            transports.clone(),
+            store,
+            synthetic_fixture_answer_evaluator(),
+            EvaluatorProvenance::SyntheticFixture,
+        );
+        let mut session = runner
+            .open(scripted_session_config("voice-session-1"))
+            .await
+            .unwrap();
+
+        let mut spoken_frames = 0_usize;
+        for bytes in [vec![1_u8, 2, 3, 4], vec![5_u8, 6, 7, 8]] {
+            session
+                .input
+                .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(bytes)))
+                .await
+                .unwrap();
+            // Panics on `BrainEvent::Error`: a turn that dies because the idle
+            // socket went away is exactly the regression this pins.
+            spoken_frames += drain_until_response_completed(&mut session)
+                .await
+                .iter()
+                .filter(|event| matches!(event, BrainEvent::AudioDelta { .. }))
+                .count();
+        }
+
+        assert_eq!(
+            spoken_frames, 2,
+            "both turns must still reach the learner as speech"
+        );
+        assert_eq!(
+            transports.connects(),
+            2,
+            "the silently closed connection is replaced by a fresh dial"
+        );
+        let by_context = transports.sockets_by_context();
+        assert_eq!(by_context["response-1"], vec![0_u32]);
+        assert_eq!(
+            by_context["response-2"],
+            vec![0_u32, 1_u32],
+            "the refused first write is retried whole on the replacement connection"
+        );
+        let replacement_writes = transports
+            .writes_on_socket(1)
+            .into_iter()
+            .map(|value| value["context_id"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !replacement_writes.is_empty()
+                && replacement_writes
+                    .iter()
+                    .all(|context_id| context_id == "response-2"),
+            "the replacement connection carries only the new context: {replacement_writes:?}"
+        );
+    }
+
     fn scripted_session_config(voice_session_id: &str) -> SessionConfig {
         scripted_session_config_for(voice_session_id, None)
     }
@@ -4712,7 +4786,8 @@ mod tests {
         }
     }
 
-    async fn drain_until_response_completed(session: &mut RealtimeSession) {
+    async fn drain_until_response_completed(session: &mut RealtimeSession) -> Vec<BrainEvent> {
+        let mut events = Vec::new();
         loop {
             let event = timeout(Duration::from_secs(10), session.events.recv())
                 .await
@@ -4721,8 +4796,10 @@ mod tests {
             if let BrainEvent::Error(error) = &event {
                 panic!("unexpected provider failure: {error:?}");
             }
-            if matches!(event, BrainEvent::RecapReady { .. }) {
-                return;
+            let finished = matches!(event, BrainEvent::RecapReady { .. });
+            events.push(event);
+            if finished {
+                return events;
             }
         }
     }
@@ -4740,8 +4817,8 @@ mod tests {
     }
 
     impl SessionScopedSonicTransports {
-        fn new(die_after_first_context: bool) -> Self {
-            let connector = Arc::new(CountingSonicConnector::new(die_after_first_context));
+        fn new(lifetime: SonicSocketLifetime) -> Self {
+            let connector = Arc::new(CountingSonicConnector::new(lifetime));
             Self {
                 inner: FakeCartesiaGeminiTransports::new(),
                 voice: Arc::new(super::super::tts::SonicSessionVoice::new(Arc::clone(
@@ -4790,6 +4867,16 @@ mod tests {
                 }
             }
             by_context
+        }
+
+        /// Everything written to one socket, in order.
+        fn writes_on_socket(&self, index: u32) -> Vec<Value> {
+            self.connector
+                .record()
+                .sent
+                .into_iter()
+                .filter_map(|(socket, value)| (socket == index).then_some(value))
+                .collect()
         }
     }
 
@@ -4867,16 +4954,31 @@ mod tests {
         sent: Vec<(u32, Value)>,
     }
 
+    /// How the provider treats the session connection once a response context
+    /// has ended.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SonicSocketLifetime {
+        /// The connection serves the whole session.
+        Healthy,
+        /// The provider hangs up at the end of the first context and the socket
+        /// observes it, so `is_open()` reports the close.
+        ClosesAndReportsIt,
+        /// The provider hangs up while the connection sits idle between turns.
+        /// Nothing is reading, so the socket learns nothing: `is_open()` still
+        /// says true and only the next write fails.
+        ClosesSilentlyWhileIdle,
+    }
+
     struct CountingSonicConnector {
         record: Arc<std::sync::Mutex<CountingSonicRecord>>,
-        die_after_first_context: bool,
+        lifetime: SonicSocketLifetime,
     }
 
     impl CountingSonicConnector {
-        fn new(die_after_first_context: bool) -> Self {
+        fn new(lifetime: SonicSocketLifetime) -> Self {
             Self {
                 record: Arc::new(std::sync::Mutex::new(CountingSonicRecord::default())),
-                die_after_first_context,
+                lifetime,
             }
         }
 
@@ -4903,8 +5005,9 @@ mod tests {
                 index,
                 record: Arc::clone(&self.record),
                 pending: std::collections::VecDeque::new(),
-                open: true,
-                die_after_first_context: self.die_after_first_context,
+                reports_open: true,
+                writable: true,
+                lifetime: self.lifetime,
                 contexts_finished: 0,
             })
         }
@@ -4916,8 +5019,12 @@ mod tests {
         index: u32,
         record: Arc<std::sync::Mutex<CountingSonicRecord>>,
         pending: std::collections::VecDeque<String>,
-        open: bool,
-        die_after_first_context: bool,
+        /// What `is_open()` tells the adapter.
+        reports_open: bool,
+        /// Whether a write still reaches the provider. These come apart exactly
+        /// when the peer hangs up on a connection nobody is reading.
+        writable: bool,
+        lifetime: SonicSocketLifetime,
         contexts_finished: u32,
     }
 
@@ -4929,7 +5036,7 @@ mod tests {
                 .expect("record lock poisoned")
                 .sent
                 .push((self.index, value.clone()));
-            if !self.open {
+            if !self.writable {
                 return Err(brain_failure(BrainProviderFailureParts {
                     failure_class: BrainFailureClass::NetworkDisconnect,
                     stage: BrainFailureStage::Transport,
@@ -4964,20 +5071,32 @@ mod tests {
                 .is_some_and(|text| text.contains(r#""type":"done""#))
             {
                 self.contexts_finished += 1;
-                if self.die_after_first_context && self.contexts_finished == 1 {
-                    // The provider hangs up as soon as the response ends.
-                    self.open = false;
+                if self.contexts_finished == 1 {
+                    match self.lifetime {
+                        SonicSocketLifetime::Healthy => {}
+                        // The provider hangs up as soon as the response ends and
+                        // the socket sees it.
+                        SonicSocketLifetime::ClosesAndReportsIt => {
+                            self.reports_open = false;
+                            self.writable = false;
+                        }
+                        // The provider hangs up while the connection is idle.
+                        // Nothing observes it, so the socket keeps claiming to
+                        // be open and only the next write finds out.
+                        SonicSocketLifetime::ClosesSilentlyWhileIdle => self.writable = false,
+                    }
                 }
             }
             Ok(next)
         }
 
         fn is_open(&self) -> bool {
-            self.open
+            self.reports_open
         }
 
         async fn close(&mut self) -> Result<(), BrainError> {
-            self.open = false;
+            self.reports_open = false;
+            self.writable = false;
             self.record.lock().expect("record lock poisoned").closes += 1;
             Ok(())
         }

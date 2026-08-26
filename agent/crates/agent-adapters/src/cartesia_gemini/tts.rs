@@ -240,7 +240,9 @@ pub(crate) async fn speak_sonic_on_socket<S>(
 where
     S: SonicSocket + ?Sized,
 {
-    write_sonic_continuations(socket, config, context_id, transcript).await?;
+    write_sonic_continuations(socket, config, context_id, transcript)
+        .await
+        .map_err(|failure| failure.error)?;
     write_sonic_finalizer(socket, config, context_id).await?;
     stream_sonic_context(socket, config, context_id, cancel, sink).await
 }
@@ -261,20 +263,34 @@ pub(crate) struct SonicContextOutcome {
     pub(crate) connection_open: bool,
 }
 
+/// A write that did not reach the provider, and how much of the context did.
+///
+/// `accepted_any` is what decides whether the context can be re-spoken on a
+/// replacement connection: once the provider has taken any part of it, a fresh
+/// dial would speak a truncated or duplicated response.
+struct SonicWriteFailure {
+    error: BrainError,
+    accepted_any: bool,
+}
+
 async fn write_sonic_continuations<S>(
     socket: &mut S,
     config: &SonicConfig,
     context_id: &str,
     text: &str,
-) -> Result<(), BrainError>
+) -> Result<(), SonicWriteFailure>
 where
     S: SonicSocket + ?Sized,
 {
+    let mut accepted_any = false;
     for request in sonic_continuation_requests(config, context_id, text) {
-        socket
-            .send_json(request)
-            .await
-            .map_err(|_| sonic_transport_failure("send_failed"))?;
+        if socket.send_json(request).await.is_err() {
+            return Err(SonicWriteFailure {
+                error: sonic_transport_failure("send_failed"),
+                accepted_any,
+            });
+        }
+        accepted_any = true;
     }
     Ok(())
 }
@@ -491,7 +507,16 @@ where
 /// never a process-global pool keyed by learner id.
 pub(crate) struct SonicSessionVoice {
     connector: Arc<dyn DynSonicConnector>,
-    socket: tokio::sync::Mutex<Option<Box<dyn SonicSocket>>>,
+    held: tokio::sync::Mutex<Option<HeldSonicConnection>>,
+}
+
+/// The session's live speech connection, and how much of the current response
+/// context the provider has already taken from it.
+struct HeldSonicConnection {
+    socket: Box<dyn SonicSocket>,
+    /// The response context this connection has already accepted input for.
+    /// `None` means nothing of any context is part-delivered on it.
+    written_context: Option<String>,
 }
 
 impl fmt::Debug for SonicSessionVoice {
@@ -509,7 +534,7 @@ impl SonicSessionVoice {
     {
         Self {
             connector,
-            socket: tokio::sync::Mutex::new(None),
+            held: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -522,6 +547,16 @@ impl SonicSessionVoice {
     /// `ADAPTER-05`: each part is written as a `continue: true` input the moment
     /// the model produces it, so the provider starts generating before the model
     /// has finished writing.
+    ///
+    /// `ADAPTER-04`: the connection is opened on first speech and reused. A
+    /// connection held from an earlier context may already be gone — Cartesia
+    /// closes idle sockets at documented limits, and a peer-initiated close is
+    /// invisible to a socket nobody is reading, so `is_open()` sampled when the
+    /// last context ended cannot see it. The first write of a *new* context into
+    /// a held connection is therefore retried once on a fresh dial: none of that
+    /// context has reached the provider, so the replacement speaks it whole.
+    /// Once any part of the context has been accepted there is no retry, because
+    /// re-speaking it elsewhere would truncate or duplicate the response.
     pub(crate) async fn extend(
         &self,
         config: &SonicConfig,
@@ -529,28 +564,51 @@ impl SonicSessionVoice {
         context_id: &str,
         text: &str,
     ) -> Result<(), BrainError> {
-        let mut held = self.socket.lock().await;
-        // A connection is held only while the provider still has it open: every
-        // exit below drops a connection that reported itself closed, so the
-        // next response context can never be written to a dead socket.
-        if held.is_none() {
-            let request = config.websocket_request(api_key)?;
-            *held = Some(
-                match timeout(config.stage_timeout, self.connector.connect_boxed(request)).await {
-                    Ok(socket) => socket?,
-                    Err(_) => return Err(sonic_deadline_failure()),
-                },
-            );
-        }
-        let socket = held
-            .as_mut()
-            .expect("the session connection was just established");
-        match write_sonic_continuations(socket.as_mut(), config, context_id, text).await {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                *held = None;
-                Err(error)
+        let mut held = self.held.lock().await;
+        if let Some(connection) = held.as_mut() {
+            let untouched_context = connection.written_context.as_deref() != Some(context_id);
+            match write_sonic_continuations(connection.socket.as_mut(), config, context_id, text)
+                .await
+            {
+                Ok(()) => {
+                    connection.written_context = Some(context_id.to_owned());
+                    return Ok(());
+                }
+                Err(failure) => {
+                    close_quietly(connection.socket.as_mut()).await;
+                    *held = None;
+                    if !untouched_context || failure.accepted_any {
+                        return Err(failure.error);
+                    }
+                }
             }
+        }
+
+        let mut socket = self.dial(config, api_key).await?;
+        match write_sonic_continuations(socket.as_mut(), config, context_id, text).await {
+            Ok(()) => {
+                *held = Some(HeldSonicConnection {
+                    socket,
+                    written_context: Some(context_id.to_owned()),
+                });
+                Ok(())
+            }
+            Err(failure) => {
+                close_quietly(socket.as_mut()).await;
+                Err(failure.error)
+            }
+        }
+    }
+
+    async fn dial(
+        &self,
+        config: &SonicConfig,
+        api_key: &str,
+    ) -> Result<Box<dyn SonicSocket>, BrainError> {
+        let request = config.websocket_request(api_key)?;
+        match timeout(config.stage_timeout, self.connector.connect_boxed(request)).await {
+            Ok(socket) => socket,
+            Err(_) => Err(sonic_deadline_failure()),
         }
     }
 
@@ -562,22 +620,28 @@ impl SonicSessionVoice {
         cancel: &CancellationToken,
         sink: &mut dyn SpeechFrameSink,
     ) -> Result<(), BrainError> {
-        let mut held = self.socket.lock().await;
-        let Some(socket) = held.as_mut() else {
+        let mut held = self.held.lock().await;
+        let Some(connection) = held.as_mut() else {
             return Err(sonic_protocol_failure("no_open_context"));
         };
-        if let Err(error) = write_sonic_finalizer(socket.as_mut(), config, context_id).await {
+        let socket = connection.socket.as_mut();
+        if let Err(error) = write_sonic_finalizer(socket, config, context_id).await {
+            close_quietly(socket).await;
             *held = None;
             return Err(error);
         }
         match timeout(
             config.stage_timeout,
-            stream_sonic_context(socket.as_mut(), config, context_id, cancel, sink),
+            stream_sonic_context(socket, config, context_id, cancel, sink),
         )
         .await
         {
             Ok(Ok(outcome)) => {
-                if !outcome.connection_open {
+                if outcome.connection_open {
+                    // The context is over, so nothing of it is part-delivered on
+                    // the connection the next context will reuse.
+                    connection.written_context = None;
+                } else {
                     *held = None;
                 }
                 Ok(())
@@ -588,8 +652,8 @@ impl SonicSessionVoice {
                 Err(error)
             }
             Err(_) => {
-                let _ = cancel_sonic_context(socket.as_mut(), context_id).await;
-                close_quietly(socket.as_mut()).await;
+                let _ = cancel_sonic_context(socket, context_id).await;
+                close_quietly(socket).await;
                 *held = None;
                 Err(sonic_deadline_failure())
             }
@@ -602,18 +666,25 @@ impl SonicSessionVoice {
     /// still has an open context on the provider. It is told, drained, and the
     /// connection is dropped rather than handed to the next turn mid-context.
     pub(crate) async fn cancel_context(&self, context_id: &str) {
-        let mut held = self.socket.lock().await;
-        if let Some(socket) = held.as_mut() {
-            let _ = cancel_sonic_context_and_drain(socket.as_mut(), context_id).await;
+        let mut held = self.held.lock().await;
+        let Some(connection) = held.as_mut() else {
+            return;
+        };
+        let reusable = cancel_sonic_context_and_drain(connection.socket.as_mut(), context_id)
+            .await
+            .is_ok_and(|outcome| outcome.connection_open);
+        if reusable {
+            connection.written_context = None;
+        } else {
+            *held = None;
         }
-        *held = None;
     }
 
     /// The single close path: session stop, session drop, or fatal error.
     pub(crate) async fn close(&self) {
-        let mut held = self.socket.lock().await;
-        if let Some(socket) = held.as_mut() {
-            close_quietly(socket.as_mut()).await;
+        let mut held = self.held.lock().await;
+        if let Some(connection) = held.as_mut() {
+            close_quietly(connection.socket.as_mut()).await;
         }
         *held = None;
     }
@@ -1531,6 +1602,198 @@ mod tests {
 
         async fn close(&mut self) -> Result<(), agent_domain::BrainError> {
             self.closed = true;
+            Ok(())
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Task 4 (`ADAPTER-04`): the boundary of the session connection's
+    // single redial.
+    // -----------------------------------------------------------------
+
+    /// The boundary of the Task 4 redial: a context the provider has already
+    /// accepted part of is never re-spoken on a fresh connection, because the
+    /// learner would hear a truncated or duplicated response.
+    #[tokio::test]
+    async fn a_half_written_context_is_never_redialled() {
+        let mut connector = SessionSonicConnector::new();
+        connector.failing_context = Some("response-2");
+        connector.accepted_writes_before_failure = 1;
+        let connector = Arc::new(connector);
+        let voice = SonicSessionVoice::new(Arc::clone(&connector));
+        let config = SonicConfig::default();
+
+        voice
+            .extend(
+                &config,
+                "sk_car_multiplex_secret",
+                "response-1",
+                "first response text",
+            )
+            .await
+            .unwrap();
+        voice
+            .finish(
+                &config,
+                "response-1",
+                &CancellationToken::new(),
+                &mut RecordedFrames::default(),
+            )
+            .await
+            .unwrap();
+
+        let long_transcript = "Connect the electron transport chain to proton pumping. Then explain why ATP synthase needs the gradient before it can make ATP. Finish with the role of oxygen as the final electron acceptor.";
+        let error = voice
+            .extend(
+                &config,
+                "sk_car_multiplex_secret",
+                "response-2",
+                long_transcript,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.failure().metadata(),
+            "stage=cartesia_sonic error_kind=send_failed"
+        );
+        let record = connector.record();
+        assert_eq!(
+            record.dials, 1,
+            "a context the provider already accepted part of is never re-spoken on a fresh dial"
+        );
+        assert_eq!(
+            record.closes, 1,
+            "the connection that failed mid-context is closed rather than reused"
+        );
+        assert_eq!(
+            record
+                .sent
+                .iter()
+                .filter(|(_, value)| value["context_id"] == "response-2")
+                .count(),
+            2,
+            "exactly the accepted chunk and the refused chunk: {:?}",
+            record.sent
+        );
+        let rendered = format!("{error} {:?}", error.failure());
+        assert!(!rendered.contains(long_transcript));
+    }
+
+    #[derive(Clone, Default)]
+    struct SessionSonicRecord {
+        dials: u32,
+        closes: u32,
+        /// Every write, tagged with the index of the socket it was written to.
+        sent: Vec<(u32, Value)>,
+    }
+
+    /// A multiplexed session connection: every finalized generation is answered
+    /// with one chunk plus `done` for that context, so one socket can serve many
+    /// response contexts.
+    struct SessionSonicConnector {
+        record: Arc<Mutex<SessionSonicRecord>>,
+        /// Writes naming this context are refused once the provider has accepted
+        /// `accepted_writes_before_failure` of them.
+        failing_context: Option<&'static str>,
+        accepted_writes_before_failure: usize,
+    }
+
+    impl SessionSonicConnector {
+        fn new() -> Self {
+            Self {
+                record: Arc::new(Mutex::new(SessionSonicRecord::default())),
+                failing_context: None,
+                accepted_writes_before_failure: 0,
+            }
+        }
+
+        fn record(&self) -> SessionSonicRecord {
+            self.record.lock().expect("record lock poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl SonicConnector for SessionSonicConnector {
+        type Socket = SessionSonicSocket;
+
+        async fn connect(
+            &self,
+            _request: tokio_tungstenite::tungstenite::http::Request<()>,
+        ) -> Result<Self::Socket, agent_domain::BrainError> {
+            let index = {
+                let mut record = self.record.lock().expect("record lock poisoned");
+                let index = record.dials;
+                record.dials += 1;
+                index
+            };
+            Ok(SessionSonicSocket {
+                index,
+                record: Arc::clone(&self.record),
+                pending: VecDeque::new(),
+                failing_context: self.failing_context,
+                accepted_writes_before_failure: self.accepted_writes_before_failure,
+                accepted_for_failing_context: 0,
+            })
+        }
+    }
+
+    struct SessionSonicSocket {
+        index: u32,
+        record: Arc<Mutex<SessionSonicRecord>>,
+        pending: VecDeque<String>,
+        failing_context: Option<&'static str>,
+        accepted_writes_before_failure: usize,
+        accepted_for_failing_context: usize,
+    }
+
+    #[async_trait]
+    impl SonicSocket for SessionSonicSocket {
+        async fn send_json(&mut self, value: Value) -> Result<(), agent_domain::BrainError> {
+            self.record
+                .lock()
+                .expect("record lock poisoned")
+                .sent
+                .push((self.index, value.clone()));
+            let context_id = value["context_id"]
+                .as_str()
+                .expect("every Sonic control names its context")
+                .to_owned();
+            if self.failing_context == Some(context_id.as_str()) {
+                if self.accepted_for_failing_context >= self.accepted_writes_before_failure {
+                    return Err(sonic_transport_failure("send_failed"));
+                }
+                self.accepted_for_failing_context += 1;
+            }
+            if value.get("cancel").and_then(Value::as_bool) == Some(true) {
+                self.pending
+                    .push_back(format!(r#"{{"type":"done","context_id":"{context_id}"}}"#));
+                return Ok(());
+            }
+            if value.get("continue").and_then(Value::as_bool) == Some(false) {
+                self.pending.push_back(format!(
+                    r#"{{"type":"chunk","context_id":"{context_id}","data":"AQI="}}"#
+                ));
+                self.pending
+                    .push_back(format!(r#"{{"type":"done","context_id":"{context_id}"}}"#));
+            }
+            Ok(())
+        }
+
+        async fn next_text(&mut self) -> Result<Option<String>, agent_domain::BrainError> {
+            if let Some(next) = self.pending.pop_front() {
+                return Ok(Some(next));
+            }
+            // A provider that never finishes the cancelled context keeps
+            // generating for it, so the bounded drain runs out rather than
+            // seeing a `done`.
+            Ok(Some(
+                r#"{"type":"chunk","context_id":"response-1","data":"AwQ="}"#.to_owned(),
+            ))
+        }
+
+        async fn close(&mut self) -> Result<(), agent_domain::BrainError> {
+            self.record.lock().expect("record lock poisoned").closes += 1;
             Ok(())
         }
     }
