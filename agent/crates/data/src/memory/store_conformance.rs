@@ -23,10 +23,12 @@
 use std::collections::BTreeSet;
 
 use agent_domain::{
-    learning_recap::SessionLearningEvidence, AnswerAttemptEnvelope, AnswerCaptureMode,
-    AnswerCaptureStatus, AnswerContentPolicy, AnswerEvaluation, AuthenticatedStudyProjectionV1,
-    ChallengeResolution, ConceptStatus, CreateFileStudySet, CreatePasteStudySet, PortErrorKind,
-    ProgressionPolicyId, QuestionProgressionResult, SessionConfig, SessionId,
+    learning_outcome::{TurnOutcome, TurnResolution},
+    learning_recap::SessionLearningEvidence,
+    AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
+    AnswerEvaluation, AuthenticatedStudyProjectionV1, ChallengeResolution, ConceptStatus,
+    CreateFileStudySet, CreatePasteStudySet, PortErrorKind, ProgressionPolicyId,
+    QuestionDisposition, QuestionProgressionResult, SessionConfig, SessionId,
     SessionTokenNonceClaim, StudyMemoryStore, StudyMode, StudyQuestion, StudySetIngestionRecord,
     StudySetIngestionStatus, StudyStoreWriteCounts, StudyStoreWriteOutcome, VoiceUsageRecord,
 };
@@ -616,6 +618,318 @@ async fn exercise_learning(
 }
 
 // ---------------------------------------------------------------------------
+// Session-scoped question fields (`A-14`): the two facts the executor gates a
+// spoken turn on, supplied by both backends from persisted state alone.
+// ---------------------------------------------------------------------------
+
+/// The seeded active question at `index` in committed ingestion order.
+///
+/// The whole value is the expectation — prompt, expected terms, follow-up,
+/// rubric, and bound source — because the rubric is precisely what a turn is
+/// graded by and precisely what a store could silently drop.
+fn seeded_active_question(fixture: &CanonicalStoreFixture, index: usize) -> StudyQuestion {
+    let active = fixture.seed.active_questions();
+    assert!(
+        index < active.len(),
+        "the learning-core seed publishes {} active questions, so index {index} does not exist",
+        active.len()
+    );
+    active[index].clone()
+}
+
+/// One evaluated outcome bound to `question_id` and `disposition` under a fresh
+/// response identity.
+///
+/// It is a fixture outcome re-bound, not an invented shape: the same schema,
+/// rubric policy version, and evaluated resolution the canonical fixture pins,
+/// with its concept transitions cleared so this helper moves the cursor without
+/// also writing a second review decision for a concept the fixture already
+/// scheduled.
+fn rebound_outcome(
+    template: &TurnOutcome,
+    response_id: &str,
+    question_id: &str,
+    disposition: QuestionDisposition,
+) -> TurnOutcome {
+    let mut outcome = template.clone();
+    outcome.response_id = response_id.to_owned();
+    outcome.question_id = question_id.to_owned();
+    outcome.supersedes_response_id = None;
+    outcome.resolution = match outcome.resolution {
+        TurnResolution::Evaluated {
+            label,
+            confidence,
+            concise_feedback,
+            retry_prompt,
+            ..
+        } => TurnResolution::Evaluated {
+            label,
+            confidence,
+            assessments: Vec::new(),
+            concept_transitions: Vec::new(),
+            concise_feedback,
+            retry_prompt,
+            disposition,
+        },
+        other => panic!("the re-bound template must be an evaluated outcome, got {other:?}"),
+    };
+    outcome
+}
+
+/// Every question `answered_questions` reports, by identity, in the order read.
+fn answered_question_ids(evidence: &SessionLearningEvidence) -> Vec<String> {
+    evidence
+        .answered_questions
+        .iter()
+        .map(|question| question.question_id.clone())
+        .collect()
+}
+
+/// How many entries `answered_questions` carries for one question identity.
+fn answered_occurrences(evidence: &SessionLearningEvidence, question_id: &str) -> usize {
+    evidence
+        .answered_questions
+        .iter()
+        .filter(|question| question.question_id == question_id)
+        .count()
+}
+
+/// `A-14`: both backends must supply `current_question` from the persisted
+/// progression cursor and `answered_questions` from the persisted outcomes.
+///
+/// This is scripted rather than trace-compared because two backends that are
+/// identically wrong compare equal. Each step asserts the fact the executor
+/// actually gates on: a new turn is authorized only by the cursor's question,
+/// and a redelivery is rebound only from the question its recorded outcome was
+/// graded against. A store that reports neither fails every real spoken answer
+/// closed, which is the window this closes.
+pub(crate) async fn exercise_session_question_fields(
+    backend: &ConformanceBackend<'_>,
+    fixture: &CanonicalStoreFixture,
+) {
+    let store = backend.store();
+    let label = backend.label();
+    let seeded = evidence_fixture().evidence["mixed_strong_shaky_missed"].clone();
+    let first = seeded_active_question(fixture, 0);
+    let second = seeded_active_question(fixture, 1);
+    let third = seeded_active_question(fixture, 2);
+
+    let opened = store
+        .record_voice_session(&SessionConfig {
+            session_id: Some(SessionId::new(fixture.voice_session_id)),
+            user_id: Some(LEARNING_USER_ID.to_owned()),
+            study_set_id: Some(LEARNING_SET_ID.to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        })
+        .await
+        .expect("the canonical session is accepted");
+    assert_eq!(
+        opened,
+        StudyStoreWriteOutcome::Inserted,
+        "{label}: this scenario opens the session itself"
+    );
+
+    let read = || async {
+        store
+            .session_learning_evidence(LEARNING_USER_ID, LEARNING_SET_ID, fixture.voice_session_id)
+            .await
+            .expect("session learning evidence reads")
+    };
+    let select = |response_id: String| async move {
+        store
+            .select_next_question(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                fixture.voice_session_id,
+                &response_id,
+                ProgressionPolicyId::OrderedV1,
+            )
+            .await
+            .expect("ordered progression selects")
+    };
+    let record = |outcome: TurnOutcome| async move {
+        store
+            .record_turn_outcome(
+                LEARNING_USER_ID,
+                LEARNING_SET_ID,
+                fixture.voice_session_id,
+                outcome,
+            )
+            .await
+            .expect("canonical turn outcome persists")
+    };
+
+    // A session that has never selected has no cursor, so no turn is authorized
+    // and no redelivery can be rebound.
+    let evidence = read().await;
+    assert_eq!(
+        evidence.current_question, None,
+        "{label}: a session with no progression cursor is on no question"
+    );
+    assert!(
+        evidence.answered_questions.is_empty(),
+        "{label}: a session with no outcome has answered no question, got {:?}",
+        answered_question_ids(&evidence)
+    );
+
+    // Mid-progression: the cursor's question is reported whole, rubric included.
+    select(seeded.outcomes[0].response_id.clone()).await;
+    let evidence = read().await;
+    assert_eq!(
+        evidence.current_question.as_ref(),
+        Some(&first),
+        "{label}: a session mid-progression reports the cursor's question, rubric intact"
+    );
+    assert!(
+        !first.rubric.criteria.is_empty(),
+        "the seeded question must carry a rubric for this comparison to mean anything"
+    );
+    assert!(
+        evidence.answered_questions.is_empty(),
+        "{label}: selecting a question answers none of them, got {:?}",
+        answered_question_ids(&evidence)
+    );
+
+    // One persisted outcome contributes exactly one answered question, whole. A
+    // retried turn does not move the cursor, so the session is still on it.
+    record(rebound_outcome(
+        &seeded.outcomes[0],
+        "resp-a14-first-retry",
+        &first.question_id,
+        QuestionDisposition::RetryCurrent,
+    ))
+    .await;
+    let evidence = read().await;
+    assert_eq!(
+        answered_question_ids(&evidence),
+        vec![first.question_id.clone()],
+        "{label}: one persisted outcome names exactly one answered question"
+    );
+    assert_eq!(
+        evidence.answered_questions[0], first,
+        "{label}: an answered question is reported whole, rubric intact"
+    );
+    assert_eq!(
+        evidence.current_question.as_ref(),
+        Some(&first),
+        "{label}: a retried turn leaves the cursor on its question"
+    );
+
+    // A second, distinct outcome on the same question is still one answered
+    // question: the field is keyed by question identity, not by outcome count.
+    record(seeded.outcomes[0].clone()).await;
+    let evidence = read().await;
+    assert_eq!(
+        answered_question_ids(&evidence),
+        vec![first.question_id.clone()],
+        "{label}: two outcomes on one question name that question exactly once"
+    );
+
+    // A redelivery of the same response identity is one answer, not two.
+    let replayed = store
+        .record_turn_outcome(
+            LEARNING_USER_ID,
+            LEARNING_SET_ID,
+            fixture.voice_session_id,
+            seeded.outcomes[0].clone(),
+        )
+        .await
+        .expect("identical replay is accepted");
+    assert!(
+        replayed.record.replayed,
+        "{label}: an identical redelivery must report itself as a replay"
+    );
+    let evidence = read().await;
+    assert_eq!(
+        answered_occurrences(&evidence, &first.question_id),
+        1,
+        "{label}: a replayed response adds no second entry, got {:?}",
+        answered_question_ids(&evidence)
+    );
+
+    // The advance moved the cursor off its question, so the session is on no
+    // question until the next selection — and the history it already has stays.
+    let evidence = read().await;
+    assert_eq!(
+        evidence.current_question, None,
+        "{label}: an advanced cursor is on no question until the next selection"
+    );
+    assert_eq!(
+        answered_question_ids(&evidence),
+        vec![first.question_id.clone()],
+        "{label}: moving off a question does not forget it was answered"
+    );
+
+    // A second distinct outcome adds exactly one more answered question.
+    select(seeded.outcomes[1].response_id.clone()).await;
+    let evidence = read().await;
+    assert_eq!(
+        evidence.current_question.as_ref(),
+        Some(&second),
+        "{label}: the cursor's second question is reported whole, rubric intact"
+    );
+    record(seeded.outcomes[1].clone()).await;
+    let evidence = read().await;
+    assert_eq!(
+        answered_question_ids(&evidence),
+        vec![first.question_id.clone(), second.question_id.clone()],
+        "{label}: a second distinct outcome adds exactly one more answered question"
+    );
+    assert_eq!(
+        evidence.answered_questions[1], second,
+        "{label}: the second answered question is reported whole, rubric intact"
+    );
+
+    // Drive the ordered policy to genuine exhaustion.
+    select("resp-a14-third-selection".to_owned()).await;
+    let evidence = read().await;
+    assert_eq!(
+        evidence.current_question.as_ref(),
+        Some(&third),
+        "{label}: the cursor's third question is reported whole, rubric intact"
+    );
+    record(rebound_outcome(
+        &seeded.outcomes[1],
+        "resp-a14-third-outcome",
+        &third.question_id,
+        QuestionDisposition::Advance,
+    ))
+    .await;
+    let exhausted = select("resp-a14-fourth-selection".to_owned()).await;
+    assert!(
+        matches!(exhausted, QuestionProgressionResult::Exhausted { .. }),
+        "{label}: every active question is completed, so progression is exhausted, got \
+         {exhausted:?}"
+    );
+
+    // Exhausted: no question authorizes a new turn, and every recorded answer is
+    // still rebindable.
+    let evidence = read().await;
+    assert_eq!(
+        evidence.current_question, None,
+        "{label}: an exhausted session is on no question"
+    );
+    assert_eq!(
+        answered_question_ids(&evidence),
+        vec![
+            first.question_id.clone(),
+            second.question_id.clone(),
+            third.question_id.clone(),
+        ],
+        "{label}: an exhausted session still carries every answered question"
+    );
+    for question in [&first, &second, &third] {
+        assert_eq!(
+            answered_occurrences(&evidence, &question.question_id),
+            1,
+            "{label}: `{}` is answered exactly once",
+            question.question_id
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Authorization and nonces: durable browser-event authority, and replay defence
 // bounded by the published token skew.
 // ---------------------------------------------------------------------------
@@ -1076,6 +1390,28 @@ async fn store_conformance_harness_rejects_inverted_replay_outcome() {
         Ok(()),
         "an unchanged trace must compare equal"
     );
+}
+
+#[tokio::test]
+async fn memory_store_conformance_session_question_fields() {
+    let fixture = CanonicalStoreFixture::new(ConformanceScenario::LearningAndProgression);
+    let store = seed_learning_core_memory(&fixture.seed);
+    exercise_session_question_fields(&ConformanceBackend::Memory(&store), &fixture).await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATA_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+async fn postgres_store_conformance_session_question_fields() {
+    let schema = PostgresSchemaFixture::migrated().await;
+    let pool = schema.pool().clone();
+    let fixture = CanonicalStoreFixture::new(ConformanceScenario::LearningAndProgression);
+    seed_learning_core_postgres(&pool, &fixture.seed).await;
+    let postgres = PostgresStudyStore::new(pool.clone());
+    exercise_session_question_fields(&ConformanceBackend::Postgres(&postgres), &fixture).await;
+    schema
+        .cleanup()
+        .await
+        .expect("isolated test schema drops cleanly");
 }
 
 #[tokio::test]

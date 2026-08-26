@@ -33,13 +33,13 @@ use uuid::Uuid;
 
 use crate::{
     memory::{
-        current_epoch_seconds, deletion_receipt, generate_file_study_set, generate_paste_study_set,
-        last_reviewed_at, payload_sha256, projection_active_question,
-        require_selected_progression_policy, review_schedule_summaries, turn_outcome_disposition,
-        turn_outcome_transitions, validate_challenge_resolution, validate_turn_outcome,
-        ConceptStatusEventPayload, EventAuthorizationKind, QuestionProgressionRecord,
-        ReviewScheduleEventPayload, DATA_RETENTION_POLICY, DELETED_ROW_CONSTANT,
-        DELETED_STUDY_SET_TITLE, SESSION_TOKEN_NONCE_SKEW_SECONDS,
+        current_epoch_seconds, cursor_current_question, deletion_receipt, generate_file_study_set,
+        generate_paste_study_set, last_reviewed_at, payload_sha256, projection_active_question,
+        require_selected_progression_policy, review_schedule_summaries, session_answered_questions,
+        turn_outcome_disposition, turn_outcome_transitions, validate_challenge_resolution,
+        validate_turn_outcome, ConceptStatusEventPayload, EventAuthorizationKind,
+        QuestionProgressionRecord, ReviewScheduleEventPayload, DATA_RETENTION_POLICY,
+        DELETED_ROW_CONSTANT, DELETED_STUDY_SET_TITLE, SESSION_TOKEN_NONCE_SKEW_SECONDS,
     },
     recap_label_buckets, InMemoryStudyStore,
 };

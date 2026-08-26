@@ -168,6 +168,39 @@ impl PostgresStudyStore {
             .collect()
     }
 
+    /// The session's committed progression cursor, read without locking it.
+    ///
+    /// Both canonical reads answer from this one query — the authenticated
+    /// projection's active question and progress, and `A-14`'s
+    /// `current_question` — so neither can drift into a second interpretation of
+    /// the same row. A session that has never selected has no row and no cursor.
+    async fn session_progression_cursor<'e, E>(
+        executor: E,
+        user_id: &str,
+        study_set_id: &str,
+        study_set_uuid: Uuid,
+        voice_session_id: &str,
+        voice_session_uuid: Uuid,
+    ) -> Result<Option<QuestionProgressionCursor>, PortError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        Ok(sqlx::query_scalar::<_, Value>(
+            "SELECT progression_json
+             FROM question_progression_cursors
+             WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .fetch_optional(executor)
+        .await
+        .map_err(pg_error)?
+        .map(|value| progression_record_from_json(user_id, study_set_id, voice_session_id, value))
+        .transpose()?
+        .map(|record| record.cursor))
+    }
+
     /// The one progression cursor for this session, locked for the rest of `tx`
     /// and created at revision `0` if it does not exist yet.
     ///
@@ -1032,10 +1065,29 @@ pub(super) async fn session_learning_evidence(
             .map(|(concept_id, decision)| (concept_id.as_str(), decision)),
     );
 
+    // `A-14`: both session-scoped question fields come from persisted rows — the
+    // session's committed cursor and its committed outcomes — resolved against
+    // the questions this set still publishes, through the same two shared rules
+    // the in-memory backend uses.
+    let published = PostgresStudyStore::active_questions(&store.pool, study_set_uuid).await?;
+    let cursor = PostgresStudyStore::session_progression_cursor(
+        &store.pool,
+        user_id,
+        study_set_id,
+        study_set_uuid,
+        voice_session_id,
+        voice_session_uuid,
+    )
+    .await?;
+    let current_question = cursor_current_question(cursor.as_ref(), &published);
+    let answered_questions = session_answered_questions(&outcomes, &published);
+
     Ok(SessionLearningEvidence {
         user_id: user_id.to_owned(),
         study_set_id: study_set_id.to_owned(),
         voice_session_id: voice_session_id.to_owned(),
+        current_question,
+        answered_questions,
         outcomes,
         concept_labels,
         review_decisions,
@@ -1311,20 +1363,15 @@ pub(super) async fn authenticated_study_projection(
 
     let ingestion_status = ingestion_status(row_string(&set_row, "ingestion_status")?.as_str())?;
     let active = PostgresStudyStore::active_questions(&store.pool, study_set_uuid).await?;
-    let cursor = sqlx::query_scalar::<_, Value>(
-        "SELECT progression_json
-         FROM question_progression_cursors
-         WHERE user_id = $1 AND study_set_id = $2 AND voice_session_id = $3",
+    let cursor = PostgresStudyStore::session_progression_cursor(
+        &store.pool,
+        user_id,
+        study_set_id,
+        study_set_uuid,
+        voice_session_id,
+        voice_session_uuid,
     )
-    .bind(user_id)
-    .bind(study_set_uuid)
-    .bind(voice_session_uuid)
-    .fetch_optional(&store.pool)
-    .await
-    .map_err(pg_error)?
-    .map(|value| progression_record_from_json(user_id, study_set_id, voice_session_id, value))
-    .transpose()?
-    .map(|record| record.cursor);
+    .await?;
 
     let document_titles =
         sqlx::query("SELECT id, display_name FROM study_documents WHERE study_set_id = $1")

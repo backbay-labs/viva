@@ -610,6 +610,58 @@ pub(crate) fn last_reviewed_at(outcomes: &[TurnOutcome], concept_id: &str) -> Op
         .max()
 }
 
+/// The whole question a session's progression cursor is on (`A-14`).
+///
+/// This is the server fact a *new* spoken turn is authorized by, so it carries
+/// the rubric that grades the turn, not just an identity. It is derived from
+/// persisted state only: the session's own committed cursor, resolved against
+/// the questions this study set still publishes.
+///
+/// `None` — a session with no cursor, a cursor sitting on no question (a fresh
+/// session, or one whose last outcome advanced past its question), or a cursor
+/// naming a question the set no longer publishes — means the store cannot
+/// confirm which question the server asked, and the turn fails closed rather
+/// than being graded against a guess.
+pub(crate) fn cursor_current_question(
+    cursor: Option<&QuestionProgressionCursor>,
+    published: &[StudyQuestion],
+) -> Option<StudyQuestion> {
+    let question_id = cursor?.current_question_id.as_deref()?;
+    published
+        .iter()
+        .find(|question| question.question_id == question_id)
+        .cloned()
+}
+
+/// The whole questions a session's persisted outcomes were graded against
+/// (`A-14`).
+///
+/// This is the server fact a *redelivery* is rebound by: the recorded turn's own
+/// disposition is what moved the cursor off its question, so the cursor cannot
+/// authorize the replay and this can. Like the cursor's question it carries the
+/// rubric, so a replay recomputes the same payload and the store keeps its
+/// per-response payload guard instead of taking a value on trust.
+///
+/// Walking the published questions rather than the outcomes is what makes the
+/// result structurally correct: one entry per distinct `question_id` even when
+/// several outcomes (or replay rows) name the same question, the same committed
+/// ingestion order in both backends, and fail-closed omission of any question
+/// the set no longer publishes.
+pub(crate) fn session_answered_questions(
+    outcomes: &[TurnOutcome],
+    published: &[StudyQuestion],
+) -> Vec<StudyQuestion> {
+    let answered = outcomes
+        .iter()
+        .map(|outcome| outcome.question_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    published
+        .iter()
+        .filter(|question| answered.contains(question.question_id.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// The projection's active question.
 ///
 /// `LEARN-008` excludes expected terms, rubric answers, and source excerpts: a
@@ -979,10 +1031,30 @@ pub(super) fn session_learning_evidence(
             .map(|record| (record.concept_id.as_str(), &record.decision)),
     );
 
+    // `A-14`: both session-scoped question fields come from persisted state — the
+    // session's committed cursor and its committed outcomes — resolved against
+    // the questions this set still publishes. Nothing here is derived from a
+    // caller, and a question the set no longer publishes is simply absent, which
+    // fails the corresponding turn closed.
+    let published = InMemoryStudyStore::active_questions_locked(&state, study_set_id);
+    let cursor = state
+        .question_progressions
+        .iter()
+        .find(|record| {
+            record.user_id == user_id
+                && record.study_set_id == study_set_id
+                && record.voice_session_id == voice_session_id
+        })
+        .map(|record| &record.cursor);
+    let current_question = cursor_current_question(cursor, &published);
+    let answered_questions = session_answered_questions(&outcomes, &published);
+
     Ok(SessionLearningEvidence {
         user_id: user_id.to_owned(),
         study_set_id: study_set_id.to_owned(),
         voice_session_id: voice_session_id.to_owned(),
+        current_question,
+        answered_questions,
         outcomes,
         concept_labels,
         review_decisions,

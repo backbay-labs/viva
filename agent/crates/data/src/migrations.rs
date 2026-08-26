@@ -4843,6 +4843,32 @@ pub(crate) mod tests {
         questions: Vec<(StudyQuestion, bool, i64)>,
     }
 
+    impl LearningCoreSeed {
+        /// The seeded questions both backends publish as active, in committed
+        /// ingestion order.
+        ///
+        /// `A-14` compares the session-scoped question fields of
+        /// `SessionLearningEvidence` against these whole values — rubric and
+        /// bound source included — so a store that reports a question without
+        /// the rubric that grades it is a failure rather than a near miss.
+        pub(crate) fn active_questions(&self) -> Vec<StudyQuestion> {
+            let mut ordered = self
+                .questions
+                .iter()
+                .filter(|(_, active, _)| *active)
+                .collect::<Vec<_>>();
+            ordered.sort_by(|left, right| {
+                left.2
+                    .cmp(&right.2)
+                    .then_with(|| left.0.question_id.cmp(&right.0.question_id))
+            });
+            ordered
+                .into_iter()
+                .map(|(question, _, _)| question.clone())
+                .collect()
+        }
+    }
+
     fn extra_source(source_id: &str, document_id: &str, span: &str) -> StudySourceReference {
         StudySourceReference {
             source_id: source_id.to_owned(),
