@@ -3913,6 +3913,236 @@ async fn live_envelope_store_failure_is_typed_durability_degraded() {
 }
 
 // ---------------------------------------------------------------------------
+// `A-20.1` (Task 6 / `ADAPTER-06` follow-up): the question-progression read is
+// a store read like any other, so its `PortErrorKind` must survive the trip to
+// the terminal reason an operator reads.
+//
+// `select_session_question` is the one seam both adapter runtimes take, at
+// session open and again on every later turn. Collapsing the executor failure
+// there into an untyped tool-executor error reports a durable-store outage as a
+// tool defect and sends the operator to the wrong system. The control half
+// matters just as much: a kind the Plan 06 vocabulary has no class for must NOT
+// be promoted into a durability claim the store never made.
+// ---------------------------------------------------------------------------
+
+const PROGRESSION_STORE_DSN_MARKER: &str = "postgres://viva:marker-dsn-b17@db.internal/viva";
+const PROGRESSION_QUESTION_MARKER: &str = "marker-authorized-question-b18";
+
+#[derive(Clone, Copy, Debug)]
+enum ProgressionStoreFailure {
+    /// The store could not durably answer. Plan 06 publishes a class for this.
+    Durability,
+    /// An invariant inside the store adapter broke. Plan 06 publishes no
+    /// distinct class, so the adapter may not invent one.
+    Internal,
+}
+
+/// A store that refuses exactly the question-progression read.
+///
+/// Every other call delegates, so the only failure in the session is the one
+/// under test and the class it produces cannot be borrowed from another stage.
+struct FailProgressionStore {
+    inner: Arc<data::InMemoryStudyStore>,
+    failure: ProgressionStoreFailure,
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for FailProgressionStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
+        self.inner.record_voice_session(config).await
+    }
+
+    async fn select_next_question(
+        &self,
+        _user_id: &str,
+        _study_set_id: &str,
+        voice_session_id: &str,
+        _response_id: &str,
+        _policy: ProgressionPolicyId,
+    ) -> Result<QuestionProgressionResult, PortError> {
+        let reason = format!(
+            "progression cursor refused by {PROGRESSION_STORE_DSN_MARKER} while reading \
+             {PROGRESSION_QUESTION_MARKER}"
+        );
+        Err(match self.failure {
+            ProgressionStoreFailure::Durability => {
+                PortError::durability("study_memory_store", voice_session_id, reason)
+            }
+            ProgressionStoreFailure::Internal => {
+                PortError::internal("study_memory_store", voice_session_id, reason)
+            }
+        })
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+}
+
+/// Open both adapter runtimes against a progression store that fails the given
+/// way, and return the typed failure each one refused with.
+async fn progression_open_failures(
+    failure: ProgressionStoreFailure,
+) -> Vec<agent_domain::BrainProviderFailure> {
+    let mut failures = Vec::new();
+    for runtime in ["fake_cartesia_gemini", "synthetic"] {
+        let inner = learning_ready_store();
+        let session = fixture_session_config();
+        let _ = inner.record_voice_session(&session).await.unwrap();
+        let store = Arc::new(FailProgressionStore { inner, failure });
+        let brain: Box<dyn RealtimeBrain> = match runtime {
+            "synthetic" => Box::new(agent_adapters::SyntheticBrain::with_study_store(store)),
+            _ => Box::new(FakeCartesiaGeminiRuntime::new(store)),
+        };
+        let error =
+            brain.open(session).await.err().unwrap_or_else(|| {
+                panic!("{runtime}: a refused progression read must fail the open")
+            });
+        failures.push(error.failure().clone());
+    }
+    failures
+}
+
+#[tokio::test]
+async fn question_progression_store_failure_keeps_its_port_error_kind() {
+    for failure in progression_open_failures(ProgressionStoreFailure::Durability).await {
+        assert_eq!(
+            failure.failure_class(),
+            BrainFailureClass::DurabilityDegraded,
+            "a durability-kind progression refusal is a durability failure: {failure:?}"
+        );
+        assert_eq!(failure.stage(), BrainFailureStage::Store, "{failure:?}");
+        assert_eq!(
+            failure.terminal_reason(),
+            TerminalSessionReason::DurabilityDegraded,
+            "the operator-visible terminal reason names the store, not the tools: {failure:?}"
+        );
+        assert!(failure.retry_eligible(), "{failure:?}");
+
+        // Classification must not be bought with a leak: the store's own prose
+        // carries a DSN and the authorized question id, and neither may appear.
+        let rendered = format!("{failure:?} {}", serde_json::to_string(&failure).unwrap());
+        assert!(
+            !rendered.contains(PROGRESSION_STORE_DSN_MARKER),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains(PROGRESSION_QUESTION_MARKER),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("marker-dsn-b17"), "{rendered}");
+    }
+
+    // The control: `PortErrorKind::Internal` has no class of its own in Plan
+    // 06's vocabulary, so it stays a tool-executor failure. A fix that simply
+    // hardcoded durability at this seam would fail here.
+    for failure in progression_open_failures(ProgressionStoreFailure::Internal).await {
+        assert_eq!(
+            failure.failure_class(),
+            BrainFailureClass::ToolExecutorFailure,
+            "an unclassified port kind must not be promoted to a durability claim: {failure:?}"
+        );
+        assert_eq!(
+            failure.terminal_reason(),
+            TerminalSessionReason::ToolExecutorFailure,
+            "{failure:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Task 10 (`ADAPTER-10`): fixture parity and differential controls.
 //
 // Everything below reads the immutable Plan 04/05 fixtures through the

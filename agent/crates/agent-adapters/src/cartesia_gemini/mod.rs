@@ -98,6 +98,87 @@ pub(crate) fn duration_ms(duration: Duration) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// `A-20.1` (`ADAPTER-06` follow-up): one kind-preserving executor/store
+// classification, shared by every adapter seam that maps one.
+//
+// `PortErrorKind` is the store-side half of Plan 06's classification boundary,
+// and an adapter that drops it reports the wrong incident: a durable-store
+// outage read by an operator as `tool_executor_failure` points at the tool
+// surface instead of the database. Preserving it is only half the rule, though.
+// The vocabulary draws no distinction for the remaining kinds, so answering
+// with a class for them anyway would be the adapter guessing — those return
+// `None` and the seam's own class stands.
+// ---------------------------------------------------------------------------
+
+/// What a typed store failure implies: the class, the stage it belongs to, and
+/// whether that class is worth retrying.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PortFailureClassification {
+    pub(crate) failure_class: BrainFailureClass,
+    pub(crate) stage: BrainFailureStage,
+    pub(crate) retry_eligible: bool,
+}
+
+/// The one place a store failure's `PortErrorKind` selects a failure class.
+///
+/// The match is exhaustive on purpose: a kind added to the port vocabulary
+/// cannot compile until someone decides whether the failure vocabulary has a
+/// class for it.
+pub(crate) fn port_error_classification(
+    error: &agent_domain::PortError,
+) -> Option<PortFailureClassification> {
+    match error.kind() {
+        agent_domain::PortErrorKind::Durability => Some(PortFailureClassification {
+            failure_class: BrainFailureClass::DurabilityDegraded,
+            stage: BrainFailureStage::Store,
+            retry_eligible: true,
+        }),
+        agent_domain::PortErrorKind::Unavailable
+        | agent_domain::PortErrorKind::InvalidInput
+        | agent_domain::PortErrorKind::Conflict
+        | agent_domain::PortErrorKind::Internal => None,
+    }
+}
+
+/// The same rule for an executor failure, whose only classified source is the
+/// port error it wraps. Nothing here reads a message to decide.
+pub(crate) fn tool_execution_classification(
+    error: &agent_domain::ToolExecutionError,
+) -> Option<PortFailureClassification> {
+    match error {
+        agent_domain::ToolExecutionError::Store(port_error) => {
+            port_error_classification(port_error)
+        }
+        agent_domain::ToolExecutionError::InvalidArguments(_)
+        | agent_domain::ToolExecutionError::Unavailable(_)
+        | agent_domain::ToolExecutionError::ReviewSchedule(_)
+        | agent_domain::ToolExecutionError::RecapEvidence(_) => None,
+    }
+}
+
+/// One executor failure at a server-owned adapter seam.
+///
+/// A classified kind carries its own class, stage, and retry policy; anything
+/// else stays exactly the tool-contract failure this seam already reported.
+pub(crate) fn executor_stage_failure(
+    error: &agent_domain::ToolExecutionError,
+    error_kind: &'static str,
+) -> BrainError {
+    let Some(classification) = tool_execution_classification(error) else {
+        return outcome_contract_failure(error_kind);
+    };
+    brain_failure(BrainProviderFailureParts {
+        failure_class: classification.failure_class,
+        stage: classification.stage,
+        retry_eligible: classification.retry_eligible,
+        latency_ms: 0,
+        provider: "server".to_owned(),
+        model: "viva-tools".to_owned(),
+        metadata: format!("error_kind={error_kind}"),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // `ADAPTER-06`: the one bounded, allowlisted provider-diagnostic vocabulary.
 //
 // Every live Gemini HTTP, Cartesia Ink, and Cartesia Sonic diagnostic is
@@ -396,6 +477,11 @@ pub(crate) fn websocket_close_code(frame: Option<&CloseFrame>) -> Option<u16> {
 /// question rather than reusing a cached one the cursor may already have moved
 /// past. An exhausted session carries no question and is never filled in with a
 /// fixture one.
+///
+/// `A-20.1`: the progression read is a store read, so a refusal keeps the class
+/// its own `PortErrorKind` selects. Discarding the executor error here reported
+/// a durable-store outage as `tool_executor_failure` and sent the operator to
+/// the wrong system.
 pub(crate) async fn select_session_question(
     executor: &VivaToolExecutor,
     study_set_id: &str,
@@ -408,7 +494,7 @@ pub(crate) async fn select_session_question(
             ToolProposal::select_next_question(study_set_id, voice_session_id, VIVA_STUDY_MODE),
         )
         .await
-        .map_err(|_| outcome_contract_failure("select_next_question_failed"))?;
+        .map_err(|error| executor_stage_failure(&error, "select_next_question_failed"))?;
     let progression: QuestionProgressionResult =
         serde_json::from_value(result.result["progression"].clone())
             .map_err(|_| outcome_contract_failure("question_progression_malformed"))?;
