@@ -19,6 +19,17 @@ export const colors = {
   ochre: "#B77831",
   copper: "#B06A3B",
   prussian: "#3C5A78",
+  // Mid tier: >=3:1 (AA_LARGE) against the vellum's darkest excursion, for
+  // meaningful non-text graphics (WCAG 1.4.11) and text >=24dp (or >=18.7dp
+  // bold) — not the full 4.5:1 *Ink bar, but no longer WCAG-exempt ornament
+  // either. Keeps more chroma than *Ink so states relying on this hue for
+  // meaning (e.g. the recap ledger's strong/shaky/due dot + numeral) stay
+  // distinguishable. See task-2-fix-1.md.
+  ochreMark: "#865824",
+  plumMark: "#6E429B",
+  sageMark: "#546750",
+  goldMark: "#745F34",
+  copperMark: "#8C542F",
   // Text-safe counterparts. Ornament values above stay as they are for
   // hairlines, keylines, sparks and rules; anything that renders as TEXT uses
   // the *Ink value. A component picks a role, never a hex.

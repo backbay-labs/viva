@@ -13,9 +13,9 @@ import { VoiceOrb } from "@/components/voice-orb";
 import { colors, fonts, layout, radius, space } from "@/theme/tokens";
 
 const LEDGER_COLORS: Record<RecapColorToken, string> = {
-  ochre: colors.ochre,
-  plumVivid: colors.plumVivid,
-  sageDeep: colors.sageDeep,
+  ochre: colors.ochreMark,
+  plumVivid: colors.plumMark,
+  sageDeep: colors.sageMark,
 };
 
 export default function RecapScreen() {

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   AA_BODY,
+  AA_LARGE,
   contrastOnVellum,
   contrastRatio,
   hexToRgb,
@@ -65,6 +66,34 @@ describe("text tokens hold AA at the light's darkest excursion", () => {
       expect(contrastOnVellum(ornament).darkest).toBeLessThan(AA_BODY);
     }
   });
+});
+
+describe("the *Mark tier holds AA_LARGE and stays lighter than *Ink", () => {
+  // Meaningful non-text graphics (WCAG 1.4.11) and text >=24dp only need
+  // AA_LARGE (3:1), not the full 4.5:1 *Ink bar. The tier only earns its place
+  // by keeping more chroma than *Ink; if a future edit collapses the two, the
+  // "lighter than its *Ink counterpart" assertion below is what catches it.
+  const markToInk: ReadonlyArray<readonly [string, string, string]> = [
+    ["ochre", colors.ochreMark, colors.ochreInk],
+    ["plum", colors.plumMark, colors.plumInk],
+    ["sage", colors.sageMark, colors.sageInk],
+    ["gold", colors.goldMark, colors.goldInk],
+    ["copper", colors.copperMark, colors.copperInk],
+  ];
+
+  for (const [name, mark] of markToInk) {
+    test(`${name}Mark clears ${AA_LARGE}:1 at ${VELLUM_DARKEST}`, () => {
+      expect(contrastOnVellum(mark).darkest).toBeGreaterThanOrEqual(AA_LARGE);
+    });
+  }
+
+  for (const [name, mark, ink] of markToInk) {
+    test(`${name}Mark is lighter than ${name}Ink`, () => {
+      const markLuminance = relativeLuminance(hexToRgb(mark));
+      const inkLuminance = relativeLuminance(hexToRgb(ink));
+      expect(markLuminance).toBeGreaterThan(inkLuminance);
+    });
+  }
 });
 
 describe("the vellum endpoints match the atmosphere spec", () => {
