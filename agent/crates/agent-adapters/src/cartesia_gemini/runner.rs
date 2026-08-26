@@ -3429,7 +3429,41 @@ mod tests {
 /// the environment.
 #[cfg(test)]
 mod evaluator_boundary_tests {
+    use agent_domain::{EvaluationError, EvaluationRequest};
+
     use super::*;
+
+    /// A request no evaluator can answer from the network: the default config
+    /// carries no credential, so the provider-backed evaluator refuses before
+    /// it opens a connection while the fixture evaluator answers from the
+    /// corpus. The two are therefore distinguishable by behaviour, offline.
+    fn credential_less_evaluation_request() -> EvaluationRequest {
+        EvaluationRequest {
+            response_id: "response-1".to_owned(),
+            question: agent_domain::fixture_question(),
+            answer_text: "the learner answer".to_owned(),
+            transcript_confidence: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_runtime_evaluator_is_provider_backed_in_behaviour_not_only_in_label() {
+        let store: Arc<dyn StudyMemoryStore> = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let live = CartesiaGeminiRunner::live(Arc::clone(&store), CartesiaGeminiConfig::default());
+        let fake = CartesiaGeminiRunner::fake(Arc::clone(&store), CartesiaGeminiConfig::default());
+        let request = credential_less_evaluation_request();
+
+        // The live composition holds a provider evaluator: with no credential it
+        // reports the provider unavailable rather than producing a verdict.
+        assert_eq!(
+            live.evaluator().evaluate(&request).await,
+            Err(EvaluationError::Unavailable)
+        );
+        // The fixture composition answers from the immutable corpus without any
+        // provider at all — so a live runtime that had silently become
+        // synthetic would return a decision here.
+        assert!(fake.evaluator().evaluate(&request).await.is_ok());
+    }
 
     #[test]
     fn live_runtime_injects_provider_evaluator_not_synthetic() {
